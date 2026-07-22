@@ -1,0 +1,29 @@
+services:
+  smelt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    init: true
+    volumes:
+      - bash-history:/home/dev/.bash_history_dir
+      - .:/app
+    ports:
+      - "8180:8080"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
+    # No auto-started dev server — exec in and run `dx serve` yourself so
+    # cargo/test output isn't mixed with `docker compose up` logs:
+    #   docker compose up -d
+    #   docker compose exec smelt bash
+    #   dx serve --fullstack --addr 0.0.0.0 --port 8080
+    # (container's :8080 is published on the host as :8180, since :8080 is
+    # already in use by another project's container on this machine)
+    command: sleep infinity
+
+volumes:
+  bash-history:
