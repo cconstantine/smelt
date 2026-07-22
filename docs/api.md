@@ -77,5 +77,6 @@ Because sending a message and opening its event stream are the same call, there'
 | `create_conversation` | `POST /api/conversations` | default title |
 | `get_messages` | `GET /api/conversations/{id}/messages` | ordered by `created_at ASC` |
 | `send_message` | `POST /api/conversations/{id}/messages` | streams the assistant reply, see above |
+| `delete_conversation` | `DELETE /api/conversations/{id}` | hard delete; cascades to the conversation's messages (`ON DELETE CASCADE`); deleting a nonexistent id is not an error |
 
-Not yet implemented (straightforward mechanical additions when needed): delete/rename a conversation, concurrent-send guarding.
+Not yet implemented (straightforward mechanical additions when needed): rename a conversation, concurrent-send guarding.

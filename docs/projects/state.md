@@ -7,6 +7,7 @@ A single-user, 100%-Rust AI chat agent: a Dioxus fullstack (SSR + hydration) web
 ## Features
 
 - Create conversations, switch between them (sidebar list, ordered by most-recently-active)
+- Delete a conversation from the sidebar (inline confirm, hard delete, cascades to its messages)
 - Send a message, see it appear immediately, watch the assistant's reply stream in live
 - Conversation auto-titled from its first user message
 - History persists across restarts (SQLite, not in-memory)
@@ -23,7 +24,7 @@ A single-user, 100%-Rust AI chat agent: a Dioxus fullstack (SSR + hydration) web
 
 - Tool-use / function calling — the agent can only talk, not act. This is the planned next step.
 - Multi-user accounts or login.
-- Deleting or renaming conversations.
+- Renaming conversations. (Deleting is supported — see [api.md](../api.md).)
 - An automated browser test tier (manual verification only so far — see [testing.md](../testing.md)).
 
 ## Goals for what comes next

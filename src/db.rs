@@ -17,7 +17,10 @@ pub async fn init() -> &'static SqlitePool {
     // parent directory — a fresh checkout with no `data/` dir yet would
     // otherwise fail to connect at all.
     if let Some(path) = db_url.strip_prefix("sqlite:") {
-        if let Some(parent) = std::path::Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Some(parent) = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent).expect("failed to create database directory");
         }
     }
@@ -47,20 +50,16 @@ pub fn get() -> &'static SqlitePool {
 const DEFAULT_TITLE: &str = "New Conversation";
 
 pub async fn create_conversation() -> Result<Conversation, sqlx::Error> {
-    sqlx::query_as::<_, Conversation>(
-        "INSERT INTO conversations (title) VALUES (?) RETURNING *",
-    )
-    .bind(DEFAULT_TITLE)
-    .fetch_one(get())
-    .await
+    sqlx::query_as::<_, Conversation>("INSERT INTO conversations (title) VALUES (?) RETURNING *")
+        .bind(DEFAULT_TITLE)
+        .fetch_one(get())
+        .await
 }
 
 pub async fn list_conversations() -> Result<Vec<Conversation>, sqlx::Error> {
-    sqlx::query_as::<_, Conversation>(
-        "SELECT * FROM conversations ORDER BY updated_at DESC",
-    )
-    .fetch_all(get())
-    .await
+    sqlx::query_as::<_, Conversation>("SELECT * FROM conversations ORDER BY updated_at DESC")
+        .fetch_all(get())
+        .await
 }
 
 pub async fn list_messages(conversation_id: i64) -> Result<Vec<Message>, sqlx::Error> {
@@ -105,6 +104,14 @@ pub async fn create_message(
     .await?;
 
     Ok(message)
+}
+
+pub async fn delete_conversation(id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM conversations WHERE id = ?")
+        .bind(id)
+        .execute(get())
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -234,5 +241,50 @@ mod tests {
             .find(|c| c.id == conversation.id)
             .expect("conversation should still exist");
         assert_eq!(updated.title, "first message");
+    }
+
+    #[tokio::test]
+    async fn test_delete_conversation_removes_it_from_list() {
+        init_test_db().await;
+
+        let conversation = create_conversation().await.expect("create conversation");
+        delete_conversation(conversation.id)
+            .await
+            .expect("delete conversation");
+
+        let all = list_conversations().await.expect("list conversations");
+        assert!(
+            !all.iter().any(|c| c.id == conversation.id),
+            "deleted conversation should not appear in list, got: {all:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_conversation_cascades_to_messages() {
+        init_test_db().await;
+
+        let conversation = create_conversation().await.expect("create conversation");
+        create_message(conversation.id, "user", "hello")
+            .await
+            .expect("create message");
+
+        delete_conversation(conversation.id)
+            .await
+            .expect("delete conversation");
+
+        let messages = list_messages(conversation.id).await.expect("list messages");
+        assert!(
+            messages.is_empty(),
+            "messages should be cascade-deleted with their conversation, got: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_conversation_is_a_no_op() {
+        init_test_db().await;
+
+        delete_conversation(-1)
+            .await
+            .expect("deleting a nonexistent conversation should not error");
     }
 }

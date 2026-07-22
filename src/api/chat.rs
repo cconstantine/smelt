@@ -33,6 +33,13 @@ pub async fn get_messages(id: i64) -> ServerFnResult<Vec<Message>> {
     db::list_messages(id).await.map_err(ServerFnError::new)
 }
 
+#[delete("/api/conversations/{id}")]
+pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
+    db::delete_conversation(id)
+        .await
+        .map_err(ServerFnError::new)
+}
+
 #[cfg(feature = "server")]
 fn anthropic_model() -> String {
     std::env::var("ANTHROPIC_MODEL")
@@ -90,25 +97,23 @@ pub async fn send_message(id: i64, content: String) -> ServerFnResult<ServerEven
         .await;
 
         match result {
-            Ok(assembled) => {
-                match db::create_message(id, "assistant", &assembled).await {
-                    Ok(saved) => {
-                        let _ = tx
-                            .send(ChatEvent::Done {
-                                message_id: saved.id,
-                                content: saved.content,
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(ChatEvent::Error {
-                                message: format!("failed to save assistant reply: {e}"),
-                            })
-                            .await;
-                    }
+            Ok(assembled) => match db::create_message(id, "assistant", &assembled).await {
+                Ok(saved) => {
+                    let _ = tx
+                        .send(ChatEvent::Done {
+                            message_id: saved.id,
+                            content: saved.content,
+                        })
+                        .await;
                 }
-            }
+                Err(e) => {
+                    let _ = tx
+                        .send(ChatEvent::Error {
+                            message: format!("failed to save assistant reply: {e}"),
+                        })
+                        .await;
+                }
+            },
             Err(message) => {
                 let _ = tx.send(ChatEvent::Error { message }).await;
             }
