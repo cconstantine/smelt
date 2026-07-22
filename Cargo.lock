@@ -3335,6 +3335,7 @@ dependencies = [
  "axum",
  "chrono",
  "dioxus",
+ "dotenvy",
  "futures-util",
  "reqwest",
  "serde",

@@ -35,7 +35,10 @@ pub async fn get_messages(id: i64) -> ServerFnResult<Vec<Message>> {
 
 #[cfg(feature = "server")]
 fn anthropic_model() -> String {
-    std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-opus-4-8".to_string())
+    std::env::var("ANTHROPIC_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "claude-opus-4-8".to_string())
 }
 
 #[post("/api/conversations/{id}/messages")]
@@ -60,7 +63,10 @@ pub async fn send_message(id: i64, content: String) -> ServerFnResult<ServerEven
     };
 
     Ok(ServerEvents::new(move |mut tx| async move {
-        let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") else {
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let Some(api_key) = api_key else {
             let _ = tx
                 .send(ChatEvent::Error {
                     message: "ANTHROPIC_API_KEY is not set on the server".to_string(),

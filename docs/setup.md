@@ -35,6 +35,14 @@ cargo test --features server
 
 ## Environment Variables
 
+Copy `.env.example` to `.env` and fill in `ANTHROPIC_API_KEY`. Loaded
+automatically at server startup (`dotenvy::dotenv()` in `main.rs`); a value
+already set in the real environment takes precedence over `.env`. A var
+that's set-but-empty is treated the same as unset (see `anthropic_model()`
+and the `ANTHROPIC_API_KEY` check in `src/api/chat.rs`) — no code path
+silently sends an empty string to the Anthropic API.
+
+
 | Variable | Required | Default | Notes |
 |---|---|---|---|
 | `ANTHROPIC_API_KEY` | yes, to send messages | — | Read server-side only; the browser never sees it. Missing key surfaces as a `ChatEvent::Error` in the chat UI, not a crash. |

@@ -12,6 +12,7 @@ tracing = "0.1"
 tokio = { version = "1", features = ["sync", "macros", "time"] }
 
 # Server-only dependencies (not WASM-compatible)
+dotenvy = { version = "0.15", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"], optional = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono"], optional = true }
@@ -24,6 +25,7 @@ web = ["dioxus/web"]
 server = [
     "dioxus/server",
     "tokio/full",
+    "dep:dotenvy",
     "dep:tracing-subscriber",
     "dep:reqwest",
     "dep:sqlx",

@@ -10,6 +10,9 @@ mod models;
 async fn main() {
     use dioxus::prelude::DioxusRouterExt;
 
+    // Optional: absent in prod, where real env vars are set directly.
+    let _ = dotenvy::dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();

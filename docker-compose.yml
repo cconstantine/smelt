@@ -13,9 +13,14 @@ services:
       - .:/app
     ports:
       - "8180:8080"
+    # ANTHROPIC_API_KEY / ANTHROPIC_MODEL aren't set here: the app loads
+    # ./.env itself at startup (bind-mounted below), and an unset var
+    # substituted as "" would otherwise silently override that .env value
+    # with an empty string instead of leaving it unset. Export them in your
+    # host shell instead if you'd rather not use a .env file.
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
+      - ANTHROPIC_API_KEY
+      - ANTHROPIC_MODEL
     # No auto-started dev server — exec in and run `dx serve` yourself so
     # cargo/test output isn't mixed with `docker compose up` logs:
     #   docker compose up -d
