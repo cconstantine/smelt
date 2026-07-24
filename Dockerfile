@@ -7,6 +7,18 @@ RUN apt-get update && apt-get install -y \
     binaryen \
     && rm -rf /var/lib/apt/lists/*
 
+# GitHub CLI, via its official apt repo — needed to open PRs from inside
+# the container (see docs/projects/completed/ retros: this was previously
+# a manual per-session install).
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && mkdir -p -m 755 /etc/apt/sources.list.d \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y gh \
+    && rm -rf /var/lib/apt/lists/*
+
 ARG UID=1000
 ARG GID=1000
 
@@ -26,6 +38,10 @@ RUN mkdir -p /home/dev/.bash_history_dir && \
 
 # Install cargo-binstall for fast prebuilt binary installs
 RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+
+# Claude Code CLI (native installer — no Node.js dependency, installs to
+# ~/.local/bin which is already on PATH by default for this user).
+RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # Pinned to match the `dioxus` crate version in Cargo.toml — a mismatched
 # `dx` CLI refuses to serve/build the project at all.
