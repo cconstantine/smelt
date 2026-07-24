@@ -7,6 +7,24 @@ RUN apt-get update && apt-get install -y \
     binaryen \
     && rm -rf /var/lib/apt/lists/*
 
+# GitHub CLI, via its official apt repo — needed to open PRs from inside
+# the container (see docs/projects/completed/ retros: this was previously
+# a manual per-session install).
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && mkdir -p -m 755 /etc/apt/sources.list.d \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Docker CLI only (no daemon) — talks to the `docker` sidecar service in
+# docker-compose.yml over DOCKER_HOST, not a locally running daemon.
+# Pinned to match that sidecar's major version (docker:29-dind).
+RUN curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-29.6.2.tgz \
+    | tar -xz --strip-components=1 -C /usr/local/bin docker/docker
+
 ARG UID=1000
 ARG GID=1000
 
@@ -24,8 +42,20 @@ RUN rustup component add rustfmt
 RUN mkdir -p /home/dev/.bash_history_dir && \
     echo 'export HISTFILE=/home/dev/.bash_history_dir/.bash_history' >> /home/dev/.bashrc
 
+# Pre-create the gh config dir owned by `dev` so the gh-config volume (see
+# docker-compose.yml) inherits correct ownership on first mount. Without
+# this, Docker auto-creates the mount point as root (nothing in the image
+# writes here otherwise — gh is installed as a system package before `USER
+# dev` is even set) and `gh auth login` can complete the OAuth flow but
+# fails to persist the token, silently leaving the container logged out.
+RUN mkdir -p /home/dev/.config/gh
+
 # Install cargo-binstall for fast prebuilt binary installs
 RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+
+# Claude Code CLI (native installer — no Node.js dependency, installs to
+# ~/.local/bin which is already on PATH by default for this user).
+RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # Pinned to match the `dioxus` crate version in Cargo.toml — a mismatched
 # `dx` CLI refuses to serve/build the project at all.
