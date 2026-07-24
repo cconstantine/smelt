@@ -10,17 +10,12 @@ services:
     init: true
     depends_on:
       - postgres
+      - docker
     volumes:
       - bash-history:/home/dev/.bash_history_dir
       - gh-config:/home/dev/.config/gh
       - claude-config:/home/dev/.claude
       - .:/app
-      # Forwards the host's Docker daemon into the container (Docker
-      # outside of Docker) rather than running a nested daemon — needed
-      # for anything in here that shells out to `docker`/`docker compose`.
-      # No `docker` CLI is installed in the image yet; add one before
-      # relying on this.
-      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8180:8080"
     # ANTHROPIC_API_KEY / ANTHROPIC_MODEL aren't set here: the app loads
@@ -32,13 +27,11 @@ services:
       - ANTHROPIC_API_KEY
       - ANTHROPIC_MODEL
       - DATABASE_URL=postgres://smelt:${POSTGRES_PASSWORD:-smelt}@postgres/smelt
-    # Grants the container's `dev` user access to the forwarded Docker
-    # socket, which on the host is group-owned (usually by a `docker`
-    # group), not world-writable. Find your host's GID with
-    # `stat -c %g /var/run/docker.sock` or `getent group docker`, and set
-    # DOCKER_GID if it isn't the common default below.
-    group_add:
-      - ${DOCKER_GID:-999}
+      # Points the `docker` CLI (installed in the image, see Dockerfile) at
+      # the `docker` sidecar below instead of a mounted host socket, so
+      # `docker ps` in here only ever sees containers this project's own
+      # nested daemon launched.
+      - DOCKER_HOST=tcp://docker:2375
     # No auto-started dev server — exec in and run `dx serve` yourself so
     # cargo/test output isn't mixed with `docker compose up` logs:
     #   docker compose up -d
@@ -61,8 +54,24 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
+  # Nested Docker daemon (Docker-in-Docker), not a forward of the host's —
+  # `docker ps` from `smelt` only ever sees containers this daemon itself
+  # launched. Costs the host's image cache (its own storage under
+  # docker-data, so image pulls happen again) and `privileged: true` (a
+  # real, broader blast radius than the socket-forwarding alternative) in
+  # exchange for that isolation. TLS disabled (empty DOCKER_TLS_CERTDIR)
+  # since, like postgres above, this never leaves the compose network.
+  docker:
+    image: docker:29-dind
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    volumes:
+      - docker-data:/var/lib/docker
+
 volumes:
   bash-history:
   gh-config:
   claude-config:
   postgres-data:
+  docker-data:

@@ -19,6 +19,12 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
+# Docker CLI only (no daemon) — talks to the `docker` sidecar service in
+# docker-compose.yml over DOCKER_HOST, not a locally running daemon.
+# Pinned to match that sidecar's major version (docker:29-dind).
+RUN curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-29.6.2.tgz \
+    | tar -xz --strip-components=1 -C /usr/local/bin docker/docker
+
 ARG UID=1000
 ARG GID=1000
 
