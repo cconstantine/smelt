@@ -1,6 +1,9 @@
 use dioxus::prelude::*;
 
-use crate::api::chat::{ChatEvent, create_conversation, get_conversations, get_messages, send_message};
+use crate::api::chat::{
+    ChatEvent, create_conversation, delete_conversation, get_conversations, get_messages,
+    send_message,
+};
 use crate::models::{Conversation, Message};
 
 #[component]
@@ -21,6 +24,7 @@ fn ConversationSidebar(mut selected: Signal<Option<i64>>) -> Element {
     let mut conversations: Signal<Vec<Conversation>> = use_signal(Vec::new);
     let mut loaded = use_signal(|| false);
     let mut error: Signal<Option<String>> = use_signal(|| None);
+    let mut pending_delete: Signal<Option<i64>> = use_signal(|| None);
 
     use_effect(move || {
         if let Some(result) = initial_conversations() {
@@ -45,6 +49,28 @@ fn ConversationSidebar(mut selected: Signal<Option<i64>>) -> Element {
         });
     };
 
+    // First click on a row's delete button arms it; a second click on the
+    // same (still-armed) row confirms. Only one row is ever armed at a
+    // time, so arming a different row implicitly cancels the last one.
+    let mut request_delete = move |id: i64| {
+        if pending_delete() == Some(id) {
+            pending_delete.set(None);
+            spawn(async move {
+                match delete_conversation(id).await {
+                    Ok(()) => {
+                        conversations.write().retain(|c| c.id != id);
+                        if selected() == Some(id) {
+                            selected.set(None);
+                        }
+                    }
+                    Err(e) => error.set(Some(e.to_string())),
+                }
+            });
+        } else {
+            pending_delete.set(Some(id));
+        }
+    };
+
     rsx! {
         aside { class: "sidebar",
             button { class: "new-conversation", onclick: new_conversation, "New conversation" }
@@ -61,8 +87,19 @@ fn ConversationSidebar(mut selected: Signal<Option<i64>>) -> Element {
                         div {
                             key: "{conversation.id}",
                             class: if selected() == Some(conversation.id) { "conversation-item active" } else { "conversation-item" },
-                            onclick: move |_| selected.set(Some(conversation.id)),
-                            "{conversation.title}"
+                            onclick: move |_| {
+                                pending_delete.set(None);
+                                selected.set(Some(conversation.id));
+                            },
+                            span { class: "conversation-title", "{conversation.title}" }
+                            button {
+                                class: if pending_delete() == Some(conversation.id) { "delete-conversation confirm" } else { "delete-conversation" },
+                                onclick: move |evt: Event<MouseData>| {
+                                    evt.stop_propagation();
+                                    request_delete(conversation.id);
+                                },
+                                if pending_delete() == Some(conversation.id) { "Confirm?" } else { "Delete" }
+                            }
                         }
                     }
                 }
@@ -91,16 +128,14 @@ fn ChatPanel(selected: Signal<Option<i64>>) -> Element {
     let mut input = use_signal(String::new);
     let mut next_temp_id = use_signal(|| -1i64);
 
-    use_effect(move || {
-        match initial_messages() {
-            Some(Some(Ok(list))) => {
-                messages.set(list);
-                load_error.set(None);
-            }
-            Some(Some(Err(e))) => load_error.set(Some(e.to_string())),
-            Some(None) => messages.set(Vec::new()),
-            None => {}
+    use_effect(move || match initial_messages() {
+        Some(Some(Ok(list))) => {
+            messages.set(list);
+            load_error.set(None);
         }
+        Some(Some(Err(e))) => load_error.set(Some(e.to_string())),
+        Some(None) => messages.set(Vec::new()),
+        None => {}
     });
 
     let mut send = move || {
@@ -133,7 +168,10 @@ fn ChatPanel(selected: Signal<Option<i64>>) -> Element {
                             Ok(ChatEvent::Delta { text }) => {
                                 streaming_text.write().push_str(&text);
                             }
-                            Ok(ChatEvent::Done { message_id, content }) => {
+                            Ok(ChatEvent::Done {
+                                message_id,
+                                content,
+                            }) => {
                                 messages.write().push(Message {
                                     id: message_id,
                                     conversation_id: id,

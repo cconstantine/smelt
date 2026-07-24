@@ -27,6 +27,24 @@ pub async fn create_conversation() -> Result<Conversation, sqlx::Error> {
 }
 ```
 
+A plain `DELETE` needs no `RETURNING`/`FromRow` mapping at all:
+
+```rust
+pub async fn delete_conversation(id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM conversations WHERE id = ?")
+        .bind(id)
+        .execute(get())
+        .await?;
+    Ok(())
+}
+```
+
+Deleting an id that doesn't exist is not an error — it just affects zero
+rows. `messages.conversation_id` has `ON DELETE CASCADE`
+(`PRAGMA foreign_keys = ON` is set on every pooled connection in
+`db::init()`), so this cleans up the conversation's messages for free; see
+[migrations.md](migrations.md).
+
 `Conversation`/`Message` derive `sqlx::FromRow` (gated `#[cfg_attr(feature = "server", derive(sqlx::FromRow))]` in `models.rs`, since the derive itself pulls in sqlx types not present on the web build).
 
 ## Errors
