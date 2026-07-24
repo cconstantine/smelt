@@ -20,22 +20,28 @@ pub enum ChatEvent {
 
 #[get("/api/conversations")]
 pub async fn get_conversations() -> ServerFnResult<Vec<Conversation>> {
-    db::list_conversations().await.map_err(ServerFnError::new)
+    db::list_conversations(db::get())
+        .await
+        .map_err(ServerFnError::new)
 }
 
 #[post("/api/conversations")]
 pub async fn create_conversation() -> ServerFnResult<Conversation> {
-    db::create_conversation().await.map_err(ServerFnError::new)
+    db::create_conversation(db::get())
+        .await
+        .map_err(ServerFnError::new)
 }
 
 #[get("/api/conversations/{id}/messages")]
 pub async fn get_messages(id: i64) -> ServerFnResult<Vec<Message>> {
-    db::list_messages(id).await.map_err(ServerFnError::new)
+    db::list_messages(db::get(), id)
+        .await
+        .map_err(ServerFnError::new)
 }
 
 #[delete("/api/conversations/{id}")]
 pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
-    db::delete_conversation(id)
+    db::delete_conversation(db::get(), id)
         .await
         .map_err(ServerFnError::new)
 }
@@ -50,11 +56,13 @@ fn anthropic_model() -> String {
 
 #[post("/api/conversations/{id}/messages")]
 pub async fn send_message(id: i64, content: String) -> ServerFnResult<ServerEvents<ChatEvent>> {
-    db::create_message(id, "user", &content)
+    db::create_message(db::get(), id, "user", &content)
         .await
         .map_err(ServerFnError::new)?;
 
-    let history = db::list_messages(id).await.map_err(ServerFnError::new)?;
+    let history = db::list_messages(db::get(), id)
+        .await
+        .map_err(ServerFnError::new)?;
     let request = anthropic::CreateMessageRequest {
         model: anthropic_model(),
         max_tokens: 4096,
@@ -97,7 +105,8 @@ pub async fn send_message(id: i64, content: String) -> ServerFnResult<ServerEven
         .await;
 
         match result {
-            Ok(assembled) => match db::create_message(id, "assistant", &assembled).await {
+            Ok(assembled) => match db::create_message(db::get(), id, "assistant", &assembled).await
+            {
                 Ok(saved) => {
                     let _ = tx
                         .send(ChatEvent::Done {

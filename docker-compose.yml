@@ -8,6 +8,8 @@ services:
         UID: ${UID:-1000}
         GID: ${GID:-1000}
     init: true
+    depends_on:
+      - postgres
     volumes:
       - bash-history:/home/dev/.bash_history_dir
       - .:/app
@@ -21,6 +23,7 @@ services:
     environment:
       - ANTHROPIC_API_KEY
       - ANTHROPIC_MODEL
+      - DATABASE_URL=postgres://smelt:${POSTGRES_PASSWORD:-smelt}@postgres/smelt
     # No auto-started dev server — exec in and run `dx serve` yourself so
     # cargo/test output isn't mixed with `docker compose up` logs:
     #   docker compose up -d
@@ -30,5 +33,19 @@ services:
     # already in use by another project's container on this machine)
     command: sleep infinity
 
+  # Local/dev only — not reachable from the host (no `ports:`), only from
+  # `smelt` over the compose network as `postgres:5432`. Credentials are
+  # dev-only defaults, same pattern as UID/GID above: this is a
+  # single-user local database, not a shared/production one.
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: smelt
+      POSTGRES_USER: smelt
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smelt}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
 volumes:
   bash-history:
+  postgres-data:

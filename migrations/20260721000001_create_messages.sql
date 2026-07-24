@@ -1,9 +1,9 @@
 CREATE TABLE messages (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     role            TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
     content         TEXT NOT NULL,
-    created_at      DATETIME NOT NULL DEFAULT (datetime('now'))
+    created_at      TIMESTAMP NOT NULL DEFAULT now()
 );
 
 CREATE INDEX idx_messages_conversation_id ON messages(conversation_id);

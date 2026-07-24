@@ -8,6 +8,4 @@
 
 .claude/
 
-# SQLite dev database
-/data/
 .env

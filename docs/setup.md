@@ -30,6 +30,8 @@ cargo check --features server
 cargo check --no-default-features --features web --target wasm32-unknown-unknown
 
 # ── Tests ─────────────────────────────────────────────────────────────────
+# Requires Postgres running first (docker compose up -d postgres) — DB tests
+# use #[sqlx::test], which needs a reachable DATABASE_URL. See testing.md.
 cargo test --features server
 ```
 
@@ -48,6 +50,6 @@ silently sends an empty string to the Anthropic API.
 | `ANTHROPIC_API_KEY` | yes, to send messages | — | Read server-side only; the browser never sees it. Missing key surfaces as a `ChatEvent::Error` in the chat UI, not a crash. |
 | `ANTHROPIC_MODEL` | no | `claude-opus-4-8` | Model id passed to the Messages API. |
 | `ANTHROPIC_BASE_URL` | no | `https://api.anthropic.com` | Override for pointing at a mock upstream in tests, or an API-compatible gateway. |
-| `DATABASE_URL` | no | `sqlite:./data/smelt.db` | SQLite path. |
+| `DATABASE_URL` | yes | — | Postgres connection string; `db::init()` panics on startup if unset. Set in `docker-compose.yml`'s `smelt` service, pointing at the `postgres` compose service (only reachable from other compose services, not the host) — only needed in `.env` if running outside docker compose. |
 | `PORT` | no | `8080` | Port the Axum server binds when run via plain `cargo run --features server` (not used by `dx serve`, which picks its own address). |
 | `RUST_LOG` | no | (silent) | Standard `tracing-subscriber` env filter, e.g. `RUST_LOG=info,tower_http=debug`. |

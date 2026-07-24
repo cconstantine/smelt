@@ -1,201 +1,163 @@
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    PgPool,
+    postgres::{PgConnectOptions, PgPoolOptions},
 };
 
 use crate::models::{Conversation, Message};
 
-static POOL: OnceLock<SqlitePool> = OnceLock::new();
+static POOL: OnceLock<PgPool> = OnceLock::new();
 
-pub async fn init() -> &'static SqlitePool {
-    let db_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:./data/smelt.db".to_string());
+const CONNECT_RETRIES: u32 = 10;
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-    // `create_if_missing` below creates the database *file*, but not its
-    // parent directory — a fresh checkout with no `data/` dir yet would
-    // otherwise fail to connect at all.
-    if let Some(path) = db_url.strip_prefix("sqlite:") {
-        if let Some(parent) = std::path::Path::new(path)
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
+pub async fn init() -> &'static PgPool {
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+
+    let options = db_url
+        .parse::<PgConnectOptions>()
+        .expect("Invalid DATABASE_URL");
+
+    // A freshly-started container doesn't mean Postgres is accepting
+    // connections yet — especially on first boot, while it initializes its
+    // data directory. A bounded retry loop tolerates that startup window
+    // without hanging forever if Postgres is genuinely misconfigured.
+    let mut attempt = 0;
+    let pool = loop {
+        attempt += 1;
+        match PgPoolOptions::new()
+            .max_connections(5)
+            .connect_with(options.clone())
+            .await
         {
-            std::fs::create_dir_all(parent).expect("failed to create database directory");
+            Ok(pool) => break pool,
+            Err(err) if attempt < CONNECT_RETRIES => {
+                tracing::warn!(
+                    "failed to connect to Postgres (attempt {attempt}/{CONNECT_RETRIES}): {err}"
+                );
+                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+            }
+            Err(err) => {
+                panic!("Failed to connect to Postgres after {CONNECT_RETRIES} attempts: {err}")
+            }
         }
-    }
-
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect_with(
-            db_url
-                .parse::<SqliteConnectOptions>()
-                .expect("Invalid DATABASE_URL")
-                .create_if_missing(true)
-                .journal_mode(SqliteJournalMode::Wal)
-                .pragma("foreign_keys", "ON"),
-        )
-        .await
-        .expect("Failed to connect to SQLite");
+    };
 
     POOL.set(pool).expect("Database already initialized");
     POOL.get().unwrap()
 }
 
-pub fn get() -> &'static SqlitePool {
+pub fn get() -> &'static PgPool {
     POOL.get()
         .expect("Database not initialized. Call db::init() first.")
 }
 
 const DEFAULT_TITLE: &str = "New Conversation";
 
-pub async fn create_conversation() -> Result<Conversation, sqlx::Error> {
-    sqlx::query_as::<_, Conversation>("INSERT INTO conversations (title) VALUES (?) RETURNING *")
+pub async fn create_conversation(pool: &PgPool) -> Result<Conversation, sqlx::Error> {
+    sqlx::query_as::<_, Conversation>("INSERT INTO conversations (title) VALUES ($1) RETURNING *")
         .bind(DEFAULT_TITLE)
-        .fetch_one(get())
+        .fetch_one(pool)
         .await
 }
 
-pub async fn list_conversations() -> Result<Vec<Conversation>, sqlx::Error> {
+pub async fn list_conversations(pool: &PgPool) -> Result<Vec<Conversation>, sqlx::Error> {
     sqlx::query_as::<_, Conversation>("SELECT * FROM conversations ORDER BY updated_at DESC")
-        .fetch_all(get())
+        .fetch_all(pool)
         .await
 }
 
-pub async fn list_messages(conversation_id: i64) -> Result<Vec<Message>, sqlx::Error> {
+pub async fn list_messages(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Vec<Message>, sqlx::Error> {
     sqlx::query_as::<_, Message>(
-        "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC",
+        "SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC",
     )
     .bind(conversation_id)
-    .fetch_all(get())
+    .fetch_all(pool)
     .await
 }
 
 pub async fn create_message(
+    pool: &PgPool,
     conversation_id: i64,
     role: &str,
     content: &str,
 ) -> Result<Message, sqlx::Error> {
     let message = sqlx::query_as::<_, Message>(
-        "INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?) RETURNING *",
+        "INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3) RETURNING *",
     )
     .bind(conversation_id)
     .bind(role)
     .bind(content)
-    .fetch_one(get())
+    .fetch_one(pool)
     .await?;
 
     // Bump updated_at so the sidebar can sort by recency; auto-title the
     // conversation from the first user message if it's still the default.
     sqlx::query(
         "UPDATE conversations
-         SET updated_at = datetime('now'),
+         SET updated_at = now(),
              title = CASE
-                 WHEN title = ? AND ? = 'user' THEN substr(?, 1, 60)
+                 WHEN title = $1 AND $2 = 'user' THEN left($3, 60)
                  ELSE title
              END
-         WHERE id = ?",
+         WHERE id = $4",
     )
     .bind(DEFAULT_TITLE)
     .bind(role)
     .bind(content)
     .bind(conversation_id)
-    .execute(get())
+    .execute(pool)
     .await?;
 
     Ok(message)
 }
 
-pub async fn delete_conversation(id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM conversations WHERE id = ?")
+pub async fn delete_conversation(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM conversations WHERE id = $1")
         .bind(id)
-        .execute(get())
+        .execute(pool)
         .await?;
     Ok(())
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    use super::*;
-    use sqlx::{Connection, sqlite::SqliteConnection};
-    use tokio::sync::OnceCell;
-
-    static INIT: OnceCell<()> = OnceCell::const_new();
-
-    /// Initialize a process-wide in-memory SQLite pool with migrations applied,
-    /// stored in the same global `POOL` that `db::get()` reads. Idempotent and
-    /// safe to call from every test; the first caller wins and the rest reuse it.
-    pub async fn init_test_db() {
-        INIT.get_or_init(|| async {
-            // Each `#[tokio::test]` runs on its own runtime. A plain
-            // `sqlite::memory:` database is private to a single connection, so
-            // when a later test on a different runtime acquires a fresh
-            // connection it sees an empty database ("no such table"). A *named,
-            // shared-cache* in-memory database is shared by every connection
-            // that opens the same URI and persists as long as one connection
-            // stays open — so all tests, on any runtime, see the same migrated
-            // schema.
-            let opts = "sqlite:file:smelt_shared_test?mode=memory&cache=shared"
-                .parse::<SqliteConnectOptions>()
-                .expect("parse shared in-memory sqlite url")
-                .create_if_missing(true)
-                .pragma("foreign_keys", "ON");
-
-            // A leaked keep-alive connection guarantees the shared in-memory DB
-            // is never torn down (it vanishes once the last connection closes),
-            // independent of the pool reaping idle connections.
-            let keepalive = SqliteConnection::connect_with(&opts)
-                .await
-                .expect("open keep-alive connection to shared in-memory DB");
-            std::mem::forget(keepalive);
-
-            let pool = SqlitePoolOptions::new()
-                .max_connections(5)
-                .connect_with(opts)
-                .await
-                .expect("create shared in-memory test pool");
-            sqlx::migrate!()
-                .run(&pool)
-                .await
-                .expect("run migrations on test pool");
-            POOL.set(pool).ok();
-        })
-        .await;
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use test_support::init_test_db;
 
-    #[tokio::test]
-    async fn test_create_and_list_conversations_round_trip() {
-        init_test_db().await;
-
-        let created = create_conversation().await.expect("create conversation");
+    #[sqlx::test]
+    async fn test_create_and_list_conversations_round_trip(pool: PgPool) {
+        let created = create_conversation(&pool)
+            .await
+            .expect("create conversation");
         assert_eq!(created.title, DEFAULT_TITLE);
 
-        let all = list_conversations().await.expect("list conversations");
+        let all = list_conversations(&pool).await.expect("list conversations");
         assert!(
             all.iter().any(|c| c.id == created.id),
             "created conversation should appear in list, got: {all:?}"
         );
     }
 
-    #[tokio::test]
-    async fn test_create_message_round_trips_and_lists_in_order() {
-        init_test_db().await;
-
-        let conversation = create_conversation().await.expect("create conversation");
-        let first = create_message(conversation.id, "user", "hello")
+    #[sqlx::test]
+    async fn test_create_message_round_trips_and_lists_in_order(pool: PgPool) {
+        let conversation = create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        let first = create_message(&pool, conversation.id, "user", "hello")
             .await
             .expect("create first message");
-        let second = create_message(conversation.id, "assistant", "hi there")
+        let second = create_message(&pool, conversation.id, "assistant", "hi there")
             .await
             .expect("create second message");
 
-        let messages = list_messages(conversation.id).await.expect("list messages");
+        let messages = list_messages(&pool, conversation.id)
+            .await
+            .expect("list messages");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].id, first.id);
         assert_eq!(messages[0].role, "user");
@@ -203,16 +165,21 @@ mod tests {
         assert_eq!(messages[1].role, "assistant");
     }
 
-    #[tokio::test]
-    async fn test_first_user_message_auto_titles_conversation() {
-        init_test_db().await;
-
-        let conversation = create_conversation().await.expect("create conversation");
-        create_message(conversation.id, "user", "What's the weather like today?")
+    #[sqlx::test]
+    async fn test_first_user_message_auto_titles_conversation(pool: PgPool) {
+        let conversation = create_conversation(&pool)
             .await
-            .expect("create message");
+            .expect("create conversation");
+        create_message(
+            &pool,
+            conversation.id,
+            "user",
+            "What's the weather like today?",
+        )
+        .await
+        .expect("create message");
 
-        let all = list_conversations().await.expect("list conversations");
+        let all = list_conversations(&pool).await.expect("list conversations");
         let updated = all
             .iter()
             .find(|c| c.id == conversation.id)
@@ -220,22 +187,22 @@ mod tests {
         assert_eq!(updated.title, "What's the weather like today?");
     }
 
-    #[tokio::test]
-    async fn test_second_message_does_not_overwrite_title() {
-        init_test_db().await;
-
-        let conversation = create_conversation().await.expect("create conversation");
-        create_message(conversation.id, "user", "first message")
+    #[sqlx::test]
+    async fn test_second_message_does_not_overwrite_title(pool: PgPool) {
+        let conversation = create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        create_message(&pool, conversation.id, "user", "first message")
             .await
             .expect("create first message");
-        create_message(conversation.id, "assistant", "a reply")
+        create_message(&pool, conversation.id, "assistant", "a reply")
             .await
             .expect("create assistant message");
-        create_message(conversation.id, "user", "second message")
+        create_message(&pool, conversation.id, "user", "second message")
             .await
             .expect("create second message");
 
-        let all = list_conversations().await.expect("list conversations");
+        let all = list_conversations(&pool).await.expect("list conversations");
         let updated = all
             .iter()
             .find(|c| c.id == conversation.id)
@@ -243,47 +210,47 @@ mod tests {
         assert_eq!(updated.title, "first message");
     }
 
-    #[tokio::test]
-    async fn test_delete_conversation_removes_it_from_list() {
-        init_test_db().await;
-
-        let conversation = create_conversation().await.expect("create conversation");
-        delete_conversation(conversation.id)
+    #[sqlx::test]
+    async fn test_delete_conversation_removes_it_from_list(pool: PgPool) {
+        let conversation = create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        delete_conversation(&pool, conversation.id)
             .await
             .expect("delete conversation");
 
-        let all = list_conversations().await.expect("list conversations");
+        let all = list_conversations(&pool).await.expect("list conversations");
         assert!(
             !all.iter().any(|c| c.id == conversation.id),
             "deleted conversation should not appear in list, got: {all:?}"
         );
     }
 
-    #[tokio::test]
-    async fn test_delete_conversation_cascades_to_messages() {
-        init_test_db().await;
-
-        let conversation = create_conversation().await.expect("create conversation");
-        create_message(conversation.id, "user", "hello")
+    #[sqlx::test]
+    async fn test_delete_conversation_cascades_to_messages(pool: PgPool) {
+        let conversation = create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        create_message(&pool, conversation.id, "user", "hello")
             .await
             .expect("create message");
 
-        delete_conversation(conversation.id)
+        delete_conversation(&pool, conversation.id)
             .await
             .expect("delete conversation");
 
-        let messages = list_messages(conversation.id).await.expect("list messages");
+        let messages = list_messages(&pool, conversation.id)
+            .await
+            .expect("list messages");
         assert!(
             messages.is_empty(),
             "messages should be cascade-deleted with their conversation, got: {messages:?}"
         );
     }
 
-    #[tokio::test]
-    async fn test_delete_nonexistent_conversation_is_a_no_op() {
-        init_test_db().await;
-
-        delete_conversation(-1)
+    #[sqlx::test]
+    async fn test_delete_nonexistent_conversation_is_a_no_op(pool: PgPool) {
+        delete_conversation(&pool, -1)
             .await
             .expect("deleting a nonexistent conversation should not error");
     }
