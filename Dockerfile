@@ -42,6 +42,14 @@ RUN rustup component add rustfmt
 RUN mkdir -p /home/dev/.bash_history_dir && \
     echo 'export HISTFILE=/home/dev/.bash_history_dir/.bash_history' >> /home/dev/.bashrc
 
+# Pre-create the gh config dir owned by `dev` so the gh-config volume (see
+# docker-compose.yml) inherits correct ownership on first mount. Without
+# this, Docker auto-creates the mount point as root (nothing in the image
+# writes here otherwise — gh is installed as a system package before `USER
+# dev` is even set) and `gh auth login` can complete the OAuth flow but
+# fails to persist the token, silently leaving the container logged out.
+RUN mkdir -p /home/dev/.config/gh
+
 # Install cargo-binstall for fast prebuilt binary installs
 RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
 
