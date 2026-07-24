@@ -12,7 +12,15 @@ services:
       - postgres
     volumes:
       - bash-history:/home/dev/.bash_history_dir
+      - gh-config:/home/dev/.config/gh
+      - claude-config:/home/dev/.claude
       - .:/app
+      # Forwards the host's Docker daemon into the container (Docker
+      # outside of Docker) rather than running a nested daemon — needed
+      # for anything in here that shells out to `docker`/`docker compose`.
+      # No `docker` CLI is installed in the image yet; add one before
+      # relying on this.
+      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8180:8080"
     # ANTHROPIC_API_KEY / ANTHROPIC_MODEL aren't set here: the app loads
@@ -24,6 +32,13 @@ services:
       - ANTHROPIC_API_KEY
       - ANTHROPIC_MODEL
       - DATABASE_URL=postgres://smelt:${POSTGRES_PASSWORD:-smelt}@postgres/smelt
+    # Grants the container's `dev` user access to the forwarded Docker
+    # socket, which on the host is group-owned (usually by a `docker`
+    # group), not world-writable. Find your host's GID with
+    # `stat -c %g /var/run/docker.sock` or `getent group docker`, and set
+    # DOCKER_GID if it isn't the common default below.
+    group_add:
+      - ${DOCKER_GID:-999}
     # No auto-started dev server — exec in and run `dx serve` yourself so
     # cargo/test output isn't mixed with `docker compose up` logs:
     #   docker compose up -d
@@ -48,4 +63,6 @@ services:
 
 volumes:
   bash-history:
+  gh-config:
+  claude-config:
   postgres-data:
