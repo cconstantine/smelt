@@ -1,6 +1,6 @@
 CREATE TABLE conversations (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     title      TEXT NOT NULL DEFAULT 'New Conversation',
-    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+    created_at TIMESTAMP NOT NULL DEFAULT now(),
+    updated_at TIMESTAMP NOT NULL DEFAULT now()
 );

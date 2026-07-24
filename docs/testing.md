@@ -19,24 +19,22 @@ mod tests {
 
 ## Database tests
 
-`db::get()` reads a process-wide `OnceLock` pool, so DB code needs a shared fixture rather than a fresh database per test:
+`db.rs`'s CRUD functions take `pool: &PgPool` as an explicit parameter (see [database.md](database.md)), so tests use `#[sqlx::test]` instead of `db::get()`'s process-wide pool — each test function gets its own freshly created, migrated Postgres database, handed in as an argument:
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_support::init_test_db;
 
-    #[tokio::test]
-    async fn test_thing_round_trip() {
-        init_test_db().await; // idempotent; first caller migrates an in-memory DB
-        let c = create_conversation().await.expect("create");
-        // ... exercise db functions against `c.id`
+    #[sqlx::test]
+    async fn test_thing_round_trip(pool: PgPool) {
+        let c = create_conversation(&pool).await.expect("create");
+        // ... exercise db functions against `c.id`, passing `&pool` explicitly
     }
 }
 ```
 
-`init_test_db` (in `src/db.rs`) opens a **named, shared-cache** in-memory SQLite database (`file:smelt_shared_test?mode=memory&cache=shared`) plus a leaked keep-alive connection, and runs all migrations — once per test binary. Shared-cache is what lets many `#[tokio::test]`s, each on its own runtime, see the same migrated schema; a plain `sqlite::memory:` is private per-connection.
+`#[sqlx::test]` connects to the Postgres server at `DATABASE_URL`, creates a new database per test, runs all migrations against it, and tears it down afterward — no shared fixture, no manual setup/teardown, and no cross-test interference since each test is fully isolated. This requires a reachable Postgres server while running tests (`docker compose up -d postgres`) — a real workflow change from the old in-memory-SQLite setup, where `cargo test` was fully self-contained.
 
 ## Testing the Anthropic streaming client without the network
 

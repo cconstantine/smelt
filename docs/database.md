@@ -1,28 +1,30 @@
 # Database
 
-SQLite via sqlx, matching the pattern used elsewhere in this style of app: a process-wide `OnceLock<SqlitePool>` rather than threading a pool through function arguments or extractors.
+Postgres via sqlx. `db.rs`'s CRUD functions take `pool: &PgPool` as an explicit parameter rather than reaching into a global — that's what lets `#[sqlx::test]` (see [testing.md](testing.md#database-tests)) hand each test its own isolated database.
+
+A process-wide `OnceLock<PgPool>` still exists for *production* wiring — `main.rs` and `api/chat.rs`'s server functions only open the pool once, at startup/per-request, same as before:
 
 ```rust
 // src/db.rs
-static POOL: OnceLock<SqlitePool> = OnceLock::new();
+static POOL: OnceLock<PgPool> = OnceLock::new();
 
-pub async fn init() -> &'static SqlitePool { /* opens the pool, sets POOL */ }
-pub fn get() -> &'static SqlitePool { /* panics if init() hasn't run yet */ }
+pub async fn init() -> &'static PgPool { /* connects (with retry), sets POOL */ }
+pub fn get() -> &'static PgPool { /* panics if init() hasn't run yet */ }
 ```
 
-`main.rs` calls `db::init()` once at startup, before serving, then runs `sqlx::migrate!()` against it. Every other function — CRUD helpers in `db.rs`, server functions in `api/chat.rs` — just calls `db::get()`.
+`main.rs` calls `db::init()` once at startup, before serving, then runs `sqlx::migrate!()` against it. Server functions in `api/chat.rs` call the `db.rs` CRUD functions directly, passing `db::get()` as the pool argument.
 
 ## Query pattern
 
-`INSERT ... RETURNING *` mapped onto the model struct via `sqlx::query_as::<_, T>`, so a create returns the exact row (including DB-assigned `id`/timestamps) in one round trip:
+`INSERT ... RETURNING *` mapped onto the model struct via `sqlx::query_as::<_, T>`, so a create returns the exact row (including DB-assigned `id`/timestamps) in one round trip. Placeholders are Postgres-style `$1, $2, ...`:
 
 ```rust
-pub async fn create_conversation() -> Result<Conversation, sqlx::Error> {
+pub async fn create_conversation(pool: &PgPool) -> Result<Conversation, sqlx::Error> {
     sqlx::query_as::<_, Conversation>(
-        "INSERT INTO conversations (title) VALUES (?) RETURNING *",
+        "INSERT INTO conversations (title) VALUES ($1) RETURNING *",
     )
     .bind(DEFAULT_TITLE)
-    .fetch_one(get())
+    .fetch_one(pool)
     .await
 }
 ```
@@ -30,20 +32,19 @@ pub async fn create_conversation() -> Result<Conversation, sqlx::Error> {
 A plain `DELETE` needs no `RETURNING`/`FromRow` mapping at all:
 
 ```rust
-pub async fn delete_conversation(id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM conversations WHERE id = ?")
+pub async fn delete_conversation(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM conversations WHERE id = $1")
         .bind(id)
-        .execute(get())
+        .execute(pool)
         .await?;
     Ok(())
 }
 ```
 
 Deleting an id that doesn't exist is not an error — it just affects zero
-rows. `messages.conversation_id` has `ON DELETE CASCADE`
-(`PRAGMA foreign_keys = ON` is set on every pooled connection in
-`db::init()`), so this cleans up the conversation's messages for free; see
-[migrations.md](migrations.md).
+rows. `messages.conversation_id` has `ON DELETE CASCADE`, which Postgres
+enforces natively (no pragma needed, unlike SQLite), so this cleans up the
+conversation's messages for free; see [migrations.md](migrations.md).
 
 `Conversation`/`Message` derive `sqlx::FromRow` (gated `#[cfg_attr(feature = "server", derive(sqlx::FromRow))]` in `models.rs`, since the derive itself pulls in sqlx types not present on the web build).
 
@@ -53,4 +54,4 @@ rows. `messages.conversation_id` has `ON DELETE CASCADE`
 
 ## Testing against the database
 
-See [testing.md](testing.md#database-tests) — `db::test_support::init_test_db()` gives every test a shared, migrated, in-memory database.
+See [testing.md](testing.md#database-tests) — `#[sqlx::test]` gives every test its own isolated, migrated Postgres database, passed in as a `PgPool` argument.

@@ -2,7 +2,7 @@
 
 ## Stack
 
-Dioxus **fullstack** (SSR + hydration + typed server functions) on Axum, SQLite via sqlx, streaming to the real Anthropic Messages API via reqwest.
+Dioxus **fullstack** (SSR + hydration + typed server functions) on Axum, Postgres via sqlx, streaming to the real Anthropic Messages API via reqwest.
 
 Unlike a hand-rolled Axum-API app, there is no separate REST layer and no hand-written browser fetch client: functions in `src/api/` decorated `#[get]`/`#[post]` are isomorphic — the same function is a real Axum route on the server build and a transparent HTTP call on the web/WASM build. See [api.md](api.md).
 
@@ -12,7 +12,7 @@ Unlike a hand-rolled Axum-API app, there is no separate REST layer and no hand-w
 |---|---|---|
 | `src/main.rs` | — | Entry point. Server build: runs migrations, assembles the fullstack router, binds and serves. Web build: `dioxus::launch` boots the hydrated client. |
 | `src/models.rs` | no | `Conversation`, `Message` — shared wire/row types, `sqlx::FromRow` derived only under `server`. |
-| `src/db.rs` | `server` only | Global `OnceLock<SqlitePool>` (`init`/`get`) + CRUD functions. Mirrors the pattern used elsewhere in this style of app: handlers call `db::get()` directly rather than threading a pool through extractors. |
+| `src/db.rs` | `server` only | CRUD functions taking `pool: &PgPool` explicitly, plus a global `OnceLock<PgPool>` (`init`/`get`) for production wiring — server functions in `api/chat.rs` call `db::get()` once and pass the pool in. |
 | `src/anthropic/types.rs` | no | Rust mirror of the Anthropic Messages API wire shapes (`ContentBlock`, `AnthropicMessage`, `CreateMessageRequest`, `CreateMessageResponse`). |
 | `src/anthropic/stream.rs` | `server` only | `stream_anthropic_message`: calls the real Anthropic API with `stream: true`, parses its SSE event stream, calls back per text delta. |
 | `src/api/chat.rs` | no (functions are isomorphic; only their bodies differ per build) | The server functions: `get_conversations`, `create_conversation`, `get_messages`, `send_message`. `send_message` returns a `ServerEvents<ChatEvent>` — see below. |
