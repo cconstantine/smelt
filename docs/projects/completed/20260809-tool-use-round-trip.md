@@ -204,23 +204,45 @@ tool, `scripts/browser-check/` demoted to documented fallback).
   via direct `curl` to `/api/conversations/{id}/tasks`, not a UI staleness
   artifact), and a separate live model call never produced a reply after
   5+ minutes despite the same request pattern working (if slowly) earlier
-  in the same session. Not investigated further — out of scope for a UI
-  pass — but flagged here since it happened twice and wasn't explained.
+  in the same session. Not investigated further at the time — out of
+  scope for a UI pass — but flagged here since it happened twice and
+  wasn't explained. **Root-caused and fixed as part of applying this
+  retro's own proposals** — see "What to change" below.
 
-**What to change (proposals — not yet applied):**
-- Add a test asserting `tool_definitions()`'s name list matches every
-  branch `anthropic::tools::execute` dispatches on, so a newly-added tool
-  can't be implemented+tested without also being offered to the model —
-  directly targets the "forgot to wire it in" gap above.
-- Consider documenting the "boxed future breaks a `Send`-inference cycle"
-  pattern somewhere more prominent than a doc-comment on `run_turn`, since
-  the next plan against `coding-session.md` (a real tool proxy calling
-  back into the conversation loop) will very likely hit the same shape.
+**What to change (proposals):**
+- ~~Add a test asserting `tool_definitions()`'s name list matches every
+  branch `anthropic::tools::execute` dispatches on~~ — checked:
+  `api::chat::tests::test_tool_definitions_covers_every_dispatchable_tool_name`
+  already does exactly this (written during the original implementation
+  pass, before this retro entry was drafted) and its hardcoded dispatch
+  list still matches `execute`'s match arms 1:1, verified by hand against
+  the current code. No change needed.
+- ~~Consider documenting the "boxed future breaks a `Send`-inference
+  cycle" pattern somewhere more prominent than a doc-comment on
+  `run_turn`~~ — done: added as a Rule in `development-process.md`,
+  alongside "Bound the boundaries" (the other async-correctness gotcha
+  this same project ran into) — see that file rather than duplicating the
+  explanation here.
 - ~~Re-propose (again) getting real browser automation available in this
   sandbox~~ — done: Playwright is now baked into the dev container image
   (see the UI-polish section above and `testing.md`).
-- Investigate the slow/stuck `run_async` task and the one outright-hung
-  model call observed live during the UI-polish pass (previous bullet) —
-  undetermined whether this is sandbox resource throttling, an Anthropic
-  API-side issue, or a real bug in the task/turn loop; worth a dedicated
-  look before it's mistaken for normal latency again.
+- ~~Investigate the slow/stuck `run_async` task and the one outright-hung
+  model call observed live during the UI-polish pass~~ — root cause
+  found: `anthropic::stream::stream_anthropic_message`'s initial request
+  to Anthropic (`reqwest::Client::new()...send()`, before any streaming
+  even starts) had **no timeout at all** — a direct violation of this
+  project's own "Bound the boundaries" rule, missed because `CHUNK_TIMEOUT`
+  (bounding the gap *between* chunks once streaming has started) reads a
+  lot like full coverage but doesn't bound the initial connect-and-headers
+  wait. A stalled/hung connect there is indistinguishable from the caller
+  hanging forever — and since a `run_async` task with `stream_output: true`
+  `.await`s exactly this call once per line before its own loop can
+  continue, that's what made the wrapped tool look permanently "stuck"
+  rather than surfacing as a visible error. Fixed by adding a
+  `RESPONSE_TIMEOUT` (90s) around the initial request, factored into a
+  `send_and_await_response` helper so a test (mock TCP listener that
+  accepts a connection and never writes a response) can exercise the
+  timeout firing without waiting 90 real seconds. Whether the *underlying*
+  slowness was sandbox throttling or a real upstream hiccup is still
+  unknown — but it can no longer hang the app indefinitely either way,
+  which was the actual risk worth closing.

@@ -151,6 +151,42 @@ impl PartialBlock {
 /// a long response is expected to take a while overall.
 const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Bound on how long we'll wait for Anthropic to even start responding —
+/// TCP connect through receiving the response headers — before giving up.
+/// Distinct from `CHUNK_TIMEOUT`, which only bounds the gap between chunks
+/// once a response is already streaming; this call had no bound at all
+/// before (see the tool-use-round-trip retrospective: a stalled connect
+/// here is indistinguishable from the caller just hanging forever — and
+/// since a `run_async` task with `stream_output: true` awaits exactly this
+/// call once per line before it can continue, that manifested as the
+/// wrapped tool looking permanently "stuck" rather than as a visible
+/// error).
+const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Sends the request and waits for Anthropic's response headers, bounded by
+/// `response_timeout` — factored out from `stream_anthropic_message` so a
+/// test can exercise the timeout with a short duration instead of the real
+/// `RESPONSE_TIMEOUT`.
+async fn send_and_await_response(
+    api_key: &str,
+    request: &CreateMessageRequest,
+    base_url: &str,
+    response_timeout: std::time::Duration,
+) -> Result<reqwest::Response, String> {
+    tokio::time::timeout(
+        response_timeout,
+        reqwest::Client::new()
+            .post(format!("{base_url}/v1/messages"))
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(request)
+            .send(),
+    )
+    .await
+    .map_err(|_| "timed out waiting for Anthropic to respond".to_string())?
+    .map_err(|e| format!("Claude API request failed: {e}"))
+}
+
 /// Stream a message from the real Anthropic API, calling `on_delta` for each
 /// text chunk as it arrives (live typing effect) and returning every content
 /// block — text and/or tool_use — plus the turn's `stop_reason` once the
@@ -161,14 +197,8 @@ pub async fn stream_anthropic_message(
     request: &CreateMessageRequest,
     mut on_delta: impl FnMut(&str),
 ) -> Result<StreamedTurn, String> {
-    let response = reqwest::Client::new()
-        .post(format!("{}/v1/messages", anthropic_base_url()))
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .json(request)
-        .send()
-        .await
-        .map_err(|e| format!("Claude API request failed: {e}"))?;
+    let response =
+        send_and_await_response(api_key, request, &anthropic_base_url(), RESPONSE_TIMEOUT).await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -468,5 +498,56 @@ mod tests {
             }]
         );
         assert_eq!(turn.stop_reason, "tool_use");
+    }
+
+    /// Regression test for the tool-use-round-trip retrospective's hung
+    /// live model call: before `RESPONSE_TIMEOUT` existed, a connection
+    /// that never got a response at all (accepted, then silence) hung
+    /// `stream_anthropic_message` forever. Accepts the connection but never
+    /// writes a response, so `send_and_await_response` has nothing to read
+    /// — a short `response_timeout` (not the real `RESPONSE_TIMEOUT`, which
+    /// would make this test take 90 real seconds) must still make it
+    /// return promptly rather than hang.
+    #[tokio::test]
+    async fn test_send_and_await_response_times_out_when_upstream_never_responds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                // Hold the connection open without ever writing a response,
+                // for comfortably longer than the test's own timeout below.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                drop(stream);
+            }
+        });
+
+        let request = CreateMessageRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 100,
+            system: None,
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            send_and_await_response(
+                "test-key",
+                &request,
+                &format!("http://{addr}"),
+                std::time::Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("send_and_await_response itself should not hang past its own timeout");
+
+        match result {
+            Err(e) => assert_eq!(e, "timed out waiting for Anthropic to respond"),
+            Ok(_) => panic!("expected a timeout error, got a response"),
+        }
     }
 }
