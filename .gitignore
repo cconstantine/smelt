@@ -10,6 +10,10 @@
 
 .env
 
+# Credential for the local k3s cluster's smelt-park namespace (bearer token
+# inline) — same category as .env, never committed. See docs/setup.md.
+.kubeconfig.yaml
+
 # Downloaded by scripts/browser-check/setup.sh — a headless Chrome binary
 # and its shared libraries, never committed. See docs/testing.md.
 /.browser-check-cache/
