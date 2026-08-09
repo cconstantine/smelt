@@ -19,6 +19,7 @@ Unlike a hand-rolled Axum-API app, there is no separate REST layer and no hand-w
 | `src/events.rs` | mixed (see below) | The per-conversation live event bus. `ConversationEvent` (not gated, crosses the boundary as `subscribe_conversation_events`'s payload) plus `server`-only `publish`/`subscribe` backed by a `LazyLock<Mutex<HashMap<i64, broadcast::Sender<ConversationEvent>>>>`. |
 | `src/api/chat.rs` | no (functions are isomorphic; only their bodies differ per build) | The server functions: `get_conversations`, `create_conversation`, `get_messages`, `send_message`, `get_tasks`, `subscribe_conversation_events`, `delete_conversation`. `run_turn` (the turn loop both `send_message` and a background task's push call into) and the per-conversation lock live here too. |
 | `src/frontend/` | no | Dioxus components: `App` (router root), `pages::Chat` (`ConversationSidebar` + `ChatPanel`). `ChatPanel` opens a live `subscribe_conversation_events` stream (web-only) and renders a background-tasks panel alongside the transcript. |
+| `src/sandbox.rs` | `server` only | `Sandbox` (a live pod handle: `exec`, plus a `Drop` that queues cleanup) and `SandboxManager` (`create`/`delete`, owning the `kube::Client` and the cleanup queue's background drain task) — the coding-session sandbox lifecycle primitive against a k8s `smelt-park` namespace. Not yet wired to any tool; see [docs/projects/plans/k8s-sandbox.md](projects/plans/k8s-sandbox.md). |
 
 ## Three channels, not two
 

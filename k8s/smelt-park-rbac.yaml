@@ -1,0 +1,63 @@
+# Recreates the RBAC scope already granted by hand on the `homelab` cluster
+# (see docs/projects/plans/k8s-sandbox.md) for the compose-provided `k3s`
+# test cluster. Applied by the `k3s-bootstrap` compose service; safe to
+# `kubectl apply` repeatedly (idempotent), since state persists across
+# `docker compose down`/`up` in the named `k3s` volumes.
+#
+# homelab's own copy of this scope predates this file and was created by
+# hand — apply this same manifest there too so the two don't drift.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: smelt-park
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: park
+  namespace: smelt-park
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: park
+  namespace: smelt-park
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch", "create", "patch", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["list", "watch", "create", "patch", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps", "services"]
+    verbs: ["list", "create", "patch", "get", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["list", "create", "patch", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["endpoints", "events", "limitranges", "resourcequotas"]
+    verbs: ["list", "get"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: park
+  namespace: smelt-park
+subjects:
+  - kind: ServiceAccount
+    name: park
+    namespace: smelt-park
+roleRef:
+  kind: Role
+  name: park
+  apiGroup: rbac.authorization.k8s.io

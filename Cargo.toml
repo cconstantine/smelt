@@ -19,6 +19,15 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "migrate", "c
 tower-http = { version = "0.6", features = ["trace"], optional = true }
 futures-util = { version = "0.3", optional = true }
 axum = { version = "0.8", optional = true }
+kube = { version = "4.2", default-features = false, features = ["client", "runtime", "rustls-tls", "ring", "ws"], optional = true }
+k8s-openapi = { version = "0.28", features = ["v1_34"], optional = true }
+# kube's rustls-tls stack only auto-installs a default CryptoProvider when
+# built with its aws-lc-rs feature (which needs cmake/nasm); this project
+# uses ring instead (same backend reqwest's own rustls-tls already pulls
+# in via __rustls-ring, avoiding a second crypto backend in the binary),
+# which kube does NOT auto-install — see main.rs's explicit
+# install_default() call.
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
 
 # Web-only: a wasm-compatible timer (tokio::time has no driver in a browser
 # tab — there's no tokio runtime on the WASM client at all).
@@ -36,4 +45,7 @@ server = [
     "dep:tower-http",
     "dep:futures-util",
     "dep:axum",
+    "dep:kube",
+    "dep:k8s-openapi",
+    "dep:rustls",
 ]

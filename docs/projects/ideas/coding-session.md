@@ -34,40 +34,65 @@ exactly this — see `state.md`.
 
 ## Sandboxing
 
+**Shipped** — the lifecycle primitive below (create/exec/delete a pod) is
+implemented in `src/sandbox.rs`; see
+`projects/completed/20260809-k8s-sandbox.md`. Not yet wired to a tool,
+which is the next step this idea still describes.
+
 Each coding session gets its own isolated, disposable environment. Nothing
 the agent does — `git checkout`, file reads/writes, shell commands — ever
 touches the smelt server's own filesystem or process directly; the server
 only ever talks *to* the sandbox (start it, send it a command, read back
 the result), never acts as it.
 
-- **Isolation mechanism:** a container per session is the natural fit —
-  smelt already assumes Docker for its own dev/deploy story (`Dockerfile`,
-  `docker-compose.yml`), so provisioning one short-lived container per
-  coding session (via the Docker API/socket, not shelling out to the CLI)
-  reuses infra the project already depends on rather than introducing a
-  new one (chroot/bubblewrap/VM). Revisit if per-session container
-  spin-up latency turns out to matter.
-- **Lifecycle:** one sandbox per conversation, created on first tool use
-  (not eagerly on conversation create) and torn down when the conversation
-  is deleted or after an idle timeout — needs to line up with whatever the
+The environment: a Kubernetes Pod in the `smelt-park` namespace of an
+existing local k3s cluster (`homelab`), not a Docker container — smelt
+talks to it via `kube-rs`, authenticated as a namespace-scoped service
+account (`park`) whose RBAC is already close to least-privilege for this:
+`pods` (create/delete/exec/log), `secrets`, `configmaps`, `services`,
+`ingresses`, `pvc` within `smelt-park`, and nothing cluster-scoped (no
+`nodes`, `RuntimeClass`, `StorageClass`, not even the `smelt-park`
+namespace object itself).
+
+- **Isolation mechanism:** one Pod per session, created/deleted through
+  the `pods` RBAC above, commands run via the `pods/exec` subresource
+  (same shape as `docker exec`, and already permitted). Confirmed
+  empirically against `homelab`: no `gVisor`/`Kata` `RuntimeClass` is
+  installed (`runtimeClassName: gvisor`/`kata`/`kata-qemu`/`kata-fc` all
+  rejected with "not found"), so sandbox pods run under plain `runc` today
+  — the same kernel-sharing tradeoff as a bare Docker container. Adding a
+  sandboxed RuntimeClass is a `homelab`-admin task, not smelt code; revisit
+  by adding `runtimeClassName` to the pod spec once one exists, no other
+  change needed. The isolation win that's already real without it: sandbox
+  pods run on a separate physical machine from wherever smelt's own server
+  process runs, unlike a same-host Docker-in-Docker sidecar.
+- **Lifecycle:** one Pod per conversation, created on first tool use (not
+  eagerly on conversation create) and deleted when the conversation is
+  deleted or after an idle timeout — needs to line up with whatever the
   delete-conversations idea lands on, so a deleted conversation doesn't
-  leave an orphaned container running.
-- **Filesystem:** a per-session working directory/volume the sandbox owns;
-  `git checkout` (or `git clone`) of the target repo happens *inside* it,
-  not on the host. No mounting of the smelt server's own source tree or
-  host paths into the sandbox.
-- **Network:** default to no egress, or an explicit allowlist (needs at
-  minimum wherever `git` is cloning from) — the sandbox running arbitrary
-  model-directed shell commands is exactly the thing that shouldn't have
-  open internet access by default.
-- **Resource limits:** CPU/memory/disk caps and a hard wall-clock timeout
-  per command, so a runaway or malicious tool call can't starve the host
-  smelt itself runs on.
-- **Credentials:** git auth (for private repos) needs to reach the sandbox
-  without smelt's own `ANTHROPIC_API_KEY`-style env-var-on-the-host pattern
-  leaking a token into a container the model can run arbitrary commands
-  in — this needs its own answer, not a reuse of how the Anthropic key is
-  handled today.
+  leave an orphaned pod running.
+- **Filesystem:** `git checkout`/`clone` of the target repo happens inside
+  the pod's own container filesystem (or an `emptyDir`), never a host path
+  and never smelt's own source tree. The RBAC already covers `pvc`
+  create/delete if a session's checkout ever needs to survive a pod
+  restart within its own lifetime, but nothing needs that yet.
+- **Network:** no egress restriction — not a launch requirement. The
+  `park` service account has no RBAC on `NetworkPolicy` objects at all
+  (list/get/create all forbidden), so enforcing an allowlist would mean
+  either widening that RBAC or an admin-managed policy outside smelt's own
+  control; not worth blocking on for now. Revisit with whoever admins
+  `homelab` if the threat model changes.
+- **Resource limits:** CPU/memory requests+limits set per-pod in the spec
+  smelt generates — the namespace has no `LimitRange`/`ResourceQuota`
+  today, so smelt itself is the only thing enforcing per-session caps. A
+  hard wall-clock timeout per command still needs its own answer; nothing
+  about Pods gives that for free.
+- **Credentials:** git auth (for private repos) reaches the sandbox as a
+  per-session Kubernetes `Secret`, mounted read-only into just that pod
+  and deleted with it when the session ends — the RBAC already grants
+  `secrets` create/patch/delete/get, so this doesn't need a new mechanism
+  beyond what's already provisioned, unlike smelt's own
+  `ANTHROPIC_API_KEY`-as-host-env-var pattern.
 
 ## Visibility
 
