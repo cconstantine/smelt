@@ -9,12 +9,21 @@ services:
         GID: ${GID:-1000}
     init: true
     depends_on:
-      - postgres
-      - docker
+      postgres:
+        condition: service_started
+      docker:
+        condition: service_started
+      # A plain list entry here would only wait for k3s-bootstrap's
+      # container to *start*, not finish — and its whole job is to write
+      # the kubeconfig file smelt's KUBECONFIG env var points at, which
+      # takes several seconds (it waits on k3s's own API readiness first).
+      k3s-bootstrap:
+        condition: service_completed_successfully
     volumes:
       - bash-history:/home/dev/.bash_history_dir
       - gh-config:/home/dev/.config/gh
       - claude-config:/home/dev/.claude
+      - k3s-out:/etc/smelt/k3s:ro
       - .:/app
     ports:
       - "8180:8080"
@@ -32,6 +41,13 @@ services:
       # `docker ps` in here only ever sees containers this project's own
       # nested daemon launched.
       - DOCKER_HOST=tcp://docker:2375
+      # A ready-to-use kubeconfig for the `park` service account, written
+      # by `k3s-bootstrap` (see below) — no rewriting needed at runtime,
+      # since the bootstrap script already bakes in the right server
+      # address and credentials. Point this at .kubeconfig.yaml instead
+      # (gitignored, not committed) to deliberately target the real
+      # `homelab` cluster instead of this hermetic test one.
+      - KUBECONFIG=/etc/smelt/k3s/park-kubeconfig.yaml
     # No auto-started dev server — exec in and run `dx serve` yourself so
     # cargo/test output isn't mixed with `docker compose up` logs:
     #   docker compose up -d
@@ -69,9 +85,77 @@ services:
     volumes:
       - docker-data:/var/lib/docker
 
+  # A hermetic k8s cluster for sandbox tests — see
+  # docs/projects/plans/k8s-sandbox.md. Pinned to match the real `homelab`
+  # cluster's version, to avoid API-shape drift between the two.
+  # `privileged: true` is the same category of tradeoff already accepted
+  # for the `docker` sidecar above; k3s needs it to run containerd-in-a-
+  # container. `--tls-san=k3s` puts this compose hostname in the server
+  # cert's SAN list, since k3s can't otherwise know in advance what DNS
+  # name a sibling container will use to reach it. The `sysctl -w` calls
+  # are required, not cosmetic: proven by spike, k3s's control-plane
+  # processes exhaust the default `fs.inotify.max_user_instances=128`
+  # within seconds of boot and the whole server shuts itself down
+  # ("too many open files") without this bump.
+  k3s:
+    image: rancher/k3s:v1.34.6-k3s1
+    privileged: true
+    entrypoint: sh
+    command:
+      - -c
+      - |
+        sysctl -w fs.inotify.max_user_instances=8192
+        sysctl -w fs.inotify.max_user_watches=1048576
+        exec k3s server --disable=traefik --tls-san=k3s
+    environment:
+      # World-readable, so the non-root `k3s-bootstrap` container (and,
+      # if ever needed, a manual debugging session) can read the
+      # generated admin kubeconfig from the shared volume below. k3s
+      # writes it root:root 0600 otherwise.
+      - K3S_KUBECONFIG_MODE=644
+    volumes:
+      - k3s-data:/var/lib/rancher/k3s
+      - k3s-config:/etc/rancher/k3s
+
+  # One-shot: applies k8s/smelt-park-rbac.yaml, mints a long-lived token
+  # for the `park` service account, and writes a ready-to-use kubeconfig
+  # for it to the `k3s-out` volume (see scripts/k3s-bootstrap.sh). Runs as
+  # root (`user: "0"`) specifically to avoid two separate permission
+  # mismatches proven by spike: `bitnami/kubectl`'s default non-root user
+  # can't read the (still root-owned, despite K3S_KUBECONFIG_MODE)
+  # `k3s-config` volume's directory, nor write into the fresh `k3s-out`
+  # volume Docker creates owned by root. No compose healthcheck on `k3s`
+  # gates this — its own busybox `wget` has no TLS support, so there's no
+  # usable in-image healthcheck command; `k3s-bootstrap.sh` polls
+  # `/healthz` itself with retries instead, which is the thing that
+  # actually needs to know the API is ready.
+  #
+  # Pinned by image digest, not a version tag: Bitnami no longer publishes
+  # granular per-version tags for this image on the free tier, only
+  # `latest` — same "needs an occasional manual bump" posture as the `k3s`
+  # image tag above, just for a different reason. `rancher/kubectl` has
+  # real version tags but ships no shell at all (a single static binary),
+  # which this script's control flow (loops, heredocs) needs.
+  k3s-bootstrap:
+    image: bitnami/kubectl@sha256:1a86ba502f618724fd493f6a2b129f060454db04f06faa58d8ed94510280b17f
+    user: "0"
+    depends_on:
+      - k3s
+    entrypoint: sh
+    command: ["/scripts/k3s-bootstrap.sh"]
+    volumes:
+      - k3s-config:/k3s-admin:ro
+      - k3s-out:/out
+      - ./k8s:/k8s:ro
+      - ./scripts/k3s-bootstrap.sh:/scripts/k3s-bootstrap.sh:ro
+    restart: "no"
+
 volumes:
   bash-history:
   gh-config:
   claude-config:
   postgres-data:
   docker-data:
+  k3s-data:
+  k3s-config:
+  k3s-out:

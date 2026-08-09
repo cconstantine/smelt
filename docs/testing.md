@@ -36,6 +36,38 @@ mod tests {
 
 `#[sqlx::test]` connects to the Postgres server at `DATABASE_URL`, creates a new database per test, runs all migrations against it, and tears it down afterward — no shared fixture, no manual setup/teardown, and no cross-test interference since each test is fully isolated. This requires a reachable Postgres server while running tests (`docker compose up -d postgres`) — a real workflow change from the old in-memory-SQLite setup, where `cargo test` was fully self-contained.
 
+## Sandbox tests
+
+`src/sandbox.rs`'s tests hit a real Kubernetes API, the same "real
+dependency, not a mock" posture as the database tests above — there's no
+cheap way to fake the k8s API surface the way `anthropic::stream`'s mock
+upstream fakes a single HTTP endpoint. Unlike the database tests, there's
+no `#[sqlx::test]`-equivalent macro giving automatic per-test isolation, so
+each test generates its own unique pod name (a timestamp-based suffix, not
+a real UUID — see `uuid_like()` in `sandbox::tests`) to avoid colliding
+with other tests or concurrent runs, and is responsible for its own
+cleanup (explicit `manager.delete(sandbox)`, or in the one test that
+covers the Drop path deliberately, a bounded `tokio::time::timeout` poll
+waiting for the background drain task to do it instead).
+
+Requires `KUBECONFIG` set and pointing at a reachable cluster with the
+`smelt-park` namespace's RBAC applied (see
+[docs/projects/plans/k8s-sandbox.md](projects/plans/k8s-sandbox.md)) —
+`docker compose up -d k3s k3s-bootstrap` (or a full `docker compose up -d`)
+sets this up automatically via `docker-compose.yml`'s `KUBECONFIG` env var
+on the `smelt` service, pointing at the compose-provided `k3s` service.
+Point it at `.kubeconfig.yaml` instead to run the same tests against the
+real `homelab` cluster as a manual drift check — not something `cargo
+test` does by default.
+
+A real, non-obvious gotcha proven the hard way: deleting a sandbox pod
+with Kubernetes' default `DeleteParams` leaves it `Terminating` for its
+full grace period (commonly 30s) before it actually disappears, because a
+plain `sleep infinity` container doesn't trap `SIGTERM`. Every delete in
+`sandbox.rs` — including test cleanup — goes through
+`immediate_delete_params()` (`grace_period_seconds: Some(0)`) specifically
+to avoid tests timing out on this.
+
 ## Testing the Anthropic streaming client without the network
 
 `anthropic::stream::stream_anthropic_message` is tested against a mock upstream — a throwaway Axum server bound to an ephemeral port, with `ANTHROPIC_BASE_URL` pointed at it for the duration of the test:

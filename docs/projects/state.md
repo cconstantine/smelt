@@ -25,10 +25,11 @@ A single-user, 100%-Rust AI chat agent: a Dioxus fullstack (SSR + hydration) web
 - `src/anthropic/tools.rs` dispatches tool calls by name and owns the in-memory background-task registry `run_async` spawns into.
 - `src/events.rs` is the per-conversation broadcast bus (`tokio::sync::broadcast`) that `subscribe_conversation_events` forwards and both `tools.rs` and `chat.rs` publish to.
 - `src/db.rs`: CRUD functions taking a `&PgPool` parameter, plus a global `OnceLock<PgPool>` for production wiring, no request-scoped extractor plumbing.
+- `src/sandbox.rs`: `Sandbox`/`SandboxManager` — create/exec/delete a disposable Kubernetes Pod per coding session, in a `smelt-park` namespace (a hermetic `docker-compose.yml`-provided `k3s` cluster for tests, the real `homelab` cluster for production) — not yet wired to any tool. See [projects/completed/20260809-k8s-sandbox.md](completed/20260809-k8s-sandbox.md).
 
 ## Explicitly out of scope (v1)
 
-- **Real tools** — `add`/`count` exist only to prove the tool-use protocol and the async-task mechanism round-trip correctly through this codebase; neither does anything useful. A sandboxed coding-session tool set (shell, file read/write) is the next real step — see `projects/ideas/coding-session.md`.
+- **Real tools** — `add`/`count` exist only to prove the tool-use protocol and the async-task mechanism round-trip correctly through this codebase; neither does anything useful. The sandbox lifecycle primitive (`src/sandbox.rs`) now exists but isn't wired to a tool yet — see `projects/ideas/coding-session.md`.
 - Multi-user accounts or login.
 - Renaming conversations. (Deleting is supported — see [api.md](../api.md).)
 - An automated browser test tier (manual verification only so far — see [testing.md](../testing.md)).
@@ -37,4 +38,4 @@ A single-user, 100%-Rust AI chat agent: a Dioxus fullstack (SSR + hydration) web
 
 ## Goals for what comes next
 
-Real tools are the natural next project, per `projects/ideas/coding-session.md`: a sandboxed shell/filesystem tool set, with the isolation, credential-handling, and visibility questions that idea doc raises still open. The tool-use round trip and the `run_async` async-task mechanism this stage built are meant to carry over largely as-is — wrapping a real tool instead of `count` — rather than being redesigned from scratch, though the task registry's current gaps (durability, output pagination, concurrency caps) will need real answers once a background tool can do something with actual consequences.
+Wiring a real tool (bash, to start) through `anthropic::tools::execute` and into the `Sandbox`/`SandboxManager` primitive `src/sandbox.rs` already provides is the natural next project — the credential-handling and visibility questions `projects/ideas/coding-session.md` raises are still open, and streaming `exec` output into `ChatEvent` needs its own design per that doc's "Visibility" section. The tool-use round trip and the `run_async` async-task mechanism this stage built are meant to carry over largely as-is — wrapping a real tool instead of `count` — rather than being redesigned from scratch, though the task registry's current gaps (durability, output pagination, concurrency caps) will need real answers once a background tool can do something with actual consequences.

@@ -34,6 +34,11 @@ exactly this — see `state.md`.
 
 ## Sandboxing
 
+**Shipped** — the lifecycle primitive below (create/exec/delete a pod) is
+implemented in `src/sandbox.rs`; see
+`projects/completed/20260809-k8s-sandbox.md`. Not yet wired to a tool,
+which is the next step this idea still describes.
+
 Each coding session gets its own isolated, disposable environment. Nothing
 the agent does — `git checkout`, file reads/writes, shell commands — ever
 touches the smelt server's own filesystem or process directly; the server

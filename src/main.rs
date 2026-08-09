@@ -5,6 +5,8 @@ mod db;
 mod events;
 mod frontend;
 mod models;
+#[cfg(feature = "server")]
+mod sandbox;
 
 #[cfg(feature = "server")]
 #[tokio::main]
@@ -13,6 +15,12 @@ async fn main() {
 
     // Optional: absent in prod, where real env vars are set directly.
     let _ = dotenvy::dotenv();
+
+    // kube's rustls-tls stack only auto-installs a default CryptoProvider
+    // when built with its aws-lc-rs feature (which needs cmake/nasm); this
+    // project uses ring instead (see Cargo.toml), which kube does NOT
+    // auto-install for. Must happen before any kube::Client is built.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
