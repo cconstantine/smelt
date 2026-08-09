@@ -9,3 +9,9 @@
 .claude/
 
 .env
+
+# Downloaded by scripts/browser-check/setup.sh — a headless Chrome binary
+# and its shared libraries, never committed. See docs/testing.md.
+/.browser-check-cache/
+
+__pycache__/

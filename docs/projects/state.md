@@ -2,31 +2,39 @@
 
 ## What smelt is
 
-A single-user, 100%-Rust AI chat agent: a Dioxus fullstack (SSR + hydration) web app talking to Claude via the Anthropic Messages API, with Postgres-persisted conversation history and token-by-token streamed replies. No login system — the Anthropic API key is a server-side env var (`ANTHROPIC_API_KEY`).
+A single-user, 100%-Rust AI chat agent: a Dioxus fullstack (SSR + hydration) web app talking to Claude via the Anthropic Messages API, with Postgres-persisted conversation history, token-by-token streamed replies, and tool-use — the agent can call tools mid-conversation, including ones that run in the background. No login system — the Anthropic API key is a server-side env var (`ANTHROPIC_API_KEY`).
 
 ## Features
 
 - Create conversations, switch between them (sidebar list, ordered by most-recently-active)
 - Delete a conversation from the sidebar (inline confirm, hard delete, cascades to its messages)
 - Send a message, see it appear immediately, watch the assistant's reply stream in live
+- The agent can call tools mid-conversation (`add`, `count` today — stand-ins proving the protocol, not real tools) and the conversation loop round-trips `tool_use`/`tool_result` blocks automatically, up to a bounded number of turns per send
+- The agent can also run a tool in the background via `run_async` (`fork`+`exec` for a tool call) and manage it afterward with a small `ps`/`wait`/`kill`-style suite (`list_tasks`, `task_status`, `task_output`, `task_result`, `wait_task`, `cancel_task`) — it gets notified in the conversation automatically when a background task finishes, with no further tool call required
+- A live, always-open per-conversation event stream pushes new messages and background-task status to the browser the instant they happen — including turns a background task pushed with no `send_message` request in flight — so a browser tab stays current without polling
 - Conversation auto-titled from its first user message
-- History persists across restarts (Postgres, not in-memory)
+- History persists across restarts (Postgres, not in-memory) — message content is stored as JSON `ContentBlock`s, not plain text, so tool calls and results round-trip through storage exactly like Anthropic's own protocol shape
 - Missing/invalid API key surfaces as a visible error in the chat UI rather than hanging or crashing silently
 
 ## Architecture (short version — see [architecture.md](../architecture.md) for the full picture)
 
 - Dioxus fullstack: server functions in `src/api/chat.rs` are the entire API surface — no hand-rolled Axum handlers, no hand-written browser fetch client.
-- `send_message` streams via `ServerEvents<ChatEvent>`, Dioxus fullstack's native SSE payload type for server functions.
-- `src/anthropic/` talks to the real Anthropic API separately, reducing its SSE stream down to plain text deltas before they ever reach `ChatEvent`.
+- `send_message` streams via `ServerEvents<ChatEvent>`; a second, independent stream, `subscribe_conversation_events`, pushes `ConversationEvent`s (new messages, task status) to any browser tab that's watching a conversation, whether or not it's the one that sent anything.
+- `send_message` is a thin wrapper around `run_turn`, a bounded (`MAX_TURNS`) loop that round-trips `tool_use`/`tool_result` turns with the real Anthropic API and persists each one. A per-conversation async lock serializes every writer — a live request and a background task's push notification can both want to persist a turn at the same time.
+- `src/anthropic/` talks to the real Anthropic API separately, reducing its SSE stream down to text deltas and `tool_use` blocks before they ever reach `ChatEvent`.
+- `src/anthropic/tools.rs` dispatches tool calls by name and owns the in-memory background-task registry `run_async` spawns into.
+- `src/events.rs` is the per-conversation broadcast bus (`tokio::sync::broadcast`) that `subscribe_conversation_events` forwards and both `tools.rs` and `chat.rs` publish to.
 - `src/db.rs`: CRUD functions taking a `&PgPool` parameter, plus a global `OnceLock<PgPool>` for production wiring, no request-scoped extractor plumbing.
 
 ## Explicitly out of scope (v1)
 
-- Tool-use / function calling — the agent can only talk, not act. This is the planned next step.
+- **Real tools** — `add`/`count` exist only to prove the tool-use protocol and the async-task mechanism round-trip correctly through this codebase; neither does anything useful. A sandboxed coding-session tool set (shell, file read/write) is the next real step — see `projects/ideas/coding-session.md`.
 - Multi-user accounts or login.
 - Renaming conversations. (Deleting is supported — see [api.md](../api.md).)
 - An automated browser test tier (manual verification only so far — see [testing.md](../testing.md)).
+- Durable/crash-recoverable background tasks — the task registry `run_async` uses is in-memory only; a server restart silently loses any task in flight (see the tool-use-round-trip plan's retrospective for the full list of gaps this leaves: no output pagination, no concurrent-task cap, no eviction policy, `cancel_task`'s race with natural completion).
+- Coalescing for `run_async`'s `stream_output` option — every streamed line currently costs a full model round trip, workable only because `count`'s target/interval are both clamped to a handful. Not safe to point at a real, higher-volume tool yet.
 
 ## Goals for what comes next
 
-Tool-use is the natural next project: give the agent one or two real tools (candidates: web fetch/search, a local filesystem or shell tool) and extend the conversation loop to handle `tool_use`/`tool_result` blocks — most of the wire types in `anthropic::types` were deliberately kept close to the full Anthropic shape (a `ContentBlock` enum with room to add variants) specifically so this is additive, not a rewrite.
+Real tools are the natural next project, per `projects/ideas/coding-session.md`: a sandboxed shell/filesystem tool set, with the isolation, credential-handling, and visibility questions that idea doc raises still open. The tool-use round trip and the `run_async` async-task mechanism this stage built are meant to carry over largely as-is — wrapping a real tool instead of `count` — rather than being redesigned from scratch, though the task registry's current gaps (durability, output pagination, concurrency caps) will need real answers once a background tool can do something with actual consequences.

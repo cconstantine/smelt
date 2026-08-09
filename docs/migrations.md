@@ -8,6 +8,7 @@ Current migrations:
 |---|---|
 | `20260721000000_create_conversations.sql` | `conversations` table |
 | `20260721000001_create_messages.sql` | `messages` table + `idx_messages_conversation_id` |
+| `20260727153258_backfill_message_content_as_json_blocks.sql` | rewrites existing `messages.content` from plain text into the single-`Text`-block JSON shape `Message::blocks()` now expects (see [models.md](models.md)) |
 
 ## Postgres notes
 
