@@ -6,6 +6,7 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
+use crate::anthropic::ContentBlock;
 use crate::models::{Conversation, Message};
 
 static POOL: OnceLock<PgPool> = OnceLock::new();
@@ -81,18 +82,36 @@ pub async fn list_messages(
     .await
 }
 
+/// Plain-text stand-in for the conversation title, extracted from a message's
+/// `Text` blocks only (`ToolUse`/`ToolResult` blocks carry nothing sensible
+/// to show as a title). Concatenates every `Text` block since a message is
+/// modeled as content *blocks*, not necessarily a single one.
+fn title_candidate(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub async fn create_message(
     pool: &PgPool,
     conversation_id: i64,
     role: &str,
-    content: &str,
+    content: &[ContentBlock],
 ) -> Result<Message, sqlx::Error> {
+    let content_json = serde_json::to_string(content)
+        .expect("ContentBlock always serializes: no non-string map keys, no floats");
+
     let message = sqlx::query_as::<_, Message>(
         "INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3) RETURNING *",
     )
     .bind(conversation_id)
     .bind(role)
-    .bind(content)
+    .bind(&content_json)
     .fetch_one(pool)
     .await?;
 
@@ -109,7 +128,7 @@ pub async fn create_message(
     )
     .bind(DEFAULT_TITLE)
     .bind(role)
-    .bind(content)
+    .bind(title_candidate(content))
     .bind(conversation_id)
     .execute(pool)
     .await?;
@@ -148,12 +167,26 @@ mod tests {
         let conversation = create_conversation(&pool)
             .await
             .expect("create conversation");
-        let first = create_message(&pool, conversation.id, "user", "hello")
-            .await
-            .expect("create first message");
-        let second = create_message(&pool, conversation.id, "assistant", "hi there")
-            .await
-            .expect("create second message");
+        let first = create_message(
+            &pool,
+            conversation.id,
+            "user",
+            &[ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        )
+        .await
+        .expect("create first message");
+        let second = create_message(
+            &pool,
+            conversation.id,
+            "assistant",
+            &[ContentBlock::Text {
+                text: "hi there".to_string(),
+            }],
+        )
+        .await
+        .expect("create second message");
 
         let messages = list_messages(&pool, conversation.id)
             .await
@@ -166,6 +199,33 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn test_create_message_stores_content_as_json_blocks(pool: PgPool) {
+        let conversation = create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        let blocks = vec![
+            ContentBlock::ToolUse {
+                id: "toolu_01".to_string(),
+                name: "add".to_string(),
+                input: serde_json::json!({"a": 1, "b": 2}),
+            },
+            ContentBlock::Text {
+                text: "done".to_string(),
+            },
+        ];
+        let saved = create_message(&pool, conversation.id, "assistant", &blocks)
+            .await
+            .expect("create message");
+
+        assert_eq!(
+            saved
+                .blocks()
+                .expect("stored content should parse as blocks"),
+            blocks
+        );
+    }
+
+    #[sqlx::test]
     async fn test_first_user_message_auto_titles_conversation(pool: PgPool) {
         let conversation = create_conversation(&pool)
             .await
@@ -174,7 +234,9 @@ mod tests {
             &pool,
             conversation.id,
             "user",
-            "What's the weather like today?",
+            &[ContentBlock::Text {
+                text: "What's the weather like today?".to_string(),
+            }],
         )
         .await
         .expect("create message");
@@ -192,15 +254,36 @@ mod tests {
         let conversation = create_conversation(&pool)
             .await
             .expect("create conversation");
-        create_message(&pool, conversation.id, "user", "first message")
-            .await
-            .expect("create first message");
-        create_message(&pool, conversation.id, "assistant", "a reply")
-            .await
-            .expect("create assistant message");
-        create_message(&pool, conversation.id, "user", "second message")
-            .await
-            .expect("create second message");
+        create_message(
+            &pool,
+            conversation.id,
+            "user",
+            &[ContentBlock::Text {
+                text: "first message".to_string(),
+            }],
+        )
+        .await
+        .expect("create first message");
+        create_message(
+            &pool,
+            conversation.id,
+            "assistant",
+            &[ContentBlock::Text {
+                text: "a reply".to_string(),
+            }],
+        )
+        .await
+        .expect("create assistant message");
+        create_message(
+            &pool,
+            conversation.id,
+            "user",
+            &[ContentBlock::Text {
+                text: "second message".to_string(),
+            }],
+        )
+        .await
+        .expect("create second message");
 
         let all = list_conversations(&pool).await.expect("list conversations");
         let updated = all
@@ -231,9 +314,16 @@ mod tests {
         let conversation = create_conversation(&pool)
             .await
             .expect("create conversation");
-        create_message(&pool, conversation.id, "user", "hello")
-            .await
-            .expect("create message");
+        create_message(
+            &pool,
+            conversation.id,
+            "user",
+            &[ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        )
+        .await
+        .expect("create message");
 
         delete_conversation(&pool, conversation.id)
             .await

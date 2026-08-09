@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y \
     xz-utils \
     git \
     binaryen \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # GitHub CLI, via its official apt repo — needed to open PRs from inside
@@ -25,11 +26,25 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
 RUN curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-29.6.2.tgz \
     | tar -xz --strip-components=1 -C /usr/local/bin docker/docker
 
+# Playwright (Python), for driving/screenshotting the running app in a real
+# (headless) browser — e.g. to verify a UI change actually renders, not just
+# that it compiles. Kept out of the project's own Cargo/Node toolchain since
+# it's a dev-container capability, not an app dependency (the app has no
+# Node.js dependency at all). `install-deps` pulls in Chromium's system
+# shared libraries and needs root; the browser binary itself is fetched
+# later as `dev` into that user's own cache dir.
+RUN python3 -m venv /opt/playwright-venv \
+    && /opt/playwright-venv/bin/pip install --no-cache-dir playwright \
+    && /opt/playwright-venv/bin/playwright install-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+
 ARG UID=1000
 ARG GID=1000
 
 RUN groupadd -g ${GID} dev && \
     useradd -m -u ${UID} -g ${GID} -s /bin/bash dev
+
+RUN chown -R dev:dev /opt/playwright-venv
 
 USER dev
 ENV USER=dev
@@ -37,6 +52,12 @@ ENV USER=dev
 # Add WASM target for the Dioxus web/client build
 RUN rustup target add wasm32-unknown-unknown
 RUN rustup component add rustfmt
+
+# Downloads into ~/.cache/ms-playwright — dev-owned, no root needed for this
+# part. `/opt/playwright-venv/bin/playwright`/`python` is the entry point for
+# scripting it (e.g. `playwright install chromium` already ran the deps half
+# above; a page-screenshot script just imports `playwright.sync_api`).
+RUN /opt/playwright-venv/bin/playwright install chromium
 
 # Persist bash history to a mountable directory
 RUN mkdir -p /home/dev/.bash_history_dir && \

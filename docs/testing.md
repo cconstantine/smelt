@@ -51,7 +51,21 @@ async fn test_stream_anthropic_message_assembles_deltas_from_mock_upstream() {
 }
 ```
 
-`ANTHROPIC_BASE_URL` is process-global, so only one test sets it — parallel test threads can't observe a torn value. The pure parsing logic (`interpret_stream_event`, deciding what a single decoded SSE payload means) is tested separately and synchronously, with no network or async runtime involved at all.
+`ANTHROPIC_BASE_URL` is process-global, so **every** test across the whole binary that points it at a mock upstream must hold `anthropic::test_support::lock_anthropic_base_url()` (a `#[cfg(test)]`-only `std::sync::Mutex<()>` in `anthropic/mod.rs`) for the duration — `anthropic::stream`'s and `api::chat`'s mock-upstream tests both do. Without it, two such tests on different OS threads can each set the var to their own mock server's address and race, with one test's HTTP client ending up pointed at the other's server; when one file's tests need more than one mock-upstream scenario, prefer folding them into a single `#[tokio::test]` function (see `anthropic::stream`'s tests) over adding another test that also touches the lock, to keep contention low. The pure parsing logic (`interpret_stream_event`, deciding what a single decoded SSE payload means) is tested separately and synchronously, with no network or async runtime involved at all.
+
+A mock upstream that needs to return a *different* response per call (e.g. a tool-use turn, then a follow-up turn once the tool result comes back) tracks a request count with a shared `AtomicUsize` in the route closure and indexes into a `Vec<String>` of bodies, clamped to the last one once exhausted — see `api::chat`'s `start_mock_upstream` test helper.
+
+## Testing code that touches the process-global DB pool
+
+Most server logic takes `pool: &PgPool` explicitly and uses `#[sqlx::test]`, per "Database tests" above. `api::chat::run_turn` is the one exception worth calling out: it was *changed* to take `pool: &PgPool` (rather than reaching for `db::get()` internally, which is what `send_message` itself still does) specifically so its own tests could use `#[sqlx::test]`. The first version reached for `db::get()` directly and initialized it once via a shared `tokio::sync::OnceCell` across tests — it worked in isolation but reliably deadlocked/timed out (`PoolTimedOut`) when multiple such tests ran concurrently, because each `#[tokio::test]` gets its *own* tokio runtime, and a `sqlx::PgPool`'s connections become unusable once the runtime that created them is torn down (which happens as soon as the test that happened to initialize the pool finishes) — a later test reusing the same process-global pool object from a *different* runtime hangs waiting for a connection that will never come back. Threading `pool: &PgPool` through instead sidesteps this: every test gets its own runtime-local, `#[sqlx::test]`-isolated pool, same as everywhere else. Any new server-side function that a background task might call (as `run_async`'s spawned task calls `run_turn`) should take its pool the same way, for the same reason.
+
+## Testing async background-task behavior
+
+`anthropic::tools`'s `run_async`/task-management-suite tests construct a `PgPool` via `PgPool::connect_lazy(...)` against a bogus URL rather than a real `#[sqlx::test]` pool — lazy construction never dials out until first use, and these tests only exercise registry logic (task creation, status transitions, cancellation), never the actual push-a-notification-through-`run_turn` path, so the pool is present (satisfying the type) but never really needs to connect. Tests that *do* need the push to actually land — proving a background task's notification round-trips through real persistence — live in `api::chat` instead, using a real `#[sqlx::test]` pool end-to-end (`anthropic::tools::execute`'s `pool: &PgPool` parameter carries the same real pool all the way into `run_async`'s spawned task).
+
+When testing a code path that could plausibly deadlock (a lock re-acquired somewhere non-obvious, a channel nobody drains), wrap the call in `tokio::time::timeout(...)` and assert it doesn't elapse — a hung test otherwise just stalls the suite with no useful failure message. `api::chat::tests::test_run_turn_does_not_deadlock_when_model_calls_cancel_task` is a concrete example: it exists because `cancel_task` pushing its notification via an *awaited* `run_turn` call deadlocked against the per-conversation lock the *calling* `run_turn` was already holding — caught by exactly this pattern, fixed by detaching that one push with `tokio::spawn` instead.
+
+**Task ids must be unique across the whole test binary, not just within one test.** `anthropic::tools`'s `TASKS` registry is a single `static` `HashMap<String, Task>` — shared by every test that runs in the same process, not scoped per test the way `#[sqlx::test]`'s pool is. Two different tests calling `run_async` with the same string task id (e.g. both using `"toolu_foo"`) race on the same `HashMap` key when run concurrently (the default), and whichever inserts last silently clobbers the other's registry entry — the loser's `wait_task`/`cancel_task`/etc. calls then observe a `Task` that isn't the one they started (wrong `AbortHandle`, wrong `Notify`, wrong everything), which reads as a mysterious hang or timeout with no useful error, not a clean failure. This bit two of `echo`/`write_task_stdin`'s own tests during development (`"toolu_echo"` and `"toolu_fast_add"` each reused across two different test functions) — the fix was giving every test's `run_async` calls their own distinct id. `tool_use_id`s passed to *other* tools (`cancel_task`, `wait_task`, `task_status`, ...) aren't at risk the same way — those tools only look at `input.task_id`, not the outer `tool_use_id` argument, so reusing a generic id like `"toolu_x"` across many tests for *those* calls is fine.
 
 ## Running tests
 
@@ -63,7 +77,53 @@ cargo test --features server test_name        # a single test by name
 
 Most logic lives behind the `server` feature; plain `cargo test` compiles but skips it. See [Definition of done](development-process.md#definition-of-done) for the full two-target check.
 
+## Browser verification
+
+There's no automated browser test tier yet (see "What's not covered yet" below) — UI/interaction changes are verified manually, driving a real headless Chrome instance against `dx serve --fullstack`.
+
+### Playwright (preferred)
+
+The dev container image bakes in a Python Playwright install specifically so this doesn't have to be rebuilt or asked for per session — see the `Dockerfile`'s `/opt/playwright-venv` stage:
+
+```bash
+dx serve --fullstack &                             # start the app (see setup.md)
+
+/opt/playwright-venv/bin/playwright install chromium   # once per container instance —
+                                                         # the venv exists in the image,
+                                                         # but the browser binary itself
+                                                         # downloads into ~/.cache/ms-playwright
+                                                         # on first use
+
+/opt/playwright-venv/bin/python your_script.py      # a short sync_playwright() script:
+                                                     # launch chromium(args=["--no-sandbox"]),
+                                                     # goto/click/fill, .screenshot(path=...)
+```
+
+Then view the screenshot (the `Read` tool renders images directly). This is a plain Python script per check, not a fixed CLI — see any recent UI-change conversation in this project for concrete examples (navigating to a conversation, clicking a sidebar entry, reading back `scrollTop`/`scrollHeight` via `page.eval_on_selector`, etc.).
+
+### `scripts/browser-check/` (fallback)
+
+Before Playwright was added to the image, UI verification in this sandbox had no browser, no Node, and no Python `pip` available at all (see the `delete-conversations` and `tool-use-round-trip` retrospectives) — `scripts/browser-check/` is a from-scratch, pure-stdlib driver built to cover that gap, and is kept as the fallback for an environment that still lacks Docker-rebuild/root access:
+
+```bash
+scripts/browser-check/setup.sh                     # once — downloads a headless
+                                                     # Chrome-for-Testing binary and
+                                                     # its shared libraries into
+                                                     # .browser-check-cache/ (gitignored,
+                                                     # never committed); idempotent,
+                                                     # safe to re-run, no root needed
+
+python3 scripts/browser-check/browser_check.py \
+    http://127.0.0.1:8080/ \
+    --screenshot /tmp/out.png \
+    --action "click:.conversation-item" \
+    --action "sleep:1000" \
+    --action "scroll:.messages"
+```
+
+`scripts/browser-check/cdp.py` hand-rolls just enough raw WebSocket framing (RFC6455) to speak the Chrome DevTools Protocol directly, and `setup.sh` fetches Chrome for Testing plus its missing shared libraries (nss, atk, dbus, X11, mesa, ...) via non-root `apt-get --print-uris` + `dpkg-deb -x` into a local prefix — no root, no system package state touched. `--action` runs steps in order: `click:SELECTOR`, `type:SELECTOR=TEXT`, `wait:SELECTOR` (poll up to 10s), `scroll:SELECTOR` (scrolls to bottom), `sleep:MS`, `eval:JS` (escape hatch — also handy for injecting synthetic markup to preview CSS for a state you don't have live data for, e.g. an error variant when nothing's currently failing). Each run launches its own Chrome and kills it on exit unless `--keep-open` is passed, specifically so repeated runs don't leak orphaned processes the way plain `kill $pid` on `dx serve` itself can (`dx serve`'s actual Axum server runs as a *child* process under a different PID — killing only the `dx` wrapper leaves it running; `pkill -f 'target/dx/.*/server-'` or checking `ps aux` after is worth doing regardless of which tool started it).
+
 ## What's not covered yet
 
-- **No automated browser tier.** UI/interaction changes are verified manually — `dx serve --fullstack` plus a real or scripted browser (a headless Chrome session driven over the DevTools Protocol worked well for a one-off pass: navigate, click, type, submit, read back rendered DOM state and console errors, screenshot). Worth formalizing into an automated test crate (mirroring the shape of a `fantoccini`-based E2E tier) once there's enough UI surface to justify the setup cost.
+- **No automated browser tier.** The above is a manual/scripted pass, not a suite that runs in CI or gates a change — worth formalizing into an automated test crate (mirroring the shape of a `fantoccini`-based E2E tier) once there's enough UI surface to justify the setup cost.
 - **No native SSR component-test harness.** Components aren't unit-tested by rendering them to a string outside a real page load. Worth adding if/when component logic grows complex enough that manual browser verification alone becomes slow to iterate on.
