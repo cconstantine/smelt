@@ -5,13 +5,21 @@
 use futures_util::StreamExt;
 use serde_json::Value;
 
-use super::types::CreateMessageRequest;
+use super::types::{ContentBlock, CreateMessageRequest};
+
+/// The fully assembled result of one streamed Anthropic turn: every content
+/// block (text and/or tool_use) in order, plus the `stop_reason` that says
+/// whether this turn is final or wants a tool run (`"tool_use"`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamedTurn {
+    pub content: Vec<ContentBlock>,
+    pub stop_reason: String,
+}
 
 /// Upstream base URL, overridable via `ANTHROPIC_BASE_URL` (used by tests to
 /// point at a mock; also handy for routing through an API-compatible gateway).
 fn anthropic_base_url() -> String {
-    std::env::var("ANTHROPIC_BASE_URL")
-        .unwrap_or_else(|_| "https://api.anthropic.com".to_string())
+    std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".to_string())
 }
 
 /// A single interpreted Anthropic SSE payload, reduced to what
@@ -22,6 +30,10 @@ fn anthropic_base_url() -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamOutcome {
     TextDelta(String),
+    ToolUseStart { id: String, name: String },
+    ToolUseInputDelta(String),
+    BlockStop,
+    StopReason(String),
     Error(String),
     Ignored,
 }
@@ -30,23 +42,61 @@ pub enum StreamOutcome {
 /// Pure and synchronous — unit-testable without any network access.
 fn interpret_stream_event(value: &Value) -> StreamOutcome {
     match value.get("type").and_then(Value::as_str) {
-        Some("content_block_delta") => {
-            let is_text_delta = value
-                .get("delta")
-                .and_then(|d| d.get("type"))
-                .and_then(Value::as_str)
-                == Some("text_delta");
-            if is_text_delta {
-                let text = value
-                    .get("delta")
-                    .and_then(|d| d.get("text"))
+        Some("content_block_start") => {
+            let block = value.get("content_block");
+            let is_tool_use =
+                block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use");
+            if is_tool_use {
+                let id = block
+                    .and_then(|b| b.get("id"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                StreamOutcome::TextDelta(text.to_string())
+                let name = block
+                    .and_then(|b| b.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                StreamOutcome::ToolUseStart {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                }
             } else {
                 StreamOutcome::Ignored
             }
         }
+        Some("content_block_delta") => {
+            match value
+                .get("delta")
+                .and_then(|d| d.get("type"))
+                .and_then(Value::as_str)
+            {
+                Some("text_delta") => {
+                    let text = value
+                        .get("delta")
+                        .and_then(|d| d.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    StreamOutcome::TextDelta(text.to_string())
+                }
+                Some("input_json_delta") => {
+                    let partial_json = value
+                        .get("delta")
+                        .and_then(|d| d.get("partial_json"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    StreamOutcome::ToolUseInputDelta(partial_json.to_string())
+                }
+                _ => StreamOutcome::Ignored,
+            }
+        }
+        Some("content_block_stop") => StreamOutcome::BlockStop,
+        Some("message_delta") => match value
+            .get("delta")
+            .and_then(|d| d.get("stop_reason"))
+            .and_then(Value::as_str)
+        {
+            Some(reason) => StreamOutcome::StopReason(reason.to_string()),
+            None => StreamOutcome::Ignored,
+        },
         Some("error") => {
             let message = value
                 .get("error")
@@ -59,6 +109,42 @@ fn interpret_stream_event(value: &Value) -> StreamOutcome {
     }
 }
 
+/// Accumulates one in-progress content block across its
+/// `content_block_start` → `content_block_delta`* → `content_block_stop`
+/// events. Anthropic emits blocks sequentially, never interleaved, so
+/// tracking a single "current" accumulator (rather than a map keyed by
+/// block index) is sufficient.
+enum PartialBlock {
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        partial_json: String,
+    },
+}
+
+impl PartialBlock {
+    fn finalize(self) -> Result<ContentBlock, String> {
+        match self {
+            PartialBlock::Text(text) => Ok(ContentBlock::Text { text }),
+            PartialBlock::ToolUse {
+                id,
+                name,
+                partial_json,
+            } => {
+                let input = if partial_json.is_empty() {
+                    Value::Object(serde_json::Map::new())
+                } else {
+                    serde_json::from_str(&partial_json).map_err(|e| {
+                        format!("failed to parse tool_use input JSON for {name}: {e}")
+                    })?
+                };
+                Ok(ContentBlock::ToolUse { id, name, input })
+            }
+        }
+    }
+}
+
 /// Bound on how long we'll wait for the *next* chunk from Anthropic before
 /// giving up — a dropped upstream connection must not hang the caller's
 /// background task forever. Applied per-chunk, not to the whole stream, since
@@ -66,13 +152,15 @@ fn interpret_stream_event(value: &Value) -> StreamOutcome {
 const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Stream a message from the real Anthropic API, calling `on_delta` for each
-/// text chunk as it arrives and returning the fully assembled text once the
-/// stream ends. `request.stream` should be `true`.
+/// text chunk as it arrives (live typing effect) and returning every content
+/// block — text and/or tool_use — plus the turn's `stop_reason` once the
+/// stream ends. Tool-use blocks accumulate silently; `on_delta` only ever
+/// fires for text. `request.stream` should be `true`.
 pub async fn stream_anthropic_message(
     api_key: &str,
     request: &CreateMessageRequest,
     mut on_delta: impl FnMut(&str),
-) -> Result<String, String> {
+) -> Result<StreamedTurn, String> {
     let response = reqwest::Client::new()
         .post(format!("{}/v1/messages", anthropic_base_url()))
         .header("x-api-key", api_key)
@@ -90,7 +178,9 @@ pub async fn stream_anthropic_message(
 
     let mut byte_stream = response.bytes_stream();
     let mut line_buffer = String::new();
-    let mut assembled = String::new();
+    let mut content: Vec<ContentBlock> = Vec::new();
+    let mut current: Option<PartialBlock> = None;
+    let mut stop_reason = String::new();
 
     loop {
         let next = tokio::time::timeout(CHUNK_TIMEOUT, byte_stream.next())
@@ -113,15 +203,47 @@ pub async fn stream_anthropic_message(
             match interpret_stream_event(&value) {
                 StreamOutcome::TextDelta(text) => {
                     on_delta(&text);
-                    assembled.push_str(&text);
+                    match &mut current {
+                        Some(PartialBlock::Text(existing)) => existing.push_str(&text),
+                        _ => current = Some(PartialBlock::Text(text)),
+                    }
                 }
+                StreamOutcome::ToolUseStart { id, name } => {
+                    current = Some(PartialBlock::ToolUse {
+                        id,
+                        name,
+                        partial_json: String::new(),
+                    });
+                }
+                StreamOutcome::ToolUseInputDelta(partial_json) => {
+                    if let Some(PartialBlock::ToolUse {
+                        partial_json: existing,
+                        ..
+                    }) = &mut current
+                    {
+                        existing.push_str(&partial_json);
+                    }
+                }
+                StreamOutcome::BlockStop => {
+                    if let Some(block) = current.take() {
+                        content.push(block.finalize()?);
+                    }
+                }
+                StreamOutcome::StopReason(reason) => stop_reason = reason,
                 StreamOutcome::Error(message) => return Err(message),
                 StreamOutcome::Ignored => {}
             }
         }
     }
 
-    Ok(assembled)
+    if let Some(block) = current.take() {
+        content.push(block.finalize()?);
+    }
+
+    Ok(StreamedTurn {
+        content,
+        stop_reason,
+    })
 }
 
 #[cfg(test)]
@@ -142,11 +264,11 @@ mod tests {
     }
 
     #[test]
-    fn test_interpret_non_text_delta_is_ignored() {
+    fn test_interpret_unrecognized_delta_type_is_ignored() {
         let value = serde_json::json!({
             "type": "content_block_delta",
             "index": 0,
-            "delta": {"type": "input_json_delta", "partial_json": "{}"}
+            "delta": {"type": "thinking_delta", "thinking": "..."}
         });
         assert_eq!(interpret_stream_event(&value), StreamOutcome::Ignored);
     }
@@ -169,23 +291,74 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_stream_anthropic_message_assembles_deltas_from_mock_upstream() {
-        let mock_body = concat!(
-            "event: message_start\n",
-            "data: {\"type\":\"message_start\"}\n",
-            "\n",
-            "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n",
-            "\n",
-            "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo!\"}}\n",
-            "\n",
-            "event: message_stop\n",
-            "data: {\"type\":\"message_stop\"}\n",
-            "\n",
+    #[test]
+    fn test_interpret_content_block_start_tool_use_captures_id_and_name() {
+        let value = serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_01", "name": "add", "input": {}}
+        });
+        assert_eq!(
+            interpret_stream_event(&value),
+            StreamOutcome::ToolUseStart {
+                id: "toolu_01".to_string(),
+                name: "add".to_string()
+            }
         );
+    }
 
+    #[test]
+    fn test_interpret_content_block_start_text_is_ignored() {
+        let value = serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        });
+        assert_eq!(interpret_stream_event(&value), StreamOutcome::Ignored);
+    }
+
+    #[test]
+    fn test_interpret_input_json_delta_extracts_partial_json() {
+        let value = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"a\":"}
+        });
+        assert_eq!(
+            interpret_stream_event(&value),
+            StreamOutcome::ToolUseInputDelta("{\"a\":".to_string())
+        );
+    }
+
+    #[test]
+    fn test_interpret_content_block_stop_returns_block_stop() {
+        let value = serde_json::json!({"type": "content_block_stop", "index": 0});
+        assert_eq!(interpret_stream_event(&value), StreamOutcome::BlockStop);
+    }
+
+    #[test]
+    fn test_interpret_message_delta_extracts_stop_reason() {
+        let value = serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+            "usage": {"output_tokens": 12}
+        });
+        assert_eq!(
+            interpret_stream_event(&value),
+            StreamOutcome::StopReason("tool_use".to_string())
+        );
+    }
+
+    /// Spins up a throwaway mock upstream returning `mock_body` verbatim and
+    /// points `ANTHROPIC_BASE_URL` (process-global) at it, then runs
+    /// `stream_anthropic_message` against it. Holds the shared
+    /// `test_support` lock for the duration, since `ANTHROPIC_BASE_URL` is
+    /// process-global and other test files (`api::chat`) mutate it too.
+    async fn run_against_mock_upstream(
+        mock_body: &'static str,
+        on_delta: impl FnMut(&str),
+    ) -> Result<StreamedTurn, String> {
+        let _guard = crate::anthropic::test_support::lock_anthropic_base_url();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -204,8 +377,6 @@ mod tests {
             axum::serve(listener, app).await.ok();
         });
 
-        // ANTHROPIC_BASE_URL is process-global; this is the only test that
-        // sets it, so parallel test threads can't observe a torn value.
         unsafe { std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}")) };
 
         let request = CreateMessageRequest {
@@ -214,16 +385,88 @@ mod tests {
             system: None,
             messages: vec![],
             stream: true,
+            tools: vec![],
         };
 
+        stream_anthropic_message("test-key", &request, on_delta).await
+    }
+
+    #[tokio::test]
+    async fn test_stream_anthropic_message_assembles_turns_from_mock_upstream() {
+        let text_mock_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\"}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo!\"}}\n",
+            "\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n",
+            "\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n",
+            "\n",
+        );
+
         let mut deltas = Vec::new();
-        let assembled = stream_anthropic_message("test-key", &request, |delta| {
-            deltas.push(delta.to_string());
+        let turn =
+            run_against_mock_upstream(text_mock_body, |delta| deltas.push(delta.to_string()))
+                .await
+                .expect("stream should succeed");
+
+        assert_eq!(deltas, vec!["Hel".to_string(), "lo!".to_string()]);
+        assert_eq!(
+            turn.content,
+            vec![ContentBlock::Text {
+                text: "Hello!".to_string()
+            }]
+        );
+        assert_eq!(turn.stop_reason, "end_turn");
+
+        let tool_use_mock_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\"}\n",
+            "\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"add\",\"input\":{}}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":\"}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"2,\\\"b\\\":3}\"}}\n",
+            "\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n",
+            "\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n",
+            "\n",
+        );
+
+        let turn = run_against_mock_upstream(tool_use_mock_body, |_| {
+            panic!("no text deltas expected in a pure tool_use turn");
         })
         .await
         .expect("stream should succeed");
 
-        assert_eq!(deltas, vec!["Hel".to_string(), "lo!".to_string()]);
-        assert_eq!(assembled, "Hello!");
+        assert_eq!(
+            turn.content,
+            vec![ContentBlock::ToolUse {
+                id: "toolu_01".to_string(),
+                name: "add".to_string(),
+                input: serde_json::json!({"a": 2, "b": 3}),
+            }]
+        );
+        assert_eq!(turn.stop_reason, "tool_use");
     }
 }

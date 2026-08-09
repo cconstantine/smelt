@@ -2,6 +2,7 @@ mod anthropic;
 mod api;
 #[cfg(feature = "server")]
 mod db;
+mod events;
 mod frontend;
 mod models;
 
