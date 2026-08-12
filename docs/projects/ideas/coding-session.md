@@ -36,8 +36,13 @@ exactly this — see `state.md`.
 
 **Shipped** — the lifecycle primitive below (create/exec/delete a pod) is
 implemented in `src/sandbox.rs`; see
-`projects/completed/20260809-k8s-sandbox.md`. Not yet wired to a tool,
-which is the next step this idea still describes.
+`projects/completed/20260809-k8s-sandbox.md`. On top of that, a real
+persistent terminal is now wired up as eleven model-facing tools (pod/
+terminal/command as three separately-guarded lifecycles, N pods per
+conversation each with N terminals) — see
+`projects/completed/20260812-sandbox-terminal.md`. Still open from this
+section: streaming command output into the browser live (today it's
+pull-only), and `git clone`/credential wiring.
 
 Each coding session gets its own isolated, disposable environment. Nothing
 the agent does — `git checkout`, file reads/writes, shell commands — ever
