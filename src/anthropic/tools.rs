@@ -41,7 +41,7 @@ mod server {
 
     use super::TaskSummary;
     use crate::anthropic::{AnthropicMessage, ContentBlock};
-    use crate::{api::chat, events};
+    use crate::{api::chat, db, events, sandbox};
 
     /// Runs the named tool against `input`, returning its result as a plain
     /// string on success or an error message on failure — the caller (the
@@ -71,6 +71,17 @@ mod server {
             "wait_task" => wait_task_tool(input).await,
             "cancel_task" => cancel_task_tool(conversation_id, input).await,
             "write_task_stdin" => write_task_stdin_tool(input),
+            "create_pod" => create_pod_tool(pool, conversation_id).await,
+            "terminate_pod" => terminate_pod_tool(pool, input).await,
+            "list_pods" => list_pods_tool(pool, conversation_id).await,
+            "create_terminal" => create_terminal_tool(pool, input).await,
+            "terminate_terminal" => terminate_terminal_tool(pool, input).await,
+            "list_terminals" => list_terminals_tool(pool, conversation_id).await,
+            "run_terminal_command" => run_terminal_command_tool(pool, conversation_id, tool_use_id, input).await,
+            "send_signal" => send_signal_tool(pool, input).await,
+            "terminal_command_status" => terminal_command_status_tool(pool, input).await,
+            "read_terminal_output" => read_terminal_output_tool(pool, input).await,
+            "list_commands" => list_commands_tool(pool, input).await,
             _ => execute_synchronous(name, input).await,
         }
     }
@@ -255,6 +266,169 @@ mod server {
                     "required": ["task_id"]
                 }),
             },
+            // --- Terminal: pod, terminal, and command are three separate,
+            // explicitly-guarded lifecycles, and a conversation may have N
+            // pods each with N terminals — see
+            // docs/projects/plans/sandbox-terminal.md.
+            ToolDefinition {
+                name: "create_pod".to_string(),
+                description: "Create a new sandbox pod for this conversation. Not idempotent \
+                               — every call creates a genuinely new pod; call list_pods to see \
+                               what already exists before deciding you need another. Returns \
+                               the new pod's id. A terminal can't be created until a pod \
+                               exists in it."
+                    .to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            ToolDefinition {
+                name: "terminate_pod".to_string(),
+                description: "Delete a sandbox pod. Idempotent if it's already terminated; \
+                               errors if pod_id is unknown. Fails if that pod still has a \
+                               terminal in it — call terminate_terminal on it first."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"pod_id": {"type": "integer"}},
+                    "required": ["pod_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "list_pods".to_string(),
+                description: "List every sandbox pod that currently exists for this \
+                               conversation, with each one's id and status. A conversation \
+                               may have any number of pods."
+                    .to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            ToolDefinition {
+                name: "create_terminal".to_string(),
+                description: "Create a new persistent terminal inside the given pod. Requires \
+                               that pod to already exist (create_pod first). Not idempotent — \
+                               every call creates a genuinely new terminal; call list_terminals \
+                               to see what already exists in it before deciding you need \
+                               another. Returns the new terminal's id. This is a real, \
+                               persistent shell: state (working directory, exported variables) \
+                               persists across separate run_terminal_command calls and across \
+                               turns. Multiple terminals in the same pod share that pod's \
+                               filesystem and installed state, but are otherwise independent — \
+                               each has its own shell state, and a long-running command in one \
+                               never blocks another."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"pod_id": {"type": "integer"}},
+                    "required": ["pod_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "terminate_terminal".to_string(),
+                description: "End a terminal without deleting its pod or affecting any other \
+                               terminal in it. Idempotent if it's already terminated; errors \
+                               if terminal_id is unknown. Fails if a command is still running \
+                               in it — send_signal or wait for it to finish first."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"terminal_id": {"type": "integer"}},
+                    "required": ["terminal_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "list_terminals".to_string(),
+                description: "List every terminal that currently exists (and whether its \
+                               pod's connection is reachable) across every pod in this \
+                               conversation, each with its id and which pod it's in."
+                    .to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            ToolDefinition {
+                name: "run_terminal_command".to_string(),
+                description: "Run a command in the given terminal. Requires that terminal to \
+                               already exist (create_terminal first). Starts the command in \
+                               the background and returns immediately with a command_id — \
+                               never the command's own output. Only one command may be in \
+                               flight per terminal at a time; this errors if another is still \
+                               running in that terminal (a different terminal is unaffected). \
+                               Use terminal_command_status/read_terminal_output with the \
+                               returned id to check on it, or send_signal to interrupt it — \
+                               you'll also be notified here when it finishes, with no further \
+                               tool call needed."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "terminal_id": {"type": "integer"},
+                        "command": {"type": "string", "description": "the shell command to run"}
+                    },
+                    "required": ["terminal_id", "command"]
+                }),
+            },
+            ToolDefinition {
+                name: "send_signal".to_string(),
+                description: "Send a signal to the currently-running command — like hitting \
+                               Ctrl-C in a real terminal for INT. The command may die, \
+                               handle it gracefully, or ignore it entirely; the terminal \
+                               itself (working directory, environment) is never affected \
+                               either way. Errors if command_id doesn't match the command \
+                               currently in flight."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command_id": {"type": "string"},
+                        "signal": {"type": "string", "enum": ["INT", "TERM", "KILL"]}
+                    },
+                    "required": ["command_id", "signal"]
+                }),
+            },
+            ToolDefinition {
+                name: "terminal_command_status".to_string(),
+                description: "Check a terminal command's status without blocking — \
+                               \"running\", or finished/lost with its exit code — plus how \
+                               many lines of stdout and stderr it has produced so far (use \
+                               these counts with read_terminal_output's offset/limit)."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"command_id": {"type": "string"}},
+                    "required": ["command_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "read_terminal_output".to_string(),
+                description: "Read a bounded slice of a terminal command's output — never \
+                               the whole thing at once. Line numbers (offset/limit) are \
+                               relative to whichever stream(s) you request: offset 0 against \
+                               \"stdout\" is not necessarily the same line as offset 0 \
+                               against \"both\"."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command_id": {"type": "string"},
+                        "stream": {"type": "string", "enum": ["stdout", "stderr", "both"], "description": "defaults to \"both\""},
+                        "offset": {"type": "integer", "minimum": 0, "description": "defaults to 0"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "defaults to 200, capped at 500"}
+                    },
+                    "required": ["command_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "list_commands".to_string(),
+                description: "List the most recent commands run in the given terminal — like \
+                               `ps`, but includes finished and lost ones too, and survives \
+                               that terminal since being terminated. Most-recent-first, \
+                               bounded."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "terminal_id": {"type": "integer"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "defaults to 20, capped at 50"}
+                    },
+                    "required": ["terminal_id"]
+                }),
+            },
         ]
     }
 
@@ -367,6 +541,13 @@ mod server {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| format!("missing or non-string field: {field}"))
+    }
+
+    fn required_i64(input: &Value, field: &str) -> Result<i64, String> {
+        input
+            .get(field)
+            .and_then(Value::as_i64)
+            .ok_or_else(|| format!("missing or non-integer field: {field}"))
     }
 
     fn add(input: &Value) -> Result<String, String> {
@@ -980,6 +1161,185 @@ mod server {
                 Ok(format!("task {task_id} cancelled"))
             }
         }
+    }
+
+    // --- Terminal ---
+    // Thin wrappers over sandbox.rs (pod/terminal lifecycle + agent
+    // connection) and db.rs (command bookkeeping + output). No locking of
+    // their own: `execute` is only ever called from `run_turn`'s tool-
+    // dispatch loop, which already holds `conversation_id`'s lock for the
+    // whole turn (including every tool_use block in it, processed one at a
+    // time, never concurrently) — see the plan's "Which files" bullet on
+    // `anthropic/tools.rs` and `api::chat::run_turn`'s own `conversation_lock`.
+
+    async fn create_pod_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
+        let pod_id = sandbox::create_pod(pool, conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"pod_id": pod_id}).to_string())
+    }
+
+    async fn terminate_pod_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
+        let pod_id = required_i64(input, "pod_id")?;
+        sandbox::terminate_pod(pool, pod_id).await.map_err(|e| e.to_string())?;
+        Ok(format!("pod {pod_id} terminated"))
+    }
+
+    async fn list_pods_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
+        let pods = sandbox::list_pods(pool, conversation_id).await.map_err(|e| e.to_string())?;
+        let payload: Vec<_> = pods
+            .iter()
+            .map(|p| serde_json::json!({"pod_id": p.pod_id, "status": p.status}))
+            .collect();
+        Ok(serde_json::json!({"pods": payload}).to_string())
+    }
+
+    async fn create_terminal_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
+        let pod_id = required_i64(input, "pod_id")?;
+        let terminal_id = sandbox::create_terminal(pool, pod_id).await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"terminal_id": terminal_id}).to_string())
+    }
+
+    async fn terminate_terminal_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
+        let terminal_id = required_i64(input, "terminal_id")?;
+        sandbox::terminate_terminal(pool, terminal_id).await.map_err(|e| e.to_string())?;
+        Ok(format!("terminal {terminal_id} terminated"))
+    }
+
+    async fn list_terminals_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
+        let terminals = sandbox::list_terminals(pool, conversation_id).await.map_err(|e| e.to_string())?;
+        let payload: Vec<_> = terminals
+            .iter()
+            .map(|t| serde_json::json!({"terminal_id": t.terminal_id, "pod_id": t.pod_id, "status": t.status}))
+            .collect();
+        Ok(serde_json::json!({"terminals": payload}).to_string())
+    }
+
+    /// Reuses `tool_use_id` as `command_id`, the same "id already exists,
+    /// don't mint a new one" pattern `run_async` uses for task ids.
+    async fn run_terminal_command_tool(
+        pool: &PgPool,
+        conversation_id: i64,
+        tool_use_id: &str,
+        input: &Value,
+    ) -> Result<String, String> {
+        let terminal_id = required_i64(input, "terminal_id")?;
+        let command = required_str(input, "command")?;
+
+        if db::terminal_command_is_running(pool, terminal_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return Err(
+                "a command is already running in this terminal; send_signal or wait for it to \
+                 finish first"
+                    .to_string(),
+            );
+        }
+
+        let command_id = tool_use_id.to_string();
+        db::create_terminal_command(pool, conversation_id, terminal_id, &command_id, &command)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Err(e) = sandbox::send_command(pool, terminal_id, &command_id, &command).await {
+            // Nothing is actually running — don't leave a dangling
+            // 'running' row with no agent ever going to report on it.
+            let _ = db::mark_terminal_command_lost(pool, &command_id).await;
+            return Err(e.to_string());
+        }
+
+        Ok(format!("command sent (id: {command_id})"))
+    }
+
+    const ALLOWED_SIGNALS: &[&str] = &["INT", "TERM", "KILL"];
+
+    async fn send_signal_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
+        let command_id = required_str(input, "command_id")?;
+        let signal = required_str(input, "signal")?;
+        if !ALLOWED_SIGNALS.contains(&signal.as_str()) {
+            return Err(format!("signal must be one of {ALLOWED_SIGNALS:?}, got {signal}"));
+        }
+        let command = db::get_terminal_command(pool, &command_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("unknown command id: {command_id}"))?;
+        sandbox::send_signal(pool, command.terminal_id, &command_id, &signal)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(format!("signal {signal} sent to {command_id}"))
+    }
+
+    async fn terminal_command_status_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
+        let command_id = required_str(input, "command_id")?;
+        let status = db::terminal_command_status(pool, &command_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("unknown command id: {command_id}"))?;
+        Ok(serde_json::json!({
+            "status": status.status,
+            "exit_code": status.exit_code,
+            "stdout_lines": status.stdout_lines,
+            "stderr_lines": status.stderr_lines,
+        })
+        .to_string())
+    }
+
+    const DEFAULT_READ_LIMIT: i64 = 200;
+    const MAX_READ_LIMIT: i64 = 500;
+
+    async fn read_terminal_output_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
+        let command_id = required_str(input, "command_id")?;
+        let stream = input.get("stream").and_then(Value::as_str).unwrap_or("both");
+        let streams: &[&str] = match stream {
+            "stdout" => &["stdout"],
+            "stderr" => &["stderr"],
+            "both" => &["stdout", "stderr"],
+            other => return Err(format!("stream must be one of stdout, stderr, both — got {other}")),
+        };
+        let offset = input.get("offset").and_then(Value::as_i64).unwrap_or(0).max(0);
+        let limit = input
+            .get("limit")
+            .and_then(Value::as_i64)
+            .unwrap_or(DEFAULT_READ_LIMIT)
+            .clamp(1, MAX_READ_LIMIT);
+
+        let lines = db::read_terminal_output(pool, &command_id, streams, offset, limit)
+            .await
+            .map_err(|e| e.to_string())?;
+        let payload: Vec<_> = lines
+            .iter()
+            .map(|l| serde_json::json!({"stream": l.stream, "data": l.data}))
+            .collect();
+        Ok(serde_json::json!({"lines": payload, "returned": payload.len()}).to_string())
+    }
+
+    const DEFAULT_LIST_COMMANDS_LIMIT: i64 = 20;
+    const MAX_LIST_COMMANDS_LIMIT: i64 = 50;
+
+    async fn list_commands_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
+        let terminal_id = required_i64(input, "terminal_id")?;
+        let limit = input
+            .get("limit")
+            .and_then(Value::as_i64)
+            .unwrap_or(DEFAULT_LIST_COMMANDS_LIMIT)
+            .clamp(1, MAX_LIST_COMMANDS_LIMIT);
+        let commands = db::list_terminal_commands(pool, terminal_id, limit)
+            .await
+            .map_err(|e| e.to_string())?;
+        let payload: Vec<_> = commands
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "command_id": c.command_id,
+                    "command": c.command,
+                    "status": c.status,
+                    "exit_code": c.exit_code,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({"commands": payload}).to_string())
     }
 
     #[cfg(test)]

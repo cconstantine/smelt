@@ -58,6 +58,10 @@ pub async fn get_messages(id: i64) -> ServerFnResult<Vec<Message>> {
 
 #[delete("/api/conversations/{id}")]
 pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
+    // Best-effort, unconditional (unlike terminate_pod, which the model
+    // calls and which is guarded) — the conversation is going away
+    // regardless, so nothing about the pod matters anymore either way.
+    crate::sandbox::teardown_conversation(db::get(), id).await;
     db::delete_conversation(db::get(), id)
         .await
         .map_err(ServerFnError::new)
@@ -157,6 +161,46 @@ pub(crate) fn run_turn<'a>(
                 .collect::<ServerFnResult<Vec<_>>>()?;
 
         for _ in 0..MAX_TURNS {
+            // Checked at the top of every loop iteration, not just once per
+            // `run_turn` call — this is what gives same-turn visibility: if
+            // a command finishes partway through a turn's tool-calling
+            // loop, the very next iteration already sees the notification,
+            // without waiting for a fresh user message. See the plan's
+            // "What" and "How" (the completion-notification design).
+            for command in db::unnotified_finished_terminal_commands(pool, conversation_id)
+                .await
+                .map_err(ServerFnError::new)?
+            {
+                let text = if command.status == "finished" {
+                    format!(
+                        "Terminal command {} finished: exit code {}.",
+                        command.command_id,
+                        command
+                            .exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    )
+                } else {
+                    format!(
+                        "Terminal command {}'s outcome is unknown — the terminal became \
+                         unreachable while it was running.",
+                        command.command_id
+                    )
+                };
+                let notification_content = vec![anthropic::ContentBlock::Text { text }];
+                let saved = db::create_message(pool, conversation_id, "user", &notification_content)
+                    .await
+                    .map_err(ServerFnError::new)?;
+                history.push(anthropic::AnthropicMessage {
+                    role: "user".to_string(),
+                    content: notification_content,
+                });
+                persisted.push(saved);
+                db::mark_terminal_command_notified(pool, &command.command_id)
+                    .await
+                    .map_err(ServerFnError::new)?;
+            }
+
             let request = anthropic::CreateMessageRequest {
                 model: anthropic_model(),
                 max_tokens: 4096,
@@ -760,6 +804,17 @@ mod tests {
             "wait_task",
             "cancel_task",
             "write_task_stdin",
+            "create_pod",
+            "terminate_pod",
+            "list_pods",
+            "create_terminal",
+            "terminate_terminal",
+            "list_terminals",
+            "run_terminal_command",
+            "send_signal",
+            "terminal_command_status",
+            "read_terminal_output",
+            "list_commands",
         ]
         .into_iter()
         .collect();
