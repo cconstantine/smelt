@@ -33,6 +33,9 @@ async fn main() {
         .expect("failed to run database migrations");
     tracing::info!("database initialized and migrations applied");
 
+    sandbox::init().await;
+    tracing::info!("sandbox manager initialized");
+
     let router = axum::Router::new()
         .serve_dioxus_application(dioxus::prelude::ServeConfig::new(), frontend::App)
         .layer(tower_http::trace::TraceLayer::new_for_http());
