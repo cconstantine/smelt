@@ -8,11 +8,25 @@ mod models;
 #[cfg(feature = "server")]
 mod sandbox;
 
+#[cfg(all(test, feature = "browser-test"))]
+mod browser_tests;
+
+/// The real Axum router `main()` serves — factored out so
+/// `src/browser_tests.rs` can build the exact same router, in-process, on a
+/// test-local port, without duplicating it. See
+/// `docs/projects/completed/20260815-sandbox-visibility.md`.
+#[cfg(feature = "server")]
+fn build_router() -> axum::Router {
+    use dioxus::prelude::DioxusRouterExt;
+
+    axum::Router::new()
+        .serve_dioxus_application(dioxus::prelude::ServeConfig::new(), frontend::App)
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+}
+
 #[cfg(feature = "server")]
 #[tokio::main]
 async fn main() {
-    use dioxus::prelude::DioxusRouterExt;
-
     // Optional: absent in prod, where real env vars are set directly.
     let _ = dotenvy::dotenv();
 
@@ -36,9 +50,7 @@ async fn main() {
     sandbox::init().await;
     tracing::info!("sandbox manager initialized");
 
-    let router = axum::Router::new()
-        .serve_dioxus_application(dioxus::prelude::ServeConfig::new(), frontend::App)
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+    let router = build_router();
 
     let port: u16 = std::env::var("PORT")
         .ok()

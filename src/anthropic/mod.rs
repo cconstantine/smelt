@@ -5,7 +5,7 @@ pub mod stream;
 
 pub mod tools;
 
-pub use types::{AnthropicMessage, ContentBlock, CreateMessageRequest, ToolDefinition};
+pub use types::{AnthropicMessage, ContentBlock, CreateMessageRequest, ThinkingConfig, ToolDefinition};
 
 /// Shared by every test (in this module, `stream.rs`, and `api::chat`) that
 /// points the process-global `ANTHROPIC_BASE_URL` env var at a mock upstream

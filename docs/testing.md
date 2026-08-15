@@ -111,7 +111,7 @@ Most logic lives behind the `server` feature; plain `cargo test` compiles but sk
 
 ## Browser verification
 
-There's no automated browser test tier yet (see "What's not covered yet" below) — UI/interaction changes are verified manually, driving a real headless Chrome instance against `dx serve --fullstack`.
+A small automated browser test tier exists (`src/browser_tests.rs`, see below) for behavior that genuinely needs a real DOM to verify — everything else is still a manual/scripted pass, driving a real headless Chrome instance against `dx serve --fullstack`.
 
 ### Playwright (preferred)
 
@@ -155,7 +155,32 @@ python3 scripts/browser-check/browser_check.py \
 
 `scripts/browser-check/cdp.py` hand-rolls just enough raw WebSocket framing (RFC6455) to speak the Chrome DevTools Protocol directly, and `setup.sh` fetches Chrome for Testing plus its missing shared libraries (nss, atk, dbus, X11, mesa, ...) via non-root `apt-get --print-uris` + `dpkg-deb -x` into a local prefix — no root, no system package state touched. `--action` runs steps in order: `click:SELECTOR`, `type:SELECTOR=TEXT`, `wait:SELECTOR` (poll up to 10s), `scroll:SELECTOR` (scrolls to bottom), `sleep:MS`, `eval:JS` (escape hatch — also handy for injecting synthetic markup to preview CSS for a state you don't have live data for, e.g. an error variant when nothing's currently failing). Each run launches its own Chrome and kills it on exit unless `--keep-open` is passed, specifically so repeated runs don't leak orphaned processes the way plain `kill $pid` on `dx serve` itself can (`dx serve`'s actual Axum server runs as a *child* process under a different PID — killing only the `dx` wrapper leaves it running; `pkill -f 'target/dx/.*/server-'` or checking `ps aux` after is worth doing regardless of which tool started it).
 
+### `src/browser_tests.rs` (automated)
+
+A `#[cfg(test)]` module in the main binary crate (not a `tests/` integration test — this project has no `lib.rs`, so an external test binary couldn't reach `db`/`sandbox`/`anthropic::tools` at all), built and run under its own Cargo feature so it never slows down the default loop:
+
+```bash
+scripts/browser-check/setup.sh           # once — see above, this reuses the same
+                                          # chrome-headless-shell download, not a
+                                          # separate one
+dx build --platform web                  # once per frontend change — dioxus-server's
+                                          # serve_dioxus_application needs a pre-bundled
+                                          # WASM/assets directory (target/dx/smelt/debug/
+                                          # web/public) that only the dx CLI produces;
+                                          # plain `cargo build`/`cargo test` never builds
+                                          # it. The harness points DIOXUS_PUBLIC_PATH at
+                                          # this directory (dioxus-server's own escape
+                                          # hatch) rather than requiring `dx serve` to
+                                          # already be running — discovered the first
+                                          # time this test actually ran, not anticipated
+                                          # up front.
+
+cargo test --features "server browser-test" -- --ignored --test-threads=1
+```
+
+`#[ignore]`d by default (needs the two setup steps above, plus a real Postgres and k3s cluster reachable the same way every other real-cluster test already assumes) and deliberately just the one test — see `docs/projects/completed/20260815-sandbox-visibility.md` for the design and reasoning (in-process server via a factored-out `build_router()`, `chromiumoxide` talking directly to `chrome-headless-shell` over CDP rather than a `chromedriver`/WebDriver setup this environment doesn't have). Reaches into `db`/`sandbox`/`anthropic::tools` directly to set up scenarios (bypassing the model entirely — this tier verifies the browser/live-event pipeline, not tool-selection behavior) and asserts against the rendered DOM via `page.evaluate("document.body.innerText...")`, not screenshots.
+
 ## What's not covered yet
 
-- **No automated browser tier.** The above is a manual/scripted pass, not a suite that runs in CI or gates a change — worth formalizing into an automated test crate (mirroring the shape of a `fantoccini`-based E2E tier) once there's enough UI surface to justify the setup cost.
+- **The automated browser tier is minimal, not comprehensive.** One test, covering the `sandbox-visibility` panel specifically — not a general framework other features are expected to plug into yet, and nothing runs it in CI (no CI exists in this repo at all). Worth extending once it's proven stable and another feature has a similar need for real-DOM verification.
 - **No native SSR component-test harness.** Components aren't unit-tested by rendering them to a string outside a real page load. Worth adding if/when component logic grows complex enough that manual browser verification alone becomes slow to iterate on.

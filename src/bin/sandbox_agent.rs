@@ -186,12 +186,14 @@ enum ClientMessage {
 enum ServerMessage {
     Line {
         id: String,
+        terminal_id: String,
         stream: &'static str,
         seq: u64,
         data: String,
     },
     Exit {
         id: String,
+        terminal_id: String,
         event: &'static str,
         code: i32,
     },
@@ -233,7 +235,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         let shell = state.terminals.lock().await.get(&terminal_id).cloned();
                         let Some(shell) = shell else { continue };
                         let id = shell.current.lock().await.clone().unwrap_or_default();
-                        send_server_message(&mut socket, ServerMessage::Line { id, stream, seq, data }).await;
+                        send_server_message(&mut socket, ServerMessage::Line { id, terminal_id, stream, seq, data }).await;
                     }
                     Some(ShellEvent::Marker { terminal_id, exit_code }) => {
                         let shell = state.terminals.lock().await.get(&terminal_id).cloned();
@@ -242,7 +244,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         if let Some(id) = id {
                             send_server_message(
                                 &mut socket,
-                                ServerMessage::Exit { id, event: "exit", code: exit_code },
+                                ServerMessage::Exit { id, terminal_id, event: "exit", code: exit_code },
                             )
                             .await;
                         }

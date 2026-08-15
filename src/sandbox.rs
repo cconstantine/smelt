@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::db;
+use crate::{db, events};
 
 // No LimitRange in the smelt-park namespace (see plan) — these are the
 // only enforcement there is.
@@ -396,6 +396,12 @@ struct TerminalConnection {
     /// `send_signal` don't use this; they're still fire-and-forget,
     /// completion arrives later as an ordinary `exit` event.
     pending_acks: StdMutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<(), String>>>>,
+    /// Resolved once, when the connection is first established (see
+    /// `connect`) — lets `handle_agent_message` publish a
+    /// `SandboxCommandUpdate` for every output line and completion without
+    /// a per-line DB round trip. See
+    /// `docs/projects/completed/20260815-sandbox-visibility.md`.
+    conversation_id: i64,
 }
 
 /// The per-pod registry — one WebSocket connection per pod, shared by
@@ -442,6 +448,14 @@ pub async fn create_pod(pool: &PgPool, conversation_id: i64) -> Result<i64, Sand
     match manager.create(&row.id.to_string()).await {
         Ok(sandbox) => {
             std::mem::forget(sandbox);
+            events::publish(
+                conversation_id,
+                events::ConversationEvent::SandboxPodUpdate {
+                    pod_id: row.id,
+                    status: "Running".to_string(),
+                    terminated: false,
+                },
+            );
             Ok(row.id)
         }
         Err(e) => {
@@ -469,7 +483,17 @@ pub async fn terminate_pod(pool: &PgPool, pod_id: i64) -> Result<(), TerminalErr
     deregister(pod_id);
 
     match db::terminate_sandbox_pod(pool, pod_id).await? {
-        Some(_) => Ok(()),
+        Some(row) => {
+            events::publish(
+                row.conversation_id,
+                events::ConversationEvent::SandboxPodUpdate {
+                    pod_id,
+                    status: "terminated".to_string(),
+                    terminated: true,
+                },
+            );
+            Ok(())
+        }
         None => Err(TerminalError::NoPod),
     }
 }
@@ -510,6 +534,15 @@ pub async fn create_terminal(pool: &PgPool, pod_id: i64) -> Result<i64, Terminal
         let _ = db::terminate_sandbox_terminal(pool, terminal_id).await;
         return Err(e);
     }
+    events::publish(
+        conn.conversation_id,
+        events::ConversationEvent::SandboxTerminalUpdate {
+            pod_id,
+            terminal_id,
+            status: "connected".to_string(),
+            terminated: false,
+        },
+    );
     Ok(terminal_id)
 }
 
@@ -536,6 +569,15 @@ pub async fn terminate_terminal(pool: &PgPool, terminal_id: i64) -> Result<(), T
     request_terminal_action(&conn, terminal_id, "terminate_terminal").await?;
 
     db::terminate_sandbox_terminal(pool, terminal_id).await?;
+    events::publish(
+        conn.conversation_id,
+        events::ConversationEvent::SandboxTerminalUpdate {
+            pod_id,
+            terminal_id,
+            status: "disconnected".to_string(),
+            terminated: true,
+        },
+    );
     Ok(())
 }
 
@@ -633,10 +675,22 @@ async fn reconnect_if_needed(pool: &PgPool, pod_id: i64) -> Result<Arc<TerminalC
     let pods = pods_api(&manager.client);
     let pod = match pods.get_opt(&name).await {
         Ok(Some(pod)) => pod,
-        Ok(None) => return Err(TerminalError::NoTerminal),
+        // The k8s Pod itself is gone (deleted out from under us, evicted,
+        // node lost, ...) — unlike "not Running yet" below, this never
+        // resolves on its own, so it's unambiguously the same "crashed"
+        // case as a failed `connect()`: run the same cleanup so the DB's
+        // still-live terminal rows don't wedge `terminate_pod` behind
+        // `TerminalStillExists` forever with no k8s pod left to reconnect
+        // to and no path back to a clean state.
+        Ok(None) => {
+            handle_crash_cleanup(pool, pod_id).await;
+            return Err(TerminalError::NoTerminal);
+        }
         Err(e) => return Err(TerminalError::from(e)),
     };
     if pod.status.and_then(|s| s.phase).as_deref() != Some("Running") {
+        // Might just be `Pending` and about to come up — not the same as
+        // "gone for good" above, so no cleanup here.
         return Err(TerminalError::NoTerminal);
     }
 
@@ -650,6 +704,20 @@ async fn reconnect_if_needed(pool: &PgPool, pod_id: i64) -> Result<Arc<TerminalC
             Err(TerminalError::NoTerminal)
         }
     }
+}
+
+/// Best-effort `reconnect_if_needed`, for callers that want the connection
+/// registry to reflect current reality *before* reporting status — e.g.
+/// `get_sandbox_state` on page load, so a terminal whose pod survived a
+/// smelt restart doesn't sit showing "disconnected" until the model
+/// happens to touch it next. `list_terminals`/`list_pods` themselves stay
+/// passive (just read the registry, no attempt to reconnect) since they're
+/// also on the model's own hot path — reconnect attempts have real
+/// latency, worth paying once for a UI snapshot, not on every tool call.
+/// Errors are swallowed; this is a freshness nicety, not something that
+/// should turn an otherwise-successful snapshot fetch into an error.
+pub async fn try_reconnect(pool: &PgPool, pod_id: i64) {
+    let _ = reconnect_if_needed(pool, pod_id).await;
 }
 
 /// `reconnect_if_needed`, and if that fails because the pod has never had
@@ -713,12 +781,24 @@ async fn request_terminal_action(conn: &Arc<TerminalConnection>, terminal_id: i6
 /// terminals terminated — a dead agent was hosting all of them, not just
 /// one. A safe no-op if the pod had no terminals.
 async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64) {
+    let conversation_id = db::sandbox_pod_conversation_id(pool, pod_id).await.ok().flatten();
     if let Ok(terminals) = db::list_sandbox_terminals_for_pod(pool, pod_id).await {
         for terminal in terminals {
             if let Ok(Some(running)) = db::terminal_command_is_running(pool, terminal.id).await {
                 let _ = db::mark_terminal_command_lost(pool, &running.command_id).await;
             }
             let _ = db::terminate_sandbox_terminal(pool, terminal.id).await;
+            if let Some(conversation_id) = conversation_id {
+                events::publish(
+                    conversation_id,
+                    events::ConversationEvent::SandboxTerminalUpdate {
+                        pod_id,
+                        terminal_id: terminal.id,
+                        status: "disconnected".to_string(),
+                        terminated: true,
+                    },
+                );
+            }
         }
     }
     deregister(pod_id);
@@ -783,6 +863,13 @@ async fn connect(
     pod_id: i64,
     pod_name: &str,
 ) -> Result<Arc<TerminalConnection>, SandboxError> {
+    // Resolved once per pod connection, not per message — see the
+    // `conversation_id` field's own doc comment on `TerminalConnection`.
+    let conversation_id = db::sandbox_pod_conversation_id(&pool, pod_id)
+        .await
+        .map_err(SandboxError::Db)?
+        .ok_or(SandboxError::Db(sqlx::Error::RowNotFound))?;
+
     let pods = pods_api(client);
     let mut pf = pods.portforward(pod_name, &[AGENT_PORT]).await?;
     let stream = pf
@@ -796,7 +883,11 @@ async fn connect(
     let (mut write, mut read) = ws_stream.split();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let conn = Arc::new(TerminalConnection { outgoing: tx, pending_acks: StdMutex::new(HashMap::new()) });
+    let conn = Arc::new(TerminalConnection {
+        outgoing: tx,
+        pending_acks: StdMutex::new(HashMap::new()),
+        conversation_id,
+    });
 
     tokio::spawn(async move {
         while let Some(text) = rx.recv().await {
@@ -851,9 +942,23 @@ async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, tex
 
     match msg.event.as_deref() {
         Some("exit") => {
-            if let (Some(id), Some(code)) = (msg.id, msg.code) {
+            if let (Some(id), Some(code)) = (msg.id.clone(), msg.code) {
                 if let Err(e) = db::mark_terminal_command_finished(pool, &id, code).await {
                     tracing::error!(command_id = %id, error = %e, "failed to record command completion");
+                }
+                if let Some(terminal_id) = parse_terminal_id(&msg.terminal_id) {
+                    events::publish(
+                        conn.conversation_id,
+                        events::ConversationEvent::SandboxCommandUpdate {
+                            terminal_id,
+                            command_id: id,
+                            command: None,
+                            status: "finished".to_string(),
+                            exit_code: Some(code),
+                            stream: None,
+                            latest_output: None,
+                        },
+                    );
                 }
             }
             return;
@@ -869,15 +974,35 @@ async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, tex
         _ => {}
     }
 
-    if let (Some(id), Some(stream), Some(seq), Some(data)) = (msg.id, msg.stream, msg.seq, msg.data) {
+    if let (Some(id), Some(stream), Some(seq), Some(data)) =
+        (msg.id.clone(), msg.stream.clone(), msg.seq, msg.data.clone())
+    {
         if let Err(e) = db::append_terminal_event(pool, &id, &stream, seq, &data).await {
             tracing::error!(command_id = %id, error = %e, "failed to record terminal output");
+        }
+        if let Some(terminal_id) = parse_terminal_id(&msg.terminal_id) {
+            events::publish(
+                conn.conversation_id,
+                events::ConversationEvent::SandboxCommandUpdate {
+                    terminal_id,
+                    command_id: id,
+                    command: None,
+                    status: "running".to_string(),
+                    exit_code: None,
+                    stream: Some(stream),
+                    latest_output: Some(data),
+                },
+            );
         }
     }
 }
 
+fn parse_terminal_id(terminal_id: &Option<String>) -> Option<i64> {
+    terminal_id.as_deref().and_then(|s| s.parse::<i64>().ok())
+}
+
 fn resolve_pending_ack(conn: &Arc<TerminalConnection>, terminal_id: Option<String>, result: Result<(), String>) {
-    let Some(terminal_id) = terminal_id.and_then(|s| s.parse::<i64>().ok()) else {
+    let Some(terminal_id) = parse_terminal_id(&terminal_id) else {
         return;
     };
     if let Some(tx) = conn.pending_acks.lock().unwrap_or_else(|e| e.into_inner()).remove(&terminal_id) {
@@ -1054,6 +1179,60 @@ mod tests {
                 "list_commands should not leak another terminal's history"
             );
 
+            // --- Pod vanishes out from under us (deleted, evicted, node
+            // lost) while smelt still thinks it's live — reconnect_if_needed's
+            // `Ok(None)` branch should run the same crash cleanup a failed
+            // `connect()` already did, not just error out and leave the
+            // terminal wedged forever. A third pod, still well within the
+            // 1..=20 range this test owns and pre-wipes. ---
+            let pod_c = create_pod(&pool, conversation_id).await.expect("create_pod (c) should succeed");
+            let terminal_c1 = create_terminal(&pool, pod_c).await.expect("create_terminal (c1) should succeed");
+
+            let pods = pods_api(&get().client);
+            pods.delete(&pod_name(pod_c), &immediate_delete_params()).await.expect("delete pod_c directly");
+            deregister(pod_c);
+
+            let err = terminate_terminal(&pool, terminal_c1).await;
+            assert!(matches!(err, Err(TerminalError::NoTerminal)), "expected NoTerminal, got {err:?}");
+
+            let live_c = db::list_sandbox_terminals_for_pod(&pool, pod_c).await.expect("list_sandbox_terminals_for_pod");
+            assert!(
+                live_c.is_empty(),
+                "crash cleanup should have marked terminal_c1 terminated even though the pod was never found, not just on a failed connect"
+            );
+
+            terminate_pod(&pool, pod_c)
+                .await
+                .expect("terminate_pod (c) should now succeed — no live terminals left blocking it, and no k8s pod left to delete");
+
+            // --- try_reconnect: a still-healthy pod that just lost its
+            // in-memory registry entry (e.g. a smelt restart, simulated
+            // here with a bare `deregister` — the k8s pod itself is left
+            // alone) should flip back to "connected" once try_reconnect
+            // runs, not need an unrelated tool call to happen first. ---
+            let pod_d = create_pod(&pool, conversation_id).await.expect("create_pod (d) should succeed");
+            let terminal_d1 = create_terminal(&pool, pod_d).await.expect("create_terminal (d1) should succeed");
+            deregister(pod_d);
+
+            let disconnected = list_terminals(&pool, conversation_id).await.expect("list_terminals");
+            assert_eq!(
+                disconnected.iter().find(|t| t.terminal_id == terminal_d1).map(|t| t.status.as_str()),
+                Some("disconnected"),
+                "deregistering should make list_terminals report this terminal as disconnected"
+            );
+
+            try_reconnect(&pool, pod_d).await;
+
+            let reconnected = list_terminals(&pool, conversation_id).await.expect("list_terminals");
+            assert_eq!(
+                reconnected.iter().find(|t| t.terminal_id == terminal_d1).map(|t| t.status.as_str()),
+                Some("connected"),
+                "try_reconnect should have re-established the connection to the still-healthy pod"
+            );
+
+            terminate_terminal(&pool, terminal_d1).await.expect("terminate_terminal (d1)");
+            terminate_pod(&pool, pod_d).await.expect("terminate_pod (d)");
+
             // --- Full teardown: terminate remaining terminals, then both pods ---
             terminate_terminal(&pool, terminal_a1).await.expect("terminate_terminal (a1)");
             terminate_pod(&pool, pod_a).await.expect("terminate_pod (a) should succeed once its terminal is gone");
@@ -1214,4 +1393,5 @@ mod tests {
         .await;
         assert!(gone.is_ok(), "drain task should have deleted the pod within the timeout");
     }
+
 }

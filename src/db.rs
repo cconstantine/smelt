@@ -262,6 +262,17 @@ pub async fn sandbox_terminal_pod_id(pool: &PgPool, terminal_id: i64) -> Result<
         .await
 }
 
+/// Resolves which conversation's `events::publish` bus a pod-scoped call
+/// (`terminate_pod`, `create_terminal`, `terminate_terminal`, crash
+/// cleanup) should target — see
+/// `docs/projects/completed/20260815-sandbox-visibility.md`.
+pub async fn sandbox_pod_conversation_id(pool: &PgPool, pod_id: i64) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar("SELECT conversation_id FROM sandbox_pods WHERE id = $1")
+        .bind(pod_id)
+        .fetch_optional(pool)
+        .await
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, sqlx::FromRow)]
 pub struct TerminalCommand {
     pub id: i64,
@@ -290,6 +301,12 @@ pub struct TerminalCommandStatus {
 pub struct TerminalLine {
     pub stream: String,
     pub data: String,
+    /// Global order across *both* streams for one command — a caller that
+    /// fetches stdout and stderr as two separate calls (e.g. to cap each
+    /// stream's tail independently, see `api::chat::fetch_command_summary`)
+    /// needs this to merge them back into the order they actually
+    /// happened in, rather than showing "all stdout, then all stderr."
+    pub seq: i64,
 }
 
 pub async fn create_terminal_command(
@@ -425,7 +442,7 @@ pub async fn read_terminal_output(
     limit: i64,
 ) -> Result<Vec<TerminalLine>, sqlx::Error> {
     sqlx::query_as::<_, TerminalLine>(
-        "SELECT stream, data FROM terminal_events
+        "SELECT stream, data, seq FROM terminal_events
          WHERE command_id = $1 AND stream = ANY($2)
          ORDER BY seq ASC
          OFFSET $3 LIMIT $4",
@@ -761,6 +778,21 @@ mod tests {
         assert!(
             !for_pod_after.iter().any(|t| t.id == terminal.id),
             "terminated terminal should no longer be listed as live"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_sandbox_pod_conversation_id_resolves_and_returns_none_for_unknown(pool: PgPool) {
+        let conversation = test_conversation(&pool).await;
+        let pod = create_sandbox_pod(&pool, conversation.id).await.expect("create pod");
+
+        assert_eq!(
+            sandbox_pod_conversation_id(&pool, pod.id).await.expect("lookup"),
+            Some(conversation.id)
+        );
+        assert_eq!(
+            sandbox_pod_conversation_id(&pool, pod.id + 999_999).await.expect("lookup"),
+            None
         );
     }
 

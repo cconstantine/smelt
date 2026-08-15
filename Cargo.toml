@@ -38,6 +38,11 @@ tar = { version = "0.4", optional = true }
 # which kube does NOT auto-install — see main.rs's explicit
 # install_default() call.
 rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+# For src/browser_tests.rs's comprehensive sandbox-visibility check —
+# CDP-native (talks directly to chrome-headless-shell, no chromedriver to
+# download/manage) — see docs/projects/completed/20260815-sandbox-visibility.md's "Why
+# chromiumoxide."
+chromiumoxide = { version = "0.7", optional = true }
 
 # Web-only: a wasm-compatible timer (tokio::time has no driver in a browser
 # tab — there's no tokio runtime on the WASM client at all).
@@ -62,6 +67,11 @@ server = [
     "dep:tokio-tungstenite",
     "dep:tar",
 ]
+# Separate from `server` so the default `cargo test --features server` loop
+# stays exactly as fast as it is today — src/browser_tests.rs's one
+# #[ignore]d test opts in explicitly. See
+# docs/projects/completed/20260815-sandbox-visibility.md.
+browser-test = ["server", "dep:chromiumoxide"]
 
 # sandbox_agent runs standalone inside the sandbox pod (injected and
 # launched by src/sandbox.rs, not served by main.rs) — it needs the same
