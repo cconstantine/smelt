@@ -41,8 +41,7 @@ persistent terminal is now wired up as eleven model-facing tools (pod/
 terminal/command as three separately-guarded lifecycles, N pods per
 conversation each with N terminals) — see
 `projects/completed/20260812-sandbox-terminal.md`. Still open from this
-section: streaming command output into the browser live (today it's
-pull-only), and `git clone`/credential wiring.
+section: `git clone`/credential wiring.
 
 Each coding session gets its own isolated, disposable environment. Nothing
 the agent does — `git checkout`, file reads/writes, shell commands — ever
@@ -100,6 +99,13 @@ namespace object itself).
   `ANTHROPIC_API_KEY`-as-host-env-var pattern.
 
 ## Visibility
+
+**Shipped** — a live sandbox panel shows every pod/terminal the model has
+and each terminal's command history (stdout/stderr in true chronological
+order), streaming as it happens, no reload needed; see
+`projects/completed/20260815-sandbox-visibility.md`. Still open from this
+section: file-edit diffs in the transcript (needs the file read/write
+tools below first).
 
 A sandbox the user can't see into is worse than no sandbox — they need to
 watch what the agent is actually doing (which commands ran, what output
