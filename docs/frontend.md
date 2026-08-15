@@ -6,7 +6,7 @@ Dioxus components under `src/frontend/`, rendered via **fullstack SSR**: the ser
 
 ```
 frontend/
-  mod.rs           # App (router root), Route enum
+  mod.rs           # App (router root), Route enum, Home/ConversationRoute
   pages/
     mod.rs
     chat.rs        # Chat, ConversationSidebar, ChatPanel
@@ -24,7 +24,17 @@ pub fn App() -> Element {
 }
 ```
 
-There's one route today (`Route::Chat {}` at `/`). A future per-conversation URL (`/c/{id}`) is a natural next step if deep-linking becomes useful, but v1 keeps conversation selection as in-component state (a `Signal<Option<i64>>`) rather than a route param.
+Two routes: `Home {}` at `/` (nothing selected) and `ConversationRoute { id: i64 }` at `/conversation/{id}`. Both just render `Chat {}` with no props — `Chat` derives which conversation is selected straight from the router:
+
+```rust
+let router = use_router();
+let selected: Memo<Option<i64>> = use_memo(move || match router.current::<Route>() {
+    Route::Home {} => None,
+    Route::ConversationRoute { id } => Some(id),
+});
+```
+
+This isn't just style — a plain prop threaded down from `Home`/`ConversationRoute` looked reasonable but silently breaks: switching from one conversation straight to another (still the same route *variant*, just a different `id`) re-renders the component with a new prop value without tearing down its hooks, and a `use_effect` that only reads that plain prop never re-fires (effects only re-run on a *tracked* — i.e. signal — read), so `use_resource`-driven state downstream quietly stops updating. `router.current()` is a genuine tracked read, so wrapping it in `use_memo` gives every descendant (including `use_resource`, which only restarts on a tracked read inside its own closure) a value that actually updates on navigation. Sidebar clicks and "New conversation" navigate via `use_navigator()`/`Route::ConversationRoute { id }` rather than writing to a local signal directly, so the URL stays the single source of truth — a refresh, bookmark, or direct link lands back on the same conversation because the server renders straight from the route.
 
 ## Calling server functions
 
@@ -60,8 +70,8 @@ let mut events = send_message(id, content).await?;
 while let Some(event) = events.recv().await {
     match event? {
         ChatEvent::Delta { text } => streaming_text.write().push_str(&text),
-        ChatEvent::Done { message_id, content } => {
-            messages.write().push(Message { id: message_id, content, .. });
+        ChatEvent::Done { message_id, role, content } => {
+            messages.write().push(Message { id: message_id, role, content, .. });
             streaming_text.set(String::new());
         }
         ChatEvent::Error { message } => stream_error.set(Some(message)),
@@ -77,4 +87,4 @@ Standard Dioxus idioms: `oninput: move |e| signal.set(e.value())`, `onsubmit: mo
 
 ## Verifying UI changes
 
-There's no automated browser test tier yet (see [testing.md](testing.md)). Drive the running app manually with `dx serve --fullstack` and a browser, or a scripted headless Chrome session over the DevTools Protocol, for anything that touches rendering or interaction — `cargo check`/`cargo test` alone don't exercise hydration, click handlers, or the live SSE loop.
+`src/browser_tests.rs` is a small, `#[ignore]`d automated tier (real Postgres, real k3s, real headless Chrome via CDP) covering the sandbox panel specifically — not a general framework everything else is expected to plug into yet. For anything else that touches rendering or interaction, drive the running app manually with `dx serve --fullstack` and a browser, or a scripted headless Chrome session over the DevTools Protocol — `cargo check`/`cargo test` alone don't exercise hydration, click handlers, or the live SSE loop. See [testing.md](testing.md).

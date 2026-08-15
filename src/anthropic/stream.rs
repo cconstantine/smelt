@@ -26,10 +26,14 @@ fn anthropic_base_url() -> String {
 /// `stream_anthropic_message` needs to act on. Anthropic's stream carries
 /// several event types (message_start, content_block_start,
 /// content_block_delta, content_block_stop, message_delta, message_stop) —
-/// only text deltas and errors matter for v1, everything else is ignored.
+/// only text/thinking deltas and errors matter for v1, everything else is
+/// ignored (including `redacted_thinking` blocks — a rare safety-filtered
+/// variant with a different, delta-less shape, not modeled here).
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamOutcome {
     TextDelta(String),
+    ThinkingDelta(String),
+    ThinkingSignatureDelta(String),
     ToolUseStart { id: String, name: String },
     ToolUseInputDelta(String),
     BlockStop,
@@ -85,6 +89,22 @@ fn interpret_stream_event(value: &Value) -> StreamOutcome {
                         .unwrap_or_default();
                     StreamOutcome::ToolUseInputDelta(partial_json.to_string())
                 }
+                Some("thinking_delta") => {
+                    let thinking = value
+                        .get("delta")
+                        .and_then(|d| d.get("thinking"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    StreamOutcome::ThinkingDelta(thinking.to_string())
+                }
+                Some("signature_delta") => {
+                    let signature = value
+                        .get("delta")
+                        .and_then(|d| d.get("signature"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    StreamOutcome::ThinkingSignatureDelta(signature.to_string())
+                }
                 _ => StreamOutcome::Ignored,
             }
         }
@@ -121,6 +141,10 @@ enum PartialBlock {
         name: String,
         partial_json: String,
     },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
 }
 
 impl PartialBlock {
@@ -140,6 +164,9 @@ impl PartialBlock {
                     })?
                 };
                 Ok(ContentBlock::ToolUse { id, name, input })
+            }
+            PartialBlock::Thinking { thinking, signature } => {
+                Ok(ContentBlock::Thinking { thinking, signature })
             }
         }
     }
@@ -161,7 +188,14 @@ const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// call once per line before it can continue, that manifested as the
 /// wrapped tool looking permanently "stuck" rather than as a visible
 /// error).
-const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+///
+/// Raised from the original 90s: a local Ollama server (a supported
+/// `ANTHROPIC_BASE_URL` override, not just the real Anthropic API) can take
+/// several minutes to cold-load a model into memory before it sends
+/// anything back at all, and that wait genuinely belongs here rather than
+/// in `CHUNK_TIMEOUT` — nothing has started streaming yet. Still just a
+/// backstop against a truly dead connection, not a real per-request budget.
+const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Sends the request and waits for Anthropic's response headers, bounded by
 /// `response_timeout` — factored out from `stream_anthropic_message` so a
@@ -238,6 +272,29 @@ pub async fn stream_anthropic_message(
                         _ => current = Some(PartialBlock::Text(text)),
                     }
                 }
+                // Not passed to `on_delta` — thinking is never part of the
+                // live-typed reply, only shown (collapsed) once the full
+                // block lands with the finished message. No live "typing"
+                // effect for it, unlike text.
+                StreamOutcome::ThinkingDelta(thinking) => match &mut current {
+                    Some(PartialBlock::Thinking { thinking: existing, .. }) => {
+                        existing.push_str(&thinking)
+                    }
+                    _ => {
+                        current = Some(PartialBlock::Thinking {
+                            thinking,
+                            signature: String::new(),
+                        })
+                    }
+                },
+                StreamOutcome::ThinkingSignatureDelta(signature) => {
+                    if let Some(PartialBlock::Thinking {
+                        signature: existing, ..
+                    }) = &mut current
+                    {
+                        existing.push_str(&signature);
+                    }
+                }
                 StreamOutcome::ToolUseStart { id, name } => {
                     current = Some(PartialBlock::ToolUse {
                         id,
@@ -298,9 +355,35 @@ mod tests {
         let value = serde_json::json!({
             "type": "content_block_delta",
             "index": 0,
-            "delta": {"type": "thinking_delta", "thinking": "..."}
+            "delta": {"type": "some_future_delta_type", "thinking": "..."}
         });
         assert_eq!(interpret_stream_event(&value), StreamOutcome::Ignored);
+    }
+
+    #[test]
+    fn test_interpret_thinking_delta_extracts_thinking_text() {
+        let value = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "Let me consider..."}
+        });
+        assert_eq!(
+            interpret_stream_event(&value),
+            StreamOutcome::ThinkingDelta("Let me consider...".to_string())
+        );
+    }
+
+    #[test]
+    fn test_interpret_signature_delta_extracts_signature() {
+        let value = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "abc123"}
+        });
+        assert_eq!(
+            interpret_stream_event(&value),
+            StreamOutcome::ThinkingSignatureDelta("abc123".to_string())
+        );
     }
 
     #[test]
@@ -416,6 +499,7 @@ mod tests {
             messages: vec![],
             stream: true,
             tools: vec![],
+            thinking: None,
         };
 
         stream_anthropic_message("test-key", &request, on_delta).await
@@ -498,6 +582,63 @@ mod tests {
             }]
         );
         assert_eq!(turn.stop_reason, "tool_use");
+
+        // A thinking block, always first when present, followed by the
+        // actual reply — `on_delta` should only ever see the text half.
+        let thinking_mock_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\"}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me \"}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"think.\"}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig123\"}}\n",
+            "\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"42\"}}\n",
+            "\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n",
+            "\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n",
+            "\n",
+        );
+
+        let mut deltas = Vec::new();
+        let turn =
+            run_against_mock_upstream(thinking_mock_body, |delta| deltas.push(delta.to_string()))
+                .await
+                .expect("stream should succeed");
+
+        assert_eq!(
+            deltas,
+            vec!["42".to_string()],
+            "on_delta should only fire for the text block, never the thinking block"
+        );
+        assert_eq!(
+            turn.content,
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "Let me think.".to_string(),
+                    signature: "sig123".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "42".to_string()
+                },
+            ]
+        );
+        assert_eq!(turn.stop_reason, "end_turn");
     }
 
     /// Regression test for the tool-use-round-trip retrospective's hung
@@ -506,7 +647,7 @@ mod tests {
     /// `stream_anthropic_message` forever. Accepts the connection but never
     /// writes a response, so `send_and_await_response` has nothing to read
     /// — a short `response_timeout` (not the real `RESPONSE_TIMEOUT`, which
-    /// would make this test take 90 real seconds) must still make it
+    /// would make this test take 10 real minutes) must still make it
     /// return promptly rather than hang.
     #[tokio::test]
     async fn test_send_and_await_response_times_out_when_upstream_never_responds() {
@@ -531,6 +672,7 @@ mod tests {
             messages: vec![],
             stream: true,
             tools: vec![],
+            thinking: None,
         };
 
         let result = tokio::time::timeout(

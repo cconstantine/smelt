@@ -125,21 +125,70 @@ body {
     color: #fff;
 }
 
+/* Below WIDE_LAYOUT_BREAKPOINT (see the media query further down): the
+   side-panels row (background tasks, sandbox terminals) and chat (messages
+   + composer) stack vertically, each taking the full width left over from
+   .sidebar — not side by side. A narrow window makes a side-by-side
+   terminal cramped; stacking gives both regions the whole width instead of
+   splitting it. Side panels on top, chat on the bottom — DOM order (below)
+   drives the visual order here, since neither uses `order` at this width.
+   At/above the breakpoint this flips to a row (chat | side panels) — see
+   the media query at the bottom of this section. */
 .chat-panel {
     flex: 1;
     display: flex;
-    flex-direction: row;
+    flex-direction: column;
     min-width: 0;
+    min-height: 0;
 }
 
-/* The conversation column — messages plus composer. Its own flex column so
-   the tasks sidebar can sit beside it as a second, independently-scrolling
-   column rather than stacked above the composer. */
+/* The conversation column — messages plus composer. Its own flex column.
+   `border-top` is the seam between it and .side-panels-row above it in the
+   stacked (narrow) layout — the wide-layout media query swaps this for a
+   `border-right` instead, since chat sits to the side-panels-row's left
+   there, not below it. */
 .chat-main {
     flex: 1;
     display: flex;
     flex-direction: column;
     min-width: 0;
+    min-height: 0;
+    border-top: 1px solid #e5e5e5;
+}
+
+/* The stacked region above chat (narrow layout): background tasks and/or
+   the sandbox panel, side by side with each other (still a row between
+   just the two of them) but full-width and taking roughly the other half
+   of the viewport's height, independently scrollable from the transcript
+   below. */
+.side-panels-row {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    min-height: 0;
+}
+
+/* At this width or above, a stacked layout leaves real horizontal space
+   unused (chat bubbles cap at 65ch; the sandbox panel doesn't need the
+   full viewport width either) — go side by side instead: chat on the
+   left (order: -1 overrides its DOM position, which is second — see the
+   comment on .chat-panel), side panels on the right. Below it, falls back
+   to the stacked layout above, unchanged. */
+@media (min-width: 1024px) {
+    .chat-panel {
+        flex-direction: row;
+    }
+
+    .chat-main {
+        order: -1;
+        flex: 3;
+        border-top: none;
+        border-right: 1px solid #e5e5e5;
+    }
+
+    .side-panels-row {
+        flex: 2;
+    }
 }
 
 .empty-state {
@@ -346,12 +395,72 @@ body {
     color: #555;
 }
 
-/* Background tasks panel — a sidebar next to the conversation, not a strip
-   stacked above the composer, and independently scrollable from it. */
+/* A model's reasoning, when present — same collapsed-by-default <details>
+   pattern as .tool-async-start above, so it costs one quiet line rather
+   than a wall of text on every single turn. */
+.thinking-block {
+    align-self: center;
+    width: 100%;
+    max-width: 65ch;
+}
+
+.thinking-summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 4px;
+    font-size: 12.5px;
+    color: #777;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+    font-style: italic;
+}
+
+.thinking-summary::-webkit-details-marker {
+    display: none;
+}
+
+.thinking-summary::before {
+    content: "▸";
+    font-size: 9px;
+    color: #aaa;
+    transition: transform 100ms ease;
+}
+
+.thinking-block[open] > .thinking-summary::before {
+    transform: rotate(90deg);
+}
+
+.thinking-icon {
+    font-size: 11px;
+    font-style: normal;
+}
+
+.thinking-summary .timestamp {
+    margin-left: auto;
+}
+
+.thinking-body {
+    margin: 2px 0 6px 17px;
+    font-size: 12.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: #888;
+    font-style: italic;
+}
+
+/* Background tasks panel — lives in .side-panels-row (below the
+   transcript, not beside it — see .chat-panel), independently scrollable
+   from both the transcript above and .sandbox-panel next to it. Only
+   .sandbox-panel gets flex: 1 (see below) — when both panels are present,
+   tasks stays a fixed width so the terminal (the one that was too small)
+   gets the rest, rather than splitting evenly. */
 .tasks-panel {
     width: 320px;
     flex-shrink: 0;
-    border-left: 1px solid #e5e5e5;
+    border-right: 1px solid #e5e5e5;
     background: #fafafa;
     padding: 16px;
     overflow-y: auto;
@@ -364,6 +473,128 @@ body {
     color: #777;
     text-transform: uppercase;
     letter-spacing: 0.03em;
+}
+
+/* Sandbox panel — takes whatever width .side-panels-row has left over
+   after .tasks-panel (usually all of it, since tasks-panel only renders
+   when there's a background task to show). Each pod groups its terminals,
+   which reuse .task-terminal/.task-terminal-* wholesale — no separate
+   "fake terminal" styling needed for these.
+
+   Neither this panel nor .sandbox-pod/.task-terminal-stack/.task-terminal
+   scroll or overflow on their own — they're a chain of flex columns that
+   just hands its bounded height (stretched from .side-panels-row) down to
+   .task-terminal-body, the one leaf that actually scrolls (see the
+   scoped override on .sandbox-panel .task-terminal-body below). That
+   keeps exactly one scrollbar per terminal and none anywhere above it —
+   no panel-level scrollbar, and no bleeding into a whole-page scrollbar
+   either (that was worse: it dragged the sidebar and transcript along
+   with it). Only one pod (the active tab — see .sandbox-pod-tabs) ever
+   renders at a time, so it's multiple *terminals within that pod* that
+   split the available height evenly via flex: 1, not multiple pods. */
+.sandbox-panel {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background: #fafafa;
+    padding: 16px;
+}
+
+.sandbox-panel h3 {
+    flex-shrink: 0;
+}
+
+.sandbox-panel .sandbox-pod {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.sandbox-panel .sandbox-pod-header {
+    flex-shrink: 0;
+}
+
+.sandbox-panel .task-terminal-stack {
+    flex: 1;
+    min-height: 0;
+}
+
+.sandbox-panel .task-terminal {
+    flex: 1;
+    min-height: 0;
+}
+
+.sandbox-panel .task-terminal-titlebar {
+    flex-shrink: 0;
+}
+
+.sandbox-panel .task-terminal-body {
+    flex: 1;
+    min-height: 0;
+    max-height: none;
+    overflow-y: auto;
+}
+
+/* One tab per pod when there's more than one — only .sandbox-pod for the
+   selected tab renders below this, so multiple pods no longer split
+   .sandbox-panel's height between them (see the flex chain above); each
+   gets the panel's full height while its tab is active. */
+.sandbox-pod-tabs {
+    flex-shrink: 0;
+    display: flex;
+    gap: 4px;
+    margin-bottom: 10px;
+    border-bottom: 1px solid #e5e5e5;
+}
+
+.sandbox-pod-tab {
+    padding: 5px 10px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    background: transparent;
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    color: #888;
+    cursor: pointer;
+}
+
+.sandbox-pod-tab:hover {
+    color: #333;
+}
+
+.sandbox-pod-tab.active {
+    color: #111;
+    border-bottom-color: #111;
+    font-weight: 600;
+}
+
+.sandbox-panel h3 {
+    margin: 0 0 12px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #777;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.sandbox-pod {
+    margin-bottom: 16px;
+}
+
+.sandbox-pod-header {
+    display: flex;
+    justify-content: flex-end;
+    align-items: baseline;
+    margin-bottom: 8px;
+    font-size: 12px;
+    color: #555;
+}
+
+.sandbox-pod-status {
+    color: #888;
 }
 
 /* Each background task gets its own terminal-window-styled widget — the
@@ -466,7 +697,11 @@ body {
 
 .task-terminal-body {
     padding: 8px 10px;
-    max-height: 220px;
+    /* Was a fixed 220px, cramped even before the sandbox panel existed —
+       the whole side-panels-row has real vertical room now that it's a
+       full-width band under the transcript rather than a narrow sidebar,
+       so each card's body scrolls internally well before hitting this. */
+    max-height: 60vh;
     overflow-y: auto;
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
     font-size: 12px;
@@ -486,6 +721,43 @@ body {
 .task-terminal-empty {
     color: #666;
     font-style: italic;
+}
+
+/* One command's worth of history within a sandbox terminal's body — see
+   the plan discussion in the sandbox-visibility follow-up: the panel now
+   shows a terminal's whole (bounded) command history, not just its
+   current command, so each command needs its own visual block rather
+   than one flat, unlabeled output stream. */
+.sandbox-command-block {
+    margin-bottom: 10px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #333;
+}
+
+.sandbox-command-block:last-child {
+    margin-bottom: 0;
+    padding-bottom: 0;
+    border-bottom: none;
+}
+
+.sandbox-command-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 4px;
+    color: #9cdcfe;
+}
+
+.sandbox-command-header code {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.sandbox-command-status {
+    flex-shrink: 0;
+    color: #888;
+    font-size: 11px;
 }
 
 .task-terminal-cursor {

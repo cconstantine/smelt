@@ -20,6 +20,17 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+    /// The model's reasoning, when `CreateMessageRequest.thinking` is set —
+    /// always the *first* block in an assistant turn's content when
+    /// present. `signature` is an opaque token Anthropic uses to verify
+    /// this block wasn't tampered with if it's echoed back in a later
+    /// turn's history (as it is here — `run_turn` persists and replays
+    /// `ContentBlock`s uninterpreted); never displayed, just carried
+    /// through as-is.
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -35,6 +46,17 @@ pub struct ToolDefinition {
     pub input_schema: serde_json::Value,
 }
 
+/// `{"type": "adaptive"}` — the model manages its own thinking budget
+/// within `max_tokens` rather than a caller-specified `budget_tokens`
+/// (deprecated on current models). The only variant smelt sends; kept as
+/// an enum rather than a bare string so an unsupported value can't be
+/// constructed by mistake.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingConfig {
+    Adaptive,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CreateMessageRequest {
     pub model: String,
@@ -45,6 +67,8 @@ pub struct CreateMessageRequest {
     pub stream: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -66,6 +90,59 @@ mod tests {
             .unwrap(),
             serde_json::json!({"type": "text", "text": "hi"})
         );
+    }
+
+    #[test]
+    fn test_thinking_block_wire_tag_matches_anthropic_api() {
+        assert_eq!(
+            serde_json::to_value(ContentBlock::Thinking {
+                thinking: "hmm".to_string(),
+                signature: "sig123".to_string(),
+            })
+            .unwrap(),
+            serde_json::json!({"type": "thinking", "thinking": "hmm", "signature": "sig123"})
+        );
+    }
+
+    #[test]
+    fn test_thinking_config_wire_shape() {
+        assert_eq!(
+            serde_json::to_value(ThinkingConfig::Adaptive).unwrap(),
+            serde_json::json!({"type": "adaptive"})
+        );
+    }
+
+    #[test]
+    fn test_request_omits_thinking_when_none() {
+        let req = CreateMessageRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+            thinking: None,
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("thinking").is_none(),
+            "thinking key should be omitted entirely when None, got: {value:?}"
+        );
+    }
+
+    #[test]
+    fn test_request_includes_thinking_when_set() {
+        let req = CreateMessageRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+            thinking: Some(ThinkingConfig::Adaptive),
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value.get("thinking"), Some(&serde_json::json!({"type": "adaptive"})));
     }
 
     #[test]
@@ -132,6 +209,7 @@ mod tests {
             messages: vec![],
             stream: true,
             tools: vec![],
+            thinking: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert!(
@@ -166,6 +244,7 @@ mod tests {
             messages: vec![],
             stream: true,
             tools: vec![],
+            thinking: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert!(

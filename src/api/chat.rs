@@ -7,6 +7,8 @@ use crate::{anthropic, events};
 
 #[cfg(feature = "server")]
 use crate::db;
+#[cfg(feature = "server")]
+use crate::sandbox;
 
 #[cfg(feature = "server")]
 use sqlx::PgPool;
@@ -75,13 +77,56 @@ fn anthropic_model() -> String {
         .unwrap_or_else(|| "claude-opus-4-8".to_string())
 }
 
-/// Bound on how many tool-use turns one `run_turn` call will chase before
-/// giving up. A guessed default (see the plan's Open questions), not a
-/// confirmed-settled value — clearly enough for `add`/`count`, clearly not
-/// infinite. Exceeding it ends the turn with an error rather than looping
-/// forever.
+/// On by default — set `ANTHROPIC_THINKING=0` (or `false`/`off`) to turn it
+/// back off. Was briefly made opt-in after thinking broke tool use against
+/// a local Ollama `gpt-oss` model (Ollama's Anthropic-compatibility shim
+/// doesn't cleanly split the model's reasoning out of a tool call's
+/// arguments the way real Anthropic does — see
+/// `is_ollama_thinking_tool_call_corruption`) — safe to default back on
+/// now that `run_turn_bounded` retries that *specific* failure without
+/// thinking instead of surfacing a raw 500, rather than requiring everyone
+/// to manually opt in just to get thinking against the real API.
 #[cfg(feature = "server")]
-const MAX_TURNS: usize = 5;
+fn thinking_enabled() -> bool {
+    !matches!(
+        std::env::var("ANTHROPIC_THINKING").as_deref(),
+        Ok("0" | "false" | "off")
+    )
+}
+
+/// Ollama's Anthropic-compatibility shim can fail to turn a model's raw
+/// output into a valid tool call, surfacing as a flat 500 with a message
+/// like `error parsing tool call: raw='...', err=...` instead of streaming
+/// normally. Two different root causes share this exact shape (at least
+/// for `gpt-oss`-family models): thinking's reasoning landing in the same
+/// text the shim expected pure tool-call JSON in (see `thinking_enabled`'s
+/// doc comment), or the model just writing invalid JSON on its own — e.g.
+/// a bare `?` for a value it wasn't sure how to fill in. Real Anthropic
+/// never returns this. Deliberately narrow (a distinctive, Ollama-specific
+/// phrase, not just "any 500") so an unrelated upstream failure doesn't
+/// silently double latency/cost by retrying pointlessly.
+#[cfg(feature = "server")]
+fn is_ollama_thinking_tool_call_corruption(message: &str) -> bool {
+    message.contains("error parsing tool call")
+}
+
+/// Extra attempts (beyond the first) for the failure
+/// `is_ollama_thinking_tool_call_corruption` recognizes — the first retry
+/// also drops `thinking` (see the call site), remaining retries are plain
+/// regenerations, since a local model's next sampling pass often just
+/// doesn't repeat the same malformed JSON. Bounded so a call the model is
+/// reliably bad at can't retry forever.
+#[cfg(feature = "server")]
+const TOOL_CALL_PARSE_RETRIES: usize = 2;
+
+/// Bound on how many tool-use turns one `run_turn` call will chase before
+/// giving up. Raised from the original placeholder of 5 (fine for `add`/
+/// `count`, hit almost immediately by a real multi-step coding session using
+/// the sandbox terminal tools) — still not a load-bearing safety limit, just
+/// a backstop against looping forever. Exceeding it ends the turn with an
+/// error rather than looping forever.
+#[cfg(feature = "server")]
+const MAX_TURNS: usize = 10_000;
 
 /// A live `send_message` call and a background task's push-triggered
 /// `run_turn` call (or two different tasks' pushes) can race for the same
@@ -123,7 +168,24 @@ pub(crate) fn run_turn<'a>(
     pool: &'a PgPool,
     conversation_id: i64,
     new_message: anthropic::AnthropicMessage,
+    on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
+{
+    run_turn_bounded(pool, conversation_id, new_message, on_delta, MAX_TURNS)
+}
+
+/// The real body of `run_turn`, with the turn-loop bound as a parameter —
+/// exists only so `test_run_turn_errors_when_max_turns_exceeded` can prove
+/// the "give up and error" behavior without actually replaying the mock
+/// upstream `MAX_TURNS` (10,000) times. Every other caller goes through
+/// `run_turn`, which always passes the real `MAX_TURNS`.
+#[cfg(feature = "server")]
+fn run_turn_bounded<'a>(
+    pool: &'a PgPool,
+    conversation_id: i64,
+    new_message: anthropic::AnthropicMessage,
     mut on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
+    max_turns: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
 {
     Box::pin(async move {
@@ -160,7 +222,7 @@ pub(crate) fn run_turn<'a>(
                 })
                 .collect::<ServerFnResult<Vec<_>>>()?;
 
-        for _ in 0..MAX_TURNS {
+        for _ in 0..max_turns {
             // Checked at the top of every loop iteration, not just once per
             // `run_turn` call — this is what gives same-turn visibility: if
             // a command finishes partway through a turn's tool-calling
@@ -201,22 +263,50 @@ pub(crate) fn run_turn<'a>(
                     .map_err(ServerFnError::new)?;
             }
 
-            let request = anthropic::CreateMessageRequest {
+            let mut request = anthropic::CreateMessageRequest {
                 model: anthropic_model(),
-                max_tokens: 4096,
+                // Raised alongside `thinking`: adaptive thinking shares
+                // this budget with the actual reply, and 4096 left no
+                // headroom for both once thinking turned on.
+                max_tokens: 16_384,
                 system: None,
                 messages: history.clone(),
                 stream: true,
                 tools: anthropic::tools::tool_definitions(),
+                thinking: thinking_enabled().then_some(anthropic::ThinkingConfig::Adaptive),
             };
 
-            let turn = anthropic::stream::stream_anthropic_message(&api_key, &request, |delta| {
+            let mut relay = |delta: &str| {
                 if let Some(cb) = on_delta.as_deref_mut() {
                     cb(delta);
                 }
-            })
-            .await
-            .map_err(ServerFnError::new)?;
+            };
+
+            // See `is_ollama_thinking_tool_call_corruption` — not always
+            // caused by thinking specifically (a local model can just
+            // flub a tool call's JSON on its own, e.g. writing a bare `?`
+            // for a value it wasn't sure about), so the mitigation is two
+            // parts: drop `thinking` once (a plausible contributing
+            // factor, and free to try), then fall back to plain retries —
+            // regenerating is often enough on its own since sampling
+            // varies run to run. Bounded so a model that's reliably bad at
+            // one particular call can't loop forever.
+            let mut turn = None;
+            let mut last_err = String::new();
+            for attempt in 0..=TOOL_CALL_PARSE_RETRIES {
+                match anthropic::stream::stream_anthropic_message(&api_key, &request, &mut relay).await {
+                    Ok(t) => {
+                        turn = Some(t);
+                        break;
+                    }
+                    Err(e) if attempt < TOOL_CALL_PARSE_RETRIES && is_ollama_thinking_tool_call_corruption(&e) => {
+                        request.thinking = None;
+                        last_err = e;
+                    }
+                    Err(e) => return Err(ServerFnError::new(e)),
+                }
+            }
+            let turn = turn.ok_or_else(|| ServerFnError::new(last_err))?;
 
             let saved = db::create_message(pool, conversation_id, "assistant", &turn.content)
                 .await
@@ -267,7 +357,7 @@ pub(crate) fn run_turn<'a>(
             crate::events::ConversationEvent::MessagesAppended(persisted),
         );
         Err(ServerFnError::new(format!(
-            "tool-use loop exceeded {MAX_TURNS} turns without reaching a final reply"
+            "tool-use loop exceeded {max_turns} turns without reaching a final reply"
         )))
     })
 }
@@ -329,6 +419,156 @@ pub async fn get_tasks(id: i64) -> ServerFnResult<Vec<anthropic::tools::TaskSumm
     Ok(anthropic::tools::snapshot_tasks(id))
 }
 
+/// One line of a command's output, in the order it actually happened —
+/// `stdout`/`stderr` fetched and capped independently (see
+/// `fetch_command_summary`) but merged back into one true chronological
+/// sequence here, rather than the panel showing "all stdout, then all
+/// stderr" the way two separate fields would.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SandboxOutputLine {
+    pub stream: String,
+    pub data: String,
+}
+
+/// One terminal's current/most recent command, hydrated for the sandbox
+/// panel's initial scrollback — see `docs/projects/completed/20260815-sandbox-visibility.md`.
+/// Only the current/most recent command is included; older history in a
+/// terminal stays reachable through the model's own `list_commands`/
+/// `read_terminal_output` tools, not duplicated here.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SandboxCommandSummary {
+    pub command_id: String,
+    pub command: String,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub output: Vec<SandboxOutputLine>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SandboxTerminalSummary {
+    pub terminal_id: i64,
+    pub pod_id: i64,
+    pub status: String,
+    /// Most recent `HISTORY_LIMIT` commands, **oldest first** — natural
+    /// terminal-scrollback reading order, the newest command (and its
+    /// output) at the bottom, closest to where the next command will
+    /// appear. `db::list_terminal_commands` itself returns most-recent-
+    /// first; this is reversed when the snapshot is built. Older commands
+    /// beyond the limit stay reachable through the model's own
+    /// `list_commands`/`read_terminal_output` tools, not duplicated here.
+    pub commands: Vec<SandboxCommandSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SandboxPodSummary {
+    pub pod_id: i64,
+    pub status: String,
+    pub terminals: Vec<SandboxTerminalSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SandboxSnapshot {
+    pub pods: Vec<SandboxPodSummary>,
+}
+
+/// Last N lines per stream, per command, on initial load, matching
+/// `read_terminal_output`'s own tool-facing default — the panel grows from
+/// there via live events for as long as the tab stays open, never
+/// re-fetching the full history.
+#[cfg(feature = "server")]
+const SNAPSHOT_TAIL_LINES: i64 = 200;
+
+/// How many of a terminal's most recent commands the panel hydrates on
+/// load — matches `list_commands`' own tool-facing default (see
+/// `anthropic::tools::DEFAULT_LIST_COMMANDS_LIMIT`).
+#[cfg(feature = "server")]
+const HISTORY_LIMIT: i64 = 20;
+
+#[cfg(feature = "server")]
+async fn fetch_command_summary(pool: &PgPool, command: &db::TerminalCommand) -> Option<SandboxCommandSummary> {
+    let status = db::terminal_command_status(pool, &command.command_id).await.ok()??;
+    let stdout_offset = (status.stdout_lines - SNAPSHOT_TAIL_LINES).max(0);
+    let stderr_offset = (status.stderr_lines - SNAPSHOT_TAIL_LINES).max(0);
+    let stdout = db::read_terminal_output(pool, &command.command_id, &["stdout"], stdout_offset, SNAPSHOT_TAIL_LINES)
+        .await
+        .unwrap_or_default();
+    let stderr = db::read_terminal_output(pool, &command.command_id, &["stderr"], stderr_offset, SNAPSHOT_TAIL_LINES)
+        .await
+        .unwrap_or_default();
+    // stdout/stderr are each capped to their own tail independently (so a
+    // stderr spew can't crowd stdout out of the window, or vice versa),
+    // which means they arrive as two separately-ordered lists — merge back
+    // by `seq` into the order the lines actually happened in.
+    let mut output: Vec<db::TerminalLine> = stdout.into_iter().chain(stderr).collect();
+    output.sort_by_key(|line| line.seq);
+    Some(SandboxCommandSummary {
+        command_id: command.command_id.clone(),
+        command: command.command.clone(),
+        status: status.status,
+        exit_code: status.exit_code,
+        output: output
+            .into_iter()
+            .map(|line| SandboxOutputLine { stream: line.stream, data: line.data })
+            .collect(),
+    })
+}
+
+#[cfg(feature = "server")]
+async fn fetch_terminal_command_history(pool: &PgPool, terminal_id: i64) -> Vec<SandboxCommandSummary> {
+    let Ok(recent) = db::list_terminal_commands(pool, terminal_id, HISTORY_LIMIT).await else {
+        return Vec::new();
+    };
+    let mut summaries = Vec::with_capacity(recent.len());
+    for command in recent.iter().rev() {
+        if let Some(summary) = fetch_command_summary(pool, command).await {
+            summaries.push(summary);
+        }
+    }
+    summaries
+}
+
+/// Thin wrapper over `sandbox::list_pods`/`sandbox::list_terminals` for the
+/// browser — a one-shot pull, not a subscription, same shape as `get_tasks`.
+/// Used both for the initial sandbox-panel load and for the reconciliation
+/// pull `subscribe_conversation_events`'s caller does on connect/reconnect.
+///
+/// Eagerly attempts `sandbox::try_reconnect` for every pod before reading
+/// terminal status — otherwise a pod that survived a smelt restart with a
+/// perfectly healthy agent still reports "disconnected" here until the
+/// model happens to touch it next, since `list_terminals` itself only ever
+/// checks the connection registry, never tries to repair it.
+#[get("/api/conversations/{id}/sandbox")]
+pub async fn get_sandbox_state(id: i64) -> ServerFnResult<SandboxSnapshot> {
+    let pool = db::get();
+    let pods = sandbox::list_pods(pool, id).await.map_err(ServerFnError::new)?;
+    for pod in &pods {
+        sandbox::try_reconnect(pool, pod.pod_id).await;
+    }
+    let terminals = sandbox::list_terminals(pool, id).await.map_err(ServerFnError::new)?;
+
+    let mut by_pod: HashMap<i64, Vec<SandboxTerminalSummary>> = HashMap::new();
+    for terminal in terminals {
+        let commands = fetch_terminal_command_history(pool, terminal.terminal_id).await;
+        by_pod.entry(terminal.pod_id).or_default().push(SandboxTerminalSummary {
+            terminal_id: terminal.terminal_id,
+            pod_id: terminal.pod_id,
+            status: terminal.status,
+            commands,
+        });
+    }
+
+    let pods = pods
+        .into_iter()
+        .map(|pod| SandboxPodSummary {
+            pod_id: pod.pod_id,
+            status: pod.status,
+            terminals: by_pod.remove(&pod.pod_id).unwrap_or_default(),
+        })
+        .collect();
+
+    Ok(SandboxSnapshot { pods })
+}
+
 /// A dedicated, always-open per-conversation event stream — independent of
 /// any particular `send_message` call, since task activity (a tick, a
 /// finish) or another writer's pushed turn can happen with no request in
@@ -363,6 +603,7 @@ pub async fn subscribe_conversation_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -410,6 +651,106 @@ mod tests {
             .iter()
             .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
             .collect()
+    }
+
+    /// Like `start_mock_upstream`, but the first `fail_count` requests get
+    /// back a flat HTTP 500 with Ollama's real "error parsing tool call"
+    /// body — the exact shape `is_ollama_thinking_tool_call_corruption` is
+    /// meant to recognize — and every request after that gets
+    /// `success_body` (a normal 200 SSE stream), if any. `success_body:
+    /// None` means every request fails, for testing the give-up path once
+    /// `TOOL_CALL_PARSE_RETRIES` is exhausted.
+    async fn start_mock_upstream_failing_n_times(fail_count: usize, success_body: Option<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let counter = counter.clone();
+                let success_body = success_body.clone();
+                async move {
+                    let i = counter.fetch_add(1, Ordering::SeqCst);
+                    if i < fail_count || success_body.is_none() {
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            format!(
+                                r#"{{"type":"error","error":{{"type":"api_error","message":"error parsing tool call: raw='attempt {i}' err=invalid character '?' after object key:value pair"}},"request_id":"req_test"}}"#
+                            ),
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            success_body.expect("checked above"),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        unsafe {
+            std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}"));
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        }
+    }
+
+    /// `ANTHROPIC_THINKING` is process-global like `ANTHROPIC_BASE_URL`, but
+    /// unlike it, no other test reads `thinking_enabled()`'s result, so
+    /// nothing else can fail if a concurrently-running test transiently
+    /// observes this one's value — restoring it afterward (rather than a
+    /// dedicated lock) is enough.
+    #[test]
+    fn test_thinking_enabled_defaults_to_on_and_recognizes_opt_out_values() {
+        // `ANTHROPIC_THINKING` is process-global, same as `ANTHROPIC_BASE_URL`
+        // — reusing that lock (rather than a dedicated one) keeps this
+        // mutually exclusive with `test_run_turn_retries_without_thinking_...`,
+        // which needs the *default* (on) to actually exercise the retry path.
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let original = std::env::var("ANTHROPIC_THINKING").ok();
+
+        unsafe { std::env::remove_var("ANTHROPIC_THINKING") };
+        assert!(thinking_enabled(), "should default to on — see the doc comment for why");
+
+        for value in ["0", "false", "off"] {
+            unsafe { std::env::set_var("ANTHROPIC_THINKING", value) };
+            assert!(!thinking_enabled(), "{value:?} should disable thinking");
+        }
+
+        for value in ["1", "true", "on", "nonsense"] {
+            unsafe { std::env::set_var("ANTHROPIC_THINKING", value) };
+            assert!(thinking_enabled(), "{value:?} should not disable thinking");
+        }
+
+        match original {
+            Some(value) => unsafe { std::env::set_var("ANTHROPIC_THINKING", value) },
+            None => unsafe { std::env::remove_var("ANTHROPIC_THINKING") },
+        }
+    }
+
+    #[test]
+    fn test_is_ollama_thinking_tool_call_corruption_matches_the_known_error_shape() {
+        let real_error = r#"Anthropic API error 500 Internal Server Error: {"type":"error","error":{"type":"api_error","message":"error parsing tool call: raw='...' err=invalid character 'T' looking for beginning of value"},"request_id":"req_123"}"#;
+        assert!(is_ollama_thinking_tool_call_corruption(real_error));
+    }
+
+    #[test]
+    fn test_is_ollama_thinking_tool_call_corruption_does_not_match_unrelated_errors() {
+        assert!(!is_ollama_thinking_tool_call_corruption(
+            "Anthropic API error 529 Overloaded: the server is overloaded"
+        ));
+        assert!(!is_ollama_thinking_tool_call_corruption(
+            "timed out waiting for Anthropic to respond"
+        ));
     }
 
     #[sqlx::test]
@@ -462,6 +803,137 @@ mod tests {
             vec![anthropic::ContentBlock::Text {
                 text: "Hi!".to_string()
             }]
+        );
+    }
+
+    /// Regression test for conversation 43's real "500 error parsing tool
+    /// call" incident: with thinking on (the default) and pointed at a
+    /// mock upstream that fails the *first* request with Ollama's exact
+    /// error shape, `run_turn` should retry without thinking and still
+    /// complete — not surface the 500 to the caller.
+    #[sqlx::test]
+    async fn test_run_turn_retries_without_thinking_after_ollama_tool_call_corruption(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+
+        let success_body = sse_body(&[
+            ("message_start", r#"{"type":"message_start"}"#),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pong"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        start_mock_upstream_failing_n_times(1, Some(success_body)).await;
+
+        let new_message = anthropic::AnthropicMessage {
+            role: "user".to_string(),
+            content: vec![anthropic::ContentBlock::Text {
+                text: "ping".to_string(),
+            }],
+        };
+
+        let messages = run_turn(&pool, conversation.id, new_message, None)
+            .await
+            .expect("run_turn should recover from the failed first attempt and succeed");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(
+            messages[1].blocks().expect("valid blocks"),
+            vec![anthropic::ContentBlock::Text {
+                text: "pong".to_string()
+            }],
+            "the retried (thinking-free) attempt's reply should be what actually got persisted"
+        );
+    }
+
+    /// Dropping `thinking` doesn't help every case (a local model can flub
+    /// a tool call's JSON on its own — see `is_ollama_thinking_tool_call_corruption`'s
+    /// doc comment) — this fails *twice*, past the thinking-drop, and
+    /// relies on `TOOL_CALL_PARSE_RETRIES` allowing one further plain
+    /// regeneration to still recover.
+    #[sqlx::test]
+    async fn test_run_turn_recovers_after_two_ollama_tool_call_failures(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+
+        let success_body = sse_body(&[
+            ("message_start", r#"{"type":"message_start"}"#),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"third time's the charm"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        start_mock_upstream_failing_n_times(2, Some(success_body)).await;
+
+        let new_message = anthropic::AnthropicMessage {
+            role: "user".to_string(),
+            content: vec![anthropic::ContentBlock::Text {
+                text: "ping".to_string(),
+            }],
+        };
+
+        let messages = run_turn(&pool, conversation.id, new_message, None)
+            .await
+            .expect("run_turn should recover after exhausting the thinking-drop and one plain retry");
+
+        assert_eq!(
+            messages[1].blocks().expect("valid blocks"),
+            vec![anthropic::ContentBlock::Text {
+                text: "third time's the charm".to_string()
+            }]
+        );
+    }
+
+    /// Once `TOOL_CALL_PARSE_RETRIES` is exhausted, `run_turn` gives up and
+    /// surfaces the error rather than retrying forever against a call the
+    /// model is reliably bad at.
+    #[sqlx::test]
+    async fn test_run_turn_gives_up_after_exhausting_tool_call_parse_retries(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+
+        // `fail_count` is irrelevant when `success_body` is `None` — every
+        // request fails regardless (see the helper's doc comment).
+        start_mock_upstream_failing_n_times(0, None).await;
+
+        let new_message = anthropic::AnthropicMessage {
+            role: "user".to_string(),
+            content: vec![anthropic::ContentBlock::Text {
+                text: "ping".to_string(),
+            }],
+        };
+
+        let err = run_turn(&pool, conversation.id, new_message, None)
+            .await
+            .expect_err("should give up and surface the error once retries are exhausted");
+        assert!(
+            err.to_string().contains("error parsing tool call"),
+            "got {err}"
         );
     }
 
@@ -593,7 +1065,11 @@ mod tests {
             }],
         };
 
-        let result = run_turn(&pool, conversation.id, new_message, None).await;
+        // Goes through run_turn_bounded directly with a small bound rather
+        // than run_turn (which would replay the mock upstream the real
+        // MAX_TURNS — 10,000 — times just to prove the same "give up and
+        // error" behavior).
+        let result = run_turn_bounded(&pool, conversation.id, new_message, None, 3).await;
         assert!(result.is_err(), "expected an error, got {result:?}");
     }
 

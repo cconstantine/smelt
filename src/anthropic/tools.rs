@@ -1250,6 +1250,22 @@ mod server {
             return Err(e.to_string());
         }
 
+        // Published immediately, before the agent has produced any output —
+        // same "started" convention `run_async`'s own `TaskUpdate` already
+        // uses, see the plan's "Which files."
+        events::publish(
+            conversation_id,
+            events::ConversationEvent::SandboxCommandUpdate {
+                terminal_id,
+                command_id: command_id.clone(),
+                command: Some(command.clone()),
+                status: "running".to_string(),
+                exit_code: None,
+                stream: None,
+                latest_output: None,
+            },
+        );
+
         Ok(format!("command sent (id: {command_id})"))
     }
 
