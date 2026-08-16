@@ -10,7 +10,8 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use k8s_openapi::api::core::v1::{Container, Pod, PodSpec};
+use k8s_openapi::api::core::v1::{Container, Pod, PodSpec, ResourceRequirements};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, AttachParams, DeleteParams, PostParams};
 use serde::Deserialize;
@@ -183,7 +184,11 @@ impl SandboxManager {
         Self { client, cleanup_tx }
     }
 
-    pub async fn create(&self, session_id: &str) -> Result<Sandbox, SandboxError> {
+    /// `memory`/`cpu` are already-resolved values (the caller's own
+    /// override, or its default) — only used on the actual-creation
+    /// branch below; the reuse branch has nothing to apply them to, since
+    /// resources are immutable on an already-existing pod.
+    pub async fn create(&self, session_id: &str, memory: &str, cpu: &str) -> Result<Sandbox, SandboxError> {
         let pods = pods_api(&self.client);
         let name = format!("sandbox-{session_id}");
 
@@ -201,7 +206,7 @@ impl SandboxManager {
                 // behavior" section.
             }
             None => {
-                pods.create(&PostParams::default(), &build_pod_spec(&name)).await?;
+                pods.create(&PostParams::default(), &build_pod_spec(&name, memory, cpu)).await?;
             }
         }
 
@@ -226,7 +231,30 @@ impl SandboxManager {
     }
 }
 
-fn build_pod_spec(name: &str) -> Pod {
+/// `SANDBOX_MEMORY_LIMIT`, default `"8Gi"` if unset or empty — same
+/// pattern `api::chat::anthropic_model()` uses for `ANTHROPIC_MODEL`. The
+/// *default* a pod gets when `create_pod`'s caller doesn't specify its own
+/// `memory_limit` — see the plan's "Per-pod limit overrides."
+fn default_memory_limit() -> String {
+    std::env::var("SANDBOX_MEMORY_LIMIT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "8Gi".to_string())
+}
+
+/// `SANDBOX_CPU_LIMIT`, default `"1"` — see `default_memory_limit`.
+fn default_cpu_limit() -> String {
+    std::env::var("SANDBOX_CPU_LIMIT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "1".to_string())
+}
+
+/// `memory`/`cpu` are plain Kubernetes `Quantity` strings (`"8Gi"`, `"1"`)
+/// — no app-side parsing or validation of the format; an invalid value is
+/// rejected by the Kubernetes API itself when the pod is actually
+/// created, surfacing back through `SandboxError::Kube` as an ordinary
+/// error. Bounded from above by the `smelt-park` namespace's own
+/// `LimitRange` (`k8s/smelt-park-rbac.yaml`), not by anything here.
+fn build_pod_spec(name: &str, memory: &str, cpu: &str) -> Pod {
+    let mut limits = std::collections::BTreeMap::new();
+    limits.insert("memory".to_string(), Quantity(memory.to_string()));
+    limits.insert("cpu".to_string(), Quantity(cpu.to_string()));
+
     Pod {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
@@ -247,12 +275,7 @@ fn build_pod_spec(name: &str) -> Pod {
                 // conversation's lifetime; the actual work all happens via
                 // exec, never via the pod's own entrypoint.
                 command: Some(vec!["sleep".to_string(), "infinity".to_string()]),
-                // No CPU/memory limits — a real limit low enough to matter
-                // (512Mi) OOM-kills real work (a `cargo build` alone can
-                // exceed it) with no detection/attribution when it
-                // happens; that's a real project of its own, deliberately
-                // deferred rather than half-built. Unbounded within
-                // whatever the node itself has to give.
+                resources: Some(ResourceRequirements { limits: Some(limits), ..Default::default() }),
                 ..Default::default()
             }],
             restart_policy: Some("Never".to_string()),
@@ -577,9 +600,20 @@ async fn conversation_pod_id(pool: &PgPool, conversation_id: i64) -> Result<i64,
 /// another. Rolls the DB row back (soft-terminates it) if the underlying
 /// k8s create fails, so a failed create never leaves a pod_id `list_pods`
 /// would show as live but that doesn't actually exist.
-pub async fn create_pod(pool: &PgPool, conversation_id: i64) -> Result<i64, SandboxError> {
+/// `memory_limit`/`cpu_limit` override the deployment's
+/// `SANDBOX_MEMORY_LIMIT`/`SANDBOX_CPU_LIMIT` default for just this one
+/// pod when given — see the plan's "Per-pod limit overrides."
+pub async fn create_pod(
+    pool: &PgPool,
+    conversation_id: i64,
+    memory_limit: Option<String>,
+    cpu_limit: Option<String>,
+) -> Result<i64, SandboxError> {
     let existing = db::list_sandbox_pods(pool, conversation_id).await.map_err(SandboxError::Db)?;
     check_pod_guard(&existing)?;
+
+    let memory = memory_limit.unwrap_or_else(default_memory_limit);
+    let cpu = cpu_limit.unwrap_or_else(default_cpu_limit);
 
     let manager = get();
     let row = db::create_sandbox_pod(pool, conversation_id).await.map_err(SandboxError::Db)?;
@@ -589,7 +623,7 @@ pub async fn create_pod(pool: &PgPool, conversation_id: i64) -> Result<i64, Sand
     // (this pod persists independently of any in-process value), so it's
     // disarmed immediately, the same `mem::forget` pattern
     // `SandboxManager::delete` itself already uses for the same reason.
-    match manager.create(&row.id.to_string()).await {
+    match manager.create(&row.id.to_string(), &memory, &cpu).await {
         Ok(sandbox) => {
             std::mem::forget(sandbox);
             events::publish(
@@ -1630,7 +1664,7 @@ mod tests {
         let conversation = db::create_conversation(&pool).await.expect("create conversation");
         db::create_sandbox_pod(&pool, conversation.id).await.expect("create sandbox pod");
 
-        let result = create_pod(&pool, conversation.id).await;
+        let result = create_pod(&pool, conversation.id, None, None).await;
         assert!(matches!(result, Err(SandboxError::PodAlreadyExists)), "expected PodAlreadyExists, got {result:?}");
     }
 
@@ -1727,8 +1761,8 @@ mod tests {
 
             // --- One pod per conversation: create_pod refuses a second
             // live pod, list reflects reality ---
-            let pod_a = create_pod(&pool, conversation_a.id).await.expect("create_pod (a) should succeed");
-            let duplicate = create_pod(&pool, conversation_a.id).await;
+            let pod_a = create_pod(&pool, conversation_a.id, None, None).await.expect("create_pod (a) should succeed");
+            let duplicate = create_pod(&pool, conversation_a.id, None, None).await;
             assert!(
                 matches!(duplicate, Err(SandboxError::PodAlreadyExists)),
                 "create_pod should refuse a second live pod for the same conversation, got {duplicate:?}"
@@ -1839,7 +1873,7 @@ mod tests {
             // --- Pod isolation: a file in conversation_a's pod is
             // invisible from conversation_b's — two separate conversations
             // now, since one conversation can't have two live pods. ---
-            create_pod(&pool, conversation_b.id).await.expect("create_pod (b) should succeed");
+            create_pod(&pool, conversation_b.id, None, None).await.expect("create_pod (b) should succeed");
             let terminal_b1 = create_terminal(&pool, conversation_b.id).await.expect("create_terminal (b1) should succeed");
             run_and_wait(&pool, conversation_a.id, terminal_a1, "write-marker", "echo marker > /tmp/isolation-marker").await;
             let check = run_and_wait(&pool, conversation_b.id, terminal_b1, "check-marker", "cat /tmp/isolation-marker 2>&1; echo EXIT:$?").await;
@@ -1997,7 +2031,7 @@ mod tests {
             // `connect()` already did, not just error out and leave the
             // terminal wedged forever. A separate conversation, since
             // conversation_a's one pod slot is already in use. ---
-            let pod_c = create_pod(&pool, conversation_c.id).await.expect("create_pod (c) should succeed");
+            let pod_c = create_pod(&pool, conversation_c.id, None, None).await.expect("create_pod (c) should succeed");
             let terminal_c1 = create_terminal(&pool, conversation_c.id).await.expect("create_terminal (c1) should succeed");
 
             let pods = pods_api(&get().client);
@@ -2023,7 +2057,7 @@ mod tests {
             // alone) should flip back to "connected" once try_reconnect
             // runs, not need an unrelated tool call to happen first.
             // Another separate conversation, same reason as pod_c. ---
-            let pod_d = create_pod(&pool, conversation_d.id).await.expect("create_pod (d) should succeed");
+            let pod_d = create_pod(&pool, conversation_d.id, None, None).await.expect("create_pod (d) should succeed");
             let terminal_d1 = create_terminal(&pool, conversation_d.id).await.expect("create_terminal (d1) should succeed");
             deregister(pod_d);
 
@@ -2127,11 +2161,39 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("create");
 
-        let sandbox = manager.create(&session_id).await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
 
         let pods = pods_api(&client);
         let pod = pods.get(&sandbox.pod_name).await.expect("pod should exist");
         assert_eq!(pod.status.and_then(|s| s.phase).as_deref(), Some("Running"));
+
+        pods.delete(&sandbox.pod_name, &immediate_delete_params()).await.ok();
+        std::mem::forget(sandbox);
+    }
+
+    #[tokio::test]
+    async fn test_create_applies_the_given_memory_and_cpu_limits() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let session_id = unique_session_id("limits");
+
+        let sandbox = manager.create(&session_id, "128Mi", "2").await.expect("create should succeed");
+
+        let pods = pods_api(&client);
+        let pod = pods.get(&sandbox.pod_name).await.expect("pod should exist");
+        let limits = pod
+            .spec
+            .expect("pod should have a spec")
+            .containers
+            .into_iter()
+            .next()
+            .expect("pod should have a container")
+            .resources
+            .expect("container should have resources")
+            .limits
+            .expect("resources should have limits");
+        assert_eq!(limits.get("memory"), Some(&Quantity("128Mi".to_string())));
+        assert_eq!(limits.get("cpu"), Some(&Quantity("2".to_string())));
 
         pods.delete(&sandbox.pod_name, &immediate_delete_params()).await.ok();
         std::mem::forget(sandbox);
@@ -2143,8 +2205,8 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("reuse");
 
-        let first = manager.create(&session_id).await.expect("first create should succeed");
-        let second = manager.create(&session_id).await.expect("second create should reuse, not error");
+        let first = manager.create(&session_id, "8Gi", "1").await.expect("first create should succeed");
+        let second = manager.create(&session_id, "8Gi", "1").await.expect("second create should reuse, not error");
 
         assert_eq!(first.pod_name, second.pod_name);
 
@@ -2159,7 +2221,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("exec");
-        let sandbox = manager.create(&session_id).await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
 
         let result = sandbox.exec(&["echo", "hello"]).await.expect("exec should succeed");
         assert_eq!(result.stdout, "hello\n");
@@ -2184,7 +2246,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("death-reason");
-        let sandbox = manager.create(&session_id).await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
         let pods = pods_api(&client);
 
         assert_eq!(pod_death_reason(&pods, &sandbox.pod_name).await, None, "a genuinely Running pod is inconclusive");
@@ -2216,7 +2278,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("delete");
-        let sandbox = manager.create(&session_id).await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
         let pod_name = sandbox.pod_name.clone();
 
         manager.delete(sandbox).await.expect("delete should succeed");
@@ -2231,7 +2293,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("drop");
-        let sandbox = manager.create(&session_id).await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
         let pod_name = sandbox.pod_name.clone();
 
         drop(sandbox); // no manager.delete call — this is the path under test

@@ -72,7 +72,7 @@ mod server {
             "wait_task" => wait_task_tool(input).await,
             "cancel_task" => cancel_task_tool(conversation_id, input).await,
             "write_task_stdin" => write_task_stdin_tool(input),
-            "create_pod" => create_pod_tool(pool, conversation_id).await,
+            "create_pod" => create_pod_tool(pool, conversation_id, input).await,
             "terminate_pod" => terminate_pod_tool(pool, conversation_id).await,
             "list_pods" => list_pods_tool(pool, conversation_id).await,
             "create_terminal" => create_terminal_tool(pool, conversation_id).await,
@@ -281,9 +281,20 @@ mod server {
                 description: "Create this conversation's sandbox pod. Refuses if one already \
                                exists — call terminate_pod first if you want a fresh one. \
                                Returns the new pod's id. A terminal can't be created until a \
-                               pod exists."
+                               pod exists. memory_limit/cpu_limit optionally override the \
+                               deployment's default resource limit for just this one pod (e.g. \
+                               memory_limit: \"4Gi\" for a memory-heavy task) — plain Kubernetes \
+                               quantity strings, rejected by Kubernetes itself (as an error from \
+                               this call) if malformed or over the deployment's configured \
+                               ceiling."
                     .to_string(),
-                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "memory_limit": {"type": "string"},
+                        "cpu_limit": {"type": "string"}
+                    }
+                }),
             },
             ToolDefinition {
                 name: "terminate_pod".to_string(),
@@ -1287,8 +1298,10 @@ mod server {
         latest_hash
     }
 
-    async fn create_pod_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
-        let pod_id = sandbox::create_pod(pool, conversation_id)
+    async fn create_pod_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
+        let memory_limit = input.get("memory_limit").and_then(Value::as_str).map(str::to_string);
+        let cpu_limit = input.get("cpu_limit").and_then(Value::as_str).map(str::to_string);
+        let pod_id = sandbox::create_pod(pool, conversation_id, memory_limit, cpu_limit)
             .await
             .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"pod_id": pod_id}).to_string())
