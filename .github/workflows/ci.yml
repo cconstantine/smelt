@@ -73,6 +73,18 @@ jobs:
       # across steps (each `run` is a fresh container) and across CI runs
       # (via the actions/cache step above) — target/ already persists via
       # docker-compose.yml's `.:/app` bind mount, no extra mount needed.
+      #
+      # src/sandbox.rs's `include_bytes!` pulls in a pre-built
+      # target/sandbox-agent/sandbox_agent — any `server`-feature build
+      # (sandbox is #[cfg(feature = "server")]-gated) fails to compile
+      # without it. scripts/build-sandbox-agent.sh must run first; see
+      # its own header comment and src/sandbox.rs's AGENT_BINARY doc.
+      - name: Build sandbox_agent
+        run: |
+          docker compose run --rm \
+            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
+            smelt scripts/build-sandbox-agent.sh
+
       - name: cargo test --features server
         run: |
           docker compose run --rm \

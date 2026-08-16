@@ -107,6 +107,8 @@ cargo check --no-default-features --features web --target wasm32-unknown-unknown
 
 (Plain `cargo test` compiles but skips every `server`-gated test, so it proves almost nothing — always pass `--features server`.)
 
+(`cargo test --features server` requires `scripts/build-sandbox-agent.sh` to have run at least once since the last `cargo clean` — `src/sandbox.rs` `include_bytes!`s a pre-built `sandbox_agent` binary. See [setup.md](setup.md).)
+
 The automated browser tier (`src/browser_tests.rs`) covers the sandbox panel only — anything else touching rendering or interaction still needs a manual pass. See [testing.md](testing.md#whats-not-covered-yet). **Run it — `cargo test --features "server browser-test" -- --ignored --test-threads=1` — as part of done for any change touching the sandbox panel's DOM structure, not just during a later review.** It sat broken for a while after the panel's tabs shipped on `sandbox-visibility`, because nothing re-ran it in between; a deliberate final review caught it, not the change that broke it.
 
 Gate per-target dead code with `#[cfg(feature = "...")]` rather than leaving a warning in the other target.

@@ -25,6 +25,14 @@ dx bundle --platform web
 # Produces a release server binary + WASM client bundle; see dx's output for
 # the exact paths.
 
+# ── Build sandbox_agent first, for any `server`-feature build ──────────────
+# src/sandbox.rs's `include_bytes!` embeds a pre-built sandbox_agent binary
+# at compile time — every `server`-feature build (check, test, or run) fails
+# with "couldn't read .../sandbox_agent: No such file or directory" without
+# this having run at least once since the last `cargo clean`. Not needed for
+# the `web`-only wasm check (`sandbox` is `#[cfg(feature = "server")]`-gated).
+scripts/build-sandbox-agent.sh
+
 # ── Fast compile check ───────────────────────────────────────────────────────
 cargo check --features server
 cargo check --no-default-features --features web --target wasm32-unknown-unknown
