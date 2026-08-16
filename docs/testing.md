@@ -68,6 +68,30 @@ plain `sleep infinity` container doesn't trap `SIGTERM`. Every delete in
 `immediate_delete_params()` (`grace_period_seconds: Some(0)`) specifically
 to avoid tests timing out on this.
 
+Two more, both proven the hard way on `sandbox-oom` (hit once during that
+project's design spikes, then hit *again*, independently, while writing
+its final integration test — worth internalizing rather than
+rediscovering a third time):
+
+- **An `AttachedProcess` (`pods.exec(...)`'s return value) whose
+  stdout/stderr are never read can leave the remote command stalled
+  rather than actually running**, not just buffered-and-ignored. If a
+  test doesn't care about the output, it still needs to drain it (spawn a
+  task that reads stdout/stderr to completion, or at minimum polls them)
+  rather than dropping the handles unread.
+- **Dropping the `AttachedProcess` itself — not just its split-off
+  stdout/stderr handles — closes the underlying exec session**, and for a
+  process that's directly attached (not `setsid`-detached the way
+  `sandbox_agent`'s own injection launch is — see `inject_and_launch`),
+  the container runtime kills it right along with the disconnect. A
+  `{ let exec = pods.exec(...).await?; ...spawn readers off exec.stdout()/stderr()...}`
+  block that lets `exec` fall out of scope at the end kills the remote
+  process as soon as that block ends, often well before the command has
+  actually done anything. Keep the whole `AttachedProcess` alive for as
+  long as the remote command needs to run — e.g. move it (not just its
+  stream handles) into the task that drains it, so the exec session stays
+  open until that task itself finishes.
+
 ## Testing the Anthropic streaming client without the network
 
 `anthropic::stream::stream_anthropic_message` is tested against a mock upstream — a throwaway Axum server bound to an ephemeral port, with `ANTHROPIC_BASE_URL` pointed at it for the duration of the test:
