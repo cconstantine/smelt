@@ -100,7 +100,7 @@ notification), WASM check clean, and the automated browser test.
   plus redirecting `ANTHROPIC_BASE_URL` to an unreachable local address),
   even though the test's own code never otherwise mentions Anthropic.
 
-**What to change (proposal):**
+**What to change (confirmed and applied to `development-process.md`):**
 - When a change makes a previously-inert code path start firing calls
   into a different subsystem — especially indirectly, via a detached
   background task rather than a call the test itself makes — check
