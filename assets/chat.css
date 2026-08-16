@@ -331,6 +331,49 @@ body {
     color: #333;
 }
 
+/* `edit_file`'s diff card — same shape/border-left-accent as .tool-call,
+   its body a real line-level diff (see diff_lines) instead of a raw
+   old_string/new_string JSON dump. See
+   docs/projects/plans/file-tools.md's "Diff rendering." */
+.file-edit-diff {
+    align-self: center;
+    width: 100%;
+    max-width: 65ch;
+    border: 1px solid #e5e5e5;
+    border-left-width: 3px;
+    border-left-color: #8a8fa3;
+    border-radius: 8px;
+    padding: 10px 14px;
+    background: #fff;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.file-edit-diff-body {
+    margin: 6px 0 0;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: 12.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.file-edit-diff-line {
+    padding: 0 8px;
+    color: #333;
+}
+
+.file-edit-diff-line-removed {
+    background: #ffeef0;
+    color: #82071e;
+}
+
+.file-edit-diff-line-added {
+    background: #e6ffed;
+    color: #22863a;
+}
+
 /* `run_async` gets a single collapsed line instead of the full tool-call
    card — the tasks sidebar is where its progress actually shows up, so
    this only needs to mark that it happened. Its raw call is available on
@@ -489,9 +532,10 @@ body {
    keeps exactly one scrollbar per terminal and none anywhere above it —
    no panel-level scrollbar, and no bleeding into a whole-page scrollbar
    either (that was worse: it dragged the sidebar and transcript along
-   with it). Only one pod (the active tab — see .sandbox-pod-tabs) ever
-   renders at a time, so it's multiple *terminals within that pod* that
-   split the available height evenly via flex: 1, not multiple pods. */
+   with it). A conversation has at most one live pod (see
+   docs/projects/plans/file-tools.md's "One pod per conversation"), so
+   it's multiple *terminals within that pod* that split the available
+   height evenly via flex: 1, not multiple pods. */
 .sandbox-panel {
     flex: 1;
     min-width: 0;
@@ -536,39 +580,6 @@ body {
     min-height: 0;
     max-height: none;
     overflow-y: auto;
-}
-
-/* One tab per pod when there's more than one — only .sandbox-pod for the
-   selected tab renders below this, so multiple pods no longer split
-   .sandbox-panel's height between them (see the flex chain above); each
-   gets the panel's full height while its tab is active. */
-.sandbox-pod-tabs {
-    flex-shrink: 0;
-    display: flex;
-    gap: 4px;
-    margin-bottom: 10px;
-    border-bottom: 1px solid #e5e5e5;
-}
-
-.sandbox-pod-tab {
-    padding: 5px 10px;
-    border: none;
-    border-bottom: 2px solid transparent;
-    background: transparent;
-    font-size: 12px;
-    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-    color: #888;
-    cursor: pointer;
-}
-
-.sandbox-pod-tab:hover {
-    color: #333;
-}
-
-.sandbox-pod-tab.active {
-    color: #111;
-    border-bottom-color: #111;
-    font-weight: 600;
 }
 
 .sandbox-panel h3 {

@@ -306,6 +306,42 @@ fn format_tool_input(input: &serde_json::Value) -> String {
     serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string())
 }
 
+/// One rendered line of an `edit_file` diff — `content` has its trailing
+/// newline already stripped (`similar`'s line-based `Change::as_str`
+/// includes it, since it's diffing whole lines).
+#[derive(Debug, Clone, PartialEq)]
+struct DiffLine {
+    kind: DiffLineKind,
+    content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DiffLineKind {
+    Equal,
+    Removed,
+    Added,
+}
+
+/// A real line-level diff between `edit_file`'s `old_string`/`new_string`,
+/// via `similar::TextDiff::from_lines` — not a naive "all of old removed,
+/// all of new added." Pure and testable the same way
+/// `format_tool_input`/`tool_result_label` are, no DOM involved. See
+/// docs/projects/plans/file-tools.md's "Diff rendering."
+fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
+    similar::TextDiff::from_lines(old, new)
+        .iter_all_changes()
+        .map(|change| {
+            let kind = match change.tag() {
+                similar::ChangeTag::Equal => DiffLineKind::Equal,
+                similar::ChangeTag::Delete => DiffLineKind::Removed,
+                similar::ChangeTag::Insert => DiffLineKind::Added,
+            };
+            let content = change.as_str().unwrap_or_default().trim_end_matches('\n').to_string();
+            DiffLine { kind, content }
+        })
+        .collect()
+}
+
 /// Label for a `ToolResult` card's header, distinguishing a normal result
 /// from an error at a glance without repeating "error"/"result" as raw text
 /// the caller has to style around.
@@ -438,6 +474,35 @@ fn render_block_element(
                 }
             }
         }
+        // `edit_file` renders as an actual line-level diff instead of a
+        // generic tool-call card showing two raw JSON strings — its
+        // `old_string`/`new_string` already carry everything a diff needs.
+        // See docs/projects/plans/file-tools.md's "Diff rendering."
+        ContentBlock::ToolUse { name, input, .. } if name == "edit_file" => {
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let old_string = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+            let new_string = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+            let lines = diff_lines(old_string, new_string);
+            rsx! {
+                div { key: "{key}", class: "file-edit-diff",
+                    div { class: "tool-call-header",
+                        span { class: "tool-call-icon", "✏️" }
+                        span { "Edited" }
+                        code { class: "tool-call-name", "{path}" }
+                        span { class: "timestamp", "{timestamp}" }
+                    }
+                    div { class: "file-edit-diff-body",
+                        for (i , line) in lines.iter().enumerate() {
+                            div {
+                                key: "{i}",
+                                class: if line.kind == DiffLineKind::Removed { "file-edit-diff-line file-edit-diff-line-removed" } else if line.kind == DiffLineKind::Added { "file-edit-diff-line file-edit-diff-line-added" } else { "file-edit-diff-line" },
+                                "{line.content}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
         ContentBlock::ToolUse { name, input, .. } => {
             let pretty_input = format_tool_input(input);
             rsx! {
@@ -499,6 +564,51 @@ mod tests {
     fn test_tool_result_label_distinguishes_error_from_success() {
         assert_eq!(tool_result_label(false), "Tool result");
         assert_eq!(tool_result_label(true), "Tool error");
+    }
+
+    #[test]
+    fn test_diff_lines_identical_content_is_all_equal() {
+        let result = diff_lines("a\nb\nc\n", "a\nb\nc\n");
+        assert_eq!(
+            result,
+            vec![
+                DiffLine { kind: DiffLineKind::Equal, content: "a".to_string() },
+                DiffLine { kind: DiffLineKind::Equal, content: "b".to_string() },
+                DiffLine { kind: DiffLineKind::Equal, content: "c".to_string() },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_diff_lines_detects_a_changed_line_as_removed_plus_added() {
+        let result = diff_lines("a\nb\nc\n", "a\nx\nc\n");
+        assert_eq!(
+            result,
+            vec![
+                DiffLine { kind: DiffLineKind::Equal, content: "a".to_string() },
+                DiffLine { kind: DiffLineKind::Removed, content: "b".to_string() },
+                DiffLine { kind: DiffLineKind::Added, content: "x".to_string() },
+                DiffLine { kind: DiffLineKind::Equal, content: "c".to_string() },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_diff_lines_keeps_common_context_around_a_multiline_change() {
+        // Proves this is a real diff, not "all of old removed, all of new
+        // added" — only the differing middle line should be marked.
+        let old = "fn f() {\n    old_body();\n}\n";
+        let new = "fn f() {\n    new_body();\n}\n";
+        let result = diff_lines(old, new);
+        assert_eq!(
+            result,
+            vec![
+                DiffLine { kind: DiffLineKind::Equal, content: "fn f() {".to_string() },
+                DiffLine { kind: DiffLineKind::Removed, content: "    old_body();".to_string() },
+                DiffLine { kind: DiffLineKind::Added, content: "    new_body();".to_string() },
+                DiffLine { kind: DiffLineKind::Equal, content: "}".to_string() },
+            ]
+        );
     }
 
     #[test]
@@ -1185,11 +1295,6 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
     let mut tasks: Signal<Vec<TaskPanelEntry>> = use_signal(Vec::new);
     let mut sandbox_pods: Signal<Vec<SandboxPodPanelEntry>> = use_signal(Vec::new);
     let mut sandbox_terminals: Signal<Vec<SandboxTerminalPanelEntry>> = use_signal(Vec::new);
-    // Which pod's tab is showing — `None` (nothing picked yet) or a
-    // `Some(id)` no longer present (that pod got terminated) both fall
-    // back to the first pod in `sandbox_pods()` at render time, rather
-    // than needing an effect to keep this in sync.
-    let mut selected_pod: Signal<Option<i64>> = use_signal(|| None);
     let mut tz_offset_minutes: Signal<i32> = use_signal(|| 0);
 
     // Sticky-bottom auto-scroll state for the message transcript: the
@@ -1528,14 +1633,6 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
         }
     });
 
-    // Recomputed every render (not an effect) — reads `selected_pod()`
-    // and `sandbox_pods()` directly, so it's already correctly reactive to
-    // both a tab click and pods appearing/disappearing, same pattern as
-    // `ConversationSidebar`'s active-item check.
-    let effective_selected_pod: Option<i64> = selected_pod()
-        .filter(|id| sandbox_pods().iter().any(|p| p.pod_id == *id))
-        .or_else(|| sandbox_pods().first().map(|p| p.pod_id));
-
     rsx! {
         section { class: "chat-panel",
             match selected() {
@@ -1610,22 +1707,11 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                             if !sandbox_pods().is_empty() {
                                 aside { class: "sandbox-panel",
                                     h3 { "Sandbox" }
-                                    // Only worth a tab bar once there's more than one
-                                    // pod to switch between — the common case (one
-                                    // pod) just shows straight through, no tabs.
-                                    if sandbox_pods().len() > 1 {
-                                        div { class: "sandbox-pod-tabs",
-                                            for pod in sandbox_pods() {
-                                                button {
-                                                    key: "{pod.pod_id}",
-                                                    class: if Some(pod.pod_id) == effective_selected_pod { "sandbox-pod-tab active" } else { "sandbox-pod-tab" },
-                                                    onclick: move |_| selected_pod.set(Some(pod.pod_id)),
-                                                    "pod {pod.pod_id}"
-                                                }
-                                            }
-                                        }
-                                    }
-                                    for pod in sandbox_pods().into_iter().filter(|p| Some(p.pod_id) == effective_selected_pod) {
+                                    // A conversation has at most one live pod (see
+                                    // docs/projects/plans/file-tools.md's "One pod
+                                    // per conversation") — straight through, no tab
+                                    // bar needed to pick between pods anymore.
+                                    for pod in sandbox_pods() {
                                         div { key: "{pod.pod_id}", class: "sandbox-pod",
                                             div { class: "sandbox-pod-header",
                                                 span { class: "sandbox-pod-status", "{pod.status}" }

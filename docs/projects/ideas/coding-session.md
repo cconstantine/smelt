@@ -103,9 +103,10 @@ namespace object itself).
 **Shipped** — a live sandbox panel shows every pod/terminal the model has
 and each terminal's command history (stdout/stderr in true chronological
 order), streaming as it happens, no reload needed; see
-`projects/completed/20260815-sandbox-visibility.md`. Still open from this
-section: file-edit diffs in the transcript (needs the file read/write
-tools below first).
+`projects/completed/20260815-sandbox-visibility.md`. File read/write/edit
+tools and file-edit diffs in the transcript have since shipped too — see
+`projects/completed/20260816-file-tools.md`. Nothing left open from this
+section.
 
 A sandbox the user can't see into is worse than no sandbox — they need to
 watch what the agent is actually doing (which commands ran, what output

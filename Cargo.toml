@@ -10,6 +10,12 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tokio = { version = "1", features = ["sync", "macros", "time"] }
+# For frontend/pages/chat.rs's edit_file diff rendering — pure Rust, no
+# OS-specific dependencies in its line-diff engine, so it compiles under
+# both `server` and `web` (wasm32-unknown-unknown) targets. Not
+# feature-gated for that reason — see
+# docs/projects/plans/file-tools.md's "Diff rendering."
+similar = "2.7"
 
 # Server-only dependencies (not WASM-compatible)
 dotenvy = { version = "0.15", optional = true }
@@ -31,6 +37,9 @@ nix = { version = "0.29", default-features = false, features = ["signal"], optio
 tokio-tungstenite = { version = "0.24", optional = true }
 # For src/sandbox.rs's tar-over-exec agent injection.
 tar = { version = "0.4", optional = true }
+# For sandbox_agent's file-tool content hashing (staleness detection on
+# edit_file/write_file) — see docs/projects/plans/file-tools.md.
+sha2 = { version = "0.10", optional = true }
 # kube's rustls-tls stack only auto-installs a default CryptoProvider when
 # built with its aws-lc-rs feature (which needs cmake/nasm); this project
 # uses ring instead (same backend reqwest's own rustls-tls already pulls
@@ -66,6 +75,7 @@ server = [
     "dep:nix",
     "dep:tokio-tungstenite",
     "dep:tar",
+    "dep:sha2",
 ]
 # Separate from `server` so the default `cargo test --features server` loop
 # stays exactly as fast as it is today — src/browser_tests.rs's one

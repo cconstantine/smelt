@@ -56,6 +56,9 @@ pub enum SandboxError {
     /// A `sandbox_pods`/`sandbox_terminals` query failed — see the plan's
     /// "How" on why pod/terminal identity is DB-backed this round.
     Db(sqlx::Error),
+    /// `create_pod` refuses: this conversation already has a live pod. See
+    /// docs/projects/plans/file-tools.md's "One pod per conversation."
+    PodAlreadyExists,
 }
 
 impl std::fmt::Display for SandboxError {
@@ -69,6 +72,9 @@ impl std::fmt::Display for SandboxError {
             SandboxError::Io(e) => write!(f, "I/O error reading exec output: {e}"),
             SandboxError::WebSocket(e) => write!(f, "WebSocket error talking to sandbox agent: {e}"),
             SandboxError::Db(e) => write!(f, "database error: {e}"),
+            SandboxError::PodAlreadyExists => {
+                write!(f, "a pod already exists for this conversation; call terminate_pod first")
+            }
         }
     }
 }
@@ -326,6 +332,13 @@ pub enum TerminalError {
     /// `terminate_terminal` refuses while a command is still `running` in
     /// that terminal.
     CommandStillRunning,
+    /// A `read_file`/`write_file`/`edit_file`/`list_directory` call the
+    /// agent rejected — hash mismatch, not found, ambiguous match, over
+    /// the size cap, etc. Carries the agent's own message straight
+    /// through, unlike `create_terminal`/`terminate_terminal`'s acks
+    /// (which only ever distinguish success from a generic failure) —
+    /// the model needs to see and act on exactly what went wrong.
+    FileOperation(String),
 }
 
 impl std::fmt::Display for TerminalError {
@@ -344,6 +357,7 @@ impl std::fmt::Display for TerminalError {
             TerminalError::CommandStillRunning => {
                 write!(f, "a command is still running in this terminal; send_signal or wait for it to finish first")
             }
+            TerminalError::FileOperation(message) => write!(f, "{message}"),
         }
     }
 }
@@ -381,6 +395,40 @@ pub struct TerminalInfo {
     pub status: String,
 }
 
+/// `read_file`'s result — `hash` is the SHA-256 of the *full* file (not
+/// just `lines`, the requested slice), what a later `edit_file`/
+/// `write_file` call's `expected_hash` is checked against. See
+/// docs/projects/plans/file-tools.md's "Change detection, not just 'was it
+/// read.'"
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileContents {
+    pub lines: Vec<String>,
+    pub total_lines: usize,
+    pub hash: String,
+}
+
+/// One `list_directory` entry — `size` is only meaningful for a file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: Option<u64>,
+}
+
+/// The parsed, successful body of a file-tool agent response — what a
+/// pending `pending_file_requests` oneshot resolves to on success (an
+/// `Err(String)` carries the agent's own error message instead, same as
+/// `pending_acks`). One enum covering all four operations since they share
+/// one correlation map (keyed by `request_id`, not tied to a
+/// `terminal_id`).
+#[derive(Debug, Clone, PartialEq)]
+enum FileResponse {
+    Read(FileContents),
+    Written { hash: String },
+    Edited { hash: String },
+    Listed(Vec<DirEntry>),
+}
+
 /// How long `create_terminal`/`terminate_terminal` wait for the agent's ack
 /// before giving up — see `request_terminal_action`. Not measured, same
 /// spirit as the plan's other not-yet-sized timeouts (see Open Questions).
@@ -396,6 +444,13 @@ struct TerminalConnection {
     /// `send_signal` don't use this; they're still fire-and-forget,
     /// completion arrives later as an ordinary `exit` event.
     pending_acks: StdMutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<(), String>>>>,
+    /// The file-tool analog of `pending_acks` — keyed by a fresh
+    /// `request_id` per call rather than `terminal_id`, since a file
+    /// operation isn't tied to any one terminal (it's scoped to the pod as
+    /// a whole). Resolved by `resolve_pending_file_request` when a
+    /// `file_read`/`file_written`/`file_edited`/`directory_listed`/
+    /// `file_error` message arrives — see `request_file_action`.
+    pending_file_requests: StdMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<FileResponse, String>>>>,
     /// Resolved once, when the connection is first established (see
     /// `connect`) — lets `handle_agent_message` publish a
     /// `SandboxCommandUpdate` for every output line and completion without
@@ -431,12 +486,45 @@ fn deregister(pod_id: i64) {
 
 // --- Pod ---
 
-/// Every call creates a genuinely new pod — no idempotency to preserve
-/// with N pods per conversation (see the plan's "What"). Rolls the DB row
-/// back (soft-terminates it) if the underlying k8s create fails, so a
-/// failed create never leaves a pod_id `list_pods` would show as live but
-/// that doesn't actually exist.
+/// The decision behind `create_pod`'s one-pod-per-conversation guard,
+/// pulled out as a pure function over an already-fetched live-pod list so
+/// it's unit-testable without a database or cluster — see
+/// docs/projects/plans/file-tools.md's "One pod per conversation."
+fn check_pod_guard(existing: &[db::SandboxPod]) -> Result<(), SandboxError> {
+    if existing.is_empty() {
+        Ok(())
+    } else {
+        Err(SandboxError::PodAlreadyExists)
+    }
+}
+
+/// The decision behind `conversation_pod_id`: with the one-pod guard above
+/// in place, a conversation's live-pod list is always 0 or 1 — this is
+/// just "the first one, or NoPod," pulled out as a pure function for the
+/// same reason as `check_pod_guard`.
+fn resolve_pod_id(existing: &[db::SandboxPod]) -> Result<i64, TerminalError> {
+    existing.first().map(|p| p.id).ok_or(TerminalError::NoPod)
+}
+
+/// Resolves "the conversation's pod" — with `create_pod`'s guard in place,
+/// a conversation has at most one live pod, so every pod-scoped call
+/// (`terminate_pod`, `create_terminal`, the file tools) can go straight
+/// from a `conversation_id` to a `pod_id` without the model ever naming one
+/// itself. See the plan's "One pod per conversation."
+async fn conversation_pod_id(pool: &PgPool, conversation_id: i64) -> Result<i64, TerminalError> {
+    let existing = db::list_sandbox_pods(pool, conversation_id).await?;
+    resolve_pod_id(&existing)
+}
+
+/// Refuses if this conversation already has a live pod (see
+/// `check_pod_guard`) — the model must `terminate_pod` before it can get
+/// another. Rolls the DB row back (soft-terminates it) if the underlying
+/// k8s create fails, so a failed create never leaves a pod_id `list_pods`
+/// would show as live but that doesn't actually exist.
 pub async fn create_pod(pool: &PgPool, conversation_id: i64) -> Result<i64, SandboxError> {
+    let existing = db::list_sandbox_pods(pool, conversation_id).await.map_err(SandboxError::Db)?;
+    check_pod_guard(&existing)?;
+
     let manager = get();
     let row = db::create_sandbox_pod(pool, conversation_id).await.map_err(SandboxError::Db)?;
     // Reuses SandboxManager::create's existing get-or-create-on-Running
@@ -465,10 +553,15 @@ pub async fn create_pod(pool: &PgPool, conversation_id: i64) -> Result<i64, Sand
     }
 }
 
-/// Idempotent on repeat (terminating an already-terminated `pod_id`
-/// succeeds), a real error on an unknown `pod_id` — see the plan's "How."
-/// Refuses if the pod still has a live terminal.
-pub async fn terminate_pod(pool: &PgPool, pod_id: i64) -> Result<(), TerminalError> {
+/// Takes `conversation_id`, resolved to "the conversation's pod" via
+/// `conversation_pod_id` — no longer idempotent on repeat the way a
+/// `pod_id`-addressed version was: once the one live pod is terminated,
+/// there's no longer a live pod for this conversation to resolve, so a
+/// second call fails clearly with `NoPod` ("call create_pod first") rather
+/// than silently succeeding again. See the plan's "How." Refuses if the
+/// pod still has a live terminal.
+pub async fn terminate_pod(pool: &PgPool, conversation_id: i64) -> Result<(), TerminalError> {
+    let pod_id = conversation_pod_id(pool, conversation_id).await?;
     let live_terminals = db::list_sandbox_terminals_for_pod(pool, pod_id).await?;
     if !live_terminals.is_empty() {
         return Err(TerminalError::TerminalStillExists);
@@ -518,13 +611,18 @@ pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInf
 
 // --- Terminal ---
 
-/// Every call creates a genuinely new terminal in `pod_id` — no
-/// idempotency to preserve with N terminals per pod. Establishes the
-/// pod's agent connection if it isn't already live, injecting and
-/// launching the agent on first use for this pod (the only place that
-/// does — see `reconnect_if_needed`, which every other terminal-touching
-/// call uses instead and which never launches a fresh agent itself).
-pub async fn create_terminal(pool: &PgPool, pod_id: i64) -> Result<i64, TerminalError> {
+/// Takes `conversation_id`, resolved to "the conversation's pod" via
+/// `conversation_pod_id` — errors `NoPod` if none exists yet (create_pod
+/// first), same requirement as before, just checked against the DB instead
+/// of trusting a caller-supplied `pod_id`. Every call creates a genuinely
+/// new terminal in that pod — no idempotency to preserve with N terminals
+/// per pod. Establishes the pod's agent connection if it isn't already
+/// live, injecting and launching the agent on first use for this pod (the
+/// only place that does — see `reconnect_if_needed`, which every other
+/// terminal-touching call uses instead and which never launches a fresh
+/// agent itself).
+pub async fn create_terminal(pool: &PgPool, conversation_id: i64) -> Result<i64, TerminalError> {
+    let pod_id = conversation_pod_id(pool, conversation_id).await?;
     let conn = ensure_pod_connection(pool, pod_id).await?;
 
     let row = db::create_sandbox_terminal(pool, pod_id).await?;
@@ -775,6 +873,148 @@ async fn request_terminal_action(conn: &Arc<TerminalConnection>, terminal_id: i6
     }
 }
 
+/// Entropy for a file-tool `request_id` — only needs to be unique among
+/// this *one pod connection's* outstanding requests (tool calls are
+/// serialized per conversation by `run_turn`'s own lock, so there's never
+/// more than one in flight at a time in practice), not globally unique.
+fn generate_request_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    format!("freq-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos())
+}
+
+/// Sends a `read_file`/`write_file`/`edit_file`/`list_directory` protocol
+/// action and blocks (up to `ACK_TIMEOUT`) for its response — the file-tool
+/// analog of `request_terminal_action`, correlated by `request_id` instead
+/// of `terminal_id` since a file operation isn't tied to any one terminal.
+/// Unlike `request_terminal_action`, an agent-reported failure's message is
+/// returned to the caller, not collapsed into a generic error — the model
+/// needs to see exactly what went wrong (hash mismatch, ambiguous match,
+/// size cap, ...).
+async fn request_file_action(
+    conn: &Arc<TerminalConnection>,
+    payload: serde_json::Value,
+    request_id: String,
+) -> Result<FileResponse, TerminalError> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    conn.pending_file_requests.lock().unwrap_or_else(|e| e.into_inner()).insert(request_id.clone(), tx);
+
+    if conn.outgoing.send(payload.to_string()).is_err() {
+        conn.pending_file_requests.lock().unwrap_or_else(|e| e.into_inner()).remove(&request_id);
+        return Err(TerminalError::NoTerminal);
+    }
+
+    match tokio::time::timeout(ACK_TIMEOUT, rx).await {
+        Ok(Ok(Ok(response))) => Ok(response),
+        Ok(Ok(Err(message))) => Err(TerminalError::FileOperation(message)),
+        Ok(Err(_)) => Err(TerminalError::NoTerminal), // sender dropped — connection ended before the response arrived
+        Err(_) => {
+            conn.pending_file_requests.lock().unwrap_or_else(|e| e.into_inner()).remove(&request_id);
+            Err(TerminalError::NoTerminal)
+        }
+    }
+}
+
+/// Reads (a paginated slice of) `path` in this conversation's pod.
+/// Reconnects first if needed, same as `send_command`/`send_signal` —
+/// never launches a fresh agent itself.
+pub async fn read_file(
+    pool: &PgPool,
+    conversation_id: i64,
+    path: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<FileContents, TerminalError> {
+    let pod_id = conversation_pod_id(pool, conversation_id).await?;
+    let conn = reconnect_if_needed(pool, pod_id).await?;
+    let request_id = generate_request_id();
+    let payload = serde_json::json!({
+        "action": "read_file",
+        "request_id": request_id,
+        "path": path,
+        "offset": offset,
+        "limit": limit,
+    });
+    match request_file_action(&conn, payload, request_id).await? {
+        FileResponse::Read(contents) => Ok(contents),
+        _ => Err(TerminalError::FileOperation("agent returned an unexpected response type for read_file".to_string())),
+    }
+}
+
+/// Creates or overwrites `path` in this conversation's pod. `expected_hash`
+/// is `None` only for a brand-new file (the read-before-write check has
+/// nothing to have read yet) — see
+/// docs/projects/plans/file-tools.md's "Read-before-write discipline."
+/// Returns the new content's hash.
+pub async fn write_file(
+    pool: &PgPool,
+    conversation_id: i64,
+    path: &str,
+    content: &str,
+    expected_hash: Option<String>,
+) -> Result<String, TerminalError> {
+    let pod_id = conversation_pod_id(pool, conversation_id).await?;
+    let conn = reconnect_if_needed(pool, pod_id).await?;
+    let request_id = generate_request_id();
+    let payload = serde_json::json!({
+        "action": "write_file",
+        "request_id": request_id,
+        "path": path,
+        "content": content,
+        "expected_hash": expected_hash,
+    });
+    match request_file_action(&conn, payload, request_id).await? {
+        FileResponse::Written { hash } => Ok(hash),
+        _ => Err(TerminalError::FileOperation("agent returned an unexpected response type for write_file".to_string())),
+    }
+}
+
+/// Applies a targeted `old_string` → `new_string` replacement to `path` in
+/// this conversation's pod. `expected_hash` is always required (unlike
+/// `write_file`) — `edit_file` always needs a prior read to have produced
+/// the `old_string` it's matching against. `expected_line`, if set, targets
+/// one specific occurrence instead of requiring a file-wide unique match —
+/// see the plan's "What" on `edit_file`. Returns the new content's hash.
+pub async fn edit_file(
+    pool: &PgPool,
+    conversation_id: i64,
+    path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+    expected_hash: String,
+    expected_line: Option<u32>,
+) -> Result<String, TerminalError> {
+    let pod_id = conversation_pod_id(pool, conversation_id).await?;
+    let conn = reconnect_if_needed(pool, pod_id).await?;
+    let request_id = generate_request_id();
+    let payload = serde_json::json!({
+        "action": "edit_file",
+        "request_id": request_id,
+        "path": path,
+        "old_string": old_string,
+        "new_string": new_string,
+        "replace_all": replace_all,
+        "expected_hash": expected_hash,
+        "expected_line": expected_line,
+    });
+    match request_file_action(&conn, payload, request_id).await? {
+        FileResponse::Edited { hash } => Ok(hash),
+        _ => Err(TerminalError::FileOperation("agent returned an unexpected response type for edit_file".to_string())),
+    }
+}
+
+/// Lists `path` (one level, non-recursive) in this conversation's pod.
+pub async fn list_directory(pool: &PgPool, conversation_id: i64, path: &str) -> Result<Vec<DirEntry>, TerminalError> {
+    let pod_id = conversation_pod_id(pool, conversation_id).await?;
+    let conn = reconnect_if_needed(pool, pod_id).await?;
+    let request_id = generate_request_id();
+    let payload = serde_json::json!({"action": "list_directory", "request_id": request_id, "path": path});
+    match request_file_action(&conn, payload, request_id).await? {
+        FileResponse::Listed(entries) => Ok(entries),
+        _ => Err(TerminalError::FileOperation("agent returned an unexpected response type for list_directory".to_string())),
+    }
+}
+
 /// Marks every command still `running` under any of this pod's terminals
 /// `'lost'` (no real exit code to report — see
 /// `db::mark_terminal_command_lost`), and every one of the pod's live
@@ -907,6 +1147,7 @@ async fn connect(
     let conn = Arc::new(TerminalConnection {
         outgoing: tx,
         pending_acks: StdMutex::new(HashMap::new()),
+        pending_file_requests: StdMutex::new(HashMap::new()),
         conversation_id,
     });
 
@@ -932,9 +1173,21 @@ async fn connect(
     Ok(conn)
 }
 
+/// Mirrors `sandbox_agent::DirEntryInfo`'s wire shape — its own type isn't
+/// reachable from here (a separate binary crate), so this is a parallel
+/// definition, same as the rest of `AgentMessage`.
+#[derive(Deserialize)]
+struct AgentDirEntry {
+    name: String,
+    is_dir: bool,
+    size: Option<u64>,
+}
+
 /// Flexible enough to cover every message shape `sandbox_agent`'s tagged
 /// `ServerMessage` enum serializes to — a line/exit event names `id`;
-/// a terminal-action ack names `terminal_id` (and, on failure, `message`).
+/// a terminal-action ack names `terminal_id` (and, on failure, `message`);
+/// a file-tool response names `request_id` instead, plus whichever of
+/// `lines`/`total_lines`/`hash`/`entries` its `event` variant carries.
 #[derive(Deserialize)]
 struct AgentMessage {
     #[serde(default)]
@@ -953,6 +1206,16 @@ struct AgentMessage {
     terminal_id: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    lines: Option<Vec<String>>,
+    #[serde(default)]
+    total_lines: Option<usize>,
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
+    entries: Option<Vec<AgentDirEntry>>,
 }
 
 async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, text: &str) {
@@ -1005,6 +1268,45 @@ async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, tex
             resolve_pending_ack(conn, msg.terminal_id, Err(msg.message.unwrap_or_default()));
             return;
         }
+        Some("file_read") => {
+            let contents = FileContents {
+                lines: msg.lines.unwrap_or_default(),
+                total_lines: msg.total_lines.unwrap_or(0),
+                hash: msg.hash.unwrap_or_default(),
+            };
+            resolve_pending_file_request(conn, msg.request_id, Ok(FileResponse::Read(contents)));
+            return;
+        }
+        Some("file_written") => {
+            resolve_pending_file_request(
+                conn,
+                msg.request_id,
+                Ok(FileResponse::Written { hash: msg.hash.unwrap_or_default() }),
+            );
+            return;
+        }
+        Some("file_edited") => {
+            resolve_pending_file_request(
+                conn,
+                msg.request_id,
+                Ok(FileResponse::Edited { hash: msg.hash.unwrap_or_default() }),
+            );
+            return;
+        }
+        Some("directory_listed") => {
+            let entries = msg
+                .entries
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| DirEntry { name: e.name, is_dir: e.is_dir, size: e.size })
+                .collect();
+            resolve_pending_file_request(conn, msg.request_id, Ok(FileResponse::Listed(entries)));
+            return;
+        }
+        Some("file_error") => {
+            resolve_pending_file_request(conn, msg.request_id, Err(msg.message.unwrap_or_default()));
+            return;
+        }
         _ => {}
     }
 
@@ -1044,12 +1346,74 @@ fn resolve_pending_ack(conn: &Arc<TerminalConnection>, terminal_id: Option<Strin
     }
 }
 
+fn resolve_pending_file_request(conn: &Arc<TerminalConnection>, request_id: Option<String>, result: Result<FileResponse, String>) {
+    let Some(request_id) = request_id else {
+        return;
+    };
+    if let Some(tx) = conn.pending_file_requests.lock().unwrap_or_else(|e| e.into_inner()).remove(&request_id) {
+        let _ = tx.send(result);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     async fn test_client() -> kube::Client {
         kube::Client::try_default().await.expect("KUBECONFIG must point at a reachable cluster for sandbox tests")
+    }
+
+    fn fake_pod(id: i64) -> db::SandboxPod {
+        db::SandboxPod { id, conversation_id: 1, created_at: chrono::Utc::now().naive_utc(), terminated_at: None }
+    }
+
+    #[test]
+    fn test_check_pod_guard_allows_when_no_live_pod_exists() {
+        assert!(check_pod_guard(&[]).is_ok());
+    }
+
+    #[test]
+    fn test_check_pod_guard_refuses_when_a_live_pod_already_exists() {
+        let result = check_pod_guard(&[fake_pod(1)]);
+        assert!(matches!(result, Err(SandboxError::PodAlreadyExists)), "expected PodAlreadyExists, got {result:?}");
+    }
+
+    #[test]
+    fn test_resolve_pod_id_returns_the_one_live_pod() {
+        assert_eq!(resolve_pod_id(&[fake_pod(42)]).expect("should resolve"), 42);
+    }
+
+    #[test]
+    fn test_resolve_pod_id_errors_with_no_pod_when_none_live() {
+        let result = resolve_pod_id(&[]);
+        assert!(matches!(result, Err(TerminalError::NoPod)), "expected NoPod, got {result:?}");
+    }
+
+    /// DB-only — `create_pod`'s guard must fire *before* it ever touches
+    /// the process-global `MANAGER` (unset here, since this test doesn't
+    /// need a real cluster), so a refusal shows up as `PodAlreadyExists`,
+    /// not a panic from `get()`.
+    #[sqlx::test]
+    async fn test_create_pod_refuses_before_touching_the_manager_when_a_live_pod_exists(pool: PgPool) {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        db::create_sandbox_pod(&pool, conversation.id).await.expect("create sandbox pod");
+
+        let result = create_pod(&pool, conversation.id).await;
+        assert!(matches!(result, Err(SandboxError::PodAlreadyExists)), "expected PodAlreadyExists, got {result:?}");
+    }
+
+    /// DB-only — no MANAGER touch, since `conversation_pod_id` never calls
+    /// `get()`.
+    #[sqlx::test]
+    async fn test_conversation_pod_id_resolves_the_live_pod_and_errors_with_no_pod_otherwise(pool: PgPool) {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+
+        let before = conversation_pod_id(&pool, conversation.id).await;
+        assert!(matches!(before, Err(TerminalError::NoPod)), "expected NoPod before any pod exists, got {before:?}");
+
+        let pod = db::create_sandbox_pod(&pool, conversation.id).await.expect("create sandbox pod");
+        let resolved = conversation_pod_id(&pool, conversation.id).await.expect("should resolve");
+        assert_eq!(resolved, pod.id);
     }
 
     fn unique_session_id(label: &str) -> String {
@@ -1064,7 +1428,8 @@ mod tests {
     }
 
     /// A single, comprehensive, real-cluster-and-real-Postgres integration
-    /// test covering the terminal lifecycle end to end — deliberately one
+    /// test covering the terminal *and* file-tool lifecycle end to end,
+    /// including the one-pod-per-conversation guard — deliberately one
     /// large test, not many small ones: the free functions (`create_pod`,
     /// `create_terminal`, ...) reach through the process-global `MANAGER`
     /// singleton (mirroring `db::init()`/`db::get()`), and initializing it
@@ -1072,7 +1437,10 @@ mod tests {
     /// risk the same cross-runtime-reuse hazard `docs/testing.md` documents
     /// for `PgPool` (each test gets its own tokio runtime) — this is the
     /// one place in the whole suite that touches `MANAGER` at all, so
-    /// there's nothing to race with.
+    /// there's nothing to race with. Pod isolation, previously shown via
+    /// two pods in one conversation, now uses two separate conversations —
+    /// a conversation can have at most one live pod, see
+    /// docs/projects/plans/file-tools.md's "One pod per conversation."
     #[sqlx::test]
     async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
         // Every terminal command that finishes during this test now
@@ -1112,63 +1480,67 @@ mod tests {
             pods_precheck.delete(&pod_name(n), &immediate_delete_params()).await.ok();
         }
 
-        let conversation = db::create_conversation(&pool).await.expect("create conversation");
-        let conversation_id = conversation.id;
+        let conversation_a = db::create_conversation(&pool).await.expect("create conversation a");
+        let conversation_b = db::create_conversation(&pool).await.expect("create conversation b");
+        let conversation_c = db::create_conversation(&pool).await.expect("create conversation c");
+        let conversation_d = db::create_conversation(&pool).await.expect("create conversation d");
 
-        let outcome = tokio::time::timeout(Duration::from_secs(180), async {
+        let outcome = tokio::time::timeout(Duration::from_secs(240), async {
             // --- Guards fire before there's anything to guard against yet ---
-            let too_early = create_terminal(&pool, 999_999).await;
+            let too_early = create_terminal(&pool, conversation_a.id).await;
             assert!(
                 matches!(too_early, Err(TerminalError::NoPod)),
-                "create_terminal against an unknown pod_id should fail with NoPod, got {too_early:?}"
+                "create_terminal before any pod exists should fail with NoPod, got {too_early:?}"
             );
 
-            // --- Pod: N per conversation, no idempotency, list reflects reality ---
-            let pod_a = create_pod(&pool, conversation_id).await.expect("create_pod (a) should succeed");
-            let pod_b = create_pod(&pool, conversation_id).await.expect("create_pod (b) should succeed");
-            assert_ne!(pod_a, pod_b, "every create_pod call should mint a distinct pod");
-            let pods_listed = list_pods(&pool, conversation_id).await.expect("list_pods should succeed");
-            assert_eq!(pods_listed.len(), 2, "both pods should be listed");
-            assert!(pods_listed.iter().all(|p| p.status == "Running"));
+            // --- One pod per conversation: create_pod refuses a second
+            // live pod, list reflects reality ---
+            let pod_a = create_pod(&pool, conversation_a.id).await.expect("create_pod (a) should succeed");
+            let duplicate = create_pod(&pool, conversation_a.id).await;
+            assert!(
+                matches!(duplicate, Err(SandboxError::PodAlreadyExists)),
+                "create_pod should refuse a second live pod for the same conversation, got {duplicate:?}"
+            );
+            let pods_listed = list_pods(&pool, conversation_a.id).await.expect("list_pods should succeed");
+            assert_eq!(pods_listed.len(), 1, "exactly the one pod should be listed");
+            assert_eq!(pods_listed[0].status, "Running");
 
             // --- Terminal: N per pod, no idempotency ---
-            let terminal_a1 = create_terminal(&pool, pod_a).await.expect("create_terminal (a1) should succeed");
-            let terminal_a2 = create_terminal(&pool, pod_a).await.expect("create_terminal (a2) should succeed");
+            let terminal_a1 = create_terminal(&pool, conversation_a.id).await.expect("create_terminal (a1) should succeed");
+            let terminal_a2 = create_terminal(&pool, conversation_a.id).await.expect("create_terminal (a2) should succeed");
             assert_ne!(terminal_a1, terminal_a2, "every create_terminal call should mint a distinct terminal");
-            let terminal_b1 = create_terminal(&pool, pod_b).await.expect("create_terminal (b1) should succeed");
 
-            let terminals_listed = list_terminals(&pool, conversation_id).await.expect("list_terminals");
-            assert_eq!(terminals_listed.len(), 3, "all three terminals across both pods should be listed");
+            let terminals_listed = list_terminals(&pool, conversation_a.id).await.expect("list_terminals");
+            assert_eq!(terminals_listed.len(), 2, "both terminals in the one pod should be listed");
             assert!(terminals_listed.iter().all(|t| t.status == "connected"));
-            assert!(terminals_listed.iter().any(|t| t.terminal_id == terminal_a1 && t.pod_id == pod_a));
-            assert!(terminals_listed.iter().any(|t| t.terminal_id == terminal_b1 && t.pod_id == pod_b));
+            assert!(terminals_listed.iter().all(|t| t.pod_id == pod_a));
 
-            // terminate_pod must now refuse for pod_a — it still has terminals.
-            let blocked = terminate_pod(&pool, pod_a).await;
+            // terminate_pod must now refuse for conversation_a — it still has terminals.
+            let blocked = terminate_pod(&pool, conversation_a.id).await;
             assert!(
                 matches!(blocked, Err(TerminalError::TerminalStillExists)),
                 "terminate_pod should refuse while a terminal exists, got {blocked:?}"
             );
 
             // --- Two terminals in the same pod are genuinely independent ---
-            run_and_wait(&pool, conversation_id, terminal_a1, "cd-a1", "cd /tmp").await;
-            run_and_wait(&pool, conversation_id, terminal_a2, "cd-a2", "cd /var").await;
-            let pwd_a1 = run_and_wait(&pool, conversation_id, terminal_a1, "pwd-a1", "pwd").await;
-            let pwd_a2 = run_and_wait(&pool, conversation_id, terminal_a2, "pwd-a2", "pwd").await;
+            run_and_wait(&pool, conversation_a.id, terminal_a1, "cd-a1", "cd /tmp").await;
+            run_and_wait(&pool, conversation_a.id, terminal_a2, "cd-a2", "cd /var").await;
+            let pwd_a1 = run_and_wait(&pool, conversation_a.id, terminal_a1, "pwd-a1", "pwd").await;
+            let pwd_a2 = run_and_wait(&pool, conversation_a.id, terminal_a2, "pwd-a2", "pwd").await;
             assert_eq!(first_stdout_line(&pool, &pwd_a1).await, "/tmp");
             assert_eq!(first_stdout_line(&pool, &pwd_a2).await, "/var");
 
             // --- Concurrency: a long command in one terminal doesn't block
             // a sibling terminal in the same pod from running its own ---
             let long_id = "long-a1";
-            db::create_terminal_command(&pool, conversation_id, terminal_a1, long_id, "sleep 5")
+            db::create_terminal_command(&pool, conversation_a.id, terminal_a1, long_id, "sleep 5")
                 .await
                 .expect("create_terminal_command");
             send_command(&pool, terminal_a1, long_id, "sleep 5").await.expect("send_command");
             tokio::time::sleep(Duration::from_millis(300)).await; // let it actually start
 
             let quick_id = "quick-a2";
-            db::create_terminal_command(&pool, conversation_id, terminal_a2, quick_id, "echo still_alive")
+            db::create_terminal_command(&pool, conversation_a.id, terminal_a2, quick_id, "echo still_alive")
                 .await
                 .expect("create_terminal_command");
             send_command(&pool, terminal_a2, quick_id, "echo still_alive").await.expect("send_command");
@@ -1191,9 +1563,9 @@ mod tests {
             // event; both are observable without ever touching a real (or
             // mock) Anthropic endpoint, and without this test doing anything
             // else that would otherwise trigger the passive backlog drain. ---
-            let mut wake_events = events::subscribe(conversation_id);
+            let mut wake_events = events::subscribe(conversation_a.id);
             let wake_command_id = "wake-a1";
-            db::create_terminal_command(&pool, conversation_id, terminal_a1, wake_command_id, "true")
+            db::create_terminal_command(&pool, conversation_a.id, terminal_a1, wake_command_id, "true")
                 .await
                 .expect("create_terminal_command");
             send_command(&pool, terminal_a1, wake_command_id, "true").await.expect("send_command");
@@ -1217,7 +1589,7 @@ mod tests {
                  for something else to happen to the conversation"
             );
 
-            let messages_after_wake = db::list_messages(&pool, conversation_id).await.expect("list_messages");
+            let messages_after_wake = db::list_messages(&pool, conversation_a.id).await.expect("list_messages");
             assert!(
                 messages_after_wake.iter().any(|m| {
                     m.blocks().ok().is_some_and(|blocks| {
@@ -1232,21 +1604,27 @@ mod tests {
                  the follow-up API call failed, got: {messages_after_wake:?}"
             );
 
-            // --- Pod isolation: a file in pod_a is invisible from pod_b ---
-            run_and_wait(&pool, conversation_id, terminal_a1, "write-marker", "echo marker > /tmp/isolation-marker").await;
-            let check = run_and_wait(&pool, conversation_id, terminal_b1, "check-marker", "cat /tmp/isolation-marker 2>&1; echo EXIT:$?").await;
+            // --- Pod isolation: a file in conversation_a's pod is
+            // invisible from conversation_b's — two separate conversations
+            // now, since one conversation can't have two live pods. ---
+            create_pod(&pool, conversation_b.id).await.expect("create_pod (b) should succeed");
+            let terminal_b1 = create_terminal(&pool, conversation_b.id).await.expect("create_terminal (b1) should succeed");
+            run_and_wait(&pool, conversation_a.id, terminal_a1, "write-marker", "echo marker > /tmp/isolation-marker").await;
+            let check = run_and_wait(&pool, conversation_b.id, terminal_b1, "check-marker", "cat /tmp/isolation-marker 2>&1; echo EXIT:$?").await;
             let lines = db::read_terminal_output(&pool, &check, &["stdout"], 0, 10)
                 .await
                 .expect("read_terminal_output");
             let joined = lines.iter().map(|l| l.data.as_str()).collect::<Vec<_>>().join("\n");
             assert!(
                 joined.contains("EXIT:1") || joined.contains("No such file"),
-                "pod_b should not see a file written in pod_a, got: {joined}"
+                "conversation_b's pod should not see a file written in conversation_a's, got: {joined}"
             );
+            terminate_terminal(&pool, terminal_b1).await.expect("terminate_terminal (b1)");
+            terminate_pod(&pool, conversation_b.id).await.expect("terminate_pod (b) should succeed");
 
             // --- terminate_terminal is guarded on a running command, per terminal ---
             let blocking_id = "blocking-a2";
-            db::create_terminal_command(&pool, conversation_id, terminal_a2, blocking_id, "sleep 30")
+            db::create_terminal_command(&pool, conversation_a.id, terminal_a2, blocking_id, "sleep 30")
                 .await
                 .expect("create_terminal_command");
             send_command(&pool, terminal_a2, blocking_id, "sleep 30").await.expect("send_command");
@@ -1266,7 +1644,7 @@ mod tests {
             // Idempotent on repeat.
             terminate_terminal(&pool, terminal_a2).await.expect("terminate_terminal (a2) should be idempotent");
 
-            let still_pwd = run_and_wait(&pool, conversation_id, terminal_a1, "pwd-a1-again", "pwd").await;
+            let still_pwd = run_and_wait(&pool, conversation_a.id, terminal_a1, "pwd-a1-again", "pwd").await;
             assert_eq!(
                 first_stdout_line(&pool, &still_pwd).await, "/tmp",
                 "terminal_a1 should be completely unaffected by terminating its sibling terminal_a2"
@@ -1282,14 +1660,113 @@ mod tests {
                 "list_commands should not leak another terminal's history"
             );
 
+            // --- File tools: write_file/read_file/edit_file/list_directory,
+            // all pod-scoped (no terminal_id needed) against conversation_a's
+            // still-live pod. ---
+            let file_path = "/tmp/file-tools-test/example.txt";
+
+            // write_file creates a new file — no expected_hash needed.
+            let hash1 = write_file(&pool, conversation_a.id, file_path, "line one\nline two\n", None)
+                .await
+                .expect("write_file (create) should succeed");
+
+            // read_file returns numbered lines, total_lines, and the same
+            // hash write_file just returned.
+            let read1 = read_file(&pool, conversation_a.id, file_path, 1, 10).await.expect("read_file should succeed");
+            assert_eq!(read1.lines, vec!["line one", "line two"]);
+            assert_eq!(read1.total_lines, 2);
+            assert_eq!(read1.hash, hash1);
+
+            // edit_file with the correct expected_hash succeeds and returns a new hash.
+            let hash2 = edit_file(&pool, conversation_a.id, file_path, "line one", "line ONE", false, hash1.clone(), None)
+                .await
+                .expect("edit_file should succeed");
+            assert_ne!(hash2, hash1);
+            let read2 = read_file(&pool, conversation_a.id, file_path, 1, 10).await.expect("read_file should succeed");
+            assert_eq!(read2.lines, vec!["line ONE", "line two"]);
+            assert_eq!(read2.hash, hash2);
+
+            // --- Staleness: a terminal command changes the file out from
+            // under a stale hash — edit_file/write_file must refuse rather
+            // than clobber it. ---
+            run_and_wait(&pool, conversation_a.id, terminal_a1, "external-write", &format!("echo changed_externally > {file_path}")).await;
+            let stale_edit = edit_file(&pool, conversation_a.id, file_path, "line ONE", "line X", false, hash2.clone(), None).await;
+            assert!(
+                matches!(stale_edit, Err(TerminalError::FileOperation(_))),
+                "edit_file should refuse a stale expected_hash, got {stale_edit:?}"
+            );
+            let stale_write = write_file(&pool, conversation_a.id, file_path, "clobber", Some(hash2.clone())).await;
+            assert!(
+                matches!(stale_write, Err(TerminalError::FileOperation(_))),
+                "write_file should refuse a stale expected_hash, got {stale_write:?}"
+            );
+
+            let read3 = read_file(&pool, conversation_a.id, file_path, 1, 10).await.expect("read_file should succeed");
+            assert_eq!(read3.lines, vec!["changed_externally"]);
+
+            // write_file with the *current* hash succeeds (a legitimate overwrite).
+            let hash4 = write_file(&pool, conversation_a.id, file_path, "alpha\nalpha\nbeta\n", Some(read3.hash.clone()))
+                .await
+                .expect("write_file (overwrite) with the current hash should succeed");
+
+            // --- expected_line targets one specific occurrence among
+            // identical repeated lines. ---
+            let hash5 = edit_file(&pool, conversation_a.id, file_path, "alpha", "ALPHA", false, hash4.clone(), Some(2))
+                .await
+                .expect("edit_file with expected_line should succeed");
+            let read5 = read_file(&pool, conversation_a.id, file_path, 1, 10).await.expect("read_file should succeed");
+            assert_eq!(read5.lines, vec!["alpha", "ALPHA", "beta"], "expected_line should have targeted only the second occurrence");
+            assert_eq!(read5.hash, hash5);
+
+            // --- replace_all replaces every occurrence ---
+            let hash6 = write_file(&pool, conversation_a.id, file_path, "dup\ndup\ndup\n", Some(read5.hash.clone()))
+                .await
+                .expect("write_file (overwrite) should succeed");
+            edit_file(&pool, conversation_a.id, file_path, "dup", "rep", true, hash6.clone(), None)
+                .await
+                .expect("edit_file with replace_all should succeed");
+            let read7 = read_file(&pool, conversation_a.id, file_path, 1, 10).await.expect("read_file should succeed");
+            assert_eq!(read7.lines, vec!["rep", "rep", "rep"]);
+
+            // --- Ambiguous match without replace_all/expected_line is a clear error ---
+            let ambiguous = edit_file(&pool, conversation_a.id, file_path, "rep", "x", false, read7.hash.clone(), None).await;
+            assert!(
+                matches!(ambiguous, Err(TerminalError::FileOperation(_))),
+                "expected an ambiguous-match error, got {ambiguous:?}"
+            );
+
+            // --- read_file on a nonexistent path is a clear error, not a panic ---
+            let missing = read_file(&pool, conversation_a.id, "/tmp/file-tools-test/does-not-exist.txt", 1, 10).await;
+            assert!(matches!(missing, Err(TerminalError::FileOperation(_))), "expected a file error, got {missing:?}");
+
+            // --- Oversized content is refused, not silently truncated ---
+            let oversized_content = "x".repeat(300 * 1024); // over the 256 KiB cap
+            let oversized = write_file(&pool, conversation_a.id, "/tmp/file-tools-test/big.txt", &oversized_content, None).await;
+            assert!(matches!(oversized, Err(TerminalError::FileOperation(_))), "expected a size-limit error, got {oversized:?}");
+
+            // --- list_directory: non-recursive, sorted, correct type/size,
+            // and (via a nested path) proves write_file creates parent
+            // directories. ---
+            write_file(&pool, conversation_a.id, "/tmp/file-tools-test/subdir/nested.txt", "nested", None)
+                .await
+                .expect("write_file should create parent directories");
+            let listing = list_directory(&pool, conversation_a.id, "/tmp/file-tools-test").await.expect("list_directory should succeed");
+            let names: Vec<&str> = listing.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, vec!["example.txt", "subdir"], "entries should be sorted alphabetically, size-limit failure excluded");
+            let example_entry = listing.iter().find(|e| e.name == "example.txt").expect("example.txt should be listed");
+            assert!(!example_entry.is_dir);
+            assert!(example_entry.size.unwrap_or(0) > 0);
+            let subdir_entry = listing.iter().find(|e| e.name == "subdir").expect("subdir should be listed");
+            assert!(subdir_entry.is_dir);
+
             // --- Pod vanishes out from under us (deleted, evicted, node
             // lost) while smelt still thinks it's live — reconnect_if_needed's
             // `Ok(None)` branch should run the same crash cleanup a failed
             // `connect()` already did, not just error out and leave the
-            // terminal wedged forever. A third pod, still well within the
-            // 1..=20 range this test owns and pre-wipes. ---
-            let pod_c = create_pod(&pool, conversation_id).await.expect("create_pod (c) should succeed");
-            let terminal_c1 = create_terminal(&pool, pod_c).await.expect("create_terminal (c1) should succeed");
+            // terminal wedged forever. A separate conversation, since
+            // conversation_a's one pod slot is already in use. ---
+            let pod_c = create_pod(&pool, conversation_c.id).await.expect("create_pod (c) should succeed");
+            let terminal_c1 = create_terminal(&pool, conversation_c.id).await.expect("create_terminal (c1) should succeed");
 
             let pods = pods_api(&get().client);
             pods.delete(&pod_name(pod_c), &immediate_delete_params()).await.expect("delete pod_c directly");
@@ -1304,7 +1781,7 @@ mod tests {
                 "crash cleanup should have marked terminal_c1 terminated even though the pod was never found, not just on a failed connect"
             );
 
-            terminate_pod(&pool, pod_c)
+            terminate_pod(&pool, conversation_c.id)
                 .await
                 .expect("terminate_pod (c) should now succeed — no live terminals left blocking it, and no k8s pod left to delete");
 
@@ -1312,12 +1789,13 @@ mod tests {
             // in-memory registry entry (e.g. a smelt restart, simulated
             // here with a bare `deregister` — the k8s pod itself is left
             // alone) should flip back to "connected" once try_reconnect
-            // runs, not need an unrelated tool call to happen first. ---
-            let pod_d = create_pod(&pool, conversation_id).await.expect("create_pod (d) should succeed");
-            let terminal_d1 = create_terminal(&pool, pod_d).await.expect("create_terminal (d1) should succeed");
+            // runs, not need an unrelated tool call to happen first.
+            // Another separate conversation, same reason as pod_c. ---
+            let pod_d = create_pod(&pool, conversation_d.id).await.expect("create_pod (d) should succeed");
+            let terminal_d1 = create_terminal(&pool, conversation_d.id).await.expect("create_terminal (d1) should succeed");
             deregister(pod_d);
 
-            let disconnected = list_terminals(&pool, conversation_id).await.expect("list_terminals");
+            let disconnected = list_terminals(&pool, conversation_d.id).await.expect("list_terminals");
             assert_eq!(
                 disconnected.iter().find(|t| t.terminal_id == terminal_d1).map(|t| t.status.as_str()),
                 Some("disconnected"),
@@ -1326,7 +1804,7 @@ mod tests {
 
             try_reconnect(&pool, pod_d).await;
 
-            let reconnected = list_terminals(&pool, conversation_id).await.expect("list_terminals");
+            let reconnected = list_terminals(&pool, conversation_d.id).await.expect("list_terminals");
             assert_eq!(
                 reconnected.iter().find(|t| t.terminal_id == terminal_d1).map(|t| t.status.as_str()),
                 Some("connected"),
@@ -1334,28 +1812,32 @@ mod tests {
             );
 
             terminate_terminal(&pool, terminal_d1).await.expect("terminate_terminal (d1)");
-            terminate_pod(&pool, pod_d).await.expect("terminate_pod (d)");
+            terminate_pod(&pool, conversation_d.id).await.expect("terminate_pod (d)");
 
-            // --- Full teardown: terminate remaining terminals, then both pods ---
+            // --- Full teardown: terminate remaining terminal, then the pod.
+            // terminate_pod is no longer idempotent on repeat now that it's
+            // resolved via conversation_pod_id (live pods only) instead of
+            // a caller-supplied pod_id — once terminated, there's no live
+            // pod left for this conversation to resolve, so a second call
+            // is genuinely NoPod, same as a conversation that never had one. ---
             terminate_terminal(&pool, terminal_a1).await.expect("terminate_terminal (a1)");
-            terminate_pod(&pool, pod_a).await.expect("terminate_pod (a) should succeed once its terminal is gone");
-            terminate_pod(&pool, pod_a).await.expect("terminate_pod (a) should be idempotent");
+            terminate_pod(&pool, conversation_a.id).await.expect("terminate_pod (a) should succeed once its terminal is gone");
+            let repeat = terminate_pod(&pool, conversation_a.id).await;
+            assert!(
+                matches!(repeat, Err(TerminalError::NoPod)),
+                "terminate_pod should no longer be idempotent — a second call resolves to NoPod, got {repeat:?}"
+            );
 
-            terminate_terminal(&pool, terminal_b1).await.expect("terminate_terminal (b1)");
-            terminate_pod(&pool, pod_b).await.expect("terminate_pod (b) should succeed");
-
-            let pods_after = list_pods(&pool, conversation_id).await.expect("list_pods");
-            assert!(pods_after.is_empty(), "no pods should be listed after terminating both, got {pods_after:?}");
-            let terminals_after = list_terminals(&pool, conversation_id).await.expect("list_terminals");
+            let pods_after = list_pods(&pool, conversation_a.id).await.expect("list_pods");
+            assert!(pods_after.is_empty(), "no pods should be listed after terminating it, got {pods_after:?}");
+            let terminals_after = list_terminals(&pool, conversation_a.id).await.expect("list_terminals");
             assert!(terminals_after.is_empty(), "no terminals should be listed after terminating all of them");
 
-            // Unknown pod_id (never created at all, unlike pod_a which
-            // exists but is already terminated — repeat-terminating pod_a
-            // is idempotent, checked above): a real error, not a silent no-op.
+            // A conversation that never had a pod at all: the same NoPod, not a panic.
             let unknown = terminate_pod(&pool, 999_999_999).await;
             assert!(
                 matches!(unknown, Err(TerminalError::NoPod)),
-                "terminate_pod on a never-existed pod_id should error, got {unknown:?}"
+                "terminate_pod on a conversation that never had a pod should error, got {unknown:?}"
             );
         })
         .await;
