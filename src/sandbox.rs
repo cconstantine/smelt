@@ -19,6 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::anthropic::ContentBlock;
 use crate::{db, events};
 
 const NAMESPACE: &str = "smelt-park";
@@ -818,41 +819,56 @@ async fn reconnect_if_needed(pool: &PgPool, pod_id: i64) -> Result<Arc<TerminalC
     if let Some(conn) = registry_get(pod_id) {
         return Ok(conn);
     }
+    reconnect_or_confirm_crash(pool, pod_id).await
+}
 
+/// Bounded retry, not measured against anything real yet — see the plan's
+/// Open Questions.
+const RECONNECT_ATTEMPTS: u32 = 3;
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Tries to (re)connect to a pod's agent; if that fails, checks the pod's
+/// *actual* status via the Kubernetes API before concluding anything — a
+/// single failed `connect()` doesn't mean the pod is dead (a transient
+/// portforward/API hiccup looks identical to one that does), so
+/// `pod_death_reason` is the authoritative signal, not the connection
+/// attempt itself. See the plan's "Detection design."
+async fn reconnect_or_confirm_crash(pool: &PgPool, pod_id: i64) -> Result<Arc<TerminalConnection>, TerminalError> {
     let manager = get();
     let name = pod_name(pod_id);
     let pods = pods_api(&manager.client);
-    let pod = match pods.get_opt(&name).await {
-        Ok(Some(pod)) => pod,
-        // The k8s Pod itself is gone (deleted out from under us, evicted,
-        // node lost, ...) — unlike "not Running yet" below, this never
-        // resolves on its own, so it's unambiguously the same "crashed"
-        // case as a failed `connect()`: run the same cleanup so the DB's
-        // still-live terminal rows don't wedge `terminate_pod` behind
-        // `TerminalStillExists` forever with no k8s pod left to reconnect
-        // to and no path back to a clean state.
-        Ok(None) => {
-            handle_crash_cleanup(pool, pod_id).await;
-            return Err(TerminalError::NoTerminal);
+
+    for attempt in 0..RECONNECT_ATTEMPTS {
+        match connect(&manager.client, pool.clone(), pod_id, &name).await {
+            Ok(conn) => {
+                register(pod_id, conn.clone());
+                return Ok(conn);
+            }
+            Err(_) => match pod_death_reason(&pods, &name).await {
+                Some(reason) => {
+                    handle_crash_cleanup(pool, pod_id, reason).await;
+                    return Err(TerminalError::NoTerminal);
+                }
+                None if attempt + 1 < RECONNECT_ATTEMPTS => {
+                    tokio::time::sleep(RECONNECT_BACKOFF).await;
+                }
+                None => {}
+            },
         }
-        Err(e) => return Err(TerminalError::from(e)),
-    };
-    if pod.status.and_then(|s| s.phase).as_deref() != Some("Running") {
-        // Might just be `Pending` and about to come up — not the same as
-        // "gone for good" above, so no cleanup here.
-        return Err(TerminalError::NoTerminal);
     }
 
-    match connect(&manager.client, pool.clone(), pod_id, &name).await {
-        Ok(conn) => {
-            register(pod_id, conn.clone());
-            Ok(conn)
-        }
-        Err(_) => {
-            handle_crash_cleanup(pool, pod_id).await;
-            Err(TerminalError::NoTerminal)
-        }
+    // Exhausted every attempt without Kubernetes ever confirming the pod
+    // is actually dead — a pod stuck reporting `Running` while genuinely
+    // unreachable, say. The terminal is unusable either way, so clean up
+    // the same as a confirmed crash, and — since Kubernetes itself isn't
+    // going to notice or clean up a pod it still thinks is healthy — make
+    // a best-effort attempt to terminate it ourselves rather than leaving
+    // a resource-consuming zombie the model can't `create_pod` past.
+    handle_crash_cleanup(pool, pod_id, None).await;
+    if let Err(e) = force_terminate_pod(pool, pod_id).await {
+        tracing::warn!(pod_id, error = %e, "best-effort pod termination failed after exhausting reconnect attempts");
     }
+    Err(TerminalError::NoTerminal)
 }
 
 /// Best-effort `reconnect_if_needed`, for callers that want the connection
@@ -875,7 +891,7 @@ pub async fn try_reconnect(pool: &PgPool, pod_id: i64) {
 /// reconnects to an agent `create_terminal` already established. See the
 /// plan's "Why N pods and N terminals."
 async fn ensure_pod_connection(pool: &PgPool, pod_id: i64) -> Result<Arc<TerminalConnection>, TerminalError> {
-    if let Ok(conn) = reconnect_if_needed(pool, pod_id).await {
+    if let Some(conn) = registry_get(pod_id) {
         return Ok(conn);
     }
 
@@ -888,6 +904,19 @@ async fn ensure_pod_connection(pool: &PgPool, pod_id: i64) -> Result<Arc<Termina
     };
     if pod.status.and_then(|s| s.phase).as_deref() != Some("Running") {
         return Err(TerminalError::NoPod);
+    }
+
+    // A single, quick connect attempt first — most calls land here because
+    // an agent is already running from an earlier `create_terminal` in
+    // this same pod (just not in our in-memory registry, e.g. after a
+    // smelt restart), not because this is genuinely the pod's first ever
+    // terminal. A failure here is routine (no agent yet), not a crash
+    // signal, so this deliberately bypasses `reconnect_or_confirm_crash`'s
+    // retry/force-terminate machinery — that's for callers who already
+    // expect a connection to exist, which isn't true here by design.
+    if let Ok(conn) = connect(&manager.client, pool.clone(), pod_id, &name).await {
+        register(pod_id, conn.clone());
+        return Ok(conn);
     }
 
     inject_and_launch(&manager.client, &name).await?;
@@ -1071,10 +1100,12 @@ pub async fn list_directory(pool: &PgPool, conversation_id: i64, path: &str) -> 
 /// `db::mark_terminal_command_lost`), and every one of the pod's live
 /// terminals terminated — a dead agent was hosting all of them, not just
 /// one. A safe no-op if the pod had no terminals.
-async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64) {
+async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64, reason: Option<String>) {
     let conversation_id = db::sandbox_pod_conversation_id(pool, pod_id).await.ok().flatten();
+    let mut found_live_terminal = false;
     if let Ok(terminals) = db::list_sandbox_terminals_for_pod(pool, pod_id).await {
         for terminal in terminals {
+            found_live_terminal = true;
             if let Ok(Some(running)) = db::terminal_command_is_running(pool, terminal.id).await {
                 let _ = db::mark_terminal_command_lost(pool, &running.command_id).await;
             }
@@ -1090,6 +1121,25 @@ async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64) {
                     },
                 );
             }
+        }
+    }
+    // One pod-level notification, gated on the same "found at least one
+    // live terminal" condition that already makes a redundant second call
+    // (e.g. the pre-existing reactive path still firing after this one
+    // already ran) a harmless no-op — no separate dedup state needed. See
+    // the plan's "Detection design": the reason string, when Kubernetes
+    // gave one, is passed straight through rather than guessed at.
+    if found_live_terminal {
+        if let Some(conversation_id) = conversation_id {
+            let text = match reason {
+                Some(reason) => format!(
+                    "Sandbox pod {pod_id} stopped unexpectedly ({reason}); every terminal running in it is no longer available."
+                ),
+                None => format!(
+                    "Sandbox pod {pod_id} stopped unexpectedly; every terminal running in it is no longer available."
+                ),
+            };
+            let _ = db::create_message(pool, conversation_id, "user", &[ContentBlock::Text { text }]).await;
         }
     }
     if let Some(conversation_id) = conversation_id {
