@@ -1174,6 +1174,12 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
     let mut streaming_text: Signal<String> = use_signal(String::new);
     let mut is_streaming = use_signal(|| false);
     let mut stream_error: Signal<Option<String>> = use_signal(|| None);
+    // Set when a background wake-up (a terminal command finishing with no
+    // `send_message` call in flight) fails to actually reach the model —
+    // see `ConversationEvent::NotificationDeliveryFailed`. Separate from
+    // `stream_error` since that one's reset at the start of every `send()`
+    // call; this can arrive at any time, not tied to a live send.
+    let mut notification_delivery_error: Signal<Option<String>> = use_signal(|| None);
     let mut input = use_signal(String::new);
     let mut next_temp_id = use_signal(|| -1i64);
     let mut tasks: Signal<Vec<TaskPanelEntry>> = use_signal(Vec::new);
@@ -1349,6 +1355,9 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                         stream,
                                         latest_output,
                                     );
+                                }
+                                Some(Ok(ConversationEvent::NotificationDeliveryFailed { detail })) => {
+                                    notification_delivery_error.set(Some(detail));
                                 }
                                 Some(Err(_)) | None => break,
                             }
@@ -1735,6 +1744,9 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                             }
                             if let Some(err) = stream_error() {
                                 p { class: "error", "{err}" }
+                            }
+                            if let Some(err) = notification_delivery_error() {
+                                p { class: "error", "A background notification failed to reach the model: {err}" }
                             }
                         }
                         form {
