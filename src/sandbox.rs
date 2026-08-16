@@ -477,6 +477,25 @@ fn deregister(pod_id: i64) {
     TERMINAL_CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner()).remove(&pod_id);
 }
 
+/// Like `deregister`, but only actually removes the entry — and reports
+/// having done so — if it's still exactly this same connection (`Arc::ptr_eq`,
+/// not just an equal `pod_id`). Returns `false` when someone else (a
+/// deliberate `terminate_pod`/`teardown_conversation`, or a newer
+/// reconnect) already replaced or removed it first. See the plan's "How":
+/// this is what lets `connect()`'s reader task tell "this pod was
+/// deliberately torn down" apart from "this connection just crashed"
+/// without any new state.
+fn deregister_if_current(pod_id: i64, conn: &Arc<TerminalConnection>) -> bool {
+    let mut connections = TERMINAL_CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
+    match connections.get(&pod_id) {
+        Some(current) if Arc::ptr_eq(current, conn) => {
+            connections.remove(&pod_id);
+            true
+        }
+        _ => false,
+    }
+}
+
 // --- Pod ---
 
 /// The decision behind `create_pod`'s one-pod-per-conversation guard,
@@ -833,42 +852,54 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 /// portforward/API hiccup looks identical to one that does), so
 /// `pod_death_reason` is the authoritative signal, not the connection
 /// attempt itself. See the plan's "Detection design."
-async fn reconnect_or_confirm_crash(pool: &PgPool, pod_id: i64) -> Result<Arc<TerminalConnection>, TerminalError> {
-    let manager = get();
-    let name = pod_name(pod_id);
-    let pods = pods_api(&manager.client);
+///
+/// Written as a plain `fn` returning a boxed future, not `async fn` —
+/// `connect()`'s reader task calls this, and this itself calls `connect()`
+/// again on retry, and that `async fn`-to-`async fn` cycle defeats rustc's
+/// `Send`-auto-trait inference (development-process.md's documented
+/// hazard — the same shape as `api::chat::run_turn`/`anthropic::tools::execute`).
+fn reconnect_or_confirm_crash(
+    pool: &PgPool,
+    pod_id: i64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<TerminalConnection>, TerminalError>> + Send + '_>> {
+    Box::pin(async move {
+        let manager = get();
+        let name = pod_name(pod_id);
+        let pods = pods_api(&manager.client);
 
-    for attempt in 0..RECONNECT_ATTEMPTS {
-        match connect(&manager.client, pool.clone(), pod_id, &name).await {
-            Ok(conn) => {
-                register(pod_id, conn.clone());
-                return Ok(conn);
+        for attempt in 0..RECONNECT_ATTEMPTS {
+            match connect(&manager.client, pool.clone(), pod_id, &name).await {
+                Ok(conn) => {
+                    register(pod_id, conn.clone());
+                    return Ok(conn);
+                }
+                Err(_) => match pod_death_reason(&pods, &name).await {
+                    Some(reason) => {
+                        handle_crash_cleanup(pool, pod_id, reason).await;
+                        return Err(TerminalError::NoTerminal);
+                    }
+                    None if attempt + 1 < RECONNECT_ATTEMPTS => {
+                        tokio::time::sleep(RECONNECT_BACKOFF).await;
+                    }
+                    None => {}
+                },
             }
-            Err(_) => match pod_death_reason(&pods, &name).await {
-                Some(reason) => {
-                    handle_crash_cleanup(pool, pod_id, reason).await;
-                    return Err(TerminalError::NoTerminal);
-                }
-                None if attempt + 1 < RECONNECT_ATTEMPTS => {
-                    tokio::time::sleep(RECONNECT_BACKOFF).await;
-                }
-                None => {}
-            },
         }
-    }
 
-    // Exhausted every attempt without Kubernetes ever confirming the pod
-    // is actually dead — a pod stuck reporting `Running` while genuinely
-    // unreachable, say. The terminal is unusable either way, so clean up
-    // the same as a confirmed crash, and — since Kubernetes itself isn't
-    // going to notice or clean up a pod it still thinks is healthy — make
-    // a best-effort attempt to terminate it ourselves rather than leaving
-    // a resource-consuming zombie the model can't `create_pod` past.
-    handle_crash_cleanup(pool, pod_id, None).await;
-    if let Err(e) = force_terminate_pod(pool, pod_id).await {
-        tracing::warn!(pod_id, error = %e, "best-effort pod termination failed after exhausting reconnect attempts");
-    }
-    Err(TerminalError::NoTerminal)
+        // Exhausted every attempt without Kubernetes ever confirming the
+        // pod is actually dead — a pod stuck reporting `Running` while
+        // genuinely unreachable, say. The terminal is unusable either way,
+        // so clean up the same as a confirmed crash, and — since
+        // Kubernetes itself isn't going to notice or clean up a pod it
+        // still thinks is healthy — make a best-effort attempt to
+        // terminate it ourselves rather than leaving a resource-consuming
+        // zombie the model can't `create_pod` past.
+        handle_crash_cleanup(pool, pod_id, None).await;
+        if let Err(e) = force_terminate_pod(pool, pod_id).await {
+            tracing::warn!(pod_id, error = %e, "best-effort pod termination failed after exhausting reconnect attempts");
+        }
+        Err(TerminalError::NoTerminal)
+    })
 }
 
 /// Best-effort `reconnect_if_needed`, for callers that want the connection
@@ -1267,8 +1298,18 @@ async fn connect(
                 handle_agent_message(&pool, &conn_for_pump, &text).await;
             }
         }
-        deregister(pod_id);
-        tracing::info!(pod_id, "pod connection ended");
+        // Only treat this as worth reacting to if nobody already tore this
+        // *specific* connection down deliberately (`terminate_pod`/
+        // `teardown_conversation` already deregister before they delete —
+        // see the plan's "How" on why that ordering makes this race-safe).
+        // A newer reconnect already having replaced this entry counts the
+        // same way: not this task's job to react to.
+        if deregister_if_current(pod_id, &conn_for_pump) {
+            tracing::info!(pod_id, "pod connection ended unexpectedly — attempting to reconnect or confirm a crash");
+            let _ = reconnect_or_confirm_crash(&pool, pod_id).await;
+        } else {
+            tracing::info!(pod_id, "pod connection ended (already torn down or replaced)");
+        }
     });
 
     Ok(conn)
