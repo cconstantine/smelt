@@ -136,7 +136,7 @@ coding-oriented `system` prompt, `git clone`/credential wiring.
   at all, since page cache is reclaimable and the kernel had no reason to
   invoke the OOM killer).
 
-**What to change (proposal):**
+**What to change (confirmed and applied to `development-process.md`):**
 - When a fresh, unrelated request arrives mid-branch, decide how to
   package it (separate commit? separate branch?) at the point it
   arrives, not just at the end of the session — the packaging question
