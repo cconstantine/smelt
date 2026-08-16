@@ -86,11 +86,18 @@ namespace object itself).
   either widening that RBAC or an admin-managed policy outside smelt's own
   control; not worth blocking on for now. Revisit with whoever admins
   `homelab` if the threat model changes.
-- **Resource limits:** CPU/memory requests+limits set per-pod in the spec
-  smelt generates — the namespace has no `LimitRange`/`ResourceQuota`
-  today, so smelt itself is the only thing enforcing per-session caps. A
-  hard wall-clock timeout per command still needs its own answer; nothing
-  about Pods gives that for free.
+- **Resource limits:** currently *not* enforced — an earlier `512Mi`/
+  `500m` limit turned out too small for real work (a `cargo build` alone
+  could exceed it) with no way to tell a real OOM kill apart from an
+  ordinary crash when it happened, so the limit was removed outright as
+  an interim fix rather than shipping a bigger number with the same
+  blind spot. `projects/plans/sandbox-oom.md` (on hold) is what
+  reintroduces a real, configurable limit paired with OOM
+  detection/attribution. The namespace still has no `LimitRange`/
+  `ResourceQuota`, so smelt itself remains the only thing that could
+  enforce a per-session cap once one exists again. A hard wall-clock
+  timeout per command still needs its own answer; nothing about Pods
+  gives that for free.
 - **Credentials:** git auth (for private repos) reaches the sandbox as a
   per-session Kubernetes `Secret`, mounted read-only into just that pod
   and deleted with it when the session ends — the RBAC already grants
@@ -103,9 +110,10 @@ namespace object itself).
 **Shipped** — a live sandbox panel shows every pod/terminal the model has
 and each terminal's command history (stdout/stderr in true chronological
 order), streaming as it happens, no reload needed; see
-`projects/completed/20260815-sandbox-visibility.md`. Still open from this
-section: file-edit diffs in the transcript (needs the file read/write
-tools below first).
+`projects/completed/20260815-sandbox-visibility.md`. File read/write/edit
+tools and file-edit diffs in the transcript have since shipped too — see
+`projects/completed/20260816-file-tools.md`. Nothing left open from this
+section.
 
 A sandbox the user can't see into is worse than no sandbox — they need to
 watch what the agent is actually doing (which commands ran, what output

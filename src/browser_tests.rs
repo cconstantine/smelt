@@ -164,28 +164,6 @@ async fn click_when_present(page: &chromiumoxide::Page, selector: &str, timeout:
     }
 }
 
-/// Clicks the first element matching `selector` whose text contains
-/// `text` — for the sandbox panel's pod tabs, which share one class
-/// (`.sandbox-pod-tab`) and are only distinguished by their label, so a
-/// plain CSS selector (what `click_when_present` uses) can't target one
-/// specifically. JS-`click()`ed via `evaluate` rather than chromiumoxide's
-/// own element click, same bounded-retry shape as `click_when_present`.
-async fn click_containing_text(page: &chromiumoxide::Page, selector: &str, text: &str, timeout: Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let js = format!(
-        "(() => {{ const el = [...document.querySelectorAll({selector:?})].find(e => e.textContent.includes({text:?})); if (el) {{ el.click(); return true; }} return false; }})()"
-    );
-    loop {
-        if let Ok(result) = page.evaluate(js.as_str()).await {
-            if let Ok(true) = result.into_value::<bool>() {
-                return;
-            }
-        }
-        assert!(tokio::time::Instant::now() < deadline, "no {selector} containing {text:?} ever appeared");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
 async fn wait_for_text_gone(page: &chromiumoxide::Page, needle: &str, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -214,12 +192,14 @@ async fn test_sandbox_panel_reflects_live_state_end_to_end() {
     let outcome = tokio::time::timeout(Duration::from_secs(180), async {
         let conversation = db::create_conversation(pool).await.expect("create conversation");
 
-        // --- Scenario 1: cold-load panel population, two pods, two terminals in one ---
-        let pod_a = sandbox::create_pod(pool, conversation.id).await.expect("create_pod (a)");
-        let pod_b = sandbox::create_pod(pool, conversation.id).await.expect("create_pod (b)");
-        let terminal_a1 = sandbox::create_terminal(pool, pod_a).await.expect("create_terminal (a1)");
-        let terminal_a2 = sandbox::create_terminal(pool, pod_a).await.expect("create_terminal (a2)");
-        let terminal_b1 = sandbox::create_terminal(pool, pod_b).await.expect("create_terminal (b1)");
+        // --- Scenario 1: cold-load panel population, one pod, two terminals
+        // in it. A conversation has at most one live pod now (see
+        // docs/projects/plans/file-tools.md's "One pod per conversation"),
+        // so there's no tab bar to click through — both terminals render
+        // straight through as soon as the panel loads. ---
+        sandbox::create_pod(pool, conversation.id).await.expect("create_pod");
+        let terminal_a1 = sandbox::create_terminal(pool, conversation.id).await.expect("create_terminal (a1)");
+        let terminal_a2 = sandbox::create_terminal(pool, conversation.id).await.expect("create_terminal (a2)");
 
         let page = harness.browser.new_page(&harness.base_url).await.expect("open the app");
         // Freshly created conversation sorts first (most-recently-updated) —
@@ -227,31 +207,12 @@ async fn test_sandbox_panel_reflects_live_state_end_to_end() {
         // `/conversation/{id}` URL would work too now that routing exists.
         click_when_present(&page, ".conversation-item", Duration::from_secs(10)).await;
 
-        // Two or more pods means a tab bar (see .sandbox-pod-tabs) — only
-        // the active tab's terminals render at once, defaulting to the
-        // first pod. Both tab labels should be visible regardless; only
-        // pod_a's own terminals should be, until pod_b's tab is clicked.
-        for text in [format!("pod {pod_a}"), format!("pod {pod_b}"), format!("terminal {terminal_a1}"), format!("terminal {terminal_a2}")]
-        {
+        for text in [format!("terminal {terminal_a1}"), format!("terminal {terminal_a2}")] {
             assert!(
                 wait_for_text(&page, &text, Duration::from_secs(10)).await,
                 "cold snapshot should render {text}"
             );
         }
-
-        click_containing_text(&page, ".sandbox-pod-tab", &format!("pod {pod_b}"), Duration::from_secs(10)).await;
-        assert!(
-            wait_for_text(&page, &format!("terminal {terminal_b1}"), Duration::from_secs(10)).await,
-            "clicking pod_b's tab should reveal its terminal"
-        );
-
-        // Scenario 2 onward only touches pod_a's terminals — switch back to
-        // its tab so their output is actually in the DOM to assert on.
-        click_containing_text(&page, ".sandbox-pod-tab", &format!("pod {pod_a}"), Duration::from_secs(10)).await;
-        assert!(
-            wait_for_text(&page, &format!("terminal {terminal_a1}"), Duration::from_secs(10)).await,
-            "switching back to pod_a's tab should show its terminals again"
-        );
 
         // --- Scenario 2: live streaming output, no reload ---
         // `anthropic::tools::execute` (unlike sandbox.rs's own lower-level
@@ -311,9 +272,7 @@ async fn test_sandbox_panel_reflects_live_state_end_to_end() {
 
         // Best-effort teardown of what this test created.
         let _ = sandbox::terminate_terminal(pool, terminal_a1).await;
-        let _ = sandbox::terminate_terminal(pool, terminal_b1).await;
-        let _ = sandbox::terminate_pod(pool, pod_a).await;
-        let _ = sandbox::terminate_pod(pool, pod_b).await;
+        let _ = sandbox::terminate_pod(pool, conversation.id).await;
     })
     .await;
 

@@ -37,17 +37,19 @@ cargo test --features server
 
 ## Environment Variables
 
-Copy `.env.example` to `.env` and fill in `ANTHROPIC_API_KEY`. Loaded
-automatically at server startup (`dotenvy::dotenv()` in `main.rs`); a value
-already set in the real environment takes precedence over `.env`. A var
-that's set-but-empty is treated the same as unset (see `anthropic_model()`
-and the `ANTHROPIC_API_KEY` check in `src/api/chat.rs`) — no code path
+Copy `.env.example` to `.env` and fill in `ANTHROPIC_API_KEY` (or
+`ANTHROPIC_AUTH_TOKEN` — see below). Loaded automatically at server startup
+(`dotenvy::dotenv()` in `main.rs`); a value already set in the real
+environment takes precedence over `.env`. A var that's set-but-empty is
+treated the same as unset (see `anthropic_model()` and
+`require_at_least_one_credential()` in `src/api/chat.rs`) — no code path
 silently sends an empty string to the Anthropic API.
 
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
-| `ANTHROPIC_API_KEY` | yes, to send messages | — | Read server-side only; the browser never sees it. Missing key surfaces as a `ChatEvent::Error` in the chat UI, not a crash. |
+| `ANTHROPIC_API_KEY` | yes, unless `ANTHROPIC_AUTH_TOKEN` is set | — | Read server-side only; the browser never sees it. Sent as the `x-api-key` header. Missing (with no `ANTHROPIC_AUTH_TOKEN` either) surfaces as a `ChatEvent::Error` in the chat UI, not a crash. |
+| `ANTHROPIC_AUTH_TOKEN` | no | — | Alternative to `ANTHROPIC_API_KEY`, sent as an `Authorization: Bearer` header instead of `x-api-key` — for an Anthropic-compatible gateway that expects bearer auth (e.g. Hugging Face's hosted endpoint) rather than a real Anthropic API key. If both are set, `ANTHROPIC_AUTH_TOKEN` takes precedence (only one auth header is ever sent). At least one of the two must be set. |
 | `ANTHROPIC_MODEL` | no | `claude-opus-4-8` | Model id passed to the Messages API. |
 | `ANTHROPIC_BASE_URL` | no | `https://api.anthropic.com` | Override for pointing at a mock upstream in tests, or an API-compatible gateway — e.g. a local Ollama server (v0.14.0+ serves an Anthropic-compatible `/v1/messages`; see the commented-out example in `.env.example`). Pick a model with a large-enough context window for tool-calling to work — some models default to a much smaller one than they support. |
 | `ANTHROPIC_THINKING` | no | on | Set to `0`/`false`/`off` to stop sending `thinking: {"type": "adaptive"}`. On by default — `run_turn` retries a request without thinking if the upstream fails with Ollama's specific "error parsing tool call" shape (seen with `gpt-oss` models, whose Anthropic-compat shim doesn't cleanly separate reasoning from a tool call's arguments), so this only needs turning off if some other backend hits a *different* thinking-related failure that retry doesn't cover. See [docs/api.md](api.md). |

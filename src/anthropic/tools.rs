@@ -41,6 +41,7 @@ mod server {
 
     use super::TaskSummary;
     use crate::anthropic::{AnthropicMessage, ContentBlock};
+    use crate::models::Message;
     use crate::{api::chat, db, events, sandbox};
 
     /// Runs the named tool against `input`, returning its result as a plain
@@ -72,9 +73,9 @@ mod server {
             "cancel_task" => cancel_task_tool(conversation_id, input).await,
             "write_task_stdin" => write_task_stdin_tool(input),
             "create_pod" => create_pod_tool(pool, conversation_id).await,
-            "terminate_pod" => terminate_pod_tool(pool, input).await,
+            "terminate_pod" => terminate_pod_tool(pool, conversation_id).await,
             "list_pods" => list_pods_tool(pool, conversation_id).await,
-            "create_terminal" => create_terminal_tool(pool, input).await,
+            "create_terminal" => create_terminal_tool(pool, conversation_id).await,
             "terminate_terminal" => terminate_terminal_tool(pool, input).await,
             "list_terminals" => list_terminals_tool(pool, conversation_id).await,
             "run_terminal_command" => run_terminal_command_tool(pool, conversation_id, tool_use_id, input).await,
@@ -82,6 +83,10 @@ mod server {
             "terminal_command_status" => terminal_command_status_tool(pool, input).await,
             "read_terminal_output" => read_terminal_output_tool(pool, input).await,
             "list_commands" => list_commands_tool(pool, input).await,
+            "read_file" => read_file_tool(pool, conversation_id, input).await,
+            "write_file" => write_file_tool(pool, conversation_id, input).await,
+            "edit_file" => edit_file_tool(pool, conversation_id, input).await,
+            "list_directory" => list_directory_tool(pool, conversation_id, input).await,
             _ => execute_synchronous(name, input).await,
         }
     }
@@ -267,58 +272,49 @@ mod server {
                 }),
             },
             // --- Terminal: pod, terminal, and command are three separate,
-            // explicitly-guarded lifecycles, and a conversation may have N
-            // pods each with N terminals — see
-            // docs/projects/plans/sandbox-terminal.md.
+            // explicitly-guarded lifecycles. A conversation has at most one
+            // live pod at a time, each with N terminals — see
+            // docs/projects/plans/sandbox-terminal.md and
+            // docs/projects/plans/file-tools.md's "One pod per conversation."
             ToolDefinition {
                 name: "create_pod".to_string(),
-                description: "Create a new sandbox pod for this conversation. Not idempotent \
-                               — every call creates a genuinely new pod; call list_pods to see \
-                               what already exists before deciding you need another. Returns \
-                               the new pod's id. A terminal can't be created until a pod \
-                               exists in it."
+                description: "Create this conversation's sandbox pod. Refuses if one already \
+                               exists — call terminate_pod first if you want a fresh one. \
+                               Returns the new pod's id. A terminal can't be created until a \
+                               pod exists."
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
             ToolDefinition {
                 name: "terminate_pod".to_string(),
-                description: "Delete a sandbox pod. Idempotent if it's already terminated; \
-                               errors if pod_id is unknown. Fails if that pod still has a \
-                               terminal in it — call terminate_terminal on it first."
+                description: "Delete this conversation's sandbox pod. Errors if there isn't \
+                               one (call create_pod first). Fails if it still has a terminal \
+                               in it — call terminate_terminal on it first."
                     .to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {"pod_id": {"type": "integer"}},
-                    "required": ["pod_id"]
-                }),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
             ToolDefinition {
                 name: "list_pods".to_string(),
-                description: "List every sandbox pod that currently exists for this \
-                               conversation, with each one's id and status. A conversation \
-                               may have any number of pods."
+                description: "List this conversation's sandbox pod, if it has one, with its \
+                               id and status."
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
             ToolDefinition {
                 name: "create_terminal".to_string(),
-                description: "Create a new persistent terminal inside the given pod. Requires \
-                               that pod to already exist (create_pod first). Not idempotent — \
-                               every call creates a genuinely new terminal; call list_terminals \
-                               to see what already exists in it before deciding you need \
-                               another. Returns the new terminal's id. This is a real, \
-                               persistent shell: state (working directory, exported variables) \
-                               persists across separate run_terminal_command calls and across \
-                               turns. Multiple terminals in the same pod share that pod's \
-                               filesystem and installed state, but are otherwise independent — \
-                               each has its own shell state, and a long-running command in one \
-                               never blocks another."
+                description: "Create a new persistent terminal inside this conversation's \
+                               sandbox pod. Requires that pod to already exist (create_pod \
+                               first). Not idempotent — every call creates a genuinely new \
+                               terminal; call list_terminals to see what already exists before \
+                               deciding you need another. Returns the new terminal's id. This \
+                               is a real, persistent shell: state (working directory, exported \
+                               variables) persists across separate run_terminal_command calls \
+                               and across turns. Multiple terminals in the same pod share that \
+                               pod's filesystem and installed state, but are otherwise \
+                               independent — each has its own shell state, and a long-running \
+                               command in one never blocks another."
                     .to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {"pod_id": {"type": "integer"}},
-                    "required": ["pod_id"]
-                }),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
             ToolDefinition {
                 name: "terminate_terminal".to_string(),
@@ -427,6 +423,86 @@ mod server {
                         "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "defaults to 20, capped at 50"}
                     },
                     "required": ["terminal_id"]
+                }),
+            },
+            // --- File tools: read/edit/write a file, and list a
+            // directory, in this conversation's sandbox pod — see
+            // docs/projects/plans/file-tools.md.
+            ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file from this conversation's sandbox pod. Paginated \
+                               (offset/limit, line-based) so a huge file doesn't have to be \
+                               consumed into context all at once. Returns line-numbered \
+                               content, the file's total line count, and a content hash — \
+                               edit_file, and write_file when overwriting, need that hash \
+                               (as expected_hash) to confirm nothing else changed the file \
+                               first."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "offset": {"type": "integer", "minimum": 1, "description": "1-indexed starting line, defaults to 1"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "defaults to 2000, capped at 2000"}
+                    },
+                    "required": ["path"]
+                }),
+            },
+            ToolDefinition {
+                name: "edit_file".to_string(),
+                description: "Make a targeted old_string -> new_string replacement in a file \
+                               in this conversation's sandbox pod — far cheaper and less risky \
+                               than rewriting the whole file. Both strings can span multiple \
+                               lines. old_string must match exactly once in the file, or the \
+                               call fails (asking for more surrounding context to disambiguate) \
+                               unless replace_all is set. For truly identical repeated blocks \
+                               that no amount of extra context can disambiguate, set \
+                               expected_line (the line old_string starts at, from read_file's \
+                               line-numbered output) to target that one occurrence directly \
+                               instead — mutually exclusive with replace_all. Requires that \
+                               this exact path was already read_file'd (or written/edited) \
+                               earlier in this conversation, and refuses if the file has \
+                               changed since then — call read_file (again) first."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"},
+                        "replace_all": {"type": "boolean", "description": "defaults to false"},
+                        "expected_line": {"type": "integer", "minimum": 1, "description": "target one specific occurrence by its starting line; mutually exclusive with replace_all"}
+                    },
+                    "required": ["path", "old_string", "new_string"]
+                }),
+            },
+            ToolDefinition {
+                name: "write_file".to_string(),
+                description: "Create a new file, or fully overwrite an existing one, in this \
+                               conversation's sandbox pod. Overwriting a path this conversation \
+                               already read_file'd (or wrote/edited) checks that it hasn't \
+                               changed since, and refuses if it has — call read_file first. \
+                               Creating a brand-new path needs no prior read."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "content"]
+                }),
+            },
+            ToolDefinition {
+                name: "list_directory".to_string(),
+                description: "List a directory's contents (one level, not recursive) in this \
+                               conversation's sandbox pod — each entry's name, whether it's a \
+                               file or directory, and byte size for files."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
                 }),
             },
         ]
@@ -1172,6 +1248,45 @@ mod server {
     // time, never concurrently) — see the plan's "Which files" bullet on
     // `anthropic/tools.rs` and `api::chat::run_turn`'s own `conversation_lock`.
 
+    /// The hash from the *most recent* successful `read_file`/`write_file`/
+    /// `edit_file` result for `path` in `messages`, if any — what
+    /// `edit_file`/`write_file`'s wrapper functions check for before ever
+    /// contacting the agent (the "read-before-write discipline"). `messages`
+    /// is expected in chronological order (as `db::list_messages` already
+    /// returns it), so a later match naturally overrides an earlier one.
+    fn find_prior_file_hash(messages: &[Message], path: &str) -> Option<String> {
+        const FILE_TOOLS: &[&str] = &["read_file", "write_file", "edit_file"];
+
+        let mut relevant_tool_use_ids = std::collections::HashSet::new();
+        let mut latest_hash = None;
+
+        for message in messages {
+            let Ok(blocks) = message.blocks() else { continue };
+            for block in blocks {
+                match block {
+                    ContentBlock::ToolUse { id, name, input }
+                        if FILE_TOOLS.contains(&name.as_str())
+                            && input.get("path").and_then(Value::as_str) == Some(path) =>
+                    {
+                        relevant_tool_use_ids.insert(id);
+                    }
+                    ContentBlock::ToolResult { tool_use_id, content, is_error }
+                        if relevant_tool_use_ids.contains(&tool_use_id) && !is_error.unwrap_or(false) =>
+                    {
+                        if let Ok(value) = serde_json::from_str::<Value>(&content) {
+                            if let Some(hash) = value.get("hash").and_then(Value::as_str) {
+                                latest_hash = Some(hash.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        latest_hash
+    }
+
     async fn create_pod_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
         let pod_id = sandbox::create_pod(pool, conversation_id)
             .await
@@ -1179,10 +1294,9 @@ mod server {
         Ok(serde_json::json!({"pod_id": pod_id}).to_string())
     }
 
-    async fn terminate_pod_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
-        let pod_id = required_i64(input, "pod_id")?;
-        sandbox::terminate_pod(pool, pod_id).await.map_err(|e| e.to_string())?;
-        Ok(format!("pod {pod_id} terminated"))
+    async fn terminate_pod_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
+        sandbox::terminate_pod(pool, conversation_id).await.map_err(|e| e.to_string())?;
+        Ok("pod terminated".to_string())
     }
 
     async fn list_pods_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
@@ -1194,9 +1308,8 @@ mod server {
         Ok(serde_json::json!({"pods": payload}).to_string())
     }
 
-    async fn create_terminal_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
-        let pod_id = required_i64(input, "pod_id")?;
-        let terminal_id = sandbox::create_terminal(pool, pod_id).await.map_err(|e| e.to_string())?;
+    async fn create_terminal_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
+        let terminal_id = sandbox::create_terminal(pool, conversation_id).await.map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"terminal_id": terminal_id}).to_string())
     }
 
@@ -1358,6 +1471,90 @@ mod server {
         Ok(serde_json::json!({"commands": payload}).to_string())
     }
 
+    const DEFAULT_READ_FILE_LIMIT: u32 = 2000;
+    const MAX_READ_FILE_LIMIT: u32 = 2000;
+
+    async fn read_file_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
+        let path = required_str(input, "path")?;
+        let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(1).max(1) as u32;
+        let limit = input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_READ_FILE_LIMIT as u64)
+            .clamp(1, MAX_READ_FILE_LIMIT as u64) as u32;
+
+        let contents = sandbox::read_file(pool, conversation_id, &path, offset, limit)
+            .await
+            .map_err(|e| e.to_string())?;
+        let numbered = contents
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{:>6}\t{line}", offset as usize + i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(serde_json::json!({
+            "content": numbered,
+            "total_lines": contents.total_lines,
+            "hash": contents.hash,
+        })
+        .to_string())
+    }
+
+    /// Overwriting an existing path requires it to have already been
+    /// `read_file`'d (or written/edited) earlier in this conversation —
+    /// `find_prior_file_hash` returning `None` means either a brand-new
+    /// path (no prior operation exists to have found) or a path this
+    /// conversation genuinely hasn't touched yet; either way `write_file`
+    /// treats it as a new file and skips the check (nothing to compare
+    /// against), matching the plan's "creating a brand-new file... doesn't
+    /// need this." `edit_file`, below, is stricter — it always needs
+    /// `old_string` to have come from somewhere, so a missing prior hash
+    /// there is a hard refusal instead.
+    async fn write_file_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
+        let path = required_str(input, "path")?;
+        let content = required_str(input, "content")?;
+
+        let messages = db::list_messages(pool, conversation_id).await.map_err(|e| e.to_string())?;
+        let expected_hash = find_prior_file_hash(&messages, &path);
+
+        let hash = sandbox::write_file(pool, conversation_id, &path, &content, expected_hash)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"hash": hash}).to_string())
+    }
+
+    async fn edit_file_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
+        let path = required_str(input, "path")?;
+        let old_string = required_str(input, "old_string")?;
+        let new_string = required_str(input, "new_string")?;
+        let replace_all = input.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+        let expected_line = input.get("expected_line").and_then(Value::as_u64).map(|v| v as u32);
+
+        if replace_all && expected_line.is_some() {
+            return Err("replace_all and expected_line are mutually exclusive — replace_all means every occurrence, expected_line means exactly one".to_string());
+        }
+
+        let messages = db::list_messages(pool, conversation_id).await.map_err(|e| e.to_string())?;
+        let expected_hash = find_prior_file_hash(&messages, &path)
+            .ok_or_else(|| format!("{path} hasn't been read in this conversation yet — call read_file first"))?;
+
+        let hash = sandbox::edit_file(pool, conversation_id, &path, &old_string, &new_string, replace_all, expected_hash, expected_line)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"hash": hash}).to_string())
+    }
+
+    async fn list_directory_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
+        let path = required_str(input, "path")?;
+        let entries = sandbox::list_directory(pool, conversation_id, &path).await.map_err(|e| e.to_string())?;
+        let payload: Vec<_> = entries
+            .iter()
+            .map(|e| serde_json::json!({"name": e.name, "type": if e.is_dir { "dir" } else { "file" }, "size": e.size}))
+            .collect();
+        Ok(serde_json::json!({"entries": payload}).to_string())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1371,6 +1568,120 @@ mod server {
             // until first use, so a bogus URL is safe to construct here.
             PgPool::connect_lazy("postgres://unused:unused@localhost/unused")
                 .expect("lazy pool construction never fails")
+        }
+
+        fn message_with_blocks(id: i64, blocks: Vec<ContentBlock>) -> Message {
+            Message {
+                id,
+                conversation_id: 1,
+                role: "assistant".to_string(),
+                content: serde_json::to_string(&blocks).expect("ContentBlock always serializes"),
+                created_at: chrono::Utc::now().naive_utc(),
+            }
+        }
+
+        fn tool_use(id: &str, name: &str, input: Value) -> ContentBlock {
+            ContentBlock::ToolUse { id: id.to_string(), name: name.to_string(), input }
+        }
+
+        fn tool_result(tool_use_id: &str, content: Value, is_error: bool) -> ContentBlock {
+            ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: content.to_string(),
+                is_error: if is_error { Some(true) } else { None },
+            }
+        }
+
+        #[test]
+        fn test_find_prior_file_hash_returns_none_when_path_never_touched() {
+            let messages = vec![message_with_blocks(
+                1,
+                vec![
+                    tool_use("t1", "read_file", serde_json::json!({"path": "/a.txt"})),
+                    tool_result("t1", serde_json::json!({"content": "x", "hash": "hash-a"}), false),
+                ],
+            )];
+            assert_eq!(find_prior_file_hash(&messages, "/other.txt"), None);
+        }
+
+        #[test]
+        fn test_find_prior_file_hash_returns_hash_from_a_prior_read_file() {
+            let messages = vec![message_with_blocks(
+                1,
+                vec![
+                    tool_use("t1", "read_file", serde_json::json!({"path": "/a.txt"})),
+                    tool_result("t1", serde_json::json!({"content": "x", "hash": "hash-a"}), false),
+                ],
+            )];
+            assert_eq!(find_prior_file_hash(&messages, "/a.txt"), Some("hash-a".to_string()));
+        }
+
+        #[test]
+        fn test_find_prior_file_hash_returns_the_most_recent_hash_across_multiple_operations() {
+            let messages = vec![
+                message_with_blocks(
+                    1,
+                    vec![
+                        tool_use("t1", "read_file", serde_json::json!({"path": "/a.txt"})),
+                        tool_result("t1", serde_json::json!({"content": "x", "hash": "hash-1"}), false),
+                    ],
+                ),
+                message_with_blocks(
+                    2,
+                    vec![
+                        tool_use("t2", "edit_file", serde_json::json!({"path": "/a.txt", "old_string": "x", "new_string": "y"})),
+                        tool_result("t2", serde_json::json!({"hash": "hash-2"}), false),
+                    ],
+                ),
+            ];
+            assert_eq!(find_prior_file_hash(&messages, "/a.txt"), Some("hash-2".to_string()));
+        }
+
+        #[test]
+        fn test_find_prior_file_hash_ignores_an_errored_result() {
+            let messages = vec![message_with_blocks(
+                1,
+                vec![
+                    tool_use("t1", "edit_file", serde_json::json!({"path": "/a.txt", "old_string": "x", "new_string": "y"})),
+                    tool_result("t1", serde_json::json!({"error": "ambiguous match"}), true),
+                ],
+            )];
+            assert_eq!(find_prior_file_hash(&messages, "/a.txt"), None);
+        }
+
+        #[tokio::test]
+        async fn test_edit_file_tool_rejects_replace_all_and_expected_line_together() {
+            let pool = test_pool();
+            let result = edit_file_tool(
+                &pool,
+                1,
+                &serde_json::json!({
+                    "path": "/a.txt", "old_string": "x", "new_string": "y",
+                    "replace_all": true, "expected_line": 3
+                }),
+            )
+            .await;
+            let message = result.expect_err("expected replace_all + expected_line to be rejected");
+            assert!(
+                message.contains("mutually exclusive"),
+                "expected a mutual-exclusivity error, got: {message}"
+            );
+        }
+
+        #[sqlx::test]
+        async fn test_edit_file_tool_refuses_when_path_never_read(pool: sqlx::PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("create conversation");
+            let result = edit_file_tool(
+                &pool,
+                conversation.id,
+                &serde_json::json!({"path": "/never-read.txt", "old_string": "x", "new_string": "y"}),
+            )
+            .await;
+            let message = result.expect_err("expected a refusal when the path was never read");
+            assert!(
+                message.contains("read_file"),
+                "expected an error telling the model to call read_file first, got: {message}"
+            );
         }
 
         #[tokio::test]
