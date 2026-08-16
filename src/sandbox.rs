@@ -498,6 +498,50 @@ fn resolve_pod_id(existing: &[db::SandboxPod]) -> Result<i64, TerminalError> {
     existing.first().map(|p| p.id).ok_or(TerminalError::NoPod)
 }
 
+/// Decides whether a pod is confirmed dead from its already-fetched
+/// status, and what reason (if any) Kubernetes gave — pulled out as a
+/// pure function over an `Option<Pod>` for the same testability reason as
+/// `check_pod_guard`/`resolve_pod_id`. See the plan's "Testing": the outer
+/// `Option` is "confirmed dead or not" (`None` means genuinely
+/// inconclusive — `Running`/`Pending` — not "no reason"); the inner one is
+/// "did Kubernetes give a specific reason for it."
+fn decide_pod_death_reason(pod: Option<Pod>) -> Option<Option<String>> {
+    let Some(pod) = pod else {
+        return Some(None); // pod object gone entirely — confirmed dead, nothing left to inspect
+    };
+    let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
+    if phase != Some("Failed") {
+        return None; // Running, Pending, or no status yet — inconclusive, not confirmed either way
+    }
+
+    let container_terminated_reason = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+        .and_then(|statuses| statuses.first())
+        .and_then(|cs| {
+            cs.state
+                .as_ref()
+                .and_then(|s| s.terminated.as_ref())
+                .or_else(|| cs.last_state.as_ref().and_then(|s| s.terminated.as_ref()))
+        })
+        .and_then(|t| t.reason.clone());
+
+    let reason = container_terminated_reason.or_else(|| pod.status.and_then(|s| s.reason));
+    Some(reason)
+}
+
+/// `decide_pod_death_reason`'s real-world entry point — just the
+/// `pods.get_opt` fetch, handed straight to the pure decision function.
+/// An API call that itself fails is treated the same as "inconclusive"
+/// (`None`), never as confirmation either way — see the plan's "How."
+async fn pod_death_reason(pods: &Api<Pod>, name: &str) -> Option<Option<String>> {
+    match pods.get_opt(name).await {
+        Ok(pod) => decide_pod_death_reason(pod),
+        Err(_) => None,
+    }
+}
+
 /// Resolves "the conversation's pod" — with `create_pod`'s guard in place,
 /// a conversation has at most one live pod, so every pod-scoped call
 /// (`terminate_pod`, `create_terminal`, the file tools) can go straight
@@ -559,28 +603,43 @@ pub async fn terminate_pod(pool: &PgPool, conversation_id: i64) -> Result<(), Te
         return Err(TerminalError::TerminalStillExists);
     }
 
+    match force_terminate_pod(pool, pod_id).await? {
+        Some(_) => Ok(()),
+        None => Err(TerminalError::NoPod),
+    }
+}
+
+/// The mechanical part of tearing a pod down: delete the k8s object (if
+/// it's still there), mark the DB row terminated, publish the UI event.
+/// Shared by `terminate_pod` (a deliberate, guarded teardown — the guard
+/// above already ensures no live terminals before this runs) and
+/// `reconnect_or_confirm_crash`'s exhausted-retries fallback (unguarded —
+/// nothing to check, it's already given up reaching this pod). Deregisters
+/// *before* touching the k8s API, not after — see the plan's "How" on why
+/// that ordering is what lets a deliberate teardown always win the race
+/// against the connection's own reader task noticing the drop.
+async fn force_terminate_pod(pool: &PgPool, pod_id: i64) -> Result<Option<db::SandboxPod>, SandboxError> {
+    deregister(pod_id);
+
     let manager = get();
     let name = pod_name(pod_id);
     let pods = pods_api(&manager.client);
     if pods.get_opt(&name).await?.is_some() {
         pods.delete(&name, &immediate_delete_params()).await?;
     }
-    deregister(pod_id);
 
-    match db::terminate_sandbox_pod(pool, pod_id).await? {
-        Some(row) => {
-            events::publish(
-                row.conversation_id,
-                events::ConversationEvent::SandboxPodUpdate {
-                    pod_id,
-                    status: "terminated".to_string(),
-                    terminated: true,
-                },
-            );
-            Ok(())
-        }
-        None => Err(TerminalError::NoPod),
+    let row = db::terminate_sandbox_pod(pool, pod_id).await.map_err(SandboxError::Db)?;
+    if let Some(row) = &row {
+        events::publish(
+            row.conversation_id,
+            events::ConversationEvent::SandboxPodUpdate {
+                pod_id,
+                status: "terminated".to_string(),
+                terminated: true,
+            },
+        );
     }
+    Ok(row)
 }
 
 pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInfo>, SandboxError> {
@@ -1381,6 +1440,96 @@ mod tests {
         assert!(matches!(result, Err(TerminalError::NoPod)), "expected NoPod, got {result:?}");
     }
 
+    use k8s_openapi::api::core::v1::{ContainerState, ContainerStateTerminated, ContainerStatus, PodStatus};
+
+    fn pod_with_phase(phase: &str) -> Pod {
+        Pod { status: Some(PodStatus { phase: Some(phase.to_string()), ..Default::default() }), ..Default::default() }
+    }
+
+    fn failed_pod_with_container_state(state: Option<ContainerState>, last_state: Option<ContainerState>) -> Pod {
+        Pod {
+            status: Some(PodStatus {
+                phase: Some("Failed".to_string()),
+                container_statuses: Some(vec![ContainerStatus {
+                    state,
+                    last_state,
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn terminated(reason: Option<&str>) -> ContainerState {
+        ContainerState {
+            terminated: Some(ContainerStateTerminated { reason: reason.map(str::to_string), ..Default::default() }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_decide_pod_death_reason_pod_gone_is_confirmed_dead_with_no_reason() {
+        assert_eq!(decide_pod_death_reason(None), Some(None));
+    }
+
+    #[test]
+    fn test_decide_pod_death_reason_failed_with_reason_in_state() {
+        let pod = failed_pod_with_container_state(Some(terminated(Some("OOMKilled"))), None);
+        assert_eq!(decide_pod_death_reason(Some(pod)), Some(Some("OOMKilled".to_string())));
+    }
+
+    #[test]
+    fn test_decide_pod_death_reason_failed_with_reason_only_in_last_state() {
+        // `state` present but not itself `terminated` (e.g. mid-restart) —
+        // the restart_policy: Never quirk this project actually hits puts
+        // the reason in `state`, not `last_state`, but a differently-
+        // configured pod could still show up this way.
+        let pod = failed_pod_with_container_state(
+            Some(ContainerState::default()),
+            Some(terminated(Some("Error"))),
+        );
+        assert_eq!(decide_pod_death_reason(Some(pod)), Some(Some("Error".to_string())));
+    }
+
+    #[test]
+    fn test_decide_pod_death_reason_failed_falls_back_to_pod_status_reason_without_container_status() {
+        let pod = Pod {
+            status: Some(PodStatus {
+                phase: Some("Failed".to_string()),
+                reason: Some("Evicted".to_string()),
+                container_statuses: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(decide_pod_death_reason(Some(pod)), Some(Some("Evicted".to_string())));
+    }
+
+    #[test]
+    fn test_decide_pod_death_reason_failed_with_no_reason_available_anywhere() {
+        let pod = Pod {
+            status: Some(PodStatus { phase: Some("Failed".to_string()), ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(decide_pod_death_reason(Some(pod)), Some(None));
+    }
+
+    #[test]
+    fn test_decide_pod_death_reason_running_is_inconclusive() {
+        assert_eq!(decide_pod_death_reason(Some(pod_with_phase("Running"))), None);
+    }
+
+    #[test]
+    fn test_decide_pod_death_reason_pending_is_inconclusive() {
+        assert_eq!(decide_pod_death_reason(Some(pod_with_phase("Pending"))), None);
+    }
+
+    #[test]
+    fn test_decide_pod_death_reason_no_status_at_all_is_inconclusive() {
+        assert_eq!(decide_pod_death_reason(Some(Pod::default())), None);
+    }
+
     /// DB-only — `create_pod`'s guard must fire *before* it ever touches
     /// the process-global `MANAGER` (unset here, since this test doesn't
     /// need a real cluster), so a refusal shows up as `PodAlreadyExists`,
@@ -1932,6 +2081,44 @@ mod tests {
         pods.delete(&sandbox.pod_name, &immediate_delete_params()).await.ok();
         std::mem::forget(sandbox);
     }
+
+    /// Characterization test for `pod_death_reason`'s real fetch, not
+    /// `decide_pod_death_reason`'s branching (already exhaustively covered
+    /// without a cluster) — proves the wrapper actually calls through to a
+    /// live pod correctly in both directions: inconclusive while it's
+    /// genuinely running, confirmed (with no reason to report) once it's
+    /// gone entirely.
+    #[tokio::test]
+    async fn test_pod_death_reason_reflects_a_real_pod_then_its_absence() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let session_id = unique_session_id("death-reason");
+        let sandbox = manager.create(&session_id).await.expect("create should succeed");
+        let pods = pods_api(&client);
+
+        assert_eq!(pod_death_reason(&pods, &sandbox.pod_name).await, None, "a genuinely Running pod is inconclusive");
+
+        pods.delete(&sandbox.pod_name, &immediate_delete_params()).await.expect("delete should succeed");
+        assert_eq!(
+            pod_death_reason(&pods, &sandbox.pod_name).await,
+            Some(None),
+            "a pod that's gone entirely is confirmed dead with no reason to report"
+        );
+        std::mem::forget(sandbox);
+    }
+
+    // No standalone `force_terminate_pod` test: it's a private helper only
+    // reachable through `terminate_pod`, which `test_terminal_lifecycle_end_to_end`
+    // already exercises six times over. A second test independently racing
+    // to set the process-global `MANAGER` singleton is actively harmful,
+    // not just redundant — `kube::Client`'s internals are tied to whichever
+    // tokio runtime first constructed it, and `#[sqlx::test]`/`#[tokio::test]`
+    // each get their own runtime; whichever test's runtime tears down first
+    // kills the shared client for every other test still relying on it via
+    // `get()`. Confirmed live: adding this test back made
+    // `test_terminal_lifecycle_end_to_end` fail with `Kube(Service(Closed))`
+    // every time it ran after this one, even though neither test touches
+    // the other's data.
 
     #[tokio::test]
     async fn test_manager_delete_removes_the_pod() {
