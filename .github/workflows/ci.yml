@@ -85,17 +85,23 @@ jobs:
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt scripts/build-sandbox-agent.sh
 
-      # SANDBOX_RUNNING_WAIT_TIMEOUT_SECS: the sandbox tests create real
-      # pods against the compose-provided k3s cluster, and the default 30s
-      # budget (fine on the real homelab cluster or a resource-rich dev
-      # machine) isn't reliable on this runner's much smaller CPU/RAM
-      # allotment, which schedules pods measurably slower — see
-      # docs/setup.md. Confirmed this doesn't reproduce off-runner: the
-      # same tests pass locally at the default 30s.
+      # The sandbox tests create real pods against the compose-provided k3s
+      # cluster, and cargo test's default parallelism means several can be
+      # concurrently competing for the runner's CPU at once. Reproduced
+      # locally: this is a genuine capacity shortfall, not just slower
+      # scheduling — a pod that can't fit stays Pending no matter how long
+      # you wait, so raising SANDBOX_RUNNING_WAIT_TIMEOUT_SECS alone
+      # (tried first) didn't fix it. SANDBOX_CPU_LIMIT lowers what
+      # create_pod's tests request per pod (250m here vs the 1-full-core
+      # production default) so more of them fit in the runner's much
+      # smaller real capacity; sandbox.rs's own SandboxManager::create
+      # tests (which bypass this env var) were lowered the same way
+      # directly in the test code. See docs/setup.md.
       - name: cargo test --features server
         run: |
           docker compose run --rm \
             -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
+            -e SANDBOX_CPU_LIMIT=250m \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo test --features server
 
@@ -118,11 +124,12 @@ jobs:
             smelt dx build --platform web
 
       # Also creates a real sandbox pod (see src/browser_tests.rs) — same
-      # SANDBOX_RUNNING_WAIT_TIMEOUT_SECS reasoning as the step above.
+      # reasoning as the step above.
       - name: Browser tests (src/browser_tests.rs)
         run: |
           docker compose run --rm \
             -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
+            -e SANDBOX_CPU_LIMIT=250m \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo test --features "server browser-test" -- --ignored --test-threads=1
 

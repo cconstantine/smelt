@@ -2301,7 +2301,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("create");
 
-        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "8Gi", "250m").await.expect("create should succeed");
 
         let pods = pods_api(&client);
         let pod = pods.get(&sandbox.pod_name).await.expect("pod should exist");
@@ -2317,7 +2317,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("limits");
 
-        let sandbox = manager.create(&session_id, "128Mi", "2").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "128Mi", "500m").await.expect("create should succeed");
 
         let pods = pods_api(&client);
         let pod = pods.get(&sandbox.pod_name).await.expect("pod should exist");
@@ -2333,7 +2333,7 @@ mod tests {
             .limits
             .expect("resources should have limits");
         assert_eq!(limits.get("memory"), Some(&Quantity("128Mi".to_string())));
-        assert_eq!(limits.get("cpu"), Some(&Quantity("2".to_string())));
+        assert_eq!(limits.get("cpu"), Some(&Quantity("500m".to_string())));
 
         pods.delete(&sandbox.pod_name, &immediate_delete_params()).await.ok();
         std::mem::forget(sandbox);
@@ -2352,7 +2352,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("over-limit");
 
-        let result = manager.create(&session_id, "128Gi", "1").await;
+        let result = manager.create(&session_id, "128Gi", "250m").await;
         assert!(
             matches!(result, Err(SandboxError::Kube(_))),
             "a memory_limit over the LimitRange's 64Gi max should be rejected by Kubernetes, got is_ok={}",
@@ -2375,7 +2375,7 @@ mod tests {
         let session_id = unique_session_id("real-oom");
         // Small on purpose — fast and reliable to trigger, using this same
         // plan's own per-pod override rather than the real 8Gi default.
-        let sandbox = manager.create(&session_id, "64Mi", "1").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "64Mi", "250m").await.expect("create should succeed");
         let pods = pods_api(&client);
 
         // The whole `AttachedProcess` — not just its split-off stdout/
@@ -2431,8 +2431,8 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("reuse");
 
-        let first = manager.create(&session_id, "8Gi", "1").await.expect("first create should succeed");
-        let second = manager.create(&session_id, "8Gi", "1").await.expect("second create should reuse, not error");
+        let first = manager.create(&session_id, "8Gi", "250m").await.expect("first create should succeed");
+        let second = manager.create(&session_id, "8Gi", "250m").await.expect("second create should reuse, not error");
 
         assert_eq!(first.pod_name, second.pod_name);
 
@@ -2447,7 +2447,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("exec");
-        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "8Gi", "250m").await.expect("create should succeed");
 
         let result = sandbox.exec(&["echo", "hello"]).await.expect("exec should succeed");
         assert_eq!(result.stdout, "hello\n");
@@ -2472,7 +2472,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("death-reason");
-        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "8Gi", "250m").await.expect("create should succeed");
         let pods = pods_api(&client);
 
         assert_eq!(pod_death_reason(&pods, &sandbox.pod_name).await, None, "a genuinely Running pod is inconclusive");
@@ -2504,7 +2504,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("delete");
-        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "8Gi", "250m").await.expect("create should succeed");
         let pod_name = sandbox.pod_name.clone();
 
         manager.delete(sandbox).await.expect("delete should succeed");
@@ -2519,7 +2519,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("drop");
-        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "8Gi", "250m").await.expect("create should succeed");
         let pod_name = sandbox.pod_name.clone();
 
         drop(sandbox); // no manager.delete call — this is the path under test
