@@ -65,6 +65,17 @@ pub enum ConversationEvent {
         stream: Option<String>,
         latest_output: Option<String>,
     },
+    /// Published when `api::chat::wake_conversation` (fired when a terminal
+    /// command finishes, to notify the model with no further tool call
+    /// needed) fails to actually reach the model — e.g. `ANTHROPIC_API_KEY`
+    /// unset, a transient Anthropic API error. The underlying notification
+    /// text is still durably persisted regardless (`wake_conversation`
+    /// drains and persists it *before* the API call that might fail) — this
+    /// means "the model hasn't been prompted with it yet," not "it's lost."
+    /// See `docs/projects/plans/terminal-exit-notify.md`.
+    NotificationDeliveryFailed {
+        detail: String,
+    },
 }
 
 #[cfg(feature = "server")]
@@ -236,6 +247,15 @@ mod server {
             assert_eq!(
                 rx.recv().await.expect("command event should be delivered"),
                 command_event
+            );
+
+            let failure_event = ConversationEvent::NotificationDeliveryFailed {
+                detail: "ANTHROPIC_API_KEY is not set on the server".to_string(),
+            };
+            publish(6, failure_event.clone());
+            assert_eq!(
+                rx.recv().await.expect("notification-delivery-failed event should be delivered"),
+                failure_event
             );
         }
     }

@@ -801,6 +801,27 @@ async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64) {
             }
         }
     }
+    if let Some(conversation_id) = conversation_id {
+        // Same active wake as a normal command exit (see
+        // `handle_agent_message`'s "exit" branch) — a crash can leave a
+        // command marked 'lost' with nobody proactively telling the model,
+        // the identical gap. One wake covers whatever this pass just
+        // marked lost; `wake_conversation`'s own no-op-when-nothing-
+        // pending behavior makes this cheap even when nothing actually
+        // changed. Detached for a different reason than the exit-event
+        // call: this can run synchronously from *inside* an
+        // already-in-progress `run_turn`/`execute()` call that's already
+        // holding `conversation_id`'s lock (e.g. `run_terminal_command_tool`
+        // → `sandbox::send_command` → `reconnect_if_needed` → here) —
+        // awaiting `wake_conversation` directly would try to re-acquire
+        // that same non-reentrant lock and deadlock, the same hazard
+        // `cancel_task_tool`'s own comment already documents. See
+        // docs/projects/plans/terminal-exit-notify.md.
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
+        });
+    }
     deregister(pod_id);
 }
 
@@ -960,6 +981,19 @@ async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, tex
                         },
                     );
                 }
+                // Actively wake the model rather than leaving it to the
+                // passive backlog drain (which only runs the next time
+                // something *else* triggers a turn) — see
+                // docs/projects/plans/terminal-exit-notify.md. Detached:
+                // this runs inside the per-pod WebSocket reader loop, and
+                // awaiting a full model round trip here would block it from
+                // processing any further output/exit events, this pod's or
+                // a sibling terminal's, until the turn finishes.
+                let pool = pool.clone();
+                let conversation_id = conn.conversation_id;
+                tokio::spawn(async move {
+                    let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
+                });
             }
             return;
         }
@@ -1041,6 +1075,24 @@ mod tests {
     /// there's nothing to race with.
     #[sqlx::test]
     async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
+        // Every terminal command that finishes during this test now
+        // triggers a detached `chat::wake_conversation` call (see
+        // docs/projects/plans/terminal-exit-notify.md) — without this
+        // redirect, `ANTHROPIC_API_KEY` present in this environment's real
+        // process env (not just this test's own doing) would send every one
+        // of those as a genuine request to the live Anthropic API. Pointed
+        // instead at a local port nothing listens on, so every such call
+        // fails fast with a local connection error rather than a real
+        // (slow, costly, non-deterministic) network round trip. Held for
+        // the test's whole duration, guarded the same way
+        // `anthropic::stream`'s and `api::chat`'s own mock-upstream tests
+        // already share this same process-global env var.
+        let _anthropic_guard = crate::anthropic::test_support::lock_anthropic_base_url();
+        unsafe {
+            std::env::set_var("ANTHROPIC_BASE_URL", "http://127.0.0.1:1");
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        }
+
         let client = test_client().await;
         MANAGER.set(SandboxManager::new(client.clone())).ok();
 
@@ -1128,6 +1180,57 @@ mod tests {
 
             send_signal(&pool, terminal_a1, long_id, "KILL").await.expect("send_signal");
             poll_until_finished(&pool, long_id).await;
+
+            // --- A terminal command's own exit event actively wakes the
+            // model — no other trigger needed (see
+            // docs/projects/plans/terminal-exit-notify.md). ANTHROPIC_API_KEY
+            // isn't set in this test environment, so the resulting
+            // wake_conversation call fails at the API step — but the
+            // notification text is drained and durably persisted *before*
+            // that failing call, and the failure itself publishes a visible
+            // event; both are observable without ever touching a real (or
+            // mock) Anthropic endpoint, and without this test doing anything
+            // else that would otherwise trigger the passive backlog drain. ---
+            let mut wake_events = events::subscribe(conversation_id);
+            let wake_command_id = "wake-a1";
+            db::create_terminal_command(&pool, conversation_id, terminal_a1, wake_command_id, "true")
+                .await
+                .expect("create_terminal_command");
+            send_command(&pool, terminal_a1, wake_command_id, "true").await.expect("send_command");
+
+            let saw_wake_failure = tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    match wake_events.recv().await {
+                        Ok(events::ConversationEvent::NotificationDeliveryFailed { .. }) => return true,
+                        Ok(_) => continue,
+                        Err(_) => return false,
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false);
+            assert!(
+                saw_wake_failure,
+                "the command's own exit event should have actively woken the model \
+                 (surfacing as NotificationDeliveryFailed since ANTHROPIC_API_KEY isn't set \
+                 in this test env), with no other trigger — not just sat unnotified waiting \
+                 for something else to happen to the conversation"
+            );
+
+            let messages_after_wake = db::list_messages(&pool, conversation_id).await.expect("list_messages");
+            assert!(
+                messages_after_wake.iter().any(|m| {
+                    m.blocks().ok().is_some_and(|blocks| {
+                        blocks.iter().any(|b| matches!(
+                            b,
+                            crate::anthropic::ContentBlock::Text { text }
+                                if text.contains(wake_command_id) && text.contains("finished")
+                        ))
+                    })
+                }),
+                "the notification message itself should be durably persisted even though \
+                 the follow-up API call failed, got: {messages_after_wake:?}"
+            );
 
             // --- Pod isolation: a file in pod_a is invisible from pod_b ---
             run_and_wait(&pool, conversation_id, terminal_a1, "write-marker", "echo marker > /tmp/isolation-marker").await;
