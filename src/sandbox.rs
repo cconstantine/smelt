@@ -2126,8 +2126,7 @@ mod tests {
 
             // --- Proactive crash detection: deleting a pod out from under a
             // live connection is noticed and reported without any further
-            // tool call — see docs/projects/plans/sandbox-oom.md's
-            // "Detection design". ---
+            // tool call — see docs/projects/completed/20260816-sandbox-oom.md. ---
             let conversation_e = db::create_conversation(&pool).await.expect("create conversation e");
             let pod_e = create_pod(&pool, conversation_e.id, None, None).await.expect("create_pod (e) should succeed");
             let terminal_e = create_terminal(&pool, conversation_e.id).await.expect("create_terminal (e) should succeed");
