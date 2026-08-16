@@ -35,6 +35,15 @@ cargo check --no-default-features --features web --target wasm32-unknown-unknown
 cargo test --features server
 ```
 
+## CI
+
+`.github/workflows/ci.yml` runs on every pull request: the full `cargo test
+--features server` suite (Postgres + real-cluster k3s sandbox tests), the
+WASM `cargo check`, and the automated browser tier — the same tests and the
+same `docker-compose.yml` stack described above and in
+[testing.md](testing.md), just running on GitHub's runner instead of a local
+machine. See [development-process.md](development-process.md#definition-of-done).
+
 ## Environment Variables
 
 Copy `.env.example` to `.env` and fill in `ANTHROPIC_API_KEY` (or

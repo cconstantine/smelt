@@ -18,4 +18,8 @@
 # and its shared libraries, never committed. See docs/testing.md.
 /.browser-check-cache/
 
+# CI's cargo registry cache mount (.github/workflows/ci.yml) — only ever
+# populated on the GitHub Actions runner, never committed.
+/.ci-cargo-cache/
+
 __pycache__/

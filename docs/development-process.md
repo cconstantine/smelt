@@ -111,6 +111,8 @@ The automated browser tier (`src/browser_tests.rs`) covers the sandbox panel onl
 
 Gate per-target dead code with `#[cfg(feature = "...")]` rather than leaving a warning in the other target.
 
+**CI runs all of this automatically on every PR** (`.github/workflows/ci.yml`) — `cargo test --features server`, the WASM `cargo check`, and the browser tier, against the same `docker-compose.yml` stack (Postgres, real k3s cluster) local dev uses. A red CI check means the same thing a red local run does; it doesn't replace running these yourself before pushing, since CI turnaround is much slower than local iteration.
+
 ---
 
 ## Adding a New Feature (Typical Flow)
