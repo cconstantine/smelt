@@ -909,7 +909,7 @@ fn reconnect_or_confirm_crash(
                 }
                 Err(_) => match pod_death_reason(&pods, &name).await {
                     Some(reason) => {
-                        handle_crash_cleanup(pool, pod_id, reason).await;
+                        clean_up_and_terminate_pod(pool, pod_id, reason).await;
                         return Err(TerminalError::NoTerminal);
                     }
                     None if attempt + 1 < RECONNECT_ATTEMPTS => {
@@ -923,17 +923,25 @@ fn reconnect_or_confirm_crash(
         // Exhausted every attempt without Kubernetes ever confirming the
         // pod is actually dead — a pod stuck reporting `Running` while
         // genuinely unreachable, say. The terminal is unusable either way,
-        // so clean up the same as a confirmed crash, and — since
-        // Kubernetes itself isn't going to notice or clean up a pod it
-        // still thinks is healthy — make a best-effort attempt to
-        // terminate it ourselves rather than leaving a resource-consuming
-        // zombie the model can't `create_pod` past.
-        handle_crash_cleanup(pool, pod_id, None).await;
-        if let Err(e) = force_terminate_pod(pool, pod_id).await {
-            tracing::warn!(pod_id, error = %e, "best-effort pod termination failed after exhausting reconnect attempts");
-        }
+        // so clean up and terminate it the same as a confirmed crash.
+        clean_up_and_terminate_pod(pool, pod_id, None).await;
         Err(TerminalError::NoTerminal)
     })
+}
+
+/// `handle_crash_cleanup` plus a best-effort attempt to actually terminate
+/// the pod — delete the k8s object, mark `sandbox_pods.terminated_at` (see
+/// `force_terminate_pod`). Used by *every* path in `reconnect_or_confirm_crash`
+/// that concludes the pod is gone, confirmed or not: Kubernetes doesn't
+/// clean up after an OOM kill (or any other early exit) on its own — a
+/// `Failed` pod with `restart_policy: Never` just sits there — and leaving
+/// the DB row "live" would block `create_pod` from ever making a fresh one
+/// until the model happened to call `terminate_pod` itself first.
+async fn clean_up_and_terminate_pod(pool: &PgPool, pod_id: i64, reason: Option<String>) {
+    handle_crash_cleanup(pool, pod_id, reason).await;
+    if let Err(e) = force_terminate_pod(pool, pod_id).await {
+        tracing::warn!(pod_id, error = %e, "best-effort pod termination failed after a crash");
+    }
 }
 
 /// Best-effort `reconnect_if_needed`, for callers that want the connection
@@ -2026,11 +2034,16 @@ mod tests {
             assert!(subdir_entry.is_dir);
 
             // --- Pod vanishes out from under us (deleted, evicted, node
-            // lost) while smelt still thinks it's live — reconnect_if_needed's
-            // `Ok(None)` branch should run the same crash cleanup a failed
-            // `connect()` already did, not just error out and leave the
-            // terminal wedged forever. A separate conversation, since
-            // conversation_a's one pod slot is already in use. ---
+            // lost) while smelt still thinks it's live — reconnect_or_confirm_crash
+            // should run the same crash cleanup a failed `connect()` already
+            // did, not just error out and leave the terminal wedged forever
+            // — and now also fully terminate the pod itself (not just its
+            // terminals), so a confirmed crash (OOM-killed, or any other
+            // early exit) always leaves `sandbox_pods` correctly marked
+            // terminated, the same as an exhausted-retries "gave up
+            // without ever confirming" crash already did. A separate
+            // conversation, since conversation_a's one pod slot is already
+            // in use. ---
             let pod_c = create_pod(&pool, conversation_c.id, None, None).await.expect("create_pod (c) should succeed");
             let terminal_c1 = create_terminal(&pool, conversation_c.id).await.expect("create_terminal (c1) should succeed");
 
@@ -2047,9 +2060,14 @@ mod tests {
                 "crash cleanup should have marked terminal_c1 terminated even though the pod was never found, not just on a failed connect"
             );
 
-            terminate_pod(&pool, conversation_c.id)
-                .await
-                .expect("terminate_pod (c) should now succeed — no live terminals left blocking it, and no k8s pod left to delete");
+            // The confirmed crash above already fully terminated pod_c
+            // itself (not just its terminal) — terminate_pod now correctly
+            // finds no live pod left for conversation_c to resolve.
+            let already_gone = terminate_pod(&pool, conversation_c.id).await;
+            assert!(
+                matches!(already_gone, Err(TerminalError::NoPod)),
+                "terminate_pod (c) should find no live pod left — a confirmed crash already terminated it, got {already_gone:?}"
+            );
 
             // --- try_reconnect: a still-healthy pod that just lost its
             // in-memory registry entry (e.g. a smelt restart, simulated

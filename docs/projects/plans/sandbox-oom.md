@@ -510,13 +510,17 @@ unit tests assume it does.
   now a best-effort attempt to actually terminate the pod (see "Which
   files"), rather than leaving a resource-consuming zombie the model
   can't `create_pod` past.
-- **Should the *confirmed*-dead branch (`Some(reason)`) also force-terminate
-  the pod, not just the exhausted-retries branch?** Not decided here —
-  the user's ask was specifically about the exhausted/unconfirmed case.
-  A confirmed-dead pod (`Failed`, or `get_opt` → `None`) isn't consuming
-  live resources the way an unconfirmed zombie might be, but it *does*
-  leave the same `create_pod`-blocking stale `sandbox_pods` row behind,
-  and a `Failed` pod object has nothing else that will ever clean it out
-  of the namespace either — same shape of problem, arguably, just lower
-  urgency. Worth revisiting before implementation rather than leaving an
-  inconsistency between the two branches by accident.
+- **Resolved: the *confirmed*-dead branch (`Some(reason)`) also
+  force-terminates the pod, same as the exhausted-retries branch.**
+  Both now go through a shared `clean_up_and_terminate_pod` helper
+  (`handle_crash_cleanup` + best-effort `force_terminate_pod`) — any
+  confirmed crash (an OOM kill specifically, or any other early exit
+  Kubernetes reports as `Failed`/gone) always leaves `sandbox_pods`
+  correctly marked terminated, not just its terminals, so a fresh
+  `create_pod` is never blocked behind a stale live-pod row regardless
+  of which branch caught the crash. Surfaced a real, previously-passing
+  test assertion that was actually relying on the old gap:
+  `test_terminal_lifecycle_end_to_end`'s pod-vanishes-out-from-under-us
+  phase used to expect a follow-up `terminate_pod` call to still
+  succeed (nothing else had terminated the pod row yet) — now correctly
+  expects `NoPod`, since the crash cleanup already fully terminated it.
