@@ -147,6 +147,25 @@ fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// The credential-requirement decision `run_turn_bounded` makes at the top
+/// of every call, pulled out as a pure function over already-read env
+/// values — testable without any env-var mutation, locking, or thread
+/// coordination at all (mutating real `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`
+/// process env vars from a test is fundamentally unsound across concurrent
+/// test threads, `getenv`/`setenv` not being thread-safe at the OS level —
+/// this sidesteps that entirely). At least one of `api_key`/`auth_token`
+/// must be present (either is enough — `ANTHROPIC_AUTH_TOKEN` is what a
+/// Hugging Face-hosted Anthropic-compatible endpoint uses instead of a
+/// real Anthropic API key).
+#[cfg(feature = "server")]
+fn require_at_least_one_credential(api_key: &Option<String>, auth_token: &Option<String>) -> Result<(), String> {
+    if api_key.is_none() && auth_token.is_none() {
+        Err("neither ANTHROPIC_API_KEY nor ANTHROPIC_AUTH_TOKEN is set on the server".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 /// Runs one full tool-use round trip for `conversation_id`: persists
 /// `new_message`, then loops calling the real Anthropic API — executing any
 /// tool the model asks for and persisting its result — until the model
@@ -273,8 +292,11 @@ fn run_turn_bounded<'a>(
 
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .ok()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| ServerFnError::new("ANTHROPIC_API_KEY is not set on the server"))?;
+            .filter(|s| !s.is_empty());
+        let auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty());
+        require_at_least_one_credential(&api_key, &auth_token).map_err(ServerFnError::new)?;
 
         let mut persisted = Vec::new();
         if let Some(new_message) = &new_message {
@@ -355,7 +377,7 @@ fn run_turn_bounded<'a>(
             let mut turn = None;
             let mut last_err = String::new();
             for attempt in 0..=TOOL_CALL_PARSE_RETRIES {
-                match anthropic::stream::stream_anthropic_message(&api_key, &request, &mut relay).await {
+                match anthropic::stream::stream_anthropic_message(api_key.as_deref(), auth_token.as_deref(), &request, &mut relay).await {
                     Ok(t) => {
                         turn = Some(t);
                         break;
@@ -814,6 +836,110 @@ mod tests {
         assert!(!is_ollama_thinking_tool_call_corruption(
             "timed out waiting for Anthropic to respond"
         ));
+    }
+
+    /// `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` are process-global, same
+    /// as `ANTHROPIC_BASE_URL` — restoring both afterward (rather than a
+    /// dedicated lock) is enough, same reasoning
+    /// `test_thinking_enabled_defaults_to_on_and_recognizes_opt_out_values`
+    /// already applies to `ANTHROPIC_THINKING`. Callers must still hold
+    /// `lock_anthropic_base_url` for the duration, since this also touches
+    /// `ANTHROPIC_BASE_URL`-adjacent test infrastructure other tests share.
+    struct CredentialEnvGuard {
+        original_api_key: Option<String>,
+        original_auth_token: Option<String>,
+    }
+
+    impl CredentialEnvGuard {
+        fn capture() -> Self {
+            Self {
+                original_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
+                original_auth_token: std::env::var("ANTHROPIC_AUTH_TOKEN").ok(),
+            }
+        }
+    }
+
+    impl Drop for CredentialEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original_api_key {
+                    Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+                    None => std::env::remove_var("ANTHROPIC_API_KEY"),
+                }
+                match &self.original_auth_token {
+                    Some(v) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", v),
+                    None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_require_at_least_one_credential_errors_when_both_are_missing() {
+        let err = require_at_least_one_credential(&None, &None)
+            .expect_err("should error when neither credential is set");
+        assert!(
+            err.contains("ANTHROPIC_API_KEY") && err.contains("ANTHROPIC_AUTH_TOKEN"),
+            "expected the error to name both env vars, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_require_at_least_one_credential_allows_api_key_only() {
+        require_at_least_one_credential(&Some("sk-ant-...".to_string()), &None)
+            .expect("an API key alone should be sufficient");
+    }
+
+    #[test]
+    fn test_require_at_least_one_credential_allows_auth_token_only() {
+        require_at_least_one_credential(&None, &Some("hf-token".to_string()))
+            .expect("an auth token alone should be sufficient — e.g. a Hugging Face-hosted endpoint");
+    }
+
+    #[test]
+    fn test_require_at_least_one_credential_allows_both_present() {
+        require_at_least_one_credential(&Some("sk-ant-...".to_string()), &Some("hf-token".to_string()))
+            .expect("both being present should still be fine");
+    }
+
+    #[sqlx::test]
+    async fn test_run_turn_succeeds_with_only_auth_token_set_no_api_key(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _env_guard = CredentialEnvGuard::capture();
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+
+        let body = sse_body(&[
+            ("message_start", r#"{"type":"message_start"}"#),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi!"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        start_mock_upstream(vec![body]).await;
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "hf-token");
+        }
+
+        let new_message = anthropic::AnthropicMessage {
+            role: "user".to_string(),
+            content: vec![anthropic::ContentBlock::Text { text: "hello".to_string() }],
+        };
+
+        let messages = run_turn(&pool, conversation.id, new_message, None)
+            .await
+            .expect("run_turn should succeed using only ANTHROPIC_AUTH_TOKEN, with no ANTHROPIC_API_KEY set");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, "assistant");
     }
 
     /// A finished, not-yet-notified terminal command — the state

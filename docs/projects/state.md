@@ -21,6 +21,7 @@ A single-user, 100%-Rust AI chat agent: a Dioxus fullstack (SSR + hydration) web
 - History persists across restarts (Postgres, not in-memory) — message content is stored as JSON `ContentBlock`s, not plain text, so tool calls, results, and thinking blocks round-trip through storage exactly like Anthropic's own protocol shape
 - Missing/invalid API key surfaces as a visible error in the chat UI rather than hanging or crashing silently
 - `ANTHROPIC_BASE_URL` can point at a local Ollama server instead of the real Anthropic API (v0.14.0+ serves an Anthropic-compatible `/v1/messages`) — see [setup.md](../setup.md).
+- `ANTHROPIC_AUTH_TOKEN` is an alternative to `ANTHROPIC_API_KEY` for an Anthropic-compatible gateway expecting bearer auth instead of an `x-api-key` header (e.g. Hugging Face's hosted endpoint) — at least one of the two must be set.
 
 ## Architecture (short version — see [architecture.md](../architecture.md) for the full picture)
 

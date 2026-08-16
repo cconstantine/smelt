@@ -202,19 +202,26 @@ const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600
 /// test can exercise the timeout with a short duration instead of the real
 /// `RESPONSE_TIMEOUT`.
 async fn send_and_await_response(
-    api_key: &str,
+    api_key: Option<&str>,
+    auth_token: Option<&str>,
     request: &CreateMessageRequest,
     base_url: &str,
     response_timeout: std::time::Duration,
 ) -> Result<reqwest::Response, String> {
+    let client = reqwest::Client::new()
+        .post(format!("{base_url}/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .json(request);
+    let client = if let Some(auth_token) = auth_token {
+        client.header("Authorization", format!("Bearer {auth_token}"))
+    } else if let Some(api_key) = api_key {
+        client.header("x-api-key", api_key)
+    } else {
+        return Err("no ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN credential was provided".to_string());
+    };
     tokio::time::timeout(
         response_timeout,
-        reqwest::Client::new()
-            .post(format!("{base_url}/v1/messages"))
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(request)
-            .send(),
+        client.send(),
     )
     .await
     .map_err(|_| "timed out waiting for Anthropic to respond".to_string())?
@@ -227,12 +234,13 @@ async fn send_and_await_response(
 /// stream ends. Tool-use blocks accumulate silently; `on_delta` only ever
 /// fires for text. `request.stream` should be `true`.
 pub async fn stream_anthropic_message(
-    api_key: &str,
+    api_key: Option<&str>,
+    auth_token: Option<&str>,
     request: &CreateMessageRequest,
     mut on_delta: impl FnMut(&str),
 ) -> Result<StreamedTurn, String> {
     let response =
-        send_and_await_response(api_key, request, &anthropic_base_url(), RESPONSE_TIMEOUT).await?;
+        send_and_await_response(api_key, auth_token, request, &anthropic_base_url(), RESPONSE_TIMEOUT).await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -502,7 +510,7 @@ mod tests {
             thinking: None,
         };
 
-        stream_anthropic_message("test-key", &request, on_delta).await
+        stream_anthropic_message(Some("test-key"), None, &request, on_delta).await
     }
 
     #[tokio::test]
@@ -678,7 +686,8 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             send_and_await_response(
-                "test-key",
+                Some("test-key"),
+                None,
                 &request,
                 &format!("http://{addr}"),
                 std::time::Duration::from_millis(50),
@@ -691,5 +700,100 @@ mod tests {
             Err(e) => assert_eq!(e, "timed out waiting for Anthropic to respond"),
             Ok(_) => panic!("expected a timeout error, got a response"),
         }
+    }
+
+    /// Spins up a throwaway mock upstream that captures the request's
+    /// headers (instead of caring about the body) and calls
+    /// `send_and_await_response` against it — for asserting exactly which
+    /// auth header a given credential combination actually sends.
+    async fn send_and_capture_headers(
+        api_key: Option<&str>,
+        auth_token: Option<&str>,
+    ) -> (Result<reqwest::Response, String>, Option<axum::http::HeaderMap>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+
+        let captured: std::sync::Arc<std::sync::Mutex<Option<axum::http::HeaderMap>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_route = captured.clone();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let captured = captured_for_route.clone();
+                async move {
+                    *captured.lock().unwrap_or_else(|e| e.into_inner()) = Some(headers);
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], "")
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let request = CreateMessageRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 100,
+            system: None,
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+            thinking: None,
+        };
+
+        let result = send_and_await_response(
+            api_key,
+            auth_token,
+            &request,
+            &format!("http://{addr}"),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let headers = captured.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        (result, headers)
+    }
+
+    #[tokio::test]
+    async fn test_send_and_await_response_uses_bearer_auth_when_auth_token_is_set() {
+        let (result, headers) = send_and_capture_headers(Some("api-key-value"), Some("hf-token-value")).await;
+        result.expect("request should succeed");
+        let headers = headers.expect("mock upstream should have received the request");
+        assert_eq!(headers.get("authorization").expect("Authorization header"), "Bearer hf-token-value");
+        assert!(headers.get("x-api-key").is_none(), "should not also send x-api-key when auth_token is set");
+    }
+
+    #[tokio::test]
+    async fn test_send_and_await_response_uses_x_api_key_when_only_api_key_is_set() {
+        let (result, headers) = send_and_capture_headers(Some("api-key-value"), None).await;
+        result.expect("request should succeed");
+        let headers = headers.expect("mock upstream should have received the request");
+        assert_eq!(headers.get("x-api-key").expect("x-api-key header"), "api-key-value");
+        assert!(headers.get("authorization").is_none(), "should not send Authorization when only api_key is set");
+    }
+
+    #[tokio::test]
+    async fn test_send_and_await_response_errors_clearly_when_neither_credential_is_set() {
+        let result = send_and_await_response(
+            None,
+            None,
+            &CreateMessageRequest {
+                model: "claude-opus-4-8".to_string(),
+                max_tokens: 100,
+                system: None,
+                messages: vec![],
+                stream: true,
+                tools: vec![],
+                thinking: None,
+            },
+            "http://127.0.0.1:1", // unreachable — must never even try to connect
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let message = result.expect_err("expected an error when neither credential is set");
+        assert!(
+            message.contains("API key") || message.contains("auth token") || message.contains("credential"),
+            "expected a clear missing-credentials error, got: {message}"
+        );
     }
 }
