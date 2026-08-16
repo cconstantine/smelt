@@ -1742,7 +1742,7 @@ mod tests {
         // names, untouched by this). A small pre-emptive wipe of the low
         // integer range this run will actually use is enough.
         let pods_precheck = pods_api(&client);
-        for n in 1..=20i64 {
+        for n in 1..=30i64 {
             pods_precheck.delete(&pod_name(n), &immediate_delete_params()).await.ok();
         }
 
@@ -1751,7 +1751,7 @@ mod tests {
         let conversation_c = db::create_conversation(&pool).await.expect("create conversation c");
         let conversation_d = db::create_conversation(&pool).await.expect("create conversation d");
 
-        let outcome = tokio::time::timeout(Duration::from_secs(240), async {
+        let outcome = tokio::time::timeout(Duration::from_secs(400), async {
             // --- Guards fire before there's anything to guard against yet ---
             let too_early = create_terminal(&pool, conversation_a.id).await;
             assert!(
@@ -2105,6 +2105,101 @@ mod tests {
                 matches!(unknown, Err(TerminalError::NoPod)),
                 "terminate_pod on a conversation that never had a pod should error, got {unknown:?}"
             );
+
+            // --- Proactive crash detection: deleting a pod out from under a
+            // live connection is noticed and reported without any further
+            // tool call — see docs/projects/plans/sandbox-oom.md's
+            // "Detection design". ---
+            let conversation_e = db::create_conversation(&pool).await.expect("create conversation e");
+            let pod_e = create_pod(&pool, conversation_e.id, None, None).await.expect("create_pod (e) should succeed");
+            let terminal_e = create_terminal(&pool, conversation_e.id).await.expect("create_terminal (e) should succeed");
+
+            pods_api(&client).delete(&pod_name(pod_e), &immediate_delete_params()).await.expect("delete pod (e) directly");
+
+            // Poll for the pod-level message itself, not `list_terminals`'
+            // "disconnected" status — that status flips (via
+            // `deregister_if_current`) *before* `handle_crash_cleanup`
+            // finishes the rest of its work (marking the terminal
+            // terminated, persisting this message), so it's an earlier,
+            // racier signal than the thing this phase actually cares about.
+            let detected = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if any_message_contains(&pool, conversation_e.id, "stopped unexpectedly").await {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            })
+            .await;
+            assert!(
+                detected.is_ok(),
+                "an unattributed crash (pod simply gone, no reason to report) should get the plain pod-level notification without any further tool call"
+            );
+            // `list_terminals` only returns *live* terminals
+            // (`terminated_at IS NULL`) — once crash-cleanup has actually
+            // terminated it, it's simply absent, not present-with-a-
+            // disconnected-status.
+            let terminals_e = list_terminals(&pool, conversation_e.id).await.expect("list_terminals");
+            assert!(
+                terminals_e.iter().all(|t| t.terminal_id != terminal_e),
+                "terminal (e) should be terminated (and so absent from list_terminals) by the same crash-cleanup pass"
+            );
+
+            // --- Deliberate termination is never misreported as a crash —
+            // the Arc::ptr_eq identity check in `deregister_if_current`
+            // is what makes this race-safe against the reader task noticing
+            // the same connection drop for a different reason. ---
+            let conversation_f = db::create_conversation(&pool).await.expect("create conversation f");
+            create_pod(&pool, conversation_f.id, None, None).await.expect("create_pod (f) should succeed");
+            terminate_pod(&pool, conversation_f.id).await.expect("terminate_pod (f) should succeed");
+            tokio::time::sleep(Duration::from_secs(2)).await; // give a wrongly-firing reader task a chance to misfire
+            assert!(
+                !any_message_contains(&pool, conversation_f.id, "stopped unexpectedly").await,
+                "a deliberate terminate_pod must never produce a crash notification"
+            );
+
+            // --- Exhausting reconnect attempts without Kubernetes ever
+            // confirming death still cleans up *and* force-terminates the
+            // pod — verified by create_pod succeeding again immediately
+            // after, not staying blocked behind a stale live-pod row. No
+            // terminal is ever created here, so no agent is ever injected:
+            // every connect() attempt genuinely and deterministically fails
+            // while the pod itself stays Running throughout, exactly the
+            // "stuck reporting Running but unreachable" case this path
+            // exists for. ---
+            let conversation_g = db::create_conversation(&pool).await.expect("create conversation g");
+            let pod_g = create_pod(&pool, conversation_g.id, None, None).await.expect("create_pod (g) should succeed");
+            let gave_up = reconnect_or_confirm_crash(&pool, pod_g).await;
+            assert!(
+                matches!(gave_up, Err(TerminalError::NoTerminal)),
+                "should give up as NoTerminal once reconnect attempts are exhausted, got {:?}",
+                gave_up.is_ok()
+            );
+            let pod_g_gone = pods_api(&client).get_opt(&pod_name(pod_g)).await.expect("get_opt");
+            assert!(pod_g_gone.is_none(), "exhausting reconnect attempts should force-terminate the k8s pod");
+            let recreated = create_pod(&pool, conversation_g.id, None, None).await;
+            assert!(
+                recreated.is_ok(),
+                "create_pod should succeed again immediately, not stay blocked behind a stale live-pod row, got {recreated:?}"
+            );
+
+            // --- An idle terminal (nothing running in it) still gets
+            // covered by the pod-level message, even though it has no
+            // per-command message of its own. ---
+            let conversation_h = db::create_conversation(&pool).await.expect("create conversation h");
+            let pod_h = create_pod(&pool, conversation_h.id, None, None).await.expect("create_pod (h) should succeed");
+            create_terminal(&pool, conversation_h.id).await.expect("create_terminal (h) should succeed");
+            pods_api(&client).delete(&pod_name(pod_h), &immediate_delete_params()).await.expect("delete pod (h) directly");
+            let detected_h = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if any_message_contains(&pool, conversation_h.id, "stopped unexpectedly").await {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            })
+            .await;
+            assert!(detected_h.is_ok(), "an idle terminal's pod crashing should still produce the pod-level notification");
         })
         .await;
 
@@ -2155,6 +2250,16 @@ mod tests {
         }
     }
 
+    async fn any_message_contains(pool: &PgPool, conversation_id: i64, needle: &str) -> bool {
+        db::list_messages(pool, conversation_id)
+            .await
+            .expect("list_messages")
+            .iter()
+            .any(|m| m.blocks().ok().is_some_and(|blocks| {
+                blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains(needle)))
+            }))
+    }
+
     #[tokio::test]
     async fn test_create_reaches_running_from_clean_slate() {
         let client = test_client().await;
@@ -2196,6 +2301,92 @@ mod tests {
         assert_eq!(limits.get("cpu"), Some(&Quantity("2".to_string())));
 
         pods.delete(&sandbox.pod_name, &immediate_delete_params()).await.ok();
+        std::mem::forget(sandbox);
+    }
+
+    /// A `memory_limit` over the `smelt-park` namespace's `LimitRange` max
+    /// (`k8s/smelt-park-rbac.yaml`, `64Gi`) is rejected by Kubernetes
+    /// itself — no app-side comparison logic to test, just that the
+    /// rejection actually happens and surfaces as an ordinary error.
+    /// Requires the `LimitRange` to actually be applied to the cluster
+    /// (`k3s-bootstrap`, or the equivalent on `homelab`) — see the plan's
+    /// "Per-pod limit overrides".
+    #[tokio::test]
+    async fn test_create_rejects_a_memory_limit_over_the_limitrange_max() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let session_id = unique_session_id("over-limit");
+
+        let result = manager.create(&session_id, "128Gi", "1").await;
+        assert!(
+            matches!(result, Err(SandboxError::Kube(_))),
+            "a memory_limit over the LimitRange's 64Gi max should be rejected by Kubernetes, got is_ok={}",
+            result.is_ok()
+        );
+    }
+
+    /// The one real, permanent OOM trigger in this suite (see the plan's
+    /// "Testing" on why this isn't a full `cargo build` like the design
+    /// spike used — a bash builtin growing memory directly in its own
+    /// process, no fork, needs no `rust:*` image). Proves the whole real
+    /// path end to end: a genuine kernel OOM kill, Kubernetes actually
+    /// reporting `OOMKilled`, and `pod_death_reason` extracting it from a
+    /// *real* API response — the pure unit tests already cover the
+    /// branching logic exhaustively, but only against constructed data.
+    #[tokio::test]
+    async fn test_pod_death_reason_reports_oomkilled_from_a_real_oom_kill() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let session_id = unique_session_id("real-oom");
+        // Small on purpose — fast and reliable to trigger, using this same
+        // plan's own per-pod override rather than the real 8Gi default.
+        let sandbox = manager.create(&session_id, "64Mi", "1").await.expect("create should succeed");
+        let pods = pods_api(&client);
+
+        // The whole `AttachedProcess` — not just its split-off stdout/
+        // stderr handles — is moved into the spawned task, so the exec
+        // session it owns stays open for as long as *that task* runs, not
+        // tied to this function's own scope. Letting `exec` drop early
+        // (e.g. a `{ ... }` block that only spawns readers off split
+        // handles) closes the underlying connection, and since this
+        // process is directly attached (not `setsid`-detached the way the
+        // real agent injection is), the container runtime kills it right
+        // along with the disconnect — the remote command never gets a
+        // chance to actually run.
+        if let Ok(mut exec) = pods
+            .exec(&sandbox.pod_name, ["bash", "-c", "printf -v x '%*s' 200000000 ''; sleep 5"], &AttachParams::default())
+            .await
+        {
+            tokio::spawn(async move {
+                let mut out = String::new();
+                let mut err = String::new();
+                if let Some(mut so) = exec.stdout() {
+                    let _ = so.read_to_string(&mut out).await;
+                }
+                if let Some(mut se) = exec.stderr() {
+                    let _ = se.read_to_string(&mut err).await;
+                }
+                exec.join().await.ok();
+            });
+        }
+
+        let reason = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(reason) = pod_death_reason(&pods, &sandbox.pod_name).await {
+                    return reason;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("pod should be confirmed dead within 30s of a real OOM trigger");
+
+        assert_eq!(
+            reason,
+            Some("OOMKilled".to_string()),
+            "a real OOM kill should surface as OOMKilled via the real Kubernetes API, not a constructed one"
+        );
+
         std::mem::forget(sandbox);
     }
 
