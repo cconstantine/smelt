@@ -5,13 +5,12 @@
 //! `docs/projects/plans/sandbox-terminal.md` for the full design; the
 //! original pod-only mechanism is `docs/projects/plans/k8s-sandbox.md`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use k8s_openapi::api::core::v1::{Container, Pod, PodSpec, ResourceRequirements};
-use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use k8s_openapi::api::core::v1::{Container, Pod, PodSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, AttachParams, DeleteParams, PostParams};
 use serde::Deserialize;
@@ -21,11 +20,6 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::{db, events};
-
-// No LimitRange in the smelt-park namespace (see plan) — these are the
-// only enforcement there is.
-const CPU_LIMIT: &str = "500m";
-const MEMORY_LIMIT: &str = "512Mi";
 
 const NAMESPACE: &str = "smelt-park";
 const RUNNING_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -232,10 +226,6 @@ impl SandboxManager {
 }
 
 fn build_pod_spec(name: &str) -> Pod {
-    let mut limits = BTreeMap::new();
-    limits.insert("cpu".to_string(), Quantity(CPU_LIMIT.to_string()));
-    limits.insert("memory".to_string(), Quantity(MEMORY_LIMIT.to_string()));
-
     Pod {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
@@ -256,10 +246,12 @@ fn build_pod_spec(name: &str) -> Pod {
                 // conversation's lifetime; the actual work all happens via
                 // exec, never via the pod's own entrypoint.
                 command: Some(vec!["sleep".to_string(), "infinity".to_string()]),
-                resources: Some(ResourceRequirements {
-                    limits: Some(limits),
-                    ..Default::default()
-                }),
+                // No CPU/memory limits — a real limit low enough to matter
+                // (512Mi) OOM-kills real work (a `cargo build` alone can
+                // exceed it) with no detection/attribution when it
+                // happens; that's a real project of its own, deliberately
+                // deferred rather than half-built. Unbounded within
+                // whatever the node itself has to give.
                 ..Default::default()
             }],
             restart_policy: Some("Never".to_string()),
