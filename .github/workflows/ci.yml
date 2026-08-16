@@ -85,9 +85,17 @@ jobs:
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt scripts/build-sandbox-agent.sh
 
+      # SANDBOX_RUNNING_WAIT_TIMEOUT_SECS: the sandbox tests create real
+      # pods against the compose-provided k3s cluster, and the default 30s
+      # budget (fine on the real homelab cluster or a resource-rich dev
+      # machine) isn't reliable on this runner's much smaller CPU/RAM
+      # allotment, which schedules pods measurably slower — see
+      # docs/setup.md. Confirmed this doesn't reproduce off-runner: the
+      # same tests pass locally at the default 30s.
       - name: cargo test --features server
         run: |
           docker compose run --rm \
+            -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo test --features server
 
@@ -109,9 +117,12 @@ jobs:
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt dx build --platform web
 
+      # Also creates a real sandbox pod (see src/browser_tests.rs) — same
+      # SANDBOX_RUNNING_WAIT_TIMEOUT_SECS reasoning as the step above.
       - name: Browser tests (src/browser_tests.rs)
         run: |
           docker compose run --rm \
+            -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo test --features "server browser-test" -- --ignored --test-threads=1
 

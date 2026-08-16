@@ -24,7 +24,7 @@ use crate::anthropic::ContentBlock;
 use crate::{db, events};
 
 const NAMESPACE: &str = "smelt-park";
-const RUNNING_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_RUNNING_WAIT_TIMEOUT_SECS: u64 = 30;
 
 /// Matches `sandbox_agent`'s own `LISTEN_ADDR` port.
 const AGENT_PORT: u16 = 8088;
@@ -41,7 +41,7 @@ static AGENT_BINARY: &[u8] = include_bytes!(concat!(
 #[derive(Debug)]
 pub enum SandboxError {
     Kube(kube::Error),
-    /// The pod didn't reach `Running` within `RUNNING_WAIT_TIMEOUT`.
+    /// The pod didn't reach `Running` within `running_wait_timeout()`.
     Timeout,
     /// A pod already existed for this session but wasn't `Running` (e.g.
     /// `Terminating`, `Failed`). What to do here is an open question in
@@ -244,6 +244,24 @@ fn default_cpu_limit() -> String {
     std::env::var("SANDBOX_CPU_LIMIT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "1".to_string())
 }
 
+/// `SANDBOX_RUNNING_WAIT_TIMEOUT_SECS`, default `30` — same pattern as
+/// `default_memory_limit`. How long `wait_for_running` waits for a pod to
+/// reach `Running` before giving up with `SandboxError::Timeout`. The
+/// homelab cluster's real scheduling latency is why this exists as a
+/// tunable rather than a bare constant: a CPU-constrained CI runner
+/// schedules pods measurably slower than a real cluster or a
+/// resource-rich dev machine, and 30s — plenty in both of the latter —
+/// isn't a reliable bound under CI's actual constraints. See
+/// docs/setup.md.
+fn running_wait_timeout() -> Duration {
+    let secs = std::env::var("SANDBOX_RUNNING_WAIT_TIMEOUT_SECS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_RUNNING_WAIT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
 /// `memory`/`cpu` are plain Kubernetes `Quantity` strings (`"8Gi"`, `"1"`)
 /// — no app-side parsing or validation of the format; an invalid value is
 /// rejected by the Kubernetes API itself when the pod is actually
@@ -286,7 +304,7 @@ fn build_pod_spec(name: &str, memory: &str, cpu: &str) -> Pod {
 }
 
 async fn wait_for_running(pods: &Api<Pod>, name: &str) -> Result<(), SandboxError> {
-    tokio::time::timeout(RUNNING_WAIT_TIMEOUT, async {
+    tokio::time::timeout(running_wait_timeout(), async {
         loop {
             let pod = pods.get(name).await?;
             if pod.status.and_then(|s| s.phase).as_deref() == Some("Running") {
