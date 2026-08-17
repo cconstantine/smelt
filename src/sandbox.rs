@@ -333,6 +333,14 @@ async fn drain_cleanup_queue(client: kube::Client, mut rx: mpsc::UnboundedReceiv
 static MANAGER: OnceLock<SandboxManager> = OnceLock::new();
 
 pub async fn init() -> &'static SandboxManager {
+    // `main()` already calls this before `init()` — but `init()` is also
+    // called directly by `browser_tests.rs`'s in-process test harness,
+    // which never runs through `main()` at all. Idempotent (`let _ = ...`
+    // ignores the "already installed" error), so calling it again here is
+    // safe regardless of caller. See `main()`'s own call site for the full
+    // "why ring, not aws-lc-rs" explanation.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let client = kube::Client::try_default()
         .await
         .unwrap_or_else(|e| panic!("failed to build kube client (check KUBECONFIG): {e}"));
