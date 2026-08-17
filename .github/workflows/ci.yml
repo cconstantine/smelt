@@ -87,19 +87,25 @@ jobs:
 
       # The sandbox tests create real pods against the compose-provided k3s
       # cluster. Two of them (test_dropping_without_delete_still_cleans_up_via_drain_task,
-      # test_terminal_lifecycle_end_to_end) reliably time out here in CI —
+      # test_terminal_lifecycle_end_to_end) reliably timed out here in CI —
       # neither raising SANDBOX_RUNNING_WAIT_TIMEOUT_SECS to 120s nor
-      # lowering SANDBOX_CPU_LIMIT to 250m fixed it, and both attempts
-      # failed at (approximately) the same elapsed time regardless, which
-      # points away from plain CPU-quota contention toward something more
-      # specific this environment hasn't surfaced yet. Kept both env vars
-      # (harmless either way) and added the diagnostics step below to
-      # capture real pod/event state on failure instead of guessing again.
+      # lowering SANDBOX_CPU_LIMIT to 250m fixed it. The diagnostics step
+      # below (added when those two didn't work) found the real cause:
+      # `FailedScheduling ... 0/1 nodes are available: 1 Insufficient
+      # memory` — every test pod requested the production 8Gi default,
+      # and this runner's node doesn't have enough allocatable memory to
+      # schedule more than one such pod at a time. Not a timing issue at
+      # all, which is why raising the timeout never helped. Lowered the
+      # same way as CPU: src/sandbox.rs's SandboxManager::create test call
+      # sites now request 128Mi instead of 8Gi, and SANDBOX_MEMORY_LIMIT
+      # below does the same for create_pod's tests via the existing
+      # env-var default.
       - name: cargo test --features server
         run: |
           docker compose run --rm \
             -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
             -e SANDBOX_CPU_LIMIT=250m \
+            -e SANDBOX_MEMORY_LIMIT=128Mi \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo test --features server
 
@@ -152,6 +158,7 @@ jobs:
           docker compose run --rm \
             -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
             -e SANDBOX_CPU_LIMIT=250m \
+            -e SANDBOX_MEMORY_LIMIT=128Mi \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo test --features "server browser-test" -- --ignored --test-threads=1
 
