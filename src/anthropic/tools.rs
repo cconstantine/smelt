@@ -62,6 +62,9 @@ mod server {
         name: &str,
         input: &Value,
     ) -> Result<String, String> {
+        if let Some((server_name, tool_name)) = crate::mcp::parse_tool_name(name) {
+            return call_mcp_tool(pool, server_name, tool_name, input).await;
+        }
         match name {
             "run_async" => run_async(pool, conversation_id, tool_use_id, input).await,
             "list_tasks" => Ok(list_tasks(conversation_id)),
@@ -91,15 +94,19 @@ mod server {
         }
     }
 
-    /// Tool schemas offered to the model on every `send_message` call, and
-    /// also what `run_async` validates a wrapped tool's input against
-    /// before spawning (see `validate_against_schema`) — one definition,
-    /// used both ways, so there's a single source of truth for what a tool
+    /// smelt's own built-in tool schemas — everything except MCP-provided
+    /// tools (see `tool_definitions` below, which appends those). Also
+    /// what `run_async` validates a wrapped tool's input against before
+    /// spawning (see `validate_against_schema`) — one definition, used
+    /// both ways, so there's a single source of truth for what a tool
     /// accepts rather than the schema and a hand-written check drifting
     /// apart. `add` and `count` are deliberately throwaway stand-ins
     /// proving the tool-use protocol round trips through this codebase,
-    /// not real tools.
-    pub fn tool_definitions() -> Vec<crate::anthropic::ToolDefinition> {
+    /// not real tools. Deliberately synchronous and pool-free: every
+    /// caller that only needs smelt's own static tools (`run_async`'s
+    /// schema validation, tests) shouldn't pay for a DB round trip and MCP
+    /// connection attempts it doesn't need.
+    pub fn native_tool_definitions() -> Vec<crate::anthropic::ToolDefinition> {
         use crate::anthropic::ToolDefinition;
         vec![
             ToolDefinition {
@@ -519,6 +526,35 @@ mod server {
         ]
     }
 
+    /// Dispatches a `mcp__<server_name>__<tool_name>` tool call — resolves
+    /// `server_name` back to its `mcp_servers` row (unique on `name`) and
+    /// forwards to `crate::mcp::call_tool`. An unknown server name is a
+    /// plain tool error (not a panic): the config could have been deleted
+    /// between when `tool_definitions` last offered this tool and when the
+    /// model called it.
+    async fn call_mcp_tool(pool: &PgPool, server_name: &str, tool_name: &str, input: &Value) -> Result<String, String> {
+        let config = crate::db::get_mcp_server_config_by_name(pool, server_name)
+            .await
+            .map_err(|e| format!("failed to look up MCP server {server_name:?}: {e}"))?
+            .ok_or_else(|| format!("unknown MCP server: {server_name:?}"))?;
+        crate::mcp::call_tool(&config, tool_name, input.clone()).await
+    }
+
+    /// The full tool list offered to the model on every `send_message`
+    /// call: smelt's own static tools plus every configured MCP server's
+    /// tools, namespaced `mcp__<server_name>__<tool_name>` (see
+    /// `crate::mcp`). A server that fails to connect this turn is skipped
+    /// rather than failing the whole request — see
+    /// `crate::mcp::tool_definitions_for`.
+    pub async fn tool_definitions(pool: &PgPool) -> Vec<crate::anthropic::ToolDefinition> {
+        let mut definitions = native_tool_definitions();
+        match crate::db::list_mcp_server_configs(pool).await {
+            Ok(configs) => definitions.extend(crate::mcp::tool_definitions_for(&configs).await),
+            Err(e) => tracing::warn!(error = %e, "failed to list configured MCP servers; their tools are unavailable this turn"),
+        }
+        definitions
+    }
+
     /// Validates `input` against a JSON Schema `schema`, generically for
     /// any tool — the model-facing `input_schema` a `ToolDefinition`
     /// already carries *is* the single source of truth for what a tool
@@ -859,10 +895,10 @@ mod server {
         // count's target out of range) would spawn a task doomed to fail,
         // return a misleading success message, and only surface the real
         // error later via task_result/wait_task or a push notification.
-        let definition = tool_definitions()
+        let definition = native_tool_definitions()
             .into_iter()
             .find(|def| def.name == tool)
-            .expect("WRAPPABLE_TOOLS names are always present in tool_definitions()");
+            .expect("WRAPPABLE_TOOLS names are always present in native_tool_definitions()");
         validate_against_schema(&tool_input, &definition.input_schema)
             .map_err(|e| format!("invalid input for {tool}: {e}"))?;
 
@@ -1802,6 +1838,42 @@ mod server {
             assert!(result.is_err(), "expected an error, got {result:?}");
         }
 
+        /// `execute`'s new `mcp__` routing branch, exercised end to end
+        /// against a real (empty) `mcp_servers` table — needs a real
+        /// `#[sqlx::test]` pool (unlike `test_pool()`'s lazy fake one)
+        /// since this path genuinely queries the database, unlike
+        /// `add`/`count`. Covers the "config was deleted out from under a
+        /// stale tool name" case `call_mcp_tool`'s doc comment describes —
+        /// a plain tool error, not a panic.
+        #[sqlx::test]
+        async fn test_execute_routes_mcp_prefixed_names_and_errors_clearly_on_unknown_server(pool: PgPool) {
+            let result = execute(
+                &pool,
+                1,
+                "toolu_mcp",
+                "mcp__github__list_issues",
+                &serde_json::json!({}),
+            )
+            .await;
+
+            let err = result.expect_err("no such MCP server is configured, so this must fail");
+            assert!(
+                err.contains("github"),
+                "error should name the unresolvable server, got: {err}"
+            );
+        }
+
+        /// A native tool name is unaffected by the new `mcp__` routing
+        /// branch — `parse_tool_name` only matches the `mcp__` prefix, so
+        /// ordinary dispatch (and its lazy/never-connects `test_pool`) is
+        /// unchanged.
+        #[tokio::test]
+        async fn test_execute_still_dispatches_native_tools_normally() {
+            let pool = test_pool();
+            let result = execute(&pool, 1, "toolu_add", "add", &serde_json::json!({"a": 2, "b": 3})).await;
+            assert_eq!(result, Ok("5".to_string()));
+        }
+
         #[tokio::test]
         async fn test_run_async_rejects_wrapped_tool_input_that_violates_its_own_schema() {
             let pool = test_pool();
@@ -1842,7 +1914,7 @@ mod server {
         }
 
         fn add_schema() -> Value {
-            tool_definitions()
+            native_tool_definitions()
                 .into_iter()
                 .find(|t| t.name == "add")
                 .unwrap()
@@ -1850,7 +1922,7 @@ mod server {
         }
 
         fn count_schema() -> Value {
-            tool_definitions()
+            native_tool_definitions()
                 .into_iter()
                 .find(|t| t.name == "count")
                 .unwrap()
@@ -2343,6 +2415,8 @@ mod server {
 
 #[cfg(feature = "server")]
 pub use server::execute;
+#[cfg(feature = "server")]
+pub use server::native_tool_definitions;
 #[cfg(feature = "server")]
 pub use server::snapshot_tasks;
 #[cfg(feature = "server")]

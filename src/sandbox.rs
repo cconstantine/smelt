@@ -1562,6 +1562,21 @@ mod tests {
     use super::*;
 
     async fn test_client() -> kube::Client {
+        // Same call `main()` makes before building any TLS-using client
+        // (see its own comment) — but `main()` never runs under `cargo
+        // test`, so without this, the first `kube::Client` built here hits
+        // rustls's auto-detect instead of an explicit choice. That
+        // auto-detect only works when exactly one crypto-provider backend
+        // is compiled into the binary; it started panicking
+        // ("Could not automatically determine the process-level
+        // CryptoProvider... make sure exactly one of the 'aws-lc-rs' and
+        // 'ring' features is enabled") once `rmcp`'s own `reqwest` feature
+        // (added for the MCP client, see Cargo.toml) pulled a second
+        // candidate backend into the shared `reqwest` dependency. `let _
+        // =` because a second call in the same test binary (multiple
+        // tests each calling `test_client()`) is no-op-safe, not an error
+        // worth surfacing.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         kube::Client::try_default().await.expect("KUBECONFIG must point at a reachable cluster for sandbox tests")
     }
 

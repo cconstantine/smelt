@@ -845,4 +845,372 @@ body {
     border-radius: 8px;
     padding: 8px 12px;
     font-size: 13px;
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+.mcp-servers-link {
+    display: block;
+    padding: 8px 10px;
+    border-radius: 8px;
+    color: #555;
+    font-size: 13px;
+    text-decoration: none;
+    text-align: center;
+    border: 1px solid #e5e5e5;
+}
+
+.mcp-servers-link:hover {
+    background: #f2f2f2;
+    color: #111;
+}
+
+.mcp-servers-page {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+}
+
+.mcp-servers-header {
+    margin-bottom: 24px;
+}
+
+.mcp-back-link {
+    display: inline-block;
+    margin-bottom: 12px;
+    color: #555;
+    font-size: 13px;
+    text-decoration: none;
+}
+
+.mcp-back-link:hover {
+    color: #111;
+}
+
+.mcp-add-form,
+.mcp-edit-form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px;
+    border: 1px solid #e5e5e5;
+    border-radius: 12px;
+    background: #fff;
+    margin-bottom: 24px;
+}
+
+.mcp-add-form label,
+.mcp-edit-form label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #333;
+}
+
+.mcp-add-form input,
+.mcp-edit-form input {
+    padding: 8px 12px;
+    border: 1px solid #d0d0d0;
+    border-radius: 8px;
+    font-size: 14px;
+}
+
+.mcp-add-form input:focus,
+.mcp-edit-form input:focus {
+    outline: none;
+    border-color: #111;
+    box-shadow: 0 0 0 3px rgba(17, 17, 17, 0.08);
+}
+
+.mcp-add-form button,
+.mcp-edit-form button,
+.mcp-server-actions button {
+    align-self: flex-start;
+    padding: 8px 16px;
+    border: 1px solid #111;
+    border-radius: 8px;
+    background: #111;
+    color: #fff;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.mcp-add-form button:hover,
+.mcp-edit-form button:hover,
+.mcp-server-actions button:hover {
+    background: #2b2b2b;
+}
+
+.mcp-save-edit:disabled {
+    background: #e5e5e5;
+    border-color: #e5e5e5;
+    color: #999;
+    cursor: not-allowed;
+}
+
+.mcp-save-edit.saving:disabled {
+    background: #111;
+    border-color: #111;
+    color: #fff;
+    cursor: default;
+}
+
+.mcp-save-spinner {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    margin-right: 6px;
+    vertical-align: -1px;
+    border: 2px solid rgba(255, 255, 255, 0.35);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: mcp-save-spin 0.7s linear infinite;
+}
+
+@keyframes mcp-save-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.mcp-header-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.mcp-header-row {
+    display: flex;
+    gap: 8px;
+}
+
+.mcp-header-row input {
+    flex: 1;
+}
+
+.mcp-header-existing-name {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    font-size: 14px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #333;
+    background: #f7f7f7;
+    border: 1px solid transparent;
+    border-radius: 8px;
+}
+
+.mcp-remove-header,
+.mcp-add-header {
+    padding: 6px 10px;
+    border: 1px solid #d0d0d0;
+    border-radius: 8px;
+    background: #fff;
+    color: #555;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.mcp-remove-header:hover,
+.mcp-add-header:hover {
+    background: #f2f2f2;
+}
+
+.mcp-server-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.mcp-server-row {
+    padding: 14px 16px;
+    border: 1px solid #e5e5e5;
+    border-radius: 12px;
+    background: #fff;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.mcp-server-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.mcp-server-name {
+    font-weight: 600;
+    font-size: 15px;
+}
+
+.mcp-server-url {
+    font-size: 13px;
+    color: #666;
+    word-break: break-all;
+}
+
+.mcp-server-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.mcp-server-actions button {
+    background: #fff;
+    color: #111;
+}
+
+.mcp-server-actions button:hover {
+    background: #f2f2f2;
+}
+
+.mcp-delete {
+    border-color: #c0392b !important;
+    color: #c0392b !important;
+}
+
+.mcp-delete.confirm {
+    background: #c0392b !important;
+    color: #fff !important;
+}
+
+.mcp-new-server-link {
+    display: inline-block;
+    margin-top: 12px;
+    padding: 8px 16px;
+    border: 1px solid #111;
+    border-radius: 8px;
+    background: #111;
+    color: #fff;
+    font-size: 13px;
+    font-weight: 600;
+    text-decoration: none;
+}
+
+.mcp-new-server-link:hover {
+    background: #2b2b2b;
+}
+
+.mcp-server-row-link {
+    color: inherit;
+    text-decoration: none;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.mcp-server-row-link:hover {
+    border-color: #bbb;
+    background: #fafafa;
+}
+
+.mcp-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.mcp-status::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+}
+
+.mcp-status-checking {
+    background: #f2f2f2;
+    color: #777;
+}
+
+.mcp-status-connected {
+    background: #e8f7ed;
+    color: #1e7e34;
+}
+
+.mcp-status-unreachable {
+    background: #fdecea;
+    color: #c0392b;
+}
+
+div.mcp-status-connected,
+div.mcp-status-unreachable {
+    display: block;
+    border-radius: 10px;
+    padding: 12px 14px;
+    white-space: normal;
+}
+
+div.mcp-status-connected::before,
+div.mcp-status-unreachable::before {
+    content: none;
+}
+
+.mcp-status-section,
+.mcp-headers-section,
+.mcp-danger-section {
+    margin-bottom: 24px;
+}
+
+.mcp-status-section h2,
+.mcp-headers-section h2,
+.mcp-danger-section h2 {
+    font-size: 14px;
+    margin-bottom: 8px;
+}
+
+.mcp-tool-list {
+    margin: 8px 0 0;
+    padding-left: 18px;
+    font-size: 13px;
+    color: #444;
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+.mcp-tool-list li {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding: 1px 0;
+}
+
+.mcp-refresh-status {
+    margin-top: 10px;
+    padding: 6px 12px;
+    border: 1px solid #d0d0d0;
+    border-radius: 8px;
+    background: #fff;
+    color: #555;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.mcp-refresh-status:hover {
+    background: #f2f2f2;
+}
+
+.mcp-refresh-status:disabled {
+    cursor: default;
+    color: #999;
+}
+
+.mcp-refresh-status:disabled:hover {
+    background: #fff;
+}
+
+.mcp-refresh-spinner {
+    /* .mcp-save-spinner's white ring is invisible on this button's light
+       background — same spinner shape, just recolored for a light button. */
+    border-color: rgba(0, 0, 0, 0.15);
+    border-top-color: #555;
 }

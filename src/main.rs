@@ -4,6 +4,8 @@ mod api;
 mod db;
 mod events;
 mod frontend;
+#[cfg(feature = "server")]
+mod mcp;
 mod models;
 #[cfg(feature = "server")]
 mod sandbox;
