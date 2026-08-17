@@ -206,5 +206,5 @@ cargo test --features "server browser-test" -- --ignored --test-threads=1
 
 ## What's not covered yet
 
-- **The automated browser tier is minimal, not comprehensive.** One test, covering the `sandbox-visibility` panel specifically — not a general framework other features are expected to plug into yet, and nothing runs it in CI (no CI exists in this repo at all). Worth extending once it's proven stable and another feature has a similar need for real-DOM verification.
+- **The automated browser tier is minimal, not comprehensive.** One test, covering the `sandbox-visibility` panel specifically — not a general framework other features are expected to plug into yet. It does run in CI now (`.github/workflows/ci.yml`, see [development-process.md](development-process.md#definition-of-done)), but is still just the one test. Worth extending once another feature has a similar need for real-DOM verification.
 - **No native SSR component-test harness.** Components aren't unit-tested by rendering them to a string outside a real page load. Worth adding if/when component logic grows complex enough that manual browser verification alone becomes slow to iterate on.
