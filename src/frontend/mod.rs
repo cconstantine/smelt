@@ -1,7 +1,7 @@
 mod pages;
 
 use dioxus::prelude::*;
-use pages::Chat;
+use pages::{Chat, McpServerEdit, McpServerNew, McpServersIndex};
 
 #[derive(Routable, Clone, PartialEq, Debug)]
 pub(crate) enum Route {
@@ -9,11 +9,32 @@ pub(crate) enum Route {
     Home {},
     #[route("/conversation/:id")]
     ConversationRoute { id: i64 },
+    #[route("/mcp-servers")]
+    McpServersRoute {},
+    #[route("/mcp-servers/new")]
+    McpServerNewRoute {},
+    #[route("/mcp-servers/:id")]
+    McpServerEditRoute { id: i64 },
 }
 
 #[component]
 fn Home() -> Element {
     rsx! { Chat {} }
+}
+
+#[component]
+fn McpServersRoute() -> Element {
+    rsx! { McpServersIndex {} }
+}
+
+#[component]
+fn McpServerNewRoute() -> Element {
+    rsx! { McpServerNew {} }
+}
+
+#[component]
+fn McpServerEditRoute(id: i64) -> Element {
+    rsx! { McpServerEdit { id } }
 }
 
 /// `id` only exists here to satisfy the `Routable` derive's requirement

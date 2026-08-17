@@ -21,7 +21,9 @@ similar = "2.7"
 dotenvy = { version = "0.15", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"], optional = true }
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "migrate", "chrono"], optional = true }
+# "json" enables serde_json::Value <-> JSONB mapping — needed by
+# mcp_servers.extra_headers (see docs/projects/plans/mcp-servers.md).
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "migrate", "chrono", "json"], optional = true }
 tower-http = { version = "0.6", features = ["trace"], optional = true }
 futures-util = { version = "0.3", optional = true }
 axum = { version = "0.8", features = ["ws"], optional = true }
@@ -52,6 +54,33 @@ rustls = { version = "0.23", default-features = false, features = ["ring"], opti
 # download/manage) — see docs/projects/completed/20260815-sandbox-visibility.md's "Why
 # chromiumoxide."
 chromiumoxide = { version = "0.7", optional = true }
+# For src/mcp.rs's MCP (Model Context Protocol) client — the official Rust
+# SDK, handles the Streamable HTTP transport (both plain-JSON and SSE-upgrade
+# response modes) and server-initiated notifications so smelt doesn't
+# hand-roll the wire protocol — see docs/projects/plans/mcp-servers.md.
+# "transport-streamable-http-server" is test-only (src/mcp.rs's #[cfg(test)]
+# mock MCP server), not used by the real binary, but there's no separate
+# dev-dependencies-with-features mechanism for an optional dep — same
+# tradeoff as pulling chromiumoxide in under a whole extra feature, not
+# worth it for this much smaller addition.
+# "reqwest" (the plain feature, distinct from
+# "transport-streamable-http-client-reqwest") is required separately —
+# rmcp's own Cargo.toml only wires TLS support (rustls) behind this feature
+# name, not behind the transport feature; without it, connecting to any
+# https:// MCP server fails at runtime with a "scheme is not http" error
+# from the underlying (TLS-less) reqwest client, discovered the hard way
+# against a real https:// server, not caught by any local test since the
+# mock MCP server in src/mcp.rs's own tests uses a plaintext in-memory
+# transport, not real HTTP.
+# For src/mcp.rs's header-map construction (HeaderName/HeaderValue) — same
+# version axum/rmcp already pull in transitively, needed here directly
+# since Rust doesn't expose a transitive dependency's API without an
+# explicit edge.
+http = { version = "1", optional = true }
+# "server" is needed too (not just the client-side pieces) purely for
+# #[cfg(test)]'s mock MCP server, which implements rmcp's own
+# ServerHandler trait — that trait is gated behind rmcp's "server" feature.
+rmcp = { version = "3.1.2", default-features = false, features = ["client", "server", "reqwest", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"], optional = true }
 
 # Web-only: a wasm-compatible timer (tokio::time has no driver in a browser
 # tab — there's no tokio runtime on the WASM client at all).
@@ -76,6 +105,8 @@ server = [
     "dep:tokio-tungstenite",
     "dep:tar",
     "dep:sha2",
+    "dep:rmcp",
+    "dep:http",
 ]
 # Separate from `server` so the default `cargo test --features server` loop
 # stays exactly as fast as it is today — src/browser_tests.rs's one

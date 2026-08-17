@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -496,6 +497,110 @@ pub async fn list_terminal_commands(
     .bind(limit)
     .fetch_all(pool)
     .await
+}
+
+// --- MCP servers (externally-hosted, configured via the /mcp-servers UI) ---
+// Plain CRUD, no soft delete — this is configuration a person edits, not a
+// live external resource like a sandbox pod. See
+// docs/projects/completed/20260817-mcp-servers.md.
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, sqlx::FromRow)]
+pub struct McpServerConfig {
+    pub id: i64,
+    pub name: String,
+    pub url: String,
+    pub extra_headers: sqlx::types::Json<HashMap<String, String>>,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+pub async fn create_mcp_server_config(
+    pool: &PgPool,
+    name: &str,
+    url: &str,
+    extra_headers: &HashMap<String, String>,
+) -> Result<McpServerConfig, sqlx::Error> {
+    sqlx::query_as::<_, McpServerConfig>(
+        "INSERT INTO mcp_servers (name, url, extra_headers) VALUES ($1, $2, $3) RETURNING *",
+    )
+    .bind(name)
+    .bind(url)
+    .bind(sqlx::types::Json(extra_headers))
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_mcp_server_configs(pool: &PgPool) -> Result<Vec<McpServerConfig>, sqlx::Error> {
+    sqlx::query_as::<_, McpServerConfig>("SELECT * FROM mcp_servers ORDER BY name ASC")
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn get_mcp_server_config(pool: &PgPool, id: i64) -> Result<Option<McpServerConfig>, sqlx::Error> {
+    sqlx::query_as::<_, McpServerConfig>("SELECT * FROM mcp_servers WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Resolves a `mcp__<server_name>__<tool_name>` tool call's server half —
+/// `name` is unique, so this is how `anthropic::tools::execute`'s MCP
+/// dispatch arm turns the model-facing name back into a row.
+pub async fn get_mcp_server_config_by_name(
+    pool: &PgPool,
+    name: &str,
+) -> Result<Option<McpServerConfig>, sqlx::Error> {
+    sqlx::query_as::<_, McpServerConfig>("SELECT * FROM mcp_servers WHERE name = $1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Updates a server's name, URL, and headers in one shot — the single save
+/// action the `/mcp-servers/{id}` edit page's one form drives. Name/URL are
+/// set outright; headers are *merged*: `upsert` adds/overwrites just those
+/// names and `remove` drops just those names, so every other existing
+/// header (including ones the browser never received a value for — see
+/// `McpServerSummary`) is left exactly as it was. If a name appears in both
+/// `upsert` and `remove`, `upsert` wins — the header ends up set, not
+/// deleted (arbitrary but deterministic; the UI never actually produces
+/// this case, since a header row is either edited or removed, never both).
+pub async fn update_mcp_server_config(
+    pool: &PgPool,
+    id: i64,
+    name: &str,
+    url: &str,
+    upsert: &HashMap<String, String>,
+    remove: &[String],
+) -> Result<Option<McpServerConfig>, sqlx::Error> {
+    let Some(existing) = get_mcp_server_config(pool, id).await? else {
+        return Ok(None);
+    };
+
+    let mut merged = existing.extra_headers.0;
+    for name in remove {
+        merged.remove(name);
+    }
+    merged.extend(upsert.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+    sqlx::query_as::<_, McpServerConfig>(
+        "UPDATE mcp_servers SET name = $2, url = $3, extra_headers = $4, updated_at = now()
+         WHERE id = $1 RETURNING *",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(url)
+    .bind(sqlx::types::Json(merged))
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_mcp_server_config(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM mcp_servers WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1165,5 +1270,173 @@ mod tests {
             .await
             .expect("list should still work against a terminated terminal");
         assert!(history.iter().any(|c| c.command_id == command.command_id));
+    }
+
+    #[sqlx::test]
+    async fn test_create_list_get_delete_mcp_server_config_round_trip(pool: PgPool) {
+        let headers = HashMap::from([("Authorization".to_string(), "Bearer secret".to_string())]);
+        let created = create_mcp_server_config(&pool, "github", "https://api.githubcopilot.com/mcp/", &headers)
+            .await
+            .expect("create mcp server config");
+        assert_eq!(created.name, "github");
+        assert_eq!(created.extra_headers.0, headers);
+
+        let all = list_mcp_server_configs(&pool).await.expect("list mcp server configs");
+        assert!(all.iter().any(|s| s.id == created.id));
+
+        let fetched = get_mcp_server_config(&pool, created.id)
+            .await
+            .expect("get mcp server config")
+            .expect("row should exist");
+        assert_eq!(fetched.url, "https://api.githubcopilot.com/mcp/");
+
+        delete_mcp_server_config(&pool, created.id)
+            .await
+            .expect("delete mcp server config");
+        let after_delete = get_mcp_server_config(&pool, created.id)
+            .await
+            .expect("get should still succeed");
+        assert!(after_delete.is_none(), "row should be gone after delete");
+    }
+
+    #[sqlx::test]
+    async fn test_update_mcp_server_config_renames_without_touching_headers(pool: PgPool) {
+        let original_headers =
+            HashMap::from([("Authorization".to_string(), "Bearer original-token".to_string())]);
+        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original_headers)
+            .await
+            .expect("create mcp server config");
+
+        let updated = update_mcp_server_config(
+            &pool,
+            created.id,
+            "github-renamed",
+            "https://example.com/mcp-v2",
+            &HashMap::new(),
+            &[],
+        )
+        .await
+        .expect("update should succeed")
+        .expect("row should exist");
+
+        assert_eq!(updated.name, "github-renamed");
+        assert_eq!(updated.url, "https://example.com/mcp-v2");
+        assert_eq!(
+            updated.extra_headers.0, original_headers,
+            "an empty upsert/remove must never touch stored headers"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_get_mcp_server_config_by_name_round_trips(pool: PgPool) {
+        let headers = HashMap::new();
+        let created = create_mcp_server_config(&pool, "github", "https://api.githubcopilot.com/mcp/", &headers)
+            .await
+            .expect("create mcp server config");
+
+        let fetched = get_mcp_server_config_by_name(&pool, "github")
+            .await
+            .expect("query should succeed")
+            .expect("row should exist");
+        assert_eq!(fetched.id, created.id);
+
+        let missing = get_mcp_server_config_by_name(&pool, "does-not-exist")
+            .await
+            .expect("query should succeed");
+        assert!(missing.is_none());
+    }
+
+    #[sqlx::test]
+    async fn test_update_mcp_server_config_upserts_headers_without_touching_others(pool: PgPool) {
+        let original = HashMap::from([
+            ("Authorization".to_string(), "Bearer old".to_string()),
+            ("X-Untouched".to_string(), "keep-me".to_string()),
+        ]);
+        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original)
+            .await
+            .expect("create mcp server config");
+
+        let upsert = HashMap::from([
+            ("Authorization".to_string(), "Bearer new".to_string()),
+            ("X-New".to_string(), "brand-new".to_string()),
+        ]);
+        let updated = update_mcp_server_config(&pool, created.id, "github", "https://example.com/mcp", &upsert, &[])
+            .await
+            .expect("update should succeed")
+            .expect("row should exist");
+
+        assert_eq!(
+            updated.extra_headers.0,
+            HashMap::from([
+                ("Authorization".to_string(), "Bearer new".to_string()),
+                ("X-Untouched".to_string(), "keep-me".to_string()),
+                ("X-New".to_string(), "brand-new".to_string()),
+            ]),
+            "upsert should update/add given keys and leave every other existing header alone"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_update_mcp_server_config_removes_named_headers(pool: PgPool) {
+        let original = HashMap::from([
+            ("Authorization".to_string(), "Bearer old".to_string()),
+            ("X-Doomed".to_string(), "bye".to_string()),
+        ]);
+        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original)
+            .await
+            .expect("create mcp server config");
+
+        let updated = update_mcp_server_config(
+            &pool,
+            created.id,
+            "github",
+            "https://example.com/mcp",
+            &HashMap::new(),
+            &["X-Doomed".to_string()],
+        )
+        .await
+        .expect("update should succeed")
+        .expect("row should exist");
+
+        assert_eq!(
+            updated.extra_headers.0,
+            HashMap::from([("Authorization".to_string(), "Bearer old".to_string())]),
+            "the removed header must be gone, everything else untouched"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_update_mcp_server_config_upsert_wins_over_remove_for_the_same_name(pool: PgPool) {
+        let original = HashMap::from([("Authorization".to_string(), "Bearer old".to_string())]);
+        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original)
+            .await
+            .expect("create mcp server config");
+
+        let upsert = HashMap::from([("Authorization".to_string(), "Bearer new".to_string())]);
+        let updated = update_mcp_server_config(
+            &pool,
+            created.id,
+            "github",
+            "https://example.com/mcp",
+            &upsert,
+            &["Authorization".to_string()],
+        )
+        .await
+        .expect("update should succeed")
+        .expect("row should exist");
+
+        assert_eq!(
+            updated.extra_headers.0,
+            HashMap::from([("Authorization".to_string(), "Bearer new".to_string())]),
+            "a name present in both upsert and remove should end up set, not removed"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_update_mcp_server_config_returns_none_for_unknown_id(pool: PgPool) {
+        let result = update_mcp_server_config(&pool, 999_999, "name", "https://example.com", &HashMap::new(), &[])
+            .await
+            .expect("query should succeed");
+        assert!(result.is_none());
     }
 }

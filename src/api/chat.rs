@@ -355,7 +355,7 @@ fn run_turn_bounded<'a>(
                 system: None,
                 messages: history.clone(),
                 stream: true,
-                tools: anthropic::tools::tool_definitions(),
+                tools: anthropic::tools::tool_definitions(pool).await,
                 thinking: thinking_enabled().then_some(anthropic::ThinkingConfig::Adaptive),
             };
 
@@ -1591,9 +1591,13 @@ mod tests {
     /// `run_async` and it correctly said no such tool was available. This
     /// pins the two lists together so a newly dispatchable tool can't be
     /// implemented without also being offered to the model.
+    ///
+    /// Scoped to `native_tool_definitions()` deliberately — this test is
+    /// about smelt's own static dispatch names, not MCP servers (which are
+    /// dynamic/external and have no fixed name list to pin against).
     #[test]
     fn test_tool_definitions_covers_every_dispatchable_tool_name() {
-        let defined: std::collections::BTreeSet<String> = anthropic::tools::tool_definitions()
+        let defined: std::collections::BTreeSet<String> = anthropic::tools::native_tool_definitions()
             .into_iter()
             .map(|t| t.name)
             .collect();
@@ -1631,7 +1635,7 @@ mod tests {
             .collect();
         assert!(
             missing.is_empty(),
-            "tool_definitions() is missing: {missing:?}"
+            "native_tool_definitions() is missing: {missing:?}"
         );
     }
 }

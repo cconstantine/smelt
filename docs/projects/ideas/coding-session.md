@@ -43,6 +43,18 @@ conversation each with N terminals) — see
 `projects/completed/20260812-sandbox-terminal.md`. Still open from this
 section: `git clone`/credential wiring.
 
+**Update:** repo access now has a second, already-shipped option that
+doesn't depend on anything below — the agent can drive GitHub through its
+hosted MCP server (search/read/write repos, issues, PRs — API-level, not
+a local shell `git`) once one is configured via `/mcp-servers`; see
+`projects/completed/20260817-mcp-servers.md`. This does not replace the
+sandbox-mounted-credential approach sketched below (no local checkout, no
+arbitrary `git`/shell commands against a real clone), just gives an
+alternative path to "the agent can act on a repo" that was available
+sooner. Revisit whether `git clone`/credential wiring inside the sandbox
+is still worth building once it's clear whether MCP-level access already
+covers real usage.
+
 Each coding session gets its own isolated, disposable environment. Nothing
 the agent does — `git checkout`, file reads/writes, shell commands — ever
 touches the smelt server's own filesystem or process directly; the server

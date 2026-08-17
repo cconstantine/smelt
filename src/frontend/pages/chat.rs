@@ -1166,6 +1166,12 @@ pub fn Chat() -> Element {
     let selected: Memo<Option<i64>> = use_memo(move || match router.current::<Route>() {
         Route::Home {} => None,
         Route::ConversationRoute { id } => Some(id),
+        // `Chat` is never actually rendered on these routes (see their own
+        // components in `frontend/mod.rs`) — these arms only exist to
+        // satisfy exhaustiveness.
+        Route::McpServersRoute {} => None,
+        Route::McpServerNewRoute {} => None,
+        Route::McpServerEditRoute { .. } => None,
     });
 
     rsx! {
@@ -1233,6 +1239,7 @@ fn ConversationSidebar(selected: Memo<Option<i64>>) -> Element {
     rsx! {
         aside { class: "sidebar",
             button { class: "new-conversation", onclick: new_conversation, "New conversation" }
+            Link { to: Route::McpServersRoute {}, class: "mcp-servers-link", "MCP servers" }
             if let Some(err) = error() {
                 p { class: "error", "{err}" }
             }
