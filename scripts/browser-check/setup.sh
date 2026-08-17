@@ -42,11 +42,18 @@ if [ ! -f "$LIBDIR/libnspr4.so" ]; then
 
     # A scratch Dir::State::lists/Dir::Cache lets `apt-get update` and
     # `--print-uris`/download work entirely as the current user — nothing
-    # here touches /var/lib/dpkg or /var/cache/apt.
+    # here touches /var/lib/dpkg or /var/cache/apt. Not -qq: this has
+    # silently "succeeded" (exit 0) while fetching a usable index for
+    # zero packages in CI at least twice — visible output here is the
+    # only way to see why until that's understood.
     apt-get -o Dir::State::lists="$APT_DIR/lists" \
             -o Dir::Cache="$APT_DIR" \
             -o Dir::Cache::archives="$CACHE_DIR/debs" \
-            update -qq
+            update
+    echo "--- apt sources in use ---" >&2
+    cat /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list >&2 2>&1 || true
+    echo "--- fetched lists dir ---" >&2
+    ls -la "$APT_DIR/lists" >&2 || true
 
     # This list was derived by running `ldd` against chrome-headless-shell
     # and mapping each "not found" .so to its owning Debian package
