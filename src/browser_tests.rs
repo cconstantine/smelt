@@ -197,7 +197,7 @@ async fn test_sandbox_panel_reflects_live_state_end_to_end() {
         // docs/projects/plans/file-tools.md's "One pod per conversation"),
         // so there's no tab bar to click through — both terminals render
         // straight through as soon as the panel loads. ---
-        sandbox::create_pod(pool, conversation.id).await.expect("create_pod");
+        sandbox::create_pod(pool, conversation.id, None, None).await.expect("create_pod");
         let terminal_a1 = sandbox::create_terminal(pool, conversation.id).await.expect("create_terminal (a1)");
         let terminal_a2 = sandbox::create_terminal(pool, conversation.id).await.expect("create_terminal (a2)");
 

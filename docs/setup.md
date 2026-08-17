@@ -25,6 +25,14 @@ dx bundle --platform web
 # Produces a release server binary + WASM client bundle; see dx's output for
 # the exact paths.
 
+# ── Build sandbox_agent first, for any `server`-feature build ──────────────
+# src/sandbox.rs's `include_bytes!` embeds a pre-built sandbox_agent binary
+# at compile time — every `server`-feature build (check, test, or run) fails
+# with "couldn't read .../sandbox_agent: No such file or directory" without
+# this having run at least once since the last `cargo clean`. Not needed for
+# the `web`-only wasm check (`sandbox` is `#[cfg(feature = "server")]`-gated).
+scripts/build-sandbox-agent.sh
+
 # ── Fast compile check ───────────────────────────────────────────────────────
 cargo check --features server
 cargo check --no-default-features --features web --target wasm32-unknown-unknown
@@ -34,6 +42,15 @@ cargo check --no-default-features --features web --target wasm32-unknown-unknown
 # use #[sqlx::test], which needs a reachable DATABASE_URL. See testing.md.
 cargo test --features server
 ```
+
+## CI
+
+`.github/workflows/ci.yml` runs on every pull request: the full `cargo test
+--features server` suite (Postgres + real-cluster k3s sandbox tests), the
+WASM `cargo check`, and the automated browser tier — the same tests and the
+same `docker-compose.yml` stack described above and in
+[testing.md](testing.md), just running on GitHub's runner instead of a local
+machine. See [development-process.md](development-process.md#definition-of-done).
 
 ## Environment Variables
 
@@ -59,3 +76,4 @@ silently sends an empty string to the Anthropic API.
 | `KUBECONFIG` | yes, for sandbox code/tests | — | Read by `kube::Client::try_default()` (`src/sandbox.rs`). In `docker-compose.yml`, `smelt`'s `KUBECONFIG` points at the kubeconfig `k3s-bootstrap` generates for the `park` service account against the compose-provided `k3s` service — a hermetic test cluster, not a real deployment target. Point it at `.kubeconfig.yaml` (gitignored) instead to deliberately target the real `homelab` cluster. See [docs/projects/plans/k8s-sandbox.md](projects/plans/k8s-sandbox.md). |
 | `SANDBOX_MEMORY_LIMIT` | no | `8Gi` | Default memory limit for a sandbox pod's container — a plain Kubernetes quantity string. Just the *default*: `create_pod`'s `memory_limit` parameter overrides it per pod, up to the `smelt-park` namespace's `LimitRange` ceiling (`k8s/smelt-park-rbac.yaml`). Hitting the limit kills the whole pod at once (`memory.oom.group=1` on this cluster), not just the offending process — see [projects/completed/20260816-sandbox-oom.md](projects/completed/20260816-sandbox-oom.md). |
 | `SANDBOX_CPU_LIMIT` | no | `1` | Default CPU limit for a sandbox pod's container, same shape as `SANDBOX_MEMORY_LIMIT` (a Kubernetes quantity string, e.g. `"2"` for two cores) — overridable per pod via `create_pod`'s `cpu_limit`. |
+| `SANDBOX_RUNNING_WAIT_TIMEOUT_SECS` | no | `30` | How long `wait_for_running` (`src/sandbox.rs`) waits for a pod to reach `Running` before giving up with `SandboxError::Timeout`. The default is plenty on the real `homelab` cluster or a resource-rich dev machine; a CPU-constrained CI runner schedules pods measurably slower, so `.github/workflows/ci.yml` raises this for its `cargo test --features server` run. |

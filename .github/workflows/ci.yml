@@ -1,0 +1,180 @@
+name: CI
+
+# Runs every test defined in the repo — the server-feature suite (Postgres +
+# real-cluster k3s sandbox tests), the WASM compile check, and the automated
+# browser tier — reusing the same docker-compose.yml stack local dev already
+# depends on, so there's one environment definition to keep working, not two.
+# See docs/projects/plans/ci-tests-in-pr.md for the design.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute UID/GID for docker compose build
+        # docker-compose.yml's `smelt` service builds its dev-user with
+        # these, defaulting to 1000/1000 — match them to the runner's real
+        # user so files the container writes into the bind-mounted repo
+        # (target/, Cargo.lock changes) aren't owned by a mismatched uid.
+        run: |
+          echo "UID=$(id -u)" >> "$GITHUB_ENV"
+          echo "GID=$(id -g)" >> "$GITHUB_ENV"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: .ci-cargo-cache
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
+
+      - name: Ensure cargo registry cache dir exists with correct ownership
+        # On a cache miss, actions/cache leaves .ci-cargo-cache absent; a
+        # plain `docker -v` bind mount then auto-creates it as root, which
+        # the container's non-root `dev` user can't write into. Creating it
+        # here as the runner user (matching UID/GID set above) avoids that.
+        run: mkdir -p .ci-cargo-cache
+
+      - name: Cache cargo build output
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: cargo-target-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-target-${{ runner.os }}-
+
+      - name: Build dev image
+        run: docker compose build smelt
+
+      - name: Start service dependencies (postgres, docker-in-docker, k3s)
+        run: docker compose up -d postgres docker k3s
+
+      - name: Bootstrap k3s (applies RBAC, writes kubeconfig for sandbox tests)
+        run: docker compose up --exit-code-from k3s-bootstrap k3s-bootstrap
+
+      # Every `docker compose run` below mounts .ci-cargo-cache over the
+      # container's cargo registry dir so downloaded crate sources survive
+      # across steps (each `run` is a fresh container) and across CI runs
+      # (via the actions/cache step above) — target/ already persists via
+      # docker-compose.yml's `.:/app` bind mount, no extra mount needed.
+      #
+      # src/sandbox.rs's `include_bytes!` pulls in a pre-built
+      # target/sandbox-agent/sandbox_agent — any `server`-feature build
+      # (sandbox is #[cfg(feature = "server")]-gated) fails to compile
+      # without it. scripts/build-sandbox-agent.sh must run first; see
+      # its own header comment and src/sandbox.rs's AGENT_BINARY doc.
+      - name: Build sandbox_agent
+        run: |
+          docker compose run --rm \
+            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
+            smelt scripts/build-sandbox-agent.sh
+
+      # The sandbox tests create real pods against the compose-provided k3s
+      # cluster. Two of them (test_dropping_without_delete_still_cleans_up_via_drain_task,
+      # test_terminal_lifecycle_end_to_end) reliably timed out here in CI —
+      # neither raising SANDBOX_RUNNING_WAIT_TIMEOUT_SECS to 120s nor
+      # lowering SANDBOX_CPU_LIMIT to 250m fixed it. The diagnostics step
+      # below (added when those two didn't work) found the real cause:
+      # `FailedScheduling ... 0/1 nodes are available: 1 Insufficient
+      # memory` — every test pod requested the production 8Gi default,
+      # and this runner's node doesn't have enough allocatable memory to
+      # schedule more than one such pod at a time. Not a timing issue at
+      # all, which is why raising the timeout never helped. Lowered the
+      # same way as CPU: src/sandbox.rs's SandboxManager::create test call
+      # sites now request 128Mi instead of 8Gi, and SANDBOX_MEMORY_LIMIT
+      # below does the same for create_pod's tests via the existing
+      # env-var default.
+      - name: cargo test --features server
+        run: |
+          docker compose run --rm \
+            -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
+            -e SANDBOX_CPU_LIMIT=250m \
+            -e SANDBOX_MEMORY_LIMIT=128Mi \
+            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
+            smelt cargo test --features server
+
+      - name: Dump sandbox pod diagnostics on failure
+        if: failure()
+        # kubectl runs *inside* the smelt service (docker compose run),
+        # not on the bare runner: the kubeconfig's server address is the
+        # compose-network-internal hostname `k3s`, which only resolves
+        # from a container on that network. Downloading the binary onto
+        # the runner and bind-mounting it in avoids needing to add it to
+        # the dev image just for this diagnostic step. The `park` service
+        # account's RBAC (k8s/smelt-park-rbac.yaml) has no `nodes` access,
+        # so the node describe is expected to 403 — kept anyway in case
+        # that ever changes, with `|| true` so it can't fail this step.
+        run: |
+          curl -fsSLo kubectl-diag "https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl-diag
+          echo "--- pods (smelt-park) ---"
+          docker compose run --rm smelt ./kubectl-diag get pods -n smelt-park -o wide || true
+          echo "--- pod descriptions ---"
+          docker compose run --rm smelt ./kubectl-diag describe pods -n smelt-park || true
+          echo "--- events, most recent first ---"
+          docker compose run --rm smelt ./kubectl-diag get events -n smelt-park --sort-by=.lastTimestamp || true
+          echo "--- node describe (capacity/allocatable/conditions; may 403, RBAC has no nodes access) ---"
+          docker compose run --rm smelt ./kubectl-diag describe nodes || true
+          rm -f kubectl-diag
+
+      - name: cargo check (wasm target)
+        run: |
+          docker compose run --rm \
+            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
+            smelt cargo check --no-default-features --features web --target wasm32-unknown-unknown
+
+      - name: Browser test setup (chrome-headless-shell)
+        run: |
+          docker compose run --rm \
+            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
+            smelt scripts/browser-check/setup.sh
+
+      - name: dx build --platform web
+        run: |
+          docker compose run --rm \
+            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
+            smelt dx build --platform web
+
+      # Also creates a real sandbox pod (see src/browser_tests.rs) — same
+      # reasoning as the step above.
+      - name: Browser tests (src/browser_tests.rs)
+        run: |
+          docker compose run --rm \
+            -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
+            -e SANDBOX_CPU_LIMIT=250m \
+            -e SANDBOX_MEMORY_LIMIT=128Mi \
+            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
+            smelt cargo test --features "server browser-test" -- --ignored --test-threads=1
+
+      - name: Dump sandbox pod diagnostics on failure (browser tests)
+        if: failure()
+        run: |
+          curl -fsSLo kubectl-diag "https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl-diag
+          echo "--- pods (smelt-park) ---"
+          docker compose run --rm smelt ./kubectl-diag get pods -n smelt-park -o wide || true
+          echo "--- pod descriptions ---"
+          docker compose run --rm smelt ./kubectl-diag describe pods -n smelt-park || true
+          echo "--- events, most recent first ---"
+          docker compose run --rm smelt ./kubectl-diag get events -n smelt-park --sort-by=.lastTimestamp || true
+          rm -f kubectl-diag
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

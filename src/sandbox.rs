@@ -24,7 +24,7 @@ use crate::anthropic::ContentBlock;
 use crate::{db, events};
 
 const NAMESPACE: &str = "smelt-park";
-const RUNNING_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_RUNNING_WAIT_TIMEOUT_SECS: u64 = 30;
 
 /// Matches `sandbox_agent`'s own `LISTEN_ADDR` port.
 const AGENT_PORT: u16 = 8088;
@@ -41,7 +41,7 @@ static AGENT_BINARY: &[u8] = include_bytes!(concat!(
 #[derive(Debug)]
 pub enum SandboxError {
     Kube(kube::Error),
-    /// The pod didn't reach `Running` within `RUNNING_WAIT_TIMEOUT`.
+    /// The pod didn't reach `Running` within `running_wait_timeout()`.
     Timeout,
     /// A pod already existed for this session but wasn't `Running` (e.g.
     /// `Terminating`, `Failed`). What to do here is an open question in
@@ -244,6 +244,24 @@ fn default_cpu_limit() -> String {
     std::env::var("SANDBOX_CPU_LIMIT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "1".to_string())
 }
 
+/// `SANDBOX_RUNNING_WAIT_TIMEOUT_SECS`, default `30` — same pattern as
+/// `default_memory_limit`. How long `wait_for_running` waits for a pod to
+/// reach `Running` before giving up with `SandboxError::Timeout`. The
+/// homelab cluster's real scheduling latency is why this exists as a
+/// tunable rather than a bare constant: a CPU-constrained CI runner
+/// schedules pods measurably slower than a real cluster or a
+/// resource-rich dev machine, and 30s — plenty in both of the latter —
+/// isn't a reliable bound under CI's actual constraints. See
+/// docs/setup.md.
+fn running_wait_timeout() -> Duration {
+    let secs = std::env::var("SANDBOX_RUNNING_WAIT_TIMEOUT_SECS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_RUNNING_WAIT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
 /// `memory`/`cpu` are plain Kubernetes `Quantity` strings (`"8Gi"`, `"1"`)
 /// — no app-side parsing or validation of the format; an invalid value is
 /// rejected by the Kubernetes API itself when the pod is actually
@@ -286,7 +304,7 @@ fn build_pod_spec(name: &str, memory: &str, cpu: &str) -> Pod {
 }
 
 async fn wait_for_running(pods: &Api<Pod>, name: &str) -> Result<(), SandboxError> {
-    tokio::time::timeout(RUNNING_WAIT_TIMEOUT, async {
+    tokio::time::timeout(running_wait_timeout(), async {
         loop {
             let pod = pods.get(name).await?;
             if pod.status.and_then(|s| s.phase).as_deref() == Some("Running") {
@@ -2283,7 +2301,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("create");
 
-        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "128Mi", "250m").await.expect("create should succeed");
 
         let pods = pods_api(&client);
         let pod = pods.get(&sandbox.pod_name).await.expect("pod should exist");
@@ -2299,7 +2317,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("limits");
 
-        let sandbox = manager.create(&session_id, "128Mi", "2").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "128Mi", "500m").await.expect("create should succeed");
 
         let pods = pods_api(&client);
         let pod = pods.get(&sandbox.pod_name).await.expect("pod should exist");
@@ -2315,7 +2333,7 @@ mod tests {
             .limits
             .expect("resources should have limits");
         assert_eq!(limits.get("memory"), Some(&Quantity("128Mi".to_string())));
-        assert_eq!(limits.get("cpu"), Some(&Quantity("2".to_string())));
+        assert_eq!(limits.get("cpu"), Some(&Quantity("500m".to_string())));
 
         pods.delete(&sandbox.pod_name, &immediate_delete_params()).await.ok();
         std::mem::forget(sandbox);
@@ -2334,7 +2352,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("over-limit");
 
-        let result = manager.create(&session_id, "128Gi", "1").await;
+        let result = manager.create(&session_id, "128Gi", "250m").await;
         assert!(
             matches!(result, Err(SandboxError::Kube(_))),
             "a memory_limit over the LimitRange's 64Gi max should be rejected by Kubernetes, got is_ok={}",
@@ -2357,7 +2375,7 @@ mod tests {
         let session_id = unique_session_id("real-oom");
         // Small on purpose — fast and reliable to trigger, using this same
         // plan's own per-pod override rather than the real 8Gi default.
-        let sandbox = manager.create(&session_id, "64Mi", "1").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "64Mi", "250m").await.expect("create should succeed");
         let pods = pods_api(&client);
 
         // The whole `AttachedProcess` — not just its split-off stdout/
@@ -2413,8 +2431,8 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("reuse");
 
-        let first = manager.create(&session_id, "8Gi", "1").await.expect("first create should succeed");
-        let second = manager.create(&session_id, "8Gi", "1").await.expect("second create should reuse, not error");
+        let first = manager.create(&session_id, "128Mi", "250m").await.expect("first create should succeed");
+        let second = manager.create(&session_id, "128Mi", "250m").await.expect("second create should reuse, not error");
 
         assert_eq!(first.pod_name, second.pod_name);
 
@@ -2429,7 +2447,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("exec");
-        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "128Mi", "250m").await.expect("create should succeed");
 
         let result = sandbox.exec(&["echo", "hello"]).await.expect("exec should succeed");
         assert_eq!(result.stdout, "hello\n");
@@ -2454,7 +2472,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("death-reason");
-        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "128Mi", "250m").await.expect("create should succeed");
         let pods = pods_api(&client);
 
         assert_eq!(pod_death_reason(&pods, &sandbox.pod_name).await, None, "a genuinely Running pod is inconclusive");
@@ -2486,7 +2504,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("delete");
-        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "128Mi", "250m").await.expect("create should succeed");
         let pod_name = sandbox.pod_name.clone();
 
         manager.delete(sandbox).await.expect("delete should succeed");
@@ -2501,7 +2519,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("drop");
-        let sandbox = manager.create(&session_id, "8Gi", "1").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "128Mi", "250m").await.expect("create should succeed");
         let pod_name = sandbox.pod_name.clone();
 
         drop(sandbox); // no manager.delete call — this is the path under test

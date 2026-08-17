@@ -35,18 +35,25 @@ else
     echo "chrome-headless-shell already present, skipping download." >&2
 fi
 
-if [ ! -f "$LIBDIR/libnspr4.so" ]; then
+if LD_LIBRARY_PATH="$LIBDIR:$LIBDIR/dri:${LD_LIBRARY_PATH:-}" ldd "$BIN" 2>/dev/null | grep -q "not found"; then
     echo "Fetching missing shared libraries via non-root apt-get..." >&2
     APT_DIR="$CACHE_DIR/apt"
     mkdir -p "$APT_DIR/lists/partial" "$APT_DIR/archives/partial" "$CACHE_DIR/debs" "$CACHE_DIR/libs"
 
     # A scratch Dir::State::lists/Dir::Cache lets `apt-get update` and
     # `--print-uris`/download work entirely as the current user — nothing
-    # here touches /var/lib/dpkg or /var/cache/apt.
+    # here touches /var/lib/dpkg or /var/cache/apt. Not -qq: this has
+    # silently "succeeded" (exit 0) while fetching a usable index for
+    # zero packages in CI at least twice — visible output here is the
+    # only way to see why until that's understood.
     apt-get -o Dir::State::lists="$APT_DIR/lists" \
             -o Dir::Cache="$APT_DIR" \
             -o Dir::Cache::archives="$CACHE_DIR/debs" \
-            update -qq
+            update
+    echo "--- apt sources in use ---" >&2
+    cat /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list >&2 2>&1 || true
+    echo "--- fetched lists dir ---" >&2
+    ls -la "$APT_DIR/lists" >&2 || true
 
     # This list was derived by running `ldd` against chrome-headless-shell
     # and mapping each "not found" .so to its owning Debian package
@@ -63,6 +70,19 @@ libxkbcommon0 libasound2 libatspi2.0-0"
                     -o APT::Install-Recommends=false \
                     -o APT::Install-Suggests=false \
                     --print-uris -qq install $PKGS | awk -F"'" '{print $2}')
+
+    if [ -z "$URLS" ]; then
+        echo "error: apt-get --print-uris returned no package URLs. The update above fetched a real index (see the listing before this), so re-running the same install non-quietly to see apt's actual reasoning (already satisfied? unavailable? something else):" >&2
+        apt-get -o Dir::State::lists="$APT_DIR/lists" \
+                -o Dir::Cache="$APT_DIR" \
+                -o Dir::Cache::archives="$CACHE_DIR/debs" \
+                -o APT::Install-Recommends=false \
+                -o APT::Install-Suggests=false \
+                --print-uris install $PKGS >&2 2>&1 || true
+        echo "--- dpkg status for these packages (system-wide, not our custom cache) ---" >&2
+        dpkg -l $PKGS >&2 2>&1 || true
+        exit 1
+    fi
 
     (cd "$CACHE_DIR/debs" && printf '%s\n' "$URLS" | xargs -P 8 -n 1 curl -sL -O)
 
