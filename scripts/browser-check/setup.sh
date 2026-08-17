@@ -35,7 +35,7 @@ else
     echo "chrome-headless-shell already present, skipping download." >&2
 fi
 
-if [ ! -f "$LIBDIR/libnspr4.so" ]; then
+if LD_LIBRARY_PATH="$LIBDIR:$LIBDIR/dri:${LD_LIBRARY_PATH:-}" ldd "$BIN" 2>/dev/null | grep -q "not found"; then
     echo "Fetching missing shared libraries via non-root apt-get..." >&2
     APT_DIR="$CACHE_DIR/apt"
     mkdir -p "$APT_DIR/lists/partial" "$APT_DIR/archives/partial" "$CACHE_DIR/debs" "$CACHE_DIR/libs"
