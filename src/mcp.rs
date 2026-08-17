@@ -1,6 +1,6 @@
 //! Thin wrapper around [`rmcp`](https://crates.io/crates/rmcp) (the
 //! official Rust MCP SDK) for smelt's externally-configured MCP servers —
-//! see `docs/projects/plans/mcp-servers.md`. `rmcp` owns the actual wire
+//! see `docs/projects/completed/20260817-mcp-servers.md`. `rmcp` owns the actual wire
 //! protocol (JSON-RPC framing, Streamable HTTP's two response modes,
 //! session tracking, notification dispatch); this module owns the
 //! connection registry keyed by `mcp_servers.id`, the
@@ -43,8 +43,7 @@ pub fn parse_tool_name(name: &str) -> Option<(&str, &str)> {
 /// Parses `extra_headers` into the `http` crate's typed header map
 /// `rmcp`'s transport config expects. A per-server config error (an
 /// invalid header name/value the UI let through) surfaces as a plain
-/// `Err` rather than a panic — see `docs/projects/plans/mcp-servers.md`'s
-/// "Managing servers."
+/// `Err` rather than a panic.
 fn build_header_map(
     extra_headers: &HashMap<String, String>,
 ) -> Result<HashMap<http::HeaderName, http::HeaderValue>, String> {
@@ -108,8 +107,8 @@ pub async fn evict(server_id: i64) {
 /// Calls `f` and, if it fails, retries exactly once. A server's very first
 /// connection attempt is the one most likely to hit a one-off transient
 /// failure (a slow DNS lookup, a dropped packet, a dev-server rebuild
-/// racing the request) — see `docs/projects/plans/mcp-servers.md`'s
-/// "Open questions." Generic over `f`'s return type so it's unit-testable
+/// racing the request — see `docs/projects/completed/20260817-mcp-servers.md`'s
+/// retrospective). Generic over `f`'s return type so it's unit-testable
 /// without a real network call; `connect`'s only caller wires it in below.
 async fn retry_once<F, Fut, T>(mut f: F) -> Result<T, String>
 where
@@ -368,7 +367,8 @@ mod tests {
     /// notification test uses) — this module's tests exercise the
     /// registry/dispatch/namespacing logic in `mcp.rs`, not the Streamable
     /// HTTP wire format itself (that's `rmcp`'s own tested responsibility;
-    /// see `docs/projects/plans/mcp-servers.md`'s "Proving this works").
+    /// the real HTTP path was proven separately, live, against GitHub's
+    /// hosted MCP server — see `docs/projects/completed/20260817-mcp-servers.md`).
     /// Registers the resulting connection under `server_id` in the shared
     /// `REGISTRY`, bypassing `connect()`'s HTTP-specific transport
     /// construction.

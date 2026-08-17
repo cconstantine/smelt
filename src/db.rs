@@ -502,7 +502,7 @@ pub async fn list_terminal_commands(
 // --- MCP servers (externally-hosted, configured via the /mcp-servers UI) ---
 // Plain CRUD, no soft delete — this is configuration a person edits, not a
 // live external resource like a sandbox pod. See
-// docs/projects/plans/mcp-servers.md.
+// docs/projects/completed/20260817-mcp-servers.md.
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, sqlx::FromRow)]
 pub struct McpServerConfig {

@@ -2,8 +2,8 @@
 
 ## What
 
-Once smelt can talk to external MCP servers (see
-`docs/projects/plans/mcp-servers.md`), the model still can't use an MCP
+Now that smelt can talk to external MCP servers (see
+`docs/projects/completed/20260817-mcp-servers.md`), the model still can't use an MCP
 server that needs to operate directly on files inside its own sandbox — a
 git MCP server, for instance, has to read and write the actual checkout, not
 just answer requests over a URL. This idea is smelt running that kind of MCP
@@ -24,9 +24,9 @@ bespoke set of git tools.
 
 ## Depends on
 
-The MCP client work in `docs/projects/plans/mcp-servers.md` landing first —
-this reuses the protocol client and the tool-dispatch path it establishes,
-rather than being designed from scratch.
+The MCP client work — `docs/projects/completed/20260817-mcp-servers.md`,
+already shipped — reuses the protocol client and the tool-dispatch path it
+establishes, rather than being designed from scratch.
 
 ## Open questions
 

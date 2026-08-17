@@ -70,7 +70,7 @@ fn status_summary(tool_names: &[String]) -> String {
 }
 
 /// Lists every configured server with a live "connected" indicator — see
-/// `docs/projects/plans/mcp-servers.md`. Each row links to
+/// `docs/projects/completed/20260817-mcp-servers.md`. Each row links to
 /// `Route::McpServerEditRoute`; adding a server is its own page
 /// (`Route::McpServerNewRoute`) rather than an inline form here.
 #[component]

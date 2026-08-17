@@ -7,8 +7,8 @@ use crate::db;
 
 /// Read-only summary of a configured MCP server for the browser — never
 /// carries header *values*, only their names (see
-/// `docs/projects/plans/mcp-servers.md`'s "Managing servers: UI + API").
-/// Defined outside any server-gated module since this type itself crosses
+/// `docs/projects/completed/20260817-mcp-servers.md`). Defined outside
+/// any server-gated module since this type itself crosses
 /// the client/server boundary as a server-function return value — the same
 /// placement `anthropic::tools::TaskSummary` already uses for the same
 /// reason.
@@ -94,8 +94,7 @@ pub async fn create_mcp_server(
 ///
 /// Always evicts `crate::mcp`'s cached connection for this row afterward —
 /// a stale connection pointed at the old URL/headers must never survive an
-/// edit; see `docs/projects/plans/mcp-servers.md`'s "Connection and
-/// dispatch flow."
+/// edit.
 #[post("/api/mcp-servers/{id}")]
 pub async fn update_mcp_server(
     id: i64,
