@@ -86,17 +86,15 @@ jobs:
             smelt scripts/build-sandbox-agent.sh
 
       # The sandbox tests create real pods against the compose-provided k3s
-      # cluster, and cargo test's default parallelism means several can be
-      # concurrently competing for the runner's CPU at once. Reproduced
-      # locally: this is a genuine capacity shortfall, not just slower
-      # scheduling — a pod that can't fit stays Pending no matter how long
-      # you wait, so raising SANDBOX_RUNNING_WAIT_TIMEOUT_SECS alone
-      # (tried first) didn't fix it. SANDBOX_CPU_LIMIT lowers what
-      # create_pod's tests request per pod (250m here vs the 1-full-core
-      # production default) so more of them fit in the runner's much
-      # smaller real capacity; sandbox.rs's own SandboxManager::create
-      # tests (which bypass this env var) were lowered the same way
-      # directly in the test code. See docs/setup.md.
+      # cluster. Two of them (test_dropping_without_delete_still_cleans_up_via_drain_task,
+      # test_terminal_lifecycle_end_to_end) reliably time out here in CI —
+      # neither raising SANDBOX_RUNNING_WAIT_TIMEOUT_SECS to 120s nor
+      # lowering SANDBOX_CPU_LIMIT to 250m fixed it, and both attempts
+      # failed at (approximately) the same elapsed time regardless, which
+      # points away from plain CPU-quota contention toward something more
+      # specific this environment hasn't surfaced yet. Kept both env vars
+      # (harmless either way) and added the diagnostics step below to
+      # capture real pod/event state on failure instead of guessing again.
       - name: cargo test --features server
         run: |
           docker compose run --rm \
@@ -104,6 +102,30 @@ jobs:
             -e SANDBOX_CPU_LIMIT=250m \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo test --features server
+
+      - name: Dump sandbox pod diagnostics on failure
+        if: failure()
+        # kubectl runs *inside* the smelt service (docker compose run),
+        # not on the bare runner: the kubeconfig's server address is the
+        # compose-network-internal hostname `k3s`, which only resolves
+        # from a container on that network. Downloading the binary onto
+        # the runner and bind-mounting it in avoids needing to add it to
+        # the dev image just for this diagnostic step. The `park` service
+        # account's RBAC (k8s/smelt-park-rbac.yaml) has no `nodes` access,
+        # so the node describe is expected to 403 — kept anyway in case
+        # that ever changes, with `|| true` so it can't fail this step.
+        run: |
+          curl -fsSLo kubectl-diag "https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl-diag
+          echo "--- pods (smelt-park) ---"
+          docker compose run --rm smelt ./kubectl-diag get pods -n smelt-park -o wide || true
+          echo "--- pod descriptions ---"
+          docker compose run --rm smelt ./kubectl-diag describe pods -n smelt-park || true
+          echo "--- events, most recent first ---"
+          docker compose run --rm smelt ./kubectl-diag get events -n smelt-park --sort-by=.lastTimestamp || true
+          echo "--- node describe (capacity/allocatable/conditions; may 403, RBAC has no nodes access) ---"
+          docker compose run --rm smelt ./kubectl-diag describe nodes || true
+          rm -f kubectl-diag
 
       - name: cargo check (wasm target)
         run: |
@@ -132,6 +154,19 @@ jobs:
             -e SANDBOX_CPU_LIMIT=250m \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo test --features "server browser-test" -- --ignored --test-threads=1
+
+      - name: Dump sandbox pod diagnostics on failure (browser tests)
+        if: failure()
+        run: |
+          curl -fsSLo kubectl-diag "https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl-diag
+          echo "--- pods (smelt-park) ---"
+          docker compose run --rm smelt ./kubectl-diag get pods -n smelt-park -o wide || true
+          echo "--- pod descriptions ---"
+          docker compose run --rm smelt ./kubectl-diag describe pods -n smelt-park || true
+          echo "--- events, most recent first ---"
+          docker compose run --rm smelt ./kubectl-diag get events -n smelt-park --sort-by=.lastTimestamp || true
+          rm -f kubectl-diag
 
       - name: Tear down
         if: always()
