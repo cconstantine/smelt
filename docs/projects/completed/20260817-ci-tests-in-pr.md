@@ -131,7 +131,7 @@ more detailed CI logs instead.
   wasn't acted on until a third, different kind of check (real cluster
   diagnostics, not another local repro) was added.
 
-**What to change (proposed, not yet applied to `development-process.md`):**
+**What to change (confirmed and applied to `development-process.md`):**
 - When a real-environment-only failure resists two consecutive fixes built
   on the same theory, stop attempting a third variation of that theory —
   add direct observability into the real environment (here: `kubectl
