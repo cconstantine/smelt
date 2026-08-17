@@ -72,7 +72,15 @@ libxkbcommon0 libasound2 libatspi2.0-0"
                     --print-uris -qq install $PKGS | awk -F"'" '{print $2}')
 
     if [ -z "$URLS" ]; then
-        echo "error: apt-get --print-uris returned no package URLs — the redirected 'apt-get update' above likely failed to fetch a usable index (network issue, mirror hiccup, or a real apt error masked by -qq)." >&2
+        echo "error: apt-get --print-uris returned no package URLs. The update above fetched a real index (see the listing before this), so re-running the same install non-quietly to see apt's actual reasoning (already satisfied? unavailable? something else):" >&2
+        apt-get -o Dir::State::lists="$APT_DIR/lists" \
+                -o Dir::Cache="$APT_DIR" \
+                -o Dir::Cache::archives="$CACHE_DIR/debs" \
+                -o APT::Install-Recommends=false \
+                -o APT::Install-Suggests=false \
+                --print-uris install $PKGS >&2 2>&1 || true
+        echo "--- dpkg status for these packages (system-wide, not our custom cache) ---" >&2
+        dpkg -l $PKGS >&2 2>&1 || true
         exit 1
     fi
 
