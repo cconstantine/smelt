@@ -510,6 +510,29 @@ pub struct McpServerConfig {
     pub name: String,
     pub url: String,
     pub extra_headers: sqlx::types::Json<HashMap<String, String>>,
+    /// `"static_headers"` or `"oauth"` — see
+    /// docs/projects/plans/mcp-oauth.md. A plain `String`, not a Rust enum:
+    /// the DB-level `CHECK` constraint is the source of truth for valid
+    /// values, matching `terminal_commands.status`'s existing precedent
+    /// elsewhere in this file.
+    pub auth_mode: String,
+    /// `rmcp::transport::auth::StoredCredentials`, serialized as-is —
+    /// `NULL` means "oauth mode, never connected (or disconnected)".
+    /// Untyped `serde_json::Value` here (not the `StoredCredentials` type
+    /// itself) since this module doesn't otherwise depend on `rmcp`;
+    /// `PgCredentialStore` (`src/mcp_oauth.rs`) does the typed
+    /// (de)serialization at its load/save boundary.
+    pub oauth_credentials: Option<sqlx::types::Json<serde_json::Value>>,
+    /// A pre-registered OAuth client, for a provider that publishes no
+    /// discovery metadata and rejects Dynamic Client Registration — GitHub,
+    /// confirmed live (see docs/projects/plans/mcp-oauth.md). Set only at
+    /// creation time (`McpServerNew`), same "delete and recreate to
+    /// change" precedent as `auth_mode` itself. `oauth_client_id` isn't
+    /// secret — it's visible in the authorization URL sent to the browser
+    /// regardless — so it's shown back plain, unlike `oauth_client_secret`
+    /// (write-only, `extra_headers`' precedent).
+    pub oauth_client_id: Option<String>,
+    pub oauth_client_secret: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -519,13 +542,20 @@ pub async fn create_mcp_server_config(
     name: &str,
     url: &str,
     extra_headers: &HashMap<String, String>,
+    auth_mode: &str,
+    oauth_client_id: Option<&str>,
+    oauth_client_secret: Option<&str>,
 ) -> Result<McpServerConfig, sqlx::Error> {
     sqlx::query_as::<_, McpServerConfig>(
-        "INSERT INTO mcp_servers (name, url, extra_headers) VALUES ($1, $2, $3) RETURNING *",
+        "INSERT INTO mcp_servers (name, url, extra_headers, auth_mode, oauth_client_id, oauth_client_secret)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
     )
     .bind(name)
     .bind(url)
     .bind(sqlx::types::Json(extra_headers))
+    .bind(auth_mode)
+    .bind(oauth_client_id)
+    .bind(oauth_client_secret)
     .fetch_one(pool)
     .await
 }
@@ -565,6 +595,10 @@ pub async fn get_mcp_server_config_by_name(
 /// `upsert` and `remove`, `upsert` wins — the header ends up set, not
 /// deleted (arbitrary but deterministic; the UI never actually produces
 /// this case, since a header row is either edited or removed, never both).
+/// A URL change clears any stored `oauth_credentials` — see
+/// docs/projects/plans/mcp-oauth.md's "Data model": a grant is bound to the
+/// audience it was issued for, so carrying it across a URL change would
+/// silently point a stale token at a different resource.
 pub async fn update_mcp_server_config(
     pool: &PgPool,
     id: i64,
@@ -572,6 +606,7 @@ pub async fn update_mcp_server_config(
     url: &str,
     upsert: &HashMap<String, String>,
     remove: &[String],
+    auth_mode: &str,
 ) -> Result<Option<McpServerConfig>, sqlx::Error> {
     let Some(existing) = get_mcp_server_config(pool, id).await? else {
         return Ok(None);
@@ -583,14 +618,20 @@ pub async fn update_mcp_server_config(
     }
     merged.extend(upsert.iter().map(|(k, v)| (k.clone(), v.clone())));
 
+    let url_changed = existing.url != url;
+
     sqlx::query_as::<_, McpServerConfig>(
-        "UPDATE mcp_servers SET name = $2, url = $3, extra_headers = $4, updated_at = now()
+        "UPDATE mcp_servers SET name = $2, url = $3, extra_headers = $4, auth_mode = $5,
+             oauth_credentials = CASE WHEN $6 THEN NULL ELSE oauth_credentials END,
+             updated_at = now()
          WHERE id = $1 RETURNING *",
     )
     .bind(id)
     .bind(name)
     .bind(url)
     .bind(sqlx::types::Json(merged))
+    .bind(auth_mode)
+    .bind(url_changed)
     .fetch_optional(pool)
     .await
 }
@@ -598,6 +639,22 @@ pub async fn update_mcp_server_config(
 pub async fn delete_mcp_server_config(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM mcp_servers WHERE id = $1")
         .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Sets or clears a server's stored OAuth credentials — the persistence
+/// half of `mcp_oauth::PgCredentialStore`'s `save`/`clear`. `None` clears
+/// (the same as a fresh `oauth` server that has never connected).
+pub async fn set_mcp_server_oauth_credentials(
+    pool: &PgPool,
+    id: i64,
+    credentials: Option<serde_json::Value>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE mcp_servers SET oauth_credentials = $2, updated_at = now() WHERE id = $1")
+        .bind(id)
+        .bind(credentials.map(sqlx::types::Json))
         .execute(pool)
         .await?;
     Ok(())
@@ -1275,7 +1332,7 @@ mod tests {
     #[sqlx::test]
     async fn test_create_list_get_delete_mcp_server_config_round_trip(pool: PgPool) {
         let headers = HashMap::from([("Authorization".to_string(), "Bearer secret".to_string())]);
-        let created = create_mcp_server_config(&pool, "github", "https://api.githubcopilot.com/mcp/", &headers)
+        let created = create_mcp_server_config(&pool, "github", "https://api.githubcopilot.com/mcp/", &headers, "static_headers", None, None)
             .await
             .expect("create mcp server config");
         assert_eq!(created.name, "github");
@@ -1303,7 +1360,7 @@ mod tests {
     async fn test_update_mcp_server_config_renames_without_touching_headers(pool: PgPool) {
         let original_headers =
             HashMap::from([("Authorization".to_string(), "Bearer original-token".to_string())]);
-        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original_headers)
+        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original_headers, "static_headers", None, None)
             .await
             .expect("create mcp server config");
 
@@ -1314,6 +1371,7 @@ mod tests {
             "https://example.com/mcp-v2",
             &HashMap::new(),
             &[],
+            "static_headers",
         )
         .await
         .expect("update should succeed")
@@ -1330,7 +1388,7 @@ mod tests {
     #[sqlx::test]
     async fn test_get_mcp_server_config_by_name_round_trips(pool: PgPool) {
         let headers = HashMap::new();
-        let created = create_mcp_server_config(&pool, "github", "https://api.githubcopilot.com/mcp/", &headers)
+        let created = create_mcp_server_config(&pool, "github", "https://api.githubcopilot.com/mcp/", &headers, "static_headers", None, None)
             .await
             .expect("create mcp server config");
 
@@ -1352,7 +1410,7 @@ mod tests {
             ("Authorization".to_string(), "Bearer old".to_string()),
             ("X-Untouched".to_string(), "keep-me".to_string()),
         ]);
-        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original)
+        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original, "static_headers", None, None)
             .await
             .expect("create mcp server config");
 
@@ -1360,7 +1418,7 @@ mod tests {
             ("Authorization".to_string(), "Bearer new".to_string()),
             ("X-New".to_string(), "brand-new".to_string()),
         ]);
-        let updated = update_mcp_server_config(&pool, created.id, "github", "https://example.com/mcp", &upsert, &[])
+        let updated = update_mcp_server_config(&pool, created.id, "github", "https://example.com/mcp", &upsert, &[], "static_headers")
             .await
             .expect("update should succeed")
             .expect("row should exist");
@@ -1382,7 +1440,7 @@ mod tests {
             ("Authorization".to_string(), "Bearer old".to_string()),
             ("X-Doomed".to_string(), "bye".to_string()),
         ]);
-        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original)
+        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original, "static_headers", None, None)
             .await
             .expect("create mcp server config");
 
@@ -1393,6 +1451,7 @@ mod tests {
             "https://example.com/mcp",
             &HashMap::new(),
             &["X-Doomed".to_string()],
+            "static_headers",
         )
         .await
         .expect("update should succeed")
@@ -1408,7 +1467,7 @@ mod tests {
     #[sqlx::test]
     async fn test_update_mcp_server_config_upsert_wins_over_remove_for_the_same_name(pool: PgPool) {
         let original = HashMap::from([("Authorization".to_string(), "Bearer old".to_string())]);
-        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original)
+        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original, "static_headers", None, None)
             .await
             .expect("create mcp server config");
 
@@ -1420,6 +1479,7 @@ mod tests {
             "https://example.com/mcp",
             &upsert,
             &["Authorization".to_string()],
+            "static_headers",
         )
         .await
         .expect("update should succeed")
@@ -1434,9 +1494,128 @@ mod tests {
 
     #[sqlx::test]
     async fn test_update_mcp_server_config_returns_none_for_unknown_id(pool: PgPool) {
-        let result = update_mcp_server_config(&pool, 999_999, "name", "https://example.com", &HashMap::new(), &[])
-            .await
-            .expect("query should succeed");
+        let result =
+            update_mcp_server_config(&pool, 999_999, "name", "https://example.com", &HashMap::new(), &[], "static_headers")
+                .await
+                .expect("query should succeed");
         assert!(result.is_none());
+    }
+
+    #[sqlx::test]
+    async fn test_create_mcp_server_config_defaults_auth_mode_to_static_headers(pool: PgPool) {
+        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &HashMap::new(), "static_headers", None, None)
+            .await
+            .expect("create mcp server config");
+        assert_eq!(created.auth_mode, "static_headers");
+        assert!(created.oauth_credentials.is_none());
+    }
+
+    #[sqlx::test]
+    async fn test_create_mcp_server_config_stores_a_preregistered_oauth_client(pool: PgPool) {
+        let created = create_mcp_server_config(
+            &pool,
+            "github",
+            "https://api.githubcopilot.com/mcp/",
+            &HashMap::new(),
+            "oauth",
+            Some("client-123"),
+            Some("secret-456"),
+        )
+        .await
+        .expect("create mcp server config");
+        assert_eq!(created.oauth_client_id.as_deref(), Some("client-123"));
+        assert_eq!(created.oauth_client_secret.as_deref(), Some("secret-456"));
+    }
+
+    #[sqlx::test]
+    async fn test_create_mcp_server_config_oauth_mode_round_trips(pool: PgPool) {
+        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &HashMap::new(), "oauth", None, None)
+            .await
+            .expect("create mcp server config");
+        assert_eq!(created.auth_mode, "oauth");
+    }
+
+    #[sqlx::test]
+    async fn test_set_mcp_server_oauth_credentials_round_trips(pool: PgPool) {
+        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &HashMap::new(), "oauth", None, None)
+            .await
+            .expect("create mcp server config");
+
+        let credentials = serde_json::json!({"client_id": "abc", "token_response": null, "granted_scopes": []});
+        set_mcp_server_oauth_credentials(&pool, created.id, Some(credentials.clone()))
+            .await
+            .expect("set oauth credentials");
+
+        let fetched = get_mcp_server_config(&pool, created.id)
+            .await
+            .expect("get mcp server config")
+            .expect("row should exist");
+        assert_eq!(fetched.oauth_credentials.map(|j| j.0), Some(credentials));
+
+        set_mcp_server_oauth_credentials(&pool, created.id, None)
+            .await
+            .expect("clear oauth credentials");
+        let cleared = get_mcp_server_config(&pool, created.id)
+            .await
+            .expect("get mcp server config")
+            .expect("row should exist");
+        assert!(cleared.oauth_credentials.is_none(), "None should clear the stored credentials");
+    }
+
+    #[sqlx::test]
+    async fn test_update_mcp_server_config_clears_oauth_credentials_when_url_changes(pool: PgPool) {
+        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &HashMap::new(), "oauth", None, None)
+            .await
+            .expect("create mcp server config");
+        set_mcp_server_oauth_credentials(&pool, created.id, Some(serde_json::json!({"client_id": "abc"})))
+            .await
+            .expect("set oauth credentials");
+
+        // Changing the URL invalidates a grant that was issued for the old
+        // audience — see docs/projects/plans/mcp-oauth.md's "Data model."
+        let updated = update_mcp_server_config(
+            &pool,
+            created.id,
+            "github",
+            "https://example.com/mcp-v2",
+            &HashMap::new(),
+            &[],
+            "oauth",
+        )
+        .await
+        .expect("update should succeed")
+        .expect("row should exist");
+
+        assert!(updated.oauth_credentials.is_none(), "a URL change must clear stored OAuth credentials");
+    }
+
+    #[sqlx::test]
+    async fn test_update_mcp_server_config_keeps_oauth_credentials_when_url_is_unchanged(pool: PgPool) {
+        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &HashMap::new(), "oauth", None, None)
+            .await
+            .expect("create mcp server config");
+        let credentials = serde_json::json!({"client_id": "abc"});
+        set_mcp_server_oauth_credentials(&pool, created.id, Some(credentials.clone()))
+            .await
+            .expect("set oauth credentials");
+
+        let updated = update_mcp_server_config(
+            &pool,
+            created.id,
+            "github-renamed",
+            "https://example.com/mcp",
+            &HashMap::new(),
+            &[],
+            "oauth",
+        )
+        .await
+        .expect("update should succeed")
+        .expect("row should exist");
+
+        assert_eq!(
+            updated.oauth_credentials.map(|j| j.0),
+            Some(credentials),
+            "renaming without changing the URL must not disturb stored OAuth credentials"
+        );
     }
 }

@@ -537,7 +537,7 @@ mod server {
             .await
             .map_err(|e| format!("failed to look up MCP server {server_name:?}: {e}"))?
             .ok_or_else(|| format!("unknown MCP server: {server_name:?}"))?;
-        crate::mcp::call_tool(&config, tool_name, input.clone()).await
+        crate::mcp::call_tool(pool, &config, tool_name, input.clone()).await
     }
 
     /// The full tool list offered to the model on every `send_message`
@@ -549,7 +549,7 @@ mod server {
     pub async fn tool_definitions(pool: &PgPool) -> Vec<crate::anthropic::ToolDefinition> {
         let mut definitions = native_tool_definitions();
         match crate::db::list_mcp_server_configs(pool).await {
-            Ok(configs) => definitions.extend(crate::mcp::tool_definitions_for(&configs).await),
+            Ok(configs) => definitions.extend(crate::mcp::tool_definitions_for(pool, &configs).await),
             Err(e) => tracing::warn!(error = %e, "failed to list configured MCP servers; their tools are unavailable this turn"),
         }
         definitions

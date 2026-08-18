@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use dioxus::prelude::*;
 
 use crate::api::mcp::{
-    McpConnectionStatus, McpServerSummary, create_mcp_server, delete_mcp_server, get_mcp_server, list_mcp_servers,
-    mcp_server_status, update_mcp_server,
+    McpConnectionStatus, McpServerSummary, create_mcp_server, delete_mcp_server, disconnect_mcp_server_oauth,
+    get_mcp_server, list_mcp_servers, mcp_server_status, start_mcp_server_oauth, update_mcp_server,
 };
 use crate::frontend::Route;
 
@@ -144,6 +144,9 @@ fn McpServerStatusBadge(id: i64) -> Element {
         Some(Ok(McpConnectionStatus::Unreachable { error })) => rsx! {
             span { class: "mcp-status mcp-status-unreachable", title: "{error}", "Unreachable" }
         },
+        Some(Ok(McpConnectionStatus::NotConnected)) => rsx! {
+            span { class: "mcp-status mcp-status-not-connected", "Not connected" }
+        },
         Some(Err(e)) => rsx! {
             span { class: "mcp-status mcp-status-unreachable", title: "{e}", "Error" }
         },
@@ -159,6 +162,20 @@ pub fn McpServerNew() -> Element {
     let mut name: Signal<String> = use_signal(String::new);
     let mut url: Signal<String> = use_signal(String::new);
     let headers: Signal<Vec<(String, String)>> = use_signal(|| vec![(String::new(), String::new())]);
+    // "static_headers" or "oauth" — see McpServerSummary::auth_mode. Fixed
+    // for the lifetime of a server once created (see McpServerEdit's doc
+    // comment on why switching modes isn't supported yet); this radio is
+    // the only place it's ever chosen.
+    let mut auth_mode: Signal<String> = use_signal(|| "static_headers".to_string());
+    // A provider with no OAuth discovery metadata and no Dynamic Client
+    // Registration support (GitHub, confirmed live — see
+    // docs/projects/plans/mcp-oauth.md's "Live verification") needs a
+    // client pre-registered by hand instead of the default DCR flow.
+    // Optional and blank by default — most MCP-spec servers need neither.
+    // Set only here, at creation time: same "delete and recreate to
+    // change" precedent as `auth_mode` itself.
+    let mut oauth_client_id: Signal<String> = use_signal(String::new);
+    let mut oauth_client_secret: Signal<String> = use_signal(String::new);
     let mut submit_error: Signal<Option<String>> = use_signal(|| None);
 
     let submit = move |evt: Event<FormData>| {
@@ -166,8 +183,13 @@ pub fn McpServerNew() -> Element {
         let name_value = name();
         let url_value = url();
         let headers_value = headers_from_rows(headers());
+        let auth_mode_value = auth_mode();
+        let client_id_value = (!oauth_client_id().trim().is_empty()).then(|| oauth_client_id());
+        let client_secret_value = (!oauth_client_secret().trim().is_empty()).then(|| oauth_client_secret());
         spawn(async move {
-            match create_mcp_server(name_value, url_value, headers_value).await {
+            match create_mcp_server(name_value, url_value, headers_value, auth_mode_value, client_id_value, client_secret_value)
+                .await
+            {
                 Ok(summary) => {
                     navigator.push(Route::McpServerEditRoute { id: summary.id });
                 }
@@ -201,8 +223,54 @@ pub fn McpServerNew() -> Element {
                     value: "{url}",
                     oninput: move |e| url.set(e.value()),
                 }
-                label { "Extra headers (optional)" }
-                {header_rows(headers, "Header value")}
+                label { "Authentication" }
+                div { class: "mcp-auth-mode-choice",
+                    label {
+                        input {
+                            r#type: "radio",
+                            name: "mcp-new-auth-mode",
+                            checked: auth_mode() == "static_headers",
+                            onclick: move |_| auth_mode.set("static_headers".to_string()),
+                        }
+                        "Static headers"
+                    }
+                    label {
+                        input {
+                            r#type: "radio",
+                            name: "mcp-new-auth-mode",
+                            checked: auth_mode() == "oauth",
+                            onclick: move |_| auth_mode.set("oauth".to_string()),
+                        }
+                        "OAuth"
+                    }
+                }
+                if auth_mode() == "static_headers" {
+                    label { "Extra headers (optional)" }
+                    {header_rows(headers, "Header value")}
+                } else {
+                    label { r#for: "mcp-new-oauth-client-id", "Client ID (optional)" }
+                    input {
+                        id: "mcp-new-oauth-client-id",
+                        r#type: "text",
+                        placeholder: "Leave blank to use dynamic client registration",
+                        value: "{oauth_client_id}",
+                        oninput: move |e| oauth_client_id.set(e.value()),
+                    }
+                    label { r#for: "mcp-new-oauth-client-secret", "Client secret (optional)" }
+                    input {
+                        id: "mcp-new-oauth-client-secret",
+                        r#type: "password",
+                        placeholder: "Only needed alongside a client ID",
+                        value: "{oauth_client_secret}",
+                        oninput: move |e| oauth_client_secret.set(e.value()),
+                    }
+                    p { class: "muted",
+                        "Most MCP servers support dynamic client registration and need neither field. A provider that doesn't (e.g. GitHub) needs an OAuth app registered by hand with its own client ID/secret."
+                    }
+                    p { class: "muted",
+                        "Save the server first, then connect it to its OAuth provider from its own page."
+                    }
+                }
                 if let Some(err) = submit_error() {
                     p { class: "error", "{err}" }
                 }
@@ -214,10 +282,17 @@ pub fn McpServerNew() -> Element {
 
 /// The full-detail view for one server: its live connection status (every
 /// tool it currently exposes, or why it's unreachable), editable
-/// name/URL, in-place header editing (see `McpServerEdit`'s headers
-/// section below for how a value's real content, which the browser never
+/// name/URL, either in-place header editing or an OAuth connection panel
+/// depending on `auth_mode` (see `McpServerEdit`'s headers section below
+/// for how a header value's real content, which the browser never
 /// receives, can still be edited without retyping every other header),
 /// and delete.
+///
+/// `auth_mode` itself is fixed once a server is created — chosen only on
+/// `McpServerNew`'s form — so there's no control here to switch a server
+/// between static headers and OAuth in place; see
+/// docs/projects/plans/mcp-oauth.md's "UI flow" for why (delete and
+/// re-create is the escape hatch for this pass).
 #[component]
 pub fn McpServerEdit(id: i64) -> Element {
     let navigator = use_navigator();
@@ -228,6 +303,11 @@ pub fn McpServerEdit(id: i64) -> Element {
 
     let mut edit_name: Signal<String> = use_signal(String::new);
     let mut edit_url: Signal<String> = use_signal(String::new);
+    let mut edit_auth_mode: Signal<String> = use_signal(|| "static_headers".to_string());
+    // Read-only display only (see McpServerNew's doc comment on why these
+    // aren't editable here).
+    let mut oauth_client_id: Signal<Option<String>> = use_signal(|| None);
+    let mut has_oauth_client_secret: Signal<bool> = use_signal(|| false);
     // The last-saved name/URL — compared against `edit_name`/`edit_url`
     // below to decide whether the form actually has unsaved changes.
     // Updated on load and again after every successful save (see
@@ -246,6 +326,9 @@ pub fn McpServerEdit(id: i64) -> Element {
                 Ok(summary) => {
                     edit_name.set(summary.name.clone());
                     edit_url.set(summary.url.clone());
+                    edit_auth_mode.set(summary.auth_mode);
+                    oauth_client_id.set(summary.oauth_client_id);
+                    has_oauth_client_secret.set(summary.has_oauth_client_secret);
                     saved_name.set(summary.name);
                     saved_url.set(summary.url);
                     existing_header_edits.set(summary.header_names.into_iter().map(|name| (name, String::new())).collect());
@@ -254,6 +337,30 @@ pub fn McpServerEdit(id: i64) -> Element {
             }
             loaded.set(true);
         }
+    });
+
+    // A failed OAuth attempt lands back here as `?oauth_error=...` (see
+    // `mcp_oauth::callback_handler`) — read once on mount via a JS eval
+    // (there's no query-param extraction wired into `Route` yet) and strip
+    // it from the URL so a later refresh doesn't keep re-showing it.
+    let mut oauth_error: Signal<Option<String>> = use_signal(|| None);
+    #[cfg(feature = "web")]
+    use_effect(move || {
+        spawn(async move {
+            let script = "const p = new URLSearchParams(window.location.search);
+                 const err = p.get('oauth_error');
+                 if (err !== null) {
+                     p.delete('oauth_error');
+                     const rest = p.toString();
+                     window.history.replaceState({}, '', window.location.pathname + (rest ? '?' + rest : ''));
+                 }
+                 return err;";
+            if let Ok(value) = document::eval(script).await {
+                if let Some(err) = value.as_str() {
+                    oauth_error.set(Some(err.to_string()));
+                }
+            }
+        });
     });
 
     // Bumping this re-runs the status resource below — used after a
@@ -304,9 +411,10 @@ pub fn McpServerEdit(id: i64) -> Element {
             existing_header_edits().into_iter().filter(|(_, value)| !value.trim().is_empty()).collect();
         upsert.extend(headers_from_rows(new_header_rows()));
         let remove = removed_header_names();
+        let auth_mode = edit_auth_mode();
         saving.set(true);
         spawn(async move {
-            match update_mcp_server(id, name, url, upsert, remove).await {
+            match update_mcp_server(id, name, url, upsert, remove, auth_mode).await {
                 Ok(summary) => {
                     saved_name.set(summary.name.clone());
                     saved_url.set(summary.url.clone());
@@ -321,6 +429,54 @@ pub fn McpServerEdit(id: i64) -> Element {
                 Err(e) => save_error.set(Some(e.to_string())),
             }
             saving.set(false);
+        });
+    };
+
+    // --- OAuth connect/reconnect/disconnect ---
+    let mut oauth_connecting = use_signal(|| false);
+
+    let connect_oauth = move |_| {
+        oauth_connecting.set(true);
+        oauth_error.set(None);
+        spawn(async move {
+            match start_mcp_server_oauth(id).await {
+                // Prefixed with `_` since it's only read under `#[cfg(feature =
+                // "web")]` below — the server build (e.g. `cargo test
+                // --features server`) never touches it.
+                Ok(_url) => {
+                    // A real full-page navigation, not a client-side route
+                    // push — this has to leave smelt entirely for the
+                    // provider's own login/consent page. `document::eval`
+                    // JSON-encodes the URL into the script rather than
+                    // string-interpolating it directly, so nothing in it
+                    // can break out of the JS string literal.
+                    #[cfg(feature = "web")]
+                    {
+                        let script = format!(
+                            "window.location.href = {};",
+                            serde_json::to_string(&_url).unwrap_or_default()
+                        );
+                        let _ = document::eval(&script).await;
+                    }
+                }
+                Err(e) => {
+                    oauth_error.set(Some(e.to_string()));
+                    oauth_connecting.set(false);
+                }
+            }
+        });
+    };
+
+    let mut disconnect_error: Signal<Option<String>> = use_signal(|| None);
+    let disconnect_oauth = move |_| {
+        spawn(async move {
+            match disconnect_mcp_server_oauth(id).await {
+                Ok(()) => {
+                    disconnect_error.set(None);
+                    status_reload.set(status_reload() + 1);
+                }
+                Err(e) => disconnect_error.set(Some(e.to_string())),
+            }
         });
     };
 
@@ -377,6 +533,11 @@ pub fn McpServerEdit(id: i64) -> Element {
                                 p { class: "error", "{error}" }
                             }
                         },
+                        Some(Ok(McpConnectionStatus::NotConnected)) => rsx! {
+                            div { class: "mcp-status mcp-status-not-connected",
+                                p { "Not connected \u{2014} use Connect below." }
+                            }
+                        },
                         Some(Err(e)) => rsx! {
                             div { class: "mcp-status mcp-status-unreachable",
                                 p { class: "error", "{e}" }
@@ -415,33 +576,35 @@ pub fn McpServerEdit(id: i64) -> Element {
                         oninput: move |e| edit_url.set(e.value()),
                     }
 
-                    label { "Headers" }
-                    if !existing_header_edits().is_empty() {
-                        div { class: "mcp-header-rows",
-                            for (index , (name , value)) in existing_header_edits().into_iter().enumerate() {
-                                div { key: "{name}", class: "mcp-header-row",
-                                    span { class: "mcp-header-existing-name", "{name}" }
-                                    input {
-                                        r#type: "text",
-                                        class: "mcp-header-value",
-                                        placeholder: "(unchanged)",
-                                        value: "{value}",
-                                        oninput: move |e| existing_header_edits.write()[index].1 = e.value(),
-                                    }
-                                    button {
-                                        r#type: "button",
-                                        class: "mcp-remove-header",
-                                        onclick: move |_| {
-                                            let (removed_name, _) = existing_header_edits.write().remove(index);
-                                            removed_header_names.write().push(removed_name);
-                                        },
-                                        "Remove"
+                    if edit_auth_mode() == "static_headers" {
+                        label { "Headers" }
+                        if !existing_header_edits().is_empty() {
+                            div { class: "mcp-header-rows",
+                                for (index , (name , value)) in existing_header_edits().into_iter().enumerate() {
+                                    div { key: "{name}", class: "mcp-header-row",
+                                        span { class: "mcp-header-existing-name", "{name}" }
+                                        input {
+                                            r#type: "text",
+                                            class: "mcp-header-value",
+                                            placeholder: "(unchanged)",
+                                            value: "{value}",
+                                            oninput: move |e| existing_header_edits.write()[index].1 = e.value(),
+                                        }
+                                        button {
+                                            r#type: "button",
+                                            class: "mcp-remove-header",
+                                            onclick: move |_| {
+                                                let (removed_name, _) = existing_header_edits.write().remove(index);
+                                                removed_header_names.write().push(removed_name);
+                                            },
+                                            "Remove"
+                                        }
                                     }
                                 }
                             }
                         }
+                        {header_rows(new_header_rows, "Header value")}
                     }
-                    {header_rows(new_header_rows, "Header value")}
 
                     if let Some(err) = save_error() {
                         p { class: "error", "{err}" }
@@ -455,6 +618,49 @@ pub fn McpServerEdit(id: i64) -> Element {
                             "Saving\u{2026}"
                         } else {
                             "Save"
+                        }
+                    }
+                }
+
+                if edit_auth_mode() == "oauth" {
+                    div { class: "mcp-oauth-panel",
+                        h2 { "OAuth connection" }
+                        p { class: "muted",
+                            if let Some(client_id) = oauth_client_id() {
+                                "Pre-registered client ID: {client_id}"
+                                if has_oauth_client_secret() {
+                                    " (with a client secret)"
+                                }
+                            } else {
+                                "Using dynamic client registration \u{2014} no pre-registered client."
+                            }
+                        }
+                        if let Some(err) = oauth_error() {
+                            p { class: "error", "{err}" }
+                        }
+                        if let Some(err) = disconnect_error() {
+                            p { class: "error", "{err}" }
+                        }
+                        div { class: "mcp-oauth-actions",
+                            button {
+                                class: "mcp-oauth-connect",
+                                r#type: "button",
+                                disabled: oauth_connecting(),
+                                onclick: connect_oauth,
+                                if matches!(status(), Some(Ok(McpConnectionStatus::Connected { .. }))) {
+                                    "Reconnect"
+                                } else {
+                                    "Connect"
+                                }
+                            }
+                            if matches!(status(), Some(Ok(McpConnectionStatus::Connected { .. } | McpConnectionStatus::Unreachable { .. }))) {
+                                button {
+                                    class: "mcp-oauth-disconnect",
+                                    r#type: "button",
+                                    onclick: disconnect_oauth,
+                                    "Disconnect"
+                                }
+                            }
                         }
                     }
                 }
