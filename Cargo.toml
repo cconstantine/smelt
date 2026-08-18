@@ -77,10 +77,24 @@ chromiumoxide = { version = "0.7", optional = true }
 # since Rust doesn't expose a transitive dependency's API without an
 # explicit edge.
 http = { version = "1", optional = true }
+# For src/mcp_oauth.rs's `CredentialStore` impl — rmcp's own trait is
+# `#[async_trait]`-annotated (its "auth" feature pulls the crate in, but
+# doesn't re-export the macro), same "explicit edge" reasoning as `http`
+# above.
+async-trait = { version = "0.1", optional = true }
+# For src/mcp_oauth.rs's callback route — percent-encoding an OAuth error
+# message into a `?oauth_error=` redirect query param. Already present
+# transitively (pulled in by `url`, itself pulled in by rmcp's "auth"
+# feature), same "explicit edge" reasoning as `http`/`async-trait` above.
+percent-encoding = { version = "2", optional = true }
 # "server" is needed too (not just the client-side pieces) purely for
 # #[cfg(test)]'s mock MCP server, which implements rmcp's own
 # ServerHandler trait — that trait is gated behind rmcp's "server" feature.
-rmcp = { version = "3.1.2", default-features = false, features = ["client", "server", "reqwest", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"], optional = true }
+# "auth" adds rmcp's own MCP-spec OAuth client (discovery, dynamic client
+# registration, PKCE, refresh) — see docs/projects/plans/mcp-oauth.md. Pulls
+# in the `oauth2` crate transitively; no separate direct dependency needed
+# since smelt only touches rmcp's re-exports of it.
+rmcp = { version = "3.1.2", default-features = false, features = ["client", "server", "reqwest", "transport-streamable-http-client-reqwest", "transport-streamable-http-server", "auth"], optional = true }
 
 # Web-only: a wasm-compatible timer (tokio::time has no driver in a browser
 # tab — there's no tokio runtime on the WASM client at all).
@@ -107,6 +121,8 @@ server = [
     "dep:sha2",
     "dep:rmcp",
     "dep:http",
+    "dep:async-trait",
+    "dep:percent-encoding",
 ]
 # Separate from `server` so the default `cargo test --features server` loop
 # stays exactly as fast as it is today — src/browser_tests.rs's one

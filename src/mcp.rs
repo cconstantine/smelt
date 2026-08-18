@@ -121,8 +121,51 @@ where
     }
 }
 
-async fn connect(config: &McpServerConfig) -> Result<Connection, String> {
-    let headers = build_header_map(&config.extra_headers.0)?;
+/// Fetches a fresh OAuth access token for `config` (auto-refreshing via the
+/// stored refresh token if the current one is expired — and persisting
+/// that refresh through `PgCredentialStore`) and merges it into `config`'s
+/// static `extra_headers` as a plain `Authorization: Bearer <token>` —
+/// deliberately reusing the same `build_header_map`/`custom_headers` path
+/// static-header mode already uses, rather than wiring `rmcp`'s
+/// `AuthClient`/`AuthorizedHttpClient` into the transport's HTTP client
+/// directly. See docs/projects/plans/mcp-oauth.md's "`src/mcp.rs` —
+/// `connect()`'s new branch." A token that expires mid-connection (a
+/// long-lived cached `Connection`) isn't proactively refreshed — only the
+/// next fresh `connect()` re-fetches one; a documented limitation, not an
+/// oversight.
+async fn oauth_headers(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<HashMap<String, String>, String> {
+    if config.oauth_credentials.is_none() {
+        return Err(format!(
+            "MCP server {:?} is configured for OAuth but has never connected — use the Connect button on its edit page",
+            config.name
+        ));
+    }
+
+    let mut manager = rmcp::transport::auth::AuthorizationManager::new(config.url.as_str())
+        .await
+        .map_err(|e| format!("failed to initialize OAuth for MCP server {:?}: {e}", config.name))?;
+    manager.set_credential_store(crate::mcp_oauth::PgCredentialStore::new(pool.clone(), config.id));
+    manager
+        .initialize_from_store()
+        .await
+        .map_err(|e| format!("failed to load stored OAuth credentials for MCP server {:?}: {e}", config.name))?;
+    let token = manager
+        .get_access_token()
+        .await
+        .map_err(|e| format!("failed to get an OAuth access token for MCP server {:?}: {e}", config.name))?;
+
+    let mut headers = config.extra_headers.0.clone();
+    headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+    Ok(headers)
+}
+
+async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connection, String> {
+    let extra_headers = if config.auth_mode == "oauth" {
+        oauth_headers(pool, config).await?
+    } else {
+        config.extra_headers.0.clone()
+    };
+    let headers = build_header_map(&extra_headers)?;
     let transport_config =
         StreamableHttpClientTransportConfig::with_uri(config.url.clone()).custom_headers(headers);
     let transport = StreamableHttpClientTransport::from_config(transport_config);
@@ -148,7 +191,7 @@ async fn connect(config: &McpServerConfig) -> Result<Connection, String> {
 /// notification fired). A `list_all_tools` failure on an existing
 /// connection is treated as "the connection is broken," not just "the list
 /// is stale": the entry is dropped so the fallback below reconnects fully.
-async fn ensure_connected(config: &McpServerConfig) -> Result<(), String> {
+async fn ensure_connected(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<(), String> {
     let mut registry = REGISTRY.lock().await;
 
     if let Some(conn) = registry.get_mut(&config.id) {
@@ -165,7 +208,7 @@ async fn ensure_connected(config: &McpServerConfig) -> Result<(), String> {
         }
     }
 
-    let connection = retry_once(|| connect(config)).await?;
+    let connection = retry_once(|| connect(pool, config)).await?;
     registry.insert(config.id, connection);
     Ok(())
 }
@@ -184,10 +227,10 @@ fn mcp_tool_to_definition(server_name: &str, tool: &McpTool) -> ToolDefinition {
 /// connect this turn is skipped (logged, not fatal) rather than failing
 /// the whole tool list — the model just doesn't see that server's tools
 /// until it's reachable again.
-pub async fn tool_definitions_for(configs: &[McpServerConfig]) -> Vec<ToolDefinition> {
+pub async fn tool_definitions_for(pool: &sqlx::PgPool, configs: &[McpServerConfig]) -> Vec<ToolDefinition> {
     let mut definitions = Vec::new();
     for config in configs {
-        if let Err(e) = ensure_connected(config).await {
+        if let Err(e) = ensure_connected(pool, config).await {
             tracing::warn!(server = %config.name, error = %e, "MCP server unreachable this turn; its tools are unavailable");
             continue;
         }
@@ -206,8 +249,8 @@ pub async fn tool_definitions_for(configs: &[McpServerConfig]) -> Vec<ToolDefini
 /// indicator at all. Shares `ensure_connected`'s registry/retry logic with
 /// `tool_definitions_for`/`call_tool`, so a server already connected this
 /// turn is reported without a second round-trip.
-pub async fn connection_check(config: &McpServerConfig) -> Result<Vec<String>, String> {
-    ensure_connected(config).await?;
+pub async fn connection_check(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Vec<String>, String> {
+    ensure_connected(pool, config).await?;
     let registry = REGISTRY.lock().await;
     let conn = registry
         .get(&config.id)
@@ -223,14 +266,19 @@ pub async fn connection_check(config: &McpServerConfig) -> Result<Vec<String>, S
 /// back as `Err` so `anthropic::tools::execute` wraps it in a
 /// `ContentBlock::ToolResult { is_error: Some(true), .. }` like any other
 /// failed tool call.
-pub async fn call_tool(config: &McpServerConfig, tool_name: &str, arguments: serde_json::Value) -> Result<String, String> {
+pub async fn call_tool(
+    pool: &sqlx::PgPool,
+    config: &McpServerConfig,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> Result<String, String> {
     let arguments = match arguments {
         serde_json::Value::Object(map) => Some(map),
         serde_json::Value::Null => None,
         other => return Err(format!("tool arguments must be a JSON object, got: {other}")),
     };
 
-    ensure_connected(config).await?;
+    ensure_connected(pool, config).await?;
     let registry = REGISTRY.lock().await;
     let conn = registry
         .get(&config.id)
@@ -402,12 +450,27 @@ mod tests {
         server
     }
 
+    /// Never actually connected to — every test below either pre-populates
+    /// `REGISTRY` directly (so `connect` is never reached) or uses a
+    /// `static_headers` config (so `oauth_headers`, the only path that
+    /// touches the pool, is never reached either). Same lazy-fake-pool
+    /// pattern `anthropic::tools`' own tests already use for the same
+    /// reason. OAuth-touching behavior gets its own `#[sqlx::test]`s in
+    /// `mcp_oauth.rs`.
+    fn test_pool() -> sqlx::PgPool {
+        sqlx::PgPool::connect_lazy("postgres://unused:unused@localhost/unused").expect("lazy pool construction never fails")
+    }
+
     fn test_config(id: i64, name: &str) -> McpServerConfig {
         McpServerConfig {
             id,
             name: name.to_string(),
             url: "http://unused.invalid".to_string(),
             extra_headers: sqlx::types::Json(HashMap::new()),
+            auth_mode: "static_headers".to_string(),
+            oauth_credentials: None,
+            oauth_client_id: None,
+            oauth_client_secret: None,
             created_at: Default::default(),
             updated_at: Default::default(),
         }
@@ -440,7 +503,7 @@ mod tests {
         let server_id = -1001;
         register_test_connection(server_id, false).await;
 
-        let definitions = tool_definitions_for(&[test_config(server_id, "test-server")]).await;
+        let definitions = tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")]).await;
 
         assert_eq!(definitions.len(), 1);
         assert_eq!(definitions[0].name, "mcp__test-server__echo");
@@ -454,7 +517,7 @@ mod tests {
         let server_id = -1002;
         register_test_connection(server_id, false).await;
 
-        let result = call_tool(&test_config(server_id, "test-server"), "echo", serde_json::json!({"hello": "world"}))
+        let result = call_tool(&test_pool(), &test_config(server_id, "test-server"), "echo", serde_json::json!({"hello": "world"}))
             .await
             .expect("call_tool should succeed");
 
@@ -475,7 +538,7 @@ mod tests {
         // `notify_if_visible`).
         let server = register_test_connection(server_id, true).await;
 
-        let before = tool_definitions_for(&[test_config(server_id, "test-server")]).await;
+        let before = tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")]).await;
         assert_eq!(before.len(), 1, "starts with just the echo tool; second_tool begins disabled");
 
         // Real behavior, not a manual eviction: nothing but the
@@ -486,7 +549,7 @@ mod tests {
         // transport and flip the connection's `stale` flag.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let after = tool_definitions_for(&[test_config(server_id, "test-server")]).await;
+        let after = tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")]).await;
         let names: Vec<&str> = after.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(after.len(), 2, "expected both tools after the list_changed notification, got: {names:?}");
         assert!(names.contains(&"mcp__test-server__second_tool"));
@@ -499,7 +562,7 @@ mod tests {
         let server_id = -1004;
         register_test_connection(server_id, false).await;
 
-        let tool_names = connection_check(&test_config(server_id, "test-server"))
+        let tool_names = connection_check(&test_pool(), &test_config(server_id, "test-server"))
             .await
             .expect("a registered connection should report as connected");
 
@@ -514,7 +577,7 @@ mod tests {
         // `test_config`'s URL is deliberately unroutable, so this must
         // report an error rather than panicking or hanging.
         let server_id = -1005;
-        let result = connection_check(&test_config(server_id, "unreachable-server")).await;
+        let result = connection_check(&test_pool(), &test_config(server_id, "unreachable-server")).await;
         assert!(result.is_err(), "expected an unreachable server to report Err, got {result:?}");
     }
 

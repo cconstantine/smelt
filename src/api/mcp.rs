@@ -18,6 +18,19 @@ pub struct McpServerSummary {
     pub name: String,
     pub url: String,
     pub header_names: Vec<String>,
+    /// `"static_headers"` or `"oauth"` — see
+    /// docs/projects/plans/mcp-oauth.md. Drives which controls
+    /// `/mcp-servers`' edit page shows (header editor vs. Connect/
+    /// Reconnect/Disconnect).
+    pub auth_mode: String,
+    /// A pre-registered OAuth client's id — not secret (visible in the
+    /// authorization URL regardless), so shown back plain. `None` means
+    /// "use Dynamic Client Registration" (most MCP-spec-compliant
+    /// servers). See `McpServerConfig::oauth_client_id`.
+    pub oauth_client_id: Option<String>,
+    /// Whether a client *secret* is configured — never the value itself,
+    /// same write-only precedent as header values.
+    pub has_oauth_client_secret: bool,
 }
 
 #[cfg(feature = "server")]
@@ -30,6 +43,9 @@ impl From<db::McpServerConfig> for McpServerSummary {
             name: config.name,
             url: config.url,
             header_names,
+            auth_mode: config.auth_mode,
+            oauth_client_id: config.oauth_client_id,
+            has_oauth_client_secret: config.oauth_client_secret.is_some(),
         }
     }
 }
@@ -41,6 +57,11 @@ impl From<db::McpServerConfig> for McpServerSummary {
 pub enum McpConnectionStatus {
     Connected { tool_names: Vec<String> },
     Unreachable { error: String },
+    /// `auth_mode == "oauth"` and no OAuth flow has ever completed for this
+    /// server (or it was disconnected) — distinct from `Unreachable`
+    /// because there's no network problem to report, just nothing to
+    /// connect with yet.
+    NotConnected,
 }
 
 #[get("/api/mcp-servers")]
@@ -68,7 +89,12 @@ pub async fn mcp_server_status(id: i64) -> ServerFnResult<McpConnectionStatus> {
         .await
         .map_err(ServerFnError::new)?
         .ok_or_else(|| ServerFnError::new(format!("no MCP server config with id {id}")))?;
-    Ok(match crate::mcp::connection_check(&config).await {
+
+    if config.auth_mode == "oauth" && config.oauth_credentials.is_none() {
+        return Ok(McpConnectionStatus::NotConnected);
+    }
+
+    Ok(match crate::mcp::connection_check(db::get(), &config).await {
         Ok(tool_names) => McpConnectionStatus::Connected { tool_names },
         Err(error) => McpConnectionStatus::Unreachable { error },
     })
@@ -79,10 +105,21 @@ pub async fn create_mcp_server(
     name: String,
     url: String,
     extra_headers: HashMap<String, String>,
+    auth_mode: String,
+    oauth_client_id: Option<String>,
+    oauth_client_secret: Option<String>,
 ) -> ServerFnResult<McpServerSummary> {
-    let config = db::create_mcp_server_config(db::get(), &name, &url, &extra_headers)
-        .await
-        .map_err(ServerFnError::new)?;
+    let config = db::create_mcp_server_config(
+        db::get(),
+        &name,
+        &url,
+        &extra_headers,
+        &auth_mode,
+        oauth_client_id.as_deref(),
+        oauth_client_secret.as_deref(),
+    )
+    .await
+    .map_err(ServerFnError::new)?;
     Ok(config.into())
 }
 
@@ -102,8 +139,9 @@ pub async fn update_mcp_server(
     url: String,
     upsert_headers: HashMap<String, String>,
     remove_headers: Vec<String>,
+    auth_mode: String,
 ) -> ServerFnResult<McpServerSummary> {
-    let config = db::update_mcp_server_config(db::get(), id, &name, &url, &upsert_headers, &remove_headers)
+    let config = db::update_mcp_server_config(db::get(), id, &name, &url, &upsert_headers, &remove_headers, &auth_mode)
         .await
         .map_err(ServerFnError::new)?
         .ok_or_else(|| ServerFnError::new(format!("no MCP server config with id {id}")))?;
@@ -116,6 +154,36 @@ pub async fn delete_mcp_server(id: i64) -> ServerFnResult<()> {
     db::delete_mcp_server_config(db::get(), id)
         .await
         .map_err(ServerFnError::new)?;
+    crate::mcp::evict(id).await;
+    Ok(())
+}
+
+/// Starts an OAuth authorization attempt for server `id` and returns the
+/// URL the browser must navigate to (a real full-page navigation to the
+/// authorization provider, not something this call itself redirects to —
+/// see `docs/projects/plans/mcp-oauth.md`'s "UI flow"). The redirect_uri
+/// smelt registers is built from *this request's own* Host header (plus
+/// `X-Forwarded-Proto`, since a bare `Host` never carries scheme) — see the
+/// plan's "Answered by the user": derived, not a configured base URL.
+#[post("/api/mcp-servers/{id}/oauth/start")]
+pub async fn start_mcp_server_oauth(id: i64) -> ServerFnResult<String> {
+    let config = db::get_mcp_server_config(db::get(), id)
+        .await
+        .map_err(ServerFnError::new)?
+        .ok_or_else(|| ServerFnError::new(format!("no MCP server config with id {id}")))?;
+    let redirect_uri = format!("{}/oauth/mcp-callback/{id}", crate::mcp_oauth::request_base_url().await?);
+    crate::mcp_oauth::start(db::get(), &config, redirect_uri).await.map_err(ServerFnError::new)
+}
+
+/// Clears server `id`'s stored OAuth credentials without deleting the
+/// server row — the edit page's "Disconnect" button.
+#[post("/api/mcp-servers/{id}/oauth/disconnect")]
+pub async fn disconnect_mcp_server_oauth(id: i64) -> ServerFnResult<()> {
+    let config = db::get_mcp_server_config(db::get(), id)
+        .await
+        .map_err(ServerFnError::new)?
+        .ok_or_else(|| ServerFnError::new(format!("no MCP server config with id {id}")))?;
+    crate::mcp_oauth::disconnect(db::get(), &config).await.map_err(ServerFnError::new)?;
     crate::mcp::evict(id).await;
     Ok(())
 }
@@ -134,6 +202,10 @@ mod tests {
                 ("Authorization".to_string(), "Bearer super-secret-token".to_string()),
                 ("X-Api-Key".to_string(), "another-secret".to_string()),
             ])),
+            auth_mode: "static_headers".to_string(),
+            oauth_credentials: None,
+            oauth_client_id: None,
+            oauth_client_secret: None,
             created_at: Default::default(),
             updated_at: Default::default(),
         };
