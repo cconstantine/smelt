@@ -37,8 +37,6 @@ nix = { version = "0.29", default-features = false, features = ["signal"], optio
 # raw stream (kube's own "ws" feature only covers exec/attach, not an
 # arbitrary application-level WS server like sandbox_agent's).
 tokio-tungstenite = { version = "0.24", optional = true }
-# For src/sandbox.rs's tar-over-exec agent injection.
-tar = { version = "0.4", optional = true }
 # For sandbox_agent's file-tool content hashing (staleness detection on
 # edit_file/write_file) — see docs/projects/plans/file-tools.md.
 sha2 = { version = "0.10", optional = true }
@@ -117,7 +115,6 @@ server = [
     "dep:rustls",
     "dep:nix",
     "dep:tokio-tungstenite",
-    "dep:tar",
     "dep:sha2",
     "dep:rmcp",
     "dep:http",
@@ -138,4 +135,12 @@ browser-test = ["server", "dep:chromiumoxide"]
 [[bin]]
 name = "sandbox_agent"
 path = "src/bin/sandbox_agent.rs"
+required-features = ["server"]
+
+# Standalone CLI, run by scripts/build-sandbox-image.sh — see
+# src/bin/sandbox_image_import.rs's own doc comment for why it isn't part
+# of the main crate's module tree.
+[[bin]]
+name = "sandbox_image_import"
+path = "src/bin/sandbox_image_import.rs"
 required-features = ["server"]

@@ -6,10 +6,12 @@ Dioxus components under `src/frontend/`, rendered via **fullstack SSR**: the ser
 
 ```
 frontend/
-  mod.rs           # App (router root), Route enum, Home/ConversationRoute
+  mod.rs               # App (router root), Route enum, Home/ConversationRoute
   pages/
     mod.rs
-    chat.rs        # Chat, ConversationSidebar, ChatPanel
+    chat.rs            # Chat, ConversationSidebar, ChatPanel
+    mcp_servers.rs      # McpServersIndex, McpServerNew, McpServerEdit
+    sandbox_volumes.rs  # SandboxVolumesIndex, SandboxVolumeNew
 ```
 
 `App` mounts a single stylesheet asset and the router:
@@ -24,7 +26,7 @@ pub fn App() -> Element {
 }
 ```
 
-Two routes: `Home {}` at `/` (nothing selected) and `ConversationRoute { id: i64 }` at `/conversation/{id}`. Both just render `Chat {}` with no props — `Chat` derives which conversation is selected straight from the router:
+The chat routes: `Home {}` at `/` (nothing selected) and `ConversationRoute { id: i64 }` at `/conversation/{id}`. Both just render `Chat {}` with no props — `Chat` derives which conversation is selected straight from the router (every other route — `/mcp-servers`, `/sandbox-volumes`, and their `new`/`:id` children — maps `None`, since `Chat` never renders there at all):
 
 ```rust
 let router = use_router();

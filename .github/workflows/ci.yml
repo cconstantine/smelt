@@ -74,16 +74,19 @@ jobs:
       # (via the actions/cache step above) — target/ already persists via
       # docker-compose.yml's `.:/app` bind mount, no extra mount needed.
       #
-      # src/sandbox.rs's `include_bytes!` pulls in a pre-built
-      # target/sandbox-agent/sandbox_agent — any `server`-feature build
-      # (sandbox is #[cfg(feature = "server")]-gated) fails to compile
-      # without it. scripts/build-sandbox-agent.sh must run first; see
-      # its own header comment and src/sandbox.rs's AGENT_BINARY doc.
-      - name: Build sandbox_agent
+      # The sandbox image is delivered with no registry involved (`ctr
+      # images import` straight into this runner's own k3s node — see
+      # docs/projects/plans/sandbox-native-environment.md) rather than
+      # pulled, so every sandbox test that creates a pod fails outright
+      # (`ImagePullBackOff`) unless this has run first — a fresh runner's
+      # k3s always starts with nothing imported. Needs `docker`/`k3s`/
+      # `k3s-bootstrap` already up, which the two steps above this one
+      # provide.
+      - name: Build and deliver the sandbox image
         run: |
           docker compose run --rm \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
-            smelt scripts/build-sandbox-agent.sh
+            smelt scripts/build-sandbox-image.sh
 
       # The sandbox tests create real pods against the compose-provided k3s
       # cluster. Two of them (test_dropping_without_delete_still_cleans_up_via_drain_task,

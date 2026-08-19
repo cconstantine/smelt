@@ -1284,3 +1284,159 @@ div.mcp-status-not-connected::before {
 .mcp-oauth-disconnect:hover {
     background: #fdecea;
 }
+
+/* Sandbox volumes (docs/projects/plans/sandbox-native-environment.md) —
+   reuses the mcp-servers pages' visual language rather than inventing a
+   second one. */
+
+.sandbox-volumes-page {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+}
+
+.sandbox-volumes-header {
+    margin-bottom: 24px;
+}
+
+.sandbox-volumes-back-link {
+    display: inline-block;
+    margin-bottom: 12px;
+    color: #555;
+    font-size: 13px;
+    text-decoration: none;
+}
+
+.sandbox-volumes-back-link:hover {
+    color: #111;
+}
+
+.sandbox-volumes-new-link {
+    display: inline-block;
+    margin-top: 12px;
+    padding: 8px 16px;
+    border: 1px solid #111;
+    border-radius: 8px;
+    background: #111;
+    color: #fff;
+    font-size: 13px;
+    font-weight: 600;
+    text-decoration: none;
+}
+
+.sandbox-volumes-new-link:hover {
+    background: #2b2b2b;
+}
+
+.sandbox-volume-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.sandbox-volume-row {
+    padding: 14px 16px;
+    border: 1px solid #e5e5e5;
+    border-radius: 12px;
+    background: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.sandbox-volume-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.sandbox-volume-name {
+    font-weight: 600;
+    font-size: 15px;
+}
+
+.sandbox-volume-path {
+    font-size: 13px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #666;
+    word-break: break-all;
+}
+
+.sandbox-volume-delete {
+    align-self: flex-start;
+    padding: 8px 16px;
+    border: 1px solid #c0392b;
+    border-radius: 8px;
+    background: #fff;
+    color: #c0392b;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.sandbox-volume-delete:hover {
+    background: #fdecea;
+}
+
+.sandbox-volume-delete.confirm {
+    background: #c0392b;
+    color: #fff;
+}
+
+.sandbox-volume-add-form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px;
+    border: 1px solid #e5e5e5;
+    border-radius: 12px;
+    background: #fff;
+    margin-bottom: 24px;
+}
+
+.sandbox-volume-add-form label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #333;
+}
+
+.sandbox-volume-add-form input {
+    padding: 8px 12px;
+    border: 1px solid #d0d0d0;
+    border-radius: 8px;
+    font-size: 14px;
+}
+
+.sandbox-volume-add-form input:focus {
+    outline: none;
+    border-color: #111;
+    box-shadow: 0 0 0 3px rgba(17, 17, 17, 0.08);
+}
+
+.sandbox-volume-add-form button {
+    align-self: flex-start;
+    padding: 8px 16px;
+    border: 1px solid #111;
+    border-radius: 8px;
+    background: #111;
+    color: #fff;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.sandbox-volume-add-form button:hover {
+    background: #2b2b2b;
+}
+
+.sandbox-volume-add-form button:disabled {
+    background: #e5e5e5;
+    border-color: #e5e5e5;
+    color: #999;
+    cursor: not-allowed;
+}
