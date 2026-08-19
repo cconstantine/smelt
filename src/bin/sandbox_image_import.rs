@@ -21,8 +21,9 @@ use std::error::Error;
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::{
-    Container, HostPathVolumeSource, Pod, PodSpec, Volume, VolumeMount,
+    Container, HostPathVolumeSource, Pod, PodSpec, ResourceRequirements, Volume, VolumeMount,
 };
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, AttachParams, DeleteParams, PostParams};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -73,6 +74,19 @@ async fn import(pods: &Api<Pod>, tar_path: &str) -> Result<(), BoxError> {
 }
 
 fn loader_pod_spec() -> Pod {
+    // Explicit and small, on purpose: `smelt-park`'s `LimitRange` sets only
+    // a `max` (64Gi/16 cores, see k8s/smelt-park-rbac.yaml), no `default` —
+    // Kubernetes fills that gap by making an unspecified request/limit
+    // default to `max` itself, which no CI runner can schedule. Found via a
+    // real CI failure (`FailedScheduling ... Insufficient cpu, Insufficient
+    // memory`) that a bigger real cluster's spare capacity had masked.
+    let mut requests = std::collections::BTreeMap::new();
+    requests.insert("cpu".to_string(), Quantity("100m".to_string()));
+    requests.insert("memory".to_string(), Quantity("128Mi".to_string()));
+    let mut limits = std::collections::BTreeMap::new();
+    limits.insert("cpu".to_string(), Quantity("500m".to_string()));
+    limits.insert("memory".to_string(), Quantity("512Mi".to_string()));
+
     Pod {
         metadata: ObjectMeta { name: Some(LOADER_POD_NAME.to_string()), namespace: Some(NAMESPACE.to_string()), ..Default::default() },
         spec: Some(PodSpec {
@@ -80,6 +94,7 @@ fn loader_pod_spec() -> Pod {
                 name: "loader".to_string(),
                 image: Some(LOADER_IMAGE.to_string()),
                 command: Some(vec!["sleep".to_string(), "300".to_string()]),
+                resources: Some(ResourceRequirements { requests: Some(requests), limits: Some(limits), ..Default::default() }),
                 volume_mounts: Some(vec![VolumeMount {
                     name: "k3s-run".to_string(),
                     mount_path: "/hostcontainerd".to_string(),

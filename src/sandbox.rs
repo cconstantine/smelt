@@ -1972,6 +1972,16 @@ mod tests {
         for n in 1..=30i64 {
             pods_precheck.delete(&pod_name(n), &immediate_delete_params()).await.ok();
         }
+        // Same reasoning as the pod-name wipe above, for
+        // `create_volume`/`delete_volume`'s PVCs (`sandbox-volume-{id}`) —
+        // this test's own `sandbox_volumes` row always lands on a
+        // low integer id in a fresh `#[sqlx::test]` database, but a
+        // previous run's PVC of the same k8s name can still be sitting
+        // around if that run failed before reaching its own cleanup.
+        let pvcs_precheck = pvc_api(&client);
+        for n in 1..=30i64 {
+            pvcs_precheck.delete(&sandbox_volume_pvc_name(n), &DeleteParams::default()).await.ok();
+        }
 
         let conversation_a = db::create_conversation(&pool).await.expect("create conversation a");
         let conversation_b = db::create_conversation(&pool).await.expect("create conversation b");
@@ -2409,6 +2419,14 @@ mod tests {
             let conversation_g = db::create_conversation(&pool).await.expect("create conversation g");
             let pod_g_row = db::create_sandbox_pod(&pool, conversation_g.id).await.expect("create_sandbox_pod (g)");
             let pod_g = pod_g_row.id;
+            // Explicit and small, on purpose — see
+            // `sandbox_image_import::loader_pod_spec`'s comment: an
+            // unspecified request/limit here would implicitly default to
+            // `smelt-park`'s `LimitRange` `max` (64Gi/16 cores), which no
+            // CI runner can schedule.
+            let mut no_agent_limits = std::collections::BTreeMap::new();
+            no_agent_limits.insert("cpu".to_string(), Quantity("250m".to_string()));
+            no_agent_limits.insert("memory".to_string(), Quantity("128Mi".to_string()));
             let no_agent_pod = Pod {
                 metadata: ObjectMeta {
                     name: Some(pod_name(pod_g)),
@@ -2420,6 +2438,7 @@ mod tests {
                         name: "sandbox".to_string(),
                         image: Some("busybox:1.36".to_string()),
                         command: Some(vec!["sleep".to_string(), "300".to_string()]),
+                        resources: Some(ResourceRequirements { limits: Some(no_agent_limits), ..Default::default() }),
                         ..Default::default()
                     }],
                     restart_policy: Some("Never".to_string()),
