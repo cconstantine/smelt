@@ -25,7 +25,7 @@ pub struct Message {
 
 Always derive: `Clone, Debug, Serialize, Deserialize, PartialEq`. `sqlx::FromRow` is gated behind `#[cfg_attr(feature = "server", ...)]` since the derive itself references sqlx types that don't exist in the web build.
 
-`Message.role` is a plain `String` (`"user"` / `"assistant"`, enforced by a `CHECK` constraint at the database level — see [migrations.md](migrations.md)). `Message.content` is still a plain `TEXT` column at the database level — one string, same as before — but its *contents* changed meaning once tool-use landed: it now holds `serde_json::to_string`-serialized `Vec<anthropic::ContentBlock>`, not raw text (`[{"type":"text","text":"hello"}]` rather than `hello`). A one-time migration backfilled existing rows into that shape.
+`Message.role` is a plain `String` (`"user"` / `"assistant"`, enforced by a `CHECK` constraint at the database level). `Message.content` is still a plain `TEXT` column at the database level — one string, same as before — but its *contents* changed meaning once tool-use landed: it now holds `serde_json::to_string`-serialized `Vec<anthropic::ContentBlock>`, not raw text (`[{"type":"text","text":"hello"}]` rather than `hello`). A one-time migration backfilled existing rows into that shape.
 
 ```rust
 impl Message {

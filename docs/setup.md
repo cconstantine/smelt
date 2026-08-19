@@ -25,13 +25,19 @@ dx bundle --platform web
 # Produces a release server binary + WASM client bundle; see dx's output for
 # the exact paths.
 
-# ── Build sandbox_agent first, for any `server`-feature build ──────────────
-# src/sandbox.rs's `include_bytes!` embeds a pre-built sandbox_agent binary
-# at compile time — every `server`-feature build (check, test, or run) fails
-# with "couldn't read .../sandbox_agent: No such file or directory" without
-# this having run at least once since the last `cargo clean`. Not needed for
-# the `web`-only wasm check (`sandbox` is `#[cfg(feature = "server")]`-gated).
-scripts/build-sandbox-agent.sh
+# ── Build + deliver the custom sandbox image, for real sandbox usage ───────
+# `docker/sandbox/Dockerfile`'s ENTRYPOINT *is* the sandbox agent — it's no
+# longer `include_bytes!`'d into the `smelt` binary at compile time, so a
+# plain `cargo build`/`cargo test --features server` doesn't need this at
+# all. But `create_pod` (real usage, or any real-cluster sandbox test) will
+# fail — `ImagePullBackOff`, since this image only ever lives on the
+# cluster's own node, never a real registry — until this has been run at
+# least once against a live cluster (once `k3s-bootstrap` has completed;
+# these commands already assume DOCKER_HOST/KUBECONFIG are set, same as
+# every other command on this page). Safe, if slower than necessary, to
+# re-run after any change; see
+# docs/projects/completed/20260818-sandbox-native-environment.md.
+scripts/build-sandbox-image.sh
 
 # ── Fast compile check ───────────────────────────────────────────────────────
 cargo check --features server
@@ -76,5 +82,6 @@ silently sends an empty string to the Anthropic API.
 | `KUBECONFIG` | yes, for sandbox code/tests | — | Read by `kube::Client::try_default()` (`src/sandbox.rs`). In `docker-compose.yml`, `smelt`'s `KUBECONFIG` points at the kubeconfig `k3s-bootstrap` generates for the `park` service account against the compose-provided `k3s` service — a hermetic test cluster, not a real deployment target. Point it at `.kubeconfig.yaml` (gitignored) instead to deliberately target the real `homelab` cluster. See [docs/projects/plans/k8s-sandbox.md](projects/plans/k8s-sandbox.md). |
 | `SANDBOX_MEMORY_LIMIT` | no | `8Gi` | Default memory limit for a sandbox pod's container — a plain Kubernetes quantity string. Just the *default*: `create_pod`'s `memory_limit` parameter overrides it per pod, up to the `smelt-park` namespace's `LimitRange` ceiling (`k8s/smelt-park-rbac.yaml`). Hitting the limit kills the whole pod at once (`memory.oom.group=1` on this cluster), not just the offending process — see [projects/completed/20260816-sandbox-oom.md](projects/completed/20260816-sandbox-oom.md). |
 | `SANDBOX_CPU_LIMIT` | no | `1` | Default CPU limit for a sandbox pod's container, same shape as `SANDBOX_MEMORY_LIMIT` (a Kubernetes quantity string, e.g. `"2"` for two cores) — overridable per pod via `create_pod`'s `cpu_limit`. |
+| `SANDBOX_IMAGE` | no | `docker.io/library/smelt-sandbox:latest` | The sandbox pod's image reference — `docker/sandbox/Dockerfile`, built and delivered with no registry involved by `scripts/build-sandbox-image.sh`. Must match whatever `ctr images import` actually registered the image as, not an arbitrary tag — see docs/projects/completed/20260818-sandbox-native-environment.md. |
 | `SANDBOX_RUNNING_WAIT_TIMEOUT_SECS` | no | `30` | How long `wait_for_running` (`src/sandbox.rs`) waits for a pod to reach `Running` before giving up with `SandboxError::Timeout`. The default is plenty on the real `homelab` cluster or a resource-rich dev machine; a CPU-constrained CI runner schedules pods measurably slower, so `.github/workflows/ci.yml` raises this for its `cargo test --features server` run. |
 | `SMELT_BASE_URL` | no | derived from the request | Overrides the scheme+host `src/mcp_oauth.rs` builds an MCP OAuth redirect_uri from (`/mcp-servers`' Connect flow). Without it, the base URL is derived from the incoming request's `Host` header (`X-Forwarded-Proto` for scheme) — wrong if smelt sits behind a proxy/tunnel that doesn't forward a `Host` a browser/OAuth provider could actually reach. No trailing slash. Set-but-empty is treated as unset, same as every other env var here. |

@@ -12,7 +12,6 @@ A single-user, 100%-Rust AI chat agent talking to Claude. Dioxus fullstack (SSR 
 | Server functions (`#[get]`/`#[post]`), `send_message`/`ServerEvents` streaming | [docs/api.md](docs/api.md) |
 | `Conversation`/`Message` structs | [docs/models.md](docs/models.md) |
 | Dioxus components, routing, calling server functions from the UI | [docs/frontend.md](docs/frontend.md) |
-| Migration naming, SQLite notes | [docs/migrations.md](docs/migrations.md) |
 | Inline tests, mock-upstream SSE testing | [docs/testing.md](docs/testing.md) |
 | New feature flow, plan phase, TDD workflow | [docs/development-process.md](docs/development-process.md) |
 | Current features, architecture, goals | [docs/projects/state.md](docs/projects/state.md) |

@@ -1,7 +1,7 @@
 mod pages;
 
 use dioxus::prelude::*;
-use pages::{Chat, McpServerEdit, McpServerNew, McpServersIndex};
+use pages::{Chat, McpServerEdit, McpServerNew, McpServersIndex, SandboxVolumeNew, SandboxVolumesIndex};
 
 #[derive(Routable, Clone, PartialEq, Debug)]
 pub(crate) enum Route {
@@ -15,6 +15,10 @@ pub(crate) enum Route {
     McpServerNewRoute {},
     #[route("/mcp-servers/:id")]
     McpServerEditRoute { id: i64 },
+    #[route("/sandbox-volumes")]
+    SandboxVolumesRoute {},
+    #[route("/sandbox-volumes/new")]
+    SandboxVolumeNewRoute {},
 }
 
 #[component]
@@ -35,6 +39,16 @@ fn McpServerNewRoute() -> Element {
 #[component]
 fn McpServerEditRoute(id: i64) -> Element {
     rsx! { McpServerEdit { id } }
+}
+
+#[component]
+fn SandboxVolumesRoute() -> Element {
+    rsx! { SandboxVolumesIndex {} }
+}
+
+#[component]
+fn SandboxVolumeNewRoute() -> Element {
+    rsx! { SandboxVolumeNew {} }
 }
 
 /// `id` only exists here to satisfy the `Routable` derive's requirement

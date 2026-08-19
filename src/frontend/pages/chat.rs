@@ -1172,6 +1172,8 @@ pub fn Chat() -> Element {
         Route::McpServersRoute {} => None,
         Route::McpServerNewRoute {} => None,
         Route::McpServerEditRoute { .. } => None,
+        Route::SandboxVolumesRoute {} => None,
+        Route::SandboxVolumeNewRoute {} => None,
     });
 
     rsx! {

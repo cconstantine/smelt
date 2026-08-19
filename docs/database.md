@@ -44,13 +44,13 @@ pub async fn delete_conversation(pool: &PgPool, id: i64) -> Result<(), sqlx::Err
 Deleting an id that doesn't exist is not an error — it just affects zero
 rows. `messages.conversation_id` has `ON DELETE CASCADE`, which Postgres
 enforces natively (no pragma needed, unlike SQLite), so this cleans up the
-conversation's messages for free; see [migrations.md](migrations.md).
+conversation's messages for free.
 
 `Conversation`/`Message` derive `sqlx::FromRow` (gated `#[cfg_attr(feature = "server", derive(sqlx::FromRow))]` in `models.rs`, since the derive itself pulls in sqlx types not present on the web build).
 
 ## Errors
 
-`db.rs` functions return `Result<T, sqlx::Error>` directly. Server functions convert with `.map_err(ServerFnError::new)` at the boundary — there's no separate hand-rolled `ApiError` type, since `ServerFnError` (from `dioxus::prelude`) already carries a message through to the client and renders sensibly via `{err}` in the UI. If a specific sqlx error needs distinct client-facing handling later (e.g. a unique-constraint violation mapped to a specific message), match on `sqlx::Error` inside the server function before converting — there's no reason to do that generically today, since nothing in the current schema has a uniqueness constraint beyond the primary keys.
+`db.rs` functions return `Result<T, sqlx::Error>` directly. Server functions convert with `.map_err(ServerFnError::new)` at the boundary — there's no separate hand-rolled `ApiError` type, since `ServerFnError` (from `dioxus::prelude`) already carries a message through to the client and renders sensibly via `{err}` in the UI. A few tables (`mcp_servers.name`, `sandbox_volumes.name`) do have a `UNIQUE` constraint beyond their primary key, and a violation surfaces exactly this way today — the raw Postgres error message (`duplicate key value violates unique constraint "..."`) reaches the browser as-is, not mapped to anything friendlier. If a specific sqlx error needs distinct client-facing handling later, match on `sqlx::Error` inside the server function before converting.
 
 ## Testing against the database
 

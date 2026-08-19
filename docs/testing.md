@@ -62,8 +62,8 @@ test` does by default.
 
 A real, non-obvious gotcha proven the hard way: deleting a sandbox pod
 with Kubernetes' default `DeleteParams` leaves it `Terminating` for its
-full grace period (commonly 30s) before it actually disappears, because a
-plain `sleep infinity` container doesn't trap `SIGTERM`. Every delete in
+full grace period (commonly 30s) before it actually disappears, because
+the sandbox container doesn't trap `SIGTERM`. Every delete in
 `sandbox.rs` — including test cleanup — goes through
 `immediate_delete_params()` (`grace_period_seconds: Some(0)`) specifically
 to avoid tests timing out on this.
@@ -81,9 +81,8 @@ rediscovering a third time):
   rather than dropping the handles unread.
 - **Dropping the `AttachedProcess` itself — not just its split-off
   stdout/stderr handles — closes the underlying exec session**, and for a
-  process that's directly attached (not `setsid`-detached the way
-  `sandbox_agent`'s own injection launch is — see `inject_and_launch`),
-  the container runtime kills it right along with the disconnect. A
+  process that's directly attached (not `setsid`-detached), the container
+  runtime kills it right along with the disconnect. A
   `{ let exec = pods.exec(...).await?; ...spawn readers off exec.stdout()/stderr()...}`
   block that lets `exec` fall out of scope at the end kills the remote
   process as soon as that block ends, often well before the command has
@@ -91,6 +90,32 @@ rediscovering a third time):
   long as the remote command needs to run — e.g. move it (not just its
   stream handles) into the task that drains it, so the exec session stays
   open until that task itself finishes.
+
+A related one from `sandbox-native-environment`'s generic-volumes work:
+**a PVC still mounted by a pod carries Kubernetes' own
+`kubernetes.io/pvc-protection` finalizer**, so deleting the PVC right after
+deleting the pod that mounts it can leave `get_opt` still returning
+`Some` (a `Terminating` object, not gone) — the finalizer only releases
+once the pod is genuinely gone, not just marked for deletion. A test (or
+any caller) that deletes both needs to poll for the *pod* to actually
+disappear before deleting the PVC, and/or poll for the PVC itself to
+disappear rather than checking once immediately after the delete call
+returns — the delete API call succeeding doesn't mean the object is
+already gone.
+- **Writing a large payload to an `AttachedProcess`'s stdin while the
+  executed command produces *zero* stdout output reliably breaks the
+  connection (`BrokenPipe`) partway through the write.** Found on
+  `sandbox-native-environment`'s registry-delivery spike: streaming a
+  ~2.2MB tarball via `sh -c "cat > /tmp/image.tar"` (no stdout at all)
+  failed every time; the identical payload against `sh -c "cat >
+  /tmp/image.tar" && echo done` (one trailing line of stdout) succeeded
+  reliably — bisected with a payload-size sweep and a real-vs-synthetic-
+  bytes comparison before finding the actual variable was the command, not
+  the data. Two things to carry forward: drain stdout/stderr *concurrently*
+  with the stdin write (`tokio::join!`, not read-after-write), and make
+  sure the executed command produces at least one byte of stdout if the
+  payload is more than a few hundred KB — `src/bin/sandbox_image_import.rs`
+  does both.
 
 ## Testing the Anthropic streaming client without the network
 
@@ -136,6 +161,8 @@ Most logic lives behind the `server` feature; plain `cargo test` compiles but sk
 ## Browser verification
 
 A small automated browser test tier exists (`src/browser_tests.rs`, see below) for behavior that genuinely needs a real DOM to verify — everything else is still a manual/scripted pass, driving a real headless Chrome instance against `dx serve --fullstack`.
+
+**A CSS/asset edit made while `dx serve` is already running doesn't reliably reach a *fresh* page load.** `App`'s `asset!("/assets/chat.css")` resolves to a content-hashed bundle path (`/assets/chat-<hash>.css`) baked into the served HTML at build time; `dx`'s hot-reload pushes a live patch over its dev websocket to tabs that were already open when the edit happened, but a brand-new browser instance (exactly what a screenshot script launches each run) requests the hashed URL fresh and can get a stale pre-edit bundle if the server hasn't actually rebuilt yet. Found on `sandbox-native-environment`: a CSS addition looked hot-reloaded (the log even said so) but a fresh `browser_check.py` run kept rendering unstyled markup until `dx serve` was killed (both the wrapper *and* its child `target/dx/.../web/server-*` process — killing just the wrapper leaves the child running, same gotcha the `scripts/browser-check/` section below already documents for a different reason) and restarted for a real full rebuild. If a browser-verification screenshot doesn't reflect a CSS change that should be there, restart `dx serve` before assuming the change itself is wrong.
 
 ### Playwright (preferred)
 

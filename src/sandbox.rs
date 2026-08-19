@@ -1,22 +1,28 @@
 //! Sandbox lifecycle: a disposable Kubernetes Pod per conversation, in the
-//! `smelt-park` namespace, plus (new) a persistent terminal reached through
-//! a purpose-built agent injected into that pod. Pod and terminal are
-//! separate, explicitly-managed lifecycles — see
-//! `docs/projects/plans/sandbox-terminal.md` for the full design; the
-//! original pod-only mechanism is `docs/projects/plans/k8s-sandbox.md`.
+//! `smelt-park` namespace, plus a persistent terminal reached through a
+//! purpose-built agent that *is* the pod's own `ENTRYPOINT` (its real PID
+//! 1 — see `docs/projects/plans/sandbox-native-environment.md`, built on a
+//! custom image `scripts/build-sandbox-image.sh` produces and delivers
+//! with no registry involved). Pod and terminal are separate,
+//! explicitly-managed lifecycles — see
+//! `docs/projects/plans/sandbox-terminal.md` for that design; the original
+//! pod-only mechanism is `docs/projects/plans/k8s-sandbox.md`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use k8s_openapi::api::core::v1::{Container, Pod, PodSpec, ResourceRequirements};
+use k8s_openapi::api::core::v1::{
+    Container, PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, Pod, PodSpec,
+    ResourceRequirements, Volume, VolumeMount, VolumeResourceRequirements,
+};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, AttachParams, DeleteParams, PostParams};
 use serde::Deserialize;
 use sqlx::PgPool;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -28,15 +34,6 @@ const DEFAULT_RUNNING_WAIT_TIMEOUT_SECS: u64 = 30;
 
 /// Matches `sandbox_agent`'s own `LISTEN_ADDR` port.
 const AGENT_PORT: u16 = 8088;
-/// The agent binary, built by `scripts/build-sandbox-agent.sh` *before*
-/// this crate — see the plan's "Build ordering." A documented two-command
-/// sequence rather than a `build.rs`: a build script that shells out to
-/// build a *second* binary in the *same* package risks recursively
-/// re-invoking its own package's build script.
-static AGENT_BINARY: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/target/sandbox-agent/sandbox_agent"
-));
 
 #[derive(Debug)]
 pub enum SandboxError {
@@ -87,8 +84,63 @@ fn pods_api(client: &kube::Client) -> Api<Pod> {
     Api::namespaced(client.clone(), NAMESPACE)
 }
 
+fn pvc_api(client: &kube::Client) -> Api<PersistentVolumeClaim> {
+    Api::namespaced(client.clone(), NAMESPACE)
+}
+
 fn pod_name(pod_id: i64) -> String {
     format!("sandbox-{pod_id}")
+}
+
+/// The sandbox user's home directory — fixed by Phase 1's `useradd -m
+/// sandbox` in `docker/sandbox/Dockerfile`, not derived from anything at
+/// runtime.
+const SANDBOX_HOME: &str = "/home/sandbox";
+
+/// Expands a leading `~` in a user-typed mount path to the sandbox user's
+/// home directory — smelt's own expansion, not something deferred to the
+/// pod spec (Kubernetes' `volumeMounts.mountPath` has no concept of `~`).
+/// Only a bare `~` or a `~/...` prefix expands, matching ordinary shell
+/// semantics for the single-user case (no `~otheruser` support — there's
+/// only ever one sandbox user). Anything else passes through unchanged.
+fn resolve_mount_path(path: &str) -> String {
+    if path == "~" {
+        SANDBOX_HOME.to_string()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        format!("{SANDBOX_HOME}/{rest}")
+    } else {
+        path.to_string()
+    }
+}
+
+/// The PVC name backing a given `sandbox_volumes` row — deterministic,
+/// same `sandbox-{id}` naming convention `pod_name` already uses.
+fn sandbox_volume_pvc_name(volume_id: i64) -> String {
+    format!("sandbox-volume-{volume_id}")
+}
+
+/// Every configured volume's `Volume`/`VolumeMount` pair for a pod spec —
+/// pulled out as a pure function over an already-fetched list, same
+/// testability reason as `check_pod_guard`/`resolve_pod_id`. Every pod
+/// gets every volume, unconditionally — see the idea's "not something
+/// chosen per conversation."
+fn volume_mounts_for(volumes: &[db::SandboxVolume]) -> (Vec<Volume>, Vec<VolumeMount>) {
+    volumes
+        .iter()
+        .map(|v| {
+            let name = format!("volume-{}", v.id);
+            let volume = Volume {
+                name: name.clone(),
+                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: sandbox_volume_pvc_name(v.id),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mount = VolumeMount { name, mount_path: v.mount_path.clone(), ..Default::default() };
+            (volume, mount)
+        })
+        .unzip()
 }
 
 /// A sandbox pod is disposable — there's nothing inside it worth a graceful
@@ -187,8 +239,18 @@ impl SandboxManager {
     /// `memory`/`cpu` are already-resolved values (the caller's own
     /// override, or its default) — only used on the actual-creation
     /// branch below; the reuse branch has nothing to apply them to, since
-    /// resources are immutable on an already-existing pod.
-    pub async fn create(&self, session_id: &str, memory: &str, cpu: &str) -> Result<Sandbox, SandboxError> {
+    /// resources are immutable on an already-existing pod. `volumes` is
+    /// every currently-configured `sandbox_volumes` row — every pod gets
+    /// every one of them mounted, unconditionally (see
+    /// docs/projects/plans/sandbox-native-environment.md's Phase 4); an
+    /// empty slice is fine for callers (mostly tests) that don't care.
+    pub async fn create(
+        &self,
+        session_id: &str,
+        memory: &str,
+        cpu: &str,
+        volumes: &[db::SandboxVolume],
+    ) -> Result<Sandbox, SandboxError> {
         let pods = pods_api(&self.client);
         let name = format!("sandbox-{session_id}");
 
@@ -206,7 +268,7 @@ impl SandboxManager {
                 // behavior" section.
             }
             None => {
-                pods.create(&PostParams::default(), &build_pod_spec(&name, memory, cpu)).await?;
+                pods.create(&PostParams::default(), &build_pod_spec(&name, memory, cpu, volumes)).await?;
             }
         }
 
@@ -244,6 +306,22 @@ fn default_cpu_limit() -> String {
     std::env::var("SANDBOX_CPU_LIMIT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "1".to_string())
 }
 
+/// `SANDBOX_IMAGE`, default `"docker.io/library/smelt-sandbox:latest"` —
+/// same pattern as `default_memory_limit`. The custom image
+/// `scripts/build-sandbox-image.sh` builds and delivers with no registry
+/// involved (see docs/projects/plans/sandbox-native-environment.md) — its
+/// own `ENTRYPOINT` is the sandbox agent, which is what makes the agent
+/// the pod's real PID 1 rather than something injected and launched after
+/// the fact. The fully-qualified default (not just `smelt-sandbox:latest`)
+/// matches exactly what `ctr images import` registers the image as —
+/// confirmed by spike, not assumed.
+fn default_sandbox_image() -> String {
+    std::env::var("SANDBOX_IMAGE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "docker.io/library/smelt-sandbox:latest".to_string())
+}
+
 /// `SANDBOX_RUNNING_WAIT_TIMEOUT_SECS`, default `30` — same pattern as
 /// `default_memory_limit`. How long `wait_for_running` waits for a pod to
 /// reach `Running` before giving up with `SandboxError::Timeout`. The
@@ -268,10 +346,12 @@ fn running_wait_timeout() -> Duration {
 /// created, surfacing back through `SandboxError::Kube` as an ordinary
 /// error. Bounded from above by the `smelt-park` namespace's own
 /// `LimitRange` (`k8s/smelt-park-rbac.yaml`), not by anything here.
-fn build_pod_spec(name: &str, memory: &str, cpu: &str) -> Pod {
+fn build_pod_spec(name: &str, memory: &str, cpu: &str, volumes: &[db::SandboxVolume]) -> Pod {
     let mut limits = std::collections::BTreeMap::new();
     limits.insert("memory".to_string(), Quantity(memory.to_string()));
     limits.insert("cpu".to_string(), Quantity(cpu.to_string()));
+
+    let (pod_volumes, volume_mounts) = volume_mounts_for(volumes);
 
     Pod {
         metadata: ObjectMeta {
@@ -282,20 +362,24 @@ fn build_pod_spec(name: &str, memory: &str, cpu: &str) -> Pod {
         spec: Some(PodSpec {
             containers: vec![Container {
                 name: "sandbox".to_string(),
-                // debian:trixie-slim, not busybox:1.36 — matches the dev
-                // image's own Debian release, so the sandbox actually has
-                // real bash (needed for sandbox_agent's inner shell) and
-                // the agent's dynamically-linked glibc dependency is
-                // satisfied by construction. See the plan's "What" and its
-                // Open Questions on this deliberate coupling.
-                image: Some("debian:trixie-slim".to_string()),
-                // Keeps the pod alive across multiple `exec` calls over a
-                // conversation's lifetime; the actual work all happens via
-                // exec, never via the pod's own entrypoint.
-                command: Some(vec!["sleep".to_string(), "infinity".to_string()]),
+                image: Some(default_sandbox_image()),
+                // `Never`, not the `:latest`-tag default of `Always`: this
+                // image is delivered straight into the node's local image
+                // store (`ctr images import`, see
+                // scripts/build-sandbox-image.sh) with no registry
+                // involved at all — a real pull would just fail (there's
+                // no such image on any real registry to pull), which is
+                // exactly what happened the first time this was left unset.
+                image_pull_policy: Some("Never".to_string()),
+                // No `command` override — the image's own `ENTRYPOINT` is
+                // the sandbox agent, so it's already running (and keeping
+                // the pod alive) the moment the container starts. See
+                // docs/projects/plans/sandbox-native-environment.md.
                 resources: Some(ResourceRequirements { limits: Some(limits), ..Default::default() }),
+                volume_mounts: (!volume_mounts.is_empty()).then_some(volume_mounts),
                 ..Default::default()
             }],
+            volumes: (!pod_volumes.is_empty()).then_some(pod_volumes),
             restart_policy: Some("Never".to_string()),
             ..Default::default()
         }),
@@ -643,13 +727,14 @@ pub async fn create_pod(
 
     let manager = get();
     let row = db::create_sandbox_pod(pool, conversation_id).await.map_err(SandboxError::Db)?;
+    let volumes = db::list_sandbox_volumes(pool).await.map_err(SandboxError::Db)?;
     // Reuses SandboxManager::create's existing get-or-create-on-Running
     // logic rather than duplicating it — the returned Sandbox is only a
     // handle for exec/Drop-cleanup purposes, neither of which apply here
     // (this pod persists independently of any in-process value), so it's
     // disarmed immediately, the same `mem::forget` pattern
     // `SandboxManager::delete` itself already uses for the same reason.
-    match manager.create(&row.id.to_string(), &memory, &cpu).await {
+    match manager.create(&row.id.to_string(), &memory, &cpu, &volumes).await {
         Ok(sandbox) => {
             std::mem::forget(sandbox);
             events::publish(
@@ -740,6 +825,73 @@ pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInf
     Ok(result)
 }
 
+// --- Generic volumes ---
+
+/// `SANDBOX_VOLUME_STORAGE_SIZE`, default `"10Gi"` — same pattern as
+/// `default_memory_limit`. Every generic volume's PVC requests this much
+/// capacity; not currently configurable per volume (nothing in
+/// docs/projects/plans/sandbox-native-environment.md calls for that), just
+/// a documented fixed default.
+fn default_volume_storage_size() -> String {
+    std::env::var("SANDBOX_VOLUME_STORAGE_SIZE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "10Gi".to_string())
+}
+
+fn build_volume_pvc_spec(volume_id: i64) -> PersistentVolumeClaim {
+    let mut requests = std::collections::BTreeMap::new();
+    requests.insert("storage".to_string(), Quantity(default_volume_storage_size()));
+
+    PersistentVolumeClaim {
+        metadata: ObjectMeta {
+            name: Some(sandbox_volume_pvc_name(volume_id)),
+            namespace: Some(NAMESPACE.to_string()),
+            ..Default::default()
+        },
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+            resources: Some(VolumeResourceRequirements { requests: Some(requests), ..Default::default() }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Creates a new generic volume: resolves a leading `~` in `mount_path`
+/// (see `resolve_mount_path`), inserts the `sandbox_volumes` row, then
+/// creates its backing PVC — rolled back (DB row deleted) if the PVC
+/// create fails, so a failed create never leaves an orphaned row
+/// `list_sandbox_volumes` would show as usable but that doesn't actually
+/// have a PVC behind it. Same rollback shape `create_pod` already uses for
+/// its own DB-row-then-k8s-object ordering.
+pub async fn create_volume(pool: &PgPool, name: &str, mount_path: &str) -> Result<i64, SandboxError> {
+    let resolved_path = resolve_mount_path(mount_path);
+    let row = db::create_sandbox_volume(pool, name, &resolved_path).await.map_err(SandboxError::Db)?;
+
+    let manager = get();
+    let pvcs = pvc_api(&manager.client);
+    if let Err(e) = pvcs.create(&PostParams::default(), &build_volume_pvc_spec(row.id)).await {
+        let _ = db::delete_sandbox_volume(pool, row.id).await;
+        return Err(e.into());
+    }
+    Ok(row.id)
+}
+
+/// Deletes a generic volume's PVC, then its `sandbox_volumes` row. A
+/// missing PVC (already gone) is not an error — same "delete if it's still
+/// there" tolerance `force_terminate_pod` already has for its own pod.
+pub async fn delete_volume(pool: &PgPool, id: i64) -> Result<(), SandboxError> {
+    let manager = get();
+    let pvcs = pvc_api(&manager.client);
+    let pvc_name = sandbox_volume_pvc_name(id);
+    if pvcs.get_opt(&pvc_name).await?.is_some() {
+        pvcs.delete(&pvc_name, &DeleteParams::default()).await?;
+    }
+    db::delete_sandbox_volume(pool, id).await.map_err(SandboxError::Db)?;
+    Ok(())
+}
+
 // --- Terminal ---
 
 /// Takes `conversation_id`, resolved to "the conversation's pod" via
@@ -748,10 +900,9 @@ pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInf
 /// of trusting a caller-supplied `pod_id`. Every call creates a genuinely
 /// new terminal in that pod — no idempotency to preserve with N terminals
 /// per pod. Establishes the pod's agent connection if it isn't already
-/// live, injecting and launching the agent on first use for this pod (the
-/// only place that does — see `reconnect_if_needed`, which every other
-/// terminal-touching call uses instead and which never launches a fresh
-/// agent itself).
+/// live in this process's registry — the agent itself is already running
+/// by the time the pod is `Running` (it's the pod's own `ENTRYPOINT`, see
+/// `ensure_pod_connection`), so this is just "connect," never "launch."
 pub async fn create_terminal(pool: &PgPool, conversation_id: i64) -> Result<i64, TerminalError> {
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
     let conn = ensure_pod_connection(pool, pod_id).await?;
@@ -984,11 +1135,19 @@ pub async fn try_reconnect(pool: &PgPool, pod_id: i64) {
     let _ = reconnect_if_needed(pool, pod_id).await;
 }
 
-/// `reconnect_if_needed`, and if that fails because the pod has never had
-/// an agent launched in it at all, injects and launches one fresh. The
-/// only caller with license to do that — everything else only ever
-/// reconnects to an agent `create_terminal` already established. See the
-/// plan's "Why N pods and N terminals."
+/// `create_terminal`'s connection step. The pod's agent is its own
+/// `ENTRYPOINT`, so unlike before there's nothing to launch here — this is
+/// "connect," never "inject and launch." A failure to connect here is
+/// routine (the agent hasn't bound its port yet, or this is genuinely the
+/// pod's first-ever connection attempt), not a crash signal, so this
+/// deliberately bypasses `reconnect_or_confirm_crash`'s retry/force-
+/// terminate machinery — that's for callers who already expect a
+/// connection to exist, which isn't true here by design. Still worth a
+/// short bounded retry (same `RECONNECT_ATTEMPTS`/`RECONNECT_BACKOFF`
+/// shape `reconnect_or_confirm_crash` uses) rather than a single attempt:
+/// `Running` and "the agent has bound its port" aren't quite the same
+/// instant, even though they're much closer together now than when the
+/// agent was injected and launched after the fact.
 async fn ensure_pod_connection(pool: &PgPool, pod_id: i64) -> Result<Arc<TerminalConnection>, TerminalError> {
     if let Some(conn) = registry_get(pod_id) {
         return Ok(conn);
@@ -1005,23 +1164,22 @@ async fn ensure_pod_connection(pool: &PgPool, pod_id: i64) -> Result<Arc<Termina
         return Err(TerminalError::NoPod);
     }
 
-    // A single, quick connect attempt first — most calls land here because
-    // an agent is already running from an earlier `create_terminal` in
-    // this same pod (just not in our in-memory registry, e.g. after a
-    // smelt restart), not because this is genuinely the pod's first ever
-    // terminal. A failure here is routine (no agent yet), not a crash
-    // signal, so this deliberately bypasses `reconnect_or_confirm_crash`'s
-    // retry/force-terminate machinery — that's for callers who already
-    // expect a connection to exist, which isn't true here by design.
-    if let Ok(conn) = connect(&manager.client, pool.clone(), pod_id, &name).await {
-        register(pod_id, conn.clone());
-        return Ok(conn);
+    let mut last_err = None;
+    for attempt in 0..RECONNECT_ATTEMPTS {
+        match connect(&manager.client, pool.clone(), pod_id, &name).await {
+            Ok(conn) => {
+                register(pod_id, conn.clone());
+                return Ok(conn);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < RECONNECT_ATTEMPTS {
+                    tokio::time::sleep(RECONNECT_BACKOFF).await;
+                }
+            }
+        }
     }
-
-    inject_and_launch(&manager.client, &name).await?;
-    let conn = connect(&manager.client, pool.clone(), pod_id, &name).await?;
-    register(pod_id, conn.clone());
-    Ok(conn)
+    Err(last_err.expect("loop runs at least once").into())
 }
 
 /// Sends a `create_terminal`/`terminate_terminal` protocol action and
@@ -1263,48 +1421,6 @@ async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64, reason: Option<String>
         });
     }
     deregister(pod_id);
-}
-
-/// Tar-over-exec injection (the same trick `kubectl cp` itself is built
-/// on) followed by a `setsid`-detached launch. The agent's own PID becomes
-/// the process group `terminate_terminal` later signals — see the plan's
-/// "Detached launch, concretely."
-async fn inject_and_launch(client: &kube::Client, pod_name: &str) -> Result<(), SandboxError> {
-    let mut tar_bytes = Vec::new();
-    {
-        let mut builder = tar::Builder::new(&mut tar_bytes);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(AGENT_BINARY.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, "sandbox_agent", AGENT_BINARY)
-            .map_err(SandboxError::Io)?;
-        builder.finish().map_err(SandboxError::Io)?;
-    }
-
-    let pods = pods_api(client);
-    let mut attached = pods
-        .exec(
-            pod_name,
-            ["tar", "xf", "-", "-C", "/tmp"],
-            &AttachParams::default().stdin(true),
-        )
-        .await?;
-    let mut stdin = attached.stdin().expect("stdin requested via AttachParams::stdin(true)");
-    stdin.write_all(&tar_bytes).await.map_err(SandboxError::Io)?;
-    stdin.flush().await.map_err(SandboxError::Io)?;
-    drop(stdin); // close stdin so `tar` sees EOF and exits
-    attached.join().await.ok();
-
-    let launch_script = "setsid /tmp/sandbox_agent > /tmp/agent.log 2>&1 < /dev/null & echo launched".to_string();
-    let launch = pods.exec(pod_name, ["sh", "-c", &launch_script], &AttachParams::default()).await?;
-    launch.join().await.ok();
-
-    // Give the agent a moment to actually start listening before the
-    // first connect attempt.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    Ok(())
 }
 
 /// Portforward + a client-side WebSocket handshake over the forwarded
@@ -1590,6 +1706,68 @@ mod tests {
 
     fn fake_pod(id: i64) -> db::SandboxPod {
         db::SandboxPod { id, conversation_id: 1, created_at: chrono::Utc::now().naive_utc(), terminated_at: None }
+    }
+
+    #[test]
+    fn test_resolve_mount_path_expands_bare_tilde() {
+        assert_eq!(resolve_mount_path("~"), "/home/sandbox");
+    }
+
+    #[test]
+    fn test_resolve_mount_path_expands_tilde_slash_prefix() {
+        assert_eq!(resolve_mount_path("~/.ssh"), "/home/sandbox/.ssh");
+    }
+
+    #[test]
+    fn test_resolve_mount_path_leaves_an_absolute_path_unchanged() {
+        assert_eq!(resolve_mount_path("/data/cache"), "/data/cache");
+    }
+
+    #[test]
+    fn test_resolve_mount_path_leaves_a_non_slash_tilde_prefix_unchanged() {
+        // No `~otheruser` support — there's only ever one sandbox user —
+        // so this passes through as a literal path rather than expanding.
+        assert_eq!(resolve_mount_path("~foo"), "~foo");
+    }
+
+    #[test]
+    fn test_volume_mounts_for_produces_a_pvc_backed_pair_per_volume() {
+        let volumes = vec![
+            db::SandboxVolume {
+                id: 7,
+                name: "ssh-key".to_string(),
+                mount_path: "/home/sandbox/.ssh".to_string(),
+                created_at: chrono::Utc::now().naive_utc(),
+                updated_at: chrono::Utc::now().naive_utc(),
+            },
+            db::SandboxVolume {
+                id: 12,
+                name: "build-cache".to_string(),
+                mount_path: "/data/cache".to_string(),
+                created_at: chrono::Utc::now().naive_utc(),
+                updated_at: chrono::Utc::now().naive_utc(),
+            },
+        ];
+
+        let (vols, mounts) = volume_mounts_for(&volumes);
+        assert_eq!(vols.len(), 2);
+        assert_eq!(mounts.len(), 2);
+
+        assert_eq!(vols[0].name, "volume-7");
+        assert_eq!(
+            vols[0].persistent_volume_claim.as_ref().expect("should be PVC-backed").claim_name,
+            "sandbox-volume-7"
+        );
+        assert_eq!(mounts[0].name, "volume-7");
+        assert_eq!(mounts[0].mount_path, "/home/sandbox/.ssh");
+
+        assert_eq!(vols[1].name, "volume-12");
+        assert_eq!(
+            vols[1].persistent_volume_claim.as_ref().expect("should be PVC-backed").claim_name,
+            "sandbox-volume-12"
+        );
+        assert_eq!(mounts[1].name, "volume-12");
+        assert_eq!(mounts[1].mount_path, "/data/cache");
     }
 
     #[test]
@@ -2219,14 +2397,39 @@ mod tests {
             // --- Exhausting reconnect attempts without Kubernetes ever
             // confirming death still cleans up *and* force-terminates the
             // pod — verified by create_pod succeeding again immediately
-            // after, not staying blocked behind a stale live-pod row. No
-            // terminal is ever created here, so no agent is ever injected:
-            // every connect() attempt genuinely and deterministically fails
-            // while the pod itself stays Running throughout, exactly the
-            // "stuck reporting Running but unreachable" case this path
+            // after, not staying blocked behind a stale live-pod row. A
+            // hand-built pod with no agent in it (not `create_pod`, which
+            // now always has one running the instant the pod is `Running`
+            // — the agent is the image's own `ENTRYPOINT`, see Phase 2 of
+            // docs/projects/plans/sandbox-native-environment.md) is what
+            // makes every connect() attempt genuinely and deterministically
+            // fail while the pod itself stays Running throughout, exactly
+            // the "stuck reporting Running but unreachable" case this path
             // exists for. ---
             let conversation_g = db::create_conversation(&pool).await.expect("create conversation g");
-            let pod_g = create_pod(&pool, conversation_g.id, None, None).await.expect("create_pod (g) should succeed");
+            let pod_g_row = db::create_sandbox_pod(&pool, conversation_g.id).await.expect("create_sandbox_pod (g)");
+            let pod_g = pod_g_row.id;
+            let no_agent_pod = Pod {
+                metadata: ObjectMeta {
+                    name: Some(pod_name(pod_g)),
+                    namespace: Some(NAMESPACE.to_string()),
+                    ..Default::default()
+                },
+                spec: Some(PodSpec {
+                    containers: vec![Container {
+                        name: "sandbox".to_string(),
+                        image: Some("busybox:1.36".to_string()),
+                        command: Some(vec!["sleep".to_string(), "300".to_string()]),
+                        ..Default::default()
+                    }],
+                    restart_policy: Some("Never".to_string()),
+                    ..Default::default()
+                }),
+                status: None,
+            };
+            pods_api(&client).create(&PostParams::default(), &no_agent_pod).await.expect("create no-agent pod (g)");
+            wait_for_running(&pods_api(&client), &pod_name(pod_g)).await.expect("no-agent pod (g) should reach Running");
+
             let gave_up = reconnect_or_confirm_crash(&pool, pod_g).await;
             assert!(
                 matches!(gave_up, Err(TerminalError::NoTerminal)),
@@ -2258,6 +2461,56 @@ mod tests {
             })
             .await;
             assert!(detected_h.is_ok(), "an idle terminal's pod crashing should still produce the pod-level notification");
+
+            // --- Generic volumes: create_volume/delete_volume manage a
+            // real PVC alongside the sandbox_volumes row, and a volume
+            // mounted into a real pod is genuinely writable/readable —
+            // see docs/projects/plans/sandbox-native-environment.md's
+            // Phase 4. Folded in here rather than a separate test function
+            // for the same MANAGER-singleton reason as everything else in
+            // this test (see docs/testing.md). ---
+            let volume_id = create_volume(&pool, "test-volume", "/data/testvol").await.expect("create_volume should succeed");
+            let pvcs = pvc_api(&client);
+            let pvc_name = sandbox_volume_pvc_name(volume_id);
+            assert!(
+                pvcs.get_opt(&pvc_name).await.expect("get_opt").is_some(),
+                "create_volume should create the backing PVC"
+            );
+
+            let volumes = db::list_sandbox_volumes(&pool).await.expect("list_sandbox_volumes");
+            let volume_session_id = unique_session_id("volume-mount");
+            let volume_sandbox =
+                get().create(&volume_session_id, "128Mi", "250m", &volumes).await.expect("create with a volume should succeed");
+            let write =
+                volume_sandbox.exec(&["sh", "-c", "echo hello > /data/testvol/marker.txt"]).await.expect("exec should succeed");
+            assert_eq!(write.exit_code, 0, "writing into the mounted volume should succeed");
+            let read = volume_sandbox.exec(&["cat", "/data/testvol/marker.txt"]).await.expect("exec should succeed");
+            assert_eq!(read.stdout.trim(), "hello", "the mounted volume should be genuinely writable and readable");
+
+            let volume_pods = pods_api(&client);
+            volume_pods.delete(&volume_sandbox.pod_name, &immediate_delete_params()).await.ok();
+            let volume_pod_name = volume_sandbox.pod_name.clone();
+            std::mem::forget(volume_sandbox);
+            // The PVC has Kubernetes' own `kubernetes.io/pvc-protection`
+            // finalizer while a pod actively mounts it — the finalizer only
+            // releases once the pod is genuinely gone, not just marked for
+            // deletion, so this waits for that before deleting the volume.
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while volume_pods.get_opt(&volume_pod_name).await.ok().flatten().is_some() {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            })
+            .await
+            .expect("the volume-mounting pod should actually disappear, not just be marked for deletion");
+
+            delete_volume(&pool, volume_id).await.expect("delete_volume should succeed");
+            let pvc_gone = tokio::time::timeout(Duration::from_secs(15), async {
+                while pvcs.get_opt(&pvc_name).await.ok().flatten().is_some() {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            })
+            .await;
+            assert!(pvc_gone.is_ok(), "delete_volume should delete the backing PVC");
         })
         .await;
 
@@ -2324,7 +2577,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("create");
 
-        let sandbox = manager.create(&session_id, "128Mi", "250m").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("create should succeed");
 
         let pods = pods_api(&client);
         let pod = pods.get(&sandbox.pod_name).await.expect("pod should exist");
@@ -2340,7 +2593,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("limits");
 
-        let sandbox = manager.create(&session_id, "128Mi", "500m").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "128Mi", "500m", &[]).await.expect("create should succeed");
 
         let pods = pods_api(&client);
         let pod = pods.get(&sandbox.pod_name).await.expect("pod should exist");
@@ -2375,7 +2628,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("over-limit");
 
-        let result = manager.create(&session_id, "128Gi", "250m").await;
+        let result = manager.create(&session_id, "128Gi", "250m", &[]).await;
         assert!(
             matches!(result, Err(SandboxError::Kube(_))),
             "a memory_limit over the LimitRange's 64Gi max should be rejected by Kubernetes, got is_ok={}",
@@ -2398,7 +2651,7 @@ mod tests {
         let session_id = unique_session_id("real-oom");
         // Small on purpose — fast and reliable to trigger, using this same
         // plan's own per-pod override rather than the real 8Gi default.
-        let sandbox = manager.create(&session_id, "64Mi", "250m").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "64Mi", "250m", &[]).await.expect("create should succeed");
         let pods = pods_api(&client);
 
         // The whole `AttachedProcess` — not just its split-off stdout/
@@ -2454,8 +2707,8 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("reuse");
 
-        let first = manager.create(&session_id, "128Mi", "250m").await.expect("first create should succeed");
-        let second = manager.create(&session_id, "128Mi", "250m").await.expect("second create should reuse, not error");
+        let first = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("first create should succeed");
+        let second = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("second create should reuse, not error");
 
         assert_eq!(first.pod_name, second.pod_name);
 
@@ -2470,7 +2723,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("exec");
-        let sandbox = manager.create(&session_id, "128Mi", "250m").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("create should succeed");
 
         let result = sandbox.exec(&["echo", "hello"]).await.expect("exec should succeed");
         assert_eq!(result.stdout, "hello\n");
@@ -2478,6 +2731,30 @@ mod tests {
 
         let failing = sandbox.exec(&["bash", "-c", "exit 7"]).await.expect("exec should succeed even for nonzero exit");
         assert_eq!(failing.exit_code, 7);
+
+        let pods = pods_api(&client);
+        pods.delete(&sandbox.pod_name, &immediate_delete_params()).await.ok();
+        std::mem::forget(sandbox);
+    }
+
+    /// New observable behavior from
+    /// docs/projects/plans/sandbox-native-environment.md's Phase 3 —
+    /// commands run as the pre-created, unprivileged `sandbox` user by
+    /// default (not root, unlike the old `debian:trixie-slim` image with
+    /// no `USER` set), with passwordless `sudo` still available for
+    /// anything that genuinely needs root.
+    #[tokio::test]
+    async fn test_sandbox_commands_run_as_non_root_with_sudo_available() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let session_id = unique_session_id("non-root");
+        let sandbox = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("create should succeed");
+
+        let whoami = sandbox.exec(&["whoami"]).await.expect("exec should succeed");
+        assert_eq!(whoami.stdout.trim(), "sandbox", "commands should run as the pre-created `sandbox` user, not root");
+
+        let sudo_whoami = sandbox.exec(&["sudo", "whoami"]).await.expect("exec should succeed");
+        assert_eq!(sudo_whoami.stdout.trim(), "root", "sudo should still reach root for a command that genuinely needs it");
 
         let pods = pods_api(&client);
         pods.delete(&sandbox.pod_name, &immediate_delete_params()).await.ok();
@@ -2495,7 +2772,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("death-reason");
-        let sandbox = manager.create(&session_id, "128Mi", "250m").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("create should succeed");
         let pods = pods_api(&client);
 
         assert_eq!(pod_death_reason(&pods, &sandbox.pod_name).await, None, "a genuinely Running pod is inconclusive");
@@ -2527,7 +2804,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("delete");
-        let sandbox = manager.create(&session_id, "128Mi", "250m").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("create should succeed");
         let pod_name = sandbox.pod_name.clone();
 
         manager.delete(sandbox).await.expect("delete should succeed");
@@ -2542,7 +2819,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("drop");
-        let sandbox = manager.create(&session_id, "128Mi", "250m").await.expect("create should succeed");
+        let sandbox = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("create should succeed");
         let pod_name = sandbox.pod_name.clone();
 
         drop(sandbox); // no manager.delete call — this is the path under test
