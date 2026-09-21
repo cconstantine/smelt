@@ -6,6 +6,18 @@
 #
 # homelab's own copy of this scope predates this file and was created by
 # hand — apply this same manifest there too so the two don't drift.
+#
+# Two namespaces: `smelt-park` for a real running `dx serve` dev instance,
+# `smelt-park-test` for `cargo test --features server`'s real-cluster
+# tests (`src/sandbox.rs`'s `NAMESPACE` constant resolves to whichever one
+# under `#[cfg(test)]` — see its own comment). Kept strictly separate so a
+# test run can never leave litter that a real dev instance later collides
+# with (or vice versa) — exactly what caused a stuck `local-path`
+# provisioner in this shared cluster before the split existed. Both
+# namespaces are served by the same `park` ServiceAccount/token (defined
+# once, in `smelt-park`; see the second Role/RoleBinding pair below for
+# how `smelt-park-test` grants it the same access) — one KUBECONFIG stays
+# enough for both.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -79,6 +91,78 @@ kind: LimitRange
 metadata:
   name: sandbox-pod-max
   namespace: smelt-park
+spec:
+  limits:
+    - type: Container
+      max:
+        memory: 64Gi
+        cpu: "16"
+---
+# `smelt-park-test` mirrors every namespaced object above, for real-cluster
+# test runs — see the file-level comment for why this exists as a second
+# namespace rather than reusing `smelt-park`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: smelt-park-test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: park
+  namespace: smelt-park-test
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch", "create", "patch", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["list", "watch", "create", "patch", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps", "services"]
+    verbs: ["list", "create", "patch", "get", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["list", "create", "patch", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["endpoints", "events", "limitranges", "resourcequotas"]
+    verbs: ["list", "get"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list", "get"]
+---
+# The subject is the *same* ServiceAccount that lives in `smelt-park` —
+# RoleBindings can reference a ServiceAccount from another namespace, so
+# this grants that one identity access here too rather than minting (and
+# having to separately credential) a second ServiceAccount/token.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: park
+  namespace: smelt-park-test
+subjects:
+  - kind: ServiceAccount
+    name: park
+    namespace: smelt-park
+roleRef:
+  kind: Role
+  name: park
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: sandbox-pod-max
+  namespace: smelt-park-test
 spec:
   limits:
     - type: Container

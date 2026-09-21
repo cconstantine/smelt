@@ -51,14 +51,18 @@ covers the Drop path deliberately, a bounded `tokio::time::timeout` poll
 waiting for the background drain task to do it instead).
 
 Requires `KUBECONFIG` set and pointing at a reachable cluster with the
-`smelt-park` namespace's RBAC applied (see
+`smelt-park`/`smelt-park-test` namespaces' RBAC applied (see
 [docs/projects/plans/k8s-sandbox.md](projects/plans/k8s-sandbox.md)) —
 `docker compose up -d k3s k3s-bootstrap` (or a full `docker compose up -d`)
 sets this up automatically via `docker-compose.yml`'s `KUBECONFIG` env var
 on the `smelt` service, pointing at the compose-provided `k3s` service.
 Point it at `.kubeconfig.yaml` instead to run the same tests against the
 real `homelab` cluster as a manual drift check — not something `cargo
-test` does by default.
+test` does by default. These tests always run against `smelt-park-test`,
+never the `smelt-park` namespace a real running `dx serve` dev instance
+uses — `src/sandbox.rs`'s `NAMESPACE` constant resolves per `#[cfg(test)]`,
+not an env var, specifically so a test run can't accidentally collide with
+(or leave litter for) a real dev instance, or vice versa.
 
 A real, non-obvious gotcha proven the hard way: deleting a sandbox pod
 with Kubernetes' default `DeleteParams` leaves it `Terminating` for its
