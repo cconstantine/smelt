@@ -6,12 +6,32 @@ use dioxus::prelude::dioxus_core::Task;
 use dioxus::prelude::*;
 
 use crate::anthropic::ContentBlock;
+// Only referenced from `merge_task_snapshot`/`merge_sandbox_snapshot` below,
+// which are themselves web-live-subscription glue (used by the browser
+// build) exercised directly by this module's own tests otherwise — so
+// they, and everything only they need, disappear from a `server`-feature
+// build that's neither of those, which would otherwise make this an
+// "unused import".
+#[cfg(any(feature = "web", test))]
 use crate::anthropic::tools::TaskSummary;
+#[cfg(any(feature = "web", test))]
+use crate::api::chat::SandboxSnapshot;
 use crate::api::chat::{
-    ChatEvent, SandboxCommandSummary, SandboxOutputLine, SandboxPodSummary, SandboxSnapshot,
-    SandboxTerminalSummary, create_conversation, delete_conversation, get_conversations,
-    get_messages, get_sandbox_state, get_tasks, send_message, subscribe_conversation_events,
+    ChatEvent, create_conversation, delete_conversation, get_conversations, get_messages,
+    send_message,
 };
+// Only called from the live event-subscription loop below, which is
+// `web`-only (see its own cfg) — a native `server`-only build never reaches
+// them.
+#[cfg(feature = "web")]
+use crate::api::chat::{get_sandbox_state, get_tasks, subscribe_conversation_events};
+// Only referenced by this module's own tests, which build their own
+// `SandboxSnapshot`s by hand rather than through `get_sandbox_state`.
+#[cfg(test)]
+use crate::api::chat::{
+    SandboxCommandSummary, SandboxOutputLine, SandboxPodSummary, SandboxTerminalSummary,
+};
+#[cfg(feature = "web")]
 use crate::events::ConversationEvent;
 use crate::frontend::Route;
 use crate::models::{Conversation, Message};
@@ -21,6 +41,10 @@ use crate::models::{Conversation, Message};
 /// `send_message`'s own `ChatEvent::Done`, once via the live
 /// `MessagesAppended` broadcast, or via the one-shot reconciliation pull on
 /// (re)connect), and a duplicate id must never render as two bubbles.
+///
+/// Only called from the `web`-only live event-subscription loop below;
+/// exercised directly by this module's own tests otherwise.
+#[cfg(any(feature = "web", test))]
 fn merge_messages_by_id(existing: &mut Vec<Message>, incoming: Vec<Message>) {
     for message in incoming {
         if !existing.iter().any(|m| m.id == message.id) {
@@ -53,6 +77,7 @@ struct TaskPanelEntry {
 /// panel already had), adds any that are new. Never removes an entry (a
 /// finished/cancelled task should stay visible with its last known output,
 /// not vanish from the panel).
+#[cfg(any(feature = "web", test))]
 fn merge_task_snapshot(existing: &mut Vec<TaskPanelEntry>, snapshot: Vec<TaskSummary>) {
     for task in snapshot {
         if let Some(entry) = existing.iter_mut().find(|e| e.task_id == task.task_id) {
@@ -77,6 +102,7 @@ fn merge_task_snapshot(existing: &mut Vec<TaskPanelEntry>, snapshot: Vec<TaskSum
 /// line rather than replacing the whole scrollback. A "just started"/
 /// terminal event carries `stream: None` (a pure status transition, no line
 /// to append) and only updates `tool`/`status`.
+#[cfg(any(feature = "web", test))]
 fn apply_task_update(
     existing: &mut Vec<TaskPanelEntry>,
     task_id: String,
@@ -159,6 +185,7 @@ struct SandboxTerminalPanelEntry {
 /// and terminals — same "snapshot is authoritative" upsert semantics as
 /// `merge_task_snapshot`, flattened from the snapshot's pod→terminal
 /// nesting into the two separate flat lists the panel renders from.
+#[cfg(any(feature = "web", test))]
 fn merge_sandbox_snapshot(
     pods: &mut Vec<SandboxPodPanelEntry>,
     terminals: &mut Vec<SandboxTerminalPanelEntry>,
@@ -168,7 +195,10 @@ fn merge_sandbox_snapshot(
         if let Some(entry) = pods.iter_mut().find(|p| p.pod_id == pod.pod_id) {
             entry.status = pod.status.clone();
         } else {
-            pods.push(SandboxPodPanelEntry { pod_id: pod.pod_id, status: pod.status.clone() });
+            pods.push(SandboxPodPanelEntry {
+                pod_id: pod.pod_id,
+                status: pod.status.clone(),
+            });
         }
 
         for terminal in pod.terminals {
@@ -183,11 +213,17 @@ fn merge_sandbox_snapshot(
                     output: cmd
                         .output
                         .into_iter()
-                        .map(|line| SandboxOutputLinePanelEntry { stream: line.stream, data: line.data })
+                        .map(|line| SandboxOutputLinePanelEntry {
+                            stream: line.stream,
+                            data: line.data,
+                        })
                         .collect(),
                 })
                 .collect();
-            if let Some(entry) = terminals.iter_mut().find(|t| t.terminal_id == terminal.terminal_id) {
+            if let Some(entry) = terminals
+                .iter_mut()
+                .find(|t| t.terminal_id == terminal.terminal_id)
+            {
                 entry.pod_id = terminal.pod_id;
                 entry.status = terminal.status;
                 entry.commands = commands;
@@ -208,6 +244,7 @@ fn merge_sandbox_snapshot(
 /// locally) on `terminated: true`. Deliberately diverges from the task
 /// panel here: a terminated pod is gone, not just relabeled — see the
 /// plan's "How."
+#[cfg(any(feature = "web", test))]
 fn apply_sandbox_pod_update(
     pods: &mut Vec<SandboxPodPanelEntry>,
     terminals: &mut Vec<SandboxTerminalPanelEntry>,
@@ -229,6 +266,7 @@ fn apply_sandbox_pod_update(
 
 /// Applies one live `SandboxTerminalUpdate` — same upsert-or-remove shape
 /// as `apply_sandbox_pod_update`.
+#[cfg(any(feature = "web", test))]
 fn apply_sandbox_terminal_update(
     terminals: &mut Vec<SandboxTerminalPanelEntry>,
     pod_id: i64,
@@ -264,6 +302,7 @@ fn apply_sandbox_terminal_update(
 /// `command_id` matching needed. A `terminal_id` with no matching entry is
 /// a no-op (shouldn't happen: a command can't start before its terminal is
 /// known to the panel).
+#[cfg(any(feature = "web", test))]
 fn apply_sandbox_command_update(
     terminals: &mut Vec<SandboxTerminalPanelEntry>,
     terminal_id: i64,
@@ -295,7 +334,9 @@ fn apply_sandbox_command_update(
     current.status = status;
     current.exit_code = exit_code;
     if let (Some(stream), Some(data)) = (stream, latest_output) {
-        current.output.push(SandboxOutputLinePanelEntry { stream, data });
+        current
+            .output
+            .push(SandboxOutputLinePanelEntry { stream, data });
     }
 }
 
@@ -336,7 +377,11 @@ fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
                 similar::ChangeTag::Delete => DiffLineKind::Removed,
                 similar::ChangeTag::Insert => DiffLineKind::Added,
             };
-            let content = change.as_str().unwrap_or_default().trim_end_matches('\n').to_string();
+            let content = change
+                .as_str()
+                .unwrap_or_default()
+                .trim_end_matches('\n')
+                .to_string();
             DiffLine { kind, content }
         })
         .collect()
@@ -479,9 +524,19 @@ fn render_block_element(
         // `old_string`/`new_string` already carry everything a diff needs.
         // See docs/projects/plans/file-tools.md's "Diff rendering."
         ContentBlock::ToolUse { name, input, .. } if name == "edit_file" => {
-            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let old_string = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
-            let new_string = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+            let path = input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let old_string = input
+                .get("old_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let new_string = input
+                .get("new_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let lines = diff_lines(old_string, new_string);
             rsx! {
                 div { key: "{key}", class: "file-edit-diff",
@@ -572,9 +627,18 @@ mod tests {
         assert_eq!(
             result,
             vec![
-                DiffLine { kind: DiffLineKind::Equal, content: "a".to_string() },
-                DiffLine { kind: DiffLineKind::Equal, content: "b".to_string() },
-                DiffLine { kind: DiffLineKind::Equal, content: "c".to_string() },
+                DiffLine {
+                    kind: DiffLineKind::Equal,
+                    content: "a".to_string()
+                },
+                DiffLine {
+                    kind: DiffLineKind::Equal,
+                    content: "b".to_string()
+                },
+                DiffLine {
+                    kind: DiffLineKind::Equal,
+                    content: "c".to_string()
+                },
             ]
         );
     }
@@ -585,10 +649,22 @@ mod tests {
         assert_eq!(
             result,
             vec![
-                DiffLine { kind: DiffLineKind::Equal, content: "a".to_string() },
-                DiffLine { kind: DiffLineKind::Removed, content: "b".to_string() },
-                DiffLine { kind: DiffLineKind::Added, content: "x".to_string() },
-                DiffLine { kind: DiffLineKind::Equal, content: "c".to_string() },
+                DiffLine {
+                    kind: DiffLineKind::Equal,
+                    content: "a".to_string()
+                },
+                DiffLine {
+                    kind: DiffLineKind::Removed,
+                    content: "b".to_string()
+                },
+                DiffLine {
+                    kind: DiffLineKind::Added,
+                    content: "x".to_string()
+                },
+                DiffLine {
+                    kind: DiffLineKind::Equal,
+                    content: "c".to_string()
+                },
             ]
         );
     }
@@ -603,10 +679,22 @@ mod tests {
         assert_eq!(
             result,
             vec![
-                DiffLine { kind: DiffLineKind::Equal, content: "fn f() {".to_string() },
-                DiffLine { kind: DiffLineKind::Removed, content: "    old_body();".to_string() },
-                DiffLine { kind: DiffLineKind::Added, content: "    new_body();".to_string() },
-                DiffLine { kind: DiffLineKind::Equal, content: "}".to_string() },
+                DiffLine {
+                    kind: DiffLineKind::Equal,
+                    content: "fn f() {".to_string()
+                },
+                DiffLine {
+                    kind: DiffLineKind::Removed,
+                    content: "    old_body();".to_string()
+                },
+                DiffLine {
+                    kind: DiffLineKind::Added,
+                    content: "    new_body();".to_string()
+                },
+                DiffLine {
+                    kind: DiffLineKind::Equal,
+                    content: "}".to_string()
+                },
             ]
         );
     }
@@ -876,11 +964,17 @@ mod tests {
     }
 
     fn test_output_line(stream: &str, data: &str) -> SandboxOutputLine {
-        SandboxOutputLine { stream: stream.to_string(), data: data.to_string() }
+        SandboxOutputLine {
+            stream: stream.to_string(),
+            data: data.to_string(),
+        }
     }
 
     fn test_output_line_entry(stream: &str, data: &str) -> SandboxOutputLinePanelEntry {
-        SandboxOutputLinePanelEntry { stream: stream.to_string(), data: data.to_string() }
+        SandboxOutputLinePanelEntry {
+            stream: stream.to_string(),
+            data: data.to_string(),
+        }
     }
 
     #[test]
@@ -931,12 +1025,20 @@ mod tests {
         assert_eq!(terminals.len(), 1);
         assert_eq!(terminals[0].terminal_id, 2);
         assert_eq!(
-            terminals[0].commands.iter().map(|c| c.command.as_str()).collect::<Vec<_>>(),
+            terminals[0]
+                .commands
+                .iter()
+                .map(|c| c.command.as_str())
+                .collect::<Vec<_>>(),
             vec!["cd /tmp", "echo hi"],
             "history should preserve the snapshot's own (oldest-first) order"
         );
         assert_eq!(
-            terminals[0].commands[1].output.iter().map(|l| (l.stream.as_str(), l.data.as_str())).collect::<Vec<_>>(),
+            terminals[0].commands[1]
+                .output
+                .iter()
+                .map(|l| (l.stream.as_str(), l.data.as_str()))
+                .collect::<Vec<_>>(),
             vec![("stdout", "hi"), ("stderr", "uh oh"), ("stdout", "bye")],
             "output order must match the snapshot's, not get split by stream"
         );
@@ -944,7 +1046,10 @@ mod tests {
 
     #[test]
     fn test_merge_sandbox_snapshot_is_authoritative_over_existing_entries() {
-        let mut pods = vec![SandboxPodPanelEntry { pod_id: 1, status: "Pending".to_string() }];
+        let mut pods = vec![SandboxPodPanelEntry {
+            pod_id: 1,
+            status: "Pending".to_string(),
+        }];
         let mut terminals = Vec::new();
         let snapshot = SandboxSnapshot {
             pods: vec![SandboxPodSummary {
@@ -956,7 +1061,11 @@ mod tests {
 
         merge_sandbox_snapshot(&mut pods, &mut terminals, snapshot);
 
-        assert_eq!(pods.len(), 1, "an existing pod should be updated, not duplicated");
+        assert_eq!(
+            pods.len(),
+            1,
+            "an existing pod should be updated, not duplicated"
+        );
         assert_eq!(pods[0].status, "Running");
     }
 
@@ -969,17 +1078,30 @@ mod tests {
         assert_eq!(pods[0].status, "Running");
 
         apply_sandbox_pod_update(&mut pods, &mut terminals, 1, "Running".to_string(), false);
-        assert_eq!(pods.len(), 1, "a repeat update for the same pod_id should update, not duplicate");
+        assert_eq!(
+            pods.len(),
+            1,
+            "a repeat update for the same pod_id should update, not duplicate"
+        );
     }
 
     #[test]
     fn test_apply_sandbox_pod_update_removes_pod_and_its_terminals_when_terminated() {
-        let mut pods = vec![SandboxPodPanelEntry { pod_id: 1, status: "Running".to_string() }];
-        let mut terminals = vec![test_sandbox_terminal_entry(10, 1), test_sandbox_terminal_entry(20, 2)];
+        let mut pods = vec![SandboxPodPanelEntry {
+            pod_id: 1,
+            status: "Running".to_string(),
+        }];
+        let mut terminals = vec![
+            test_sandbox_terminal_entry(10, 1),
+            test_sandbox_terminal_entry(20, 2),
+        ];
 
         apply_sandbox_pod_update(&mut pods, &mut terminals, 1, "terminated".to_string(), true);
 
-        assert!(pods.is_empty(), "the terminated pod should be removed, not just relabeled");
+        assert!(
+            pods.is_empty(),
+            "the terminated pod should be removed, not just relabeled"
+        );
         assert_eq!(
             terminals.iter().map(|t| t.terminal_id).collect::<Vec<_>>(),
             vec![20],
@@ -997,7 +1119,10 @@ mod tests {
 
     #[test]
     fn test_apply_sandbox_terminal_update_removes_only_the_matching_terminal_when_terminated() {
-        let mut terminals = vec![test_sandbox_terminal_entry(10, 1), test_sandbox_terminal_entry(20, 1)];
+        let mut terminals = vec![
+            test_sandbox_terminal_entry(10, 1),
+            test_sandbox_terminal_entry(20, 1),
+        ];
 
         apply_sandbox_terminal_update(&mut terminals, 1, 10, "disconnected".to_string(), true);
 
@@ -1011,8 +1136,13 @@ mod tests {
     #[test]
     fn test_apply_sandbox_command_update_with_command_appends_a_new_history_entry() {
         let mut terminals = vec![test_sandbox_terminal_entry(10, 1)];
-        terminals[0].commands.push(test_sandbox_command_entry("cmd-old", "sleep 30"));
-        terminals[0].commands[0].output = vec![test_output_line_entry("stdout", "output from a previous command")];
+        terminals[0]
+            .commands
+            .push(test_sandbox_command_entry("cmd-old", "sleep 30"));
+        terminals[0].commands[0].output = vec![test_output_line_entry(
+            "stdout",
+            "output from a previous command",
+        )];
 
         apply_sandbox_command_update(
             &mut terminals,
@@ -1026,22 +1156,32 @@ mod tests {
         );
 
         assert_eq!(
-            terminals[0].commands.iter().map(|c| c.command_id.as_str()).collect::<Vec<_>>(),
+            terminals[0]
+                .commands
+                .iter()
+                .map(|c| c.command_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["cmd-old", "cmd-new"],
             "a new command should be appended to the terminal's history, not replace it"
         );
         assert_eq!(
             terminals[0].commands[0].output,
-            vec![test_output_line_entry("stdout", "output from a previous command")],
+            vec![test_output_line_entry(
+                "stdout",
+                "output from a previous command"
+            )],
             "an earlier command's own output should be untouched by a later command starting"
         );
         assert!(terminals[0].commands[1].output.is_empty());
     }
 
     #[test]
-    fn test_apply_sandbox_command_update_without_command_appends_a_line_to_the_most_recent_command() {
+    fn test_apply_sandbox_command_update_without_command_appends_a_line_to_the_most_recent_command()
+    {
         let mut terminals = vec![test_sandbox_terminal_entry(10, 1)];
-        terminals[0].commands.push(test_sandbox_command_entry("cmd-1", "echo hi"));
+        terminals[0]
+            .commands
+            .push(test_sandbox_command_entry("cmd-1", "echo hi"));
 
         apply_sandbox_command_update(
             &mut terminals,
@@ -1054,10 +1194,12 @@ mod tests {
             Some("hi".to_string()),
         );
 
-        assert_eq!(terminals[0].commands[0].output, vec![test_output_line_entry("stdout", "hi")]);
         assert_eq!(
-            terminals[0].commands[0].command,
-            "echo hi",
+            terminals[0].commands[0].output,
+            vec![test_output_line_entry("stdout", "hi")]
+        );
+        assert_eq!(
+            terminals[0].commands[0].command, "echo hi",
             "an output-line update shouldn't touch the already-known command text"
         );
     }
@@ -1065,7 +1207,9 @@ mod tests {
     #[test]
     fn test_apply_sandbox_command_update_preserves_arrival_order_across_streams() {
         let mut terminals = vec![test_sandbox_terminal_entry(10, 1)];
-        terminals[0].commands.push(test_sandbox_command_entry("cmd-1", "sh -c '...'"));
+        terminals[0]
+            .commands
+            .push(test_sandbox_command_entry("cmd-1", "sh -c '...'"));
 
         for (stream, data) in [("stdout", "one"), ("stderr", "uh oh"), ("stdout", "two")] {
             apply_sandbox_command_update(
@@ -1092,9 +1236,12 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_sandbox_command_update_finish_sets_status_and_exit_code_on_the_most_recent_command() {
+    fn test_apply_sandbox_command_update_finish_sets_status_and_exit_code_on_the_most_recent_command()
+     {
         let mut terminals = vec![test_sandbox_terminal_entry(10, 1)];
-        terminals[0].commands.push(test_sandbox_command_entry("cmd-1", "echo hi"));
+        terminals[0]
+            .commands
+            .push(test_sandbox_command_entry("cmd-1", "echo hi"));
 
         apply_sandbox_command_update(
             &mut terminals,
@@ -1162,7 +1309,7 @@ mod tests {
 /// inside its own closure) a value that actually updates on navigation.
 #[component]
 pub fn Chat() -> Element {
-    let router = use_router();
+    let router = router();
     let selected: Memo<Option<i64>> = use_memo(move || match router.current::<Route>() {
         Route::Home {} => None,
         Route::ConversationRoute { id } => Some(id),
@@ -1298,12 +1445,21 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
     // see `ConversationEvent::NotificationDeliveryFailed`. Separate from
     // `stream_error` since that one's reset at the start of every `send()`
     // call; this can arrive at any time, not tied to a live send.
+    //
+    // `mut` is only exercised by the `web`-only live-subscription loop and
+    // timezone effect below (`.set()`/`.write()`); a `server`-only build
+    // never mutates these, so `allow(unused_mut)` there.
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut notification_delivery_error: Signal<Option<String>> = use_signal(|| None);
     let mut input = use_signal(String::new);
     let mut next_temp_id = use_signal(|| -1i64);
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut tasks: Signal<Vec<TaskPanelEntry>> = use_signal(Vec::new);
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut sandbox_pods: Signal<Vec<SandboxPodPanelEntry>> = use_signal(Vec::new);
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut sandbox_terminals: Signal<Vec<SandboxTerminalPanelEntry>> = use_signal(Vec::new);
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut tz_offset_minutes: Signal<i32> = use_signal(|| 0);
 
     // Sticky-bottom auto-scroll state for the message transcript: the
@@ -1403,7 +1559,11 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                             merge_task_snapshot(&mut tasks.write(), snapshot);
                         }
                         if let Ok(snapshot) = get_sandbox_state(id).await {
-                            merge_sandbox_snapshot(&mut sandbox_pods.write(), &mut sandbox_terminals.write(), snapshot);
+                            merge_sandbox_snapshot(
+                                &mut sandbox_pods.write(),
+                                &mut sandbox_terminals.write(),
+                                snapshot,
+                            );
                         }
 
                         loop {
@@ -1427,7 +1587,11 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                         latest_output,
                                     );
                                 }
-                                Some(Ok(ConversationEvent::SandboxPodUpdate { pod_id, status, terminated })) => {
+                                Some(Ok(ConversationEvent::SandboxPodUpdate {
+                                    pod_id,
+                                    status,
+                                    terminated,
+                                })) => {
                                     apply_sandbox_pod_update(
                                         &mut sandbox_pods.write(),
                                         &mut sandbox_terminals.write(),
@@ -1470,7 +1634,9 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                         latest_output,
                                     );
                                 }
-                                Some(Ok(ConversationEvent::NotificationDeliveryFailed { detail })) => {
+                                Some(Ok(ConversationEvent::NotificationDeliveryFailed {
+                                    detail,
+                                })) => {
                                     notification_delivery_error.set(Some(detail));
                                 }
                                 Some(Err(_)) | None => break,

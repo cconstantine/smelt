@@ -220,7 +220,10 @@ mod server {
                 terminated: false,
             };
             publish(6, pod_event.clone());
-            assert_eq!(rx.recv().await.expect("pod event should be delivered"), pod_event);
+            assert_eq!(
+                rx.recv().await.expect("pod event should be delivered"),
+                pod_event
+            );
 
             let terminal_event = ConversationEvent::SandboxTerminalUpdate {
                 pod_id: 1,
@@ -254,7 +257,9 @@ mod server {
             };
             publish(6, failure_event.clone());
             assert_eq!(
-                rx.recv().await.expect("notification-delivery-failed event should be delivered"),
+                rx.recv()
+                    .await
+                    .expect("notification-delivery-failed event should be delivered"),
                 failure_event
             );
         }

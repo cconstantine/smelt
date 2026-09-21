@@ -84,7 +84,10 @@ fn find_matches(haystack: &str, needle: &str) -> Vec<usize> {
 /// `read_file`'s line-numbered output is produced. Counts newlines strictly
 /// before `offset`.
 fn byte_offset_to_line(text: &str, offset: usize) -> u32 {
-    1 + text.as_bytes()[..offset].iter().filter(|&&b| b == b'\n').count() as u32
+    1 + text.as_bytes()[..offset]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count() as u32
 }
 
 /// `edit_file`'s core replace logic — see
@@ -123,7 +126,9 @@ fn apply_edit(
             .find(|&&offset| byte_offset_to_line(content, offset) == line)
             .ok_or(EditError::NoMatchAtLine { line })?
     } else if matches.len() > 1 {
-        return Err(EditError::Ambiguous { count: matches.len() });
+        return Err(EditError::Ambiguous {
+            count: matches.len(),
+        });
     } else {
         matches[0]
     };
@@ -179,7 +184,9 @@ fn edit_error_message(err: EditError) -> String {
     match err {
         EditError::NotFound => "old_string not found in file".to_string(),
         EditError::Ambiguous { count } => {
-            format!("old_string matches {count} times; add more surrounding context, set replace_all, or set expected_line to target one occurrence")
+            format!(
+                "old_string matches {count} times; add more surrounding context, set replace_all, or set expected_line to target one occurrence"
+            )
         }
         EditError::NoMatchAtLine { line } => {
             format!("old_string does not match at line {line}")
@@ -316,13 +323,31 @@ enum ClientMessage {
     #[serde(rename = "terminate_terminal")]
     TerminateTerminal { terminal_id: String },
     #[serde(rename = "command")]
-    Command { terminal_id: String, id: String, command: String },
+    Command {
+        terminal_id: String,
+        id: String,
+        command: String,
+    },
     #[serde(rename = "signal")]
-    Signal { terminal_id: String, id: String, signal: String },
+    Signal {
+        terminal_id: String,
+        id: String,
+        signal: String,
+    },
     #[serde(rename = "read_file")]
-    ReadFile { request_id: String, path: String, offset: u32, limit: u32 },
+    ReadFile {
+        request_id: String,
+        path: String,
+        offset: u32,
+        limit: u32,
+    },
     #[serde(rename = "write_file")]
-    WriteFile { request_id: String, path: String, content: String, expected_hash: Option<String> },
+    WriteFile {
+        request_id: String,
+        path: String,
+        content: String,
+        expected_hash: Option<String>,
+    },
     #[serde(rename = "edit_file")]
     EditFile {
         request_id: String,
@@ -457,22 +482,54 @@ async fn handle_client_message(text: &str, state: &Arc<AppState>, socket: &mut W
     };
 
     match msg {
-        ClientMessage::CreateTerminal { terminal_id } => create_terminal(state, socket, terminal_id).await,
-        ClientMessage::TerminateTerminal { terminal_id } => terminate_terminal(state, socket, terminal_id).await,
-        ClientMessage::Command { terminal_id, id, command } => {
-            start_command(state, &terminal_id, id, &command).await
+        ClientMessage::CreateTerminal { terminal_id } => {
+            create_terminal(state, socket, terminal_id).await
         }
-        ClientMessage::Signal { terminal_id, id, signal } => {
-            signal_current_command(state, &terminal_id, &id, &signal).await
+        ClientMessage::TerminateTerminal { terminal_id } => {
+            terminate_terminal(state, socket, terminal_id).await
         }
-        ClientMessage::ReadFile { request_id, path, offset, limit } => {
-            handle_read_file(socket, request_id, path, offset, limit).await
-        }
-        ClientMessage::WriteFile { request_id, path, content, expected_hash } => {
-            handle_write_file(socket, request_id, path, content, expected_hash).await
-        }
-        ClientMessage::EditFile { request_id, path, old_string, new_string, replace_all, expected_hash, expected_line } => {
-            handle_edit_file(socket, request_id, path, old_string, new_string, replace_all, expected_hash, expected_line).await
+        ClientMessage::Command {
+            terminal_id,
+            id,
+            command,
+        } => start_command(state, &terminal_id, id, &command).await,
+        ClientMessage::Signal {
+            terminal_id,
+            id,
+            signal,
+        } => signal_current_command(state, &terminal_id, &id, &signal).await,
+        ClientMessage::ReadFile {
+            request_id,
+            path,
+            offset,
+            limit,
+        } => handle_read_file(socket, request_id, path, offset, limit).await,
+        ClientMessage::WriteFile {
+            request_id,
+            path,
+            content,
+            expected_hash,
+        } => handle_write_file(socket, request_id, path, content, expected_hash).await,
+        ClientMessage::EditFile {
+            request_id,
+            path,
+            old_string,
+            new_string,
+            replace_all,
+            expected_hash,
+            expected_line,
+        } => {
+            handle_edit_file(
+                socket,
+                request_id,
+                path,
+                old_string,
+                new_string,
+                replace_all,
+                expected_hash,
+                expected_line,
+            )
+            .await
         }
         ClientMessage::ListDirectory { request_id, path } => {
             handle_list_directory(socket, request_id, path).await
@@ -492,12 +549,22 @@ const MAX_DIR_ENTRIES: usize = 1000;
 async fn send_file_error(socket: &mut WebSocket, request_id: String, message: &str) {
     send_server_message(
         socket,
-        ServerMessage::FileError { request_id, event: "file_error", message: message.to_string() },
+        ServerMessage::FileError {
+            request_id,
+            event: "file_error",
+            message: message.to_string(),
+        },
     )
     .await;
 }
 
-async fn handle_read_file(socket: &mut WebSocket, request_id: String, path: String, offset: u32, limit: u32) {
+async fn handle_read_file(
+    socket: &mut WebSocket,
+    request_id: String,
+    path: String,
+    offset: u32,
+    limit: u32,
+) {
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -506,7 +573,12 @@ async fn handle_read_file(socket: &mut WebSocket, request_id: String, path: Stri
         }
     };
     if bytes.len() as u64 > MAX_FILE_SIZE_BYTES {
-        send_file_error(socket, request_id, &format!("{path} exceeds the {MAX_FILE_SIZE_BYTES}-byte size limit")).await;
+        send_file_error(
+            socket,
+            request_id,
+            &format!("{path} exceeds the {MAX_FILE_SIZE_BYTES}-byte size limit"),
+        )
+        .await;
         return;
     }
     let content = match String::from_utf8(bytes) {
@@ -518,7 +590,17 @@ async fn handle_read_file(socket: &mut WebSocket, request_id: String, path: Stri
     };
     let hash = hash_content(content.as_bytes());
     let (lines, total_lines) = paginate_lines(&content, offset, limit);
-    send_server_message(socket, ServerMessage::FileRead { request_id, event: "file_read", lines, total_lines, hash }).await;
+    send_server_message(
+        socket,
+        ServerMessage::FileRead {
+            request_id,
+            event: "file_read",
+            lines,
+            total_lines,
+            hash,
+        },
+    )
+    .await;
 }
 
 async fn handle_write_file(
@@ -529,7 +611,12 @@ async fn handle_write_file(
     expected_hash: Option<String>,
 ) {
     if content.len() as u64 > MAX_FILE_SIZE_BYTES {
-        send_file_error(socket, request_id, &format!("content exceeds the {MAX_FILE_SIZE_BYTES}-byte size limit")).await;
+        send_file_error(
+            socket,
+            request_id,
+            &format!("content exceeds the {MAX_FILE_SIZE_BYTES}-byte size limit"),
+        )
+        .await;
         return;
     }
 
@@ -548,7 +635,12 @@ async fn handle_write_file(
                 }
             }
             Err(e) => {
-                send_file_error(socket, request_id, &format!("failed to read {path} for hash check: {e}")).await;
+                send_file_error(
+                    socket,
+                    request_id,
+                    &format!("failed to read {path} for hash check: {e}"),
+                )
+                .await;
                 return;
             }
         }
@@ -557,7 +649,12 @@ async fn handle_write_file(
     if let Some(parent) = std::path::Path::new(&path).parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                send_file_error(socket, request_id, &format!("failed to create parent directories for {path}: {e}")).await;
+                send_file_error(
+                    socket,
+                    request_id,
+                    &format!("failed to create parent directories for {path}: {e}"),
+                )
+                .await;
                 return;
             }
         }
@@ -568,7 +665,15 @@ async fn handle_write_file(
         return;
     }
     let hash = hash_content(content.as_bytes());
-    send_server_message(socket, ServerMessage::FileWritten { request_id, event: "file_written", hash }).await;
+    send_server_message(
+        socket,
+        ServerMessage::FileWritten {
+            request_id,
+            event: "file_written",
+            hash,
+        },
+    )
+    .await;
 }
 
 async fn handle_edit_file(
@@ -606,7 +711,13 @@ async fn handle_edit_file(
         }
     };
 
-    let new_content = match apply_edit(&content, &old_string, &new_string, replace_all, expected_line) {
+    let new_content = match apply_edit(
+        &content,
+        &old_string,
+        &new_string,
+        replace_all,
+        expected_line,
+    ) {
         Ok(new_content) => new_content,
         Err(edit_err) => {
             send_file_error(socket, request_id, &edit_error_message(edit_err)).await;
@@ -619,14 +730,27 @@ async fn handle_edit_file(
         return;
     }
     let hash = hash_content(new_content.as_bytes());
-    send_server_message(socket, ServerMessage::FileEdited { request_id, event: "file_edited", hash }).await;
+    send_server_message(
+        socket,
+        ServerMessage::FileEdited {
+            request_id,
+            event: "file_edited",
+            hash,
+        },
+    )
+    .await;
 }
 
 async fn handle_list_directory(socket: &mut WebSocket, request_id: String, path: String) {
     let mut read_dir = match tokio::fs::read_dir(&path).await {
         Ok(read_dir) => read_dir,
         Err(e) => {
-            send_file_error(socket, request_id, &format!("failed to read directory {path}: {e}")).await;
+            send_file_error(
+                socket,
+                request_id,
+                &format!("failed to read directory {path}: {e}"),
+            )
+            .await;
             return;
         }
     };
@@ -636,24 +760,46 @@ async fn handle_list_directory(socket: &mut WebSocket, request_id: String, path:
         match read_dir.next_entry().await {
             Ok(Some(entry)) => {
                 if entries.len() >= MAX_DIR_ENTRIES {
-                    send_file_error(socket, request_id, &format!("{path} has more than {MAX_DIR_ENTRIES} entries")).await;
+                    send_file_error(
+                        socket,
+                        request_id,
+                        &format!("{path} has more than {MAX_DIR_ENTRIES} entries"),
+                    )
+                    .await;
                     return;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-                let size = if is_dir { None } else { entry.metadata().await.ok().map(|m| m.len()) };
+                let size = if is_dir {
+                    None
+                } else {
+                    entry.metadata().await.ok().map(|m| m.len())
+                };
                 entries.push(DirEntryInfo { name, is_dir, size });
             }
             Ok(None) => break,
             Err(e) => {
-                send_file_error(socket, request_id, &format!("failed to read directory {path}: {e}")).await;
+                send_file_error(
+                    socket,
+                    request_id,
+                    &format!("failed to read directory {path}: {e}"),
+                )
+                .await;
                 return;
             }
         }
     }
 
     let entries = sort_entries(entries);
-    send_server_message(socket, ServerMessage::DirectoryListed { request_id, event: "directory_listed", entries }).await;
+    send_server_message(
+        socket,
+        ServerMessage::DirectoryListed {
+            request_id,
+            event: "directory_listed",
+            entries,
+        },
+    )
+    .await;
 }
 
 /// Spawns a new named shell — `.process_group(0)` gives it a process group
@@ -681,10 +827,25 @@ async fn create_terminal(state: &Arc<AppState>, socket: &mut WebSocket, terminal
             return;
         }
     };
-    let bash_pid = child.id().expect("bash should have a pid immediately after spawn");
-    let mut stdin = child.stdin.take().expect("stdin requested via Stdio::piped()");
-    let stdout = BufReader::new(child.stdout.take().expect("stdout requested via Stdio::piped()"));
-    let stderr = BufReader::new(child.stderr.take().expect("stderr requested via Stdio::piped()"));
+    let bash_pid = child
+        .id()
+        .expect("bash should have a pid immediately after spawn");
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("stdin requested via Stdio::piped()");
+    let stdout = BufReader::new(
+        child
+            .stdout
+            .take()
+            .expect("stdout requested via Stdio::piped()"),
+    );
+    let stderr = BufReader::new(
+        child
+            .stderr
+            .take()
+            .expect("stderr requested via Stdio::piped()"),
+    );
 
     // set -m: job control, so every command (including a plain foreground
     // one) gets its own process group send_signal can target.
@@ -692,12 +853,22 @@ async fn create_terminal(state: &Arc<AppState>, socket: &mut WebSocket, terminal
     // against itself once a foreground job dies from it, taking the whole
     // shell down with it — see the plan's "Signaling a running command."
     if let Err(e) = stdin.write_all(b"set -m\ntrap ':' INT\n").await {
-        send_terminal_error(socket, terminal_id, &format!("failed to initialize shell: {e}")).await;
+        send_terminal_error(
+            socket,
+            terminal_id,
+            &format!("failed to initialize shell: {e}"),
+        )
+        .await;
         return;
     }
     let _ = stdin.flush().await;
 
-    tokio::spawn(run_reader(terminal_id.clone(), stdout, stderr, state.events_tx.clone()));
+    tokio::spawn(run_reader(
+        terminal_id.clone(),
+        stdout,
+        stderr,
+        state.events_tx.clone(),
+    ));
 
     let shell = Arc::new(Shell {
         stdin: AsyncMutex::new(stdin),
@@ -705,11 +876,18 @@ async fn create_terminal(state: &Arc<AppState>, socket: &mut WebSocket, terminal
         current: AsyncMutex::new(None),
         _bash_child: AsyncMutex::new(child),
     });
-    state.terminals.lock().await.insert(terminal_id.clone(), shell);
+    state
+        .terminals
+        .lock()
+        .await
+        .insert(terminal_id.clone(), shell);
 
     send_server_message(
         socket,
-        ServerMessage::TerminalCreated { terminal_id, event: "terminal_created" },
+        ServerMessage::TerminalCreated {
+            terminal_id,
+            event: "terminal_created",
+        },
     )
     .await;
 }
@@ -731,7 +909,10 @@ async fn terminate_terminal(state: &Arc<AppState>, socket: &mut WebSocket, termi
 
     send_server_message(
         socket,
-        ServerMessage::TerminalTerminated { terminal_id, event: "terminal_terminated" },
+        ServerMessage::TerminalTerminated {
+            terminal_id,
+            event: "terminal_terminated",
+        },
     )
     .await;
 }
@@ -739,7 +920,11 @@ async fn terminate_terminal(state: &Arc<AppState>, socket: &mut WebSocket, termi
 async fn send_terminal_error(socket: &mut WebSocket, terminal_id: String, message: &str) {
     send_server_message(
         socket,
-        ServerMessage::TerminalError { terminal_id, event: "terminal_error", message: message.to_string() },
+        ServerMessage::TerminalError {
+            terminal_id,
+            event: "terminal_error",
+            message: message.to_string(),
+        },
     )
     .await;
 }
@@ -761,7 +946,10 @@ async fn start_command(state: &Arc<AppState>, terminal_id: &str, id: String, com
     *current = Some(id);
     drop(current);
 
-    let payload = format!("eval {}\necho \"{MARKER_PREFIX}$?\"\n", shell_quote(command));
+    let payload = format!(
+        "eval {}\necho \"{MARKER_PREFIX}$?\"\n",
+        shell_quote(command)
+    );
     let mut stdin = shell.stdin.lock().await;
     if stdin.write_all(payload.as_bytes()).await.is_ok() {
         let _ = stdin.flush().await;
@@ -890,7 +1078,8 @@ mod tests {
 
     #[test]
     fn test_apply_edit_replaces_a_unique_match() {
-        let result = apply_edit("hello world", "world", "there", false, None).expect("should succeed");
+        let result =
+            apply_edit("hello world", "world", "there", false, None).expect("should succeed");
         assert_eq!(result, "hello there");
     }
 
@@ -919,8 +1108,14 @@ mod tests {
         let content = "let x = 1;\nlet x = 1;\n";
         let line2_start = content.match_indices("let x = 1;").nth(1).unwrap().0;
         let expected_line = byte_offset_to_line(content, line2_start);
-        let result =
-            apply_edit(content, "let x = 1;", "let x = 2;", false, Some(expected_line)).expect("should succeed");
+        let result = apply_edit(
+            content,
+            "let x = 1;",
+            "let x = 2;",
+            false,
+            Some(expected_line),
+        )
+        .expect("should succeed");
         assert_eq!(result, "let x = 1;\nlet x = 2;\n");
     }
 
@@ -963,7 +1158,10 @@ mod tests {
     fn test_paginate_lines_respects_limit() {
         let (lines, total) = paginate_lines("a\nb\nc", 1, 2);
         assert_eq!(lines, vec!["a", "b"]);
-        assert_eq!(total, 3, "total should reflect the whole file, not just the returned slice");
+        assert_eq!(
+            total, 3,
+            "total should reflect the whole file, not just the returned slice"
+        );
     }
 
     #[test]
@@ -974,7 +1172,11 @@ mod tests {
     }
 
     fn entry(name: &str, is_dir: bool, size: Option<u64>) -> DirEntryInfo {
-        DirEntryInfo { name: name.to_string(), is_dir, size }
+        DirEntryInfo {
+            name: name.to_string(),
+            is_dir,
+            size,
+        }
     }
 
     #[test]
@@ -995,19 +1197,28 @@ mod tests {
 
     #[test]
     fn test_edit_error_message_not_found() {
-        assert_eq!(edit_error_message(EditError::NotFound), "old_string not found in file");
+        assert_eq!(
+            edit_error_message(EditError::NotFound),
+            "old_string not found in file"
+        );
     }
 
     #[test]
     fn test_edit_error_message_ambiguous_includes_match_count() {
         let message = edit_error_message(EditError::Ambiguous { count: 4 });
-        assert!(message.contains('4'), "expected the match count in the message, got: {message}");
+        assert!(
+            message.contains('4'),
+            "expected the match count in the message, got: {message}"
+        );
     }
 
     #[test]
     fn test_edit_error_message_no_match_at_line_includes_the_line_number() {
         let message = edit_error_message(EditError::NoMatchAtLine { line: 42 });
-        assert!(message.contains("42"), "expected the line number in the message, got: {message}");
+        assert!(
+            message.contains("42"),
+            "expected the line number in the message, got: {message}"
+        );
     }
 }
 
@@ -1048,7 +1259,9 @@ async fn main() {
         events_rx: AsyncMutex::new(rx),
     });
 
-    let app = Router::new().route("/ws", get(ws_handler)).with_state(state);
+    let app = Router::new()
+        .route("/ws", get(ws_handler))
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind(LISTEN_ADDR)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {LISTEN_ADDR}: {e}"));

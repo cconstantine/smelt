@@ -158,7 +158,10 @@ fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<()>> {
 /// Hugging Face-hosted Anthropic-compatible endpoint uses instead of a
 /// real Anthropic API key).
 #[cfg(feature = "server")]
-fn require_at_least_one_credential(api_key: &Option<String>, auth_token: &Option<String>) -> Result<(), String> {
+fn require_at_least_one_credential(
+    api_key: &Option<String>,
+    auth_token: &Option<String>,
+) -> Result<(), String> {
     if api_key.is_none() && auth_token.is_none() {
         Err("neither ANTHROPIC_API_KEY nor ANTHROPIC_AUTH_TOKEN is set on the server".to_string())
     } else {
@@ -190,7 +193,13 @@ pub(crate) fn run_turn<'a>(
     on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
 {
-    run_turn_bounded(pool, conversation_id, Some(new_message), on_delta, MAX_TURNS)
+    run_turn_bounded(
+        pool,
+        conversation_id,
+        Some(new_message),
+        on_delta,
+        MAX_TURNS,
+    )
 }
 
 /// Wakes `conversation_id`'s turn loop because a terminal command reached a
@@ -212,13 +221,18 @@ pub(crate) fn run_turn<'a>(
 /// commits *before* the API call that might fail, so this only means the
 /// model hasn't been prompted with it yet, not that it's lost.
 #[cfg(feature = "server")]
-pub(crate) async fn wake_conversation(pool: &PgPool, conversation_id: i64) -> ServerFnResult<Vec<Message>> {
+pub(crate) async fn wake_conversation(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> ServerFnResult<Vec<Message>> {
     let result = run_turn_bounded(pool, conversation_id, None, None, MAX_TURNS).await;
     if let Err(e) = &result {
         tracing::warn!(conversation_id, error = %e, "wake_conversation failed to notify the model");
         crate::events::publish(
             conversation_id,
-            crate::events::ConversationEvent::NotificationDeliveryFailed { detail: e.to_string() },
+            crate::events::ConversationEvent::NotificationDeliveryFailed {
+                detail: e.to_string(),
+            },
         );
     }
     result
@@ -332,7 +346,8 @@ fn run_turn_bounded<'a>(
             // loop, the very next iteration already sees the notification,
             // without waiting for a fresh user message. See the plan's
             // "What" and "How" (the completion-notification design).
-            drain_unnotified_terminal_commands(pool, conversation_id, &mut history, &mut persisted).await?;
+            drain_unnotified_terminal_commands(pool, conversation_id, &mut history, &mut persisted)
+                .await?;
 
             // Nothing to do: `new_message` was `None` (a pure "check for a
             // backlog" wake-up, see `wake_conversation`) and the drain
@@ -377,12 +392,22 @@ fn run_turn_bounded<'a>(
             let mut turn = None;
             let mut last_err = String::new();
             for attempt in 0..=TOOL_CALL_PARSE_RETRIES {
-                match anthropic::stream::stream_anthropic_message(api_key.as_deref(), auth_token.as_deref(), &request, &mut relay).await {
+                match anthropic::stream::stream_anthropic_message(
+                    api_key.as_deref(),
+                    auth_token.as_deref(),
+                    &request,
+                    &mut relay,
+                )
+                .await
+                {
                     Ok(t) => {
                         turn = Some(t);
                         break;
                     }
-                    Err(e) if attempt < TOOL_CALL_PARSE_RETRIES && is_ollama_thinking_tool_call_corruption(&e) => {
+                    Err(e)
+                        if attempt < TOOL_CALL_PARSE_RETRIES
+                            && is_ollama_thinking_tool_call_corruption(&e) =>
+                    {
                         request.thinking = None;
                         last_err = e;
                     }
@@ -568,16 +593,33 @@ const SNAPSHOT_TAIL_LINES: i64 = 200;
 const HISTORY_LIMIT: i64 = 20;
 
 #[cfg(feature = "server")]
-async fn fetch_command_summary(pool: &PgPool, command: &db::TerminalCommand) -> Option<SandboxCommandSummary> {
-    let status = db::terminal_command_status(pool, &command.command_id).await.ok()??;
+async fn fetch_command_summary(
+    pool: &PgPool,
+    command: &db::TerminalCommand,
+) -> Option<SandboxCommandSummary> {
+    let status = db::terminal_command_status(pool, &command.command_id)
+        .await
+        .ok()??;
     let stdout_offset = (status.stdout_lines - SNAPSHOT_TAIL_LINES).max(0);
     let stderr_offset = (status.stderr_lines - SNAPSHOT_TAIL_LINES).max(0);
-    let stdout = db::read_terminal_output(pool, &command.command_id, &["stdout"], stdout_offset, SNAPSHOT_TAIL_LINES)
-        .await
-        .unwrap_or_default();
-    let stderr = db::read_terminal_output(pool, &command.command_id, &["stderr"], stderr_offset, SNAPSHOT_TAIL_LINES)
-        .await
-        .unwrap_or_default();
+    let stdout = db::read_terminal_output(
+        pool,
+        &command.command_id,
+        &["stdout"],
+        stdout_offset,
+        SNAPSHOT_TAIL_LINES,
+    )
+    .await
+    .unwrap_or_default();
+    let stderr = db::read_terminal_output(
+        pool,
+        &command.command_id,
+        &["stderr"],
+        stderr_offset,
+        SNAPSHOT_TAIL_LINES,
+    )
+    .await
+    .unwrap_or_default();
     // stdout/stderr are each capped to their own tail independently (so a
     // stderr spew can't crowd stdout out of the window, or vice versa),
     // which means they arrive as two separately-ordered lists — merge back
@@ -591,13 +633,19 @@ async fn fetch_command_summary(pool: &PgPool, command: &db::TerminalCommand) -> 
         exit_code: status.exit_code,
         output: output
             .into_iter()
-            .map(|line| SandboxOutputLine { stream: line.stream, data: line.data })
+            .map(|line| SandboxOutputLine {
+                stream: line.stream,
+                data: line.data,
+            })
             .collect(),
     })
 }
 
 #[cfg(feature = "server")]
-async fn fetch_terminal_command_history(pool: &PgPool, terminal_id: i64) -> Vec<SandboxCommandSummary> {
+async fn fetch_terminal_command_history(
+    pool: &PgPool,
+    terminal_id: i64,
+) -> Vec<SandboxCommandSummary> {
     let Ok(recent) = db::list_terminal_commands(pool, terminal_id, HISTORY_LIMIT).await else {
         return Vec::new();
     };
@@ -623,21 +671,28 @@ async fn fetch_terminal_command_history(pool: &PgPool, terminal_id: i64) -> Vec<
 #[get("/api/conversations/{id}/sandbox")]
 pub async fn get_sandbox_state(id: i64) -> ServerFnResult<SandboxSnapshot> {
     let pool = db::get();
-    let pods = sandbox::list_pods(pool, id).await.map_err(ServerFnError::new)?;
+    let pods = sandbox::list_pods(pool, id)
+        .await
+        .map_err(ServerFnError::new)?;
     for pod in &pods {
         sandbox::try_reconnect(pool, pod.pod_id).await;
     }
-    let terminals = sandbox::list_terminals(pool, id).await.map_err(ServerFnError::new)?;
+    let terminals = sandbox::list_terminals(pool, id)
+        .await
+        .map_err(ServerFnError::new)?;
 
     let mut by_pod: HashMap<i64, Vec<SandboxTerminalSummary>> = HashMap::new();
     for terminal in terminals {
         let commands = fetch_terminal_command_history(pool, terminal.terminal_id).await;
-        by_pod.entry(terminal.pod_id).or_default().push(SandboxTerminalSummary {
-            terminal_id: terminal.terminal_id,
-            pod_id: terminal.pod_id,
-            status: terminal.status,
-            commands,
-        });
+        by_pod
+            .entry(terminal.pod_id)
+            .or_default()
+            .push(SandboxTerminalSummary {
+                terminal_id: terminal.terminal_id,
+                pod_id: terminal.pod_id,
+                status: terminal.status,
+                commands,
+            });
     }
 
     let pods = pods
@@ -804,7 +859,10 @@ mod tests {
         let original = std::env::var("ANTHROPIC_THINKING").ok();
 
         unsafe { std::env::remove_var("ANTHROPIC_THINKING") };
-        assert!(thinking_enabled(), "should default to on — see the doc comment for why");
+        assert!(
+            thinking_enabled(),
+            "should default to on — see the doc comment for why"
+        );
 
         for value in ["0", "false", "off"] {
             unsafe { std::env::set_var("ANTHROPIC_THINKING", value) };
@@ -892,21 +950,27 @@ mod tests {
 
     #[test]
     fn test_require_at_least_one_credential_allows_auth_token_only() {
-        require_at_least_one_credential(&None, &Some("hf-token".to_string()))
-            .expect("an auth token alone should be sufficient — e.g. a Hugging Face-hosted endpoint");
+        require_at_least_one_credential(&None, &Some("hf-token".to_string())).expect(
+            "an auth token alone should be sufficient — e.g. a Hugging Face-hosted endpoint",
+        );
     }
 
     #[test]
     fn test_require_at_least_one_credential_allows_both_present() {
-        require_at_least_one_credential(&Some("sk-ant-...".to_string()), &Some("hf-token".to_string()))
-            .expect("both being present should still be fine");
+        require_at_least_one_credential(
+            &Some("sk-ant-...".to_string()),
+            &Some("hf-token".to_string()),
+        )
+        .expect("both being present should still be fine");
     }
 
     #[sqlx::test]
     async fn test_run_turn_succeeds_with_only_auth_token_set_no_api_key(pool: PgPool) {
         let _guard = anthropic::test_support::lock_anthropic_base_url();
         let _env_guard = CredentialEnvGuard::capture();
-        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
 
         let body = sse_body(&[
             ("message_start", r#"{"type":"message_start"}"#),
@@ -932,7 +996,9 @@ mod tests {
 
         let new_message = anthropic::AnthropicMessage {
             role: "user".to_string(),
-            content: vec![anthropic::ContentBlock::Text { text: "hello".to_string() }],
+            content: vec![anthropic::ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
         };
 
         let messages = run_turn(&pool, conversation.id, new_message, None)
@@ -946,8 +1012,12 @@ mod tests {
     /// `wake_conversation` is meant to react to. Mirrors `db.rs`'s own
     /// `test_terminal` helper shape.
     async fn unnotified_finished_command(pool: &PgPool, conversation_id: i64, command_id: &str) {
-        let pod = db::create_sandbox_pod(pool, conversation_id).await.expect("create sandbox pod");
-        let terminal = db::create_sandbox_terminal(pool, pod.id).await.expect("create sandbox terminal");
+        let pod = db::create_sandbox_pod(pool, conversation_id)
+            .await
+            .expect("create sandbox pod");
+        let terminal = db::create_sandbox_terminal(pool, pod.id)
+            .await
+            .expect("create sandbox terminal");
         db::create_terminal_command(pool, conversation_id, terminal.id, command_id, "echo hi")
             .await
             .expect("create terminal command");
@@ -959,23 +1029,39 @@ mod tests {
     #[sqlx::test]
     async fn test_wake_conversation_is_a_noop_when_nothing_is_pending(pool: PgPool) {
         let _guard = anthropic::test_support::lock_anthropic_base_url();
-        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
         let counter = start_mock_upstream(vec!["unused".to_string()]).await;
 
         let result = wake_conversation(&pool, conversation.id)
             .await
             .expect("wake_conversation should succeed even with nothing pending");
-        assert!(result.is_empty(), "expected no persisted messages, got {result:?}");
-        assert_eq!(counter.load(Ordering::SeqCst), 0, "nothing pending should mean no API call at all");
+        assert!(
+            result.is_empty(),
+            "expected no persisted messages, got {result:?}"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "nothing pending should mean no API call at all"
+        );
 
-        let messages = db::list_messages(&pool, conversation.id).await.expect("list messages");
-        assert!(messages.is_empty(), "no message should be persisted when nothing is pending");
+        let messages = db::list_messages(&pool, conversation.id)
+            .await
+            .expect("list messages");
+        assert!(
+            messages.is_empty(),
+            "no message should be persisted when nothing is pending"
+        );
     }
 
     #[sqlx::test]
     async fn test_wake_conversation_drains_a_pending_command_and_completes_a_turn(pool: PgPool) {
         let _guard = anthropic::test_support::lock_anthropic_base_url();
-        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
         unnotified_finished_command(&pool, conversation.id, "cmd-1").await;
 
         let body = sse_body(&[
@@ -1000,7 +1086,11 @@ mod tests {
             .await
             .expect("wake_conversation should succeed");
 
-        assert_eq!(messages.len(), 2, "expected the notification plus the assistant's reply, got {messages:?}");
+        assert_eq!(
+            messages.len(),
+            2,
+            "expected the notification plus the assistant's reply, got {messages:?}"
+        );
         assert_eq!(messages[0].role, "user");
         assert_eq!(
             messages[0].blocks().expect("valid blocks"),
@@ -1013,13 +1103,20 @@ mod tests {
         let remaining = db::unnotified_finished_terminal_commands(&pool, conversation.id)
             .await
             .expect("query unnotified commands");
-        assert!(remaining.is_empty(), "the command should now be marked notified");
+        assert!(
+            remaining.is_empty(),
+            "the command should now be marked notified"
+        );
     }
 
     #[sqlx::test]
-    async fn test_wake_conversation_second_call_is_a_noop_once_the_first_drained_everything(pool: PgPool) {
+    async fn test_wake_conversation_second_call_is_a_noop_once_the_first_drained_everything(
+        pool: PgPool,
+    ) {
         let _guard = anthropic::test_support::lock_anthropic_base_url();
-        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
         unnotified_finished_command(&pool, conversation.id, "cmd-1").await;
 
         let body = sse_body(&[
@@ -1040,22 +1137,39 @@ mod tests {
         ]);
         let counter = start_mock_upstream(vec![body]).await;
 
-        let first = wake_conversation(&pool, conversation.id).await.expect("first wake should succeed");
+        let first = wake_conversation(&pool, conversation.id)
+            .await
+            .expect("first wake should succeed");
         assert_eq!(first.len(), 2);
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "first wake should make exactly one API call");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "first wake should make exactly one API call"
+        );
 
         // Simulates a second, near-simultaneous exit event's own detached
         // wake_conversation call — nothing should be left to drain, so this
         // must not persist another message or make another API call.
-        let second = wake_conversation(&pool, conversation.id).await.expect("second wake should succeed");
-        assert!(second.is_empty(), "second wake should find nothing left to drain, got {second:?}");
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "second wake should not make another API call");
+        let second = wake_conversation(&pool, conversation.id)
+            .await
+            .expect("second wake should succeed");
+        assert!(
+            second.is_empty(),
+            "second wake should find nothing left to drain, got {second:?}"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "second wake should not make another API call"
+        );
     }
 
     #[sqlx::test]
     async fn test_wake_conversation_publishes_notification_delivery_failed_on_error(pool: PgPool) {
         let _guard = anthropic::test_support::lock_anthropic_base_url();
-        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
         unnotified_finished_command(&pool, conversation.id, "cmd-1").await;
 
         // `fail_count` is irrelevant when `success_body` is `None` — every
@@ -1065,21 +1179,33 @@ mod tests {
         let mut rx = events::subscribe(conversation.id);
 
         let result = wake_conversation(&pool, conversation.id).await;
-        assert!(result.is_err(), "expected wake_conversation to surface the underlying failure, got {result:?}");
+        assert!(
+            result.is_err(),
+            "expected wake_conversation to surface the underlying failure, got {result:?}"
+        );
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
             .expect("should not time out waiting for the event")
             .expect("event channel should not close");
         assert!(
-            matches!(event, events::ConversationEvent::NotificationDeliveryFailed { .. }),
+            matches!(
+                event,
+                events::ConversationEvent::NotificationDeliveryFailed { .. }
+            ),
             "expected NotificationDeliveryFailed, got {event:?}"
         );
 
         // The notification text itself is durably persisted regardless —
         // the drain step commits before the API call that failed.
-        let messages = db::list_messages(&pool, conversation.id).await.expect("list messages");
-        assert_eq!(messages.len(), 1, "the notification message should still be persisted, got {messages:?}");
+        let messages = db::list_messages(&pool, conversation.id)
+            .await
+            .expect("list messages");
+        assert_eq!(
+            messages.len(),
+            1,
+            "the notification message should still be persisted, got {messages:?}"
+        );
         assert_eq!(messages[0].role, "user");
     }
 
@@ -1142,7 +1268,9 @@ mod tests {
     /// error shape, `run_turn` should retry without thinking and still
     /// complete — not surface the 500 to the caller.
     #[sqlx::test]
-    async fn test_run_turn_retries_without_thinking_after_ollama_tool_call_corruption(pool: PgPool) {
+    async fn test_run_turn_retries_without_thinking_after_ollama_tool_call_corruption(
+        pool: PgPool,
+    ) {
         let _guard = anthropic::test_support::lock_anthropic_base_url();
         let conversation = db::create_conversation(&pool)
             .await
@@ -1227,7 +1355,9 @@ mod tests {
 
         let messages = run_turn(&pool, conversation.id, new_message, None)
             .await
-            .expect("run_turn should recover after exhausting the thinking-drop and one plain retry");
+            .expect(
+                "run_turn should recover after exhausting the thinking-drop and one plain retry",
+            );
 
         assert_eq!(
             messages[1].blocks().expect("valid blocks"),
@@ -1597,10 +1727,11 @@ mod tests {
     /// dynamic/external and have no fixed name list to pin against).
     #[test]
     fn test_tool_definitions_covers_every_dispatchable_tool_name() {
-        let defined: std::collections::BTreeSet<String> = anthropic::tools::native_tool_definitions()
-            .into_iter()
-            .map(|t| t.name)
-            .collect();
+        let defined: std::collections::BTreeSet<String> =
+            anthropic::tools::native_tool_definitions()
+                .into_iter()
+                .map(|t| t.name)
+                .collect();
         let dispatchable: std::collections::BTreeSet<&str> = [
             "add",
             "count",

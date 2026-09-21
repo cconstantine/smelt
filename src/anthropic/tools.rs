@@ -81,7 +81,9 @@ mod server {
             "create_terminal" => create_terminal_tool(pool, conversation_id).await,
             "terminate_terminal" => terminate_terminal_tool(pool, input).await,
             "list_terminals" => list_terminals_tool(pool, conversation_id).await,
-            "run_terminal_command" => run_terminal_command_tool(pool, conversation_id, tool_use_id, input).await,
+            "run_terminal_command" => {
+                run_terminal_command_tool(pool, conversation_id, tool_use_id, input).await
+            }
             "send_signal" => send_signal_tool(pool, input).await,
             "terminal_command_status" => terminal_command_status_tool(pool, input).await,
             "read_terminal_output" => read_terminal_output_tool(pool, input).await,
@@ -532,7 +534,12 @@ mod server {
     /// plain tool error (not a panic): the config could have been deleted
     /// between when `tool_definitions` last offered this tool and when the
     /// model called it.
-    async fn call_mcp_tool(pool: &PgPool, server_name: &str, tool_name: &str, input: &Value) -> Result<String, String> {
+    async fn call_mcp_tool(
+        pool: &PgPool,
+        server_name: &str,
+        tool_name: &str,
+        input: &Value,
+    ) -> Result<String, String> {
         let config = crate::db::get_mcp_server_config_by_name(pool, server_name)
             .await
             .map_err(|e| format!("failed to look up MCP server {server_name:?}: {e}"))?
@@ -549,8 +556,12 @@ mod server {
     pub async fn tool_definitions(pool: &PgPool) -> Vec<crate::anthropic::ToolDefinition> {
         let mut definitions = native_tool_definitions();
         match crate::db::list_mcp_server_configs(pool).await {
-            Ok(configs) => definitions.extend(crate::mcp::tool_definitions_for(pool, &configs).await),
-            Err(e) => tracing::warn!(error = %e, "failed to list configured MCP servers; their tools are unavailable this turn"),
+            Ok(configs) => {
+                definitions.extend(crate::mcp::tool_definitions_for(pool, &configs).await)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to list configured MCP servers; their tools are unavailable this turn")
+            }
         }
         definitions
     }
@@ -1308,7 +1319,9 @@ mod server {
         let mut latest_hash = None;
 
         for message in messages {
-            let Ok(blocks) = message.blocks() else { continue };
+            let Ok(blocks) = message.blocks() else {
+                continue;
+            };
             for block in blocks {
                 match block {
                     ContentBlock::ToolUse { id, name, input }
@@ -1317,8 +1330,12 @@ mod server {
                     {
                         relevant_tool_use_ids.insert(id);
                     }
-                    ContentBlock::ToolResult { tool_use_id, content, is_error }
-                        if relevant_tool_use_ids.contains(&tool_use_id) && !is_error.unwrap_or(false) =>
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } if relevant_tool_use_ids.contains(&tool_use_id)
+                        && !is_error.unwrap_or(false) =>
                     {
                         if let Ok(value) = serde_json::from_str::<Value>(&content) {
                             if let Some(hash) = value.get("hash").and_then(Value::as_str) {
@@ -1334,9 +1351,19 @@ mod server {
         latest_hash
     }
 
-    async fn create_pod_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
-        let memory_limit = input.get("memory_limit").and_then(Value::as_str).map(str::to_string);
-        let cpu_limit = input.get("cpu_limit").and_then(Value::as_str).map(str::to_string);
+    async fn create_pod_tool(
+        pool: &PgPool,
+        conversation_id: i64,
+        input: &Value,
+    ) -> Result<String, String> {
+        let memory_limit = input
+            .get("memory_limit")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let cpu_limit = input
+            .get("cpu_limit")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let pod_id = sandbox::create_pod(pool, conversation_id, memory_limit, cpu_limit)
             .await
             .map_err(|e| e.to_string())?;
@@ -1344,12 +1371,16 @@ mod server {
     }
 
     async fn terminate_pod_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
-        sandbox::terminate_pod(pool, conversation_id).await.map_err(|e| e.to_string())?;
+        sandbox::terminate_pod(pool, conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok("pod terminated".to_string())
     }
 
     async fn list_pods_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
-        let pods = sandbox::list_pods(pool, conversation_id).await.map_err(|e| e.to_string())?;
+        let pods = sandbox::list_pods(pool, conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
         let payload: Vec<_> = pods
             .iter()
             .map(|p| serde_json::json!({"pod_id": p.pod_id, "status": p.status}))
@@ -1358,18 +1389,24 @@ mod server {
     }
 
     async fn create_terminal_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
-        let terminal_id = sandbox::create_terminal(pool, conversation_id).await.map_err(|e| e.to_string())?;
+        let terminal_id = sandbox::create_terminal(pool, conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"terminal_id": terminal_id}).to_string())
     }
 
     async fn terminate_terminal_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
         let terminal_id = required_i64(input, "terminal_id")?;
-        sandbox::terminate_terminal(pool, terminal_id).await.map_err(|e| e.to_string())?;
+        sandbox::terminate_terminal(pool, terminal_id)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(format!("terminal {terminal_id} terminated"))
     }
 
     async fn list_terminals_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
-        let terminals = sandbox::list_terminals(pool, conversation_id).await.map_err(|e| e.to_string())?;
+        let terminals = sandbox::list_terminals(pool, conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
         let payload: Vec<_> = terminals
             .iter()
             .map(|t| serde_json::json!({"terminal_id": t.terminal_id, "pod_id": t.pod_id, "status": t.status}))
@@ -1437,7 +1474,9 @@ mod server {
         let command_id = required_str(input, "command_id")?;
         let signal = required_str(input, "signal")?;
         if !ALLOWED_SIGNALS.contains(&signal.as_str()) {
-            return Err(format!("signal must be one of {ALLOWED_SIGNALS:?}, got {signal}"));
+            return Err(format!(
+                "signal must be one of {ALLOWED_SIGNALS:?}, got {signal}"
+            ));
         }
         let command = db::get_terminal_command(pool, &command_id)
             .await
@@ -1469,14 +1508,25 @@ mod server {
 
     async fn read_terminal_output_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
         let command_id = required_str(input, "command_id")?;
-        let stream = input.get("stream").and_then(Value::as_str).unwrap_or("both");
+        let stream = input
+            .get("stream")
+            .and_then(Value::as_str)
+            .unwrap_or("both");
         let streams: &[&str] = match stream {
             "stdout" => &["stdout"],
             "stderr" => &["stderr"],
             "both" => &["stdout", "stderr"],
-            other => return Err(format!("stream must be one of stdout, stderr, both — got {other}")),
+            other => {
+                return Err(format!(
+                    "stream must be one of stdout, stderr, both — got {other}"
+                ));
+            }
         };
-        let offset = input.get("offset").and_then(Value::as_i64).unwrap_or(0).max(0);
+        let offset = input
+            .get("offset")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(0);
         let limit = input
             .get("limit")
             .and_then(Value::as_i64)
@@ -1523,9 +1573,17 @@ mod server {
     const DEFAULT_READ_FILE_LIMIT: u32 = 2000;
     const MAX_READ_FILE_LIMIT: u32 = 2000;
 
-    async fn read_file_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
+    async fn read_file_tool(
+        pool: &PgPool,
+        conversation_id: i64,
+        input: &Value,
+    ) -> Result<String, String> {
         let path = required_str(input, "path")?;
-        let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(1).max(1) as u32;
+        let offset = input
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1) as u32;
         let limit = input
             .get("limit")
             .and_then(Value::as_u64)
@@ -1560,11 +1618,17 @@ mod server {
     /// need this." `edit_file`, below, is stricter — it always needs
     /// `old_string` to have come from somewhere, so a missing prior hash
     /// there is a hard refusal instead.
-    async fn write_file_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
+    async fn write_file_tool(
+        pool: &PgPool,
+        conversation_id: i64,
+        input: &Value,
+    ) -> Result<String, String> {
         let path = required_str(input, "path")?;
         let content = required_str(input, "content")?;
 
-        let messages = db::list_messages(pool, conversation_id).await.map_err(|e| e.to_string())?;
+        let messages = db::list_messages(pool, conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
         let expected_hash = find_prior_file_hash(&messages, &path);
 
         let hash = sandbox::write_file(pool, conversation_id, &path, &content, expected_hash)
@@ -1573,30 +1637,58 @@ mod server {
         Ok(serde_json::json!({"hash": hash}).to_string())
     }
 
-    async fn edit_file_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
+    async fn edit_file_tool(
+        pool: &PgPool,
+        conversation_id: i64,
+        input: &Value,
+    ) -> Result<String, String> {
         let path = required_str(input, "path")?;
         let old_string = required_str(input, "old_string")?;
         let new_string = required_str(input, "new_string")?;
-        let replace_all = input.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
-        let expected_line = input.get("expected_line").and_then(Value::as_u64).map(|v| v as u32);
+        let replace_all = input
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let expected_line = input
+            .get("expected_line")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32);
 
         if replace_all && expected_line.is_some() {
             return Err("replace_all and expected_line are mutually exclusive — replace_all means every occurrence, expected_line means exactly one".to_string());
         }
 
-        let messages = db::list_messages(pool, conversation_id).await.map_err(|e| e.to_string())?;
-        let expected_hash = find_prior_file_hash(&messages, &path)
-            .ok_or_else(|| format!("{path} hasn't been read in this conversation yet — call read_file first"))?;
-
-        let hash = sandbox::edit_file(pool, conversation_id, &path, &old_string, &new_string, replace_all, expected_hash, expected_line)
+        let messages = db::list_messages(pool, conversation_id)
             .await
             .map_err(|e| e.to_string())?;
+        let expected_hash = find_prior_file_hash(&messages, &path).ok_or_else(|| {
+            format!("{path} hasn't been read in this conversation yet — call read_file first")
+        })?;
+
+        let hash = sandbox::edit_file(
+            pool,
+            conversation_id,
+            &path,
+            &old_string,
+            &new_string,
+            replace_all,
+            expected_hash,
+            expected_line,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"hash": hash}).to_string())
     }
 
-    async fn list_directory_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
+    async fn list_directory_tool(
+        pool: &PgPool,
+        conversation_id: i64,
+        input: &Value,
+    ) -> Result<String, String> {
         let path = required_str(input, "path")?;
-        let entries = sandbox::list_directory(pool, conversation_id, &path).await.map_err(|e| e.to_string())?;
+        let entries = sandbox::list_directory(pool, conversation_id, &path)
+            .await
+            .map_err(|e| e.to_string())?;
         let payload: Vec<_> = entries
             .iter()
             .map(|e| serde_json::json!({"name": e.name, "type": if e.is_dir { "dir" } else { "file" }, "size": e.size}))
@@ -1630,7 +1722,11 @@ mod server {
         }
 
         fn tool_use(id: &str, name: &str, input: Value) -> ContentBlock {
-            ContentBlock::ToolUse { id: id.to_string(), name: name.to_string(), input }
+            ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input,
+            }
         }
 
         fn tool_result(tool_use_id: &str, content: Value, is_error: bool) -> ContentBlock {
@@ -1647,7 +1743,11 @@ mod server {
                 1,
                 vec![
                     tool_use("t1", "read_file", serde_json::json!({"path": "/a.txt"})),
-                    tool_result("t1", serde_json::json!({"content": "x", "hash": "hash-a"}), false),
+                    tool_result(
+                        "t1",
+                        serde_json::json!({"content": "x", "hash": "hash-a"}),
+                        false,
+                    ),
                 ],
             )];
             assert_eq!(find_prior_file_hash(&messages, "/other.txt"), None);
@@ -1659,10 +1759,17 @@ mod server {
                 1,
                 vec![
                     tool_use("t1", "read_file", serde_json::json!({"path": "/a.txt"})),
-                    tool_result("t1", serde_json::json!({"content": "x", "hash": "hash-a"}), false),
+                    tool_result(
+                        "t1",
+                        serde_json::json!({"content": "x", "hash": "hash-a"}),
+                        false,
+                    ),
                 ],
             )];
-            assert_eq!(find_prior_file_hash(&messages, "/a.txt"), Some("hash-a".to_string()));
+            assert_eq!(
+                find_prior_file_hash(&messages, "/a.txt"),
+                Some("hash-a".to_string())
+            );
         }
 
         #[test]
@@ -1672,18 +1779,29 @@ mod server {
                     1,
                     vec![
                         tool_use("t1", "read_file", serde_json::json!({"path": "/a.txt"})),
-                        tool_result("t1", serde_json::json!({"content": "x", "hash": "hash-1"}), false),
+                        tool_result(
+                            "t1",
+                            serde_json::json!({"content": "x", "hash": "hash-1"}),
+                            false,
+                        ),
                     ],
                 ),
                 message_with_blocks(
                     2,
                     vec![
-                        tool_use("t2", "edit_file", serde_json::json!({"path": "/a.txt", "old_string": "x", "new_string": "y"})),
+                        tool_use(
+                            "t2",
+                            "edit_file",
+                            serde_json::json!({"path": "/a.txt", "old_string": "x", "new_string": "y"}),
+                        ),
                         tool_result("t2", serde_json::json!({"hash": "hash-2"}), false),
                     ],
                 ),
             ];
-            assert_eq!(find_prior_file_hash(&messages, "/a.txt"), Some("hash-2".to_string()));
+            assert_eq!(
+                find_prior_file_hash(&messages, "/a.txt"),
+                Some("hash-2".to_string())
+            );
         }
 
         #[test]
@@ -1691,7 +1809,11 @@ mod server {
             let messages = vec![message_with_blocks(
                 1,
                 vec![
-                    tool_use("t1", "edit_file", serde_json::json!({"path": "/a.txt", "old_string": "x", "new_string": "y"})),
+                    tool_use(
+                        "t1",
+                        "edit_file",
+                        serde_json::json!({"path": "/a.txt", "old_string": "x", "new_string": "y"}),
+                    ),
                     tool_result("t1", serde_json::json!({"error": "ambiguous match"}), true),
                 ],
             )];
@@ -1719,7 +1841,9 @@ mod server {
 
         #[sqlx::test]
         async fn test_edit_file_tool_refuses_when_path_never_read(pool: sqlx::PgPool) {
-            let conversation = db::create_conversation(&pool).await.expect("create conversation");
+            let conversation = db::create_conversation(&pool)
+                .await
+                .expect("create conversation");
             let result = edit_file_tool(
                 &pool,
                 conversation.id,
@@ -1846,7 +1970,9 @@ mod server {
         /// stale tool name" case `call_mcp_tool`'s doc comment describes —
         /// a plain tool error, not a panic.
         #[sqlx::test]
-        async fn test_execute_routes_mcp_prefixed_names_and_errors_clearly_on_unknown_server(pool: PgPool) {
+        async fn test_execute_routes_mcp_prefixed_names_and_errors_clearly_on_unknown_server(
+            pool: PgPool,
+        ) {
             let result = execute(
                 &pool,
                 1,
@@ -1870,7 +1996,14 @@ mod server {
         #[tokio::test]
         async fn test_execute_still_dispatches_native_tools_normally() {
             let pool = test_pool();
-            let result = execute(&pool, 1, "toolu_add", "add", &serde_json::json!({"a": 2, "b": 3})).await;
+            let result = execute(
+                &pool,
+                1,
+                "toolu_add",
+                "add",
+                &serde_json::json!({"a": 2, "b": 3}),
+            )
+            .await;
             assert_eq!(result, Ok("5".to_string()));
         }
 
@@ -2415,7 +2548,11 @@ mod server {
 
 #[cfg(feature = "server")]
 pub use server::execute;
-#[cfg(feature = "server")]
+// Only reachable through this re-export from `api::chat`'s own
+// `native_tool_definitions()`-coverage regression test — every other
+// caller of the unqualified `native_tool_definitions()` is inside this
+// same module (see `tool_definitions` below), which doesn't need it.
+#[cfg(all(feature = "server", test))]
 pub use server::native_tool_definitions;
 #[cfg(feature = "server")]
 pub use server::snapshot_tasks;

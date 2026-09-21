@@ -168,11 +168,16 @@ pub struct SandboxTerminal {
     pub terminated_at: Option<NaiveDateTime>,
 }
 
-pub async fn create_sandbox_pod(pool: &PgPool, conversation_id: i64) -> Result<SandboxPod, sqlx::Error> {
-    sqlx::query_as::<_, SandboxPod>("INSERT INTO sandbox_pods (conversation_id) VALUES ($1) RETURNING *")
-        .bind(conversation_id)
-        .fetch_one(pool)
-        .await
+pub async fn create_sandbox_pod(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<SandboxPod, sqlx::Error> {
+    sqlx::query_as::<_, SandboxPod>(
+        "INSERT INTO sandbox_pods (conversation_id) VALUES ($1) RETURNING *",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
 }
 
 /// Idempotent by design (unlike creation) — terminating an already-
@@ -180,7 +185,10 @@ pub async fn create_sandbox_pod(pool: &PgPool, conversation_id: i64) -> Result<S
 /// without first checking. A `pod_id` that doesn't exist at all is a
 /// separate, real error, surfaced by the caller checking the row count
 /// via `RETURNING` returning nothing — see `sandbox.rs`.
-pub async fn terminate_sandbox_pod(pool: &PgPool, pod_id: i64) -> Result<Option<SandboxPod>, sqlx::Error> {
+pub async fn terminate_sandbox_pod(
+    pool: &PgPool,
+    pod_id: i64,
+) -> Result<Option<SandboxPod>, sqlx::Error> {
     sqlx::query_as::<_, SandboxPod>(
         "UPDATE sandbox_pods SET terminated_at = now() WHERE id = $1 RETURNING *",
     )
@@ -192,7 +200,10 @@ pub async fn terminate_sandbox_pod(pool: &PgPool, pod_id: i64) -> Result<Option<
 /// Live pods only (`terminated_at IS NULL`) — a terminated pod's row
 /// sticks around (see the plan's "How") but shouldn't be listed as if it
 /// still existed.
-pub async fn list_sandbox_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<SandboxPod>, sqlx::Error> {
+pub async fn list_sandbox_pods(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Vec<SandboxPod>, sqlx::Error> {
     sqlx::query_as::<_, SandboxPod>(
         "SELECT * FROM sandbox_pods WHERE conversation_id = $1 AND terminated_at IS NULL ORDER BY id ASC",
     )
@@ -201,11 +212,16 @@ pub async fn list_sandbox_pods(pool: &PgPool, conversation_id: i64) -> Result<Ve
     .await
 }
 
-pub async fn create_sandbox_terminal(pool: &PgPool, pod_id: i64) -> Result<SandboxTerminal, sqlx::Error> {
-    sqlx::query_as::<_, SandboxTerminal>("INSERT INTO sandbox_terminals (pod_id) VALUES ($1) RETURNING *")
-        .bind(pod_id)
-        .fetch_one(pool)
-        .await
+pub async fn create_sandbox_terminal(
+    pool: &PgPool,
+    pod_id: i64,
+) -> Result<SandboxTerminal, sqlx::Error> {
+    sqlx::query_as::<_, SandboxTerminal>(
+        "INSERT INTO sandbox_terminals (pod_id) VALUES ($1) RETURNING *",
+    )
+    .bind(pod_id)
+    .fetch_one(pool)
+    .await
 }
 
 /// Same idempotent-on-repeat, real-error-on-unknown-id shape as
@@ -256,7 +272,10 @@ pub async fn list_sandbox_terminals_for_conversation(
 
 /// The owning pod for a terminal — `sandbox.rs` needs this before it can
 /// look up (or establish) that pod's agent connection.
-pub async fn sandbox_terminal_pod_id(pool: &PgPool, terminal_id: i64) -> Result<Option<i64>, sqlx::Error> {
+pub async fn sandbox_terminal_pod_id(
+    pool: &PgPool,
+    terminal_id: i64,
+) -> Result<Option<i64>, sqlx::Error> {
     sqlx::query_scalar("SELECT pod_id FROM sandbox_terminals WHERE id = $1")
         .bind(terminal_id)
         .fetch_optional(pool)
@@ -267,7 +286,10 @@ pub async fn sandbox_terminal_pod_id(pool: &PgPool, terminal_id: i64) -> Result<
 /// (`terminate_pod`, `create_terminal`, `terminate_terminal`, crash
 /// cleanup) should target — see
 /// `docs/projects/completed/20260815-sandbox-visibility.md`.
-pub async fn sandbox_pod_conversation_id(pool: &PgPool, pod_id: i64) -> Result<Option<i64>, sqlx::Error> {
+pub async fn sandbox_pod_conversation_id(
+    pool: &PgPool,
+    pod_id: i64,
+) -> Result<Option<i64>, sqlx::Error> {
     sqlx::query_scalar("SELECT conversation_id FROM sandbox_pods WHERE id = $1")
         .bind(pod_id)
         .fetch_optional(pool)
@@ -353,13 +375,15 @@ pub async fn append_terminal_event(
     seq: i64,
     data: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO terminal_events (command_id, stream, seq, data) VALUES ($1, $2, $3, $4)")
-        .bind(command_id)
-        .bind(stream)
-        .bind(seq)
-        .bind(data)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO terminal_events (command_id, stream, seq, data) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(command_id)
+    .bind(stream)
+    .bind(seq)
+    .bind(data)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -384,7 +408,10 @@ pub async fn mark_terminal_command_finished(
 /// `exit_code` stays `NULL` — see the plan's "Agent crash recovery."
 /// Restricted to rows still `running` so this is safe to call defensively
 /// without first checking status.
-pub async fn mark_terminal_command_lost(pool: &PgPool, command_id: &str) -> Result<(), sqlx::Error> {
+pub async fn mark_terminal_command_lost(
+    pool: &PgPool,
+    command_id: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE terminal_commands SET status = 'lost', finished_at = now()
          WHERE command_id = $1 AND status = 'running'",
@@ -473,7 +500,10 @@ pub async fn unnotified_finished_terminal_commands(
     .await
 }
 
-pub async fn mark_terminal_command_notified(pool: &PgPool, command_id: &str) -> Result<(), sqlx::Error> {
+pub async fn mark_terminal_command_notified(
+    pool: &PgPool,
+    command_id: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE terminal_commands SET notified_at = now() WHERE command_id = $1")
         .bind(command_id)
         .execute(pool)
@@ -517,7 +547,11 @@ pub struct SandboxVolume {
     pub updated_at: NaiveDateTime,
 }
 
-pub async fn create_sandbox_volume(pool: &PgPool, name: &str, mount_path: &str) -> Result<SandboxVolume, sqlx::Error> {
+pub async fn create_sandbox_volume(
+    pool: &PgPool,
+    name: &str,
+    mount_path: &str,
+) -> Result<SandboxVolume, sqlx::Error> {
     sqlx::query_as::<_, SandboxVolume>(
         "INSERT INTO sandbox_volumes (name, mount_path) VALUES ($1, $2) RETURNING *",
     )
@@ -537,7 +571,10 @@ pub async fn list_sandbox_volumes(pool: &PgPool) -> Result<Vec<SandboxVolume>, s
         .await
 }
 
-pub async fn get_sandbox_volume(pool: &PgPool, id: i64) -> Result<Option<SandboxVolume>, sqlx::Error> {
+pub async fn get_sandbox_volume(
+    pool: &PgPool,
+    id: i64,
+) -> Result<Option<SandboxVolume>, sqlx::Error> {
     sqlx::query_as::<_, SandboxVolume>("SELECT * FROM sandbox_volumes WHERE id = $1")
         .bind(id)
         .fetch_optional(pool)
@@ -545,7 +582,10 @@ pub async fn get_sandbox_volume(pool: &PgPool, id: i64) -> Result<Option<Sandbox
 }
 
 pub async fn delete_sandbox_volume(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM sandbox_volumes WHERE id = $1").bind(id).execute(pool).await?;
+    sqlx::query("DELETE FROM sandbox_volumes WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -616,7 +656,10 @@ pub async fn list_mcp_server_configs(pool: &PgPool) -> Result<Vec<McpServerConfi
         .await
 }
 
-pub async fn get_mcp_server_config(pool: &PgPool, id: i64) -> Result<Option<McpServerConfig>, sqlx::Error> {
+pub async fn get_mcp_server_config(
+    pool: &PgPool,
+    id: i64,
+) -> Result<Option<McpServerConfig>, sqlx::Error> {
     sqlx::query_as::<_, McpServerConfig>("SELECT * FROM mcp_servers WHERE id = $1")
         .bind(id)
         .fetch_optional(pool)
@@ -914,25 +957,35 @@ mod tests {
     // --- Terminal ---
 
     async fn test_conversation(pool: &PgPool) -> Conversation {
-        create_conversation(pool).await.expect("create conversation")
+        create_conversation(pool)
+            .await
+            .expect("create conversation")
     }
 
     /// A pod + terminal pair, for tests that only care about
     /// `terminal_commands`/`terminal_events` and just need a valid
     /// `terminal_id` to hang them off — most of this module.
     async fn test_terminal(pool: &PgPool, conversation_id: i64) -> i64 {
-        let pod = create_sandbox_pod(pool, conversation_id).await.expect("create sandbox pod");
-        let terminal = create_sandbox_terminal(pool, pod.id).await.expect("create sandbox terminal");
+        let pod = create_sandbox_pod(pool, conversation_id)
+            .await
+            .expect("create sandbox pod");
+        let terminal = create_sandbox_terminal(pool, pod.id)
+            .await
+            .expect("create sandbox terminal");
         terminal.id
     }
 
     #[sqlx::test]
     async fn test_create_sandbox_pod_and_terminate_is_idempotent(pool: PgPool) {
         let conversation = test_conversation(&pool).await;
-        let pod = create_sandbox_pod(&pool, conversation.id).await.expect("create pod");
+        let pod = create_sandbox_pod(&pool, conversation.id)
+            .await
+            .expect("create pod");
         assert!(pod.terminated_at.is_none());
 
-        let listed = list_sandbox_pods(&pool, conversation.id).await.expect("list pods");
+        let listed = list_sandbox_pods(&pool, conversation.id)
+            .await
+            .expect("list pods");
         assert!(listed.iter().any(|p| p.id == pod.id));
 
         let terminated = terminate_sandbox_pod(&pool, pod.id)
@@ -941,7 +994,9 @@ mod tests {
             .expect("pod should exist");
         assert!(terminated.terminated_at.is_some());
 
-        let listed_after = list_sandbox_pods(&pool, conversation.id).await.expect("list pods");
+        let listed_after = list_sandbox_pods(&pool, conversation.id)
+            .await
+            .expect("list pods");
         assert!(
             !listed_after.iter().any(|p| p.id == pod.id),
             "terminated pod should no longer be listed as live"
@@ -966,15 +1021,23 @@ mod tests {
     #[sqlx::test]
     async fn test_sandbox_terminal_lifecycle_and_pod_id_lookup(pool: PgPool) {
         let conversation = test_conversation(&pool).await;
-        let pod = create_sandbox_pod(&pool, conversation.id).await.expect("create pod");
-        let terminal = create_sandbox_terminal(&pool, pod.id).await.expect("create terminal");
+        let pod = create_sandbox_pod(&pool, conversation.id)
+            .await
+            .expect("create pod");
+        let terminal = create_sandbox_terminal(&pool, pod.id)
+            .await
+            .expect("create terminal");
 
         assert_eq!(
-            sandbox_terminal_pod_id(&pool, terminal.id).await.expect("lookup"),
+            sandbox_terminal_pod_id(&pool, terminal.id)
+                .await
+                .expect("lookup"),
             Some(pod.id)
         );
 
-        let for_pod = list_sandbox_terminals_for_pod(&pool, pod.id).await.expect("list for pod");
+        let for_pod = list_sandbox_terminals_for_pod(&pool, pod.id)
+            .await
+            .expect("list for pod");
         assert!(for_pod.iter().any(|t| t.id == terminal.id));
         let for_conversation = list_sandbox_terminals_for_conversation(&pool, conversation.id)
             .await
@@ -986,7 +1049,9 @@ mod tests {
             .expect("terminate should succeed")
             .expect("terminal should exist");
 
-        let for_pod_after = list_sandbox_terminals_for_pod(&pool, pod.id).await.expect("list for pod");
+        let for_pod_after = list_sandbox_terminals_for_pod(&pool, pod.id)
+            .await
+            .expect("list for pod");
         assert!(
             !for_pod_after.iter().any(|t| t.id == terminal.id),
             "terminated terminal should no longer be listed as live"
@@ -996,14 +1061,20 @@ mod tests {
     #[sqlx::test]
     async fn test_sandbox_pod_conversation_id_resolves_and_returns_none_for_unknown(pool: PgPool) {
         let conversation = test_conversation(&pool).await;
-        let pod = create_sandbox_pod(&pool, conversation.id).await.expect("create pod");
+        let pod = create_sandbox_pod(&pool, conversation.id)
+            .await
+            .expect("create pod");
 
         assert_eq!(
-            sandbox_pod_conversation_id(&pool, pod.id).await.expect("lookup"),
+            sandbox_pod_conversation_id(&pool, pod.id)
+                .await
+                .expect("lookup"),
             Some(conversation.id)
         );
         assert_eq!(
-            sandbox_pod_conversation_id(&pool, pod.id + 999_999).await.expect("lookup"),
+            sandbox_pod_conversation_id(&pool, pod.id + 999_999)
+                .await
+                .expect("lookup"),
             None
         );
     }
@@ -1011,10 +1082,17 @@ mod tests {
     #[sqlx::test]
     async fn test_terminating_a_pod_cascades_to_its_terminals(pool: PgPool) {
         let conversation = test_conversation(&pool).await;
-        let pod = create_sandbox_pod(&pool, conversation.id).await.expect("create pod");
-        let terminal = create_sandbox_terminal(&pool, pod.id).await.expect("create terminal");
+        let pod = create_sandbox_pod(&pool, conversation.id)
+            .await
+            .expect("create pod");
+        let terminal = create_sandbox_terminal(&pool, pod.id)
+            .await
+            .expect("create terminal");
 
-        terminate_sandbox_pod(&pool, pod.id).await.expect("terminate").expect("pod exists");
+        terminate_sandbox_pod(&pool, pod.id)
+            .await
+            .expect("terminate")
+            .expect("pod exists");
 
         // Hard DB cascade only fires on conversation deletion (see the
         // plan's "How") — terminating the pod itself is a soft delete and
@@ -1022,17 +1100,24 @@ mod tests {
         // terminate_terminal each one first (enforced at the tool layer,
         // not here). Confirm the terminal row is untouched by the pod's
         // own soft delete.
-        let still_there = sandbox_terminal_pod_id(&pool, terminal.id).await.expect("lookup");
-        assert_eq!(still_there, Some(pod.id), "terminating a pod should not itself touch its terminal rows");
+        let still_there = sandbox_terminal_pod_id(&pool, terminal.id)
+            .await
+            .expect("lookup");
+        assert_eq!(
+            still_there,
+            Some(pod.id),
+            "terminating a pod should not itself touch its terminal rows"
+        );
     }
 
     #[sqlx::test]
     async fn test_create_terminal_command_starts_running(pool: PgPool) {
         let conversation = test_conversation(&pool).await;
         let terminal_id = test_terminal(&pool, conversation.id).await;
-        let command = create_terminal_command(&pool, conversation.id, terminal_id, "cmd-1", "echo hi")
-            .await
-            .expect("create terminal command");
+        let command =
+            create_terminal_command(&pool, conversation.id, terminal_id, "cmd-1", "echo hi")
+                .await
+                .expect("create terminal command");
         assert_eq!(command.status, "running");
         assert_eq!(command.command, "echo hi");
         assert!(command.exit_code.is_none());
@@ -1052,9 +1137,10 @@ mod tests {
             "nothing running yet"
         );
 
-        let command = create_terminal_command(&pool, conversation.id, terminal_id, "cmd-2", "sleep 5")
-            .await
-            .expect("create terminal command");
+        let command =
+            create_terminal_command(&pool, conversation.id, terminal_id, "cmd-2", "sleep 5")
+                .await
+                .expect("create terminal command");
 
         let running = terminal_command_is_running(&pool, terminal_id)
             .await
@@ -1087,11 +1173,17 @@ mod tests {
             .expect("create terminal command");
 
         assert!(
-            terminal_command_is_running(&pool, terminal_a).await.expect("query").is_some(),
+            terminal_command_is_running(&pool, terminal_a)
+                .await
+                .expect("query")
+                .is_some(),
             "terminal_a has a running command"
         );
         assert!(
-            terminal_command_is_running(&pool, terminal_b).await.expect("query").is_none(),
+            terminal_command_is_running(&pool, terminal_b)
+                .await
+                .expect("query")
+                .is_none(),
             "terminal_b should be unaffected by terminal_a's running command"
         );
     }
@@ -1100,9 +1192,10 @@ mod tests {
     async fn test_mark_terminal_command_finished_sets_status_and_exit_code(pool: PgPool) {
         let conversation = test_conversation(&pool).await;
         let terminal_id = test_terminal(&pool, conversation.id).await;
-        let command = create_terminal_command(&pool, conversation.id, terminal_id, "cmd-3", "false")
-            .await
-            .expect("create terminal command");
+        let command =
+            create_terminal_command(&pool, conversation.id, terminal_id, "cmd-3", "false")
+                .await
+                .expect("create terminal command");
 
         mark_terminal_command_finished(&pool, &command.command_id, 1)
             .await
@@ -1120,9 +1213,10 @@ mod tests {
     async fn test_mark_terminal_command_lost_only_affects_running_rows(pool: PgPool) {
         let conversation = test_conversation(&pool).await;
         let terminal_id = test_terminal(&pool, conversation.id).await;
-        let command = create_terminal_command(&pool, conversation.id, terminal_id, "cmd-4", "sleep 100")
-            .await
-            .expect("create terminal command");
+        let command =
+            create_terminal_command(&pool, conversation.id, terminal_id, "cmd-4", "sleep 100")
+                .await
+                .expect("create terminal command");
         mark_terminal_command_finished(&pool, &command.command_id, 0)
             .await
             .expect("mark finished");
@@ -1145,9 +1239,10 @@ mod tests {
     async fn test_mark_terminal_command_lost_on_a_running_row(pool: PgPool) {
         let conversation = test_conversation(&pool).await;
         let terminal_id = test_terminal(&pool, conversation.id).await;
-        let command = create_terminal_command(&pool, conversation.id, terminal_id, "cmd-5", "sleep 100")
-            .await
-            .expect("create terminal command");
+        let command =
+            create_terminal_command(&pool, conversation.id, terminal_id, "cmd-5", "sleep 100")
+                .await
+                .expect("create terminal command");
 
         mark_terminal_command_lost(&pool, &command.command_id)
             .await
@@ -1193,7 +1288,10 @@ mod tests {
             .await
             .expect("read output");
         assert_eq!(
-            stdout_only.iter().map(|l| l.data.as_str()).collect::<Vec<_>>(),
+            stdout_only
+                .iter()
+                .map(|l| l.data.as_str())
+                .collect::<Vec<_>>(),
             vec!["out1", "out2"]
         );
 
@@ -1213,9 +1311,10 @@ mod tests {
     async fn test_read_terminal_output_respects_offset_and_limit(pool: PgPool) {
         let conversation = test_conversation(&pool).await;
         let terminal_id = test_terminal(&pool, conversation.id).await;
-        let command = create_terminal_command(&pool, conversation.id, terminal_id, "cmd-7", "seq 5")
-            .await
-            .expect("create terminal command");
+        let command =
+            create_terminal_command(&pool, conversation.id, terminal_id, "cmd-7", "seq 5")
+                .await
+                .expect("create terminal command");
         for i in 1..=5i64 {
             append_terminal_event(&pool, &command.command_id, "stdout", i, &format!("line{i}"))
                 .await
@@ -1266,21 +1365,26 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_unnotified_finished_terminal_commands_matches_finished_and_lost_only(pool: PgPool) {
+    async fn test_unnotified_finished_terminal_commands_matches_finished_and_lost_only(
+        pool: PgPool,
+    ) {
         let conversation = test_conversation(&pool).await;
         let terminal_id = test_terminal(&pool, conversation.id).await;
-        let _running = create_terminal_command(&pool, conversation.id, terminal_id, "cmd-9", "sleep 1")
-            .await
-            .expect("create");
-        let finished = create_terminal_command(&pool, conversation.id, terminal_id, "cmd-10", "true")
-            .await
-            .expect("create");
+        let _running =
+            create_terminal_command(&pool, conversation.id, terminal_id, "cmd-9", "sleep 1")
+                .await
+                .expect("create");
+        let finished =
+            create_terminal_command(&pool, conversation.id, terminal_id, "cmd-10", "true")
+                .await
+                .expect("create");
         mark_terminal_command_finished(&pool, &finished.command_id, 0)
             .await
             .expect("mark finished");
-        let lost = create_terminal_command(&pool, conversation.id, terminal_id, "cmd-11", "sleep 100")
-            .await
-            .expect("create");
+        let lost =
+            create_terminal_command(&pool, conversation.id, terminal_id, "cmd-11", "sleep 100")
+                .await
+                .expect("create");
         mark_terminal_command_lost(&pool, &lost.command_id)
             .await
             .expect("mark lost");
@@ -1291,7 +1395,10 @@ mod tests {
         let ids: Vec<_> = unnotified.iter().map(|c| c.command_id.as_str()).collect();
         assert!(ids.contains(&"cmd-10"));
         assert!(ids.contains(&"cmd-11"));
-        assert!(!ids.contains(&"cmd-9"), "still-running command should not need notification");
+        assert!(
+            !ids.contains(&"cmd-9"),
+            "still-running command should not need notification"
+        );
 
         mark_terminal_command_notified(&pool, &finished.command_id)
             .await
@@ -1301,7 +1408,10 @@ mod tests {
             .expect("query should succeed");
         let ids: Vec<_> = remaining.iter().map(|c| c.command_id.as_str()).collect();
         assert!(!ids.contains(&"cmd-10"), "notified command should drop out");
-        assert!(ids.contains(&"cmd-11"), "still-unnotified command should remain");
+        assert!(
+            ids.contains(&"cmd-11"),
+            "still-unnotified command should remain"
+        );
     }
 
     #[sqlx::test]
@@ -1309,9 +1419,15 @@ mod tests {
         let conversation = test_conversation(&pool).await;
         let terminal_id = test_terminal(&pool, conversation.id).await;
         for i in 1..=5 {
-            create_terminal_command(&pool, conversation.id, terminal_id, &format!("list-cmd-{i}"), "echo")
-                .await
-                .expect("create");
+            create_terminal_command(
+                &pool,
+                conversation.id,
+                terminal_id,
+                &format!("list-cmd-{i}"),
+                "echo",
+            )
+            .await
+            .expect("create");
         }
 
         let limited = list_terminal_commands(&pool, terminal_id, 3)
@@ -1319,7 +1435,10 @@ mod tests {
             .expect("list should succeed");
         assert_eq!(limited.len(), 3);
         assert_eq!(
-            limited.iter().map(|c| c.command_id.as_str()).collect::<Vec<_>>(),
+            limited
+                .iter()
+                .map(|c| c.command_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["list-cmd-5", "list-cmd-4", "list-cmd-3"]
         );
     }
@@ -1328,9 +1447,15 @@ mod tests {
     async fn test_delete_conversation_cascades_to_terminal_commands_and_events(pool: PgPool) {
         let conversation = test_conversation(&pool).await;
         let terminal_id = test_terminal(&pool, conversation.id).await;
-        let command = create_terminal_command(&pool, conversation.id, terminal_id, "cmd-cascade", "echo hi")
-            .await
-            .expect("create terminal command");
+        let command = create_terminal_command(
+            &pool,
+            conversation.id,
+            terminal_id,
+            "cmd-cascade",
+            "echo hi",
+        )
+        .await
+        .expect("create terminal command");
         append_terminal_event(&pool, &command.command_id, "stdout", 1, "hi")
             .await
             .expect("append");
@@ -1354,11 +1479,21 @@ mod tests {
         // DELETEing (see the plan's "How"): list_commands should still be
         // able to show what ran in a terminal that's since been torn down.
         let conversation = test_conversation(&pool).await;
-        let pod = create_sandbox_pod(&pool, conversation.id).await.expect("create pod");
-        let terminal = create_sandbox_terminal(&pool, pod.id).await.expect("create terminal");
-        let command = create_terminal_command(&pool, conversation.id, terminal.id, "cmd-survives", "echo hi")
+        let pod = create_sandbox_pod(&pool, conversation.id)
             .await
-            .expect("create terminal command");
+            .expect("create pod");
+        let terminal = create_sandbox_terminal(&pool, pod.id)
+            .await
+            .expect("create terminal");
+        let command = create_terminal_command(
+            &pool,
+            conversation.id,
+            terminal.id,
+            "cmd-survives",
+            "echo hi",
+        )
+        .await
+        .expect("create terminal command");
         mark_terminal_command_finished(&pool, &command.command_id, 0)
             .await
             .expect("mark finished");
@@ -1371,7 +1506,10 @@ mod tests {
         let status = terminal_command_status(&pool, &command.command_id)
             .await
             .expect("query should succeed");
-        assert!(status.is_some(), "command history should survive terminate_terminal");
+        assert!(
+            status.is_some(),
+            "command history should survive terminate_terminal"
+        );
 
         let history = list_terminal_commands(&pool, terminal.id, 10)
             .await
@@ -1382,13 +1520,23 @@ mod tests {
     #[sqlx::test]
     async fn test_create_list_get_delete_mcp_server_config_round_trip(pool: PgPool) {
         let headers = HashMap::from([("Authorization".to_string(), "Bearer secret".to_string())]);
-        let created = create_mcp_server_config(&pool, "github", "https://api.githubcopilot.com/mcp/", &headers, "static_headers", None, None)
-            .await
-            .expect("create mcp server config");
+        let created = create_mcp_server_config(
+            &pool,
+            "github",
+            "https://api.githubcopilot.com/mcp/",
+            &headers,
+            "static_headers",
+            None,
+            None,
+        )
+        .await
+        .expect("create mcp server config");
         assert_eq!(created.name, "github");
         assert_eq!(created.extra_headers.0, headers);
 
-        let all = list_mcp_server_configs(&pool).await.expect("list mcp server configs");
+        let all = list_mcp_server_configs(&pool)
+            .await
+            .expect("list mcp server configs");
         assert!(all.iter().any(|s| s.id == created.id));
 
         let fetched = get_mcp_server_config(&pool, created.id)
@@ -1408,11 +1556,21 @@ mod tests {
 
     #[sqlx::test]
     async fn test_update_mcp_server_config_renames_without_touching_headers(pool: PgPool) {
-        let original_headers =
-            HashMap::from([("Authorization".to_string(), "Bearer original-token".to_string())]);
-        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original_headers, "static_headers", None, None)
-            .await
-            .expect("create mcp server config");
+        let original_headers = HashMap::from([(
+            "Authorization".to_string(),
+            "Bearer original-token".to_string(),
+        )]);
+        let created = create_mcp_server_config(
+            &pool,
+            "github",
+            "https://example.com/mcp",
+            &original_headers,
+            "static_headers",
+            None,
+            None,
+        )
+        .await
+        .expect("create mcp server config");
 
         let updated = update_mcp_server_config(
             &pool,
@@ -1438,9 +1596,17 @@ mod tests {
     #[sqlx::test]
     async fn test_get_mcp_server_config_by_name_round_trips(pool: PgPool) {
         let headers = HashMap::new();
-        let created = create_mcp_server_config(&pool, "github", "https://api.githubcopilot.com/mcp/", &headers, "static_headers", None, None)
-            .await
-            .expect("create mcp server config");
+        let created = create_mcp_server_config(
+            &pool,
+            "github",
+            "https://api.githubcopilot.com/mcp/",
+            &headers,
+            "static_headers",
+            None,
+            None,
+        )
+        .await
+        .expect("create mcp server config");
 
         let fetched = get_mcp_server_config_by_name(&pool, "github")
             .await
@@ -1460,18 +1626,34 @@ mod tests {
             ("Authorization".to_string(), "Bearer old".to_string()),
             ("X-Untouched".to_string(), "keep-me".to_string()),
         ]);
-        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original, "static_headers", None, None)
-            .await
-            .expect("create mcp server config");
+        let created = create_mcp_server_config(
+            &pool,
+            "github",
+            "https://example.com/mcp",
+            &original,
+            "static_headers",
+            None,
+            None,
+        )
+        .await
+        .expect("create mcp server config");
 
         let upsert = HashMap::from([
             ("Authorization".to_string(), "Bearer new".to_string()),
             ("X-New".to_string(), "brand-new".to_string()),
         ]);
-        let updated = update_mcp_server_config(&pool, created.id, "github", "https://example.com/mcp", &upsert, &[], "static_headers")
-            .await
-            .expect("update should succeed")
-            .expect("row should exist");
+        let updated = update_mcp_server_config(
+            &pool,
+            created.id,
+            "github",
+            "https://example.com/mcp",
+            &upsert,
+            &[],
+            "static_headers",
+        )
+        .await
+        .expect("update should succeed")
+        .expect("row should exist");
 
         assert_eq!(
             updated.extra_headers.0,
@@ -1490,9 +1672,17 @@ mod tests {
             ("Authorization".to_string(), "Bearer old".to_string()),
             ("X-Doomed".to_string(), "bye".to_string()),
         ]);
-        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original, "static_headers", None, None)
-            .await
-            .expect("create mcp server config");
+        let created = create_mcp_server_config(
+            &pool,
+            "github",
+            "https://example.com/mcp",
+            &original,
+            "static_headers",
+            None,
+            None,
+        )
+        .await
+        .expect("create mcp server config");
 
         let updated = update_mcp_server_config(
             &pool,
@@ -1517,9 +1707,17 @@ mod tests {
     #[sqlx::test]
     async fn test_update_mcp_server_config_upsert_wins_over_remove_for_the_same_name(pool: PgPool) {
         let original = HashMap::from([("Authorization".to_string(), "Bearer old".to_string())]);
-        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &original, "static_headers", None, None)
-            .await
-            .expect("create mcp server config");
+        let created = create_mcp_server_config(
+            &pool,
+            "github",
+            "https://example.com/mcp",
+            &original,
+            "static_headers",
+            None,
+            None,
+        )
+        .await
+        .expect("create mcp server config");
 
         let upsert = HashMap::from([("Authorization".to_string(), "Bearer new".to_string())]);
         let updated = update_mcp_server_config(
@@ -1544,53 +1742,90 @@ mod tests {
 
     #[sqlx::test]
     async fn test_update_mcp_server_config_returns_none_for_unknown_id(pool: PgPool) {
-        let result =
-            update_mcp_server_config(&pool, 999_999, "name", "https://example.com", &HashMap::new(), &[], "static_headers")
-                .await
-                .expect("query should succeed");
+        let result = update_mcp_server_config(
+            &pool,
+            999_999,
+            "name",
+            "https://example.com",
+            &HashMap::new(),
+            &[],
+            "static_headers",
+        )
+        .await
+        .expect("query should succeed");
         assert!(result.is_none());
     }
 
     #[sqlx::test]
     async fn test_create_sandbox_volume_round_trips_name_and_mount_path(pool: PgPool) {
-        let created = create_sandbox_volume(&pool, "ssh-key", "/home/sandbox/.ssh").await.expect("create sandbox volume");
+        let created = create_sandbox_volume(&pool, "ssh-key", "/home/sandbox/.ssh")
+            .await
+            .expect("create sandbox volume");
         assert_eq!(created.name, "ssh-key");
         assert_eq!(created.mount_path, "/home/sandbox/.ssh");
 
-        let fetched = get_sandbox_volume(&pool, created.id).await.expect("get sandbox volume").expect("should exist");
+        let fetched = get_sandbox_volume(&pool, created.id)
+            .await
+            .expect("get sandbox volume")
+            .expect("should exist");
         assert_eq!(fetched, created);
     }
 
     #[sqlx::test]
     async fn test_get_sandbox_volume_returns_none_for_unknown_id(pool: PgPool) {
-        let result = get_sandbox_volume(&pool, 999_999).await.expect("query should succeed");
+        let result = get_sandbox_volume(&pool, 999_999)
+            .await
+            .expect("query should succeed");
         assert!(result.is_none());
     }
 
     #[sqlx::test]
     async fn test_list_sandbox_volumes_orders_by_name(pool: PgPool) {
-        create_sandbox_volume(&pool, "zzz-cache", "/data/cache").await.expect("create volume");
-        create_sandbox_volume(&pool, "aaa-ssh", "/home/sandbox/.ssh").await.expect("create volume");
+        create_sandbox_volume(&pool, "zzz-cache", "/data/cache")
+            .await
+            .expect("create volume");
+        create_sandbox_volume(&pool, "aaa-ssh", "/home/sandbox/.ssh")
+            .await
+            .expect("create volume");
 
-        let listed = list_sandbox_volumes(&pool).await.expect("list sandbox volumes");
+        let listed = list_sandbox_volumes(&pool)
+            .await
+            .expect("list sandbox volumes");
         let names: Vec<&str> = listed.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(names, vec!["aaa-ssh", "zzz-cache"]);
     }
 
     #[sqlx::test]
     async fn test_delete_sandbox_volume_actually_removes_it(pool: PgPool) {
-        let created = create_sandbox_volume(&pool, "build-cache", "/data/cache").await.expect("create volume");
-        delete_sandbox_volume(&pool, created.id).await.expect("delete sandbox volume");
+        let created = create_sandbox_volume(&pool, "build-cache", "/data/cache")
+            .await
+            .expect("create volume");
+        delete_sandbox_volume(&pool, created.id)
+            .await
+            .expect("delete sandbox volume");
 
-        let fetched = get_sandbox_volume(&pool, created.id).await.expect("query should succeed");
-        assert!(fetched.is_none(), "deleted volume should no longer be gettable");
+        let fetched = get_sandbox_volume(&pool, created.id)
+            .await
+            .expect("query should succeed");
+        assert!(
+            fetched.is_none(),
+            "deleted volume should no longer be gettable"
+        );
     }
 
     #[sqlx::test]
     async fn test_create_mcp_server_config_defaults_auth_mode_to_static_headers(pool: PgPool) {
-        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &HashMap::new(), "static_headers", None, None)
-            .await
-            .expect("create mcp server config");
+        let created = create_mcp_server_config(
+            &pool,
+            "github",
+            "https://example.com/mcp",
+            &HashMap::new(),
+            "static_headers",
+            None,
+            None,
+        )
+        .await
+        .expect("create mcp server config");
         assert_eq!(created.auth_mode, "static_headers");
         assert!(created.oauth_credentials.is_none());
     }
@@ -1614,19 +1849,36 @@ mod tests {
 
     #[sqlx::test]
     async fn test_create_mcp_server_config_oauth_mode_round_trips(pool: PgPool) {
-        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &HashMap::new(), "oauth", None, None)
-            .await
-            .expect("create mcp server config");
+        let created = create_mcp_server_config(
+            &pool,
+            "github",
+            "https://example.com/mcp",
+            &HashMap::new(),
+            "oauth",
+            None,
+            None,
+        )
+        .await
+        .expect("create mcp server config");
         assert_eq!(created.auth_mode, "oauth");
     }
 
     #[sqlx::test]
     async fn test_set_mcp_server_oauth_credentials_round_trips(pool: PgPool) {
-        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &HashMap::new(), "oauth", None, None)
-            .await
-            .expect("create mcp server config");
+        let created = create_mcp_server_config(
+            &pool,
+            "github",
+            "https://example.com/mcp",
+            &HashMap::new(),
+            "oauth",
+            None,
+            None,
+        )
+        .await
+        .expect("create mcp server config");
 
-        let credentials = serde_json::json!({"client_id": "abc", "token_response": null, "granted_scopes": []});
+        let credentials =
+            serde_json::json!({"client_id": "abc", "token_response": null, "granted_scopes": []});
         set_mcp_server_oauth_credentials(&pool, created.id, Some(credentials.clone()))
             .await
             .expect("set oauth credentials");
@@ -1644,17 +1896,32 @@ mod tests {
             .await
             .expect("get mcp server config")
             .expect("row should exist");
-        assert!(cleared.oauth_credentials.is_none(), "None should clear the stored credentials");
+        assert!(
+            cleared.oauth_credentials.is_none(),
+            "None should clear the stored credentials"
+        );
     }
 
     #[sqlx::test]
     async fn test_update_mcp_server_config_clears_oauth_credentials_when_url_changes(pool: PgPool) {
-        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &HashMap::new(), "oauth", None, None)
-            .await
-            .expect("create mcp server config");
-        set_mcp_server_oauth_credentials(&pool, created.id, Some(serde_json::json!({"client_id": "abc"})))
-            .await
-            .expect("set oauth credentials");
+        let created = create_mcp_server_config(
+            &pool,
+            "github",
+            "https://example.com/mcp",
+            &HashMap::new(),
+            "oauth",
+            None,
+            None,
+        )
+        .await
+        .expect("create mcp server config");
+        set_mcp_server_oauth_credentials(
+            &pool,
+            created.id,
+            Some(serde_json::json!({"client_id": "abc"})),
+        )
+        .await
+        .expect("set oauth credentials");
 
         // Changing the URL invalidates a grant that was issued for the old
         // audience — see docs/projects/plans/mcp-oauth.md's "Data model."
@@ -1671,14 +1938,27 @@ mod tests {
         .expect("update should succeed")
         .expect("row should exist");
 
-        assert!(updated.oauth_credentials.is_none(), "a URL change must clear stored OAuth credentials");
+        assert!(
+            updated.oauth_credentials.is_none(),
+            "a URL change must clear stored OAuth credentials"
+        );
     }
 
     #[sqlx::test]
-    async fn test_update_mcp_server_config_keeps_oauth_credentials_when_url_is_unchanged(pool: PgPool) {
-        let created = create_mcp_server_config(&pool, "github", "https://example.com/mcp", &HashMap::new(), "oauth", None, None)
-            .await
-            .expect("create mcp server config");
+    async fn test_update_mcp_server_config_keeps_oauth_credentials_when_url_is_unchanged(
+        pool: PgPool,
+    ) {
+        let created = create_mcp_server_config(
+            &pool,
+            "github",
+            "https://example.com/mcp",
+            &HashMap::new(),
+            "oauth",
+            None,
+            None,
+        )
+        .await
+        .expect("create mcp server config");
         let credentials = serde_json::json!({"client_id": "abc"});
         set_mcp_server_oauth_credentials(&pool, created.id, Some(credentials.clone()))
             .await
