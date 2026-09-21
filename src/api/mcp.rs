@@ -55,8 +55,12 @@ impl From<db::McpServerConfig> for McpServerSummary {
 /// guess. See `/mcp-servers`' index badge and its edit page's full status.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum McpConnectionStatus {
-    Connected { tool_names: Vec<String> },
-    Unreachable { error: String },
+    Connected {
+        tool_names: Vec<String>,
+    },
+    Unreachable {
+        error: String,
+    },
     /// `auth_mode == "oauth"` and no OAuth flow has ever completed for this
     /// server (or it was disconnected) — distinct from `Unreachable`
     /// because there's no network problem to report, just nothing to
@@ -94,10 +98,12 @@ pub async fn mcp_server_status(id: i64) -> ServerFnResult<McpConnectionStatus> {
         return Ok(McpConnectionStatus::NotConnected);
     }
 
-    Ok(match crate::mcp::connection_check(db::get(), &config).await {
-        Ok(tool_names) => McpConnectionStatus::Connected { tool_names },
-        Err(error) => McpConnectionStatus::Unreachable { error },
-    })
+    Ok(
+        match crate::mcp::connection_check(db::get(), &config).await {
+            Ok(tool_names) => McpConnectionStatus::Connected { tool_names },
+            Err(error) => McpConnectionStatus::Unreachable { error },
+        },
+    )
 }
 
 #[post("/api/mcp-servers")]
@@ -141,10 +147,18 @@ pub async fn update_mcp_server(
     remove_headers: Vec<String>,
     auth_mode: String,
 ) -> ServerFnResult<McpServerSummary> {
-    let config = db::update_mcp_server_config(db::get(), id, &name, &url, &upsert_headers, &remove_headers, &auth_mode)
-        .await
-        .map_err(ServerFnError::new)?
-        .ok_or_else(|| ServerFnError::new(format!("no MCP server config with id {id}")))?;
+    let config = db::update_mcp_server_config(
+        db::get(),
+        id,
+        &name,
+        &url,
+        &upsert_headers,
+        &remove_headers,
+        &auth_mode,
+    )
+    .await
+    .map_err(ServerFnError::new)?
+    .ok_or_else(|| ServerFnError::new(format!("no MCP server config with id {id}")))?;
     crate::mcp::evict(id).await;
     Ok(config.into())
 }
@@ -171,8 +185,13 @@ pub async fn start_mcp_server_oauth(id: i64) -> ServerFnResult<String> {
         .await
         .map_err(ServerFnError::new)?
         .ok_or_else(|| ServerFnError::new(format!("no MCP server config with id {id}")))?;
-    let redirect_uri = format!("{}/oauth/mcp-callback/{id}", crate::mcp_oauth::request_base_url().await?);
-    crate::mcp_oauth::start(db::get(), &config, redirect_uri).await.map_err(ServerFnError::new)
+    let redirect_uri = format!(
+        "{}/oauth/mcp-callback/{id}",
+        crate::mcp_oauth::request_base_url().await?
+    );
+    crate::mcp_oauth::start(db::get(), &config, redirect_uri)
+        .await
+        .map_err(ServerFnError::new)
 }
 
 /// Clears server `id`'s stored OAuth credentials without deleting the
@@ -183,7 +202,9 @@ pub async fn disconnect_mcp_server_oauth(id: i64) -> ServerFnResult<()> {
         .await
         .map_err(ServerFnError::new)?
         .ok_or_else(|| ServerFnError::new(format!("no MCP server config with id {id}")))?;
-    crate::mcp_oauth::disconnect(db::get(), &config).await.map_err(ServerFnError::new)?;
+    crate::mcp_oauth::disconnect(db::get(), &config)
+        .await
+        .map_err(ServerFnError::new)?;
     crate::mcp::evict(id).await;
     Ok(())
 }
@@ -199,7 +220,10 @@ mod tests {
             name: "github".to_string(),
             url: "https://api.githubcopilot.com/mcp/".to_string(),
             extra_headers: sqlx::types::Json(HashMap::from([
-                ("Authorization".to_string(), "Bearer super-secret-token".to_string()),
+                (
+                    "Authorization".to_string(),
+                    "Bearer super-secret-token".to_string(),
+                ),
                 ("X-Api-Key".to_string(), "another-secret".to_string()),
             ])),
             auth_mode: "static_headers".to_string(),

@@ -165,9 +165,13 @@ impl PartialBlock {
                 };
                 Ok(ContentBlock::ToolUse { id, name, input })
             }
-            PartialBlock::Thinking { thinking, signature } => {
-                Ok(ContentBlock::Thinking { thinking, signature })
-            }
+            PartialBlock::Thinking {
+                thinking,
+                signature,
+            } => Ok(ContentBlock::Thinking {
+                thinking,
+                signature,
+            }),
         }
     }
 }
@@ -217,15 +221,14 @@ async fn send_and_await_response(
     } else if let Some(api_key) = api_key {
         client.header("x-api-key", api_key)
     } else {
-        return Err("no ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN credential was provided".to_string());
+        return Err(
+            "no ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN credential was provided".to_string(),
+        );
     };
-    tokio::time::timeout(
-        response_timeout,
-        client.send(),
-    )
-    .await
-    .map_err(|_| "timed out waiting for Anthropic to respond".to_string())?
-    .map_err(|e| format!("Claude API request failed: {e}"))
+    tokio::time::timeout(response_timeout, client.send())
+        .await
+        .map_err(|_| "timed out waiting for Anthropic to respond".to_string())?
+        .map_err(|e| format!("Claude API request failed: {e}"))
 }
 
 /// Stream a message from the real Anthropic API, calling `on_delta` for each
@@ -239,8 +242,14 @@ pub async fn stream_anthropic_message(
     request: &CreateMessageRequest,
     mut on_delta: impl FnMut(&str),
 ) -> Result<StreamedTurn, String> {
-    let response =
-        send_and_await_response(api_key, auth_token, request, &anthropic_base_url(), RESPONSE_TIMEOUT).await?;
+    let response = send_and_await_response(
+        api_key,
+        auth_token,
+        request,
+        &anthropic_base_url(),
+        RESPONSE_TIMEOUT,
+    )
+    .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -285,9 +294,9 @@ pub async fn stream_anthropic_message(
                 // block lands with the finished message. No live "typing"
                 // effect for it, unlike text.
                 StreamOutcome::ThinkingDelta(thinking) => match &mut current {
-                    Some(PartialBlock::Thinking { thinking: existing, .. }) => {
-                        existing.push_str(&thinking)
-                    }
+                    Some(PartialBlock::Thinking {
+                        thinking: existing, ..
+                    }) => existing.push_str(&thinking),
                     _ => {
                         current = Some(PartialBlock::Thinking {
                             thinking,
@@ -297,7 +306,8 @@ pub async fn stream_anthropic_message(
                 },
                 StreamOutcome::ThinkingSignatureDelta(signature) => {
                     if let Some(PartialBlock::Thinking {
-                        signature: existing, ..
+                        signature: existing,
+                        ..
                     }) = &mut current
                     {
                         existing.push_str(&signature);
@@ -709,7 +719,10 @@ mod tests {
     async fn send_and_capture_headers(
         api_key: Option<&str>,
         auth_token: Option<&str>,
-    ) -> (Result<reqwest::Response, String>, Option<axum::http::HeaderMap>) {
+    ) -> (
+        Result<reqwest::Response, String>,
+        Option<axum::http::HeaderMap>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -724,7 +737,10 @@ mod tests {
                 let captured = captured_for_route.clone();
                 async move {
                     *captured.lock().unwrap_or_else(|e| e.into_inner()) = Some(headers);
-                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], "")
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        "",
+                    )
                 }
             }),
         );
@@ -756,11 +772,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_and_await_response_uses_bearer_auth_when_auth_token_is_set() {
-        let (result, headers) = send_and_capture_headers(Some("api-key-value"), Some("hf-token-value")).await;
+        let (result, headers) =
+            send_and_capture_headers(Some("api-key-value"), Some("hf-token-value")).await;
         result.expect("request should succeed");
         let headers = headers.expect("mock upstream should have received the request");
-        assert_eq!(headers.get("authorization").expect("Authorization header"), "Bearer hf-token-value");
-        assert!(headers.get("x-api-key").is_none(), "should not also send x-api-key when auth_token is set");
+        assert_eq!(
+            headers.get("authorization").expect("Authorization header"),
+            "Bearer hf-token-value"
+        );
+        assert!(
+            headers.get("x-api-key").is_none(),
+            "should not also send x-api-key when auth_token is set"
+        );
     }
 
     #[tokio::test]
@@ -768,8 +791,14 @@ mod tests {
         let (result, headers) = send_and_capture_headers(Some("api-key-value"), None).await;
         result.expect("request should succeed");
         let headers = headers.expect("mock upstream should have received the request");
-        assert_eq!(headers.get("x-api-key").expect("x-api-key header"), "api-key-value");
-        assert!(headers.get("authorization").is_none(), "should not send Authorization when only api_key is set");
+        assert_eq!(
+            headers.get("x-api-key").expect("x-api-key header"),
+            "api-key-value"
+        );
+        assert!(
+            headers.get("authorization").is_none(),
+            "should not send Authorization when only api_key is set"
+        );
     }
 
     #[tokio::test]
@@ -792,7 +821,9 @@ mod tests {
         .await;
         let message = result.expect_err("expected an error when neither credential is set");
         assert!(
-            message.contains("API key") || message.contains("auth token") || message.contains("credential"),
+            message.contains("API key")
+                || message.contains("auth token")
+                || message.contains("credential"),
             "expected a clear missing-credentials error, got: {message}"
         );
     }

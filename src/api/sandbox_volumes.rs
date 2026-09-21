@@ -18,14 +18,23 @@ pub struct SandboxVolumeSummary {
 #[cfg(feature = "server")]
 impl From<db::SandboxVolume> for SandboxVolumeSummary {
     fn from(volume: db::SandboxVolume) -> Self {
-        Self { id: volume.id, name: volume.name, mount_path: volume.mount_path }
+        Self {
+            id: volume.id,
+            name: volume.name,
+            mount_path: volume.mount_path,
+        }
     }
 }
 
 #[get("/api/sandbox-volumes")]
 pub async fn list_sandbox_volumes() -> ServerFnResult<Vec<SandboxVolumeSummary>> {
-    let volumes = db::list_sandbox_volumes(db::get()).await.map_err(ServerFnError::new)?;
-    Ok(volumes.into_iter().map(SandboxVolumeSummary::from).collect())
+    let volumes = db::list_sandbox_volumes(db::get())
+        .await
+        .map_err(ServerFnError::new)?;
+    Ok(volumes
+        .into_iter()
+        .map(SandboxVolumeSummary::from)
+        .collect())
 }
 
 /// Creates a volume and its backing PVC (`sandbox::create_volume` — see
@@ -34,8 +43,13 @@ pub async fn list_sandbox_volumes() -> ServerFnResult<Vec<SandboxVolumeSummary>>
 /// directory before anything is persisted, so the browser never needs to
 /// know that resolution happened.
 #[post("/api/sandbox-volumes")]
-pub async fn create_sandbox_volume(name: String, mount_path: String) -> ServerFnResult<SandboxVolumeSummary> {
-    let id = sandbox::create_volume(db::get(), &name, &mount_path).await.map_err(ServerFnError::new)?;
+pub async fn create_sandbox_volume(
+    name: String,
+    mount_path: String,
+) -> ServerFnResult<SandboxVolumeSummary> {
+    let id = sandbox::create_volume(db::get(), &name, &mount_path)
+        .await
+        .map_err(ServerFnError::new)?;
     let volume = db::get_sandbox_volume(db::get(), id)
         .await
         .map_err(ServerFnError::new)?
@@ -45,6 +59,8 @@ pub async fn create_sandbox_volume(name: String, mount_path: String) -> ServerFn
 
 #[delete("/api/sandbox-volumes/{id}")]
 pub async fn delete_sandbox_volume(id: i64) -> ServerFnResult<()> {
-    sandbox::delete_volume(db::get(), id).await.map_err(ServerFnError::new)?;
+    sandbox::delete_volume(db::get(), id)
+        .await
+        .map_err(ServerFnError::new)?;
     Ok(())
 }

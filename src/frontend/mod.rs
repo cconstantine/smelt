@@ -1,7 +1,9 @@
 mod pages;
 
 use dioxus::prelude::*;
-use pages::{Chat, McpServerEdit, McpServerNew, McpServersIndex, SandboxVolumeNew, SandboxVolumesIndex};
+use pages::{
+    Chat, McpServerEdit, McpServerNew, McpServersIndex, SandboxVolumeNew, SandboxVolumesIndex,
+};
 
 #[derive(Routable, Clone, PartialEq, Debug)]
 pub(crate) enum Route {

@@ -33,12 +33,17 @@ pub enum ContentBlock {
     },
 }
 
+// `AnthropicMessage` through `CreateMessageRequest` below are only built
+// and sent by `stream.rs`, which is itself server-only — the `web`
+// (browser) build never touches them, only `ContentBlock` above.
+#[cfg(feature = "server")]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AnthropicMessage {
     pub role: String,
     pub content: Vec<ContentBlock>,
 }
 
+#[cfg(feature = "server")]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolDefinition {
     pub name: String,
@@ -51,12 +56,14 @@ pub struct ToolDefinition {
 /// (deprecated on current models). The only variant smelt sends; kept as
 /// an enum rather than a bare string so an unsupported value can't be
 /// constructed by mistake.
+#[cfg(feature = "server")]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThinkingConfig {
     Adaptive,
 }
 
+#[cfg(feature = "server")]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CreateMessageRequest {
     pub model: String,
@@ -69,12 +76,6 @@ pub struct CreateMessageRequest {
     pub tools: Vec<ToolDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct CreateMessageResponse {
-    pub content: Vec<ContentBlock>,
-    pub stop_reason: String,
 }
 
 #[cfg(test)]
@@ -142,7 +143,10 @@ mod tests {
             thinking: Some(ThinkingConfig::Adaptive),
         };
         let value = serde_json::to_value(&req).unwrap();
-        assert_eq!(value.get("thinking"), Some(&serde_json::json!({"type": "adaptive"})));
+        assert_eq!(
+            value.get("thinking"),
+            Some(&serde_json::json!({"type": "adaptive"}))
+        );
     }
 
     #[test]
@@ -250,28 +254,6 @@ mod tests {
         assert!(
             value.get("system").is_none(),
             "system key should be omitted entirely when None, got: {value:?}"
-        );
-    }
-
-    #[test]
-    fn test_response_ignores_unmodeled_fields() {
-        // Real API responses carry id/model/role/usage/etc. we don't model —
-        // deserialization must not choke on them.
-        let raw = serde_json::json!({
-            "id": "msg_1",
-            "model": "claude-opus-4-8",
-            "role": "assistant",
-            "usage": {"input_tokens": 10, "output_tokens": 5},
-            "content": [{"type": "text", "text": "HELLO"}],
-            "stop_reason": "end_turn"
-        });
-        let response: CreateMessageResponse = serde_json::from_value(raw).unwrap();
-        assert_eq!(response.stop_reason, "end_turn");
-        assert_eq!(
-            response.content,
-            vec![ContentBlock::Text {
-                text: "HELLO".to_string()
-            }]
         );
     }
 }

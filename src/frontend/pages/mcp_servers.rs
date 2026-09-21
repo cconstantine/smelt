@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use dioxus::prelude::*;
 
 use crate::api::mcp::{
-    McpConnectionStatus, McpServerSummary, create_mcp_server, delete_mcp_server, disconnect_mcp_server_oauth,
-    get_mcp_server, list_mcp_servers, mcp_server_status, start_mcp_server_oauth, update_mcp_server,
+    McpConnectionStatus, McpServerSummary, create_mcp_server, delete_mcp_server,
+    disconnect_mcp_server_oauth, get_mcp_server, list_mcp_servers, mcp_server_status,
+    start_mcp_server_oauth, update_mcp_server,
 };
 use crate::frontend::Route;
 
@@ -15,7 +16,10 @@ use crate::frontend::Route;
 /// this works the same as any other closure-capturing helper already used
 /// in this file (see `ConversationSidebar` for the same pattern with
 /// per-row closures).
-fn header_rows(mut headers: Signal<Vec<(String, String)>>, value_placeholder: &'static str) -> Element {
+fn header_rows(
+    mut headers: Signal<Vec<(String, String)>>,
+    value_placeholder: &'static str,
+) -> Element {
     rsx! {
         div { class: "mcp-header-rows",
             for (index , (name , value)) in headers().into_iter().enumerate() {
@@ -58,7 +62,9 @@ fn header_rows(mut headers: Signal<Vec<(String, String)>>, value_placeholder: &'
 /// rows with a blank name are dropped (an empty "+ Add header" row left
 /// untouched shouldn't become a header named `""`).
 fn headers_from_rows(rows: Vec<(String, String)>) -> HashMap<String, String> {
-    rows.into_iter().filter(|(name, _)| !name.trim().is_empty()).collect()
+    rows.into_iter()
+        .filter(|(name, _)| !name.trim().is_empty())
+        .collect()
 }
 
 /// A server's live connection status, fetched with a real connection
@@ -66,7 +72,11 @@ fn headers_from_rows(rows: Vec<(String, String)>) -> HashMap<String, String> {
 /// guess — see that function's doc comment for why. Shared rendering used
 /// by both the index badge and the edit page's fuller status section.
 fn status_summary(tool_names: &[String]) -> String {
-    format!("Connected \u{2014} {} tool{}", tool_names.len(), if tool_names.len() == 1 { "" } else { "s" })
+    format!(
+        "Connected \u{2014} {} tool{}",
+        tool_names.len(),
+        if tool_names.len() == 1 { "" } else { "s" }
+    )
 }
 
 /// Lists every configured server with a live "connected" indicator — see
@@ -161,7 +171,8 @@ pub fn McpServerNew() -> Element {
     let navigator = use_navigator();
     let mut name: Signal<String> = use_signal(String::new);
     let mut url: Signal<String> = use_signal(String::new);
-    let headers: Signal<Vec<(String, String)>> = use_signal(|| vec![(String::new(), String::new())]);
+    let headers: Signal<Vec<(String, String)>> =
+        use_signal(|| vec![(String::new(), String::new())]);
     // "static_headers" or "oauth" — see McpServerSummary::auth_mode. Fixed
     // for the lifetime of a server once created (see McpServerEdit's doc
     // comment on why switching modes isn't supported yet); this radio is
@@ -185,10 +196,18 @@ pub fn McpServerNew() -> Element {
         let headers_value = headers_from_rows(headers());
         let auth_mode_value = auth_mode();
         let client_id_value = (!oauth_client_id().trim().is_empty()).then(|| oauth_client_id());
-        let client_secret_value = (!oauth_client_secret().trim().is_empty()).then(|| oauth_client_secret());
+        let client_secret_value =
+            (!oauth_client_secret().trim().is_empty()).then(|| oauth_client_secret());
         spawn(async move {
-            match create_mcp_server(name_value, url_value, headers_value, auth_mode_value, client_id_value, client_secret_value)
-                .await
+            match create_mcp_server(
+                name_value,
+                url_value,
+                headers_value,
+                auth_mode_value,
+                client_id_value,
+                client_secret_value,
+            )
+            .await
             {
                 Ok(summary) => {
                     navigator.push(Route::McpServerEditRoute { id: summary.id });
@@ -331,7 +350,13 @@ pub fn McpServerEdit(id: i64) -> Element {
                     has_oauth_client_secret.set(summary.has_oauth_client_secret);
                     saved_name.set(summary.name);
                     saved_url.set(summary.url);
-                    existing_header_edits.set(summary.header_names.into_iter().map(|name| (name, String::new())).collect());
+                    existing_header_edits.set(
+                        summary
+                            .header_names
+                            .into_iter()
+                            .map(|name| (name, String::new()))
+                            .collect(),
+                    );
                 }
                 Err(e) => load_error.set(Some(e.to_string())),
             }
@@ -395,9 +420,13 @@ pub fn McpServerEdit(id: i64) -> Element {
     // row or an empty "+ Add header" row isn't a real change.
     let is_dirty = edit_name() != saved_name()
         || edit_url() != saved_url()
-        || existing_header_edits().iter().any(|(_, value)| !value.trim().is_empty())
+        || existing_header_edits()
+            .iter()
+            .any(|(_, value)| !value.trim().is_empty())
         || !removed_header_names().is_empty()
-        || new_header_rows().iter().any(|(name, _)| !name.trim().is_empty());
+        || new_header_rows()
+            .iter()
+            .any(|(name, _)| !name.trim().is_empty());
 
     // The whole page is one form with one save action: name, URL, and
     // every header change all go to the server together — see
@@ -407,8 +436,10 @@ pub fn McpServerEdit(id: i64) -> Element {
         evt.prevent_default();
         let name = edit_name();
         let url = edit_url();
-        let mut upsert: HashMap<String, String> =
-            existing_header_edits().into_iter().filter(|(_, value)| !value.trim().is_empty()).collect();
+        let mut upsert: HashMap<String, String> = existing_header_edits()
+            .into_iter()
+            .filter(|(_, value)| !value.trim().is_empty())
+            .collect();
         upsert.extend(headers_from_rows(new_header_rows()));
         let remove = removed_header_names();
         let auth_mode = edit_auth_mode();
@@ -420,7 +451,13 @@ pub fn McpServerEdit(id: i64) -> Element {
                     saved_url.set(summary.url.clone());
                     edit_name.set(summary.name);
                     edit_url.set(summary.url);
-                    existing_header_edits.set(summary.header_names.into_iter().map(|name| (name, String::new())).collect());
+                    existing_header_edits.set(
+                        summary
+                            .header_names
+                            .into_iter()
+                            .map(|name| (name, String::new()))
+                            .collect(),
+                    );
                     removed_header_names.set(Vec::new());
                     new_header_rows.set(Vec::new());
                     save_error.set(None);

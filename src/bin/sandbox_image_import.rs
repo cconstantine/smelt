@@ -41,9 +41,13 @@ const REMOTE_TAR_PATH: &str = "/tmp/sandbox-image.tar";
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    let tar_path = std::env::args().nth(1).ok_or("usage: sandbox_image_import <path-to-docker-save-tarball>")?;
+    let tar_path = std::env::args()
+        .nth(1)
+        .ok_or("usage: sandbox_image_import <path-to-docker-save-tarball>")?;
 
-    rustls::crypto::ring::default_provider().install_default().ok();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
     let client = kube::Client::try_default().await?;
     let pods: Api<Pod> = Api::namespaced(client, NAMESPACE);
 
@@ -59,12 +63,16 @@ async fn main() -> Result<(), BoxError> {
 
 async fn import(pods: &Api<Pod>, tar_path: &str) -> Result<(), BoxError> {
     let tar_bytes = std::fs::read(tar_path).map_err(|e| format!("reading {tar_path}: {e}"))?;
-    println!("sandbox_image_import: read {} bytes from {tar_path}", tar_bytes.len());
+    println!(
+        "sandbox_image_import: read {} bytes from {tar_path}",
+        tar_bytes.len()
+    );
 
     let _ = pods.delete(LOADER_POD_NAME, &immediate_delete()).await;
     wait_gone(pods, LOADER_POD_NAME).await;
 
-    pods.create(&PostParams::default(), &loader_pod_spec()).await?;
+    pods.create(&PostParams::default(), &loader_pod_spec())
+        .await?;
     wait_running(pods, LOADER_POD_NAME).await?;
     println!("sandbox_image_import: loader pod Running");
 
@@ -88,13 +96,21 @@ fn loader_pod_spec() -> Pod {
     limits.insert("memory".to_string(), Quantity("512Mi".to_string()));
 
     Pod {
-        metadata: ObjectMeta { name: Some(LOADER_POD_NAME.to_string()), namespace: Some(NAMESPACE.to_string()), ..Default::default() },
+        metadata: ObjectMeta {
+            name: Some(LOADER_POD_NAME.to_string()),
+            namespace: Some(NAMESPACE.to_string()),
+            ..Default::default()
+        },
         spec: Some(PodSpec {
             containers: vec![Container {
                 name: "loader".to_string(),
                 image: Some(LOADER_IMAGE.to_string()),
                 command: Some(vec!["sleep".to_string(), "300".to_string()]),
-                resources: Some(ResourceRequirements { requests: Some(requests), limits: Some(limits), ..Default::default() }),
+                resources: Some(ResourceRequirements {
+                    requests: Some(requests),
+                    limits: Some(limits),
+                    ..Default::default()
+                }),
                 volume_mounts: Some(vec![VolumeMount {
                     name: "k3s-run".to_string(),
                     mount_path: "/hostcontainerd".to_string(),
@@ -105,7 +121,10 @@ fn loader_pod_spec() -> Pod {
             }],
             volumes: Some(vec![Volume {
                 name: "k3s-run".to_string(),
-                host_path: Some(HostPathVolumeSource { path: "/run/k3s".to_string(), type_: Some("Directory".to_string()) }),
+                host_path: Some(HostPathVolumeSource {
+                    path: "/run/k3s".to_string(),
+                    type_: Some("Directory".to_string()),
+                }),
                 ..Default::default()
             }]),
             restart_policy: Some("Never".to_string()),
@@ -116,14 +135,21 @@ fn loader_pod_spec() -> Pod {
 }
 
 fn immediate_delete() -> DeleteParams {
-    DeleteParams { grace_period_seconds: Some(0), ..Default::default() }
+    DeleteParams {
+        grace_period_seconds: Some(0),
+        ..Default::default()
+    }
 }
 
 async fn wait_running(pods: &Api<Pod>, name: &str) -> Result<(), BoxError> {
     let result = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let pod = pods.get(name).await?;
-            let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref()).unwrap_or("");
+            let phase = pod
+                .status
+                .as_ref()
+                .and_then(|s| s.phase.as_deref())
+                .unwrap_or("");
             if phase == "Running" {
                 return Ok::<(), BoxError>(());
             }
@@ -152,13 +178,26 @@ async fn wait_gone(pods: &Api<Pod>, name: &str) {
     .await;
 }
 
-async fn exec_capture(pods: &Api<Pod>, pod_name: &str, command: &[&str]) -> Result<String, BoxError> {
-    let mut attached = pods.exec(pod_name, command.iter().copied(), &AttachParams::default()).await?;
-    let mut stdout_reader = attached.stdout().expect("stdout requested by AttachParams::default()");
-    let mut stderr_reader = attached.stderr().expect("stderr requested by AttachParams::default()");
+async fn exec_capture(
+    pods: &Api<Pod>,
+    pod_name: &str,
+    command: &[&str],
+) -> Result<String, BoxError> {
+    let mut attached = pods
+        .exec(pod_name, command.iter().copied(), &AttachParams::default())
+        .await?;
+    let mut stdout_reader = attached
+        .stdout()
+        .expect("stdout requested by AttachParams::default()");
+    let mut stderr_reader = attached
+        .stderr()
+        .expect("stderr requested by AttachParams::default()");
     let mut stdout = String::new();
     let mut stderr = String::new();
-    let (r1, r2) = tokio::join!(stdout_reader.read_to_string(&mut stdout), stderr_reader.read_to_string(&mut stderr));
+    let (r1, r2) = tokio::join!(
+        stdout_reader.read_to_string(&mut stdout),
+        stderr_reader.read_to_string(&mut stderr)
+    );
     r1.ok();
     r2.ok();
     attached.join().await.ok();
@@ -177,8 +216,13 @@ async fn exec_capture(pods: &Api<Pod>, pod_name: &str, command: &[&str]) -> Resu
 /// real cluster before this binary was written.
 async fn stream_and_import(pods: &Api<Pod>, data: &[u8]) -> Result<(), BoxError> {
     let command = format!("cat > {REMOTE_TAR_PATH} && echo done");
-    let mut attached =
-        pods.exec(LOADER_POD_NAME, ["sh", "-c", command.as_str()], &AttachParams::default().stdin(true)).await?;
+    let mut attached = pods
+        .exec(
+            LOADER_POD_NAME,
+            ["sh", "-c", command.as_str()],
+            &AttachParams::default().stdin(true),
+        )
+        .await?;
     let mut stdin = attached.stdin().expect("stdin requested");
     let mut stdout = attached.stdout().expect("stdout requested by default");
     let mut stderr = attached.stderr().expect("stderr requested by default");
@@ -210,7 +254,16 @@ async fn stream_and_import(pods: &Api<Pod>, data: &[u8]) -> Result<(), BoxError>
     let import_out = exec_capture(
         pods,
         LOADER_POD_NAME,
-        &["ctr", "--address", CONTAINERD_SOCKET, "--namespace", "k8s.io", "images", "import", REMOTE_TAR_PATH],
+        &[
+            "ctr",
+            "--address",
+            CONTAINERD_SOCKET,
+            "--namespace",
+            "k8s.io",
+            "images",
+            "import",
+            REMOTE_TAR_PATH,
+        ],
     )
     .await?;
     println!("{import_out}");

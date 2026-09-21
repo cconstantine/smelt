@@ -26,7 +26,10 @@ fn build_router() -> axum::Router {
     axum::Router::new()
         // A plain Axum route, not a Dioxus server function — see
         // src/mcp_oauth.rs's `callback_handler` doc comment for why.
-        .route("/oauth/mcp-callback/{id}", axum::routing::get(mcp_oauth::callback_handler))
+        .route(
+            "/oauth/mcp-callback/{id}",
+            axum::routing::get(mcp_oauth::callback_handler),
+        )
         .serve_dioxus_application(dioxus::prelude::ServeConfig::new(), frontend::App)
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }

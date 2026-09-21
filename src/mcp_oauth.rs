@@ -15,7 +15,10 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use rmcp::transport::auth::{AuthError, AuthorizationManager, AuthorizationRequest, CredentialStore, OAuthState, StoredCredentials};
+use rmcp::transport::auth::{
+    AuthError, AuthorizationManager, AuthorizationRequest, CredentialStore, OAuthState,
+    StoredCredentials,
+};
 use sqlx::PgPool;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -48,17 +51,20 @@ impl CredentialStore for PgCredentialStore {
         let config = db::get_mcp_server_config(&self.pool, self.server_id)
             .await
             .map_err(|e| AuthError::InternalError(e.to_string()))?
-            .ok_or_else(|| AuthError::InternalError(format!("no MCP server config with id {}", self.server_id)))?;
+            .ok_or_else(|| {
+                AuthError::InternalError(format!("no MCP server config with id {}", self.server_id))
+            })?;
         match config.oauth_credentials {
             None => Ok(None),
-            Some(json) => {
-                serde_json::from_value(json.0).map(Some).map_err(|e| AuthError::InternalError(e.to_string()))
-            }
+            Some(json) => serde_json::from_value(json.0)
+                .map(Some)
+                .map_err(|e| AuthError::InternalError(e.to_string())),
         }
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
-        let value = serde_json::to_value(&credentials).map_err(|e| AuthError::InternalError(e.to_string()))?;
+        let value = serde_json::to_value(&credentials)
+            .map_err(|e| AuthError::InternalError(e.to_string()))?;
         db::set_mcp_server_oauth_credentials(&self.pool, self.server_id, Some(value))
             .await
             .map_err(|e| AuthError::InternalError(e.to_string()))
@@ -77,16 +83,26 @@ impl CredentialStore for PgCredentialStore {
 /// restart mid-login just means starting over, the same class of accepted
 /// limitation as `mcp.rs`'s connection registry and `run_async`'s task
 /// registry — see the plan's "Key discovery."
-static PENDING: LazyLock<AsyncMutex<HashMap<i64, OAuthState>>> = LazyLock::new(|| AsyncMutex::new(HashMap::new()));
+static PENDING: LazyLock<AsyncMutex<HashMap<i64, OAuthState>>> =
+    LazyLock::new(|| AsyncMutex::new(HashMap::new()));
 
 /// Starts an OAuth authorization attempt for `config` and returns the
 /// authorization URL the browser must be navigated to. Only one attempt
 /// per server is tracked at a time — starting a new one for the same
 /// server replaces whatever attempt was pending.
-pub async fn start(pool: &PgPool, config: &McpServerConfig, redirect_uri: String) -> Result<String, String> {
+pub async fn start(
+    pool: &PgPool,
+    config: &McpServerConfig,
+    redirect_uri: String,
+) -> Result<String, String> {
     let mut manager = AuthorizationManager::new(config.url.as_str())
         .await
-        .map_err(|e| format!("failed to initialize OAuth for MCP server {:?}: {e}", config.name))?;
+        .map_err(|e| {
+            format!(
+                "failed to initialize OAuth for MCP server {:?}: {e}",
+                config.name
+            )
+        })?;
     manager.set_credential_store(PgCredentialStore::new(pool.clone(), config.id));
 
     let mut state = OAuthState::Unauthorized(manager);
@@ -103,14 +119,18 @@ pub async fn start(pool: &PgPool, config: &McpServerConfig, redirect_uri: String
             request = request.with_client_secret(client_secret);
         }
     }
-    state
-        .start_authorization(request)
-        .await
-        .map_err(|e| format!("failed to start OAuth authorization for MCP server {:?}: {e}", config.name))?;
-    let url = state
-        .get_authorization_url()
-        .await
-        .map_err(|e| format!("failed to get authorization URL for MCP server {:?}: {e}", config.name))?;
+    state.start_authorization(request).await.map_err(|e| {
+        format!(
+            "failed to start OAuth authorization for MCP server {:?}: {e}",
+            config.name
+        )
+    })?;
+    let url = state.get_authorization_url().await.map_err(|e| {
+        format!(
+            "failed to get authorization URL for MCP server {:?}: {e}",
+            config.name
+        )
+    })?;
 
     PENDING.lock().await.insert(config.id, state);
     Ok(url)
@@ -129,7 +149,10 @@ pub async fn handle_callback(server_id: i64, code: &str, csrf_token: &str) -> Re
     let mut state = PENDING.lock().await.remove(&server_id).ok_or_else(|| {
         "no OAuth authorization attempt in progress for this server — it may have expired, or this callback link was already used".to_string()
     })?;
-    state.handle_callback(code, csrf_token).await.map_err(|e| format!("OAuth callback failed: {e}"))
+    state
+        .handle_callback(code, csrf_token)
+        .await
+        .map_err(|e| format!("OAuth callback failed: {e}"))
 }
 
 /// Clears `config`'s stored OAuth credentials without touching anything
@@ -164,9 +187,16 @@ pub async fn request_base_url() -> Result<String, dioxus::prelude::ServerFnError
         return Ok(base_url);
     }
     let headers =
-        dioxus::prelude::dioxus_fullstack::FullstackContext::extract::<axum::http::HeaderMap, _>().await?;
-    let host = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("localhost");
-    let scheme = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("http");
+        dioxus::prelude::dioxus_fullstack::FullstackContext::extract::<axum::http::HeaderMap, _>()
+            .await?;
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
     Ok(format!("{scheme}://{host}"))
 }
 
@@ -199,7 +229,9 @@ pub async fn callback_handler(
     match outcome {
         Ok(()) => axum::response::Redirect::to(&format!("/mcp-servers/{id}")),
         Err(error) => {
-            let encoded: String = percent_encoding::utf8_percent_encode(&error, percent_encoding::NON_ALPHANUMERIC).collect();
+            let encoded: String =
+                percent_encoding::utf8_percent_encode(&error, percent_encoding::NON_ALPHANUMERIC)
+                    .collect();
             axum::response::Redirect::to(&format!("/mcp-servers/{id}?oauth_error={encoded}"))
         }
     }
@@ -209,8 +241,12 @@ async fn complete_callback(id: i64, params: CallbackParams) -> Result<(), String
     if let Some(error) = params.error {
         return Err(params.error_description.unwrap_or(error));
     }
-    let code = params.code.ok_or_else(|| "authorization callback is missing its code parameter".to_string())?;
-    let state = params.state.ok_or_else(|| "authorization callback is missing its state parameter".to_string())?;
+    let code = params
+        .code
+        .ok_or_else(|| "authorization callback is missing its code parameter".to_string())?;
+    let state = params
+        .state
+        .ok_or_else(|| "authorization callback is missing its state parameter".to_string())?;
     handle_callback(id, &code, &state).await?;
     crate::mcp::evict(id).await;
     Ok(())
@@ -237,10 +273,17 @@ mod tests {
         assert_eq!(oauth_base_url_override(), None);
 
         unsafe { std::env::set_var("SMELT_BASE_URL", "") };
-        assert_eq!(oauth_base_url_override(), None, "set-but-empty should be treated as unset, same as every other env var here");
+        assert_eq!(
+            oauth_base_url_override(),
+            None,
+            "set-but-empty should be treated as unset, same as every other env var here"
+        );
 
         unsafe { std::env::set_var("SMELT_BASE_URL", "https://smelt.example.com") };
-        assert_eq!(oauth_base_url_override(), Some("https://smelt.example.com".to_string()));
+        assert_eq!(
+            oauth_base_url_override(),
+            Some("https://smelt.example.com".to_string())
+        );
 
         unsafe { std::env::set_var("SMELT_BASE_URL", "https://smelt.example.com/") };
         assert_eq!(
@@ -287,9 +330,13 @@ mod tests {
     }
 
     async fn spawn_mock_oauth_server() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind mock oauth server");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock oauth server");
         let addr = listener.local_addr().expect("mock oauth server local addr");
-        let app = axum::Router::new().route("/register", post(register_handler)).route("/token", post(token_handler));
+        let app = axum::Router::new()
+            .route("/register", post(register_handler))
+            .route("/token", post(token_handler));
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("mock oauth server");
         });
@@ -306,23 +353,44 @@ mod tests {
         let query = url.split_once('?')?.1;
         query.split('&').find_map(|pair| {
             let (k, v) = pair.split_once('=')?;
-            (k == key).then(|| percent_encoding::percent_decode_str(v).decode_utf8_lossy().into_owned())
+            (k == key).then(|| {
+                percent_encoding::percent_decode_str(v)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            })
         })
     }
 
     #[sqlx::test]
-    async fn test_start_and_handle_callback_persists_credentials_and_a_later_fetch_refreshes(pool: PgPool) {
+    async fn test_start_and_handle_callback_persists_credentials_and_a_later_fetch_refreshes(
+        pool: PgPool,
+    ) {
         let base_url = spawn_mock_oauth_server().await;
-        let created = db::create_mcp_server_config(&pool, "oauth-test-server", &base_url, &HashMap::new(), "oauth", None, None)
-            .await
-            .expect("create mcp server config");
+        let created = db::create_mcp_server_config(
+            &pool,
+            "oauth-test-server",
+            &base_url,
+            &HashMap::new(),
+            "oauth",
+            None,
+            None,
+        )
+        .await
+        .expect("create mcp server config");
 
-        let authorization_url =
-            start(&pool, &created, "http://localhost/oauth/mcp-callback/1".to_string()).await.expect("start should succeed");
+        let authorization_url = start(
+            &pool,
+            &created,
+            "http://localhost/oauth/mcp-callback/1".to_string(),
+        )
+        .await
+        .expect("start should succeed");
         let state_param = extract_query_param(&authorization_url, "state")
             .expect("authorization url should carry a state param");
 
-        handle_callback(created.id, "test-code", &state_param).await.expect("callback should succeed");
+        handle_callback(created.id, "test-code", &state_param)
+            .await
+            .expect("callback should succeed");
 
         let stored = db::get_mcp_server_config(&pool, created.id)
             .await
@@ -330,16 +398,27 @@ mod tests {
             .expect("row should exist")
             .oauth_credentials
             .expect("credentials should be stored after a successful callback");
-        assert!(stored.0.get("token_response").is_some(), "stored credentials should include the exchanged token");
+        assert!(
+            stored.0.get("token_response").is_some(),
+            "stored credentials should include the exchanged token"
+        );
 
         // `get_access_token` on a fresh manager built from the same store
         // mirrors exactly what `crate::mcp::oauth_headers` does on every
         // `connect()` — proves both persistence and transparent refresh
         // (the initial token's `expires_in: 0` forces this).
-        let mut manager = rmcp::transport::auth::AuthorizationManager::new(base_url.as_str()).await.expect("new manager");
+        let mut manager = rmcp::transport::auth::AuthorizationManager::new(base_url.as_str())
+            .await
+            .expect("new manager");
         manager.set_credential_store(PgCredentialStore::new(pool.clone(), created.id));
-        manager.initialize_from_store().await.expect("initialize_from_store");
-        let token = manager.get_access_token().await.expect("get_access_token should refresh transparently");
+        manager
+            .initialize_from_store()
+            .await
+            .expect("initialize_from_store");
+        let token = manager
+            .get_access_token()
+            .await
+            .expect("get_access_token should refresh transparently");
         assert_eq!(token, "refreshed-access-token");
     }
 
@@ -348,20 +427,38 @@ mod tests {
         let _ = pool;
         let result = handle_callback(999_999, "some-code", "some-state").await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no OAuth authorization attempt in progress"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("no OAuth authorization attempt in progress")
+        );
     }
 
     #[sqlx::test]
     async fn test_disconnect_clears_stored_credentials(pool: PgPool) {
         let base_url = spawn_mock_oauth_server().await;
-        let created = db::create_mcp_server_config(&pool, "oauth-test-server", &base_url, &HashMap::new(), "oauth", None, None)
-            .await
-            .expect("create mcp server config");
-        db::set_mcp_server_oauth_credentials(&pool, created.id, Some(serde_json::json!({"client_id": "abc"})))
-            .await
-            .expect("seed oauth credentials");
+        let created = db::create_mcp_server_config(
+            &pool,
+            "oauth-test-server",
+            &base_url,
+            &HashMap::new(),
+            "oauth",
+            None,
+            None,
+        )
+        .await
+        .expect("create mcp server config");
+        db::set_mcp_server_oauth_credentials(
+            &pool,
+            created.id,
+            Some(serde_json::json!({"client_id": "abc"})),
+        )
+        .await
+        .expect("seed oauth credentials");
 
-        disconnect(&pool, &created).await.expect("disconnect should succeed");
+        disconnect(&pool, &created)
+            .await
+            .expect("disconnect should succeed");
 
         let after = db::get_mcp_server_config(&pool, created.id)
             .await

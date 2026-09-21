@@ -133,7 +133,10 @@ where
 /// long-lived cached `Connection`) isn't proactively refreshed — only the
 /// next fresh `connect()` re-fetches one; a documented limitation, not an
 /// oversight.
-async fn oauth_headers(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<HashMap<String, String>, String> {
+async fn oauth_headers(
+    pool: &sqlx::PgPool,
+    config: &McpServerConfig,
+) -> Result<HashMap<String, String>, String> {
     if config.oauth_credentials.is_none() {
         return Err(format!(
             "MCP server {:?} is configured for OAuth but has never connected — use the Connect button on its edit page",
@@ -143,16 +146,28 @@ async fn oauth_headers(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<
 
     let mut manager = rmcp::transport::auth::AuthorizationManager::new(config.url.as_str())
         .await
-        .map_err(|e| format!("failed to initialize OAuth for MCP server {:?}: {e}", config.name))?;
-    manager.set_credential_store(crate::mcp_oauth::PgCredentialStore::new(pool.clone(), config.id));
-    manager
-        .initialize_from_store()
-        .await
-        .map_err(|e| format!("failed to load stored OAuth credentials for MCP server {:?}: {e}", config.name))?;
-    let token = manager
-        .get_access_token()
-        .await
-        .map_err(|e| format!("failed to get an OAuth access token for MCP server {:?}: {e}", config.name))?;
+        .map_err(|e| {
+            format!(
+                "failed to initialize OAuth for MCP server {:?}: {e}",
+                config.name
+            )
+        })?;
+    manager.set_credential_store(crate::mcp_oauth::PgCredentialStore::new(
+        pool.clone(),
+        config.id,
+    ));
+    manager.initialize_from_store().await.map_err(|e| {
+        format!(
+            "failed to load stored OAuth credentials for MCP server {:?}: {e}",
+            config.name
+        )
+    })?;
+    let token = manager.get_access_token().await.map_err(|e| {
+        format!(
+            "failed to get an OAuth access token for MCP server {:?}: {e}",
+            config.name
+        )
+    })?;
 
     let mut headers = config.extra_headers.0.clone();
     headers.insert("Authorization".to_string(), format!("Bearer {token}"));
@@ -171,18 +186,26 @@ async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connec
     let transport = StreamableHttpClientTransport::from_config(transport_config);
 
     let stale = Arc::new(AtomicBool::new(false));
-    let handler = SmeltClientHandler { stale: stale.clone() };
+    let handler = SmeltClientHandler {
+        stale: stale.clone(),
+    };
     let service = handler
         .serve(transport)
         .await
         .map_err(|e| format!("failed to connect to MCP server {:?}: {e}", config.name))?;
 
-    let tools = service
-        .list_all_tools()
-        .await
-        .map_err(|e| format!("failed to list tools from MCP server {:?}: {e}", config.name))?;
+    let tools = service.list_all_tools().await.map_err(|e| {
+        format!(
+            "failed to list tools from MCP server {:?}: {e}",
+            config.name
+        )
+    })?;
 
-    Ok(Connection { service, tools, stale })
+    Ok(Connection {
+        service,
+        tools,
+        stale,
+    })
 }
 
 /// Ensures `REGISTRY` has a live, up-to-date entry for `config.id` —
@@ -227,7 +250,10 @@ fn mcp_tool_to_definition(server_name: &str, tool: &McpTool) -> ToolDefinition {
 /// connect this turn is skipped (logged, not fatal) rather than failing
 /// the whole tool list — the model just doesn't see that server's tools
 /// until it's reachable again.
-pub async fn tool_definitions_for(pool: &sqlx::PgPool, configs: &[McpServerConfig]) -> Vec<ToolDefinition> {
+pub async fn tool_definitions_for(
+    pool: &sqlx::PgPool,
+    configs: &[McpServerConfig],
+) -> Vec<ToolDefinition> {
     let mut definitions = Vec::new();
     for config in configs {
         if let Err(e) = ensure_connected(pool, config).await {
@@ -236,7 +262,11 @@ pub async fn tool_definitions_for(pool: &sqlx::PgPool, configs: &[McpServerConfi
         }
         let registry = REGISTRY.lock().await;
         if let Some(conn) = registry.get(&config.id) {
-            definitions.extend(conn.tools.iter().map(|tool| mcp_tool_to_definition(&config.name, tool)));
+            definitions.extend(
+                conn.tools
+                    .iter()
+                    .map(|tool| mcp_tool_to_definition(&config.name, tool)),
+            );
         }
     }
     definitions
@@ -249,13 +279,23 @@ pub async fn tool_definitions_for(pool: &sqlx::PgPool, configs: &[McpServerConfi
 /// indicator at all. Shares `ensure_connected`'s registry/retry logic with
 /// `tool_definitions_for`/`call_tool`, so a server already connected this
 /// turn is reported without a second round-trip.
-pub async fn connection_check(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Vec<String>, String> {
+pub async fn connection_check(
+    pool: &sqlx::PgPool,
+    config: &McpServerConfig,
+) -> Result<Vec<String>, String> {
     ensure_connected(pool, config).await?;
     let registry = REGISTRY.lock().await;
-    let conn = registry
-        .get(&config.id)
-        .ok_or_else(|| format!("connection to MCP server {:?} vanished immediately after connecting", config.name))?;
-    Ok(conn.tools.iter().map(|tool| tool.name.to_string()).collect())
+    let conn = registry.get(&config.id).ok_or_else(|| {
+        format!(
+            "connection to MCP server {:?} vanished immediately after connecting",
+            config.name
+        )
+    })?;
+    Ok(conn
+        .tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect())
 }
 
 /// Dispatches a `tools/call` to `config`'s server and turns the result
@@ -275,7 +315,11 @@ pub async fn call_tool(
     let arguments = match arguments {
         serde_json::Value::Object(map) => Some(map),
         serde_json::Value::Null => None,
-        other => return Err(format!("tool arguments must be a JSON object, got: {other}")),
+        other => {
+            return Err(format!(
+                "tool arguments must be a JSON object, got: {other}"
+            ));
+        }
     };
 
     ensure_connected(pool, config).await?;
@@ -289,18 +333,20 @@ pub async fn call_tool(
         request = request.with_arguments(arguments);
     }
 
-    let result = conn
-        .service
-        .call_tool(request)
-        .await
-        .map_err(|e| format!("MCP tool call to {:?} on {:?} failed: {e}", tool_name, config.name))?;
+    let result = conn.service.call_tool(request).await.map_err(|e| {
+        format!(
+            "MCP tool call to {:?} on {:?} failed: {e}",
+            tool_name, config.name
+        )
+    })?;
 
     let content = result
         .content
         .into_iter()
         .map(|block| match block {
             McpContentBlock::Text(text) => text.text,
-            other => serde_json::to_string(&other).unwrap_or_else(|_| "<unrepresentable MCP content block>".to_string()),
+            other => serde_json::to_string(&other)
+                .unwrap_or_else(|_| "<unrepresentable MCP content block>".to_string()),
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -318,7 +364,9 @@ mod tests {
 
     use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
     use rmcp::handler::server::tool::ToolCallContext;
-    use rmcp::model::{CallToolResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo};
+    use rmcp::model::{
+        CallToolResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
+    };
     use rmcp::service::RequestContext;
     use rmcp::{ErrorData, RoleServer, ServerHandler};
     use tokio::sync::RwLock;
@@ -348,14 +396,18 @@ mod tests {
                 rmcp::model::Tool::new(
                     "echo",
                     "Echoes its input back",
-                    Arc::new(serde_json::from_value(serde_json::json!({"type": "object"})).unwrap()),
+                    Arc::new(
+                        serde_json::from_value(serde_json::json!({"type": "object"})).unwrap(),
+                    ),
                 ),
                 |ctx| {
                     Box::pin(async move {
                         let args = ctx.arguments.clone().unwrap_or_default();
-                        Ok(CallToolResult::success(vec![McpContentBlock::Text(rmcp::model::TextContent::new(
-                            serde_json::to_string(&args).unwrap_or_default(),
-                        ))])
+                        Ok(CallToolResult::success(vec![McpContentBlock::Text(
+                            rmcp::model::TextContent::new(
+                                serde_json::to_string(&args).unwrap_or_default(),
+                            ),
+                        )])
                         .into())
                     })
                 },
@@ -365,13 +417,17 @@ mod tests {
                     rmcp::model::Tool::new(
                         "second_tool",
                         "A second tool, initially hidden",
-                        Arc::new(serde_json::from_value(serde_json::json!({"type": "object"})).unwrap()),
+                        Arc::new(
+                            serde_json::from_value(serde_json::json!({"type": "object"})).unwrap(),
+                        ),
                     ),
                     |_ctx| Box::pin(async { Ok(CallToolResult::default().into()) }),
                 ));
                 router.disable_route("second_tool");
             }
-            Self { router: Arc::new(RwLock::new(router)) }
+            Self {
+                router: Arc::new(RwLock::new(router)),
+            }
         }
     }
 
@@ -386,7 +442,9 @@ mod tests {
             context: RequestContext<RoleServer>,
         ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
             let router = self.router.read().await;
-            router.call(ToolCallContext::new(self, request, context)).await
+            router
+                .call(ToolCallContext::new(self, request, context))
+                .await
         }
 
         async fn list_tools(
@@ -395,7 +453,10 @@ mod tests {
             _context: RequestContext<RoleServer>,
         ) -> Result<ListToolsResult, ErrorData> {
             let router = self.router.read().await;
-            Ok(ListToolsResult { tools: router.list_all(), ..Default::default() })
+            Ok(ListToolsResult {
+                tools: router.list_all(),
+                ..Default::default()
+            })
         }
 
         fn on_initialized(
@@ -438,15 +499,31 @@ mod tests {
         // `.abort()`ing it at the very end; `mem::forget` gets the same
         // "never dropped" effect without threading the handle through
         // every test.
-        let server_handle = tokio::spawn(async move { server_for_task.serve(server_transport).await });
+        let server_handle =
+            tokio::spawn(async move { server_for_task.serve(server_transport).await });
         std::mem::forget(server_handle);
 
         let stale = Arc::new(AtomicBool::new(false));
-        let handler = SmeltClientHandler { stale: stale.clone() };
-        let service = handler.serve(client_transport).await.expect("client should connect");
-        let tools = service.list_all_tools().await.expect("list_all_tools should succeed");
+        let handler = SmeltClientHandler {
+            stale: stale.clone(),
+        };
+        let service = handler
+            .serve(client_transport)
+            .await
+            .expect("client should connect");
+        let tools = service
+            .list_all_tools()
+            .await
+            .expect("list_all_tools should succeed");
 
-        REGISTRY.lock().await.insert(server_id, Connection { service, tools, stale });
+        REGISTRY.lock().await.insert(
+            server_id,
+            Connection {
+                service,
+                tools,
+                stale,
+            },
+        );
         server
     }
 
@@ -458,7 +535,8 @@ mod tests {
     /// reason. OAuth-touching behavior gets its own `#[sqlx::test]`s in
     /// `mcp_oauth.rs`.
     fn test_pool() -> sqlx::PgPool {
-        sqlx::PgPool::connect_lazy("postgres://unused:unused@localhost/unused").expect("lazy pool construction never fails")
+        sqlx::PgPool::connect_lazy("postgres://unused:unused@localhost/unused")
+            .expect("lazy pool construction never fails")
     }
 
     fn test_config(id: i64, name: &str) -> McpServerConfig {
@@ -478,11 +556,21 @@ mod tests {
 
     #[test]
     fn test_parse_tool_name_splits_server_and_tool() {
-        assert_eq!(parse_tool_name("mcp__github__list_issues"), Some(("github", "list_issues")));
+        assert_eq!(
+            parse_tool_name("mcp__github__list_issues"),
+            Some(("github", "list_issues"))
+        );
         // A tool name that itself contains further underscores still
         // resolves — only the first `__` after the server name matters.
-        assert_eq!(parse_tool_name("mcp__github__list__issues"), Some(("github", "list__issues")));
-        assert_eq!(parse_tool_name("read_file"), None, "native tool names must not be misparsed as MCP-dispatched");
+        assert_eq!(
+            parse_tool_name("mcp__github__list__issues"),
+            Some(("github", "list__issues"))
+        );
+        assert_eq!(
+            parse_tool_name("read_file"),
+            None,
+            "native tool names must not be misparsed as MCP-dispatched"
+        );
         assert_eq!(parse_tool_name("mcp__no_separator"), None);
     }
 
@@ -503,7 +591,8 @@ mod tests {
         let server_id = -1001;
         register_test_connection(server_id, false).await;
 
-        let definitions = tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")]).await;
+        let definitions =
+            tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")]).await;
 
         assert_eq!(definitions.len(), 1);
         assert_eq!(definitions[0].name, "mcp__test-server__echo");
@@ -517,11 +606,19 @@ mod tests {
         let server_id = -1002;
         register_test_connection(server_id, false).await;
 
-        let result = call_tool(&test_pool(), &test_config(server_id, "test-server"), "echo", serde_json::json!({"hello": "world"}))
-            .await
-            .expect("call_tool should succeed");
+        let result = call_tool(
+            &test_pool(),
+            &test_config(server_id, "test-server"),
+            "echo",
+            serde_json::json!({"hello": "world"}),
+        )
+        .await
+        .expect("call_tool should succeed");
 
-        assert!(result.contains("hello"), "expected echoed arguments in result, got: {result}");
+        assert!(
+            result.contains("hello"),
+            "expected echoed arguments in result, got: {result}"
+        );
         assert!(result.contains("world"));
 
         REGISTRY.lock().await.remove(&server_id);
@@ -538,8 +635,13 @@ mod tests {
         // `notify_if_visible`).
         let server = register_test_connection(server_id, true).await;
 
-        let before = tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")]).await;
-        assert_eq!(before.len(), 1, "starts with just the echo tool; second_tool begins disabled");
+        let before =
+            tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")]).await;
+        assert_eq!(
+            before.len(),
+            1,
+            "starts with just the echo tool; second_tool begins disabled"
+        );
 
         // Real behavior, not a manual eviction: nothing but the
         // notification tells tool_definitions_for the cached list is stale.
@@ -549,9 +651,14 @@ mod tests {
         // transport and flip the connection's `stale` flag.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let after = tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")]).await;
+        let after =
+            tool_definitions_for(&test_pool(), &[test_config(server_id, "test-server")]).await;
         let names: Vec<&str> = after.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(after.len(), 2, "expected both tools after the list_changed notification, got: {names:?}");
+        assert_eq!(
+            after.len(),
+            2,
+            "expected both tools after the list_changed notification, got: {names:?}"
+        );
         assert!(names.contains(&"mcp__test-server__second_tool"));
 
         REGISTRY.lock().await.remove(&server_id);
@@ -577,8 +684,12 @@ mod tests {
         // `test_config`'s URL is deliberately unroutable, so this must
         // report an error rather than panicking or hanging.
         let server_id = -1005;
-        let result = connection_check(&test_pool(), &test_config(server_id, "unreachable-server")).await;
-        assert!(result.is_err(), "expected an unreachable server to report Err, got {result:?}");
+        let result =
+            connection_check(&test_pool(), &test_config(server_id, "unreachable-server")).await;
+        assert!(
+            result.is_err(),
+            "expected an unreachable server to report Err, got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -586,12 +697,22 @@ mod tests {
         let attempts = std::sync::atomic::AtomicU32::new(0);
         let result = retry_once(|| {
             let n = attempts.fetch_add(1, Ordering::SeqCst);
-            async move { if n == 0 { Err("first attempt fails".to_string()) } else { Ok(42) } }
+            async move {
+                if n == 0 {
+                    Err("first attempt fails".to_string())
+                } else {
+                    Ok(42)
+                }
+            }
         })
         .await;
 
         assert_eq!(result, Ok(42));
-        assert_eq!(attempts.load(Ordering::SeqCst), 2, "expected exactly one retry after the first failure");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "expected exactly one retry after the first failure"
+        );
     }
 
     #[tokio::test]
@@ -604,6 +725,10 @@ mod tests {
         .await;
 
         assert_eq!(result, Err("still failing".to_string()));
-        assert_eq!(attempts.load(Ordering::SeqCst), 2, "expected no more than one retry");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "expected no more than one retry"
+        );
     }
 }

@@ -14,11 +14,13 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use k8s_openapi::api::core::v1::{
-    Container, PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, Pod, PodSpec,
-    ResourceRequirements, Volume, VolumeMount, VolumeResourceRequirements,
+    Container, PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource,
+    Pod, PodSpec, ResourceRequirements, Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+#[cfg(test)]
+use kube::api::ListParams;
 use kube::api::{Api, AttachParams, DeleteParams, PostParams};
 use serde::Deserialize;
 use sqlx::PgPool;
@@ -29,7 +31,16 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use crate::anthropic::ContentBlock;
 use crate::{db, events};
 
+// `cfg(test)` rather than an env var deliberately: the whole point is that
+// there's no way to forget to isolate a test run from `dx serve`'s real
+// dev-instance pods — an env var can simply not be set. The `park`
+// ServiceAccount (see k8s/smelt-park-rbac.yaml) is scoped to both
+// namespaces via two separate Role/RoleBinding pairs, so the one
+// `KUBECONFIG`/token already in use keeps working unchanged for either.
+#[cfg(not(test))]
 const NAMESPACE: &str = "smelt-park";
+#[cfg(test)]
+const NAMESPACE: &str = "smelt-park-test";
 const DEFAULT_RUNNING_WAIT_TIMEOUT_SECS: u64 = 30;
 
 /// Matches `sandbox_agent`'s own `LISTEN_ADDR` port.
@@ -44,6 +55,11 @@ pub enum SandboxError {
     /// `Terminating`, `Failed`). What to do here is an open question in
     /// the plan — not resolved, just surfaced rather than guessed at.
     ExistingPodNotRunning(String),
+    // Only ever constructed by `Sandbox::exec`, which is itself only called
+    // by the real-cluster tests below (see its own cfg) — production code
+    // talks to the sandbox through `sandbox_agent`'s WebSocket protocol
+    // instead, never this lower-level kube-exec path.
+    #[cfg_attr(not(test), allow(dead_code))]
     Io(std::io::Error),
     WebSocket(tokio_tungstenite::tungstenite::Error),
     /// A `sandbox_pods`/`sandbox_terminals` query failed — see the plan's
@@ -63,10 +79,15 @@ impl std::fmt::Display for SandboxError {
                 write!(f, "existing sandbox pod is not Running (phase: {phase})")
             }
             SandboxError::Io(e) => write!(f, "I/O error reading exec output: {e}"),
-            SandboxError::WebSocket(e) => write!(f, "WebSocket error talking to sandbox agent: {e}"),
+            SandboxError::WebSocket(e) => {
+                write!(f, "WebSocket error talking to sandbox agent: {e}")
+            }
             SandboxError::Db(e) => write!(f, "database error: {e}"),
             SandboxError::PodAlreadyExists => {
-                write!(f, "a pod already exists for this conversation; call terminate_pod first")
+                write!(
+                    f,
+                    "a pod already exists for this conversation; call terminate_pod first"
+                )
             }
         }
     }
@@ -137,7 +158,11 @@ fn volume_mounts_for(volumes: &[db::SandboxVolume]) -> (Vec<Volume>, Vec<VolumeM
                 }),
                 ..Default::default()
             };
-            let mount = VolumeMount { name, mount_path: v.mount_path.clone(), ..Default::default() };
+            let mount = VolumeMount {
+                name,
+                mount_path: v.mount_path.clone(),
+                ..Default::default()
+            };
             (volume, mount)
         })
         .unzip()
@@ -158,25 +183,45 @@ fn immediate_delete_params() -> DeleteParams {
 
 pub struct Sandbox {
     pod_name: String,
+    // Only read by `exec` below, which is itself real-cluster-test-only
+    // (see its own cfg) — production code talks to the sandbox through
+    // `sandbox_agent`'s WebSocket protocol instead.
+    #[cfg_attr(not(test), allow(dead_code))]
     client: kube::Client,
     cleanup_tx: mpsc::UnboundedSender<String>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct ExecResult {
     pub stdout: String,
-    pub stderr: String,
     pub exit_code: i32,
 }
 
 impl Sandbox {
+    /// Lower-level kube-exec path used only by the real-cluster tests below
+    /// to check a raw property of the pod itself (its mounted volumes, its
+    /// non-root user, ...) independent of `sandbox_agent`'s own WebSocket
+    /// terminal protocol, which is what production code actually uses.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn exec(&self, command: &[&str]) -> Result<ExecResult, SandboxError> {
         let pods = pods_api(&self.client);
         let mut attached = pods
-            .exec(&self.pod_name, command.iter().copied(), &AttachParams::default())
+            .exec(
+                &self.pod_name,
+                command.iter().copied(),
+                &AttachParams::default(),
+            )
             .await?;
 
-        let mut stdout_reader = attached.stdout().expect("stdout requested by AttachParams::default()");
-        let mut stderr_reader = attached.stderr().expect("stderr requested by AttachParams::default()");
+        let mut stdout_reader = attached
+            .stdout()
+            .expect("stdout requested by AttachParams::default()");
+        // Requested (so the exec session doesn't wait on a caller that will
+        // never read it) but discarded — no caller has needed stderr
+        // separately from stdout yet.
+        let mut stderr_reader = attached
+            .stderr()
+            .expect("stderr requested by AttachParams::default()");
         let mut stdout = String::new();
         let mut stderr = String::new();
         let (stdout_res, stderr_res) = tokio::join!(
@@ -195,7 +240,6 @@ impl Sandbox {
 
         Ok(ExecResult {
             stdout,
-            stderr,
             exit_code: extract_exit_code(status),
         })
     }
@@ -205,7 +249,10 @@ impl Sandbox {
 /// all (implying 0); on a non-zero exit it's a `StatusCause` with
 /// `reason == "ExitCode"` and the code itself, as a string, in `message`.
 /// Verified against a real cluster, not assumed — see the plan.
-fn extract_exit_code(status: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Status>) -> i32 {
+#[cfg_attr(not(test), allow(dead_code))]
+fn extract_exit_code(
+    status: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Status>,
+) -> i32 {
     status
         .and_then(|s| s.details)
         .and_then(|d| d.causes)
@@ -251,10 +298,34 @@ impl SandboxManager {
         cpu: &str,
         volumes: &[db::SandboxVolume],
     ) -> Result<Sandbox, SandboxError> {
+        self.create_with_running_timeout(session_id, memory, cpu, volumes, running_wait_timeout())
+            .await
+    }
+
+    /// Split out of `create` so a test can exercise the "pod never reaches
+    /// `Running`" path with a short, explicit timeout instead of either
+    /// waiting out the real (30s+) default or mutating the
+    /// `SANDBOX_RUNNING_WAIT_TIMEOUT_SECS` env var — a process-global that
+    /// other tests read concurrently, so overriding it here would risk
+    /// spuriously timing *them* out instead. `create` itself just forwards
+    /// the real env-driven default.
+    async fn create_with_running_timeout(
+        &self,
+        session_id: &str,
+        memory: &str,
+        cpu: &str,
+        volumes: &[db::SandboxVolume],
+        running_timeout: Duration,
+    ) -> Result<Sandbox, SandboxError> {
         let pods = pods_api(&self.client);
         let name = format!("sandbox-{session_id}");
 
-        match pods.get_opt(&name).await? {
+        // Tracks whether *this call* created the pod, as opposed to
+        // reusing one that already existed — only a pod we just created is
+        // ours to delete if it never reaches `Running` below; a reused
+        // pod's non-`Running` status could be a transient blip on
+        // something another part of the system still depends on.
+        let just_created = match pods.get_opt(&name).await? {
             Some(pod) => {
                 let phase = pod.status.and_then(|s| s.phase).unwrap_or_default();
                 if phase != "Running" {
@@ -266,13 +337,31 @@ impl SandboxManager {
                 // Reuse: what makes an active conversation's sandbox
                 // survive a smelt server restart, see the plan's "Restart
                 // behavior" section.
+                false
             }
             None => {
-                pods.create(&PostParams::default(), &build_pod_spec(&name, memory, cpu, volumes)).await?;
+                pods.create(
+                    &PostParams::default(),
+                    &build_pod_spec(&name, memory, cpu, volumes),
+                )
+                .await?;
+                true
             }
-        }
+        };
 
-        wait_for_running(&pods, &name).await?;
+        if let Err(e) = wait_for_running_with_timeout(&pods, &name, running_timeout).await {
+            if just_created {
+                // Nothing else ever cleans this up: `Sandbox::drop`'s
+                // cleanup-queue only fires for a `Sandbox` we actually
+                // return, which never happens on this path. Left alone,
+                // it sits forever — worse, a caller that derives this same
+                // pod name deterministically (as `sandbox_volume_pvc_name`
+                // does; see `test_terminal_lifecycle_end_to_end`'s own
+                // precheck) collides with it on every subsequent attempt.
+                pods.delete(&name, &immediate_delete_params()).await.ok();
+            }
+            return Err(e);
+        }
 
         Ok(Sandbox {
             pod_name: name,
@@ -281,9 +370,16 @@ impl SandboxManager {
         })
     }
 
+    /// Only called by the tests below (production relies on `Sandbox`'s own
+    /// `Drop` impl, which queues the same cleanup asynchronously) — kept as
+    /// an explicit, synchronous alternative for tests that need to assert
+    /// on the pod's absence immediately after deleting, without racing the
+    /// cleanup queue.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn delete(&self, sandbox: Sandbox) -> Result<(), SandboxError> {
         let pods = pods_api(&self.client);
-        pods.delete(&sandbox.pod_name, &immediate_delete_params()).await?;
+        pods.delete(&sandbox.pod_name, &immediate_delete_params())
+            .await?;
         // Disarms Drop: safe to skip since none of Sandbox's fields have
         // meaningful Drop side effects of their own (a String, a
         // cheaply-Clone/Arc-backed kube::Client, an UnboundedSender whose
@@ -298,12 +394,18 @@ impl SandboxManager {
 /// *default* a pod gets when `create_pod`'s caller doesn't specify its own
 /// `memory_limit` — see the plan's "Per-pod limit overrides."
 fn default_memory_limit() -> String {
-    std::env::var("SANDBOX_MEMORY_LIMIT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "8Gi".to_string())
+    std::env::var("SANDBOX_MEMORY_LIMIT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "8Gi".to_string())
 }
 
 /// `SANDBOX_CPU_LIMIT`, default `"1"` — see `default_memory_limit`.
 fn default_cpu_limit() -> String {
-    std::env::var("SANDBOX_CPU_LIMIT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "1".to_string())
+    std::env::var("SANDBOX_CPU_LIMIT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "1".to_string())
 }
 
 /// `SANDBOX_IMAGE`, default `"docker.io/library/smelt-sandbox:latest"` —
@@ -375,7 +477,10 @@ fn build_pod_spec(name: &str, memory: &str, cpu: &str, volumes: &[db::SandboxVol
                 // the sandbox agent, so it's already running (and keeping
                 // the pod alive) the moment the container starts. See
                 // docs/projects/plans/sandbox-native-environment.md.
-                resources: Some(ResourceRequirements { limits: Some(limits), ..Default::default() }),
+                resources: Some(ResourceRequirements {
+                    limits: Some(limits),
+                    ..Default::default()
+                }),
                 volume_mounts: (!volume_mounts.is_empty()).then_some(volume_mounts),
                 ..Default::default()
             }],
@@ -387,8 +492,19 @@ fn build_pod_spec(name: &str, memory: &str, cpu: &str, volumes: &[db::SandboxVol
     }
 }
 
+// Only called by the "no-agent pod" real-cluster test below — `create`
+// itself now goes straight to `create_with_running_timeout`.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn wait_for_running(pods: &Api<Pod>, name: &str) -> Result<(), SandboxError> {
-    tokio::time::timeout(running_wait_timeout(), async {
+    wait_for_running_with_timeout(pods, name, running_wait_timeout()).await
+}
+
+async fn wait_for_running_with_timeout(
+    pods: &Api<Pod>,
+    name: &str,
+    timeout: Duration,
+) -> Result<(), SandboxError> {
+    tokio::time::timeout(timeout, async {
         loop {
             let pod = pods.get(name).await?;
             if pod.status.and_then(|s| s.phase).as_deref() == Some("Running") {
@@ -404,9 +520,16 @@ async fn wait_for_running(pods: &Api<Pod>, name: &str) -> Result<(), SandboxErro
 async fn drain_cleanup_queue(client: kube::Client, mut rx: mpsc::UnboundedReceiver<String>) {
     let pods = pods_api(&client);
     while let Some(name) = rx.recv().await {
-        match tokio::time::timeout(Duration::from_secs(30), pods.delete(&name, &immediate_delete_params())).await {
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            pods.delete(&name, &immediate_delete_params()),
+        )
+        .await
+        {
             Ok(Ok(_)) => tracing::info!(pod = %name, "cleaned up dropped sandbox"),
-            Ok(Err(e)) => tracing::error!(pod = %name, error = %e, "failed to clean up dropped sandbox"),
+            Ok(Err(e)) => {
+                tracing::error!(pod = %name, error = %e, "failed to clean up dropped sandbox")
+            }
             Err(_) => tracing::error!(pod = %name, "timed out cleaning up dropped sandbox"),
         }
     }
@@ -436,7 +559,9 @@ pub async fn init() -> &'static SandboxManager {
 }
 
 pub fn get() -> &'static SandboxManager {
-    MANAGER.get().expect("sandbox not initialized; call sandbox::init() first")
+    MANAGER
+        .get()
+        .expect("sandbox not initialized; call sandbox::init() first")
 }
 
 // --- Terminal: pod, terminal, and command are three separate, explicitly
@@ -472,16 +597,28 @@ impl std::fmt::Display for TerminalError {
         match self {
             TerminalError::Sandbox(e) => write!(f, "{e}"),
             TerminalError::NoPod => {
-                write!(f, "no such pod (it doesn't exist, isn't Running, or was already terminated)")
+                write!(
+                    f,
+                    "no such pod (it doesn't exist, isn't Running, or was already terminated)"
+                )
             }
             TerminalError::NoTerminal => {
-                write!(f, "no such terminal (it doesn't exist, or its pod's agent is unreachable)")
+                write!(
+                    f,
+                    "no such terminal (it doesn't exist, or its pod's agent is unreachable)"
+                )
             }
             TerminalError::TerminalStillExists => {
-                write!(f, "this pod still has a live terminal; call terminate_terminal on it first")
+                write!(
+                    f,
+                    "this pod still has a live terminal; call terminate_terminal on it first"
+                )
             }
             TerminalError::CommandStillRunning => {
-                write!(f, "a command is still running in this terminal; send_signal or wait for it to finish first")
+                write!(
+                    f,
+                    "a command is still running in this terminal; send_signal or wait for it to finish first"
+                )
             }
             TerminalError::FileOperation(message) => write!(f, "{message}"),
         }
@@ -576,7 +713,8 @@ struct TerminalConnection {
     /// a whole). Resolved by `resolve_pending_file_request` when a
     /// `file_read`/`file_written`/`file_edited`/`directory_listed`/
     /// `file_error` message arrives — see `request_file_action`.
-    pending_file_requests: StdMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<FileResponse, String>>>>,
+    pending_file_requests:
+        StdMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<FileResponse, String>>>>,
     /// Resolved once, when the connection is first established (see
     /// `connect`) — lets `handle_agent_message` publish a
     /// `SandboxCommandUpdate` for every output line and completion without
@@ -595,19 +733,32 @@ static TERMINAL_CONNECTIONS: LazyLock<StdMutex<HashMap<i64, Arc<TerminalConnecti
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 fn registry_get(pod_id: i64) -> Option<Arc<TerminalConnection>> {
-    TERMINAL_CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner()).get(&pod_id).cloned()
+    TERMINAL_CONNECTIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&pod_id)
+        .cloned()
 }
 
 fn registry_contains(pod_id: i64) -> bool {
-    TERMINAL_CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&pod_id)
+    TERMINAL_CONNECTIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&pod_id)
 }
 
 fn register(pod_id: i64, conn: Arc<TerminalConnection>) {
-    TERMINAL_CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, conn);
+    TERMINAL_CONNECTIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(pod_id, conn);
 }
 
 fn deregister(pod_id: i64) {
-    TERMINAL_CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner()).remove(&pod_id);
+    TERMINAL_CONNECTIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&pod_id);
 }
 
 /// Like `deregister`, but only actually removes the entry — and reports
@@ -619,7 +770,9 @@ fn deregister(pod_id: i64) {
 /// deliberately torn down" apart from "this connection just crashed"
 /// without any new state.
 fn deregister_if_current(pod_id: i64, conn: &Arc<TerminalConnection>) -> bool {
-    let mut connections = TERMINAL_CONNECTIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut connections = TERMINAL_CONNECTIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     match connections.get(&pod_id) {
         Some(current) if Arc::ptr_eq(current, conn) => {
             connections.remove(&pod_id);
@@ -719,22 +872,31 @@ pub async fn create_pod(
     memory_limit: Option<String>,
     cpu_limit: Option<String>,
 ) -> Result<i64, SandboxError> {
-    let existing = db::list_sandbox_pods(pool, conversation_id).await.map_err(SandboxError::Db)?;
+    let existing = db::list_sandbox_pods(pool, conversation_id)
+        .await
+        .map_err(SandboxError::Db)?;
     check_pod_guard(&existing)?;
 
     let memory = memory_limit.unwrap_or_else(default_memory_limit);
     let cpu = cpu_limit.unwrap_or_else(default_cpu_limit);
 
     let manager = get();
-    let row = db::create_sandbox_pod(pool, conversation_id).await.map_err(SandboxError::Db)?;
-    let volumes = db::list_sandbox_volumes(pool).await.map_err(SandboxError::Db)?;
+    let row = db::create_sandbox_pod(pool, conversation_id)
+        .await
+        .map_err(SandboxError::Db)?;
+    let volumes = db::list_sandbox_volumes(pool)
+        .await
+        .map_err(SandboxError::Db)?;
     // Reuses SandboxManager::create's existing get-or-create-on-Running
     // logic rather than duplicating it — the returned Sandbox is only a
     // handle for exec/Drop-cleanup purposes, neither of which apply here
     // (this pod persists independently of any in-process value), so it's
     // disarmed immediately, the same `mem::forget` pattern
     // `SandboxManager::delete` itself already uses for the same reason.
-    match manager.create(&row.id.to_string(), &memory, &cpu, &volumes).await {
+    match manager
+        .create(&row.id.to_string(), &memory, &cpu, &volumes)
+        .await
+    {
         Ok(sandbox) => {
             std::mem::forget(sandbox);
             events::publish(
@@ -783,7 +945,10 @@ pub async fn terminate_pod(pool: &PgPool, conversation_id: i64) -> Result<(), Te
 /// *before* touching the k8s API, not after — see the plan's "How" on why
 /// that ordering is what lets a deliberate teardown always win the race
 /// against the connection's own reader task noticing the drop.
-async fn force_terminate_pod(pool: &PgPool, pod_id: i64) -> Result<Option<db::SandboxPod>, SandboxError> {
+async fn force_terminate_pod(
+    pool: &PgPool,
+    pod_id: i64,
+) -> Result<Option<db::SandboxPod>, SandboxError> {
     deregister(pod_id);
 
     let manager = get();
@@ -793,7 +958,9 @@ async fn force_terminate_pod(pool: &PgPool, pod_id: i64) -> Result<Option<db::Sa
         pods.delete(&name, &immediate_delete_params()).await?;
     }
 
-    let row = db::terminate_sandbox_pod(pool, pod_id).await.map_err(SandboxError::Db)?;
+    let row = db::terminate_sandbox_pod(pool, pod_id)
+        .await
+        .map_err(SandboxError::Db)?;
     if let Some(row) = &row {
         events::publish(
             row.conversation_id,
@@ -810,7 +977,9 @@ async fn force_terminate_pod(pool: &PgPool, pod_id: i64) -> Result<Option<db::Sa
 pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInfo>, SandboxError> {
     let manager = get();
     let pods = pods_api(&manager.client);
-    let rows = db::list_sandbox_pods(pool, conversation_id).await.map_err(SandboxError::Db)?;
+    let rows = db::list_sandbox_pods(pool, conversation_id)
+        .await
+        .map_err(SandboxError::Db)?;
     let mut result = Vec::with_capacity(rows.len());
     for row in rows {
         let name = pod_name(row.id);
@@ -820,7 +989,10 @@ pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInf
             .and_then(|p| p.status)
             .and_then(|s| s.phase)
             .unwrap_or_else(|| "Unknown".to_string());
-        result.push(PodInfo { pod_id: row.id, status });
+        result.push(PodInfo {
+            pod_id: row.id,
+            status,
+        });
     }
     Ok(result)
 }
@@ -841,7 +1013,10 @@ fn default_volume_storage_size() -> String {
 
 fn build_volume_pvc_spec(volume_id: i64) -> PersistentVolumeClaim {
     let mut requests = std::collections::BTreeMap::new();
-    requests.insert("storage".to_string(), Quantity(default_volume_storage_size()));
+    requests.insert(
+        "storage".to_string(),
+        Quantity(default_volume_storage_size()),
+    );
 
     PersistentVolumeClaim {
         metadata: ObjectMeta {
@@ -851,7 +1026,10 @@ fn build_volume_pvc_spec(volume_id: i64) -> PersistentVolumeClaim {
         },
         spec: Some(PersistentVolumeClaimSpec {
             access_modes: Some(vec!["ReadWriteOnce".to_string()]),
-            resources: Some(VolumeResourceRequirements { requests: Some(requests), ..Default::default() }),
+            resources: Some(VolumeResourceRequirements {
+                requests: Some(requests),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         ..Default::default()
@@ -865,13 +1043,22 @@ fn build_volume_pvc_spec(volume_id: i64) -> PersistentVolumeClaim {
 /// `list_sandbox_volumes` would show as usable but that doesn't actually
 /// have a PVC behind it. Same rollback shape `create_pod` already uses for
 /// its own DB-row-then-k8s-object ordering.
-pub async fn create_volume(pool: &PgPool, name: &str, mount_path: &str) -> Result<i64, SandboxError> {
+pub async fn create_volume(
+    pool: &PgPool,
+    name: &str,
+    mount_path: &str,
+) -> Result<i64, SandboxError> {
     let resolved_path = resolve_mount_path(mount_path);
-    let row = db::create_sandbox_volume(pool, name, &resolved_path).await.map_err(SandboxError::Db)?;
+    let row = db::create_sandbox_volume(pool, name, &resolved_path)
+        .await
+        .map_err(SandboxError::Db)?;
 
     let manager = get();
     let pvcs = pvc_api(&manager.client);
-    if let Err(e) = pvcs.create(&PostParams::default(), &build_volume_pvc_spec(row.id)).await {
+    if let Err(e) = pvcs
+        .create(&PostParams::default(), &build_volume_pvc_spec(row.id))
+        .await
+    {
         let _ = db::delete_sandbox_volume(pool, row.id).await;
         return Err(e.into());
     }
@@ -888,7 +1075,9 @@ pub async fn delete_volume(pool: &PgPool, id: i64) -> Result<(), SandboxError> {
     if pvcs.get_opt(&pvc_name).await?.is_some() {
         pvcs.delete(&pvc_name, &DeleteParams::default()).await?;
     }
-    db::delete_sandbox_volume(pool, id).await.map_err(SandboxError::Db)?;
+    db::delete_sandbox_volume(pool, id)
+        .await
+        .map_err(SandboxError::Db)?;
     Ok(())
 }
 
@@ -966,7 +1155,10 @@ pub async fn terminate_terminal(pool: &PgPool, terminal_id: i64) -> Result<(), T
 /// itself. `status` reflects whether the *owning pod's* connection is
 /// currently live, not anything about the terminal individually (there's
 /// nothing per-terminal to check — one connection serves a whole pod).
-pub async fn list_terminals(pool: &PgPool, conversation_id: i64) -> Result<Vec<TerminalInfo>, SandboxError> {
+pub async fn list_terminals(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Vec<TerminalInfo>, SandboxError> {
     let rows = db::list_sandbox_terminals_for_conversation(pool, conversation_id)
         .await
         .map_err(SandboxError::Db)?;
@@ -975,7 +1167,12 @@ pub async fn list_terminals(pool: &PgPool, conversation_id: i64) -> Result<Vec<T
         .map(|t| TerminalInfo {
             terminal_id: t.id,
             pod_id: t.pod_id,
-            status: if registry_contains(t.pod_id) { "connected" } else { "disconnected" }.to_string(),
+            status: if registry_contains(t.pod_id) {
+                "connected"
+            } else {
+                "disconnected"
+            }
+            .to_string(),
         })
         .collect())
 }
@@ -991,12 +1188,16 @@ pub async fn send_command(
     command_id: &str,
     command: &str,
 ) -> Result<(), TerminalError> {
-    let pod_id = db::sandbox_terminal_pod_id(pool, terminal_id).await?.ok_or(TerminalError::NoTerminal)?;
+    let pod_id = db::sandbox_terminal_pod_id(pool, terminal_id)
+        .await?
+        .ok_or(TerminalError::NoTerminal)?;
     let conn = reconnect_if_needed(pool, pod_id).await?;
     let payload =
         serde_json::json!({"action": "command", "terminal_id": terminal_id.to_string(), "id": command_id, "command": command})
             .to_string();
-    conn.outgoing.send(payload).map_err(|_| TerminalError::NoTerminal)
+    conn.outgoing
+        .send(payload)
+        .map_err(|_| TerminalError::NoTerminal)
 }
 
 /// Sends `{"action": "signal", "terminal_id", "id": command_id,
@@ -1008,12 +1209,16 @@ pub async fn send_signal(
     command_id: &str,
     signal: &str,
 ) -> Result<(), TerminalError> {
-    let pod_id = db::sandbox_terminal_pod_id(pool, terminal_id).await?.ok_or(TerminalError::NoTerminal)?;
+    let pod_id = db::sandbox_terminal_pod_id(pool, terminal_id)
+        .await?
+        .ok_or(TerminalError::NoTerminal)?;
     let conn = reconnect_if_needed(pool, pod_id).await?;
     let payload =
         serde_json::json!({"action": "signal", "terminal_id": terminal_id.to_string(), "id": command_id, "signal": signal})
             .to_string();
-    conn.outgoing.send(payload).map_err(|_| TerminalError::NoTerminal)
+    conn.outgoing
+        .send(payload)
+        .map_err(|_| TerminalError::NoTerminal)
 }
 
 /// Deletes every pod that exists for this conversation, unconditionally
@@ -1026,7 +1231,9 @@ pub async fn send_signal(
 pub async fn teardown_conversation(pool: &PgPool, conversation_id: i64) {
     let manager = get();
     let pods = pods_api(&manager.client);
-    let rows = db::list_sandbox_pods(pool, conversation_id).await.unwrap_or_default();
+    let rows = db::list_sandbox_pods(pool, conversation_id)
+        .await
+        .unwrap_or_default();
     for row in rows {
         deregister(row.id);
         let name = pod_name(row.id);
@@ -1045,7 +1252,10 @@ pub async fn teardown_conversation(pool: &PgPool, conversation_id: i64) {
 /// answers) — see the plan's "Agent crash recovery": cleanup only, never
 /// touches the pod, and does not attempt to launch a fresh agent itself
 /// (that's `ensure_pod_connection`'s job, used only by `create_terminal`).
-async fn reconnect_if_needed(pool: &PgPool, pod_id: i64) -> Result<Arc<TerminalConnection>, TerminalError> {
+async fn reconnect_if_needed(
+    pool: &PgPool,
+    pod_id: i64,
+) -> Result<Arc<TerminalConnection>, TerminalError> {
     if let Some(conn) = registry_get(pod_id) {
         return Ok(conn);
     }
@@ -1072,7 +1282,13 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 fn reconnect_or_confirm_crash(
     pool: &PgPool,
     pod_id: i64,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<TerminalConnection>, TerminalError>> + Send + '_>> {
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<Arc<TerminalConnection>, TerminalError>>
+            + Send
+            + '_,
+    >,
+> {
     Box::pin(async move {
         let manager = get();
         let name = pod_name(pod_id);
@@ -1148,7 +1364,10 @@ pub async fn try_reconnect(pool: &PgPool, pod_id: i64) {
 /// `Running` and "the agent has bound its port" aren't quite the same
 /// instant, even though they're much closer together now than when the
 /// agent was injected and launched after the fact.
-async fn ensure_pod_connection(pool: &PgPool, pod_id: i64) -> Result<Arc<TerminalConnection>, TerminalError> {
+async fn ensure_pod_connection(
+    pool: &PgPool,
+    pod_id: i64,
+) -> Result<Arc<TerminalConnection>, TerminalError> {
     if let Some(conn) = registry_get(pod_id) {
         return Ok(conn);
     }
@@ -1186,13 +1405,24 @@ async fn ensure_pod_connection(pool: &PgPool, pod_id: i64) -> Result<Arc<Termina
 /// blocks (up to `ACK_TIMEOUT`) for its ack — see the plan's "Request/ack
 /// correlation, new this round." `send_command`/`send_signal` don't go
 /// through this; they stay fire-and-forget.
-async fn request_terminal_action(conn: &Arc<TerminalConnection>, terminal_id: i64, action: &str) -> Result<(), TerminalError> {
+async fn request_terminal_action(
+    conn: &Arc<TerminalConnection>,
+    terminal_id: i64,
+    action: &str,
+) -> Result<(), TerminalError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    conn.pending_acks.lock().unwrap_or_else(|e| e.into_inner()).insert(terminal_id, tx);
+    conn.pending_acks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(terminal_id, tx);
 
-    let payload = serde_json::json!({"action": action, "terminal_id": terminal_id.to_string()}).to_string();
+    let payload =
+        serde_json::json!({"action": action, "terminal_id": terminal_id.to_string()}).to_string();
     if conn.outgoing.send(payload).is_err() {
-        conn.pending_acks.lock().unwrap_or_else(|e| e.into_inner()).remove(&terminal_id);
+        conn.pending_acks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&terminal_id);
         return Err(TerminalError::NoTerminal);
     }
 
@@ -1204,7 +1434,10 @@ async fn request_terminal_action(conn: &Arc<TerminalConnection>, terminal_id: i6
         }
         Ok(Err(_)) => Err(TerminalError::NoTerminal), // sender dropped — connection ended before the ack arrived
         Err(_) => {
-            conn.pending_acks.lock().unwrap_or_else(|e| e.into_inner()).remove(&terminal_id);
+            conn.pending_acks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&terminal_id);
             Err(TerminalError::NoTerminal)
         }
     }
@@ -1216,7 +1449,13 @@ async fn request_terminal_action(conn: &Arc<TerminalConnection>, terminal_id: i6
 /// more than one in flight at a time in practice), not globally unique.
 fn generate_request_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    format!("freq-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos())
+    format!(
+        "freq-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
 }
 
 /// Sends a `read_file`/`write_file`/`edit_file`/`list_directory` protocol
@@ -1233,10 +1472,16 @@ async fn request_file_action(
     request_id: String,
 ) -> Result<FileResponse, TerminalError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    conn.pending_file_requests.lock().unwrap_or_else(|e| e.into_inner()).insert(request_id.clone(), tx);
+    conn.pending_file_requests
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(request_id.clone(), tx);
 
     if conn.outgoing.send(payload.to_string()).is_err() {
-        conn.pending_file_requests.lock().unwrap_or_else(|e| e.into_inner()).remove(&request_id);
+        conn.pending_file_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&request_id);
         return Err(TerminalError::NoTerminal);
     }
 
@@ -1245,7 +1490,10 @@ async fn request_file_action(
         Ok(Ok(Err(message))) => Err(TerminalError::FileOperation(message)),
         Ok(Err(_)) => Err(TerminalError::NoTerminal), // sender dropped — connection ended before the response arrived
         Err(_) => {
-            conn.pending_file_requests.lock().unwrap_or_else(|e| e.into_inner()).remove(&request_id);
+            conn.pending_file_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&request_id);
             Err(TerminalError::NoTerminal)
         }
     }
@@ -1273,7 +1521,9 @@ pub async fn read_file(
     });
     match request_file_action(&conn, payload, request_id).await? {
         FileResponse::Read(contents) => Ok(contents),
-        _ => Err(TerminalError::FileOperation("agent returned an unexpected response type for read_file".to_string())),
+        _ => Err(TerminalError::FileOperation(
+            "agent returned an unexpected response type for read_file".to_string(),
+        )),
     }
 }
 
@@ -1301,7 +1551,9 @@ pub async fn write_file(
     });
     match request_file_action(&conn, payload, request_id).await? {
         FileResponse::Written { hash } => Ok(hash),
-        _ => Err(TerminalError::FileOperation("agent returned an unexpected response type for write_file".to_string())),
+        _ => Err(TerminalError::FileOperation(
+            "agent returned an unexpected response type for write_file".to_string(),
+        )),
     }
 }
 
@@ -1336,19 +1588,28 @@ pub async fn edit_file(
     });
     match request_file_action(&conn, payload, request_id).await? {
         FileResponse::Edited { hash } => Ok(hash),
-        _ => Err(TerminalError::FileOperation("agent returned an unexpected response type for edit_file".to_string())),
+        _ => Err(TerminalError::FileOperation(
+            "agent returned an unexpected response type for edit_file".to_string(),
+        )),
     }
 }
 
 /// Lists `path` (one level, non-recursive) in this conversation's pod.
-pub async fn list_directory(pool: &PgPool, conversation_id: i64, path: &str) -> Result<Vec<DirEntry>, TerminalError> {
+pub async fn list_directory(
+    pool: &PgPool,
+    conversation_id: i64,
+    path: &str,
+) -> Result<Vec<DirEntry>, TerminalError> {
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
     let conn = reconnect_if_needed(pool, pod_id).await?;
     let request_id = generate_request_id();
-    let payload = serde_json::json!({"action": "list_directory", "request_id": request_id, "path": path});
+    let payload =
+        serde_json::json!({"action": "list_directory", "request_id": request_id, "path": path});
     match request_file_action(&conn, payload, request_id).await? {
         FileResponse::Listed(entries) => Ok(entries),
-        _ => Err(TerminalError::FileOperation("agent returned an unexpected response type for list_directory".to_string())),
+        _ => Err(TerminalError::FileOperation(
+            "agent returned an unexpected response type for list_directory".to_string(),
+        )),
     }
 }
 
@@ -1358,7 +1619,10 @@ pub async fn list_directory(pool: &PgPool, conversation_id: i64, path: &str) -> 
 /// terminals terminated — a dead agent was hosting all of them, not just
 /// one. A safe no-op if the pod had no terminals.
 async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64, reason: Option<String>) {
-    let conversation_id = db::sandbox_pod_conversation_id(pool, pod_id).await.ok().flatten();
+    let conversation_id = db::sandbox_pod_conversation_id(pool, pod_id)
+        .await
+        .ok()
+        .flatten();
     let mut found_live_terminal = false;
     if let Ok(terminals) = db::list_sandbox_terminals_for_pod(pool, pod_id).await {
         for terminal in terminals {
@@ -1396,7 +1660,13 @@ async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64, reason: Option<String>
                     "Sandbox pod {pod_id} stopped unexpectedly; every terminal running in it is no longer available."
                 ),
             };
-            let _ = db::create_message(pool, conversation_id, "user", &[ContentBlock::Text { text }]).await;
+            let _ = db::create_message(
+                pool,
+                conversation_id,
+                "user",
+                &[ContentBlock::Text { text }],
+            )
+            .await;
         }
     }
     if let Some(conversation_id) = conversation_id {
@@ -1489,10 +1759,16 @@ async fn connect(
         // A newer reconnect already having replaced this entry counts the
         // same way: not this task's job to react to.
         if deregister_if_current(pod_id, &conn_for_pump) {
-            tracing::info!(pod_id, "pod connection ended unexpectedly — attempting to reconnect or confirm a crash");
+            tracing::info!(
+                pod_id,
+                "pod connection ended unexpectedly — attempting to reconnect or confirm a crash"
+            );
             let _ = reconnect_or_confirm_crash(&pool, pod_id).await;
         } else {
-            tracing::info!(pod_id, "pod connection ended (already torn down or replaced)");
+            tracing::info!(
+                pod_id,
+                "pod connection ended (already torn down or replaced)"
+            );
         }
     });
 
@@ -1607,7 +1883,9 @@ async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, tex
             resolve_pending_file_request(
                 conn,
                 msg.request_id,
-                Ok(FileResponse::Written { hash: msg.hash.unwrap_or_default() }),
+                Ok(FileResponse::Written {
+                    hash: msg.hash.unwrap_or_default(),
+                }),
             );
             return;
         }
@@ -1615,7 +1893,9 @@ async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, tex
             resolve_pending_file_request(
                 conn,
                 msg.request_id,
-                Ok(FileResponse::Edited { hash: msg.hash.unwrap_or_default() }),
+                Ok(FileResponse::Edited {
+                    hash: msg.hash.unwrap_or_default(),
+                }),
             );
             return;
         }
@@ -1624,21 +1904,32 @@ async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, tex
                 .entries
                 .unwrap_or_default()
                 .into_iter()
-                .map(|e| DirEntry { name: e.name, is_dir: e.is_dir, size: e.size })
+                .map(|e| DirEntry {
+                    name: e.name,
+                    is_dir: e.is_dir,
+                    size: e.size,
+                })
                 .collect();
             resolve_pending_file_request(conn, msg.request_id, Ok(FileResponse::Listed(entries)));
             return;
         }
         Some("file_error") => {
-            resolve_pending_file_request(conn, msg.request_id, Err(msg.message.unwrap_or_default()));
+            resolve_pending_file_request(
+                conn,
+                msg.request_id,
+                Err(msg.message.unwrap_or_default()),
+            );
             return;
         }
         _ => {}
     }
 
-    if let (Some(id), Some(stream), Some(seq), Some(data)) =
-        (msg.id.clone(), msg.stream.clone(), msg.seq, msg.data.clone())
-    {
+    if let (Some(id), Some(stream), Some(seq), Some(data)) = (
+        msg.id.clone(),
+        msg.stream.clone(),
+        msg.seq,
+        msg.data.clone(),
+    ) {
         if let Err(e) = db::append_terminal_event(pool, &id, &stream, seq, &data).await {
             tracing::error!(command_id = %id, error = %e, "failed to record terminal output");
         }
@@ -1663,20 +1954,38 @@ fn parse_terminal_id(terminal_id: &Option<String>) -> Option<i64> {
     terminal_id.as_deref().and_then(|s| s.parse::<i64>().ok())
 }
 
-fn resolve_pending_ack(conn: &Arc<TerminalConnection>, terminal_id: Option<String>, result: Result<(), String>) {
+fn resolve_pending_ack(
+    conn: &Arc<TerminalConnection>,
+    terminal_id: Option<String>,
+    result: Result<(), String>,
+) {
     let Some(terminal_id) = parse_terminal_id(&terminal_id) else {
         return;
     };
-    if let Some(tx) = conn.pending_acks.lock().unwrap_or_else(|e| e.into_inner()).remove(&terminal_id) {
+    if let Some(tx) = conn
+        .pending_acks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&terminal_id)
+    {
         let _ = tx.send(result);
     }
 }
 
-fn resolve_pending_file_request(conn: &Arc<TerminalConnection>, request_id: Option<String>, result: Result<FileResponse, String>) {
+fn resolve_pending_file_request(
+    conn: &Arc<TerminalConnection>,
+    request_id: Option<String>,
+    result: Result<FileResponse, String>,
+) {
     let Some(request_id) = request_id else {
         return;
     };
-    if let Some(tx) = conn.pending_file_requests.lock().unwrap_or_else(|e| e.into_inner()).remove(&request_id) {
+    if let Some(tx) = conn
+        .pending_file_requests
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&request_id)
+    {
         let _ = tx.send(result);
     }
 }
@@ -1701,11 +2010,18 @@ mod tests {
         // tests each calling `test_client()`) is no-op-safe, not an error
         // worth surfacing.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        kube::Client::try_default().await.expect("KUBECONFIG must point at a reachable cluster for sandbox tests")
+        kube::Client::try_default()
+            .await
+            .expect("KUBECONFIG must point at a reachable cluster for sandbox tests")
     }
 
     fn fake_pod(id: i64) -> db::SandboxPod {
-        db::SandboxPod { id, conversation_id: 1, created_at: chrono::Utc::now().naive_utc(), terminated_at: None }
+        db::SandboxPod {
+            id,
+            conversation_id: 1,
+            created_at: chrono::Utc::now().naive_utc(),
+            terminated_at: None,
+        }
     }
 
     #[test]
@@ -1755,7 +2071,11 @@ mod tests {
 
         assert_eq!(vols[0].name, "volume-7");
         assert_eq!(
-            vols[0].persistent_volume_claim.as_ref().expect("should be PVC-backed").claim_name,
+            vols[0]
+                .persistent_volume_claim
+                .as_ref()
+                .expect("should be PVC-backed")
+                .claim_name,
             "sandbox-volume-7"
         );
         assert_eq!(mounts[0].name, "volume-7");
@@ -1763,7 +2083,11 @@ mod tests {
 
         assert_eq!(vols[1].name, "volume-12");
         assert_eq!(
-            vols[1].persistent_volume_claim.as_ref().expect("should be PVC-backed").claim_name,
+            vols[1]
+                .persistent_volume_claim
+                .as_ref()
+                .expect("should be PVC-backed")
+                .claim_name,
             "sandbox-volume-12"
         );
         assert_eq!(mounts[1].name, "volume-12");
@@ -1778,7 +2102,10 @@ mod tests {
     #[test]
     fn test_check_pod_guard_refuses_when_a_live_pod_already_exists() {
         let result = check_pod_guard(&[fake_pod(1)]);
-        assert!(matches!(result, Err(SandboxError::PodAlreadyExists)), "expected PodAlreadyExists, got {result:?}");
+        assert!(
+            matches!(result, Err(SandboxError::PodAlreadyExists)),
+            "expected PodAlreadyExists, got {result:?}"
+        );
     }
 
     #[test]
@@ -1789,16 +2116,30 @@ mod tests {
     #[test]
     fn test_resolve_pod_id_errors_with_no_pod_when_none_live() {
         let result = resolve_pod_id(&[]);
-        assert!(matches!(result, Err(TerminalError::NoPod)), "expected NoPod, got {result:?}");
+        assert!(
+            matches!(result, Err(TerminalError::NoPod)),
+            "expected NoPod, got {result:?}"
+        );
     }
 
-    use k8s_openapi::api::core::v1::{ContainerState, ContainerStateTerminated, ContainerStatus, PodStatus};
+    use k8s_openapi::api::core::v1::{
+        ContainerState, ContainerStateTerminated, ContainerStatus, PodStatus,
+    };
 
     fn pod_with_phase(phase: &str) -> Pod {
-        Pod { status: Some(PodStatus { phase: Some(phase.to_string()), ..Default::default() }), ..Default::default() }
+        Pod {
+            status: Some(PodStatus {
+                phase: Some(phase.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 
-    fn failed_pod_with_container_state(state: Option<ContainerState>, last_state: Option<ContainerState>) -> Pod {
+    fn failed_pod_with_container_state(
+        state: Option<ContainerState>,
+        last_state: Option<ContainerState>,
+    ) -> Pod {
         Pod {
             status: Some(PodStatus {
                 phase: Some("Failed".to_string()),
@@ -1815,7 +2156,10 @@ mod tests {
 
     fn terminated(reason: Option<&str>) -> ContainerState {
         ContainerState {
-            terminated: Some(ContainerStateTerminated { reason: reason.map(str::to_string), ..Default::default() }),
+            terminated: Some(ContainerStateTerminated {
+                reason: reason.map(str::to_string),
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -1828,7 +2172,10 @@ mod tests {
     #[test]
     fn test_decide_pod_death_reason_failed_with_reason_in_state() {
         let pod = failed_pod_with_container_state(Some(terminated(Some("OOMKilled"))), None);
-        assert_eq!(decide_pod_death_reason(Some(pod)), Some(Some("OOMKilled".to_string())));
+        assert_eq!(
+            decide_pod_death_reason(Some(pod)),
+            Some(Some("OOMKilled".to_string()))
+        );
     }
 
     #[test]
@@ -1841,11 +2188,15 @@ mod tests {
             Some(ContainerState::default()),
             Some(terminated(Some("Error"))),
         );
-        assert_eq!(decide_pod_death_reason(Some(pod)), Some(Some("Error".to_string())));
+        assert_eq!(
+            decide_pod_death_reason(Some(pod)),
+            Some(Some("Error".to_string()))
+        );
     }
 
     #[test]
-    fn test_decide_pod_death_reason_failed_falls_back_to_pod_status_reason_without_container_status() {
+    fn test_decide_pod_death_reason_failed_falls_back_to_pod_status_reason_without_container_status()
+     {
         let pod = Pod {
             status: Some(PodStatus {
                 phase: Some("Failed".to_string()),
@@ -1855,13 +2206,19 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(decide_pod_death_reason(Some(pod)), Some(Some("Evicted".to_string())));
+        assert_eq!(
+            decide_pod_death_reason(Some(pod)),
+            Some(Some("Evicted".to_string()))
+        );
     }
 
     #[test]
     fn test_decide_pod_death_reason_failed_with_no_reason_available_anywhere() {
         let pod = Pod {
-            status: Some(PodStatus { phase: Some("Failed".to_string()), ..Default::default() }),
+            status: Some(PodStatus {
+                phase: Some("Failed".to_string()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         assert_eq!(decide_pod_death_reason(Some(pod)), Some(None));
@@ -1869,12 +2226,18 @@ mod tests {
 
     #[test]
     fn test_decide_pod_death_reason_running_is_inconclusive() {
-        assert_eq!(decide_pod_death_reason(Some(pod_with_phase("Running"))), None);
+        assert_eq!(
+            decide_pod_death_reason(Some(pod_with_phase("Running"))),
+            None
+        );
     }
 
     #[test]
     fn test_decide_pod_death_reason_pending_is_inconclusive() {
-        assert_eq!(decide_pod_death_reason(Some(pod_with_phase("Pending"))), None);
+        assert_eq!(
+            decide_pod_death_reason(Some(pod_with_phase("Pending"))),
+            None
+        );
     }
 
     #[test]
@@ -1887,25 +2250,45 @@ mod tests {
     /// need a real cluster), so a refusal shows up as `PodAlreadyExists`,
     /// not a panic from `get()`.
     #[sqlx::test]
-    async fn test_create_pod_refuses_before_touching_the_manager_when_a_live_pod_exists(pool: PgPool) {
-        let conversation = db::create_conversation(&pool).await.expect("create conversation");
-        db::create_sandbox_pod(&pool, conversation.id).await.expect("create sandbox pod");
+    async fn test_create_pod_refuses_before_touching_the_manager_when_a_live_pod_exists(
+        pool: PgPool,
+    ) {
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        db::create_sandbox_pod(&pool, conversation.id)
+            .await
+            .expect("create sandbox pod");
 
         let result = create_pod(&pool, conversation.id, None, None).await;
-        assert!(matches!(result, Err(SandboxError::PodAlreadyExists)), "expected PodAlreadyExists, got {result:?}");
+        assert!(
+            matches!(result, Err(SandboxError::PodAlreadyExists)),
+            "expected PodAlreadyExists, got {result:?}"
+        );
     }
 
     /// DB-only — no MANAGER touch, since `conversation_pod_id` never calls
     /// `get()`.
     #[sqlx::test]
-    async fn test_conversation_pod_id_resolves_the_live_pod_and_errors_with_no_pod_otherwise(pool: PgPool) {
-        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    async fn test_conversation_pod_id_resolves_the_live_pod_and_errors_with_no_pod_otherwise(
+        pool: PgPool,
+    ) {
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
 
         let before = conversation_pod_id(&pool, conversation.id).await;
-        assert!(matches!(before, Err(TerminalError::NoPod)), "expected NoPod before any pod exists, got {before:?}");
+        assert!(
+            matches!(before, Err(TerminalError::NoPod)),
+            "expected NoPod before any pod exists, got {before:?}"
+        );
 
-        let pod = db::create_sandbox_pod(&pool, conversation.id).await.expect("create sandbox pod");
-        let resolved = conversation_pod_id(&pool, conversation.id).await.expect("should resolve");
+        let pod = db::create_sandbox_pod(&pool, conversation.id)
+            .await
+            .expect("create sandbox pod");
+        let resolved = conversation_pod_id(&pool, conversation.id)
+            .await
+            .expect("should resolve");
         assert_eq!(resolved, pod.id);
     }
 
@@ -1913,11 +2296,24 @@ mod tests {
         format!("test-{label}-{}", uuid_like())
     }
 
+    /// The `unique_session_id` label `test_terminal_lifecycle_end_to_end`'s
+    /// own volume-mount pod uses — pulled out as a constant so the
+    /// precheck below (which needs the *prefix*, sans the pod's own
+    /// unpredictable nanosecond suffix) can't drift out of sync with the
+    /// actual pod-creation call site.
+    const VOLUME_MOUNT_SESSION_LABEL: &str = "volume-mount";
+
     // Not a real UUID — just enough entropy to avoid pod-name collisions
     // between concurrent test runs, without adding a `uuid` dependency.
     fn uuid_like() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
-        format!("{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
+        format!(
+            "{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     }
 
     /// A single, comprehensive, real-cluster-and-real-Postgres integration
@@ -1970,7 +2366,10 @@ mod tests {
         // integer range this run will actually use is enough.
         let pods_precheck = pods_api(&client);
         for n in 1..=30i64 {
-            pods_precheck.delete(&pod_name(n), &immediate_delete_params()).await.ok();
+            pods_precheck
+                .delete(&pod_name(n), &immediate_delete_params())
+                .await
+                .ok();
         }
         // Same reasoning as the pod-name wipe above, for
         // `create_volume`/`delete_volume`'s PVCs (`sandbox-volume-{id}`) —
@@ -1980,13 +2379,51 @@ mod tests {
         // around if that run failed before reaching its own cleanup.
         let pvcs_precheck = pvc_api(&client);
         for n in 1..=30i64 {
-            pvcs_precheck.delete(&sandbox_volume_pvc_name(n), &DeleteParams::default()).await.ok();
+            pvcs_precheck
+                .delete(&sandbox_volume_pvc_name(n), &DeleteParams::default())
+                .await
+                .ok();
+        }
+        // Same reasoning again, for the volume-mount pod itself
+        // (`unique_session_id(VOLUME_MOUNT_SESSION_LABEL)`) — its name
+        // carries a nanosecond suffix, not a low integer, so a fixed-range
+        // wipe like the two above can't cover it; list and filter by
+        // prefix instead. A previous run's pod here is what actually
+        // starved the PVC precheck above of its point: `local-path`'s
+        // `WaitForFirstConsumer` binding waits on *a* pod using the claim
+        // reaching `Scheduled`, and a pile of these left `Pending` forever
+        // (nothing schedules them — SandboxManager::create now cleans up
+        // its own timeout, but this covers every prior run before that
+        // fix, and any future failure mode that leaves one behind again)
+        // starves that wait indefinitely. Safe to sweep unconditionally:
+        // this is the only place in the whole suite that uses this label,
+        // so nothing concurrently running can collide with it.
+        let volume_mount_pod_prefix = format!("sandbox-test-{VOLUME_MOUNT_SESSION_LABEL}-");
+        if let Ok(existing) = pods_precheck.list(&ListParams::default()).await {
+            for pod in existing.items {
+                if let Some(name) = pod.metadata.name.as_deref() {
+                    if name.starts_with(&volume_mount_pod_prefix) {
+                        pods_precheck
+                            .delete(name, &immediate_delete_params())
+                            .await
+                            .ok();
+                    }
+                }
+            }
         }
 
-        let conversation_a = db::create_conversation(&pool).await.expect("create conversation a");
-        let conversation_b = db::create_conversation(&pool).await.expect("create conversation b");
-        let conversation_c = db::create_conversation(&pool).await.expect("create conversation c");
-        let conversation_d = db::create_conversation(&pool).await.expect("create conversation d");
+        let conversation_a = db::create_conversation(&pool)
+            .await
+            .expect("create conversation a");
+        let conversation_b = db::create_conversation(&pool)
+            .await
+            .expect("create conversation b");
+        let conversation_c = db::create_conversation(&pool)
+            .await
+            .expect("create conversation c");
+        let conversation_d = db::create_conversation(&pool)
+            .await
+            .expect("create conversation d");
 
         let outcome = tokio::time::timeout(Duration::from_secs(400), async {
             // --- Guards fire before there's anything to guard against yet ---
@@ -2497,7 +2934,7 @@ mod tests {
             );
 
             let volumes = db::list_sandbox_volumes(&pool).await.expect("list_sandbox_volumes");
-            let volume_session_id = unique_session_id("volume-mount");
+            let volume_session_id = unique_session_id(VOLUME_MOUNT_SESSION_LABEL);
             let volume_sandbox =
                 get().create(&volume_session_id, "128Mi", "250m", &volumes).await.expect("create with a volume should succeed");
             let write =
@@ -2537,20 +2974,32 @@ mod tests {
         // existing convention (real-cluster tests, no automatic isolation).
         let pods = pods_api(&get().client);
         for n in 1..=20i64 {
-            pods.delete(&pod_name(n), &immediate_delete_params()).await.ok();
+            pods.delete(&pod_name(n), &immediate_delete_params())
+                .await
+                .ok();
         }
 
-        outcome.expect("terminal lifecycle integration test should complete within the timeout, not hang");
+        outcome.expect(
+            "terminal lifecycle integration test should complete within the timeout, not hang",
+        );
     }
 
     /// Creates and sends a command in one step, waits for it to finish,
     /// returns its `command_id` — most of this test's steps are this exact
     /// shape, this just cuts the repetition.
-    async fn run_and_wait(pool: &PgPool, conversation_id: i64, terminal_id: i64, command_id: &str, command: &str) -> String {
+    async fn run_and_wait(
+        pool: &PgPool,
+        conversation_id: i64,
+        terminal_id: i64,
+        command_id: &str,
+        command: &str,
+    ) -> String {
         db::create_terminal_command(pool, conversation_id, terminal_id, command_id, command)
             .await
             .expect("create_terminal_command");
-        send_command(pool, terminal_id, command_id, command).await.expect("send_command");
+        send_command(pool, terminal_id, command_id, command)
+            .await
+            .expect("send_command");
         poll_until_finished(pool, command_id).await;
         command_id.to_string()
     }
@@ -2585,9 +3034,13 @@ mod tests {
             .await
             .expect("list_messages")
             .iter()
-            .any(|m| m.blocks().ok().is_some_and(|blocks| {
-                blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains(needle)))
-            }))
+            .any(|m| {
+                m.blocks().ok().is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::Text { text } if text.contains(needle)))
+                })
+            })
     }
 
     #[tokio::test]
@@ -2596,14 +3049,76 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("create");
 
-        let sandbox = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("create should succeed");
+        let sandbox = manager
+            .create(&session_id, "128Mi", "250m", &[])
+            .await
+            .expect("create should succeed");
 
         let pods = pods_api(&client);
         let pod = pods.get(&sandbox.pod_name).await.expect("pod should exist");
         assert_eq!(pod.status.and_then(|s| s.phase).as_deref(), Some("Running"));
 
-        pods.delete(&sandbox.pod_name, &immediate_delete_params()).await.ok();
+        pods.delete(&sandbox.pod_name, &immediate_delete_params())
+            .await
+            .ok();
         std::mem::forget(sandbox);
+    }
+
+    /// A pod that never reaches `Running` (real cause seen in this
+    /// environment: `local-path`'s `WaitForFirstConsumer` provisioning
+    /// stuck behind an unrelated pileup — see the precheck below) must not
+    /// be left behind: nothing else in the system ever cleans up a pod
+    /// `create` gave up waiting on, since `Sandbox::drop`'s cleanup queue
+    /// only fires for a `Sandbox` that was actually returned. An orphaned
+    /// pod here isn't just wasted — a caller that derives the same pod
+    /// name deterministically (`sandbox_volume_pvc_name`'s pod-name
+    /// counterpart) collides with it on every later attempt, exactly what
+    /// happened to `test_terminal_lifecycle_end_to_end`'s volume-mount pod
+    /// before this fix.
+    ///
+    /// Drives `create_with_running_timeout` directly with a 1ms timeout
+    /// rather than the real (30s+) default, or mutating
+    /// `SANDBOX_RUNNING_WAIT_TIMEOUT_SECS` — that env var is process-global
+    /// and read by every other concurrently-running test in this suite, so
+    /// overriding it here would risk timing them out too. 1ms guarantees
+    /// the timeout fires before the first status check ever completes,
+    /// independent of how fast this cluster actually schedules pods.
+    #[tokio::test]
+    async fn test_create_deletes_the_pod_it_just_created_if_it_never_reaches_running() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let session_id = unique_session_id("timeout-cleanup");
+        let name = format!("sandbox-{session_id}");
+
+        let result = manager
+            .create_with_running_timeout(
+                &session_id,
+                "128Mi",
+                "250m",
+                &[],
+                Duration::from_millis(1),
+            )
+            .await;
+        match result {
+            Err(SandboxError::Timeout) => {}
+            Err(e) => panic!("expected a Timeout error, got a different error: {e}"),
+            Ok(sandbox) => {
+                std::mem::forget(sandbox);
+                panic!("expected create to time out waiting for Running, but it succeeded");
+            }
+        }
+
+        let pods = pods_api(&client);
+        let gone = tokio::time::timeout(Duration::from_secs(15), async {
+            while pods.get_opt(&name).await.ok().flatten().is_some() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await;
+        assert!(
+            gone.is_ok(),
+            "the pod create() gave up waiting on should have been cleaned up, not left orphaned"
+        );
     }
 
     #[tokio::test]
@@ -2612,7 +3127,10 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("limits");
 
-        let sandbox = manager.create(&session_id, "128Mi", "500m", &[]).await.expect("create should succeed");
+        let sandbox = manager
+            .create(&session_id, "128Mi", "500m", &[])
+            .await
+            .expect("create should succeed");
 
         let pods = pods_api(&client);
         let pod = pods.get(&sandbox.pod_name).await.expect("pod should exist");
@@ -2630,7 +3148,9 @@ mod tests {
         assert_eq!(limits.get("memory"), Some(&Quantity("128Mi".to_string())));
         assert_eq!(limits.get("cpu"), Some(&Quantity("500m".to_string())));
 
-        pods.delete(&sandbox.pod_name, &immediate_delete_params()).await.ok();
+        pods.delete(&sandbox.pod_name, &immediate_delete_params())
+            .await
+            .ok();
         std::mem::forget(sandbox);
     }
 
@@ -2670,7 +3190,10 @@ mod tests {
         let session_id = unique_session_id("real-oom");
         // Small on purpose — fast and reliable to trigger, using this same
         // plan's own per-pod override rather than the real 8Gi default.
-        let sandbox = manager.create(&session_id, "64Mi", "250m", &[]).await.expect("create should succeed");
+        let sandbox = manager
+            .create(&session_id, "64Mi", "250m", &[])
+            .await
+            .expect("create should succeed");
         let pods = pods_api(&client);
 
         // The whole `AttachedProcess` — not just its split-off stdout/
@@ -2684,7 +3207,11 @@ mod tests {
         // along with the disconnect — the remote command never gets a
         // chance to actually run.
         if let Ok(mut exec) = pods
-            .exec(&sandbox.pod_name, ["bash", "-c", "printf -v x '%*s' 200000000 ''; sleep 5"], &AttachParams::default())
+            .exec(
+                &sandbox.pod_name,
+                ["bash", "-c", "printf -v x '%*s' 200000000 ''; sleep 5"],
+                &AttachParams::default(),
+            )
             .await
         {
             tokio::spawn(async move {
@@ -2726,13 +3253,21 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("reuse");
 
-        let first = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("first create should succeed");
-        let second = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("second create should reuse, not error");
+        let first = manager
+            .create(&session_id, "128Mi", "250m", &[])
+            .await
+            .expect("first create should succeed");
+        let second = manager
+            .create(&session_id, "128Mi", "250m", &[])
+            .await
+            .expect("second create should reuse, not error");
 
         assert_eq!(first.pod_name, second.pod_name);
 
         let pods = pods_api(&client);
-        pods.delete(&first.pod_name, &immediate_delete_params()).await.ok();
+        pods.delete(&first.pod_name, &immediate_delete_params())
+            .await
+            .ok();
         std::mem::forget(first);
         std::mem::forget(second);
     }
@@ -2742,17 +3277,28 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("exec");
-        let sandbox = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("create should succeed");
+        let sandbox = manager
+            .create(&session_id, "128Mi", "250m", &[])
+            .await
+            .expect("create should succeed");
 
-        let result = sandbox.exec(&["echo", "hello"]).await.expect("exec should succeed");
+        let result = sandbox
+            .exec(&["echo", "hello"])
+            .await
+            .expect("exec should succeed");
         assert_eq!(result.stdout, "hello\n");
         assert_eq!(result.exit_code, 0);
 
-        let failing = sandbox.exec(&["bash", "-c", "exit 7"]).await.expect("exec should succeed even for nonzero exit");
+        let failing = sandbox
+            .exec(&["bash", "-c", "exit 7"])
+            .await
+            .expect("exec should succeed even for nonzero exit");
         assert_eq!(failing.exit_code, 7);
 
         let pods = pods_api(&client);
-        pods.delete(&sandbox.pod_name, &immediate_delete_params()).await.ok();
+        pods.delete(&sandbox.pod_name, &immediate_delete_params())
+            .await
+            .ok();
         std::mem::forget(sandbox);
     }
 
@@ -2767,16 +3313,35 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("non-root");
-        let sandbox = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("create should succeed");
+        let sandbox = manager
+            .create(&session_id, "128Mi", "250m", &[])
+            .await
+            .expect("create should succeed");
 
-        let whoami = sandbox.exec(&["whoami"]).await.expect("exec should succeed");
-        assert_eq!(whoami.stdout.trim(), "sandbox", "commands should run as the pre-created `sandbox` user, not root");
+        let whoami = sandbox
+            .exec(&["whoami"])
+            .await
+            .expect("exec should succeed");
+        assert_eq!(
+            whoami.stdout.trim(),
+            "sandbox",
+            "commands should run as the pre-created `sandbox` user, not root"
+        );
 
-        let sudo_whoami = sandbox.exec(&["sudo", "whoami"]).await.expect("exec should succeed");
-        assert_eq!(sudo_whoami.stdout.trim(), "root", "sudo should still reach root for a command that genuinely needs it");
+        let sudo_whoami = sandbox
+            .exec(&["sudo", "whoami"])
+            .await
+            .expect("exec should succeed");
+        assert_eq!(
+            sudo_whoami.stdout.trim(),
+            "root",
+            "sudo should still reach root for a command that genuinely needs it"
+        );
 
         let pods = pods_api(&client);
-        pods.delete(&sandbox.pod_name, &immediate_delete_params()).await.ok();
+        pods.delete(&sandbox.pod_name, &immediate_delete_params())
+            .await
+            .ok();
         std::mem::forget(sandbox);
     }
 
@@ -2791,12 +3356,21 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("death-reason");
-        let sandbox = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("create should succeed");
+        let sandbox = manager
+            .create(&session_id, "128Mi", "250m", &[])
+            .await
+            .expect("create should succeed");
         let pods = pods_api(&client);
 
-        assert_eq!(pod_death_reason(&pods, &sandbox.pod_name).await, None, "a genuinely Running pod is inconclusive");
+        assert_eq!(
+            pod_death_reason(&pods, &sandbox.pod_name).await,
+            None,
+            "a genuinely Running pod is inconclusive"
+        );
 
-        pods.delete(&sandbox.pod_name, &immediate_delete_params()).await.expect("delete should succeed");
+        pods.delete(&sandbox.pod_name, &immediate_delete_params())
+            .await
+            .expect("delete should succeed");
         assert_eq!(
             pod_death_reason(&pods, &sandbox.pod_name).await,
             Some(None),
@@ -2823,14 +3397,26 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("delete");
-        let sandbox = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("create should succeed");
+        let sandbox = manager
+            .create(&session_id, "128Mi", "250m", &[])
+            .await
+            .expect("create should succeed");
         let pod_name = sandbox.pod_name.clone();
 
-        manager.delete(sandbox).await.expect("delete should succeed");
+        manager
+            .delete(sandbox)
+            .await
+            .expect("delete should succeed");
 
         let pods = pods_api(&client);
-        let still_there = pods.get_opt(&pod_name).await.expect("get_opt should not error");
-        assert!(still_there.is_none(), "pod should be gone immediately after manager.delete returns Ok");
+        let still_there = pods
+            .get_opt(&pod_name)
+            .await
+            .expect("get_opt should not error");
+        assert!(
+            still_there.is_none(),
+            "pod should be gone immediately after manager.delete returns Ok"
+        );
     }
 
     #[tokio::test]
@@ -2838,7 +3424,10 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("drop");
-        let sandbox = manager.create(&session_id, "128Mi", "250m", &[]).await.expect("create should succeed");
+        let sandbox = manager
+            .create(&session_id, "128Mi", "250m", &[])
+            .await
+            .expect("create should succeed");
         let pod_name = sandbox.pod_name.clone();
 
         drop(sandbox); // no manager.delete call — this is the path under test
@@ -2846,14 +3435,21 @@ mod tests {
         let pods = pods_api(&client);
         let gone = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if pods.get_opt(&pod_name).await.expect("get_opt should not error").is_none() {
+                if pods
+                    .get_opt(&pod_name)
+                    .await
+                    .expect("get_opt should not error")
+                    .is_none()
+                {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         })
         .await;
-        assert!(gone.is_ok(), "drain task should have deleted the pod within the timeout");
+        assert!(
+            gone.is_ok(),
+            "drain task should have deleted the pod within the timeout"
+        );
     }
-
 }

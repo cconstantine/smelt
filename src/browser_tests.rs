@@ -58,7 +58,10 @@ impl BrowserTestHarness {
         // std::env read) — see the harness's own doc comment on why this is
         // the one test in this module.
         unsafe {
-            std::env::set_var("LD_LIBRARY_PATH", format!("{}:{}/dri:{existing}", lib_dir.display(), lib_dir.display()));
+            std::env::set_var(
+                "LD_LIBRARY_PATH",
+                format!("{}:{}/dri:{existing}", lib_dir.display(), lib_dir.display()),
+            );
         }
 
         // dioxus-server's `serve_dioxus_application` needs a pre-bundled
@@ -84,9 +87,14 @@ impl BrowserTestHarness {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind a test-local port");
-        let port = listener.local_addr().expect("listener should have a local address").port();
+        let port = listener
+            .local_addr()
+            .expect("listener should have a local address")
+            .port();
         let server_task = tokio::spawn(async move {
-            axum::serve(listener, router).await.expect("test server error");
+            axum::serve(listener, router)
+                .await
+                .expect("test server error");
         });
 
         let config = BrowserConfig::builder()
@@ -96,12 +104,17 @@ impl BrowserTestHarness {
             .window_size(1400, 900)
             .build()
             .expect("valid chrome-headless-shell launch config");
-        let (browser, mut handler) = Browser::launch(config).await.expect("chrome-headless-shell should launch");
-        let handler_task = tokio::spawn(async move {
-            while handler.next().await.is_some() {}
-        });
+        let (browser, mut handler) = Browser::launch(config)
+            .await
+            .expect("chrome-headless-shell should launch");
+        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
-        Self { browser, handler_task, server_task, base_url: format!("http://127.0.0.1:{port}/") }
+        Self {
+            browser,
+            handler_task,
+            server_task,
+            base_url: format!("http://127.0.0.1:{port}/"),
+        }
     }
 
     /// Best-effort, called explicitly at the end of the test rather than via
@@ -159,7 +172,10 @@ async fn click_when_present(page: &chromiumoxide::Page, selector: &str, timeout:
                 return;
             }
         }
-        assert!(tokio::time::Instant::now() < deadline, "{selector} never appeared");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{selector} never appeared"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -184,7 +200,10 @@ async fn wait_for_text_gone(page: &chromiumoxide::Page, needle: &str, timeout: D
 #[ignore]
 async fn test_sandbox_panel_reflects_live_state_end_to_end() {
     let pool = db::init().await;
-    sqlx::migrate!().run(pool).await.expect("migrations should apply");
+    sqlx::migrate!()
+        .run(pool)
+        .await
+        .expect("migrations should apply");
     sandbox::init().await;
 
     let harness = BrowserTestHarness::start().await;
