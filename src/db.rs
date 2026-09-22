@@ -147,6 +147,51 @@ pub async fn delete_conversation(pool: &PgPool, id: i64) -> Result<(), sqlx::Err
     Ok(())
 }
 
+/// Last-known real `usage` numbers for `conversation_id` — see
+/// docs/projects/plans/auto-compaction.md. `None` if no turn has completed
+/// for this conversation yet (nothing to report).
+pub async fn get_conversation_usage(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Option<crate::anthropic::TokenUsage>, sqlx::Error> {
+    sqlx::query_as::<_, crate::anthropic::TokenUsage>(
+        "SELECT input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens
+         FROM conversation_context_usage WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Overwrites `conversation_id`'s usage row with `usage` — "last known
+/// only," not a history, so this is always a full replace, not an
+/// accumulation.
+pub async fn upsert_conversation_usage(
+    pool: &PgPool,
+    conversation_id: i64,
+    usage: &crate::anthropic::TokenUsage,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO conversation_context_usage
+             (conversation_id, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, updated_at)
+         VALUES ($1, $2, $3, $4, $5, now())
+         ON CONFLICT (conversation_id) DO UPDATE SET
+             input_tokens = EXCLUDED.input_tokens,
+             output_tokens = EXCLUDED.output_tokens,
+             cache_creation_input_tokens = EXCLUDED.cache_creation_input_tokens,
+             cache_read_input_tokens = EXCLUDED.cache_read_input_tokens,
+             updated_at = now()",
+    )
+    .bind(conversation_id)
+    .bind(usage.input_tokens)
+    .bind(usage.output_tokens)
+    .bind(usage.cache_creation_input_tokens)
+    .bind(usage.cache_read_input_tokens)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // --- Terminal (pod/terminal/command lifecycle) ---
 // Server-only, no client/server boundary to cross (no UI yet) — unlike
 // Conversation/Message, these don't need to live in models.rs or derive
@@ -768,6 +813,59 @@ mod tests {
         assert!(
             all.iter().any(|c| c.id == created.id),
             "created conversation should appear in list, got: {all:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_get_conversation_usage_returns_none_when_never_set(pool: PgPool) {
+        let conversation = create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        assert_eq!(
+            get_conversation_usage(&pool, conversation.id)
+                .await
+                .expect("lookup"),
+            None
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_upsert_conversation_usage_round_trips_and_overwrites(pool: PgPool) {
+        let conversation = create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        let first = crate::anthropic::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_creation_input_tokens: 5,
+            cache_read_input_tokens: 0,
+        };
+        upsert_conversation_usage(&pool, conversation.id, &first)
+            .await
+            .expect("upsert should succeed");
+        assert_eq!(
+            get_conversation_usage(&pool, conversation.id)
+                .await
+                .expect("lookup"),
+            Some(first)
+        );
+
+        // A second call overwrites, rather than accumulating — "last known
+        // only," not a history.
+        let second = crate::anthropic::TokenUsage {
+            input_tokens: 150,
+            output_tokens: 30,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 5,
+        };
+        upsert_conversation_usage(&pool, conversation.id, &second)
+            .await
+            .expect("second upsert should succeed");
+        assert_eq!(
+            get_conversation_usage(&pool, conversation.id)
+                .await
+                .expect("lookup"),
+            Some(second)
         );
     }
 

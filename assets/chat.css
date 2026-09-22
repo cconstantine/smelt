@@ -494,6 +494,66 @@ body {
     font-style: italic;
 }
 
+/* Auto-compaction's own transcript entry — a visible divider, distinct
+   from an ordinary assistant message (dashed rule, no chat-bubble
+   background) since it's the model's own housekeeping, not something it
+   said. Collapsed by default, same pattern as .thinking-block. See
+   docs/projects/plans/auto-compaction.md. */
+.compaction-summary-block {
+    align-self: center;
+    width: 100%;
+    max-width: 65ch;
+    margin: 12px 0;
+    border-top: 1px dashed #c3c2b7;
+    border-bottom: 1px dashed #c3c2b7;
+    padding: 6px 0;
+}
+
+.compaction-summary-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 4px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: #52514e;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+}
+
+.compaction-summary-header::-webkit-details-marker {
+    display: none;
+}
+
+.compaction-summary-header::before {
+    content: "▸";
+    font-size: 9px;
+    color: #898781;
+    transition: transform 100ms ease;
+}
+
+.compaction-summary-block[open] > .compaction-summary-header::before {
+    transform: rotate(90deg);
+}
+
+.compaction-summary-icon {
+    font-size: 12px;
+}
+
+.compaction-summary-header .timestamp {
+    margin-left: auto;
+}
+
+.compaction-summary-body {
+    margin: 4px 4px 4px 17px;
+    font-size: 13px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: #52514e;
+}
+
 /* Background tasks panel — lives in .side-panels-row (below the
    transcript, not beside it — see .chat-panel), independently scrollable
    from both the transcript above and .sandbox-panel next to it. Only
@@ -1439,4 +1499,212 @@ div.mcp-status-not-connected::before {
     border-color: #e5e5e5;
     color: #999;
     cursor: not-allowed;
+}
+
+/* Always-visible context-usage indicator — a thin bar sitting above the
+   transcript, clickable to open the full detail view. See
+   docs/projects/plans/auto-compaction.md. */
+.context-usage-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 24px;
+    border-bottom: 1px solid #e5e5e5;
+    background: #fff;
+    cursor: pointer;
+    font-size: 12px;
+    color: #555;
+}
+
+.context-usage-bar:hover {
+    background: #fafafa;
+}
+
+.context-usage-track {
+    flex: 1;
+    max-width: 200px;
+    height: 6px;
+    border-radius: 3px;
+    background: #e5e5e5;
+    overflow: hidden;
+}
+
+.context-usage-fill {
+    height: 100%;
+    background: #111;
+    transition: width 200ms ease;
+}
+
+.context-usage-label {
+    white-space: nowrap;
+}
+
+.context-detail-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.3);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+}
+
+.context-detail-panel {
+    position: relative;
+    max-width: 640px;
+    max-height: 80vh;
+    width: 90%;
+    overflow-y: auto;
+    background: #fff;
+    border-radius: 12px;
+    padding: 24px;
+}
+
+.context-detail-close {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    border: none;
+    background: none;
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    color: #666;
+}
+
+.context-detail-tool {
+    border: 1px solid #e5e5e5;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 10px;
+}
+
+.context-detail-tool pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 12px;
+    background: #fafafa;
+    padding: 8px;
+    border-radius: 6px;
+}
+
+/* Context-usage breakdown meter (detail view) — categorical slots 1-4 from
+   the dataviz skill's validated default palette (references/palette.md),
+   in their documented fixed order, never reassigned: input, output, cache
+   creation, cache read. That order is certified for adjacent-pairlist
+   charts (stacks/bars/lines) in light mode; this app has no dark mode, so
+   only the light values are defined. "Free" (unused window) is a neutral
+   track color, not a categorical hue — it isn't a data category with its
+   own identity. See docs/projects/plans/auto-compaction.md. */
+.context-meter {
+    --meter-input: #2a78d6;
+    --meter-output: #eb6834;
+    --meter-cache-creation: #1baf7a;
+    --meter-cache-read: #eda100;
+    --meter-free: #e1e0d9;
+    margin: 12px 0 16px;
+}
+
+.context-meter-track {
+    display: flex;
+    align-items: stretch;
+    gap: 2px;
+    height: 20px;
+    border-radius: 4px;
+    overflow: hidden;
+    background: var(--meter-free);
+}
+
+.context-meter-segment {
+    position: relative;
+    height: 100%;
+    flex-shrink: 0;
+    flex-basis: 0;
+    cursor: default;
+}
+
+.context-meter-segment:focus-visible {
+    outline: 2px solid #111;
+    outline-offset: 2px;
+}
+
+.context-meter-segment[data-category="input"] {
+    background: var(--meter-input);
+}
+.context-meter-segment[data-category="output"] {
+    background: var(--meter-output);
+}
+.context-meter-segment[data-category="cache-creation"] {
+    background: var(--meter-cache-creation);
+}
+.context-meter-segment[data-category="cache-read"] {
+    background: var(--meter-cache-read);
+}
+.context-meter-segment[data-category="free"] {
+    background: var(--meter-free);
+}
+
+/* Tooltip: enhances, never gates — the same numbers are already in the
+   plain-text token line above the meter and in the legend below it, so
+   nothing here is the only way to read a value. Same visibility on
+   keyboard focus as on hover. */
+.context-meter-tooltip {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #111;
+    color: #fff;
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-size: 12px;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 100ms ease;
+    z-index: 10;
+}
+
+.context-meter-segment:hover .context-meter-tooltip,
+.context-meter-segment:focus-visible .context-meter-tooltip {
+    opacity: 1;
+}
+
+.context-meter-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 14px;
+    margin-top: 8px;
+    font-size: 12px;
+    color: #52514e;
+}
+
+.context-meter-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.context-meter-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    flex-shrink: 0;
+    display: inline-block;
+}
+
+.context-meter-swatch[data-category="input"] {
+    background: var(--meter-input);
+}
+.context-meter-swatch[data-category="output"] {
+    background: var(--meter-output);
+}
+.context-meter-swatch[data-category="cache-creation"] {
+    background: var(--meter-cache-creation);
+}
+.context-meter-swatch[data-category="cache-read"] {
+    background: var(--meter-cache-read);
+}
+.context-meter-swatch[data-category="free"] {
+    background: var(--meter-free);
 }

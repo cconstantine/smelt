@@ -35,6 +35,8 @@ impl Message {
 }
 ```
 
-`Message::blocks()` parses the stored JSON back into `ContentBlock`s — callers (persistence in `db::create_message`, rendering in `frontend/pages/chat.rs`, history-building in `api::chat::run_turn`) always go through `blocks()`/a `&[ContentBlock]` parameter rather than touching `content` as a string directly. A parse error is a real possibility (malformed content shouldn't happen but isn't structurally prevented) — every caller surfaces it rather than silently rendering blank, per `development-process.md`'s "surface fallback outcomes" rule.
+`Message::blocks()` parses the stored JSON back into `ContentBlock`s — callers (persistence in `db::create_message`, rendering in `frontend/pages/chat.rs`, history-building in `api::chat::history_for_request`) always go through `blocks()`/a `&[ContentBlock]` parameter rather than touching `content` as a string directly. A parse error is a real possibility (malformed content shouldn't happen but isn't structurally prevented) — every caller surfaces it rather than silently rendering blank, per `development-process.md`'s "surface fallback outcomes" rule.
+
+Two `ContentBlock` variants exist only for smelt's own bookkeeping, never sent or accepted by Anthropic itself — `CompactionSummary` and `CompactionPlaceholder` (auto-compaction's own output — see `docs/projects/completed/20260922-auto-compaction.md`). `history_for_request` translates both into plain `Text` blocks before they're ever replayed to the real API; storage and rendering see the real variant.
 
 Don't confuse `models::Message` (a database row) with `anthropic::AnthropicMessage` (an Anthropic API wire message, `{role, content: Vec<ContentBlock>}`) — `run_turn` converts between them when building a request and when persisting a turn.

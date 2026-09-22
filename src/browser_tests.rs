@@ -1,20 +1,29 @@
-//! The one comprehensive browser test for `sandbox-visibility` — see
-//! `docs/projects/completed/20260815-sandbox-visibility.md`. Runs the real app in-process
-//! (no `lib.rs` exists, so an external `tests/` integration test couldn't
-//! reach `db`/`sandbox`/`anthropic::tools` at all — see the plan's "How")
+//! The one comprehensive browser test tier — started for `sandbox-visibility`
+//! (see `docs/projects/completed/20260815-sandbox-visibility.md`), extended for
+//! `auto-compaction`'s context-usage indicator/detail view and compaction
+//! divider (see `docs/projects/plans/auto-compaction.md`) — per
+//! `docs/testing.md`'s own note that this tier was "worth extending once
+//! another feature has a similar need for real-DOM verification." Runs the
+//! real app in-process (no `lib.rs` exists, so an external `tests/`
+//! integration test couldn't reach `db`/`sandbox`/`anthropic::tools` at all)
 //! against a real headless `chrome-headless-shell`, driven over CDP via
 //! `chromiumoxide` (no `chromedriver` to download/manage). `#[ignore]`d by
 //! default: needs `scripts/browser-check/setup.sh` run first, and a real
 //! Postgres + k3s cluster reachable the same way every other real-cluster
 //! test in this codebase already assumes.
 //!
-//! Deliberately one test, not several: every scenario in the plan's
-//! `Verification` checklist runs sequentially inside it, sharing one
-//! browser/server/`MANAGER` instance for its whole duration — more than one
-//! `#[tokio::test]` here touching `sandbox::init()` would risk the same
-//! `OnceLock`-across-separate-runtimes hazard `docs/testing.md` documents
-//! for `PgPool`, the same reasoning `sandbox-terminal`'s own real-cluster
-//! test already applied.
+//! Deliberately one test, not several: every scenario runs sequentially
+//! inside it, sharing one browser/server/`MANAGER` instance for its whole
+//! duration — more than one `#[tokio::test]` here touching `sandbox::init()`/
+//! `db::init()` would risk the same `OnceLock`-across-separate-runtimes
+//! hazard `docs/testing.md` documents for `PgPool`, the same reasoning
+//! `sandbox-terminal`'s own real-cluster test already applied. Every
+//! scenario bypasses the model entirely (seeding state directly via `db`/
+//! `anthropic::tools`, never a real `send_message`) — this tier verifies
+//! the browser/live-event pipeline and DOM rendering, not tool-selection or
+//! compaction-trigger *logic* (already covered by `api::chat`'s own
+//! mock-upstream tests), and this test environment (like CI) has no real
+//! Anthropic credentials to make a live call with anyway.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -198,7 +207,7 @@ async fn wait_for_text_gone(page: &chromiumoxide::Page, needle: &str, timeout: D
 
 #[tokio::test]
 #[ignore]
-async fn test_sandbox_panel_reflects_live_state_end_to_end() {
+async fn test_end_to_end_browser_scenarios() {
     let pool = db::init().await;
     sqlx::migrate!()
         .run(pool)
@@ -292,6 +301,123 @@ async fn test_sandbox_panel_reflects_live_state_end_to_end() {
         // Best-effort teardown of what this test created.
         let _ = sandbox::terminate_terminal(pool, terminal_a1).await;
         let _ = sandbox::terminate_pod(pool, conversation.id).await;
+
+        // --- Scenario 5: the always-visible context-usage indicator and
+        // its click-through detail view — see
+        // docs/projects/plans/auto-compaction.md. A separate conversation,
+        // seeded directly (db::create_message/upsert_conversation_usage)
+        // rather than sent through the model — same "bypass the model,
+        // verify the DOM" shape every scenario above already uses; a real
+        // Anthropic call needs credentials this test environment (and CI)
+        // doesn't have. ---
+        let context_conversation = db::create_conversation(pool)
+            .await
+            .expect("create context-usage conversation");
+        db::create_message(
+            pool,
+            context_conversation.id,
+            "user",
+            &[anthropic::ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        )
+        .await
+        .expect("seed a message");
+        db::upsert_conversation_usage(
+            pool,
+            context_conversation.id,
+            &anthropic::TokenUsage {
+                input_tokens: 40_000,
+                output_tokens: 10_000,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+        )
+        .await
+        .expect("seed usage");
+
+        let context_page = harness
+            .browser
+            .new_page(&format!(
+                "{}conversation/{}",
+                harness.base_url, context_conversation.id
+            ))
+            .await
+            .expect("open the context-usage conversation");
+        assert!(
+            wait_for_text(&context_page, "25% of context", Duration::from_secs(10)).await,
+            "the always-visible indicator should reflect the seeded usage \
+             (40_000 + 10_000 of a 200_000 default window = 25%)"
+        );
+
+        click_when_present(&context_page, ".context-usage-bar", Duration::from_secs(5)).await;
+        assert!(
+            wait_for_text(&context_page, "Tools (", Duration::from_secs(10)).await,
+            "clicking the indicator should open the detail view, listing every available tool"
+        );
+        assert!(
+            wait_for_text(
+                &context_page,
+                "Tokens — input: 40000, output: 10000",
+                Duration::from_secs(5)
+            )
+            .await,
+            "the detail view should show the same real usage numbers the indicator did"
+        );
+
+        // --- Scenario 6: a compaction event renders as a distinct,
+        // collapsed-by-default divider — not an ordinary chat bubble —
+        // and expands to reveal the real summary text on click. Seeded
+        // directly (a real trigger/summarization round trip is already
+        // covered by api::chat's own mock-upstream integration test; this
+        // tier's job is the DOM, not the backend logic). ---
+        db::create_message(
+            pool,
+            context_conversation.id,
+            "assistant",
+            &[anthropic::ContentBlock::CompactionSummary {
+                summary: "the user said hello; nothing else happened".to_string(),
+                covers_through_message_id: 1,
+            }],
+        )
+        .await
+        .expect("seed a compaction summary message");
+
+        context_page
+            .goto(&format!(
+                "{}conversation/{}",
+                harness.base_url, context_conversation.id
+            ))
+            .await
+            .expect("reload to see the newly seeded message");
+        assert!(
+            wait_for_text(&context_page, "Conversation compacted", Duration::from_secs(10)).await,
+            "a CompactionSummary block should render as its own distinct divider"
+        );
+        assert!(
+            wait_for_text_gone(
+                &context_page,
+                "the user said hello; nothing else happened",
+                Duration::from_secs(2)
+            )
+            .await,
+            "collapsed by default — the summary text itself shouldn't be visible yet"
+        );
+        click_when_present(
+            &context_page,
+            ".compaction-summary-header",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            wait_for_text(
+                &context_page,
+                "the user said hello; nothing else happened",
+                Duration::from_secs(5)
+            )
+            .await,
+            "expanding the divider should reveal the real summary text"
+        );
     })
     .await;
 

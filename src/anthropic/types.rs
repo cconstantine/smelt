@@ -31,11 +31,60 @@ pub enum ContentBlock {
         thinking: String,
         signature: String,
     },
+    /// A model-generated summary standing in for every original message up
+    /// to and including `covers_through_message_id` — auto-compaction's own
+    /// output, never something Anthropic itself sends or accepts. Persisted
+    /// as an ordinary new message (nothing earlier is rewritten or
+    /// deleted), but replayed to Anthropic as a plain `Text` block — see
+    /// `api::chat::history_for_request` — since Anthropic has no concept of
+    /// this block type. See docs/projects/plans/auto-compaction.md.
+    CompactionSummary {
+        summary: String,
+        covers_through_message_id: i64,
+    },
+    /// A fixed, structural message auto-compaction inserts immediately
+    /// before and after a `CompactionSummary` block (see
+    /// `api::chat::compaction_messages`) — carries no real conversational
+    /// content, just makes that synthetic exchange valid for Anthropic's
+    /// own message-shape rules (`messages` must start with `user` and
+    /// strictly alternate). Replayed to Anthropic as a plain `Text` block,
+    /// same as `CompactionSummary`, but rendered as nothing in the
+    /// transcript (see `render_block_element`) — a human reading it never
+    /// typed or needs to see this, unlike the summary itself. See
+    /// docs/projects/plans/auto-compaction.md.
+    CompactionPlaceholder {
+        text: String,
+    },
 }
 
-// `AnthropicMessage` through `CreateMessageRequest` below are only built
-// and sent by `stream.rs`, which is itself server-only — the `web`
-// (browser) build never touches them, only `ContentBlock` above.
+/// Anthropic's own real `usage` field names, no translation layer — the
+/// ground truth for "how much of the context window is actually being
+/// used." Ungated (unlike the request/response types below): `stream.rs`
+/// (server-only) constructs these from a real response, but
+/// `events::ConversationEvent::ContextUsageUpdate` carries one across the
+/// wire to the browser too, so the type itself must compile for both
+/// `server` and `web` — see docs/projects/plans/auto-compaction.md.
+/// `#[serde(default)]` on every field: `message_delta`'s own `usage`
+/// object only ever carries `output_tokens`, not the other three, and
+/// this same type deserializes both shapes. `sqlx::FromRow` gated the same
+/// way `models::Conversation`/`Message` gate theirs — `db.rs` reads this
+/// straight back out of `conversation_context_usage` by column name.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "server", derive(sqlx::FromRow))]
+pub struct TokenUsage {
+    #[serde(default)]
+    pub input_tokens: i64,
+    #[serde(default)]
+    pub output_tokens: i64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: i64,
+    #[serde(default)]
+    pub cache_read_input_tokens: i64,
+}
+
+// `AnthropicMessage`/`CreateMessageRequest` below are only built and sent
+// by `stream.rs`, which is itself server-only — the `web` (browser) build
+// never touches them.
 #[cfg(feature = "server")]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AnthropicMessage {
@@ -43,7 +92,12 @@ pub struct AnthropicMessage {
     pub content: Vec<ContentBlock>,
 }
 
-#[cfg(feature = "server")]
+/// Ungated, unlike `AnthropicMessage`/`CreateMessageRequest` above —
+/// `api::chat::get_context_detail`'s context-visibility view sends every
+/// available tool's full definition to the browser (see
+/// docs/projects/plans/auto-compaction.md), so this specifically *is*
+/// touched by the `web` build now, even though it started server-only in
+/// the same PR that introduced this whole split.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolDefinition {
     pub name: String,
@@ -83,6 +137,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_token_usage_deserializes_a_full_message_start_usage_object() {
+        let usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 2095,
+            "cache_creation_input_tokens": 10,
+            "cache_read_input_tokens": 5,
+            "output_tokens": 3
+        }))
+        .expect("full usage object should deserialize");
+        assert_eq!(
+            usage,
+            TokenUsage {
+                input_tokens: 2095,
+                output_tokens: 3,
+                cache_creation_input_tokens: 10,
+                cache_read_input_tokens: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn test_token_usage_deserializes_message_deltas_output_tokens_only_shape() {
+        // message_delta's own `usage` object carries only output_tokens,
+        // never the other three fields — must not fail to parse just
+        // because they're absent.
+        let usage: TokenUsage = serde_json::from_value(serde_json::json!({"output_tokens": 45}))
+            .expect("output-tokens-only usage object should deserialize");
+        assert_eq!(
+            usage,
+            TokenUsage {
+                input_tokens: 0,
+                output_tokens: 45,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }
+        );
+    }
+
+    #[test]
     fn test_content_block_wire_tag_matches_anthropic_api() {
         assert_eq!(
             serde_json::to_value(ContentBlock::Text {
@@ -102,6 +194,40 @@ mod tests {
             })
             .unwrap(),
             serde_json::json!({"type": "thinking", "thinking": "hmm", "signature": "sig123"})
+        );
+    }
+
+    #[test]
+    fn test_compaction_summary_block_wire_shape() {
+        // Storage/frontend shape only — this block never round-trips
+        // through Anthropic's own API itself, see its doc comment.
+        assert_eq!(
+            serde_json::to_value(ContentBlock::CompactionSummary {
+                summary: "earlier discussion condensed".to_string(),
+                covers_through_message_id: 42,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "compaction_summary",
+                "summary": "earlier discussion condensed",
+                "covers_through_message_id": 42
+            })
+        );
+    }
+
+    #[test]
+    fn test_compaction_placeholder_block_wire_shape() {
+        // Storage/frontend shape only — same "never round-trips through
+        // Anthropic's own API" caveat as CompactionSummary.
+        assert_eq!(
+            serde_json::to_value(ContentBlock::CompactionPlaceholder {
+                text: "Continue based on the summary above.".to_string(),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "compaction_placeholder",
+                "text": "Continue based on the summary above."
+            })
         );
     }
 

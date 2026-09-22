@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::anthropic::TokenUsage;
 use crate::models::Message;
 
 /// `TaskUpdate` is ephemeral UI telemetry, regenerable at any time from the
@@ -76,6 +77,14 @@ pub enum ConversationEvent {
     NotificationDeliveryFailed {
         detail: String,
     },
+    /// Published after every real turn completes — ephemeral UI telemetry,
+    /// same category as `TaskUpdate`/`Sandbox*Update`, regenerable at any
+    /// time from `api::chat::get_context_usage`. See
+    /// docs/projects/plans/auto-compaction.md.
+    ContextUsageUpdate {
+        usage: TokenUsage,
+        context_window: u32,
+    },
 }
 
 #[cfg(feature = "server")]
@@ -124,6 +133,7 @@ mod server {
 
     #[cfg(test)]
     mod tests {
+        use super::super::TokenUsage;
         use super::*;
 
         #[tokio::test]
@@ -261,6 +271,23 @@ mod server {
                     .await
                     .expect("notification-delivery-failed event should be delivered"),
                 failure_event
+            );
+
+            let context_usage_event = ConversationEvent::ContextUsageUpdate {
+                usage: TokenUsage {
+                    input_tokens: 1000,
+                    output_tokens: 200,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                context_window: 200_000,
+            };
+            publish(6, context_usage_event.clone());
+            assert_eq!(
+                rx.recv()
+                    .await
+                    .expect("context-usage-update event should be delivered"),
+                context_usage_event
             );
         }
     }

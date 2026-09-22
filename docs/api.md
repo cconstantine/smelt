@@ -81,7 +81,7 @@ Because sending a message and opening its event stream are the same call, there'
 
 ## Live conversation events
 
-Three server functions exist purely to support live-updating panels (the background-tasks panel via `run_async`, and the sandbox panel — see `docs/projects/completed/20260815-sandbox-visibility.md`) and turns pushed from outside a request:
+Five server functions exist purely to support live-updating panels (the background-tasks panel via `run_async`, the sandbox panel — see `docs/projects/completed/20260815-sandbox-visibility.md` — and the context-usage indicator/detail view — see `docs/projects/completed/20260922-auto-compaction.md`) and turns pushed from outside a request:
 
 ```rust
 #[get("/api/conversations/{id}/tasks")]
@@ -89,6 +89,12 @@ pub async fn get_tasks(id: i64) -> ServerFnResult<Vec<anthropic::tools::TaskSumm
 
 #[get("/api/conversations/{id}/sandbox")]
 pub async fn get_sandbox_state(id: i64) -> ServerFnResult<SandboxSnapshot>;
+
+#[get("/api/conversations/{id}/context-usage")]
+pub async fn get_context_usage(id: i64) -> ServerFnResult<ContextUsageSnapshot>;
+
+#[get("/api/conversations/{id}/context-detail")]
+pub async fn get_context_detail(id: i64) -> ServerFnResult<ContextDetailSnapshot>;
 
 #[get("/api/conversations/{id}/events")]
 pub async fn subscribe_conversation_events(id: i64) -> ServerFnResult<ServerEvents<ConversationEvent>>;
@@ -104,6 +110,13 @@ pub struct SandboxPodSummary { pod_id: i64, status: String, terminals: Vec<Sandb
 pub struct SandboxSnapshot { pods: Vec<SandboxPodSummary> }
 ```
 
+`get_context_usage` is the always-visible indicator's one-shot pull — the last real `usage` numbers persisted for this conversation (`None` if no turn has completed yet) plus the configured model's context window. `get_context_detail` is the click-through view: the same usage numbers, plus the system prompt (currently always `None`), every available tool's full definition, and the current message count — reconstructed from current state each call, not a stored snapshot of some specific past request:
+
+```rust
+pub struct ContextUsageSnapshot { usage: Option<anthropic::TokenUsage>, context_window: u32 }
+pub struct ContextDetailSnapshot { system: Option<String>, tools: Vec<anthropic::ToolDefinition>, message_count: usize, usage: Option<anthropic::TokenUsage>, context_window: u32 }
+```
+
 `subscribe_conversation_events` is a second, independent `ServerEvents` stream — unlike `send_message`'s, it isn't scoped to one request; a browser tab opens it once per viewed conversation and keeps it open for as long as that conversation is selected, forwarding whatever `events::subscribe(id)` yields:
 
 ```rust
@@ -115,10 +128,12 @@ pub enum ConversationEvent {
     SandboxPodUpdate { pod_id: i64, status: String, terminated: bool },
     SandboxTerminalUpdate { pod_id: i64, terminal_id: i64, status: String, terminated: bool },
     SandboxCommandUpdate { terminal_id: i64, command_id: String, command: Option<String>, status: String, exit_code: Option<i32>, stream: Option<String>, latest_output: Option<String> },
+    NotificationDeliveryFailed { detail: String },
+    ContextUsageUpdate { usage: anthropic::TokenUsage, context_window: u32 },
 }
 ```
 
-`TaskUpdate`/`Sandbox*` are all ephemeral UI telemetry (never persisted, regenerable at any time from `get_tasks`/`get_sandbox_state`); `MessagesAppended` is a live-delivery notification for rows `run_turn` already persisted — whether that `run_turn` call came from a live `send_message` or from a background task's own push. `SandboxPodUpdate`/`SandboxTerminalUpdate` fire on create/terminate (a `terminated: true` update means the frontend should *remove* that pod/terminal, not just relabel it — unlike a finished task, which the task panel keeps showing); `SandboxCommandUpdate` follows the exact same "started/one output line/finished" pattern `TaskUpdate` already uses, with `command` only populated on the "started" event. Since the underlying `broadcast` channel has no replay, the frontend does a one-shot `get_messages`/`get_tasks`/`get_sandbox_state` reconciliation pull on connect/reconnect to cover anything published before it subscribed — see `architecture.md`.
+`TaskUpdate`/`Sandbox*`/`ContextUsageUpdate` are all ephemeral UI telemetry (never persisted as such, regenerable at any time from `get_tasks`/`get_sandbox_state`/`get_context_usage` — `ContextUsageUpdate`'s own numbers *are* separately persisted, in `conversation_context_usage`, precisely so `get_context_usage` can regenerate it); `MessagesAppended` is a live-delivery notification for rows `run_turn` already persisted — whether that `run_turn` call came from a live `send_message` or from a background task's own push. `SandboxPodUpdate`/`SandboxTerminalUpdate` fire on create/terminate (a `terminated: true` update means the frontend should *remove* that pod/terminal, not just relabel it — unlike a finished task, which the task panel keeps showing); `SandboxCommandUpdate` follows the exact same "started/one output line/finished" pattern `TaskUpdate` already uses, with `command` only populated on the "started" event. `ContextUsageUpdate` publishes once per completed real turn, right after `run_turn_bounded` persists that turn's usage. Since the underlying `broadcast` channel has no replay, the frontend does a one-shot `get_messages`/`get_tasks`/`get_sandbox_state`/`get_context_usage` reconciliation pull on connect/reconnect to cover anything published before it subscribed — see `architecture.md`.
 
 ## Current endpoints
 
@@ -130,6 +145,8 @@ pub enum ConversationEvent {
 | `send_message` | `POST /api/conversations/{id}/messages` | streams the assistant reply (and any tool-use turns), see above |
 | `get_tasks` | `GET /api/conversations/{id}/tasks` | one-shot snapshot of `run_async` tasks for this conversation |
 | `get_sandbox_state` | `GET /api/conversations/{id}/sandbox` | one-shot snapshot of every pod/terminal for this conversation, see above |
+| `get_context_usage` | `GET /api/conversations/{id}/context-usage` | one-shot snapshot for the always-visible context-usage indicator, see above |
+| `get_context_detail` | `GET /api/conversations/{id}/context-detail` | one-shot snapshot for the context-usage detail view, see above |
 | `subscribe_conversation_events` | `GET /api/conversations/{id}/events` | always-open live stream, see above |
 | `delete_conversation` | `DELETE /api/conversations/{id}` | hard delete; cascades to the conversation's messages (`ON DELETE CASCADE`); deleting a nonexistent id is not an error |
 
