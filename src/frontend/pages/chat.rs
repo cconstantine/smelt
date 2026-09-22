@@ -6,12 +6,14 @@ use dioxus::prelude::dioxus_core::Task;
 use dioxus::prelude::*;
 
 use crate::anthropic::{ContentBlock, TokenUsage};
-// Only referenced from `merge_task_snapshot`/`merge_sandbox_snapshot` below,
-// which are themselves web-live-subscription glue (used by the browser
-// build) exercised directly by this module's own tests otherwise — so
-// they, and everything only they need, disappear from a `server`-feature
-// build that's neither of those, which would otherwise make this an
-// "unused import".
+// `TodoItem`/`TodoStatus` are used unconditionally (the todo panel itself
+// renders in the shared SSR body, not gated behind `web`) — only
+// `TaskSummary` is web/test-only glue, referenced from
+// `merge_task_snapshot`/`merge_sandbox_snapshot` below (browser-build live
+// subscription, also exercised directly by this module's own tests), so
+// it alone disappears from a plain `server`-feature build, which would
+// otherwise make it an "unused import".
+use crate::anthropic::tools::{TodoItem, TodoStatus};
 #[cfg(any(feature = "web", test))]
 use crate::anthropic::tools::TaskSummary;
 #[cfg(any(feature = "web", test))]
@@ -25,7 +27,7 @@ use crate::api::chat::{
 // them.
 #[cfg(feature = "web")]
 use crate::api::chat::{
-    get_context_usage, get_sandbox_state, get_tasks, subscribe_conversation_events,
+    get_context_usage, get_sandbox_state, get_tasks, get_todos, subscribe_conversation_events,
 };
 // Only referenced by this module's own tests, which build their own
 // `SandboxSnapshot`s by hand rather than through `get_sandbox_state`.
@@ -63,6 +65,17 @@ fn merge_messages_by_id(existing: &mut Vec<Message>, incoming: Vec<Message>) {
 /// so the widget can render like a real terminal's history rather than a
 /// one-line status row — this is deliberately shaped to grow into a real
 /// shell session later, not just a log viewer.
+/// CSS class suffix for a todo's status marker — a plain string mapping,
+/// not a `Display` impl, since this is presentation-only and the panel is
+/// the only caller.
+fn todo_status_class(status: TodoStatus) -> &'static str {
+    match status {
+        TodoStatus::Pending => "pending",
+        TodoStatus::InProgress => "in-progress",
+        TodoStatus::Completed => "completed",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct TaskPanelEntry {
     task_id: String,
@@ -1701,6 +1714,8 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut tasks: Signal<Vec<TaskPanelEntry>> = use_signal(Vec::new);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut todos: Signal<Vec<TodoItem>> = use_signal(Vec::new);
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut sandbox_pods: Signal<Vec<SandboxPodPanelEntry>> = use_signal(Vec::new);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut sandbox_terminals: Signal<Vec<SandboxTerminalPanelEntry>> = use_signal(Vec::new);
@@ -1790,6 +1805,7 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
             }
             let Some(id) = selected() else { return };
             tasks.set(Vec::new());
+            todos.set(Vec::new());
             task_body_els.write().clear();
             task_body_stuck.write().clear();
             sandbox_pods.set(Vec::new());
@@ -1821,6 +1837,9 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                         }
                         if let Ok(snapshot) = get_context_usage(id).await {
                             context_usage.set(Some(snapshot));
+                        }
+                        if let Ok(snapshot) = get_todos(id).await {
+                            todos.set(snapshot);
                         }
 
                         loop {
@@ -1904,6 +1923,9 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                         usage: Some(usage),
                                         context_window,
                                     }));
+                                }
+                                Some(Ok(ConversationEvent::TodoListUpdate { items })) => {
+                                    todos.set(items);
                                 }
                                 Some(Err(_)) | None => break,
                             }
@@ -2097,8 +2119,23 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                 Some(_) => {
                     let tool_names = tool_use_names_by_id(&messages());
                     rsx! {
-                    if !tasks().is_empty() || !sandbox_pods().is_empty() {
+                    if !tasks().is_empty() || !sandbox_pods().is_empty() || !todos().is_empty() {
                         div { class: "side-panels-row",
+                            if !todos().is_empty() {
+                                aside { class: "todo-panel",
+                                    h3 { "Todos" }
+                                    ul { class: "todo-list",
+                                        for (i , todo) in todos().into_iter().enumerate() {
+                                            li {
+                                                key: "{i}",
+                                                class: "todo-item todo-item-{todo_status_class(todo.status)}",
+                                                span { class: "todo-item-marker" }
+                                                span { class: "todo-item-content", "{todo.content}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if !tasks().is_empty() {
                                 aside { class: "tasks-panel",
                                     h3 { "Background tasks" }

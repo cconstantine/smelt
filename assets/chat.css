@@ -554,6 +554,93 @@ body {
     color: #52514e;
 }
 
+/* Todo panel — lives in .side-panels-row, same fixed-width-sidebar
+   treatment as .tasks-panel (border-right, scrolls independently), and
+   renders first (leftmost/topmost) since the plan is the thing worth
+   orienting on before background tasks or the sandbox panel. */
+.todo-panel {
+    width: 280px;
+    flex-shrink: 0;
+    border-right: 1px solid #e5e5e5;
+    background: #fafafa;
+    padding: 16px;
+    overflow-y: auto;
+}
+
+.todo-panel h3 {
+    margin: 0 0 12px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #777;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.todo-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.todo-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 13px;
+    line-height: 1.4;
+}
+
+/* Same marker box for every status — only its border/fill/glyph change —
+   so an item's status is legible without relying on color alone (a plain
+   empty box vs. a half-filled box vs. a checkmark), not just a repainted
+   dot. */
+.todo-item-marker {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    margin-top: 1px;
+    border-radius: 3px;
+    border: 1.5px solid #999;
+    flex-shrink: 0;
+    font-size: 9px;
+    line-height: 1;
+    color: #fff;
+}
+
+.todo-item-in-progress .todo-item-marker {
+    border-color: #2a78d6;
+    background: linear-gradient(135deg, #2a78d6 50%, transparent 50%);
+}
+
+.todo-item-completed .todo-item-marker {
+    border-color: #1baf7a;
+    background: #1baf7a;
+}
+
+.todo-item-completed .todo-item-marker::after {
+    content: "\2713";
+}
+
+.todo-item-content {
+    flex: 1;
+    min-width: 0;
+    word-break: break-word;
+}
+
+.todo-item-in-progress .todo-item-content {
+    font-weight: 600;
+}
+
+.todo-item-completed .todo-item-content {
+    color: #999;
+    text-decoration: line-through;
+}
+
 /* Background tasks panel — lives in .side-panels-row (below the
    transcript, not beside it — see .chat-panel), independently scrollable
    from both the transcript above and .sandbox-panel next to it. Only

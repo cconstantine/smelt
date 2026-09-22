@@ -383,6 +383,15 @@ async fn describe_live_state(pool: &PgPool, conversation_id: i64) -> String {
             task.task_id, task.tool, task.status
         ));
     }
+    if let Ok(todos) = db::get_conversation_todos(pool, conversation_id).await {
+        for todo in todos {
+            lines.push(format!(
+                "- todo: {} (status: {})",
+                todo.content,
+                todo.status.as_str()
+            ));
+        }
+    }
     if lines.is_empty() {
         "(nothing currently live)".to_string()
     } else {
@@ -938,6 +947,16 @@ pub async fn send_message(id: i64, content: String) -> ServerFnResult<ServerEven
 #[get("/api/conversations/{id}/tasks")]
 pub async fn get_tasks(id: i64) -> ServerFnResult<Vec<anthropic::tools::TaskSummary>> {
     Ok(anthropic::tools::snapshot_tasks(id))
+}
+
+/// One-shot pull of the current todo list for the browser — same shape as
+/// `get_tasks`, used for the todo panel's initial load and the
+/// reconciliation pull on connect/reconnect.
+#[get("/api/conversations/{id}/todos")]
+pub async fn get_todos(id: i64) -> ServerFnResult<Vec<anthropic::tools::TodoItem>> {
+    db::get_conversation_todos(db::get(), id)
+        .await
+        .map_err(ServerFnError::new)
 }
 
 /// One line of a command's output, in the order it actually happened —
@@ -2254,6 +2273,40 @@ mod tests {
         assert!(
             description.contains("add"),
             "expected the task's tool name in: {description}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_describe_live_state_lists_the_current_todo_list(pool: PgPool) {
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        db::set_conversation_todos(
+            &pool,
+            conversation.id,
+            &[
+                anthropic::tools::TodoItem {
+                    content: "write the plan".to_string(),
+                    status: anthropic::tools::TodoStatus::Completed,
+                },
+                anthropic::tools::TodoItem {
+                    content: "implement".to_string(),
+                    status: anthropic::tools::TodoStatus::InProgress,
+                },
+            ],
+        )
+        .await
+        .expect("seed todos");
+
+        let description = describe_live_state(&pool, conversation.id).await;
+
+        assert!(
+            description.contains("write the plan") && description.contains("completed"),
+            "expected the first todo and its status in: {description}"
+        );
+        assert!(
+            description.contains("implement") && description.contains("in_progress"),
+            "expected the second todo and its status in: {description}"
         );
     }
 
