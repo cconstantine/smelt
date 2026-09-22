@@ -12,7 +12,7 @@ services:
       postgres:
         condition: service_started
       docker:
-        condition: service_started
+        condition: service_healthy
       # A plain list entry here would only wait for k3s-bootstrap's
       # container to *start*, not finish — and its whole job is to write
       # the kubeconfig file smelt's KUBECONFIG env var points at, which
@@ -78,6 +78,23 @@ services:
       DOCKER_TLS_CERTDIR: ""
     volumes:
       - docker-data:/var/lib/docker
+    # Without this, `docker compose up -d` (and `run`'s own dependency
+    # start) returns as soon as the *container* starts, not once dockerd
+    # inside it is actually accepting connections. `smelt`'s own
+    # `depends_on` used to just say `condition: service_started` for this
+    # service, which couldn't see past that — now `service_healthy`,
+    # which actually waits on this. `docker info` is the standard
+    # readiness probe for this image; its own local socket is the same
+    # daemon `smelt` reaches over DOCKER_HOST=tcp://docker:2375. Caught
+    # live in CI: "Build and deliver the sandbox image" failed once with
+    # "Cannot connect to the Docker daemon at tcp://docker:2375" — k3s
+    # already had this solved via k3s-bootstrap's own `/healthz` poll;
+    # this was the missing equivalent for the docker-in-docker sidecar.
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
 
   # A hermetic k8s cluster for sandbox tests — see
   # docs/projects/plans/k8s-sandbox.md. Pinned to match the real `homelab`
