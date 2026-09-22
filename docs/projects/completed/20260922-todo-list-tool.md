@@ -76,14 +76,17 @@ render correctly.
   about it, not by any self-check.
 
 **What to change:**
-- **Proposing** (not yet applied — needs confirmation): add an explicit
-  checklist item near the top of `development-process.md`'s Phase 1
-  ("Plan") — before starting a new idea, confirm the *previous* project
-  was actually closed out (retrospective, completed doc, `state.md`
-  update, idea/plan files removed), not just merged. Right now the
-  close-out steps are documented (under "Keeping project docs current")
-  but nothing prompts checking they were done before moving to the next
-  thing, which is exactly how this one slipped.
+- **Confirmed and applied**: move the close-out gate from "start of the
+  next idea" to "before the PR is opened" — per review, checking at the
+  *next* project's start relies on remembering to look backward, which is
+  exactly what failed here. Gating it at PR-creation time instead ties the
+  check to the project that's actually finishing, and pulls the close-out
+  commit onto the same branch/PR as the implementation (mirroring
+  `auto-compaction`'s own pattern) rather than a separate follow-up commit
+  after merge — which is what let this one slip through as a direct,
+  easy-to-forget post-merge commit in the first place. Applied to
+  `development-process.md`'s "Retrospective" section and a new note on
+  "Definition of done."
 - **Proposing** (not yet applied — needs confirmation): `development-process.md`'s
   "Definition of done" section names the browser-tier test command
   directly but doesn't mention `dx build --platform web` as a

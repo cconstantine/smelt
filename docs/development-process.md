@@ -111,7 +111,7 @@ cargo check --no-default-features --features web --target wasm32-unknown-unknown
 
 (Real-cluster sandbox tests that create a pod need `scripts/build-sandbox-image.sh` to have run at least once against that cluster — the sandbox pod's image is delivered straight into the cluster's node with no registry involved, so a pod referencing it fails outright (`ImagePullBackOff`) otherwise. Not a compile-time dependency of `cargo test` itself. See [setup.md](setup.md).)
 
-The automated browser tier (`src/browser_tests.rs`) covers the sandbox panel only — anything else touching rendering or interaction still needs a manual pass. See [testing.md](testing.md#whats-not-covered-yet). **Run it — `cargo test --features "server browser-test" -- --ignored --test-threads=1` — as part of done for any change touching the sandbox panel's DOM structure, not just during a later review.** It sat broken for a while after the panel's tabs shipped on `sandbox-visibility`, because nothing re-ran it in between; a deliberate final review caught it, not the change that broke it.
+The automated browser tier (`src/browser_tests.rs`) covers the sandbox panel, the context-usage indicator/detail view/compaction divider, and the todo panel — anything else touching rendering or interaction still needs a manual pass. See [testing.md](testing.md#whats-not-covered-yet). **Run it — `cargo test --features "server browser-test" -- --ignored --test-threads=1` — as part of done for any change touching a covered panel's DOM structure, not just during a later review.** It sat broken for a while after the panel's tabs shipped on `sandbox-visibility`, because nothing re-ran it in between; a deliberate final review caught it, not the change that broke it. **If a frontend (`web`-feature) file changed, run `dx build --platform web` first** — the browser tier serves a separately-built WASM bundle that plain `cargo test` never rebuilds, so a stale one can make a real UI change look broken (or look like it's still missing) when it's actually just untested. See [testing.md](testing.md#src-browser_testsrs-automated) for the full reasoning; discovered the hard way on `todo-list-tool`.
 
 Gate per-target dead code with `#[cfg(feature = "...")]` rather than leaving a warning in the other target.
 
@@ -159,6 +159,19 @@ When the user mentions a new idea, add a file to [projects/ideas/](projects/idea
 ---
 
 ## Retrospective (end of each project)
+
+**Close-out (this section plus "Keeping project docs current" above) is a
+gate on opening the project's PR, not a follow-up to do after it merges.**
+Do it on the same branch as the implementation, so the close-out commit
+rides along in the same PR — not as a separate direct-to-main commit
+afterward, which is easy to forget entirely once the PR is merged and
+attention has moved to whatever's next. Discovered on `todo-list-tool`:
+its close-out was skipped after merge and only caught because the user
+noticed the stale plan file still sitting in `projects/plans/` — checking
+"did the last thing get closed out" at the *start* of the next project
+relies on remembering to look backward, which is exactly what failed;
+gating it at the point the current project's own PR is created doesn't
+have that failure mode.
 
 Before considering a project closed, do a short retrospective covering:
 
