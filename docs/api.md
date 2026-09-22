@@ -81,11 +81,14 @@ Because sending a message and opening its event stream are the same call, there'
 
 ## Live conversation events
 
-Five server functions exist purely to support live-updating panels (the background-tasks panel via `run_async`, the sandbox panel — see `docs/projects/completed/20260815-sandbox-visibility.md` — and the context-usage indicator/detail view — see `docs/projects/completed/20260922-auto-compaction.md`) and turns pushed from outside a request:
+Six server functions exist purely to support live-updating panels (the background-tasks panel via `run_async`, the sandbox panel — see `docs/projects/completed/20260815-sandbox-visibility.md` — the context-usage indicator/detail view — see `docs/projects/completed/20260922-auto-compaction.md` — and the todo panel via `todowrite`/`todoread` — see `docs/projects/completed/20260922-todo-list-tool.md`) and turns pushed from outside a request:
 
 ```rust
 #[get("/api/conversations/{id}/tasks")]
 pub async fn get_tasks(id: i64) -> ServerFnResult<Vec<anthropic::tools::TaskSummary>>;
+
+#[get("/api/conversations/{id}/todos")]
+pub async fn get_todos(id: i64) -> ServerFnResult<Vec<anthropic::tools::TodoItem>>;
 
 #[get("/api/conversations/{id}/sandbox")]
 pub async fn get_sandbox_state(id: i64) -> ServerFnResult<SandboxSnapshot>;
@@ -100,7 +103,7 @@ pub async fn get_context_detail(id: i64) -> ServerFnResult<ContextDetailSnapshot
 pub async fn subscribe_conversation_events(id: i64) -> ServerFnResult<ServerEvents<ConversationEvent>>;
 ```
 
-`get_tasks` is a thin, one-shot wrapper around `anthropic::tools::snapshot_tasks` — every task started via `run_async` in that conversation, with its current status. `get_sandbox_state` is the same shape for the sandbox panel: every pod and terminal currently live in the conversation, each terminal hydrated with its `HISTORY_LIMIT` most recent commands (oldest first), each with the last 200 lines per stream, merged back into one true chronological `output` (stdout and stderr are fetched/capped independently so one stream can't crowd the other out of the window, then re-sorted by `seq` — see `fetch_command_summary` — so the panel doesn't show "all stdout, then all stderr"). Older history beyond the limit isn't duplicated here, it's still reachable through the model's own `list_commands`/`read_terminal_output` tools:
+`get_tasks` is a thin, one-shot wrapper around `anthropic::tools::snapshot_tasks` — every task started via `run_async` in that conversation, with its current status. `get_todos` is the same one-shot shape for the todo panel: the conversation's current todo list, as last set by `todowrite` (`db::get_conversation_todos` — empty if never called). `get_sandbox_state` is the same shape for the sandbox panel: every pod and terminal currently live in the conversation, each terminal hydrated with its `HISTORY_LIMIT` most recent commands (oldest first), each with the last 200 lines per stream, merged back into one true chronological `output` (stdout and stderr are fetched/capped independently so one stream can't crowd the other out of the window, then re-sorted by `seq` — see `fetch_command_summary` — so the panel doesn't show "all stdout, then all stderr"). Older history beyond the limit isn't duplicated here, it's still reachable through the model's own `list_commands`/`read_terminal_output` tools:
 
 ```rust
 pub struct SandboxOutputLine { stream: String, data: String }
@@ -130,10 +133,11 @@ pub enum ConversationEvent {
     SandboxCommandUpdate { terminal_id: i64, command_id: String, command: Option<String>, status: String, exit_code: Option<i32>, stream: Option<String>, latest_output: Option<String> },
     NotificationDeliveryFailed { detail: String },
     ContextUsageUpdate { usage: anthropic::TokenUsage, context_window: u32 },
+    TodoListUpdate { items: Vec<anthropic::tools::TodoItem> },
 }
 ```
 
-`TaskUpdate`/`Sandbox*`/`ContextUsageUpdate` are all ephemeral UI telemetry (never persisted as such, regenerable at any time from `get_tasks`/`get_sandbox_state`/`get_context_usage` — `ContextUsageUpdate`'s own numbers *are* separately persisted, in `conversation_context_usage`, precisely so `get_context_usage` can regenerate it); `MessagesAppended` is a live-delivery notification for rows `run_turn` already persisted — whether that `run_turn` call came from a live `send_message` or from a background task's own push. `SandboxPodUpdate`/`SandboxTerminalUpdate` fire on create/terminate (a `terminated: true` update means the frontend should *remove* that pod/terminal, not just relabel it — unlike a finished task, which the task panel keeps showing); `SandboxCommandUpdate` follows the exact same "started/one output line/finished" pattern `TaskUpdate` already uses, with `command` only populated on the "started" event. `ContextUsageUpdate` publishes once per completed real turn, right after `run_turn_bounded` persists that turn's usage. Since the underlying `broadcast` channel has no replay, the frontend does a one-shot `get_messages`/`get_tasks`/`get_sandbox_state`/`get_context_usage` reconciliation pull on connect/reconnect to cover anything published before it subscribed — see `architecture.md`.
+`TaskUpdate`/`Sandbox*`/`ContextUsageUpdate`/`TodoListUpdate` are all ephemeral UI telemetry (never persisted as such, regenerable at any time from `get_tasks`/`get_sandbox_state`/`get_context_usage`/`get_todos` — `ContextUsageUpdate`'s own numbers *are* separately persisted, in `conversation_context_usage`, precisely so `get_context_usage` can regenerate it, and `TodoListUpdate`'s are likewise persisted in `conversation_todos`); `MessagesAppended` is a live-delivery notification for rows `run_turn` already persisted — whether that `run_turn` call came from a live `send_message` or from a background task's own push. `SandboxPodUpdate`/`SandboxTerminalUpdate` fire on create/terminate (a `terminated: true` update means the frontend should *remove* that pod/terminal, not just relabel it — unlike a finished task, which the task panel keeps showing); `SandboxCommandUpdate` follows the exact same "started/one output line/finished" pattern `TaskUpdate` already uses, with `command` only populated on the "started" event. `ContextUsageUpdate` publishes once per completed real turn, right after `run_turn_bounded` persists that turn's usage. `TodoListUpdate` publishes on every `todowrite` call and always carries the *complete* current list (never a partial diff — `todowrite` itself is a whole-list replace, no per-item ids), so the frontend just overwrites its signal wholesale rather than merging like `TaskUpdate` requires. Since the underlying `broadcast` channel has no replay, the frontend does a one-shot `get_messages`/`get_tasks`/`get_sandbox_state`/`get_context_usage`/`get_todos` reconciliation pull on connect/reconnect to cover anything published before it subscribed — see `architecture.md`.
 
 ## Current endpoints
 
@@ -144,6 +148,7 @@ pub enum ConversationEvent {
 | `get_messages` | `GET /api/conversations/{id}/messages` | ordered by `created_at ASC` |
 | `send_message` | `POST /api/conversations/{id}/messages` | streams the assistant reply (and any tool-use turns), see above |
 | `get_tasks` | `GET /api/conversations/{id}/tasks` | one-shot snapshot of `run_async` tasks for this conversation |
+| `get_todos` | `GET /api/conversations/{id}/todos` | one-shot snapshot of the current todo list, see above |
 | `get_sandbox_state` | `GET /api/conversations/{id}/sandbox` | one-shot snapshot of every pod/terminal for this conversation, see above |
 | `get_context_usage` | `GET /api/conversations/{id}/context-usage` | one-shot snapshot for the always-visible context-usage indicator, see above |
 | `get_context_detail` | `GET /api/conversations/{id}/context-detail` | one-shot snapshot for the context-usage detail view, see above |

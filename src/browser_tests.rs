@@ -418,6 +418,66 @@ async fn test_end_to_end_browser_scenarios() {
             .await,
             "expanding the divider should reveal the real summary text"
         );
+
+        // --- Scenario 7: the todo panel — cold-load population from a
+        // seeded list, then a live, full-replace update with no reload,
+        // via the real todowrite tool (not a hand-built event) — see
+        // docs/projects/plans/todo-list-tool.md. ---
+        let todo_conversation = db::create_conversation(pool)
+            .await
+            .expect("create todo conversation");
+        db::set_conversation_todos(
+            pool,
+            todo_conversation.id,
+            &[
+                anthropic::tools::TodoItem {
+                    content: "write the plan".to_string(),
+                    status: anthropic::tools::TodoStatus::Completed,
+                },
+                anthropic::tools::TodoItem {
+                    content: "implement".to_string(),
+                    status: anthropic::tools::TodoStatus::InProgress,
+                },
+            ],
+        )
+        .await
+        .expect("seed initial todos");
+
+        let todo_page = harness
+            .browser
+            .new_page(&format!(
+                "{}conversation/{}",
+                harness.base_url, todo_conversation.id
+            ))
+            .await
+            .expect("open the todo conversation");
+        assert!(
+            wait_for_text(&todo_page, "write the plan", Duration::from_secs(10)).await,
+            "cold load should show the seeded todo list"
+        );
+        assert!(
+            wait_for_text(&todo_page, "implement", Duration::from_secs(5)).await,
+            "cold load should show every seeded item, not just the first"
+        );
+
+        anthropic::tools::execute(
+            pool,
+            todo_conversation.id,
+            "toolu_todo_test",
+            "todowrite",
+            &serde_json::json!({"todos": [{"content": "ship it", "status": "pending"}]}),
+        )
+        .await
+        .expect("todowrite should succeed");
+
+        assert!(
+            wait_for_text(&todo_page, "ship it", Duration::from_secs(10)).await,
+            "a live todowrite call should update the panel with no reload"
+        );
+        assert!(
+            wait_for_text_gone(&todo_page, "write the plan", Duration::from_secs(5)).await,
+            "todowrite is a full replace — the old list shouldn't still be showing"
+        );
     })
     .await;
 

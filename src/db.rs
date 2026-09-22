@@ -192,6 +192,45 @@ pub async fn upsert_conversation_usage(
     Ok(())
 }
 
+/// Current todo list for `conversation_id` — empty if `todowrite` has never
+/// been called for it. Mechanical mirror of `get_conversation_usage`
+/// (flagged per development-process.md's exception): same "last-known-only"
+/// shape, just a JSONB list instead of four token counts. See
+/// docs/projects/plans/todo-list-tool.md.
+pub async fn get_conversation_todos(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Vec<crate::anthropic::tools::TodoItem>, sqlx::Error> {
+    let items = sqlx::query_scalar::<_, sqlx::types::Json<Vec<crate::anthropic::tools::TodoItem>>>(
+        "SELECT items FROM conversation_todos WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(items.map(|sqlx::types::Json(v)| v).unwrap_or_default())
+}
+
+/// Overwrites `conversation_id`'s todo list with `items` — a full replace,
+/// never a partial update (see the plan's "no per-item ids" decision).
+pub async fn set_conversation_todos(
+    pool: &PgPool,
+    conversation_id: i64,
+    items: &[crate::anthropic::tools::TodoItem],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO conversation_todos (conversation_id, items, updated_at)
+         VALUES ($1, $2, now())
+         ON CONFLICT (conversation_id) DO UPDATE SET
+             items = EXCLUDED.items,
+             updated_at = now()",
+    )
+    .bind(conversation_id)
+    .bind(sqlx::types::Json(items))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // --- Terminal (pod/terminal/command lifecycle) ---
 // Server-only, no client/server boundary to cross (no UI yet) — unlike
 // Conversation/Message, these don't need to live in models.rs or derive
@@ -866,6 +905,63 @@ mod tests {
                 .await
                 .expect("lookup"),
             Some(second)
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_get_conversation_todos_is_empty_when_never_written(pool: PgPool) {
+        let conversation = create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        assert_eq!(
+            get_conversation_todos(&pool, conversation.id)
+                .await
+                .expect("lookup"),
+            Vec::new()
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_set_conversation_todos_round_trips_and_overwrites(pool: PgPool) {
+        use crate::anthropic::tools::{TodoItem, TodoStatus};
+
+        let conversation = create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        let first = vec![
+            TodoItem {
+                content: "write the plan".to_string(),
+                status: TodoStatus::Completed,
+            },
+            TodoItem {
+                content: "implement".to_string(),
+                status: TodoStatus::InProgress,
+            },
+        ];
+        set_conversation_todos(&pool, conversation.id, &first)
+            .await
+            .expect("set should succeed");
+        assert_eq!(
+            get_conversation_todos(&pool, conversation.id)
+                .await
+                .expect("lookup"),
+            first
+        );
+
+        // A second call overwrites wholesale, rather than merging with the
+        // first — "last known only," not an append log.
+        let second = vec![TodoItem {
+            content: "ship it".to_string(),
+            status: TodoStatus::Pending,
+        }];
+        set_conversation_todos(&pool, conversation.id, &second)
+            .await
+            .expect("second set should succeed");
+        assert_eq!(
+            get_conversation_todos(&pool, conversation.id)
+                .await
+                .expect("lookup"),
+            second
         );
     }
 

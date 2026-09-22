@@ -85,6 +85,16 @@ pub enum ConversationEvent {
         usage: TokenUsage,
         context_window: u32,
     },
+    /// Published by `todowrite` on every call — carries the *complete*
+    /// list (never a partial diff, matching `todowrite`'s own whole-list-
+    /// replace semantics), so the frontend panel can just overwrite its
+    /// signal wholesale rather than merging like `TaskUpdate` requires.
+    /// Ephemeral UI telemetry, regenerable at any time from
+    /// `db::get_conversation_todos`. See
+    /// docs/projects/plans/todo-list-tool.md.
+    TodoListUpdate {
+        items: Vec<crate::anthropic::tools::TodoItem>,
+    },
 }
 
 #[cfg(feature = "server")]
