@@ -158,6 +158,75 @@ fn paginate_lines(content: &str, offset: u32, limit: u32) -> (Vec<String>, usize
     (slice, total)
 }
 
+/// Compiles `pattern` into a matcher shared by `glob`'s own `pattern` and
+/// `grep`'s optional `glob` filter — see
+/// docs/projects/plans/glob-and-grep.md's "Decisions from review."
+/// `literal_separator(true)` is deliberate, not `globset`'s own default:
+/// checked against the real crate source (not assumed), a bare
+/// `globset::Glob` lets `*` cross a `/` (so plain `*.rs`, with no `**`,
+/// would already match `src/main.rs`) — indistinguishable from `**/*.rs`
+/// and defeating the whole point of documenting `**` as the recursive
+/// marker in this tool's own schema. `literal_separator(true)` restores
+/// the shell/ripgrep-familiar meaning: a bare `*` matches within one path
+/// segment, only an explicit `**/` recurses.
+fn compile_glob_pattern(pattern: &str) -> Result<globset::GlobMatcher, String> {
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .map(|glob| glob.compile_matcher())
+        .map_err(|e| format!("invalid glob pattern {pattern:?}: {e}"))
+}
+
+/// Compiles `pattern` for `grep` — shared error-formatting wrapper around
+/// `regex::RegexBuilder`, same reason as `compile_glob_pattern`.
+fn compile_grep_pattern(pattern: &str, case_insensitive: bool) -> Result<regex::Regex, String> {
+    regex::RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map_err(|e| format!("invalid regex pattern {pattern:?}: {e}"))
+}
+
+/// Scans `content` line by line for `pattern`, returning up to `budget`
+/// `(1-indexed line number, line text)` matches and whether `budget` was
+/// exhausted before every line was checked (distinct from the file simply
+/// having no more matches). One file's worth of work — the walk loop that
+/// calls this per file (only exercised by the real-cluster integration
+/// test, not unit-tested here — see docs/projects/plans/glob-and-grep.md)
+/// owns combining this across every file into the overall `scan_capped`.
+fn grep_content(
+    content: &str,
+    pattern: &regex::Regex,
+    budget: usize,
+) -> (Vec<(u32, String)>, bool) {
+    let mut matches = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        if matches.len() >= budget {
+            return (matches, true);
+        }
+        if pattern.is_match(line) {
+            matches.push((i as u32 + 1, line.to_string()));
+        }
+    }
+    (matches, false)
+}
+
+/// Same offset/limit slicing as `paginate_lines`, generalized to an
+/// already-materialized slice rather than `&str` split into lines — what
+/// `glob`/`grep` page their (pre-capped, see `MAX_GLOB_SCAN`/
+/// `MAX_GREP_SCAN`) match lists with. `total` is `items.len()`, not the
+/// returned page's length.
+fn paginate_slice<T: Clone>(items: &[T], offset: u32, limit: u32) -> (Vec<T>, usize) {
+    let total = items.len();
+    let skip = offset.saturating_sub(1) as usize;
+    let page = items
+        .iter()
+        .skip(skip)
+        .take(limit as usize)
+        .cloned()
+        .collect();
+    (page, total)
+}
+
 /// One `list_directory` entry — `size` is only meaningful for a file (a
 /// directory's byte size on disk isn't what a caller of this tool wants to
 /// know), see docs/projects/plans/file-tools.md's "What."
@@ -360,6 +429,41 @@ enum ClientMessage {
     },
     #[serde(rename = "list_directory")]
     ListDirectory { request_id: String, path: String },
+    #[serde(rename = "glob")]
+    Glob {
+        request_id: String,
+        path: String,
+        pattern: String,
+        offset: u32,
+        limit: u32,
+    },
+    #[serde(rename = "grep")]
+    Grep {
+        request_id: String,
+        path: String,
+        pattern: String,
+        glob: Option<String>,
+        case_insensitive: bool,
+        offset: u32,
+        limit: u32,
+    },
+}
+
+/// One `grep` match — see docs/projects/plans/glob-and-grep.md.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct GrepMatchInfo {
+    path: String,
+    line: u32,
+    text: String,
+}
+
+/// One file `grep` excluded (too large, or not valid UTF-8) — reported
+/// explicitly rather than silently dropped, per the plan's "Decisions from
+/// review."
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct SkippedFileInfo {
+    path: String,
+    reason: String,
 }
 
 #[derive(Serialize)]
@@ -412,6 +516,21 @@ enum ServerMessage {
         request_id: String,
         event: &'static str,
         entries: Vec<DirEntryInfo>,
+    },
+    GlobMatched {
+        request_id: String,
+        event: &'static str,
+        paths: Vec<String>,
+        total: usize,
+        scan_capped: bool,
+    },
+    GrepMatched {
+        request_id: String,
+        event: &'static str,
+        matches: Vec<GrepMatchInfo>,
+        total: usize,
+        scan_capped: bool,
+        skipped: Vec<SkippedFileInfo>,
     },
     FileError {
         request_id: String,
@@ -534,6 +653,34 @@ async fn handle_client_message(text: &str, state: &Arc<AppState>, socket: &mut W
         ClientMessage::ListDirectory { request_id, path } => {
             handle_list_directory(socket, request_id, path).await
         }
+        ClientMessage::Glob {
+            request_id,
+            path,
+            pattern,
+            offset,
+            limit,
+        } => handle_glob(socket, request_id, path, pattern, offset, limit).await,
+        ClientMessage::Grep {
+            request_id,
+            path,
+            pattern,
+            glob,
+            case_insensitive,
+            offset,
+            limit,
+        } => {
+            handle_grep(
+                socket,
+                request_id,
+                path,
+                pattern,
+                glob,
+                case_insensitive,
+                offset,
+                limit,
+            )
+            .await
+        }
     }
 }
 
@@ -545,6 +692,20 @@ const MAX_FILE_SIZE_BYTES: u64 = 256 * 1024;
 /// `list_directory`'s analogous bound, as an entry count rather than bytes
 /// — same reasoning, see the plan's "Size bound."
 const MAX_DIR_ENTRIES: usize = 1000;
+/// `grep` skips (never errors out entirely on, see `SkippedFileInfo`) a
+/// file bigger than this — bounds worst-case per-file scan time. Distinct
+/// from `MAX_FILE_SIZE_BYTES` above, which caps *returned* content
+/// (`read_file`'s concern); grep's returned payload is already bounded by
+/// its match count, not the size of what it searched through.
+const MAX_GREP_FILE_SIZE_BYTES: u64 = 5 * 1024 * 1024;
+/// Hard ceiling on matches `glob`/`grep` accumulate across the whole walk,
+/// independent of the page (`offset`/`limit`) actually requested — bounds
+/// worst-case walk cost on a huge tree or a pathological pattern.
+/// `scan_capped` in the response is true only when *this* was hit, not
+/// just the requested page — see
+/// docs/projects/plans/glob-and-grep.md's "Decisions from review."
+const MAX_GLOB_SCAN: usize = 2000;
+const MAX_GREP_SCAN: usize = 1000;
 
 async fn send_file_error(socket: &mut WebSocket, request_id: String, message: &str) {
     send_server_message(
@@ -800,6 +961,211 @@ async fn handle_list_directory(socket: &mut WebSocket, request_id: String, path:
         },
     )
     .await;
+}
+
+/// Finds files under `path` whose path relative to `path` matches
+/// `pattern` — see docs/projects/plans/glob-and-grep.md. Real filesystem
+/// walk (via `ignore::WalkBuilder`, `.gitignore`-aware even outside a real
+/// git checkout), not unit-tested directly — only `compile_glob_pattern`
+/// and `paginate_slice`, its pure pieces, are; this glue is exercised by
+/// the real-cluster integration test instead, same as
+/// `handle_list_directory` above already is.
+async fn handle_glob(
+    socket: &mut WebSocket,
+    request_id: String,
+    path: String,
+    pattern: String,
+    offset: u32,
+    limit: u32,
+) {
+    let matcher = match compile_glob_pattern(&pattern) {
+        Ok(matcher) => matcher,
+        Err(e) => {
+            send_file_error(socket, request_id, &e).await;
+            return;
+        }
+    };
+    let walked = tokio::task::spawn_blocking(move || walk_glob(&path, &matcher)).await;
+    let (all_paths, scan_capped) = match walked {
+        Ok(result) => result,
+        Err(_) => {
+            send_file_error(socket, request_id, "internal error walking directory").await;
+            return;
+        }
+    };
+    let (paths, total) = paginate_slice(&all_paths, offset, limit);
+    send_server_message(
+        socket,
+        ServerMessage::GlobMatched {
+            request_id,
+            event: "glob_matched",
+            paths,
+            total,
+            scan_capped,
+        },
+    )
+    .await;
+}
+
+/// Synchronous (`ignore`'s walker is not async) — must run inside
+/// `spawn_blocking`, never called directly from async code. Stops once
+/// `MAX_GLOB_SCAN` matches are found, reporting that as `scan_capped`
+/// rather than silently truncating.
+fn walk_glob(root: &str, matcher: &globset::GlobMatcher) -> (Vec<String>, bool) {
+    let root_path = std::path::Path::new(root);
+    let mut paths = Vec::new();
+    let mut scan_capped = false;
+    let walker = ignore::WalkBuilder::new(root_path)
+        .git_ignore(true)
+        .require_git(false)
+        .build();
+    for entry in walker {
+        let Ok(entry) = entry else { continue };
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(root_path).unwrap_or(entry.path());
+        if !matcher.is_match(relative) {
+            continue;
+        }
+        if paths.len() >= MAX_GLOB_SCAN {
+            scan_capped = true;
+            break;
+        }
+        paths.push(entry.path().to_string_lossy().into_owned());
+    }
+    (paths, scan_capped)
+}
+
+/// Searches file contents under `path` for `pattern`, optionally narrowed
+/// to files matching `glob` first — same walk/testing split as
+/// `handle_glob` above.
+async fn handle_grep(
+    socket: &mut WebSocket,
+    request_id: String,
+    path: String,
+    pattern: String,
+    glob: Option<String>,
+    case_insensitive: bool,
+    offset: u32,
+    limit: u32,
+) {
+    let pattern = match compile_grep_pattern(&pattern, case_insensitive) {
+        Ok(pattern) => pattern,
+        Err(e) => {
+            send_file_error(socket, request_id, &e).await;
+            return;
+        }
+    };
+    let glob_matcher = match glob.as_deref().map(compile_glob_pattern) {
+        Some(Ok(matcher)) => Some(matcher),
+        Some(Err(e)) => {
+            send_file_error(socket, request_id, &e).await;
+            return;
+        }
+        None => None,
+    };
+    let walked =
+        tokio::task::spawn_blocking(move || walk_grep(&path, &pattern, glob_matcher.as_ref()))
+            .await;
+    let (all_matches, scan_capped, skipped) = match walked {
+        Ok(result) => result,
+        Err(_) => {
+            send_file_error(socket, request_id, "internal error walking directory").await;
+            return;
+        }
+    };
+    let (matches, total) = paginate_slice(&all_matches, offset, limit);
+    send_server_message(
+        socket,
+        ServerMessage::GrepMatched {
+            request_id,
+            event: "grep_matched",
+            matches,
+            total,
+            scan_capped,
+            skipped,
+        },
+    )
+    .await;
+}
+
+/// Synchronous, same `spawn_blocking`-only rule as `walk_glob`. Every file
+/// it excludes (oversized, or not valid UTF-8) lands in the returned
+/// `skipped` list — never silently dropped, per the plan's "Decisions
+/// from review." `scan_capped` combines the walk's own cap with
+/// `grep_content`'s per-file budget exhaustion — either one means there
+/// may be more matches than `total` reports.
+fn walk_grep(
+    root: &str,
+    pattern: &regex::Regex,
+    glob_matcher: Option<&globset::GlobMatcher>,
+) -> (Vec<GrepMatchInfo>, bool, Vec<SkippedFileInfo>) {
+    let root_path = std::path::Path::new(root);
+    let mut matches = Vec::new();
+    let mut skipped = Vec::new();
+    let mut scan_capped = false;
+    let walker = ignore::WalkBuilder::new(root_path)
+        .git_ignore(true)
+        .require_git(false)
+        .build();
+    for entry in walker {
+        if matches.len() >= MAX_GREP_SCAN {
+            scan_capped = true;
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(root_path).unwrap_or(entry.path());
+        if let Some(matcher) = glob_matcher {
+            if !matcher.is_match(relative) {
+                continue;
+            }
+        }
+        let display_path = entry.path().to_string_lossy().into_owned();
+        let size = match entry.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(_) => continue,
+        };
+        if size > MAX_GREP_FILE_SIZE_BYTES {
+            skipped.push(SkippedFileInfo {
+                path: display_path,
+                reason: format!("too large ({size} bytes > {MAX_GREP_FILE_SIZE_BYTES} byte limit)"),
+            });
+            continue;
+        }
+        let bytes = match std::fs::read(entry.path()) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(_) => {
+                skipped.push(SkippedFileInfo {
+                    path: display_path,
+                    reason: "binary".to_string(),
+                });
+                continue;
+            }
+        };
+        let budget = MAX_GREP_SCAN.saturating_sub(matches.len());
+        let (file_matches, file_capped) = grep_content(&content, pattern, budget);
+        if file_capped {
+            scan_capped = true;
+        }
+        for (line, text) in file_matches {
+            matches.push(GrepMatchInfo {
+                path: display_path.clone(),
+                line,
+                text,
+            });
+        }
+    }
+    (matches, scan_capped, skipped)
 }
 
 /// Spawns a new named shell — `.process_group(0)` gives it a process group
@@ -1169,6 +1535,130 @@ mod tests {
         let (lines, total) = paginate_lines("a\nb\nc", 99, 10);
         assert!(lines.is_empty());
         assert_eq!(total, 3);
+    }
+
+    // --- paginate_slice: same offset/limit semantics as paginate_lines,
+    // but over an already-materialized Vec<T> (glob's Vec<String> paths,
+    // grep's Vec<GrepMatch>) rather than splitting `&str` into lines —
+    // see docs/projects/plans/glob-and-grep.md.
+
+    #[test]
+    fn test_paginate_slice_returns_full_slice_within_limit() {
+        let (page, total) = paginate_slice(&["a", "b", "c"], 1, 10);
+        assert_eq!(page, vec!["a", "b", "c"]);
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn test_paginate_slice_respects_offset() {
+        let (page, total) = paginate_slice(&["a", "b", "c"], 2, 10);
+        assert_eq!(page, vec!["b", "c"]);
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn test_paginate_slice_respects_limit() {
+        let (page, total) = paginate_slice(&["a", "b", "c"], 1, 2);
+        assert_eq!(page, vec!["a", "b"]);
+        assert_eq!(
+            total, 3,
+            "total should reflect the whole slice, not just the returned page"
+        );
+    }
+
+    #[test]
+    fn test_paginate_slice_offset_beyond_end_returns_empty_but_correct_total() {
+        let (page, total): (Vec<&str>, usize) = paginate_slice(&["a", "b", "c"], 99, 10);
+        assert!(page.is_empty());
+        assert_eq!(total, 3);
+    }
+
+    // --- compile_glob_pattern: shared by glob's own `pattern` and grep's
+    // optional `glob` filter — see docs/projects/plans/glob-and-grep.md's
+    // "Decisions from review."
+
+    #[test]
+    fn test_compile_glob_pattern_matches_double_star_extension() {
+        let matcher = compile_glob_pattern("**/*.rs").expect("valid pattern");
+        assert!(matcher.is_match("src/main.rs"));
+        assert!(matcher.is_match("main.rs"));
+        assert!(!matcher.is_match("src/main.py"));
+    }
+
+    #[test]
+    fn test_compile_glob_pattern_plain_star_does_not_cross_directories() {
+        let matcher = compile_glob_pattern("*.rs").expect("valid pattern");
+        assert!(matcher.is_match("main.rs"));
+        assert!(
+            !matcher.is_match("src/main.rs"),
+            "a bare * shouldn't match across a path separator"
+        );
+    }
+
+    #[test]
+    fn test_compile_glob_pattern_rejects_invalid_pattern() {
+        let err = compile_glob_pattern("[").expect_err("unterminated character class");
+        assert!(
+            err.contains("invalid glob pattern"),
+            "expected a clear invalid-pattern error, got: {err}"
+        );
+    }
+
+    // --- compile_grep_pattern / grep_content: grep's own regex-matching
+    // core, deliberately separated from the real directory walk (which is
+    // only exercised by the real-cluster integration test) — see
+    // docs/projects/plans/glob-and-grep.md.
+
+    #[test]
+    fn test_compile_grep_pattern_rejects_invalid_regex() {
+        let err = compile_grep_pattern("(", false).expect_err("unbalanced group");
+        assert!(
+            err.contains("invalid regex pattern"),
+            "expected a clear invalid-pattern error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_compile_grep_pattern_case_insensitive_matches_regardless_of_case() {
+        let pattern = compile_grep_pattern("hello", true).expect("valid pattern");
+        assert!(pattern.is_match("HELLO world"));
+    }
+
+    #[test]
+    fn test_compile_grep_pattern_case_sensitive_by_default() {
+        let pattern = compile_grep_pattern("hello", false).expect("valid pattern");
+        assert!(!pattern.is_match("HELLO world"));
+    }
+
+    #[test]
+    fn test_grep_content_returns_every_matching_line_with_1_indexed_line_numbers() {
+        let pattern = compile_grep_pattern("fn ", false).expect("valid pattern");
+        let (matches, budget_exhausted) =
+            grep_content("fn a() {}\nlet x = 1;\nfn b() {}\n", &pattern, 10);
+        assert_eq!(
+            matches,
+            vec![(1, "fn a() {}".to_string()), (3, "fn b() {}".to_string())]
+        );
+        assert!(!budget_exhausted);
+    }
+
+    #[test]
+    fn test_grep_content_no_matches_returns_empty() {
+        let pattern = compile_grep_pattern("nope", false).expect("valid pattern");
+        let (matches, budget_exhausted) = grep_content("a\nb\nc\n", &pattern, 10);
+        assert!(matches.is_empty());
+        assert!(!budget_exhausted);
+    }
+
+    #[test]
+    fn test_grep_content_stops_at_budget_and_reports_exhaustion() {
+        let pattern = compile_grep_pattern("x", false).expect("valid pattern");
+        let (matches, budget_exhausted) = grep_content("x\nx\nx\nx\n", &pattern, 2);
+        assert_eq!(matches, vec![(1, "x".to_string()), (2, "x".to_string())]);
+        assert!(
+            budget_exhausted,
+            "should report that more matches existed than the budget allowed"
+        );
     }
 
     fn entry(name: &str, is_dir: bool, size: Option<u64>) -> DirEntryInfo {
