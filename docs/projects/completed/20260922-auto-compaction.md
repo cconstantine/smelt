@@ -127,12 +127,10 @@ to the post-compaction continuation prompt.
   side effect (one less thing to keep in sync by hand).
 
 **What to change:**
-- Proposing (not yet applied — needs confirmation): add a line to
-  `development-process.md`'s existing "spike the riskiest assumption
-  first" guidance naming *protocol/message-shape constraints* (alternation
-  rules, required-first-role, and similar structural requirements of
-  whatever wire format is being extended) as their own category worth
-  reasoning through on paper before writing code — parallel to, not a
-  replacement for, the existing "verify external crate APIs against
+- Confirmed and applied: `development-process.md`'s "Rules" section now
+  names *wire-protocol structural constraints* (alternation rules,
+  required-first-role, and similar shape requirements) as their own
+  category worth verifying against the real spec before writing code —
+  right alongside the existing "verify external crate APIs against
   source" rule, since this was the same discipline applied to a protocol
   rather than a library.
