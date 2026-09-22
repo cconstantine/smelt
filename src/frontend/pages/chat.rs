@@ -5,7 +5,7 @@ use dioxus::html::geometry::PixelsVector2D;
 use dioxus::prelude::dioxus_core::Task;
 use dioxus::prelude::*;
 
-use crate::anthropic::ContentBlock;
+use crate::anthropic::{ContentBlock, TokenUsage};
 // Only referenced from `merge_task_snapshot`/`merge_sandbox_snapshot` below,
 // which are themselves web-live-subscription glue (used by the browser
 // build) exercised directly by this module's own tests otherwise — so
@@ -17,14 +17,16 @@ use crate::anthropic::tools::TaskSummary;
 #[cfg(any(feature = "web", test))]
 use crate::api::chat::SandboxSnapshot;
 use crate::api::chat::{
-    ChatEvent, create_conversation, delete_conversation, get_conversations, get_messages,
-    send_message,
+    ChatEvent, ContextDetailSnapshot, ContextUsageSnapshot, create_conversation,
+    delete_conversation, get_context_detail, get_conversations, get_messages, send_message,
 };
 // Only called from the live event-subscription loop below, which is
 // `web`-only (see its own cfg) — a native `server`-only build never reaches
 // them.
 #[cfg(feature = "web")]
-use crate::api::chat::{get_sandbox_state, get_tasks, subscribe_conversation_events};
+use crate::api::chat::{
+    get_context_usage, get_sandbox_state, get_tasks, subscribe_conversation_events,
+};
 // Only referenced by this module's own tests, which build their own
 // `SandboxSnapshot`s by hand rather than through `get_sandbox_state`.
 #[cfg(test)]
@@ -458,6 +460,231 @@ fn is_scrolled_to_bottom(scroll_top: f64, scroll_height: f64, client_height: f64
     scroll_height - scroll_top - client_height <= SCROLL_BOTTOM_SLACK_PX
 }
 
+/// How full the model's context window is, as a whole-number percent — the
+/// always-visible indicator's own number. `None` if `usage` hasn't arrived
+/// yet (a brand-new conversation). Clamped to 100 — a conversation caught
+/// mid-compaction, or a `context_window` estimate that's simply wrong for
+/// the configured model, shouldn't render a bar past full. See
+/// docs/projects/plans/auto-compaction.md.
+fn context_usage_percent(snapshot: &ContextUsageSnapshot) -> Option<u32> {
+    let usage = snapshot.usage.as_ref()?;
+    if snapshot.context_window == 0 {
+        return None;
+    }
+    let breakdown = context_usage_breakdown(usage, snapshot.context_window);
+    let used = breakdown
+        .context_window
+        .saturating_sub(breakdown.free_tokens);
+    let percent = used.saturating_mul(100) / breakdown.context_window;
+    Some(percent.min(100) as u32)
+}
+
+/// One category's worth of a context-window breakdown — the detail view's
+/// visual meter splits usage into exactly these segments. Cache tokens are
+/// additive to `input_tokens` (Anthropic counts fresh vs. cached input
+/// separately) but still occupy real context-window space, so all four
+/// count toward `free_tokens`'s subtraction — the same total
+/// `context_usage_percent` reports, just split by category here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ContextUsageBreakdown {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+    free_tokens: u64,
+    context_window: u64,
+}
+
+fn context_usage_breakdown(usage: &TokenUsage, context_window: u32) -> ContextUsageBreakdown {
+    let input_tokens = usage.input_tokens.max(0) as u64;
+    let output_tokens = usage.output_tokens.max(0) as u64;
+    let cache_creation_tokens = usage.cache_creation_input_tokens.max(0) as u64;
+    let cache_read_tokens = usage.cache_read_input_tokens.max(0) as u64;
+    let window = context_window as u64;
+    let used = input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens;
+    ContextUsageBreakdown {
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        free_tokens: window.saturating_sub(used),
+        context_window: window,
+    }
+}
+
+/// The detail view's visual context-usage meter — a horizontal stacked bar,
+/// one segment per non-zero category in `breakdown`, sized proportionally
+/// (`flex-grow` set to each segment's own token count, so the segments
+/// plus the free remainder always sum to the full bar with no manual
+/// percent math). Fixed category order (input, output, cache creation,
+/// cache read, free), never reassigned by size — see
+/// `docs/projects/plans/auto-compaction.md` and the dataviz skill's
+/// categorical-color rule. A zero-valued category is skipped entirely
+/// (not rendered at flex-grow: 0) so it can't leave a stray 2px gap next
+/// to nothing.
+fn render_context_meter(breakdown: &ContextUsageBreakdown) -> Element {
+    let segment = |category: &'static str, tokens: u64, label: &str| {
+        if tokens == 0 {
+            return rsx! {};
+        }
+        let percent = if breakdown.context_window > 0 {
+            tokens.saturating_mul(100) / breakdown.context_window
+        } else {
+            0
+        };
+        rsx! {
+            div {
+                key: "{category}",
+                class: "context-meter-segment",
+                "data-category": category,
+                style: "flex-grow: {tokens}",
+                tabindex: 0,
+                role: "img",
+                "aria-label": "{label}: {tokens} tokens, {percent}% of context",
+                span { class: "context-meter-tooltip", "{label}: {tokens} ({percent}%)" }
+            }
+        }
+    };
+
+    rsx! {
+        div { class: "context-meter",
+            div { class: "context-meter-track",
+                {segment("input", breakdown.input_tokens, "Input")}
+                {segment("output", breakdown.output_tokens, "Output")}
+                {segment("cache-creation", breakdown.cache_creation_tokens, "Cache creation")}
+                {segment("cache-read", breakdown.cache_read_tokens, "Cache read")}
+                {segment("free", breakdown.free_tokens, "Free")}
+            }
+            div { class: "context-meter-legend",
+                if breakdown.input_tokens > 0 {
+                    span { class: "context-meter-legend-item",
+                        span { class: "context-meter-swatch", "data-category": "input" }
+                        "Input"
+                    }
+                }
+                if breakdown.output_tokens > 0 {
+                    span { class: "context-meter-legend-item",
+                        span { class: "context-meter-swatch", "data-category": "output" }
+                        "Output"
+                    }
+                }
+                if breakdown.cache_creation_tokens > 0 {
+                    span { class: "context-meter-legend-item",
+                        span { class: "context-meter-swatch", "data-category": "cache-creation" }
+                        "Cache creation"
+                    }
+                }
+                if breakdown.cache_read_tokens > 0 {
+                    span { class: "context-meter-legend-item",
+                        span { class: "context-meter-swatch", "data-category": "cache-read" }
+                        "Cache read"
+                    }
+                }
+                if breakdown.free_tokens > 0 {
+                    span { class: "context-meter-legend-item",
+                        span { class: "context-meter-swatch", "data-category": "free" }
+                        "Free"
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod context_usage_tests {
+    use super::*;
+
+    #[test]
+    fn test_context_usage_percent_none_when_usage_not_yet_known() {
+        let snapshot = ContextUsageSnapshot {
+            usage: None,
+            context_window: 200_000,
+        };
+        assert_eq!(context_usage_percent(&snapshot), None);
+    }
+
+    #[test]
+    fn test_context_usage_percent_computes_input_plus_output_over_window() {
+        let snapshot = ContextUsageSnapshot {
+            usage: Some(TokenUsage {
+                input_tokens: 40_000,
+                output_tokens: 10_000,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+            context_window: 200_000,
+        };
+        assert_eq!(context_usage_percent(&snapshot), Some(25));
+    }
+
+    #[test]
+    fn test_context_usage_percent_clamps_at_100() {
+        let snapshot = ContextUsageSnapshot {
+            usage: Some(TokenUsage {
+                input_tokens: 500_000,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+            context_window: 200_000,
+        };
+        assert_eq!(context_usage_percent(&snapshot), Some(100));
+    }
+
+    #[test]
+    fn test_context_usage_percent_counts_cache_tokens_too() {
+        // Cache tokens are additive to input_tokens (Anthropic counts fresh
+        // vs. cached input separately) — they still occupy real context
+        // window space and must count toward "how full is it", not be
+        // silently excluded.
+        let snapshot = ContextUsageSnapshot {
+            usage: Some(TokenUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: 25_000,
+                cache_read_input_tokens: 25_000,
+            }),
+            context_window: 200_000,
+        };
+        assert_eq!(context_usage_percent(&snapshot), Some(25));
+    }
+
+    #[test]
+    fn test_context_usage_breakdown_splits_every_category_and_computes_free() {
+        let usage = TokenUsage {
+            input_tokens: 40_000,
+            output_tokens: 10_000,
+            cache_creation_input_tokens: 5_000,
+            cache_read_input_tokens: 5_000,
+        };
+        let breakdown = context_usage_breakdown(&usage, 200_000);
+        assert_eq!(
+            breakdown,
+            ContextUsageBreakdown {
+                input_tokens: 40_000,
+                output_tokens: 10_000,
+                cache_creation_tokens: 5_000,
+                cache_read_tokens: 5_000,
+                free_tokens: 140_000,
+                context_window: 200_000,
+            }
+        );
+    }
+
+    #[test]
+    fn test_context_usage_breakdown_free_never_negative_when_usage_exceeds_window() {
+        let usage = TokenUsage {
+            input_tokens: 150_000,
+            output_tokens: 100_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        let breakdown = context_usage_breakdown(&usage, 200_000);
+        assert_eq!(breakdown.free_tokens, 0);
+    }
+}
+
 /// Renders one content block, keyed by `{message_id}-{index}` for the
 /// enclosing `for` loop. `Text` renders as an ordinary chat bubble, same as
 /// always (including synthetic pushed `<task-output>`/`<task-notification>`
@@ -602,6 +829,24 @@ fn render_block_element(
                 }
             }
         }
+        // Auto-compaction's own output — visible as something that
+        // happened (per docs/projects/plans/auto-compaction.md's "visible
+        // to the user" decision), collapsed by default same as `Thinking`
+        // above so it doesn't dominate the transcript on every reload.
+        ContentBlock::CompactionSummary { summary, .. } => rsx! {
+            details { key: "{key}", class: "compaction-summary-block",
+                summary { class: "compaction-summary-header",
+                    span { class: "compaction-summary-icon", "🗜️" }
+                    span { "Conversation compacted" }
+                    span { class: "timestamp", "{timestamp}" }
+                }
+                div { class: "compaction-summary-body", "{summary}" }
+            }
+        },
+        // Purely structural (see its own doc comment) — nothing a human
+        // typed or needs to see; the `CompactionSummary` divider above is
+        // what actually marks "compaction happened" in the transcript.
+        ContentBlock::CompactionPlaceholder { .. } => rsx! {},
     }
 }
 
@@ -1461,6 +1706,15 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
     let mut sandbox_terminals: Signal<Vec<SandboxTerminalPanelEntry>> = use_signal(Vec::new);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut tz_offset_minutes: Signal<i32> = use_signal(|| 0);
+    // `None` until the first `ContextUsageUpdate`/`get_context_usage` pull
+    // — a brand-new conversation has no turn yet to report usage for. See
+    // docs/projects/plans/auto-compaction.md.
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut context_usage: Signal<Option<ContextUsageSnapshot>> = use_signal(|| None);
+    // The click-through detail view: closed by default, fetched on demand
+    // (not kept live) the moment it's opened — see `open_context_detail`.
+    let mut context_detail: Signal<Option<ContextDetailSnapshot>> = use_signal(|| None);
+    let mut context_detail_open = use_signal(|| false);
 
     // Sticky-bottom auto-scroll state for the message transcript: the
     // mounted `.messages` element (so an effect can query/set its scroll
@@ -1565,6 +1819,9 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                 snapshot,
                             );
                         }
+                        if let Ok(snapshot) = get_context_usage(id).await {
+                            context_usage.set(Some(snapshot));
+                        }
 
                         loop {
                             match events.recv().await {
@@ -1639,6 +1896,15 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                 })) => {
                                     notification_delivery_error.set(Some(detail));
                                 }
+                                Some(Ok(ConversationEvent::ContextUsageUpdate {
+                                    usage,
+                                    context_window,
+                                })) => {
+                                    context_usage.set(Some(ContextUsageSnapshot {
+                                        usage: Some(usage),
+                                        context_window,
+                                    }));
+                                }
                                 Some(Err(_)) | None => break,
                             }
                         }
@@ -1653,6 +1919,20 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
             event_task.set(Some(handle));
         });
     }
+
+    // Fetches a fresh detail snapshot every time it's opened, rather than
+    // caching — matches the idea's "most recently sent request" decision;
+    // reopening after a new turn should show that turn's numbers, not a
+    // stale first-open snapshot.
+    let mut open_context_detail = move || {
+        let Some(id) = selected() else { return };
+        context_detail_open.set(true);
+        spawn(async move {
+            if let Ok(detail) = get_context_detail(id).await {
+                context_detail.set(Some(detail));
+            }
+        });
+    };
 
     let mut send = move || {
         let Some(id) = selected() else { return };
@@ -1967,6 +2247,68 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                         }
                     }
                     div { class: "chat-main",
+                        if let Some(snapshot) = context_usage() {
+                            div {
+                                class: "context-usage-bar",
+                                onclick: move |_| open_context_detail(),
+                                if let Some(percent) = context_usage_percent(&snapshot) {
+                                    div { class: "context-usage-track",
+                                        div {
+                                            class: "context-usage-fill",
+                                            style: "width: {percent}%",
+                                        }
+                                    }
+                                    span { class: "context-usage-label", "{percent}% of context" }
+                                } else {
+                                    span { class: "context-usage-label", "context: —" }
+                                }
+                            }
+                        }
+                        if context_detail_open() {
+                            div { class: "context-detail-overlay",
+                                onclick: move |_| context_detail_open.set(false),
+                                div {
+                                    class: "context-detail-panel",
+                                    onclick: move |evt| evt.stop_propagation(),
+                                    button {
+                                        class: "context-detail-close",
+                                        onclick: move |_| context_detail_open.set(false),
+                                        "×"
+                                    }
+                                    match context_detail() {
+                                        None => rsx! { p { "Loading…" } },
+                                        Some(detail) => rsx! {
+                                            h3 { "Context" }
+                                            p {
+                                                "System prompt: "
+                                                if let Some(system) = &detail.system {
+                                                    "{system}"
+                                                } else {
+                                                    "none set"
+                                                }
+                                            }
+                                            p { "Messages: {detail.message_count}" }
+                                            if let Some(usage) = &detail.usage {
+                                                p {
+                                                    "Tokens — input: {usage.input_tokens}, output: {usage.output_tokens}, "
+                                                    "cache creation: {usage.cache_creation_input_tokens}, cache read: {usage.cache_read_input_tokens}"
+                                                }
+                                                {render_context_meter(&context_usage_breakdown(usage, detail.context_window))}
+                                            }
+                                            p { "Context window: {detail.context_window}" }
+                                            h4 { "Tools ({detail.tools.len()})" }
+                                            for tool in &detail.tools {
+                                                div { class: "context-detail-tool",
+                                                    strong { "{tool.name}" }
+                                                    p { "{tool.description}" }
+                                                    pre { "{tool.input_schema}" }
+                                                }
+                                            }
+                                        },
+                                    }
+                                }
+                            }
+                        }
                         div {
                             class: "messages",
                             onmounted: move |evt| messages_el.set(Some(evt)),

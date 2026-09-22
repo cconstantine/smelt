@@ -5,13 +5,46 @@ pub mod stream;
 
 pub mod tools;
 
-pub use types::ContentBlock;
+pub use types::{ContentBlock, TokenUsage, ToolDefinition};
 // The rest of the Messages API request/response shape is only built and
 // sent by `stream.rs`, which is itself server-only (see its own `#[cfg]`
 // above) — the `web` (browser) build never touches them, only the shared
-// `ContentBlock` payload type above.
+// types above.
 #[cfg(feature = "server")]
-pub use types::{AnthropicMessage, CreateMessageRequest, ThinkingConfig, ToolDefinition};
+pub use types::{AnthropicMessage, CreateMessageRequest, ThinkingConfig};
+
+/// Known context-window size (real token count) for a recognized
+/// `claude-*` model id — nothing in the Messages API surfaces this, so it
+/// can't be derived or queried, only looked up. `None` for anything else
+/// (a gateway or local Ollama model has no "Anthropic model name" to match
+/// at all) — `api::chat`'s caller falls back to `ANTHROPIC_CONTEXT_WINDOW`
+/// in that case. See docs/projects/plans/auto-compaction.md.
+#[cfg(feature = "server")]
+pub fn context_window_for(model: &str) -> Option<u32> {
+    if model.starts_with("claude-") {
+        Some(200_000)
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "server")]
+#[cfg(test)]
+mod context_window_tests {
+    use super::context_window_for;
+
+    #[test]
+    fn test_context_window_for_recognizes_claude_model_ids() {
+        assert_eq!(context_window_for("claude-opus-4-8"), Some(200_000));
+        assert_eq!(context_window_for("claude-sonnet-4-5"), Some(200_000));
+    }
+
+    #[test]
+    fn test_context_window_for_unrecognized_model_is_none() {
+        assert_eq!(context_window_for("gpt-oss:120b_128k"), None);
+        assert_eq!(context_window_for("llama3"), None);
+    }
+}
 
 /// Shared by every test (in this module, `stream.rs`, and `api::chat`) that
 /// points the process-global `ANTHROPIC_BASE_URL` env var at a mock upstream

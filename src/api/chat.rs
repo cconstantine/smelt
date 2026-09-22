@@ -128,6 +128,373 @@ const TOOL_CALL_PARSE_RETRIES: usize = 2;
 #[cfg(feature = "server")]
 const MAX_TURNS: usize = 10_000;
 
+/// Every real turn's requested reply budget — shared with the
+/// auto-compaction trigger below, which reserves at least this much
+/// headroom off the context window before deciding a request is too big.
+#[cfg(feature = "server")]
+const MAX_TOKENS: u32 = 16_384;
+
+/// Extra headroom reserved on top of `MAX_TOKENS`, in case a smaller
+/// `max_tokens` is ever configured per-request in the future — mirrors
+/// opencode's own `max(output reserve, buffer)` term. Not currently
+/// reachable as its own binding factor since `MAX_TOKENS` already exceeds
+/// it, but kept as a named floor rather than assuming `MAX_TOKENS` always
+/// will. See docs/projects/plans/auto-compaction.md.
+#[cfg(feature = "server")]
+const COMPACTION_SAFETY_BUFFER: u32 = 4096;
+
+/// A cheap, approximate token-count estimate for content not yet sent —
+/// chars/4, Anthropic's own rough published guidance, not a real
+/// tokenizer. Used only to decide whether compaction should run before a
+/// request goes out; never persisted or shown as if it were exact usage.
+///
+/// Spiked once against the real (non-mock) gateway configured in dev,
+/// rather than left as a pure assumption: two consecutive real turns'
+/// `usage.input_tokens` differ by (previous turn's real `output_tokens` +
+/// whatever new message content was added) — isolating that second term
+/// for an 800-character message gave ~211 real tokens against this
+/// function's 200-token estimate, ~3.8 real chars/token vs. the 4.0
+/// assumed here. Close enough not to revisit without a reason to — and
+/// that one data point (repeated single characters) is a harder case for
+/// a tokenizer than real prose, which should compress to *more*
+/// chars/token, not fewer, so if anything this errs slightly generous
+/// already. Same method (diff two real `get_context_usage` reads, subtract
+/// the earlier one's `output_tokens`) works to re-check this later against
+/// a real, varied conversation if the constant is ever in question.
+#[cfg(feature = "server")]
+fn estimate_tokens(blocks: &[anthropic::ContentBlock]) -> u64 {
+    let chars: usize = blocks
+        .iter()
+        .map(|block| match block {
+            anthropic::ContentBlock::Text { text } => text.len(),
+            anthropic::ContentBlock::ToolResult { content, .. } => content.len(),
+            anthropic::ContentBlock::ToolUse { input, .. } => input.to_string().len(),
+            anthropic::ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => thinking.len() + signature.len(),
+            anthropic::ContentBlock::CompactionSummary { summary, .. } => summary.len(),
+            anthropic::ContentBlock::CompactionPlaceholder { text } => text.len(),
+        })
+        .sum();
+    (chars / 4) as u64
+}
+
+/// Whether the upcoming request's real size looks likely to eat into the
+/// reserved ceiling (model output allowance + a safety buffer, subtracted
+/// from the context window) — opencode's own trigger mechanism, checked
+/// *before* a request is sent rather than reacting to a real rejection.
+/// `last_usage` is the last real response's usage (the ground truth for
+/// everything already in the conversation — see `stream::StreamedTurn`'s
+/// own doc comment); `new_content_estimate` is `estimate_tokens` applied
+/// to whatever's freshly being added this turn. `None` `last_usage`
+/// (nothing sent yet) never triggers — there's nothing to compact. See
+/// docs/projects/plans/auto-compaction.md.
+#[cfg(feature = "server")]
+fn should_compact(
+    last_usage: Option<&anthropic::TokenUsage>,
+    new_content_estimate: u64,
+    context_window: u32,
+) -> bool {
+    let Some(last_usage) = last_usage else {
+        return false;
+    };
+    let already_used = (last_usage.input_tokens
+        + last_usage.output_tokens
+        + last_usage.cache_creation_input_tokens
+        + last_usage.cache_read_input_tokens)
+        .max(0) as u64;
+    let projected = already_used + new_content_estimate;
+    let reserved = MAX_TOKENS.max(COMPACTION_SAFETY_BUFFER) as u64;
+    let ceiling = (context_window as u64).saturating_sub(reserved);
+    projected >= ceiling
+}
+
+/// Whether it's safe to end a compaction's covered range right after a
+/// message with this content — i.e. it contains no `tool_use` block whose
+/// paired `tool_result` (always the very next persisted message, in this
+/// codebase's per-turn persistence model) hasn't been included too.
+/// Anthropic rejects a request with an orphaned half outright, so this is
+/// a hard constraint on where `covers_through_message_id` may point, never
+/// best-effort. See docs/projects/plans/auto-compaction.md.
+#[cfg(feature = "server")]
+fn is_safe_compaction_boundary(blocks: &[anthropic::ContentBlock]) -> bool {
+    !blocks
+        .iter()
+        .any(|block| matches!(block, anthropic::ContentBlock::ToolUse { .. }))
+}
+
+/// A fixed, structural placeholder — never shown as if the user actually
+/// typed it, just what makes the synthetic post-compaction exchange below
+/// start validly with `user` (Anthropic's own requirement, not negotiable).
+#[cfg(feature = "server")]
+const COMPACTION_PLACEHOLDER_PROMPT: &str = "Summarize the conversation so far.";
+
+/// The synthetic message that actually gets a real response after
+/// compaction — the summary already carries forward whatever the model
+/// needs (including the gist of whatever large content triggered
+/// compaction in the first place, since the summarization call sees
+/// everything up through it), so this is a plain continuation nudge, not
+/// a replay of anything.
+#[cfg(feature = "server")]
+const COMPACTION_CONTINUATION_PROMPT: &str = "Continue based on the summary above.";
+
+/// The three synthetic messages one compaction pass inserts, in this
+/// order — pure construction, no I/O (see `compact_conversation` for what
+/// actually persists them). Three messages, not one, because Anthropic
+/// requires strict user/assistant alternation *and* that `messages` start
+/// with `user` — a single summary message can't satisfy both "starts with
+/// user" and "ends with something real to respond to" on its own:
+/// `user` (structural placeholder) -> `assistant` (the summary) -> `user`
+/// (a plain continuation nudge, the thing the *next* real request
+/// actually responds to). See docs/projects/plans/auto-compaction.md.
+#[cfg(feature = "server")]
+fn compaction_messages(
+    summary: String,
+    covers_through_message_id: i64,
+) -> [(&'static str, Vec<anthropic::ContentBlock>); 3] {
+    [
+        (
+            "user",
+            vec![anthropic::ContentBlock::CompactionPlaceholder {
+                text: COMPACTION_PLACEHOLDER_PROMPT.to_string(),
+            }],
+        ),
+        (
+            "assistant",
+            vec![anthropic::ContentBlock::CompactionSummary {
+                summary,
+                covers_through_message_id,
+            }],
+        ),
+        (
+            "user",
+            vec![anthropic::ContentBlock::CompactionPlaceholder {
+                text: COMPACTION_CONTINUATION_PROMPT.to_string(),
+            }],
+        ),
+    ]
+}
+
+/// Builds the message history actually replayed to Anthropic — every
+/// persisted message, *except* the compaction boundary, if any, changes
+/// what's replayed without anything having been rewritten or deleted in
+/// storage. Finds the *latest* `CompactionSummary` block across every
+/// message (a long conversation can compact more than once; only the most
+/// recent boundary matters — everything at or before it, including any
+/// earlier compaction's own summary message, is superseded), skips every
+/// message at or before that boundary, and translates the summary itself
+/// from `CompactionSummary` into a plain `Text` block — Anthropic has no
+/// concept of the former. See docs/projects/plans/auto-compaction.md.
+#[cfg(feature = "server")]
+fn history_for_request(
+    messages: Vec<Message>,
+) -> Result<Vec<anthropic::AnthropicMessage>, serde_json::Error> {
+    let parsed = messages
+        .into_iter()
+        .map(|m| {
+            let blocks = m.blocks()?;
+            Ok((m.id, m.role, blocks))
+        })
+        .collect::<Result<Vec<(i64, String, Vec<anthropic::ContentBlock>)>, serde_json::Error>>()?;
+
+    let latest_boundary = parsed
+        .iter()
+        .flat_map(|(_, _, blocks)| blocks.iter())
+        .filter_map(|block| match block {
+            anthropic::ContentBlock::CompactionSummary {
+                covers_through_message_id,
+                ..
+            } => Some(*covers_through_message_id),
+            _ => None,
+        })
+        .max();
+
+    let history = parsed
+        .into_iter()
+        .filter(|(id, _, _)| latest_boundary.is_none_or(|boundary| *id > boundary))
+        .map(|(_, role, blocks)| {
+            let content = blocks
+                .into_iter()
+                .map(|block| match block {
+                    anthropic::ContentBlock::CompactionSummary { summary, .. } => {
+                        anthropic::ContentBlock::Text { text: summary }
+                    }
+                    anthropic::ContentBlock::CompactionPlaceholder { text } => {
+                        anthropic::ContentBlock::Text { text }
+                    }
+                    other => other,
+                })
+                .collect();
+            anthropic::AnthropicMessage { role, content }
+        })
+        .collect();
+    Ok(history)
+}
+
+/// The system prompt for the dedicated summarization call `compact_conversation`
+/// makes — no tools attached, so this is the model's only instruction.
+/// Explicitly demands every live id be preserved verbatim rather than
+/// trusting the model to notice one buried in a long transcript
+/// unprompted — see `describe_live_state` below, which hands them over
+/// directly rather than leaving them to be spotted.
+#[cfg(feature = "server")]
+const COMPACTION_SYSTEM_PROMPT: &str = "You are compacting an AI coding agent's \
+conversation history to free up context window space. Write a concise summary \
+of the conversation so far: the user's original goal, key decisions made, the \
+current state of any files or code changed, and any unresolved next steps. You \
+MUST explicitly mention, by its exact id, every sandbox pod, terminal, and \
+background task listed below as currently live — never omit or paraphrase an \
+id, since later tool calls still need a working reference to it. Write the \
+summary as plain prose.";
+
+/// A plain-text listing of every currently-live pod/terminal/task for
+/// `conversation_id`, handed to the summarization call so it can be told
+/// directly what must survive — see `COMPACTION_SYSTEM_PROMPT` and
+/// docs/projects/plans/auto-compaction.md's "Interaction with live/
+/// in-flight state." Best-effort: a lookup failure just omits that
+/// category rather than failing the whole compaction over it.
+#[cfg(feature = "server")]
+async fn describe_live_state(pool: &PgPool, conversation_id: i64) -> String {
+    // Deliberately the plain `db::` row queries, not `sandbox::list_pods`/
+    // `list_terminals` — those also reach through the process-global
+    // sandbox manager to check live connection status, which panics if
+    // `sandbox::init()` was never called (true of most tests, and not
+    // otherwise relevant here: a summarization prompt just needs which
+    // ids exist and aren't terminated, not real-time connection health).
+    let mut lines = Vec::new();
+    if let Ok(pods) = db::list_sandbox_pods(pool, conversation_id).await {
+        for pod in pods {
+            lines.push(format!("- sandbox pod_id {}", pod.id));
+        }
+    }
+    if let Ok(terminals) = db::list_sandbox_terminals_for_conversation(pool, conversation_id).await
+    {
+        for terminal in terminals {
+            lines.push(format!(
+                "- terminal_id {} in pod_id {}",
+                terminal.id, terminal.pod_id
+            ));
+        }
+    }
+    for task in anthropic::tools::snapshot_tasks(conversation_id) {
+        lines.push(format!(
+            "- background task_id {} ({}, status: {})",
+            task.task_id, task.tool, task.status
+        ));
+    }
+    if lines.is_empty() {
+        "(nothing currently live)".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// Runs one compaction pass: summarizes everything currently persisted (up
+/// through and including whatever's pending — the size trigger fired
+/// because of everything currently in the conversation, not just the
+/// older part of it) via a separate, tools-less Anthropic call, and
+/// inserts `compaction_messages`' three synthetic messages. Nothing
+/// already stored is rewritten or removed. A no-op (`Ok(())`, no API call)
+/// if there's nothing to compact, or if the current last message isn't a
+/// safe boundary (shouldn't happen given the loop's own invariant — see
+/// `is_safe_compaction_boundary` — but checked defensively rather than
+/// assumed). If the summarization call itself fails, this propagates the
+/// error and the whole turn fails loudly, rather than proceeding with the
+/// oversized request compaction exists to prevent — see the plan's
+/// "Resolved" decision on this.
+#[cfg(feature = "server")]
+async fn compact_conversation(
+    pool: &PgPool,
+    conversation_id: i64,
+    api_key: Option<&str>,
+    auth_token: Option<&str>,
+) -> ServerFnResult<()> {
+    let messages = db::list_messages(pool, conversation_id)
+        .await
+        .map_err(ServerFnError::new)?;
+    let Some(last) = messages.last() else {
+        return Ok(());
+    };
+    let last_blocks = last.blocks().map_err(ServerFnError::new)?;
+    if !is_safe_compaction_boundary(&last_blocks) {
+        return Ok(());
+    }
+    let covers_through_message_id = last.id;
+
+    let mut transcript = String::new();
+    for message in &messages {
+        let Ok(blocks) = message.blocks() else {
+            continue;
+        };
+        for block in blocks {
+            let text = match block {
+                anthropic::ContentBlock::Text { text } => text,
+                anthropic::ContentBlock::ToolUse { name, input, .. } => {
+                    format!("[called tool {name} with {input}]")
+                }
+                anthropic::ContentBlock::ToolResult { content, .. } => {
+                    format!("[tool result: {content}]")
+                }
+                anthropic::ContentBlock::Thinking { .. } => continue,
+                anthropic::ContentBlock::CompactionSummary { summary, .. } => summary,
+                // Purely structural (see its own doc comment) — noise for
+                // a *later* compaction's own summarization transcript, not
+                // real prior dialogue worth feeding back in.
+                anthropic::ContentBlock::CompactionPlaceholder { .. } => continue,
+            };
+            transcript.push_str(&message.role);
+            transcript.push_str(": ");
+            transcript.push_str(&text);
+            transcript.push('\n');
+        }
+    }
+
+    let live_state = describe_live_state(pool, conversation_id).await;
+    let prompt = format!(
+        "Conversation so far:\n{transcript}\n\nCurrently live (preserve these \
+         exact ids in your summary):\n{live_state}"
+    );
+
+    let summarization_request = anthropic::CreateMessageRequest {
+        model: anthropic_model(),
+        max_tokens: 2048,
+        system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
+        messages: vec![anthropic::AnthropicMessage {
+            role: "user".to_string(),
+            content: vec![anthropic::ContentBlock::Text { text: prompt }],
+        }],
+        stream: true,
+        tools: vec![],
+        thinking: None,
+    };
+
+    let mut discard_deltas = |_: &str| {};
+    let turn = anthropic::stream::stream_anthropic_message(
+        api_key,
+        auth_token,
+        &summarization_request,
+        &mut discard_deltas,
+    )
+    .await
+    .map_err(ServerFnError::new)?;
+    let summary = turn
+        .content
+        .into_iter()
+        .find_map(|block| match block {
+            anthropic::ContentBlock::Text { text } => Some(text),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    for (role, content) in compaction_messages(summary, covers_through_message_id) {
+        db::create_message(pool, conversation_id, role, &content)
+            .await
+            .map_err(ServerFnError::new)?;
+    }
+    Ok(())
+}
+
 /// A live `send_message` call and a background task's push-triggered
 /// `run_turn` call (or two different tasks' pushes) can race for the same
 /// conversation — Anthropic's strict user/assistant alternation breaks if
@@ -244,15 +611,18 @@ pub(crate) async fn wake_conversation(
 /// upstream `MAX_TURNS` (10,000) times. Every other caller goes through
 /// `run_turn`, which always passes the real `MAX_TURNS`.
 /// Drains any terminal commands finished (or lost) but not yet notified
-/// into `history`/`persisted` as ordinary persisted `user` messages —
-/// pulled out of `run_turn_bounded`'s loop so `wake_conversation` (which
-/// has no synthetic message of its own to send) can trigger exactly this
-/// step directly, without duplicating the notification-text logic.
+/// into `persisted` as ordinary persisted `user` messages, folding their
+/// content into `pending_new_content` too (the compaction trigger's
+/// "what's new since the last real response" estimate — see
+/// `run_turn_bounded`'s own use of it) — pulled out of `run_turn_bounded`'s
+/// loop so `wake_conversation` (which has no synthetic message of its own
+/// to send) can trigger exactly this step directly, without duplicating
+/// the notification-text logic.
 #[cfg(feature = "server")]
 async fn drain_unnotified_terminal_commands(
     pool: &PgPool,
     conversation_id: i64,
-    history: &mut Vec<anthropic::AnthropicMessage>,
+    pending_new_content: &mut Vec<anthropic::ContentBlock>,
     persisted: &mut Vec<Message>,
 ) -> ServerFnResult<()> {
     for command in db::unnotified_finished_terminal_commands(pool, conversation_id)
@@ -279,10 +649,7 @@ async fn drain_unnotified_terminal_commands(
         let saved = db::create_message(pool, conversation_id, "user", &notification_content)
             .await
             .map_err(ServerFnError::new)?;
-        history.push(anthropic::AnthropicMessage {
-            role: "user".to_string(),
-            content: notification_content,
-        });
+        pending_new_content.extend(notification_content);
         persisted.push(saved);
         db::mark_terminal_command_notified(pool, &command.command_id)
             .await
@@ -313,6 +680,17 @@ fn run_turn_bounded<'a>(
         require_at_least_one_credential(&api_key, &auth_token).map_err(ServerFnError::new)?;
 
         let mut persisted = Vec::new();
+        // Tracks what's been persisted since the last *real* Anthropic
+        // response — the compaction trigger's cheap size estimate (see
+        // `should_compact`) is computed over exactly this, added to that
+        // last response's own real `usage`. Reset to empty every time a
+        // real response lands (below); grows with the new user message,
+        // any drained notifications, and (on a later loop iteration) the
+        // previous turn's tool-result batch.
+        let mut pending_new_content: Vec<anthropic::ContentBlock> = Vec::new();
+        let mut last_known_usage = db::get_conversation_usage(pool, conversation_id)
+            .await
+            .map_err(ServerFnError::new)?;
         if let Some(new_message) = &new_message {
             let saved = db::create_message(
                 pool,
@@ -322,22 +700,9 @@ fn run_turn_bounded<'a>(
             )
             .await
             .map_err(ServerFnError::new)?;
+            pending_new_content.extend(new_message.content.clone());
             persisted.push(saved);
         }
-
-        let mut history: Vec<anthropic::AnthropicMessage> =
-            db::list_messages(pool, conversation_id)
-                .await
-                .map_err(ServerFnError::new)?
-                .into_iter()
-                .map(|m| {
-                    let content = m.blocks().map_err(ServerFnError::new)?;
-                    Ok(anthropic::AnthropicMessage {
-                        role: m.role,
-                        content,
-                    })
-                })
-                .collect::<ServerFnResult<Vec<_>>>()?;
 
         for _ in 0..max_turns {
             // Checked at the top of every loop iteration, not just once per
@@ -346,8 +711,13 @@ fn run_turn_bounded<'a>(
             // loop, the very next iteration already sees the notification,
             // without waiting for a fresh user message. See the plan's
             // "What" and "How" (the completion-notification design).
-            drain_unnotified_terminal_commands(pool, conversation_id, &mut history, &mut persisted)
-                .await?;
+            drain_unnotified_terminal_commands(
+                pool,
+                conversation_id,
+                &mut pending_new_content,
+                &mut persisted,
+            )
+            .await?;
 
             // Nothing to do: `new_message` was `None` (a pure "check for a
             // backlog" wake-up, see `wake_conversation`) and the drain
@@ -361,14 +731,42 @@ fn run_turn_bounded<'a>(
                 return Ok(persisted);
             }
 
+            // Proactive, not reactive: checked *before* building the
+            // request that would be too big, using the last real
+            // response's own usage plus a cheap estimate of what's new
+            // since then — see `should_compact`/`estimate_tokens`. A
+            // failure here fails the whole turn loudly rather than risking
+            // the oversized request compaction exists to prevent — see
+            // docs/projects/plans/auto-compaction.md's "Resolved" decisions.
+            if should_compact(
+                last_known_usage.as_ref(),
+                estimate_tokens(&pending_new_content),
+                context_window(),
+            ) {
+                compact_conversation(
+                    pool,
+                    conversation_id,
+                    api_key.as_deref(),
+                    auth_token.as_deref(),
+                )
+                .await?;
+            }
+
+            let history = history_for_request(
+                db::list_messages(pool, conversation_id)
+                    .await
+                    .map_err(ServerFnError::new)?,
+            )
+            .map_err(ServerFnError::new)?;
+
             let mut request = anthropic::CreateMessageRequest {
                 model: anthropic_model(),
                 // Raised alongside `thinking`: adaptive thinking shares
                 // this budget with the actual reply, and 4096 left no
                 // headroom for both once thinking turned on.
-                max_tokens: 16_384,
+                max_tokens: MAX_TOKENS,
                 system: None,
-                messages: history.clone(),
+                messages: history,
                 stream: true,
                 tools: anthropic::tools::tool_definitions(pool).await,
                 thinking: thinking_enabled().then_some(anthropic::ThinkingConfig::Adaptive),
@@ -419,11 +817,29 @@ fn run_turn_bounded<'a>(
             let saved = db::create_message(pool, conversation_id, "assistant", &turn.content)
                 .await
                 .map_err(ServerFnError::new)?;
-            history.push(anthropic::AnthropicMessage {
-                role: "assistant".to_string(),
-                content: turn.content.clone(),
-            });
             persisted.push(saved);
+
+            // Real usage from this call is the ground truth for "how much
+            // context is actually being used" — persisted so
+            // `get_context_usage` survives a reload, published live so the
+            // indicator updates without one, and tracked here as the new
+            // baseline the *next* compaction check starts from (everything
+            // up through this response is now accounted for, so
+            // `pending_new_content` resets — only what's persisted after
+            // this point is "new" again). See
+            // docs/projects/plans/auto-compaction.md.
+            db::upsert_conversation_usage(pool, conversation_id, &turn.usage)
+                .await
+                .map_err(ServerFnError::new)?;
+            crate::events::publish(
+                conversation_id,
+                crate::events::ConversationEvent::ContextUsageUpdate {
+                    usage: turn.usage,
+                    context_window: context_window(),
+                },
+            );
+            last_known_usage = Some(turn.usage);
+            pending_new_content.clear();
 
             if turn.stop_reason != "tool_use" {
                 crate::events::publish(
@@ -453,10 +869,7 @@ fn run_turn_bounded<'a>(
             let saved = db::create_message(pool, conversation_id, "user", &result_blocks)
                 .await
                 .map_err(ServerFnError::new)?;
-            history.push(anthropic::AnthropicMessage {
-                role: "user".to_string(),
-                content: result_blocks,
-            });
+            pending_new_content = result_blocks;
             persisted.push(saved);
         }
 
@@ -707,6 +1120,82 @@ pub async fn get_sandbox_state(id: i64) -> ServerFnResult<SandboxSnapshot> {
     Ok(SandboxSnapshot { pods })
 }
 
+/// How full the model's context window is right now — the always-visible
+/// indicator's data. `usage` is `None` for a conversation with no
+/// completed turn yet (nothing to report). See
+/// docs/projects/plans/auto-compaction.md.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ContextUsageSnapshot {
+    pub usage: Option<anthropic::TokenUsage>,
+    pub context_window: u32,
+}
+
+/// `context_window_for(&anthropic_model())`, falling back to
+/// `ANTHROPIC_CONTEXT_WINDOW` (for a gateway/local model the built-in table
+/// doesn't recognize), falling back again to a conservative default if
+/// neither resolves it — see docs/projects/plans/auto-compaction.md's
+/// "Resolved: the context window is looked up per-model."
+#[cfg(feature = "server")]
+fn context_window() -> u32 {
+    crate::anthropic::context_window_for(&anthropic_model())
+        .or_else(|| {
+            std::env::var("ANTHROPIC_CONTEXT_WINDOW")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(200_000)
+}
+
+/// One-shot pull for the always-visible context-usage indicator — same
+/// shape as `get_tasks`/`get_sandbox_state`.
+#[get("/api/conversations/{id}/context-usage")]
+pub async fn get_context_usage(id: i64) -> ServerFnResult<ContextUsageSnapshot> {
+    let usage = db::get_conversation_usage(db::get(), id)
+        .await
+        .map_err(ServerFnError::new)?;
+    Ok(ContextUsageSnapshot {
+        usage,
+        context_window: context_window(),
+    })
+}
+
+/// The click-through detail view: every available tool's full definition,
+/// the current message count, and the same usage numbers
+/// `get_context_usage` reports — reconstructed from current state rather
+/// than a stored snapshot of what was literally sent (matches
+/// `run_turn_bounded`'s own request-building exactly, since nothing else
+/// changes `system`/the tool list between turns). `system` is `None`
+/// today because `run_turn_bounded` never sets one — see
+/// docs/projects/plans/auto-compaction.md's "not in scope."
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ContextDetailSnapshot {
+    pub system: Option<String>,
+    pub tools: Vec<anthropic::ToolDefinition>,
+    pub message_count: usize,
+    pub usage: Option<anthropic::TokenUsage>,
+    pub context_window: u32,
+}
+
+#[get("/api/conversations/{id}/context-detail")]
+pub async fn get_context_detail(id: i64) -> ServerFnResult<ContextDetailSnapshot> {
+    let pool = db::get();
+    let tools = anthropic::tools::tool_definitions(pool).await;
+    let message_count = db::list_messages(pool, id)
+        .await
+        .map_err(ServerFnError::new)?
+        .len();
+    let usage = db::get_conversation_usage(pool, id)
+        .await
+        .map_err(ServerFnError::new)?;
+    Ok(ContextDetailSnapshot {
+        system: None,
+        tools,
+        message_count,
+        usage,
+        context_window: context_window(),
+    })
+}
+
 /// A dedicated, always-open per-conversation event stream — independent of
 /// any particular `send_message` call, since task activity (a tick, a
 /// finish) or another writer's pushed turn can happen with no request in
@@ -744,6 +1233,241 @@ mod tests {
     use axum::response::IntoResponse;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn message_with_blocks(id: i64, role: &str, blocks: Vec<anthropic::ContentBlock>) -> Message {
+        Message {
+            id,
+            conversation_id: 1,
+            role: role.to_string(),
+            content: serde_json::to_string(&blocks).expect("ContentBlock always serializes"),
+            created_at: chrono::Utc::now().naive_utc(),
+        }
+    }
+
+    #[test]
+    fn test_compaction_messages_start_with_user_and_alternate_correctly() {
+        let inserted = compaction_messages("the summary".to_string(), 42);
+        let roles: Vec<&str> = inserted.iter().map(|(role, _)| *role).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user"],
+            "Anthropic requires messages to start with user and strictly \
+             alternate — a single summary message can't satisfy both \
+             'starts with user' and 'ends with something to respond to'"
+        );
+        assert_eq!(
+            inserted[1].1,
+            vec![anthropic::ContentBlock::CompactionSummary {
+                summary: "the summary".to_string(),
+                covers_through_message_id: 42,
+            }]
+        );
+    }
+
+    fn text_block(text: &str) -> anthropic::ContentBlock {
+        anthropic::ContentBlock::Text {
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_history_for_request_passes_everything_through_unchanged_with_no_compaction() {
+        let messages = vec![
+            message_with_blocks(1, "user", vec![text_block("hi")]),
+            message_with_blocks(2, "assistant", vec![text_block("hello")]),
+        ];
+        let history = history_for_request(messages).expect("should parse");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[0].content, vec![text_block("hi")]);
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[1].content, vec![text_block("hello")]);
+    }
+
+    #[test]
+    fn test_history_for_request_skips_covered_messages_and_translates_the_summary() {
+        let messages = vec![
+            message_with_blocks(1, "user", vec![text_block("old message 1")]),
+            message_with_blocks(2, "assistant", vec![text_block("old reply 1")]),
+            message_with_blocks(
+                3,
+                "user",
+                vec![anthropic::ContentBlock::CompactionSummary {
+                    summary: "condensed: talked about X".to_string(),
+                    covers_through_message_id: 2,
+                }],
+            ),
+            message_with_blocks(4, "user", vec![text_block("new message")]),
+        ];
+        let history = history_for_request(messages).expect("should parse");
+        assert_eq!(
+            history,
+            vec![
+                anthropic::AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![text_block("condensed: talked about X")],
+                },
+                anthropic::AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![text_block("new message")],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_history_for_request_translates_compaction_placeholder_to_text_too() {
+        // Anthropic has no concept of either synthetic block type — an
+        // untranslated CompactionPlaceholder forwarded as-is would be
+        // rejected outright, same reasoning as CompactionSummary above.
+        let messages = vec![message_with_blocks(
+            1,
+            "user",
+            vec![anthropic::ContentBlock::CompactionPlaceholder {
+                text: "Continue based on the summary above.".to_string(),
+            }],
+        )];
+        let history = history_for_request(messages).expect("should parse");
+        assert_eq!(
+            history,
+            vec![anthropic::AnthropicMessage {
+                role: "user".to_string(),
+                content: vec![text_block("Continue based on the summary above.")],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_history_for_request_only_the_latest_of_two_compactions_applies() {
+        let messages = vec![
+            message_with_blocks(1, "user", vec![text_block("ancient")]),
+            message_with_blocks(
+                2,
+                "user",
+                vec![anthropic::ContentBlock::CompactionSummary {
+                    summary: "first summary".to_string(),
+                    covers_through_message_id: 1,
+                }],
+            ),
+            message_with_blocks(3, "user", vec![text_block("middle")]),
+            message_with_blocks(
+                4,
+                "user",
+                vec![anthropic::ContentBlock::CompactionSummary {
+                    summary: "second summary, supersedes the first".to_string(),
+                    covers_through_message_id: 3,
+                }],
+            ),
+            message_with_blocks(5, "user", vec![text_block("recent")]),
+        ];
+        let history = history_for_request(messages).expect("should parse");
+        // Message 2 (the first compaction's own summary) has id 2 <= the
+        // second compaction's boundary (3), so it's superseded and skipped
+        // entirely too — only the second summary and what came after it
+        // survive.
+        assert_eq!(
+            history,
+            vec![
+                anthropic::AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![text_block("second summary, supersedes the first")],
+                },
+                anthropic::AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![text_block("recent")],
+                },
+            ]
+        );
+    }
+
+    fn usage(
+        input: i64,
+        output: i64,
+        cache_creation: i64,
+        cache_read: i64,
+    ) -> anthropic::TokenUsage {
+        anthropic::TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_input_tokens: cache_creation,
+            cache_read_input_tokens: cache_read,
+        }
+    }
+
+    #[test]
+    fn test_estimate_tokens_uses_chars_over_4_heuristic() {
+        let blocks = vec![anthropic::ContentBlock::Text {
+            text: "a".repeat(400),
+        }];
+        assert_eq!(estimate_tokens(&blocks), 100);
+    }
+
+    #[test]
+    fn test_estimate_tokens_sums_every_block_and_every_category() {
+        let blocks = vec![
+            anthropic::ContentBlock::Text {
+                text: "a".repeat(40),
+            },
+            anthropic::ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                content: "b".repeat(40),
+                is_error: None,
+            },
+        ];
+        assert_eq!(estimate_tokens(&blocks), 20);
+    }
+
+    #[test]
+    fn test_should_compact_false_when_nothing_sent_yet() {
+        assert!(!should_compact(None, 1000, 200_000));
+    }
+
+    #[test]
+    fn test_should_compact_false_comfortably_under_ceiling() {
+        let last = usage(10_000, 2_000, 0, 0);
+        assert!(!should_compact(Some(&last), 500, 200_000));
+    }
+
+    #[test]
+    fn test_should_compact_true_when_projected_crosses_reserved_ceiling() {
+        // ceiling = 200_000 - max(MAX_TOKENS, COMPACTION_SAFETY_BUFFER) = 183_616
+        let last = usage(183_000, 0, 0, 0);
+        assert!(should_compact(Some(&last), 1_000, 200_000));
+    }
+
+    #[test]
+    fn test_should_compact_counts_cache_tokens_in_already_used() {
+        let last = usage(0, 0, 90_000, 90_000);
+        assert!(should_compact(Some(&last), 10_000, 200_000));
+    }
+
+    #[test]
+    fn test_is_safe_compaction_boundary_true_for_plain_text() {
+        let blocks = vec![anthropic::ContentBlock::Text {
+            text: "hi".to_string(),
+        }];
+        assert!(is_safe_compaction_boundary(&blocks));
+    }
+
+    #[test]
+    fn test_is_safe_compaction_boundary_true_for_tool_result_only() {
+        let blocks = vec![anthropic::ContentBlock::ToolResult {
+            tool_use_id: "t1".to_string(),
+            content: "3".to_string(),
+            is_error: None,
+        }];
+        assert!(is_safe_compaction_boundary(&blocks));
+    }
+
+    #[test]
+    fn test_is_safe_compaction_boundary_false_when_tool_use_present() {
+        let blocks = vec![anthropic::ContentBlock::ToolUse {
+            id: "t1".to_string(),
+            name: "add".to_string(),
+            input: serde_json::json!({}),
+        }];
+        assert!(!is_safe_compaction_boundary(&blocks));
+    }
 
     /// Spins up a mock Anthropic upstream that returns `bodies` in order (one
     /// per request, clamped to the last body once exhausted) and points
@@ -1482,6 +2206,196 @@ mod tests {
             messages[3].blocks().expect("valid blocks"),
             vec![anthropic::ContentBlock::Text {
                 text: "Sum is 5".to_string()
+            }]
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_describe_live_state_lists_real_pods_terminals_and_tasks(pool: PgPool) {
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+
+        // Deliberately real rows/a real registry entry, not hand-built
+        // strings — this is the exact data `compact_conversation`'s
+        // summarization prompt hands the model, so the format it actually
+        // produces from real fixtures is what matters, not an assumption
+        // about it.
+        let pod = db::create_sandbox_pod(&pool, conversation.id)
+            .await
+            .expect("create pod");
+        let terminal = db::create_sandbox_terminal(&pool, pod.id)
+            .await
+            .expect("create terminal");
+        anthropic::tools::execute(
+            &pool,
+            conversation.id,
+            "toolu_describe_live_state_test",
+            "run_async",
+            &serde_json::json!({"tool": "add", "input": {"a": 1, "b": 2}}),
+        )
+        .await
+        .expect("seed background task");
+
+        let description = describe_live_state(&pool, conversation.id).await;
+
+        assert!(
+            description.contains(&format!("pod_id {}", pod.id)),
+            "expected the real pod id in: {description}"
+        );
+        assert!(
+            description.contains(&format!("terminal_id {} in pod_id {}", terminal.id, pod.id)),
+            "expected the real terminal id (and its pod) in: {description}"
+        );
+        assert!(
+            description.contains("toolu_describe_live_state_test"),
+            "expected the real task id in: {description}"
+        );
+        assert!(
+            description.contains("add"),
+            "expected the task's tool name in: {description}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_run_turn_compacts_before_sending_when_usage_is_near_the_ceiling(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+
+        // A prior turn's persisted message plus usage close enough to the
+        // reserved ceiling (200_000 - 16_384 = 183_616 for the default
+        // "claude-opus-4-8" model — see `context_window_for`/`MAX_TOKENS`)
+        // that the very next turn must compact before sending, regardless
+        // of how small the new message's own estimate is.
+        db::create_message(
+            &pool,
+            conversation.id,
+            "user",
+            &[anthropic::ContentBlock::Text {
+                text: "earlier message".to_string(),
+            }],
+        )
+        .await
+        .expect("seed earlier message");
+        db::upsert_conversation_usage(
+            &pool,
+            conversation.id,
+            &anthropic::TokenUsage {
+                input_tokens: 190_000,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+        )
+        .await
+        .expect("seed usage");
+
+        // First request the mock upstream sees is the compaction's own
+        // summarization call; the second is the real turn, sent afterward
+        // using the now-compacted history.
+        let summary_body = sse_body(&[
+            ("message_start", r#"{"type":"message_start"}"#),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Summary: discussed earlier topics. Nothing currently live."}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        let real_body = sse_body(&[
+            ("message_start", r#"{"type":"message_start"}"#),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi again"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        start_mock_upstream(vec![summary_body, real_body]).await;
+
+        let new_message = anthropic::AnthropicMessage {
+            role: "user".to_string(),
+            content: vec![anthropic::ContentBlock::Text {
+                text: "new question".to_string(),
+            }],
+        };
+
+        let messages = run_turn(&pool, conversation.id, new_message, None)
+            .await
+            .expect("run_turn should succeed");
+
+        let all_messages = db::list_messages(&pool, conversation.id)
+            .await
+            .expect("list messages");
+        let compaction_summary = all_messages.iter().find_map(|m| {
+            m.blocks().ok()?.into_iter().find_map(|b| match b {
+                anthropic::ContentBlock::CompactionSummary {
+                    summary,
+                    covers_through_message_id,
+                } => Some((summary, covers_through_message_id)),
+                _ => None,
+            })
+        });
+        assert!(
+            compaction_summary.is_some(),
+            "expected a CompactionSummary message to have been persisted, got: {all_messages:?}"
+        );
+        assert!(
+            compaction_summary
+                .unwrap()
+                .0
+                .contains("discussed earlier topics"),
+            "expected the real summarization response's text to be what got persisted"
+        );
+
+        // Nothing already stored was rewritten or deleted — the original
+        // seeded message and the new question are both still there in
+        // full, untouched.
+        assert!(
+            all_messages
+                .iter()
+                .any(|m| m
+                    .blocks()
+                    .unwrap_or_default()
+                    .contains(&anthropic::ContentBlock::Text {
+                        text: "earlier message".to_string()
+                    }))
+        );
+        assert!(
+            all_messages
+                .iter()
+                .any(|m| m
+                    .blocks()
+                    .unwrap_or_default()
+                    .contains(&anthropic::ContentBlock::Text {
+                        text: "new question".to_string()
+                    }))
+        );
+
+        // The real turn still completed successfully, replying to the
+        // post-compaction continuation prompt.
+        let last = messages.last().expect("at least one message");
+        assert_eq!(last.role, "assistant");
+        assert_eq!(
+            last.blocks().expect("valid blocks"),
+            vec![anthropic::ContentBlock::Text {
+                text: "Hi again".to_string()
             }]
         );
     }

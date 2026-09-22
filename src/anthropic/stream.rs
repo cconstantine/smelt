@@ -5,7 +5,7 @@
 use futures_util::StreamExt;
 use serde_json::Value;
 
-use super::types::{ContentBlock, CreateMessageRequest};
+use super::types::{ContentBlock, CreateMessageRequest, TokenUsage};
 
 /// The fully assembled result of one streamed Anthropic turn: every content
 /// block (text and/or tool_use) in order, plus the `stop_reason` that says
@@ -14,6 +14,12 @@ use super::types::{ContentBlock, CreateMessageRequest};
 pub struct StreamedTurn {
     pub content: Vec<ContentBlock>,
     pub stop_reason: String,
+    /// Real usage for *this call* — `input_tokens`/cache fields from
+    /// `message_start`, `output_tokens` from the last `message_delta` that
+    /// carried one (overwritten each time it arrives, same "last one wins"
+    /// treatment `stop_reason` itself already gets). See
+    /// docs/projects/plans/auto-compaction.md.
+    pub usage: TokenUsage,
 }
 
 /// Upstream base URL, overridable via `ANTHROPIC_BASE_URL` (used by tests to
@@ -34,10 +40,26 @@ pub enum StreamOutcome {
     TextDelta(String),
     ThinkingDelta(String),
     ThinkingSignatureDelta(String),
-    ToolUseStart { id: String, name: String },
+    ToolUseStart {
+        id: String,
+        name: String,
+    },
     ToolUseInputDelta(String),
     BlockStop,
-    StopReason(String),
+    /// `output_tokens` is `None` only if a `message_delta` event genuinely
+    /// carried no `usage` field at all (defensive — real Anthropic
+    /// responses always include one alongside `stop_reason`) — distinct
+    /// from a real, explicit zero.
+    StopReason {
+        reason: String,
+        output_tokens: Option<i64>,
+    },
+    /// `message_start`'s own `usage` — the authoritative input/cache token
+    /// counts for this call. `output_tokens` here is a placeholder Anthropic
+    /// sends before any output has streamed; `StopReason`'s own
+    /// `output_tokens` (from `message_delta`, arriving later) is what
+    /// actually finalizes it — see `stream_anthropic_message`.
+    InitialUsage(TokenUsage),
     Error(String),
     Ignored,
 }
@@ -46,6 +68,13 @@ pub enum StreamOutcome {
 /// Pure and synchronous — unit-testable without any network access.
 fn interpret_stream_event(value: &Value) -> StreamOutcome {
     match value.get("type").and_then(Value::as_str) {
+        Some("message_start") => {
+            let usage = value.get("message").and_then(|m| m.get("usage"));
+            match usage.and_then(|u| serde_json::from_value::<TokenUsage>(u.clone()).ok()) {
+                Some(usage) => StreamOutcome::InitialUsage(usage),
+                None => StreamOutcome::Ignored,
+            }
+        }
         Some("content_block_start") => {
             let block = value.get("content_block");
             let is_tool_use =
@@ -114,7 +143,13 @@ fn interpret_stream_event(value: &Value) -> StreamOutcome {
             .and_then(|d| d.get("stop_reason"))
             .and_then(Value::as_str)
         {
-            Some(reason) => StreamOutcome::StopReason(reason.to_string()),
+            Some(reason) => StreamOutcome::StopReason {
+                reason: reason.to_string(),
+                output_tokens: value
+                    .get("usage")
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(Value::as_i64),
+            },
             None => StreamOutcome::Ignored,
         },
         Some("error") => {
@@ -262,6 +297,7 @@ pub async fn stream_anthropic_message(
     let mut content: Vec<ContentBlock> = Vec::new();
     let mut current: Option<PartialBlock> = None;
     let mut stop_reason = String::new();
+    let mut usage = TokenUsage::default();
 
     loop {
         let next = tokio::time::timeout(CHUNK_TIMEOUT, byte_stream.next())
@@ -334,7 +370,20 @@ pub async fn stream_anthropic_message(
                         content.push(block.finalize()?);
                     }
                 }
-                StreamOutcome::StopReason(reason) => stop_reason = reason,
+                StreamOutcome::StopReason {
+                    reason,
+                    output_tokens,
+                } => {
+                    stop_reason = reason;
+                    if let Some(output_tokens) = output_tokens {
+                        usage.output_tokens = output_tokens;
+                    }
+                }
+                StreamOutcome::InitialUsage(initial) => {
+                    usage.input_tokens = initial.input_tokens;
+                    usage.cache_creation_input_tokens = initial.cache_creation_input_tokens;
+                    usage.cache_read_input_tokens = initial.cache_read_input_tokens;
+                }
                 StreamOutcome::Error(message) => return Err(message),
                 StreamOutcome::Ignored => {}
             }
@@ -348,6 +397,7 @@ pub async fn stream_anthropic_message(
     Ok(StreamedTurn {
         content,
         stop_reason,
+        usage,
     })
 }
 
@@ -468,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn test_interpret_message_delta_extracts_stop_reason() {
+    fn test_interpret_message_delta_extracts_stop_reason_and_output_tokens() {
         let value = serde_json::json!({
             "type": "message_delta",
             "delta": {"stop_reason": "tool_use", "stop_sequence": null},
@@ -476,8 +526,57 @@ mod tests {
         });
         assert_eq!(
             interpret_stream_event(&value),
-            StreamOutcome::StopReason("tool_use".to_string())
+            StreamOutcome::StopReason {
+                reason: "tool_use".to_string(),
+                output_tokens: Some(12)
+            }
         );
+    }
+
+    #[test]
+    fn test_interpret_message_delta_without_usage_reports_no_output_tokens() {
+        let value = serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null}
+        });
+        assert_eq!(
+            interpret_stream_event(&value),
+            StreamOutcome::StopReason {
+                reason: "end_turn".to_string(),
+                output_tokens: None
+            }
+        );
+    }
+
+    #[test]
+    fn test_interpret_message_start_extracts_initial_usage() {
+        let value = serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_01",
+                "usage": {
+                    "input_tokens": 2095,
+                    "cache_creation_input_tokens": 10,
+                    "cache_read_input_tokens": 5,
+                    "output_tokens": 3
+                }
+            }
+        });
+        assert_eq!(
+            interpret_stream_event(&value),
+            StreamOutcome::InitialUsage(TokenUsage {
+                input_tokens: 2095,
+                output_tokens: 3,
+                cache_creation_input_tokens: 10,
+                cache_read_input_tokens: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn test_interpret_message_start_without_usage_is_ignored() {
+        let value = serde_json::json!({"type": "message_start", "message": {"id": "msg_01"}});
+        assert_eq!(interpret_stream_event(&value), StreamOutcome::Ignored);
     }
 
     /// Spins up a throwaway mock upstream returning `mock_body` verbatim and
@@ -657,6 +756,43 @@ mod tests {
             ]
         );
         assert_eq!(turn.stop_reason, "end_turn");
+    }
+
+    #[tokio::test]
+    async fn test_stream_anthropic_message_captures_real_usage_from_mock_upstream() {
+        let mock_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"usage\":{\"input_tokens\":2095,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":5,\"output_tokens\":3}}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi!\"}}\n",
+            "\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":45}}\n",
+            "\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n",
+            "\n",
+        );
+
+        let turn = run_against_mock_upstream(mock_body, |_| {})
+            .await
+            .expect("stream should succeed");
+
+        // input_tokens/cache fields come from message_start; output_tokens
+        // is message_delta's final value, not message_start's placeholder 3.
+        assert_eq!(
+            turn.usage,
+            TokenUsage {
+                input_tokens: 2095,
+                output_tokens: 45,
+                cache_creation_input_tokens: 10,
+                cache_read_input_tokens: 5,
+            }
+        );
     }
 
     /// Regression test for the tool-use-round-trip retrospective's hung
