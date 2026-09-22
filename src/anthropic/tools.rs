@@ -92,6 +92,8 @@ mod server {
             "write_file" => write_file_tool(pool, conversation_id, input).await,
             "edit_file" => edit_file_tool(pool, conversation_id, input).await,
             "list_directory" => list_directory_tool(pool, conversation_id, input).await,
+            "glob" => glob_tool(pool, conversation_id, input).await,
+            "grep" => grep_tool(pool, conversation_id, input).await,
             _ => execute_synchronous(name, input).await,
         }
     }
@@ -523,6 +525,52 @@ mod server {
                     "type": "object",
                     "properties": {"path": {"type": "string"}},
                     "required": ["path"]
+                }),
+            },
+            ToolDefinition {
+                name: "glob".to_string(),
+                description: "Find files under path whose path relative to path matches a glob \
+                               pattern, in this conversation's sandbox pod — e.g. **/*.rs for \
+                               every .rs file at any depth, *.rs for only ones directly in path \
+                               (a bare * never crosses a directory separator; only ** does). \
+                               Paginated (offset/limit) — response also carries total (how many \
+                               matches were found, up to an internal scan limit) and \
+                               scan_capped (true if that internal limit, not just this page, was \
+                               hit; narrow pattern or path rather than just paging further when \
+                               that happens)."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "root directory to search from"},
+                        "pattern": {"type": "string", "description": "glob pattern relative to path, e.g. **/*.rs"},
+                        "offset": {"type": "integer", "minimum": 1, "description": "1-indexed starting result, defaults to 1"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "defaults to 50, capped at 200"}
+                    },
+                    "required": ["path", "pattern"]
+                }),
+            },
+            ToolDefinition {
+                name: "grep".to_string(),
+                description: "Search file contents under path for a regex pattern, in this \
+                               conversation's sandbox pod. Returns each match's file, 1-indexed \
+                               line number, and line text. Optionally narrow to files matching a \
+                               glob first (same pattern syntax as the glob tool). A file that's \
+                               skipped (not valid UTF-8, or too large) is named, with why, in \
+                               skipped — never silently omitted. Paginated (offset/limit) — see \
+                               the glob tool's description for what total/scan_capped mean."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "root directory to search from"},
+                        "pattern": {"type": "string", "description": "regex to search file contents for"},
+                        "glob": {"type": "string", "description": "optional glob filter, e.g. *.rs — only search matching files; defaults to every file"},
+                        "case_insensitive": {"type": "boolean", "description": "defaults to false"},
+                        "offset": {"type": "integer", "minimum": 1, "description": "1-indexed starting result, defaults to 1"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "defaults to 20, capped at 100"}
+                    },
+                    "required": ["path", "pattern"]
                 }),
             },
         ]
@@ -1694,6 +1742,93 @@ mod server {
             .map(|e| serde_json::json!({"name": e.name, "type": if e.is_dir { "dir" } else { "file" }, "size": e.size}))
             .collect();
         Ok(serde_json::json!({"entries": payload}).to_string())
+    }
+
+    const DEFAULT_GLOB_LIMIT: u32 = 50;
+    const MAX_GLOB_LIMIT: u32 = 200;
+    const DEFAULT_GREP_LIMIT: u32 = 20;
+    const MAX_GREP_LIMIT: u32 = 100;
+
+    /// Shared by `glob_tool`/`grep_tool` — same 1-indexed-offset,
+    /// clamped-limit shape `read_file_tool` already uses.
+    fn pagination_params(input: &Value, default_limit: u32, max_limit: u32) -> (u32, u32) {
+        let offset = input
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1) as u32;
+        let limit = input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(default_limit as u64)
+            .clamp(1, max_limit as u64) as u32;
+        (offset, limit)
+    }
+
+    async fn glob_tool(
+        pool: &PgPool,
+        conversation_id: i64,
+        input: &Value,
+    ) -> Result<String, String> {
+        let path = required_str(input, "path")?;
+        let pattern = required_str(input, "pattern")?;
+        let (offset, limit) = pagination_params(input, DEFAULT_GLOB_LIMIT, MAX_GLOB_LIMIT);
+        let result = sandbox::glob(pool, conversation_id, &path, &pattern, offset, limit)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "paths": result.paths,
+            "total": result.total,
+            "scan_capped": result.scan_capped,
+        })
+        .to_string())
+    }
+
+    async fn grep_tool(
+        pool: &PgPool,
+        conversation_id: i64,
+        input: &Value,
+    ) -> Result<String, String> {
+        let path = required_str(input, "path")?;
+        let pattern = required_str(input, "pattern")?;
+        let glob = input
+            .get("glob")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let case_insensitive = input
+            .get("case_insensitive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let (offset, limit) = pagination_params(input, DEFAULT_GREP_LIMIT, MAX_GREP_LIMIT);
+        let result = sandbox::grep(
+            pool,
+            conversation_id,
+            &path,
+            &pattern,
+            glob,
+            case_insensitive,
+            offset,
+            limit,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let matches: Vec<_> = result
+            .matches
+            .iter()
+            .map(|m| serde_json::json!({"path": m.path, "line": m.line, "text": m.text}))
+            .collect();
+        let skipped: Vec<_> = result
+            .skipped
+            .iter()
+            .map(|s| serde_json::json!({"path": s.path, "reason": s.reason}))
+            .collect();
+        Ok(serde_json::json!({
+            "matches": matches,
+            "total": result.total,
+            "scan_capped": result.scan_capped,
+            "skipped": skipped,
+        })
+        .to_string())
     }
 
     #[cfg(test)]

@@ -678,10 +678,48 @@ pub struct DirEntry {
     pub size: Option<u64>,
 }
 
+/// One `grep` match — see docs/projects/plans/glob-and-grep.md.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrepMatch {
+    pub path: String,
+    pub line: u32,
+    pub text: String,
+}
+
+/// One file `grep` excluded (too large, or not valid UTF-8) — reported
+/// explicitly rather than silently dropped, per the plan's "Decisions from
+/// review."
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkippedFile {
+    pub path: String,
+    pub reason: String,
+}
+
+/// `glob`'s result. `total` is the match count the walk actually found, up
+/// to its internal scan ceiling (`sandbox_agent`'s `MAX_GLOB_SCAN`) — not
+/// just how many fit in this page. `scan_capped` is true only when that
+/// ceiling itself was hit, distinct from ordinary pagination (`total`
+/// larger than one page, `scan_capped: false`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlobResult {
+    pub paths: Vec<String>,
+    pub total: usize,
+    pub scan_capped: bool,
+}
+
+/// `grep`'s result — same `total`/`scan_capped` meaning as `GlobResult`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrepResult {
+    pub matches: Vec<GrepMatch>,
+    pub total: usize,
+    pub scan_capped: bool,
+    pub skipped: Vec<SkippedFile>,
+}
+
 /// The parsed, successful body of a file-tool agent response — what a
 /// pending `pending_file_requests` oneshot resolves to on success (an
 /// `Err(String)` carries the agent's own error message instead, same as
-/// `pending_acks`). One enum covering all four operations since they share
+/// `pending_acks`). One enum covering all six operations since they share
 /// one correlation map (keyed by `request_id`, not tied to a
 /// `terminal_id`).
 #[derive(Debug, Clone, PartialEq)]
@@ -690,6 +728,8 @@ enum FileResponse {
     Written { hash: String },
     Edited { hash: String },
     Listed(Vec<DirEntry>),
+    Globbed(GlobResult),
+    Grepped(GrepResult),
 }
 
 /// How long `create_terminal`/`terminate_terminal` wait for the agent's ack
@@ -1613,6 +1653,70 @@ pub async fn list_directory(
     }
 }
 
+/// Finds files under `path` whose path relative to `path` matches
+/// `pattern`, paginated by `offset`/`limit` — see
+/// docs/projects/plans/glob-and-grep.md.
+pub async fn glob(
+    pool: &PgPool,
+    conversation_id: i64,
+    path: &str,
+    pattern: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<GlobResult, TerminalError> {
+    let pod_id = conversation_pod_id(pool, conversation_id).await?;
+    let conn = reconnect_if_needed(pool, pod_id).await?;
+    let request_id = generate_request_id();
+    let payload = serde_json::json!({
+        "action": "glob",
+        "request_id": request_id,
+        "path": path,
+        "pattern": pattern,
+        "offset": offset,
+        "limit": limit,
+    });
+    match request_file_action(&conn, payload, request_id).await? {
+        FileResponse::Globbed(result) => Ok(result),
+        _ => Err(TerminalError::FileOperation(
+            "agent returned an unexpected response type for glob".to_string(),
+        )),
+    }
+}
+
+/// Searches file contents under `path` for `pattern`, optionally narrowed
+/// to files matching `glob` first, paginated by `offset`/`limit` — see
+/// docs/projects/plans/glob-and-grep.md.
+pub async fn grep(
+    pool: &PgPool,
+    conversation_id: i64,
+    path: &str,
+    pattern: &str,
+    glob: Option<String>,
+    case_insensitive: bool,
+    offset: u32,
+    limit: u32,
+) -> Result<GrepResult, TerminalError> {
+    let pod_id = conversation_pod_id(pool, conversation_id).await?;
+    let conn = reconnect_if_needed(pool, pod_id).await?;
+    let request_id = generate_request_id();
+    let payload = serde_json::json!({
+        "action": "grep",
+        "request_id": request_id,
+        "path": path,
+        "pattern": pattern,
+        "glob": glob,
+        "case_insensitive": case_insensitive,
+        "offset": offset,
+        "limit": limit,
+    });
+    match request_file_action(&conn, payload, request_id).await? {
+        FileResponse::Grepped(result) => Ok(result),
+        _ => Err(TerminalError::FileOperation(
+            "agent returned an unexpected response type for grep".to_string(),
+        )),
+    }
+}
+
 /// Marks every command still `running` under any of this pod's terminals
 /// `'lost'` (no real exit code to report — see
 /// `db::mark_terminal_command_lost`), and every one of the pod's live
@@ -1785,11 +1889,28 @@ struct AgentDirEntry {
     size: Option<u64>,
 }
 
+/// Mirrors `sandbox_agent`'s `GrepMatchInfo` — see
+/// docs/projects/plans/glob-and-grep.md.
+#[derive(Deserialize)]
+struct AgentGrepMatch {
+    path: String,
+    line: u32,
+    text: String,
+}
+
+/// Mirrors `sandbox_agent`'s `SkippedFileInfo`.
+#[derive(Deserialize)]
+struct AgentSkippedFile {
+    path: String,
+    reason: String,
+}
+
 /// Flexible enough to cover every message shape `sandbox_agent`'s tagged
 /// `ServerMessage` enum serializes to — a line/exit event names `id`;
 /// a terminal-action ack names `terminal_id` (and, on failure, `message`);
 /// a file-tool response names `request_id` instead, plus whichever of
-/// `lines`/`total_lines`/`hash`/`entries` its `event` variant carries.
+/// `lines`/`total_lines`/`hash`/`entries`/`paths`/`matches`/`skipped`/
+/// `total`/`scan_capped` its `event` variant carries.
 #[derive(Deserialize)]
 struct AgentMessage {
     #[serde(default)]
@@ -1818,6 +1939,16 @@ struct AgentMessage {
     hash: Option<String>,
     #[serde(default)]
     entries: Option<Vec<AgentDirEntry>>,
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+    #[serde(default)]
+    matches: Option<Vec<AgentGrepMatch>>,
+    #[serde(default)]
+    skipped: Option<Vec<AgentSkippedFile>>,
+    #[serde(default)]
+    total: Option<usize>,
+    #[serde(default)]
+    scan_capped: Option<bool>,
 }
 
 async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, text: &str) {
@@ -1911,6 +2042,42 @@ async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, tex
                 })
                 .collect();
             resolve_pending_file_request(conn, msg.request_id, Ok(FileResponse::Listed(entries)));
+            return;
+        }
+        Some("glob_matched") => {
+            let result = GlobResult {
+                paths: msg.paths.unwrap_or_default(),
+                total: msg.total.unwrap_or(0),
+                scan_capped: msg.scan_capped.unwrap_or(false),
+            };
+            resolve_pending_file_request(conn, msg.request_id, Ok(FileResponse::Globbed(result)));
+            return;
+        }
+        Some("grep_matched") => {
+            let result = GrepResult {
+                matches: msg
+                    .matches
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|m| GrepMatch {
+                        path: m.path,
+                        line: m.line,
+                        text: m.text,
+                    })
+                    .collect(),
+                total: msg.total.unwrap_or(0),
+                scan_capped: msg.scan_capped.unwrap_or(false),
+                skipped: msg
+                    .skipped
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| SkippedFile {
+                        path: s.path,
+                        reason: s.reason,
+                    })
+                    .collect(),
+            };
+            resolve_pending_file_request(conn, msg.request_id, Ok(FileResponse::Grepped(result)));
             return;
         }
         Some("file_error") => {
@@ -2698,6 +2865,81 @@ mod tests {
             assert!(example_entry.size.unwrap_or(0) > 0);
             let subdir_entry = listing.iter().find(|e| e.name == "subdir").expect("subdir should be listed");
             assert!(subdir_entry.is_dir);
+
+            // --- glob/grep: pattern-based file discovery and content
+            // search — see docs/projects/plans/glob-and-grep.md. A fresh
+            // subdirectory, kept separate from example.txt's own
+            // (by-now-heavily-edited) content above so this section's
+            // expectations don't depend on tracking that history. ---
+            write_file(&pool, conversation_a.id, "/tmp/file-tools-test/glob-grep/one.rs", "fn one() {}\n", None)
+                .await
+                .expect("write_file should succeed");
+            write_file(&pool, conversation_a.id, "/tmp/file-tools-test/glob-grep/nested/two.rs", "fn two() {}\n", None)
+                .await
+                .expect("write_file should create parent directories");
+            write_file(&pool, conversation_a.id, "/tmp/file-tools-test/glob-grep/notes.txt", "just plain prose, nothing to match\n", None)
+                .await
+                .expect("write_file should succeed");
+
+            let recursive_glob = glob(&pool, conversation_a.id, "/tmp/file-tools-test/glob-grep", "**/*.rs", 1, 50)
+                .await
+                .expect("glob should succeed");
+            let mut recursive_paths = recursive_glob.paths.clone();
+            recursive_paths.sort();
+            assert_eq!(
+                recursive_paths,
+                vec![
+                    "/tmp/file-tools-test/glob-grep/nested/two.rs".to_string(),
+                    "/tmp/file-tools-test/glob-grep/one.rs".to_string(),
+                ],
+                "**/*.rs should match .rs files at every depth"
+            );
+            assert_eq!(recursive_glob.total, 2);
+            assert!(!recursive_glob.scan_capped);
+
+            let shallow_glob = glob(&pool, conversation_a.id, "/tmp/file-tools-test/glob-grep", "*.rs", 1, 50)
+                .await
+                .expect("glob should succeed");
+            assert_eq!(
+                shallow_glob.paths,
+                vec!["/tmp/file-tools-test/glob-grep/one.rs".to_string()],
+                "a bare * shouldn't cross into nested/ the way ** does"
+            );
+
+            let grep_result = grep(&pool, conversation_a.id, "/tmp/file-tools-test/glob-grep", "fn ", None, false, 1, 20)
+                .await
+                .expect("grep should succeed");
+            let mut grep_paths: Vec<&str> = grep_result.matches.iter().map(|m| m.path.as_str()).collect();
+            grep_paths.sort();
+            assert_eq!(
+                grep_paths,
+                vec![
+                    "/tmp/file-tools-test/glob-grep/nested/two.rs",
+                    "/tmp/file-tools-test/glob-grep/one.rs",
+                ],
+                "grep should find matches across every file under path, not just the top level"
+            );
+            assert_eq!(grep_result.total, 2);
+            assert!(!grep_result.scan_capped);
+            assert!(grep_result.skipped.is_empty());
+
+            let filtered_grep = grep(
+                &pool,
+                conversation_a.id,
+                "/tmp/file-tools-test/glob-grep",
+                "fn ",
+                Some("nested/*.rs".to_string()),
+                false,
+                1,
+                20,
+            )
+            .await
+            .expect("grep should succeed");
+            assert_eq!(
+                filtered_grep.matches.len(), 1,
+                "grep's glob filter should narrow the search to just the matching file"
+            );
+            assert_eq!(filtered_grep.matches[0].path, "/tmp/file-tools-test/glob-grep/nested/two.rs");
 
             // --- Pod vanishes out from under us (deleted, evicted, node
             // lost) while smelt still thinks it's live — reconnect_or_confirm_crash

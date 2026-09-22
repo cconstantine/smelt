@@ -40,6 +40,23 @@ tokio-tungstenite = { version = "0.24", optional = true }
 # For sandbox_agent's file-tool content hashing (staleness detection on
 # edit_file/write_file) — see docs/projects/plans/file-tools.md.
 sha2 = { version = "0.10", optional = true }
+# For sandbox_agent's glob/grep tools — ignore walks a directory tree
+# respecting .gitignore (the same crate ripgrep itself is built on) and
+# regex is the content-search engine grep needs. Neither is used outside
+# sandbox_agent, but both need a direct [dependencies] entry to be usable
+# from our own code at all — see docs/projects/plans/glob-and-grep.md.
+ignore = { version = "0.4", optional = true }
+regex = { version = "1", optional = true }
+# For single-pattern glob matching ("does this path match this one
+# pattern") used by both glob itself and grep's optional glob filter.
+# ignore::overrides::Override looked like it should cover this without a
+# second crate, but its real shape (checked in
+# ~/.cargo/registry/src, not assumed) is a whitelist/gitignore-precedence
+# matcher tied to a root directory — built for filtering a walk, not a
+# plain pure match check. globset::Glob::compile_matcher() is the actual
+# fit, and costs nothing new in the dependency tree — ignore already pulls
+# it in transitively.
+globset = { version = "0.4", optional = true }
 # kube's rustls-tls stack only auto-installs a default CryptoProvider when
 # built with its aws-lc-rs feature (which needs cmake/nasm); this project
 # uses ring instead (same backend reqwest's own rustls-tls already pulls
@@ -116,6 +133,9 @@ server = [
     "dep:nix",
     "dep:tokio-tungstenite",
     "dep:sha2",
+    "dep:ignore",
+    "dep:regex",
+    "dep:globset",
     "dep:rmcp",
     "dep:http",
     "dep:async-trait",
