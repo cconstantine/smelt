@@ -3,7 +3,11 @@ mod api;
 #[cfg(feature = "server")]
 mod db;
 mod events;
+#[cfg(feature = "server")]
+mod fetch_guard;
 mod frontend;
+#[cfg(feature = "server")]
+mod http_request;
 #[cfg(feature = "server")]
 mod mcp;
 #[cfg(feature = "server")]

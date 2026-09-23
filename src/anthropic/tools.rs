@@ -136,6 +136,7 @@ mod server {
             "todowrite" => todowrite_tool(pool, conversation_id, input).await,
             "todoread" => todoread_tool(pool, conversation_id).await,
             "webfetch" => webfetch_tool(input).await,
+            "http_request" => http_request_tool(input).await,
             _ => execute_synchronous(name, input).await,
         }
     }
@@ -658,12 +659,35 @@ mod server {
                                even with no pod created. http/https only; the resolved address \
                                (and every address any redirect or the page's own JS tries to \
                                reach) must be a real public address, not an internal/private \
-                               one."
+                               one. Slower and heavier than http_request — prefer http_request \
+                               for a JSON API or anything that doesn't need real page rendering."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "url": {"type": "string", "description": "the http:// or https:// URL to fetch"}
+                    },
+                    "required": ["url"]
+                }),
+            },
+            ToolDefinition {
+                name: "http_request".to_string(),
+                description: "Make a plain HTTP request (like curl) — no browser, no JS \
+                               execution, much cheaper than webfetch. Use this for a JSON API, \
+                               a REST endpoint, or anything else that doesn't need a real \
+                               rendered page; use webfetch instead for a page that needs JS to \
+                               show its real content. A non-2xx status (404, 500, ...) is \
+                               returned as normal data, not an error. http/https only; the \
+                               resolved address (and any redirect target) must be a real public \
+                               address, not an internal/private one."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "the http:// or https:// URL to request"},
+                        "method": {"type": "string", "description": "defaults to GET, e.g. GET/POST/PUT/PATCH/DELETE"},
+                        "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "extra request headers"},
+                        "body": {"type": "string", "description": "raw request body, e.g. a JSON string"}
                     },
                     "required": ["url"]
                 }),
@@ -1971,6 +1995,27 @@ mod server {
     async fn webfetch_tool(input: &Value) -> Result<String, String> {
         let url = required_str(input, "url")?;
         let result = crate::webfetch::fetch(&url).await?;
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
+
+    async fn http_request_tool(input: &Value) -> Result<String, String> {
+        let url = required_str(input, "url")?;
+        let method = input
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("GET")
+            .to_string();
+        let headers: Vec<(String, String)> = input
+            .get("headers")
+            .and_then(Value::as_object)
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let body = input.get("body").and_then(Value::as_str);
+        let result = crate::http_request::request(&method, &url, &headers, body).await?;
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
