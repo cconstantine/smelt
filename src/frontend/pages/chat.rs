@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use dioxus::html::geometry::PixelsVector2D;
+use dioxus::html::input_data::MouseButton;
 #[cfg(feature = "web")]
 use dioxus::prelude::dioxus_core::Task;
 use dioxus::prelude::*;
@@ -89,9 +90,21 @@ fn todo_status_class(status: TodoStatus) -> &'static str {
 /// trip) recognizes it. Unconditional (not web-gated): called from the
 /// main render body's `onkeydown` handler, part of the same shared rsx
 /// tree the server target compiles too — same reason `todo_status_class`
-/// is unconditional.
-fn browser_input_event_for_key(key: keyboard_types::Key) -> Option<BrowserInputEvent> {
+/// is unconditional. A character typed with Ctrl/Cmd held is a shortcut,
+/// not text (Ctrl+V must not type a "v"), so it isn't forwarded — the
+/// caller then leaves it to the viewer's own browser. Ctrl+Alt is let
+/// through: that's how AltGr reports itself on Windows, and AltGr is
+/// ordinary typing on many layouts.
+fn browser_input_event_for_key(
+    key: keyboard_types::Key,
+    modifiers: keyboard_types::Modifiers,
+) -> Option<BrowserInputEvent> {
     match key {
+        keyboard_types::Key::Character(_)
+            if (modifiers.ctrl() || modifiers.meta()) && !modifiers.alt() =>
+        {
+            None
+        }
         keyboard_types::Key::Character(text) => Some(BrowserInputEvent::TypeText { text }),
         named => {
             let name = named.to_string();
@@ -110,6 +123,29 @@ fn browser_input_event_for_key(key: keyboard_types::Key) -> Option<BrowserInputE
             .then_some(BrowserInputEvent::PressKey { key: name })
         }
     }
+}
+
+/// Collapses each run of back-to-back mouse moves (for the same
+/// conversation) down to its last one — only the pointer's latest position
+/// matters, and forwarding every intermediate one would let a fast-moving
+/// mouse queue up far more requests than the page needs. Anything else
+/// keeps its place and order.
+fn coalesce_mouse_moves(batch: Vec<(i64, BrowserInputEvent)>) -> Vec<(i64, BrowserInputEvent)> {
+    let mut out: Vec<(i64, BrowserInputEvent)> = Vec::with_capacity(batch.len());
+    for item in batch {
+        let replaces_last = matches!(
+            (out.last(), &item),
+            (
+                Some((last_id, BrowserInputEvent::MouseMove { .. })),
+                (id, BrowserInputEvent::MouseMove { .. }),
+            ) if last_id == id
+        );
+        if replaces_last {
+            out.pop();
+        }
+        out.push(item);
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1238,10 +1274,69 @@ mod tests {
         assert_eq!(existing[0].stderr, vec!["a diagnostic".to_string()]);
     }
 
+    fn no_mods() -> keyboard_types::Modifiers {
+        keyboard_types::Modifiers::empty()
+    }
+
+    #[test]
+    fn test_browser_input_event_for_key_leaves_ctrl_and_cmd_shortcuts_to_the_viewer() {
+        for mods in [keyboard_types::Modifiers::CONTROL, keyboard_types::Modifiers::META] {
+            assert_eq!(
+                browser_input_event_for_key(keyboard_types::Key::Character("v".to_string()), mods),
+                None,
+                "{mods:?}+V should not type a v"
+            );
+        }
+    }
+
+    #[test]
+    fn test_browser_input_event_for_key_still_types_altgr_characters() {
+        // Windows reports AltGr as Ctrl+Alt.
+        assert_eq!(
+            browser_input_event_for_key(
+                keyboard_types::Key::Character("@".to_string()),
+                keyboard_types::Modifiers::CONTROL | keyboard_types::Modifiers::ALT,
+            ),
+            Some(BrowserInputEvent::TypeText { text: "@".to_string() })
+        );
+    }
+
+    #[test]
+    fn test_browser_input_event_for_key_types_shifted_characters() {
+        assert_eq!(
+            browser_input_event_for_key(
+                keyboard_types::Key::Character("A".to_string()),
+                keyboard_types::Modifiers::SHIFT,
+            ),
+            Some(BrowserInputEvent::TypeText { text: "A".to_string() })
+        );
+    }
+
+    fn mv(x: f64) -> BrowserInputEvent {
+        BrowserInputEvent::MouseMove { x, y: 0.0, left_held: false }
+    }
+
+    #[test]
+    fn test_coalesce_mouse_moves_keeps_only_the_last_of_a_run() {
+        let down = BrowserInputEvent::MouseDown { x: 3.0, y: 0.0 };
+        assert_eq!(
+            coalesce_mouse_moves(vec![(1, mv(1.0)), (1, mv(2.0)), (1, down.clone()), (1, mv(4.0)), (1, mv(5.0))]),
+            vec![(1, mv(2.0)), (1, down), (1, mv(5.0))]
+        );
+    }
+
+    #[test]
+    fn test_coalesce_mouse_moves_keeps_moves_for_different_conversations() {
+        assert_eq!(
+            coalesce_mouse_moves(vec![(1, mv(1.0)), (2, mv(2.0))]),
+            vec![(1, mv(1.0)), (2, mv(2.0))]
+        );
+    }
+
     #[test]
     fn test_browser_input_event_for_key_maps_a_printable_character_to_type_text() {
         assert_eq!(
-            browser_input_event_for_key(keyboard_types::Key::Character("a".to_string())),
+            browser_input_event_for_key(keyboard_types::Key::Character("a".to_string()), no_mods()),
             Some(BrowserInputEvent::TypeText {
                 text: "a".to_string()
             })
@@ -1263,7 +1358,7 @@ mod tests {
         ];
         for (key, expected_name) in cases {
             assert_eq!(
-                browser_input_event_for_key(key),
+                browser_input_event_for_key(key, no_mods()),
                 Some(BrowserInputEvent::PressKey {
                     key: expected_name.to_string()
                 }),
@@ -1277,14 +1372,14 @@ mod tests {
         // F1 isn't in the forwarded set — same reasoning
         // `browsing::server::named_key_event_fields` uses server-side: no
         // point round-tripping a key the server would reject anyway.
-        assert_eq!(browser_input_event_for_key(keyboard_types::Key::F1), None);
+        assert_eq!(browser_input_event_for_key(keyboard_types::Key::F1, no_mods()), None);
     }
 
     #[test]
     fn test_browser_input_event_for_key_drops_a_bare_modifier() {
-        assert_eq!(browser_input_event_for_key(keyboard_types::Key::Shift), None);
-        assert_eq!(browser_input_event_for_key(keyboard_types::Key::Control), None);
-        assert_eq!(browser_input_event_for_key(keyboard_types::Key::Alt), None);
+        assert_eq!(browser_input_event_for_key(keyboard_types::Key::Shift, no_mods()), None);
+        assert_eq!(browser_input_event_for_key(keyboard_types::Key::Control, no_mods()), None);
+        assert_eq!(browser_input_event_for_key(keyboard_types::Key::Alt, no_mods()), None);
     }
 
     fn test_sandbox_terminal_entry(terminal_id: i64, pod_id: i64) -> SandboxTerminalPanelEntry {
@@ -1810,6 +1905,23 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
     // `get_browsing_state` pull and by `ConversationEvent::BrowsingSessionUpdate`.
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut browsing_session_open: Signal<bool> = use_signal(|| false);
+    // Forwards the live panel's input one request at a time, in the order
+    // it happened — separately spawned requests can overtake each other (a
+    // mouse-up reaching the page before its mouse-down). Moves that queued
+    // up while a request was in flight collapse to the latest one.
+    let browser_input = use_coroutine(
+        move |mut queue: UnboundedReceiver<(i64, BrowserInputEvent)>| async move {
+            while let Ok(first) = queue.recv().await {
+                let mut batch = vec![first];
+                while let Ok(next) = queue.try_recv() {
+                    batch.push(next);
+                }
+                for (id, event) in coalesce_mouse_moves(batch) {
+                    let _ = send_browser_input(id, event).await;
+                }
+            }
+        },
+    );
     // The latest live-panel frame (base64 JPEG), `None` until the first
     // one arrives after subscribing.
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
@@ -2268,59 +2380,51 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                         onmousemove: move |evt: Event<MouseData>| {
                                             let Some(id) = selected() else { return };
                                             let p = evt.data().element_coordinates();
-                                            spawn(async move {
-                                                let _ = send_browser_input(
-                                                    id,
-                                                    BrowserInputEvent::MouseMove { x: p.x, y: p.y },
-                                                ).await;
-                                            });
+                                            let left_held = evt.data().held_buttons().contains(MouseButton::Primary);
+                                            browser_input.send((id, BrowserInputEvent::MouseMove { x: p.x, y: p.y, left_held }));
                                         },
                                         onmousedown: move |evt: Event<MouseData>| {
+                                            if evt.data().trigger_button() != Some(MouseButton::Primary) {
+                                                return;
+                                            }
                                             let Some(id) = selected() else { return };
                                             let p = evt.data().element_coordinates();
-                                            spawn(async move {
-                                                let _ = send_browser_input(
-                                                    id,
-                                                    BrowserInputEvent::MouseDown { x: p.x, y: p.y },
-                                                ).await;
-                                            });
+                                            browser_input.send((id, BrowserInputEvent::MouseDown { x: p.x, y: p.y }));
                                         },
                                         onmouseup: move |evt: Event<MouseData>| {
+                                            if evt.data().trigger_button() != Some(MouseButton::Primary) {
+                                                return;
+                                            }
                                             let Some(id) = selected() else { return };
                                             let p = evt.data().element_coordinates();
-                                            spawn(async move {
-                                                let _ = send_browser_input(
-                                                    id,
-                                                    BrowserInputEvent::MouseUp { x: p.x, y: p.y },
-                                                ).await;
-                                            });
+                                            browser_input.send((id, BrowserInputEvent::MouseUp { x: p.x, y: p.y }));
                                         },
                                         onwheel: move |evt: Event<WheelData>| {
                                             let Some(id) = selected() else { return };
                                             let p = evt.data().element_coordinates();
                                             let delta = evt.data().delta().strip_units();
-                                            spawn(async move {
-                                                let _ = send_browser_input(
-                                                    id,
-                                                    BrowserInputEvent::Wheel {
-                                                        x: p.x,
-                                                        y: p.y,
-                                                        delta_x: delta.x,
-                                                        delta_y: delta.y,
-                                                    },
-                                                ).await;
-                                            });
+                                            browser_input.send((
+                                                id,
+                                                BrowserInputEvent::Wheel {
+                                                    x: p.x,
+                                                    y: p.y,
+                                                    delta_x: delta.x,
+                                                    delta_y: delta.y,
+                                                },
+                                            ));
                                         },
                                         onkeydown: move |evt: Event<KeyboardData>| {
-                                            evt.prevent_default();
                                             let Some(id) = selected() else { return };
-                                            let Some(input_event) = browser_input_event_for_key(evt.data().key())
-                                            else {
+                                            let Some(input_event) = browser_input_event_for_key(
+                                                evt.data().key(),
+                                                evt.data().modifiers(),
+                                            ) else {
+                                                // Not ours to handle (a shortcut, a bare
+                                                // modifier) — leave it to the viewer's browser.
                                                 return;
                                             };
-                                            spawn(async move {
-                                                let _ = send_browser_input(id, input_event).await;
-                                            });
+                                            evt.prevent_default();
+                                            browser_input.send((id, input_event));
                                         },
                                         if let Some(data) = browsing_frame() {
                                             img {

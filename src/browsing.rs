@@ -2,33 +2,17 @@
 //! conversation — open a page, read it, click/fill/navigate across
 //! several tool calls, instead of `webfetch`'s fresh-page-per-call shape.
 //! Plus a live panel: the user can watch and interact with the same real
-//! page the model is browsing. See docs/projects/plans/web-browsing.md.
+//! page the model is browsing. See
+//! docs/projects/completed/20260922-web-browsing.md.
 //!
-//! `PageElement`/`PageState`/`BrowserFrame`/`BrowserInputEvent` are
-//! ungated — they cross the client/server boundary as server-function
-//! payloads (`api::browsing`'s frame stream and input endpoint), so the
-//! `web` build needs them too. Everything else (the actual
-//! `chromiumoxide`-driven session logic) lives in the `server`-only
-//! nested module, re-exported — same shape `anthropic::tools` already
-//! uses for the same reason.
+//! `BrowserFrame`/`BrowserInputEvent` are ungated — they cross the
+//! client/server boundary as server-function payloads (`api::browsing`'s
+//! frame stream and input endpoint), so the `web` build needs them too.
+//! Everything else (the actual `chromiumoxide`-driven session logic) lives
+//! in the `server`-only nested module, re-exported — same shape
+//! `anthropic::tools` already uses for the same reason.
 
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PageElement {
-    pub index: usize,
-    pub tag: String,
-    pub kind: String,
-    pub label: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct PageState {
-    pub url: String,
-    pub text: String,
-    pub truncated: bool,
-    pub elements: Vec<PageElement>,
-}
 
 /// One live-panel frame — a base64-encoded JPEG straight off the wire
 /// (CDP's own `screencastFrame.data` is already base64; `chromiumoxide`'s
@@ -53,11 +37,15 @@ pub struct BrowserFrame {
 /// characters; `PressKey` is for the small set of *named* keys
 /// (Enter, Backspace, ...) a page's `keydown` handler might actually care
 /// about, which does need a real `dispatchKeyEvent` — see
-/// `server::named_key_event_fields`.
+/// `server::named_key_event_fields`. `MouseMove` carries whether the
+/// viewer's left button is actually held (read off the real DOM event, not
+/// tracked server-side, so a button released outside the panel can't leave
+/// the page stuck mid-drag) — a plain hover must reach the page as a move
+/// with no buttons down, not a drag.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum BrowserInputEvent {
-    MouseMove { x: f64, y: f64 },
+    MouseMove { x: f64, y: f64, left_held: bool },
     MouseDown { x: f64, y: f64 },
     MouseUp { x: f64, y: f64 },
     Wheel { x: f64, y: f64, delta_x: f64, delta_y: f64 },
@@ -69,6 +57,7 @@ pub enum BrowserInputEvent {
 mod server {
     use std::collections::HashMap;
     use std::net::IpAddr;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
 
@@ -82,11 +71,29 @@ mod server {
         EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat,
         StartScreencastParams, StopScreencastParams,
     };
-    use futures_util::StreamExt;
-    use tokio::sync::broadcast;
+    use futures_util::{Stream, StreamExt};
+    use tokio::sync::{broadcast, watch};
 
-    use super::{BrowserFrame, BrowserInputEvent, PageElement, PageState};
+    use serde::{Deserialize, Serialize};
+
+    use super::{BrowserFrame, BrowserInputEvent};
     use crate::fetch_guard;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct PageElement {
+        pub index: usize,
+        pub tag: String,
+        pub kind: String,
+        pub label: String,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct PageState {
+        pub url: String,
+        pub text: String,
+        pub truncated: bool,
+        pub elements: Vec<PageElement>,
+    }
 
     /// Bounds page navigation+load, same reasoning `webfetch::NAV_TIMEOUT`
     /// already established — "bound the boundaries" (development-process.md).
@@ -149,12 +156,29 @@ mod server {
     static SESSIONS: LazyLock<Mutex<HashMap<i64, Session>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
+    /// Held across the whole of `open_session` so its "is one already
+    /// open?" check and the eventual insert can't interleave with another
+    /// open for the same conversation. Opens are rare, so one lock for all
+    /// conversations is fine.
+    static OPEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Distinguishes one open of a conversation's session from the next,
+    /// so a `FrameSubscription` outliving the session it came from can't
+    /// touch a later session's viewer count.
+    static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
     struct Session {
+        id: u64,
         page: Page,
         intercept_task: tokio::task::JoinHandle<()>,
         frame_tx: broadcast::Sender<BrowserFrame>,
         frame_subscriber_count: usize,
-        screencast_task: Option<tokio::task::JoinHandle<()>>,
+        /// Whether anyone is watching — `run_screencast` (one task for the
+        /// session's whole life) starts/stops the real screencast as this
+        /// flips, so start and stop commands are always issued in order
+        /// from one place and can't race each other.
+        want_screencast: watch::Sender<bool>,
+        screencast_task: tokio::task::JoinHandle<()>,
     }
 
     /// Opens a browsing session for `conversation_id` — refuses if one is
@@ -177,6 +201,7 @@ mod server {
         conversation_id: i64,
         is_addr_allowed: fn(IpAddr) -> bool,
     ) -> Result<(), String> {
+        let _opening = OPEN_LOCK.lock().await;
         if SESSIONS.lock().unwrap().contains_key(&conversation_id) {
             return Err(
                 "a browsing session is already open for this conversation — call \
@@ -189,6 +214,43 @@ mod server {
             .new_page("about:blank")
             .await
             .map_err(|e| format!("failed to open a page: {e}"))?;
+        let intercept_task = match configure_session_page(&page, is_addr_allowed).await {
+            Ok(task) => task,
+            Err(e) => {
+                let _ = page.close().await;
+                return Err(e);
+            }
+        };
+        let (frame_tx, _) = broadcast::channel(FRAME_CHANNEL_CAPACITY);
+        let (want_screencast, want_rx) = watch::channel(false);
+        let screencast_task = tokio::spawn(run_screencast(page.clone(), frame_tx.clone(), want_rx));
+        SESSIONS.lock().unwrap().insert(
+            conversation_id,
+            Session {
+                id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+                page,
+                intercept_task,
+                frame_tx,
+                frame_subscriber_count: 0,
+                want_screencast,
+                screencast_task,
+            },
+        );
+        crate::events::publish(
+            conversation_id,
+            crate::events::ConversationEvent::BrowsingSessionUpdate { open: true },
+        );
+        Ok(())
+    }
+
+    /// Everything a fresh session page needs before it's handed out —
+    /// pinned viewport plus SSRF interception. Split out so
+    /// `open_session_with_guard` can close the page if any step fails,
+    /// rather than leaking it in the shared browser.
+    async fn configure_session_page(
+        page: &Page,
+        is_addr_allowed: fn(IpAddr) -> bool,
+    ) -> Result<tokio::task::JoinHandle<()>, String> {
         // Pins this page's viewport to exactly the screencast's own
         // max dimensions (device_scale_factor 1, no mobile emulation) —
         // otherwise every screencast frame's actual pixel size depends on
@@ -205,24 +267,7 @@ mod server {
         ))
         .await
         .map_err(|e| format!("failed to set the session's viewport: {e}"))?;
-        let intercept_task =
-            fetch_guard::spawn_request_interceptor(&page, is_addr_allowed).await?;
-        let (frame_tx, _) = broadcast::channel(FRAME_CHANNEL_CAPACITY);
-        SESSIONS.lock().unwrap().insert(
-            conversation_id,
-            Session {
-                page,
-                intercept_task,
-                frame_tx,
-                frame_subscriber_count: 0,
-                screencast_task: None,
-            },
-        );
-        crate::events::publish(
-            conversation_id,
-            crate::events::ConversationEvent::BrowsingSessionUpdate { open: true },
-        );
-        Ok(())
+        fetch_guard::spawn_request_interceptor(page, is_addr_allowed).await
     }
 
     /// Closes `conversation_id`'s browsing session — a no-op (not an
@@ -234,9 +279,7 @@ mod server {
         let session = SESSIONS.lock().unwrap().remove(&conversation_id);
         if let Some(session) = session {
             session.intercept_task.abort();
-            if let Some(task) = session.screencast_task {
-                task.abort();
-            }
+            session.screencast_task.abort();
             let _ = session.page.close().await;
             crate::events::publish(
                 conversation_id,
@@ -249,23 +292,24 @@ mod server {
     /// A live handle on `conversation_id`'s frame stream — subscribing
     /// (`subscribe_frames`) starts the real CDP screencast if this is the
     /// first viewer; dropping this (when the panel closes or the browser
-    /// tab disconnects) stops it again if this was the last one. The
-    /// actual unsubscribe is async (it may send `Page.stopScreencast`),
-    /// which a plain `Drop` impl can't `.await` — so `Drop` here spawns a
-    /// detached task to do it, the same "best-effort cleanup, fire and
-    /// forget" shape this codebase already uses for other non-critical
-    /// teardown.
+    /// tab disconnects) stops it again if this was the last one.
     pub struct FrameSubscription {
         pub receiver: broadcast::Receiver<BrowserFrame>,
-        conversation_id: i64,
+        _viewer: ViewerGuard,
     }
 
-    impl Drop for FrameSubscription {
+    /// Counts as one viewer of one specific session for as long as it
+    /// lives. Unsubscribing is synchronous (a counter plus a `watch`
+    /// flip that `run_screencast` acts on), so this needs no spawned
+    /// cleanup task.
+    struct ViewerGuard {
+        conversation_id: i64,
+        session_id: u64,
+    }
+
+    impl Drop for ViewerGuard {
         fn drop(&mut self) {
-            let conversation_id = self.conversation_id;
-            tokio::spawn(async move {
-                unsubscribe_frames(conversation_id).await;
-            });
+            unsubscribe_frames(self.conversation_id, self.session_id);
         }
     }
 
@@ -282,52 +326,81 @@ mod server {
         let receiver = session.frame_tx.subscribe();
         session.frame_subscriber_count += 1;
         if session.frame_subscriber_count == 1 {
-            let page = session.page.clone();
-            let frame_tx = session.frame_tx.clone();
-            session.screencast_task = Some(tokio::spawn(async move {
-                run_screencast(page, frame_tx).await;
-            }));
+            session.want_screencast.send_replace(true);
         }
         Ok(FrameSubscription {
             receiver,
-            conversation_id,
+            _viewer: ViewerGuard {
+                conversation_id,
+                session_id: session.id,
+            },
         })
     }
 
-    /// Decrements `conversation_id`'s subscriber count and, if it just
-    /// hit zero, stops the real screencast — both the local polling task
-    /// and the actual CDP `Page.stopScreencast` command, so Chrome stops
-    /// encoding frames nobody's reading. A no-op if the session itself is
-    /// already gone (closed out from under a still-live subscription).
-    async fn unsubscribe_frames(conversation_id: i64) {
-        let (should_stop, page) = {
-            let mut sessions = SESSIONS.lock().unwrap();
-            let Some(session) = sessions.get_mut(&conversation_id) else {
-                return;
-            };
-            session.frame_subscriber_count = session.frame_subscriber_count.saturating_sub(1);
-            if session.frame_subscriber_count == 0 {
-                if let Some(task) = session.screencast_task.take() {
-                    task.abort();
-                }
-                (true, Some(session.page.clone()))
-            } else {
-                (false, None)
-            }
+    /// Drops one viewer from the session it was counted against; the last
+    /// one leaving tells `run_screencast` to stop, so Chrome stops encoding
+    /// frames nobody's reading. A no-op if that session is gone — including
+    /// when a *newer* session has since been opened for the same
+    /// conversation, whose viewers this one was never part of.
+    fn unsubscribe_frames(conversation_id: i64, session_id: u64) {
+        let mut sessions = SESSIONS.lock().unwrap();
+        let Some(session) = sessions.get_mut(&conversation_id) else {
+            return;
         };
-        if should_stop {
-            if let Some(page) = page {
-                let _ = page.execute(StopScreencastParams::default()).await;
-            }
+        if session.id != session_id {
+            return;
+        }
+        session.frame_subscriber_count = session.frame_subscriber_count.saturating_sub(1);
+        if session.frame_subscriber_count == 0 {
+            session.want_screencast.send_replace(false);
         }
     }
 
-    /// Drives the real screencast: starts it, then forwards every frame
-    /// onto `frame_tx` and acks it (`Page.screencastFrameAck`) so Chrome
-    /// keeps sending more — CDP stops sending new frames until the
-    /// previous one is acked. Ends (and lets the screencast trail off)
-    /// when the event stream itself ends, e.g. the page closes.
-    async fn run_screencast(page: Page, frame_tx: broadcast::Sender<BrowserFrame>) {
+    /// The live panel's frame stream for one subscription: yields frames as
+    /// they're pulled, skipping any the reader fell too far behind on
+    /// (the broadcast channel only holds `FRAME_CHANNEL_CAPACITY`), so a
+    /// slow reader always gets the most recent frames rather than an
+    /// ever-growing backlog. Holds the subscription for as long as the
+    /// stream lives — dropping the stream (the SSE connection closing)
+    /// is what drops the viewer.
+    pub fn frame_stream(
+        subscription: FrameSubscription,
+    ) -> impl Stream<Item = Result<BrowserFrame, axum::BoxError>> + Send + 'static {
+        let FrameSubscription { receiver, _viewer } = subscription;
+        latest_wins(receiver, _viewer).map(Ok)
+    }
+
+    /// Streams `rx`'s items, skipping past a lag instead of erroring, and
+    /// ends when every sender is gone. `guard` is kept alive exactly as long
+    /// as the stream.
+    fn latest_wins<T: Clone + Send + 'static, G: Send + 'static>(
+        rx: broadcast::Receiver<T>,
+        guard: G,
+    ) -> impl Stream<Item = T> + Send + 'static {
+        futures_util::stream::unfold((rx, guard), |(mut rx, guard)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(item) => return Some((item, (rx, guard))),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        })
+    }
+
+    /// Runs for the session's whole life, starting the real screencast
+    /// whenever `want` turns true and stopping it (`Page.stopScreencast`)
+    /// whenever it turns false. While running, forwards every frame onto
+    /// `frame_tx` and acks it (`Page.screencastFrameAck`) so Chrome keeps
+    /// sending more — CDP stops sending new frames until the previous one is
+    /// acked. Issuing every start/stop from this one task is what keeps a
+    /// stop meant for a departed viewer from landing after a new viewer's
+    /// start.
+    async fn run_screencast(
+        page: Page,
+        frame_tx: broadcast::Sender<BrowserFrame>,
+        mut want: watch::Receiver<bool>,
+    ) {
         let mut frames = match page.event_listener::<EventScreencastFrame>().await {
             Ok(f) => f,
             Err(e) => {
@@ -335,25 +408,51 @@ mod server {
                 return;
             }
         };
-        let start = StartScreencastParams::builder()
-            .format(StartScreencastFormat::Jpeg)
-            .quality(SCREENCAST_QUALITY)
-            .max_width(SCREENCAST_MAX_WIDTH)
-            .max_height(SCREENCAST_MAX_HEIGHT)
-            .build();
-        if let Err(e) = page.execute(start).await {
-            tracing::warn!("browsing: failed to start screencast: {e}");
-            return;
-        }
-        while let Some(event) = frames.next().await {
-            let _ = frame_tx.send(BrowserFrame {
-                data: String::from(event.data.clone()),
-            });
-            if let Err(e) = page
-                .execute(ScreencastFrameAckParams::new(event.session_id))
-                .await
-            {
-                tracing::warn!("browsing: failed to ack screencast frame: {e}");
+        loop {
+            if want.wait_for(|wanted| *wanted).await.is_err() {
+                return;
+            }
+            let start = StartScreencastParams::builder()
+                .format(StartScreencastFormat::Jpeg)
+                .quality(SCREENCAST_QUALITY)
+                .max_width(SCREENCAST_MAX_WIDTH)
+                .max_height(SCREENCAST_MAX_HEIGHT)
+                .build();
+            if let Err(e) = page.execute(start).await {
+                tracing::warn!("browsing: failed to start screencast: {e}");
+                // Retry on the next viewer rather than giving up for the
+                // rest of the session.
+                if want.wait_for(|wanted| !*wanted).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            loop {
+                tokio::select! {
+                    changed = want.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        if !*want.borrow_and_update() {
+                            break;
+                        }
+                    }
+                    frame = frames.next() => {
+                        let Some(event) = frame else { return };
+                        let _ = frame_tx.send(BrowserFrame {
+                            data: String::from(event.data.clone()),
+                        });
+                        if let Err(e) = page
+                            .execute(ScreencastFrameAckParams::new(event.session_id))
+                            .await
+                        {
+                            tracing::warn!("browsing: failed to ack screencast frame: {e}");
+                        }
+                    }
+                }
+            }
+            if let Err(e) = page.execute(StopScreencastParams::default()).await {
+                tracing::warn!("browsing: failed to stop screencast: {e}");
             }
         }
     }
@@ -365,6 +464,15 @@ mod server {
     /// doesn't exist yet.
     pub fn is_session_open(conversation_id: i64) -> bool {
         SESSIONS.lock().unwrap().contains_key(&conversation_id)
+    }
+
+    #[cfg(all(test, feature = "browser-test"))]
+    fn frame_subscriber_count(conversation_id: i64) -> usize {
+        SESSIONS
+            .lock()
+            .unwrap()
+            .get(&conversation_id)
+            .map_or(0, |s| s.frame_subscriber_count)
     }
 
     fn live_page(conversation_id: i64) -> Result<Page, String> {
@@ -380,123 +488,171 @@ mod server {
             })
     }
 
-    /// `(key, code, windows_virtual_key_code)` for the named keys
-    /// `PressKey` supports — real, standard values (the same ones any
-    /// real keyboard sends), not placeholders. Deliberately a small,
-    /// explicit set rather than a full keyboard layout table — covers the
-    /// common cases a form or a keyboard-driven page actually listens
-    /// for.
-    fn named_key_event_fields(key: &str) -> Result<(&'static str, &'static str, i64), String> {
-        match key {
-            "Enter" => Ok(("Enter", "Enter", 13)),
-            "Backspace" => Ok(("Backspace", "Backspace", 8)),
-            "Tab" => Ok(("Tab", "Tab", 9)),
-            "Escape" => Ok(("Escape", "Escape", 27)),
-            "Delete" => Ok(("Delete", "Delete", 46)),
-            "ArrowUp" => Ok(("ArrowUp", "ArrowUp", 38)),
-            "ArrowDown" => Ok(("ArrowDown", "ArrowDown", 40)),
-            "ArrowLeft" => Ok(("ArrowLeft", "ArrowLeft", 37)),
-            "ArrowRight" => Ok(("ArrowRight", "ArrowRight", 39)),
-            other => Err(format!("unsupported named key: {other:?}")),
-        }
+    /// CDP key-event fields for one named key `PressKey` supports.
+    #[derive(Debug, PartialEq)]
+    struct NamedKey {
+        key: &'static str,
+        code: &'static str,
+        windows_virtual_key_code: i64,
+        /// What the key types, if anything. Chrome only runs a key's
+        /// default text action — Enter's implicit form submit or textarea
+        /// newline — when the keydown carries it, the same way
+        /// Puppeteer's US layout sends Enter as `text: "\r"`.
+        text: Option<&'static str>,
+    }
+
+    /// Real, standard values for the named keys `PressKey` supports (the
+    /// same ones any real keyboard sends), not placeholders. Deliberately a
+    /// small, explicit set rather than a full keyboard layout table —
+    /// covers the common cases a form or a keyboard-driven page actually
+    /// listens for.
+    fn named_key_event_fields(key: &str) -> Result<NamedKey, String> {
+        let (key, windows_virtual_key_code, text) = match key {
+            "Enter" => ("Enter", 13, Some("\r")),
+            "Backspace" => ("Backspace", 8, None),
+            "Tab" => ("Tab", 9, None),
+            "Escape" => ("Escape", 27, None),
+            "Delete" => ("Delete", 46, None),
+            "ArrowUp" => ("ArrowUp", 38, None),
+            "ArrowDown" => ("ArrowDown", 40, None),
+            "ArrowLeft" => ("ArrowLeft", 37, None),
+            "ArrowRight" => ("ArrowRight", 39, None),
+            other => return Err(format!("unsupported named key: {other:?}")),
+        };
+        Ok(NamedKey {
+            key,
+            code: key,
+            windows_virtual_key_code,
+            text,
+        })
     }
 
     /// Forwards a live-panel input event to `conversation_id`'s session
     /// page.
     pub async fn send_input(conversation_id: i64, event: BrowserInputEvent) -> Result<(), String> {
         let page = live_page(conversation_id)?;
-        match event {
-            BrowserInputEvent::MouseMove { x, y } => {
-                dispatch_mouse(&page, DispatchMouseEventType::MouseMoved, x, y, None, None).await
+        let params = match event {
+            BrowserInputEvent::TypeText { text } => {
+                return page
+                    .execute(InsertTextParams::new(text))
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| format!("failed to send input: {e}"));
             }
-            BrowserInputEvent::MouseDown { x, y } => {
-                dispatch_mouse(
-                    &page,
-                    DispatchMouseEventType::MousePressed,
-                    x,
-                    y,
-                    Some(1),
-                    None,
-                )
-                .await
+            BrowserInputEvent::PressKey { key } => {
+                for params in key_event_params(&key)? {
+                    page.execute(params)
+                        .await
+                        .map_err(|e| format!("failed to send key event: {e}"))?;
+                }
+                return Ok(());
             }
-            BrowserInputEvent::MouseUp { x, y } => {
-                dispatch_mouse(
-                    &page,
-                    DispatchMouseEventType::MouseReleased,
-                    x,
-                    y,
-                    Some(1),
-                    None,
-                )
-                .await
-            }
+            mouse => mouse_event_params(&mouse),
+        };
+        page.execute(params)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("failed to send mouse event: {e}"))
+    }
+
+    /// The keydown/keyup pair for a named key. A key that types something
+    /// (Enter) goes down as `keyDown` with its text so Chrome runs its
+    /// default action; one that doesn't goes down as `rawKeyDown`, the
+    /// same split Puppeteer makes.
+    fn key_event_params(key: &str) -> Result<Vec<DispatchKeyEventParams>, String> {
+        let named = named_key_event_fields(key)?;
+        let down_type = if named.text.is_some() {
+            DispatchKeyEventType::KeyDown
+        } else {
+            DispatchKeyEventType::RawKeyDown
+        };
+        let mut down = DispatchKeyEventParams::builder()
+            .r#type(down_type)
+            .key(named.key)
+            .code(named.code)
+            .windows_virtual_key_code(named.windows_virtual_key_code);
+        if let Some(text) = named.text {
+            down = down.text(text).unmodified_text(text);
+        }
+        let up = DispatchKeyEventParams::builder()
+            .r#type(DispatchKeyEventType::KeyUp)
+            .key(named.key)
+            .code(named.code)
+            .windows_virtual_key_code(named.windows_virtual_key_code);
+        [down, up]
+            .into_iter()
+            .map(|b| b.build().map_err(|e| format!("failed to build key event: {e}")))
+            .collect()
+    }
+
+    /// CDP params for a mouse-shaped input event. `button` is the button
+    /// this event is *about* (pressed or released — none for a move or
+    /// wheel); `buttons` is the bitmask held *after* it, which is what a
+    /// page's `event.buttons` reports. Getting these wrong turns a plain
+    /// hover into a drag. Only ever called with a mouse event — the key
+    /// events are handled before `send_input` reaches here.
+    fn mouse_event_params(event: &BrowserInputEvent) -> DispatchMouseEventParams {
+        use chromiumoxide::cdp::browser_protocol::input::MouseButton;
+        const LEFT: i64 = 1;
+        let (r#type, x, y, button, buttons, click_count, delta) = match *event {
+            BrowserInputEvent::MouseMove { x, y, left_held } => (
+                DispatchMouseEventType::MouseMoved,
+                x,
+                y,
+                if left_held { MouseButton::Left } else { MouseButton::None },
+                if left_held { LEFT } else { 0 },
+                None,
+                None,
+            ),
+            BrowserInputEvent::MouseDown { x, y } => (
+                DispatchMouseEventType::MousePressed,
+                x,
+                y,
+                MouseButton::Left,
+                LEFT,
+                Some(1),
+                None,
+            ),
+            BrowserInputEvent::MouseUp { x, y } => (
+                DispatchMouseEventType::MouseReleased,
+                x,
+                y,
+                MouseButton::Left,
+                0,
+                Some(1),
+                None,
+            ),
             BrowserInputEvent::Wheel {
                 x,
                 y,
                 delta_x,
                 delta_y,
-            } => {
-                dispatch_mouse(
-                    &page,
-                    DispatchMouseEventType::MouseWheel,
-                    x,
-                    y,
-                    None,
-                    Some((delta_x, delta_y)),
-                )
-                .await
+            } => (
+                DispatchMouseEventType::MouseWheel,
+                x,
+                y,
+                MouseButton::None,
+                0,
+                None,
+                Some((delta_x, delta_y)),
+            ),
+            BrowserInputEvent::TypeText { .. } | BrowserInputEvent::PressKey { .. } => {
+                unreachable!("key events are dispatched before mouse_event_params")
             }
-            BrowserInputEvent::TypeText { text } => page
-                .execute(InsertTextParams::new(text))
-                .await
-                .map(|_| ())
-                .map_err(|e| format!("failed to send input: {e}")),
-            BrowserInputEvent::PressKey { key } => {
-                let (key_value, code, windows_virtual_key_code) = named_key_event_fields(&key)?;
-                for r#type in [DispatchKeyEventType::KeyDown, DispatchKeyEventType::KeyUp] {
-                    let params = DispatchKeyEventParams::builder()
-                        .r#type(r#type)
-                        .key(key_value)
-                        .code(code)
-                        .windows_virtual_key_code(windows_virtual_key_code)
-                        .build()
-                        .map_err(|e| format!("failed to build key event: {e}"))?;
-                    page.execute(params)
-                        .await
-                        .map_err(|e| format!("failed to send key event: {e}"))?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    async fn dispatch_mouse(
-        page: &Page,
-        r#type: DispatchMouseEventType,
-        x: f64,
-        y: f64,
-        click_count: Option<i64>,
-        wheel_delta: Option<(f64, f64)>,
-    ) -> Result<(), String> {
+        };
         let mut builder = DispatchMouseEventParams::builder()
             .r#type(r#type)
             .x(x)
             .y(y)
-            .button(chromiumoxide::cdp::browser_protocol::input::MouseButton::Left);
+            .button(button)
+            .buttons(buttons);
         if let Some(click_count) = click_count {
             builder = builder.click_count(click_count);
         }
-        if let Some((delta_x, delta_y)) = wheel_delta {
+        if let Some((delta_x, delta_y)) = delta {
             builder = builder.delta_x(delta_x).delta_y(delta_y);
         }
-        let params = builder
-            .build()
-            .map_err(|e| format!("failed to build mouse event: {e}"))?;
-        page.execute(params)
-            .await
-            .map(|_| ())
-            .map_err(|e| format!("failed to send mouse event: {e}"))
+        builder.build().expect("type, x and y are always set")
     }
 
     async fn extract_page_state(page: &Page) -> Result<PageState, String> {
@@ -712,6 +868,21 @@ mod server {
                     "/page2",
                     axum::routing::get(|| async {
                         axum::response::Html("<html><body><h1>Page two</h1></body></html>")
+                    }),
+                )
+                .route(
+                    "/input-events",
+                    axum::routing::get(|| async {
+                        axum::response::Html(
+                            "<html><body>\
+                             <div id=\"buttons-out\">no move yet</div>\
+                             <form onsubmit=\"event.preventDefault(); document.getElementById('submit-out').innerText='submitted';\">\
+                             <input id=\"q\" type=\"text\">\
+                             </form>\
+                             <div id=\"submit-out\">not sent</div>\
+                             <script>document.addEventListener('mousemove', e => { document.getElementById('buttons-out').innerText = 'buttons=' + e.buttons; });</script>\
+                             </body></html>",
+                        )
                     }),
                 );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -956,6 +1127,7 @@ mod server {
                 BrowserInputEvent::MouseMove {
                     x: point.x,
                     y: point.y,
+                    left_held: false,
                 },
             )
             .await
@@ -1030,9 +1202,130 @@ mod server {
                 after_type.text
             );
 
+            // --- Scenario 11: a plain hover isn't a drag — a mouse move
+            // with no button held reaches the page with `buttons == 0`. ---
+            navigate(conversation_id, &format!("{base}/input-events"))
+                .await
+                .expect("navigate to the input-events page should succeed");
+            send_input(
+                conversation_id,
+                BrowserInputEvent::MouseMove { x: 200.0, y: 300.0, left_held: false },
+            )
+            .await
+            .expect("mouse move should succeed");
+            let after_hover = read(conversation_id).await.expect("read should succeed");
+            assert!(
+                after_hover.text.contains("buttons=0"),
+                "expected a plain hover to report no held buttons, got: {:?}",
+                after_hover.text
+            );
+
+            // --- Scenario 12: Enter in a form's text field submits it,
+            // the same as a real keyboard's Enter would. ---
+            let page = live_page(conversation_id).expect("session should still be live");
+            let field = page.find_element("#q").await.expect("should find #q");
+            let field_point = field.clickable_point().await.expect("clickable point for #q");
+            for event in [
+                BrowserInputEvent::MouseDown { x: field_point.x, y: field_point.y },
+                BrowserInputEvent::MouseUp { x: field_point.x, y: field_point.y },
+                BrowserInputEvent::PressKey { key: "Enter".to_string() },
+            ] {
+                send_input(conversation_id, event).await.expect("input should succeed");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let after_enter = read(conversation_id).await.expect("read should succeed");
+            assert!(
+                after_enter.text.contains("submitted"),
+                "expected Enter to submit the form, got: {:?}",
+                after_enter.text
+            );
+
+            // --- Scenario 13: a viewer leaving and another arriving right
+            // away (a panel re-render, a quick conversation switch back)
+            // never leaves the new viewer without frames, whatever the
+            // timing between the two. ---
+            navigate_to_animated_page(conversation_id).await;
+            for delay_ms in [0, 1, 5, 20, 50] {
+                let mut sub = subscribe_frames(conversation_id).expect("subscribe should succeed");
+                expect_fresh_frame(&mut sub).await;
+                drop(sub);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            let mut last_sub = subscribe_frames(conversation_id).expect("subscribe should succeed");
+            expect_fresh_frame(&mut last_sub).await;
+            drop(last_sub);
+
+            // --- Scenario 14: a subscription left over from a *closed*
+            // session can't affect the next session opened for the same
+            // conversation when it finally drops. ---
+            let stale_sub = subscribe_frames(conversation_id).expect("subscribe should succeed");
+            close_session(conversation_id).await.expect("close should succeed");
+            open_session_with_guard(conversation_id, allow_loopback_too)
+                .await
+                .expect("re-open should succeed");
+            navigate_to_animated_page(conversation_id).await;
+            let mut fresh_sub = subscribe_frames(conversation_id).expect("subscribe should succeed");
+            expect_fresh_frame(&mut fresh_sub).await;
+            drop(stale_sub);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            expect_fresh_frame(&mut fresh_sub).await;
+            drop(fresh_sub);
+
+            // --- Scenario 15: the live panel's frame stream releases its
+            // viewer as soon as the stream is dropped (the SSE connection
+            // closing), so a departed viewer doesn't keep the screencast
+            // running for the rest of the session. ---
+            assert_eq!(frame_subscriber_count(conversation_id), 0);
+            let mut stream = Box::pin(frame_stream(
+                subscribe_frames(conversation_id).expect("subscribe should succeed"),
+            ));
+            assert_eq!(frame_subscriber_count(conversation_id), 1);
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("the stream should yield a frame")
+                .expect("the stream should not end")
+                .expect("frames are never errors");
+            drop(stream);
+            assert_eq!(frame_subscriber_count(conversation_id), 0);
+
+            close_session(conversation_id)
+                .await
+                .expect("close_session should succeed");
+
+            // --- Scenario 16: two opens racing for the same conversation
+            // — exactly one wins; the other is refused rather than
+            // silently replacing (and leaking) the first. ---
+            let (first, second) = tokio::join!(
+                open_session_with_guard(conversation_id, allow_loopback_too),
+                open_session_with_guard(conversation_id, allow_loopback_too),
+            );
+            assert_eq!(
+                [first.is_ok(), second.is_ok()].iter().filter(|ok| **ok).count(),
+                1,
+                "expected exactly one of two racing opens to succeed, got {first:?} / {second:?}"
+            );
+
             close_session(conversation_id)
                 .await
                 .expect("final close_session should succeed");
+        }
+
+        /// Waits for a frame produced *after* this call — anything already
+        /// buffered is discarded first, so a stalled screencast can't pass
+        /// on a stale frame.
+        async fn expect_fresh_frame(sub: &mut FrameSubscription) {
+            use tokio::sync::broadcast::error::TryRecvError;
+            loop {
+                match sub.receiver.try_recv() {
+                    Ok(_) | Err(TryRecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+            let frame = tokio::time::timeout(Duration::from_secs(5), sub.receiver.recv())
+                .await
+                .expect("expected a fresh frame within 5s — the screencast stalled")
+                .expect("frame channel should not error");
+            assert!(!frame.data.is_empty());
         }
 
         /// Navigates to a page whose content changes continuously (a
@@ -1101,24 +1394,114 @@ mod server {
 
         #[test]
         fn test_named_key_event_fields_accepts_a_known_key() {
-            let (key, code, windows_virtual_key_code) =
-                named_key_event_fields("Enter").expect("Enter should be known");
-            assert_eq!(key, "Enter");
-            assert_eq!(code, "Enter");
-            assert_eq!(windows_virtual_key_code, 13);
+            assert_eq!(
+                named_key_event_fields("Enter").expect("Enter should be known"),
+                NamedKey {
+                    key: "Enter",
+                    code: "Enter",
+                    windows_virtual_key_code: 13,
+                    text: Some("\r"),
+                }
+            );
         }
 
         #[test]
         fn test_named_key_event_fields_rejects_an_unknown_key() {
             assert!(named_key_event_fields("F13").is_err());
         }
+
+        #[test]
+        fn test_key_event_params_sends_enter_down_with_its_text() {
+            let params = key_event_params("Enter").expect("Enter should be known");
+            assert_eq!(params.len(), 2);
+            assert_eq!(params[0].r#type, DispatchKeyEventType::KeyDown);
+            assert_eq!(params[0].text.as_deref(), Some("\r"));
+            assert_eq!(params[1].r#type, DispatchKeyEventType::KeyUp);
+            assert_eq!(params[1].text, None);
+        }
+
+        #[test]
+        fn test_key_event_params_sends_a_non_typing_key_down_raw() {
+            let params = key_event_params("Backspace").expect("Backspace should be known");
+            assert_eq!(params[0].r#type, DispatchKeyEventType::RawKeyDown);
+            assert_eq!(params[0].text, None);
+            assert_eq!(params[1].r#type, DispatchKeyEventType::KeyUp);
+        }
+
+        fn buttons_of(event: BrowserInputEvent) -> (Option<MouseButton>, Option<i64>) {
+            let params = mouse_event_params(&event);
+            (params.button, params.buttons)
+        }
+
+        use chromiumoxide::cdp::browser_protocol::input::MouseButton;
+
+        #[test]
+        fn test_mouse_event_params_hover_holds_no_button() {
+            assert_eq!(
+                buttons_of(BrowserInputEvent::MouseMove { x: 1.0, y: 2.0, left_held: false }),
+                (Some(MouseButton::None), Some(0))
+            );
+        }
+
+        #[test]
+        fn test_mouse_event_params_drag_holds_the_left_button() {
+            assert_eq!(
+                buttons_of(BrowserInputEvent::MouseMove { x: 1.0, y: 2.0, left_held: true }),
+                (Some(MouseButton::Left), Some(1))
+            );
+        }
+
+        #[test]
+        fn test_mouse_event_params_press_and_release_name_the_left_button() {
+            assert_eq!(
+                buttons_of(BrowserInputEvent::MouseDown { x: 1.0, y: 2.0 }),
+                (Some(MouseButton::Left), Some(1))
+            );
+            assert_eq!(
+                buttons_of(BrowserInputEvent::MouseUp { x: 1.0, y: 2.0 }),
+                (Some(MouseButton::Left), Some(0))
+            );
+        }
+
+        #[test]
+        fn test_mouse_event_params_wheel_holds_no_button() {
+            let params = mouse_event_params(&BrowserInputEvent::Wheel {
+                x: 1.0,
+                y: 2.0,
+                delta_x: 0.0,
+                delta_y: 120.0,
+            });
+            assert_eq!((params.button, params.buttons), (Some(MouseButton::None), Some(0)));
+            assert_eq!(params.delta_y, Some(120.0));
+        }
+
+        #[tokio::test]
+        async fn test_latest_wins_skips_what_a_slow_reader_missed() {
+            let (tx, rx) = broadcast::channel(4);
+            for n in 1..=10 {
+                tx.send(n).unwrap();
+            }
+            drop(tx);
+            let received: Vec<i32> = latest_wins(rx, ()).collect().await;
+            assert_eq!(received, vec![7, 8, 9, 10]);
+        }
+
+        #[tokio::test]
+        async fn test_latest_wins_releases_its_guard_when_dropped() {
+            let (_tx, rx) = broadcast::channel::<i32>(4);
+            let guard = std::sync::Arc::new(());
+            let stream = latest_wins(rx, guard.clone());
+            assert_eq!(std::sync::Arc::strong_count(&guard), 2);
+            drop(stream);
+            assert_eq!(std::sync::Arc::strong_count(&guard), 1);
+        }
     }
 }
 
 #[cfg(feature = "server")]
 pub use server::{
-    click, close_session, fill, go_back, is_session_open, navigate, open_session, read,
-    send_input, subscribe_frames,
+    click, close_session, fill, frame_stream, go_back, is_session_open, navigate, open_session,
+    read, send_input, subscribe_frames,
 };
 
 #[cfg(all(test, feature = "browser-test"))]

@@ -26,31 +26,21 @@ pub async fn get_browsing_state(id: i64) -> ServerFnResult<BrowsingState> {
 
 /// Live frame stream for the panel — opens once per conversation the
 /// panel is visible for, closes when the browser tab navigates away or
-/// closes (the underlying `FrameSubscription` this wraps then drops,
-/// which stops the real screencast if this was the last viewer — see
-/// `browsing::FrameSubscription`'s own doc comment).
+/// closes. Built with `ServerEvents::from_stream`, not `ServerEvents::new`:
+/// the response body *pulls* each frame only when the connection can take
+/// it, so a slow viewer lags behind the small broadcast buffer and skips
+/// stale frames instead of queueing them in memory, and a closed connection
+/// drops the stream — and with it the viewer — straight away. (`new` runs
+/// its closure as a detached task feeding an unbounded queue, which does
+/// neither.)
 #[get("/api/conversations/{id}/browsing/frames")]
 pub async fn subscribe_browser_frames(
     id: i64,
 ) -> ServerFnResult<ServerEvents<crate::browsing::BrowserFrame>> {
-    let mut subscription = crate::browsing::subscribe_frames(id).map_err(ServerFnError::new)?;
-    Ok(ServerEvents::new(move |mut tx| async move {
-        loop {
-            match subscription.receiver.recv().await {
-                Ok(frame) => {
-                    let _ = tx.send(frame).await;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // Frames are "latest wins" ephemeral data (see
-                    // `browsing::FRAME_CHANNEL_CAPACITY`'s own doc
-                    // comment) — a lagging viewer just misses some old
-                    // ones, not something to reconcile like a message.
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    }))
+    let subscription = crate::browsing::subscribe_frames(id).map_err(ServerFnError::new)?;
+    Ok(ServerEvents::from_stream(crate::browsing::frame_stream(
+        subscription,
+    )))
 }
 
 /// Forwards one live-panel input event (mouse/keyboard) to the session's
