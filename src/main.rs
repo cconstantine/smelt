@@ -11,6 +11,8 @@ mod mcp_oauth;
 mod models;
 #[cfg(feature = "server")]
 mod sandbox;
+#[cfg(feature = "server")]
+mod webfetch;
 
 #[cfg(all(test, feature = "browser-test"))]
 mod browser_tests;

@@ -135,6 +135,7 @@ mod server {
             "grep" => grep_tool(pool, conversation_id, input).await,
             "todowrite" => todowrite_tool(pool, conversation_id, input).await,
             "todoread" => todoread_tool(pool, conversation_id).await,
+            "webfetch" => webfetch_tool(input).await,
             _ => execute_synchronous(name, input).await,
         }
     }
@@ -648,6 +649,24 @@ mod server {
                                todowrite."
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            ToolDefinition {
+                name: "webfetch".to_string(),
+                description: "Fetch a URL in a real browser (JS included — unlike a plain HTTP \
+                               request, this handles JS-rendered pages) and return its \
+                               rendered, readable text. Independent of the sandbox pod — works \
+                               even with no pod created. http/https only; the resolved address \
+                               (and every address any redirect or the page's own JS tries to \
+                               reach) must be a real public address, not an internal/private \
+                               one."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "the http:// or https:// URL to fetch"}
+                    },
+                    "required": ["url"]
+                }),
             },
         ]
     }
@@ -1947,6 +1966,12 @@ mod server {
             .await
             .map_err(|e| e.to_string())?;
         serde_json::to_string(&todos).map_err(|e| e.to_string())
+    }
+
+    async fn webfetch_tool(input: &Value) -> Result<String, String> {
+        let url = required_str(input, "url")?;
+        let result = crate::webfetch::fetch(&url).await?;
+        serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
     #[cfg(test)]

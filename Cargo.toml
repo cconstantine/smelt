@@ -64,10 +64,13 @@ globset = { version = "0.4", optional = true }
 # which kube does NOT auto-install — see main.rs's explicit
 # install_default() call.
 rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
-# For src/browser_tests.rs's comprehensive sandbox-visibility check —
 # CDP-native (talks directly to chrome-headless-shell, no chromedriver to
-# download/manage) — see docs/projects/completed/20260815-sandbox-visibility.md's "Why
-# chromiumoxide."
+# download/manage) — originally added for src/browser_tests.rs's
+# comprehensive sandbox-visibility check (see
+# docs/projects/completed/20260815-sandbox-visibility.md's "Why
+# chromiumoxide"), now also a real runtime dependency of src/webfetch.rs
+# (a real headless browser is the actual mechanism behind the `webfetch`
+# tool, not just a test tool) — see docs/projects/plans/webfetch.md.
 chromiumoxide = { version = "0.7", optional = true }
 # For src/mcp.rs's MCP (Model Context Protocol) client — the official Rust
 # SDK, handles the Streamable HTTP transport (both plain-JSON and SSE-upgrade
@@ -102,6 +105,11 @@ async-trait = { version = "0.1", optional = true }
 # transitively (pulled in by `url`, itself pulled in by rmcp's "auth"
 # feature), same "explicit edge" reasoning as `http`/`async-trait` above.
 percent-encoding = { version = "2", optional = true }
+# For src/webfetch.rs's SSRF guard — parsing a request URL to check its
+# scheme and host before allowing the browser to connect. Already present
+# transitively (see percent-encoding's own comment above), same "explicit
+# edge" reasoning.
+url = { version = "2", optional = true }
 # "server" is needed too (not just the client-side pieces) purely for
 # #[cfg(test)]'s mock MCP server, which implements rmcp's own
 # ServerHandler trait — that trait is gated behind rmcp's "server" feature.
@@ -140,12 +148,17 @@ server = [
     "dep:http",
     "dep:async-trait",
     "dep:percent-encoding",
+    "dep:chromiumoxide",
+    "dep:url",
 ]
 # Separate from `server` so the default `cargo test --features server` loop
 # stays exactly as fast as it is today — src/browser_tests.rs's one
-# #[ignore]d test opts in explicitly. See
-# docs/projects/completed/20260815-sandbox-visibility.md.
-browser-test = ["server", "dep:chromiumoxide"]
+# #[ignore]d test opts in explicitly. `chromiumoxide` itself moved to
+# `server` proper once `webfetch` started using it as a real runtime
+# dependency, not just a test one — see
+# docs/projects/completed/20260815-sandbox-visibility.md and
+# docs/projects/plans/webfetch.md.
+browser-test = ["server"]
 
 # sandbox_agent runs standalone inside the sandbox pod (injected and
 # launched by src/sandbox.rs, not served by main.rs) — it needs the same
