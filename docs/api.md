@@ -81,7 +81,7 @@ Because sending a message and opening its event stream are the same call, there'
 
 ## Live conversation events
 
-Six server functions exist purely to support live-updating panels (the background-tasks panel via `run_async`, the sandbox panel — see `docs/projects/completed/20260815-sandbox-visibility.md` — the context-usage indicator/detail view — see `docs/projects/completed/20260922-auto-compaction.md` — and the todo panel via `todowrite`/`todoread` — see `docs/projects/completed/20260922-todo-list-tool.md`) and turns pushed from outside a request:
+Seven server functions exist purely to support live-updating panels (the background-tasks panel via `run_async`, the sandbox panel — see `docs/projects/completed/20260815-sandbox-visibility.md` — the context-usage indicator/detail view — see `docs/projects/completed/20260922-auto-compaction.md` — the todo panel via `todowrite`/`todoread` — see `docs/projects/completed/20260922-todo-list-tool.md` — and the browsing-session panel — see `docs/projects/completed/20260922-web-browsing.md`) and turns pushed from outside a request:
 
 ```rust
 #[get("/api/conversations/{id}/tasks")]
@@ -98,6 +98,9 @@ pub async fn get_context_usage(id: i64) -> ServerFnResult<ContextUsageSnapshot>;
 
 #[get("/api/conversations/{id}/context-detail")]
 pub async fn get_context_detail(id: i64) -> ServerFnResult<ContextDetailSnapshot>;
+
+#[get("/api/conversations/{id}/browsing")]
+pub async fn get_browsing_state(id: i64) -> ServerFnResult<browsing::BrowsingState>;
 
 #[get("/api/conversations/{id}/events")]
 pub async fn subscribe_conversation_events(id: i64) -> ServerFnResult<ServerEvents<ConversationEvent>>;
@@ -120,6 +123,12 @@ pub struct ContextUsageSnapshot { usage: Option<anthropic::TokenUsage>, context_
 pub struct ContextDetailSnapshot { system: Option<String>, tools: Vec<anthropic::ToolDefinition>, message_count: usize, usage: Option<anthropic::TokenUsage>, context_window: u32 }
 ```
 
+`get_browsing_state` is the browsing panel's own one-shot check — is a session even open right now (`browsing::is_session_open`) — so the panel can show an idle state instead of trying to subscribe to a frame stream that doesn't exist yet:
+
+```rust
+pub struct BrowsingState { session_open: bool }
+```
+
 `subscribe_conversation_events` is a second, independent `ServerEvents` stream — unlike `send_message`'s, it isn't scoped to one request; a browser tab opens it once per viewed conversation and keeps it open for as long as that conversation is selected, forwarding whatever `events::subscribe(id)` yields:
 
 ```rust
@@ -134,10 +143,25 @@ pub enum ConversationEvent {
     NotificationDeliveryFailed { detail: String },
     ContextUsageUpdate { usage: anthropic::TokenUsage, context_window: u32 },
     TodoListUpdate { items: Vec<anthropic::tools::TodoItem> },
+    BrowsingSessionUpdate { open: bool },
 }
 ```
 
-`TaskUpdate`/`Sandbox*`/`ContextUsageUpdate`/`TodoListUpdate` are all ephemeral UI telemetry (never persisted as such, regenerable at any time from `get_tasks`/`get_sandbox_state`/`get_context_usage`/`get_todos` — `ContextUsageUpdate`'s own numbers *are* separately persisted, in `conversation_context_usage`, precisely so `get_context_usage` can regenerate it, and `TodoListUpdate`'s are likewise persisted in `conversation_todos`); `MessagesAppended` is a live-delivery notification for rows `run_turn` already persisted — whether that `run_turn` call came from a live `send_message` or from a background task's own push. `SandboxPodUpdate`/`SandboxTerminalUpdate` fire on create/terminate (a `terminated: true` update means the frontend should *remove* that pod/terminal, not just relabel it — unlike a finished task, which the task panel keeps showing); `SandboxCommandUpdate` follows the exact same "started/one output line/finished" pattern `TaskUpdate` already uses, with `command` only populated on the "started" event. `ContextUsageUpdate` publishes once per completed real turn, right after `run_turn_bounded` persists that turn's usage. `TodoListUpdate` publishes on every `todowrite` call and always carries the *complete* current list (never a partial diff — `todowrite` itself is a whole-list replace, no per-item ids), so the frontend just overwrites its signal wholesale rather than merging like `TaskUpdate` requires. Since the underlying `broadcast` channel has no replay, the frontend does a one-shot `get_messages`/`get_tasks`/`get_sandbox_state`/`get_context_usage`/`get_todos` reconciliation pull on connect/reconnect to cover anything published before it subscribed — see `architecture.md`.
+`TaskUpdate`/`Sandbox*`/`ContextUsageUpdate`/`TodoListUpdate`/`BrowsingSessionUpdate` are all ephemeral UI telemetry (never persisted as such, regenerable at any time from `get_tasks`/`get_sandbox_state`/`get_context_usage`/`get_todos`/`get_browsing_state` — `ContextUsageUpdate`'s own numbers *are* separately persisted, in `conversation_context_usage`, precisely so `get_context_usage` can regenerate it, and `TodoListUpdate`'s are likewise persisted in `conversation_todos`); `MessagesAppended` is a live-delivery notification for rows `run_turn` already persisted — whether that `run_turn` call came from a live `send_message` or from a background task's own push. `SandboxPodUpdate`/`SandboxTerminalUpdate` fire on create/terminate (a `terminated: true` update means the frontend should *remove* that pod/terminal, not just relabel it — unlike a finished task, which the task panel keeps showing); `SandboxCommandUpdate` follows the exact same "started/one output line/finished" pattern `TaskUpdate` already uses, with `command` only populated on the "started" event. `ContextUsageUpdate` publishes once per completed real turn, right after `run_turn_bounded` persists that turn's usage. `TodoListUpdate` publishes on every `todowrite` call and always carries the *complete* current list (never a partial diff — `todowrite` itself is a whole-list replace, no per-item ids), so the frontend just overwrites its signal wholesale rather than merging like `TaskUpdate` requires. `BrowsingSessionUpdate` publishes from `open_browser_session`/`close_browser_session`, so the panel shows/hides reactively rather than only checking on conversation (re)select. Since the underlying `broadcast` channel has no replay, the frontend does a one-shot `get_messages`/`get_tasks`/`get_sandbox_state`/`get_context_usage`/`get_todos`/`get_browsing_state` reconciliation pull on connect/reconnect to cover anything published before it subscribed — see `architecture.md`.
+
+### The browsing panel's own live channel
+
+Unlike every other panel above, the browsing panel's live frames are **not** part of `ConversationEvent` — they're frequent, ephemeral, UI-only data (a base64 JPEG per screen update) that shouldn't crowd out task/message updates in that shared bounded broadcast channel, so they get a dedicated per-conversation channel instead, in `src/browsing.rs` itself:
+
+```rust
+#[get("/api/conversations/{id}/browsing/frames")]
+pub async fn subscribe_browser_frames(id: i64) -> ServerFnResult<ServerEvents<browsing::BrowserFrame>>;
+
+#[post("/api/conversations/{id}/browsing/input")]
+pub async fn send_browser_input(id: i64, event: browsing::BrowserInputEvent) -> ServerFnResult<()>;
+```
+
+`subscribe_browser_frames` starts the real CDP screencast (`Page.startScreencast`) the moment the *first* viewer subscribes and stops it (`Page.stopScreencast`) when the *last* one disconnects — reference-counted, via a `Drop`-based guard (`browsing::FrameSubscription`) that spawns the actual async stop call, since `Drop` itself can't `.await`. `send_browser_input` forwards one mouse/keyboard event (in the frame's own fixed pixel space — the session's viewport is pinned to match the screencast bounds exactly, so no scale-factor lookup is needed) to the real page via `Input.dispatchMouseEvent`/`dispatchKeyEvent`/`insertText`. There's no locking between this and the model's own tool-driven `browser_click`/`browser_fill`/... calls — both act on the same real page, and CDP just serializes whichever commands arrive.
 
 ## Current endpoints
 
@@ -152,6 +176,9 @@ pub enum ConversationEvent {
 | `get_sandbox_state` | `GET /api/conversations/{id}/sandbox` | one-shot snapshot of every pod/terminal for this conversation, see above |
 | `get_context_usage` | `GET /api/conversations/{id}/context-usage` | one-shot snapshot for the always-visible context-usage indicator, see above |
 | `get_context_detail` | `GET /api/conversations/{id}/context-detail` | one-shot snapshot for the context-usage detail view, see above |
+| `get_browsing_state` | `GET /api/conversations/{id}/browsing` | one-shot check for whether a browsing session is open, see above |
+| `subscribe_browser_frames` | `GET /api/conversations/{id}/browsing/frames` | live screencast frame stream for the browsing panel, see above |
+| `send_browser_input` | `POST /api/conversations/{id}/browsing/input` | forwards one live-panel mouse/keyboard event, see above |
 | `subscribe_conversation_events` | `GET /api/conversations/{id}/events` | always-open live stream, see above |
 | `delete_conversation` | `DELETE /api/conversations/{id}` | hard delete; cascades to the conversation's messages (`ON DELETE CASCADE`); deleting a nonexistent id is not an error |
 

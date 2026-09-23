@@ -15,10 +15,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chromiumoxide::Browser;
-use chromiumoxide::cdp::browser_protocol::fetch::{
-    ContinueRequestParams, EnableParams, EventRequestPaused, FailRequestParams,
-};
-use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
 use futures_util::StreamExt;
 use serde::Serialize;
 use tokio::sync::OnceCell;
@@ -46,7 +42,9 @@ pub struct FetchResult {
 
 static BROWSER: OnceCell<Browser> = OnceCell::const_new();
 
-async fn shared_browser() -> Result<&'static Browser, String> {
+/// `pub(crate)` — `src/browsing.rs`'s persistent sessions run on this same
+/// shared browser instance rather than launching a second one.
+pub(crate) async fn shared_browser() -> Result<&'static Browser, String> {
     BROWSER.get_or_try_init(launch_browser).await
 }
 
@@ -122,37 +120,7 @@ async fn fetch_with_guard(
         .await
         .map_err(|e| format!("failed to open a page: {e}"))?;
 
-    page.execute(EnableParams::default())
-        .await
-        .map_err(|e| format!("failed to enable request interception: {e}"))?;
-    let mut paused = page
-        .event_listener::<EventRequestPaused>()
-        .await
-        .map_err(|e| format!("failed to listen for intercepted requests: {e}"))?;
-    let intercept_page = page.clone();
-    let intercept_task = tokio::spawn(async move {
-        while let Some(event) = paused.next().await {
-            let allowed =
-                fetch_guard::is_request_allowed_with(&event.request.url, is_addr_allowed).await;
-            let result = if allowed {
-                intercept_page
-                    .execute(ContinueRequestParams::new(event.request_id.clone()))
-                    .await
-                    .map(|_| ())
-            } else {
-                intercept_page
-                    .execute(FailRequestParams::new(
-                        event.request_id.clone(),
-                        ErrorReason::BlockedByClient,
-                    ))
-                    .await
-                    .map(|_| ())
-            };
-            if let Err(e) = result {
-                tracing::warn!("webfetch: failed to resolve intercepted request: {e}");
-            }
-        }
-    });
+    let intercept_task = fetch_guard::spawn_request_interceptor(&page, is_addr_allowed).await?;
 
     // `goto` itself already resolves only once the navigated URL is fully
     // loaded (confirmed against the vendored source's own doc comment) —
@@ -291,5 +259,11 @@ mod browser_tests {
                 panic!("script never finished; last text: {:?}", result.text);
             }
         }
+
+        // `src/browsing.rs`'s own real-browser scenarios run on this same
+        // shared browser static — see that module's `browser_tests` doc
+        // comment for why they run here, as a plain async fn, rather than
+        // as their own `#[tokio::test]`.
+        crate::browsing::browser_tests::run_session_scenarios().await;
     }
 }

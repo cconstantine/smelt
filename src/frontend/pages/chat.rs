@@ -18,17 +18,21 @@ use crate::anthropic::tools::{TodoItem, TodoStatus};
 use crate::anthropic::tools::TaskSummary;
 #[cfg(any(feature = "web", test))]
 use crate::api::chat::SandboxSnapshot;
+use crate::api::browsing::send_browser_input;
 use crate::api::chat::{
     ChatEvent, ContextDetailSnapshot, ContextUsageSnapshot, create_conversation,
     delete_conversation, get_context_detail, get_conversations, get_messages, send_message,
 };
-// Only called from the live event-subscription loop below, which is
-// `web`-only (see its own cfg) — a native `server`-only build never reaches
-// them.
+// Only called from the live event-subscription loops below, which are
+// `web`-only (see their own cfg) — a native `server`-only build never
+// reaches them.
 #[cfg(feature = "web")]
 use crate::api::chat::{
     get_context_usage, get_sandbox_state, get_tasks, get_todos, subscribe_conversation_events,
 };
+#[cfg(feature = "web")]
+use crate::api::browsing::{get_browsing_state, subscribe_browser_frames};
+use crate::browsing::BrowserInputEvent;
 // Only referenced by this module's own tests, which build their own
 // `SandboxSnapshot`s by hand rather than through `get_sandbox_state`.
 #[cfg(test)]
@@ -73,6 +77,38 @@ fn todo_status_class(status: TodoStatus) -> &'static str {
         TodoStatus::Pending => "pending",
         TodoStatus::InProgress => "in-progress",
         TodoStatus::Completed => "completed",
+    }
+}
+
+/// Maps a live-panel keydown to a `BrowserInputEvent`, or `None` for a
+/// key that isn't meaningful to forward (a bare modifier like Shift/Alt/
+/// Control on its own, an unrecognized named key, ...). A printable
+/// character forwards as `TypeText`; a named key forwards as `PressKey`
+/// only if `browsing::server::named_key_event_fields` (checked
+/// server-side too — this is just avoiding an obviously-doomed round
+/// trip) recognizes it. Unconditional (not web-gated): called from the
+/// main render body's `onkeydown` handler, part of the same shared rsx
+/// tree the server target compiles too — same reason `todo_status_class`
+/// is unconditional.
+fn browser_input_event_for_key(key: keyboard_types::Key) -> Option<BrowserInputEvent> {
+    match key {
+        keyboard_types::Key::Character(text) => Some(BrowserInputEvent::TypeText { text }),
+        named => {
+            let name = named.to_string();
+            matches!(
+                name.as_str(),
+                "Enter"
+                    | "Backspace"
+                    | "Tab"
+                    | "Escape"
+                    | "Delete"
+                    | "ArrowUp"
+                    | "ArrowDown"
+                    | "ArrowLeft"
+                    | "ArrowRight"
+            )
+            .then_some(BrowserInputEvent::PressKey { key: name })
+        }
     }
 }
 
@@ -1202,6 +1238,55 @@ mod tests {
         assert_eq!(existing[0].stderr, vec!["a diagnostic".to_string()]);
     }
 
+    #[test]
+    fn test_browser_input_event_for_key_maps_a_printable_character_to_type_text() {
+        assert_eq!(
+            browser_input_event_for_key(keyboard_types::Key::Character("a".to_string())),
+            Some(BrowserInputEvent::TypeText {
+                text: "a".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_browser_input_event_for_key_maps_each_recognized_named_key_to_press_key() {
+        let cases = [
+            (keyboard_types::Key::Enter, "Enter"),
+            (keyboard_types::Key::Backspace, "Backspace"),
+            (keyboard_types::Key::Tab, "Tab"),
+            (keyboard_types::Key::Escape, "Escape"),
+            (keyboard_types::Key::Delete, "Delete"),
+            (keyboard_types::Key::ArrowUp, "ArrowUp"),
+            (keyboard_types::Key::ArrowDown, "ArrowDown"),
+            (keyboard_types::Key::ArrowLeft, "ArrowLeft"),
+            (keyboard_types::Key::ArrowRight, "ArrowRight"),
+        ];
+        for (key, expected_name) in cases {
+            assert_eq!(
+                browser_input_event_for_key(key),
+                Some(BrowserInputEvent::PressKey {
+                    key: expected_name.to_string()
+                }),
+                "expected {expected_name} to forward as a PressKey"
+            );
+        }
+    }
+
+    #[test]
+    fn test_browser_input_event_for_key_drops_an_unrecognized_named_key() {
+        // F1 isn't in the forwarded set — same reasoning
+        // `browsing::server::named_key_event_fields` uses server-side: no
+        // point round-tripping a key the server would reject anyway.
+        assert_eq!(browser_input_event_for_key(keyboard_types::Key::F1), None);
+    }
+
+    #[test]
+    fn test_browser_input_event_for_key_drops_a_bare_modifier() {
+        assert_eq!(browser_input_event_for_key(keyboard_types::Key::Shift), None);
+        assert_eq!(browser_input_event_for_key(keyboard_types::Key::Control), None);
+        assert_eq!(browser_input_event_for_key(keyboard_types::Key::Alt), None);
+    }
+
     fn test_sandbox_terminal_entry(terminal_id: i64, pod_id: i64) -> SandboxTerminalPanelEntry {
         SandboxTerminalPanelEntry {
             terminal_id,
@@ -1719,6 +1804,16 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
     let mut sandbox_pods: Signal<Vec<SandboxPodPanelEntry>> = use_signal(Vec::new);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut sandbox_terminals: Signal<Vec<SandboxTerminalPanelEntry>> = use_signal(Vec::new);
+    // Whether the model currently has a browsing session open — drives
+    // both the panel's visibility and (via the separate effect below)
+    // the live frame subscription. Updated by the initial
+    // `get_browsing_state` pull and by `ConversationEvent::BrowsingSessionUpdate`.
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut browsing_session_open: Signal<bool> = use_signal(|| false);
+    // The latest live-panel frame (base64 JPEG), `None` until the first
+    // one arrives after subscribing.
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut browsing_frame: Signal<Option<String>> = use_signal(|| None);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut tz_offset_minutes: Signal<i32> = use_signal(|| 0);
     // `None` until the first `ContextUsageUpdate`/`get_context_usage` pull
@@ -1812,6 +1907,8 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
             sandbox_terminals.set(Vec::new());
             terminal_body_els.write().clear();
             terminal_body_stuck.write().clear();
+            browsing_session_open.set(false);
+            browsing_frame.set(None);
 
             let handle = spawn(async move {
                 loop {
@@ -1840,6 +1937,9 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                         }
                         if let Ok(snapshot) = get_todos(id).await {
                             todos.set(snapshot);
+                        }
+                        if let Ok(state) = get_browsing_state(id).await {
+                            browsing_session_open.set(state.session_open);
                         }
 
                         loop {
@@ -1927,6 +2027,12 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                 Some(Ok(ConversationEvent::TodoListUpdate { items })) => {
                                     todos.set(items);
                                 }
+                                Some(Ok(ConversationEvent::BrowsingSessionUpdate { open })) => {
+                                    browsing_session_open.set(open);
+                                    if !open {
+                                        browsing_frame.set(None);
+                                    }
+                                }
                                 Some(Err(_)) | None => break,
                             }
                         }
@@ -1939,6 +2045,37 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                 }
             });
             event_task.set(Some(handle));
+        });
+    }
+
+    // A second, independent live subscription — the frame stream isn't
+    // part of `ConversationEvent` (see `events::ConversationEvent`'s own
+    // doc comment on why frames get a separate channel), and only needs
+    // to run while a session is actually open, not for the conversation's
+    // whole lifetime the way the main event subscription does. Reacts to
+    // both `selected()` (conversation switch) and `browsing_session_open()`
+    // (the model opening/closing a session) — either changing tears down
+    // any existing subscription and, if a session is now open, starts a
+    // fresh one.
+    #[cfg(feature = "web")]
+    {
+        let mut frame_task: Signal<Option<Task>> = use_signal(|| None);
+        use_effect(move || {
+            if let Some(task) = frame_task.write().take() {
+                task.cancel();
+            }
+            let Some(id) = selected() else { return };
+            if !browsing_session_open() {
+                return;
+            }
+            let handle = spawn(async move {
+                if let Ok(mut frames) = subscribe_browser_frames(id).await {
+                    while let Some(Ok(frame)) = frames.recv().await {
+                        browsing_frame.set(Some(frame.data));
+                    }
+                }
+            });
+            frame_task.set(Some(handle));
         });
     }
 
@@ -2119,8 +2256,84 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                 Some(_) => {
                     let tool_names = tool_use_names_by_id(&messages());
                     rsx! {
-                    if !tasks().is_empty() || !sandbox_pods().is_empty() || !todos().is_empty() {
+                    if !tasks().is_empty() || !sandbox_pods().is_empty() || !todos().is_empty() || browsing_session_open() {
                         div { class: "side-panels-row",
+                            if browsing_session_open() {
+                                aside { class: "browsing-panel",
+                                    h3 { "Live Browser" }
+                                    div {
+                                        class: "browsing-panel-frame-wrap",
+                                        tabindex: "0",
+                                        oncontextmenu: move |evt| evt.prevent_default(),
+                                        onmousemove: move |evt: Event<MouseData>| {
+                                            let Some(id) = selected() else { return };
+                                            let p = evt.data().element_coordinates();
+                                            spawn(async move {
+                                                let _ = send_browser_input(
+                                                    id,
+                                                    BrowserInputEvent::MouseMove { x: p.x, y: p.y },
+                                                ).await;
+                                            });
+                                        },
+                                        onmousedown: move |evt: Event<MouseData>| {
+                                            let Some(id) = selected() else { return };
+                                            let p = evt.data().element_coordinates();
+                                            spawn(async move {
+                                                let _ = send_browser_input(
+                                                    id,
+                                                    BrowserInputEvent::MouseDown { x: p.x, y: p.y },
+                                                ).await;
+                                            });
+                                        },
+                                        onmouseup: move |evt: Event<MouseData>| {
+                                            let Some(id) = selected() else { return };
+                                            let p = evt.data().element_coordinates();
+                                            spawn(async move {
+                                                let _ = send_browser_input(
+                                                    id,
+                                                    BrowserInputEvent::MouseUp { x: p.x, y: p.y },
+                                                ).await;
+                                            });
+                                        },
+                                        onwheel: move |evt: Event<WheelData>| {
+                                            let Some(id) = selected() else { return };
+                                            let p = evt.data().element_coordinates();
+                                            let delta = evt.data().delta().strip_units();
+                                            spawn(async move {
+                                                let _ = send_browser_input(
+                                                    id,
+                                                    BrowserInputEvent::Wheel {
+                                                        x: p.x,
+                                                        y: p.y,
+                                                        delta_x: delta.x,
+                                                        delta_y: delta.y,
+                                                    },
+                                                ).await;
+                                            });
+                                        },
+                                        onkeydown: move |evt: Event<KeyboardData>| {
+                                            evt.prevent_default();
+                                            let Some(id) = selected() else { return };
+                                            let Some(input_event) = browser_input_event_for_key(evt.data().key())
+                                            else {
+                                                return;
+                                            };
+                                            spawn(async move {
+                                                let _ = send_browser_input(id, input_event).await;
+                                            });
+                                        },
+                                        if let Some(data) = browsing_frame() {
+                                            img {
+                                                class: "browsing-panel-frame",
+                                                src: "data:image/jpeg;base64,{data}",
+                                                alt: "Live browsing session",
+                                            }
+                                        } else {
+                                            div { class: "browsing-panel-empty", "Waiting for the first frame…" }
+                                        }
+                                    }
+                                }
+                            }
                             if !todos().is_empty() {
                                 aside { class: "todo-panel",
                                     h3 { "Todos" }

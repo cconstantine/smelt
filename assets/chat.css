@@ -554,10 +554,63 @@ body {
     color: #52514e;
 }
 
+/* Live browsing panel — lives in .side-panels-row, renders first
+   (leftmost/topmost) when a session is open since it's the most
+   attention-grabbing of the panels (a real live view, not just a status
+   list). The frame itself renders at a fixed size matching
+   `browsing::server`'s own `SCREENCAST_MAX_WIDTH`/`SCREENCAST_MAX_HEIGHT`
+   exactly (1280x800) — deliberately not responsive/scaled, since the
+   click/keyboard forwarding math assumes on-screen pixels equal real
+   frame pixels 1:1 (see `chat.rs`'s input handlers) — a real limitation
+   worth a proper coordinate-scaling pass if this needs to fit a smaller
+   viewport later. */
+.browsing-panel {
+    flex-shrink: 0;
+    border-right: 1px solid #e5e5e5;
+    background: #fafafa;
+    padding: 16px;
+    overflow: auto;
+}
+
+.browsing-panel h3 {
+    margin: 0 0 12px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #777;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.browsing-panel-frame-wrap {
+    width: 1280px;
+    height: 800px;
+    background: #111;
+    border-radius: 4px;
+    cursor: pointer;
+    outline: none;
+    position: relative;
+}
+
+.browsing-panel-frame {
+    display: block;
+    width: 1280px;
+    height: 800px;
+    -webkit-user-drag: none;
+    user-select: none;
+}
+
+.browsing-panel-empty {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #999;
+    font-size: 13px;
+}
+
 /* Todo panel — lives in .side-panels-row, same fixed-width-sidebar
-   treatment as .tasks-panel (border-right, scrolls independently), and
-   renders first (leftmost/topmost) since the plan is the thing worth
-   orienting on before background tasks or the sandbox panel. */
+   treatment as .tasks-panel (border-right, scrolls independently). */
 .todo-panel {
     width: 280px;
     flex-shrink: 0;
