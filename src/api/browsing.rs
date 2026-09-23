@@ -28,8 +28,8 @@ pub async fn get_browsing_state(id: i64) -> ServerFnResult<BrowsingState> {
 /// panel is visible for, closes when the browser tab navigates away or
 /// closes. Built with `ServerEvents::from_stream`, not `ServerEvents::new`:
 /// the response body *pulls* each frame only when the connection can take
-/// it, so a slow viewer lags behind the small broadcast buffer and skips
-/// stale frames instead of queueing them in memory, and a closed connection
+/// it, and each pull gets the newest frame, so a slow viewer skips stale
+/// frames instead of queueing them in memory, and a closed connection
 /// drops the stream — and with it the viewer — straight away. (`new` runs
 /// its closure as a detached task feeding an unbounded queue, which does
 /// neither.)

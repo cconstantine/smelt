@@ -114,6 +114,9 @@ async fn fetch_with_guard(
     url: &str,
     is_addr_allowed: fn(IpAddr) -> bool,
 ) -> Result<FetchResult, String> {
+    // The request interceptor only sees loads that touch the network, so it
+    // can't stop a `data:` (or similar) URL — check the scheme here.
+    fetch_guard::parse_fetch_target(url)?;
     let browser = shared_browser().await?;
     let page = browser
         .new_page("about:blank")
@@ -226,6 +229,11 @@ mod browser_tests {
             result.is_err(),
             "expected navigating straight to a loopback address to be refused"
         );
+
+        // --- Scenario 2b: a data: URL is refused too — it never touches
+        // the network, so the request interceptor can't be what stops it. ---
+        let result = fetch("data:text/html,<h1>DATA-SCHEME-LOADED</h1>").await;
+        assert!(result.is_err(), "expected a data: URL to be refused, got: {result:?}");
 
         // --- Scenario 3: a page-initiated (JS `fetch()`) request to a
         // private address is blocked too — the case a plain top-level-URL

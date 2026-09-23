@@ -751,8 +751,10 @@ mod server {
             ToolDefinition {
                 name: "browser_fill".to_string(),
                 description: "Type a value into the element at the given index (an input, \
-                               textarea, ...) and return the resulting page's state. Does not \
-                               submit — call browser_click on a submit control separately."
+                               textarea, ...), replacing whatever it already contained (an \
+                               empty value clears it), and return the resulting page's state. \
+                               Does not submit — call browser_click on a submit control \
+                               separately."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",

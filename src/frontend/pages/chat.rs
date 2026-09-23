@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use dioxus::html::geometry::PixelsVector2D;
+use dioxus::html::geometry::{PixelsVector2D, WheelDelta};
 use dioxus::html::input_data::MouseButton;
 #[cfg(feature = "web")]
 use dioxus::prelude::dioxus_core::Task;
@@ -94,7 +94,8 @@ fn todo_status_class(status: TodoStatus) -> &'static str {
 /// not text (Ctrl+V must not type a "v"), so it isn't forwarded — the
 /// caller then leaves it to the viewer's own browser. Ctrl+Alt is let
 /// through: that's how AltGr reports itself on Windows, and AltGr is
-/// ordinary typing on many layouts.
+/// ordinary typing on many layouts. A named key carries its modifiers, so
+/// Shift+Tab or Ctrl+Backspace do what they would on a real keyboard.
 fn browser_input_event_for_key(
     key: keyboard_types::Key,
     modifiers: keyboard_types::Modifiers,
@@ -120,8 +121,42 @@ fn browser_input_event_for_key(
                     | "ArrowLeft"
                     | "ArrowRight"
             )
-            .then_some(BrowserInputEvent::PressKey { key: name })
+            .then(|| BrowserInputEvent::PressKey {
+                key: name,
+                modifiers: cdp_modifiers(modifiers),
+            })
         }
+    }
+}
+
+/// CDP's modifier bitmask for `Input.dispatchKeyEvent`.
+fn cdp_modifiers(modifiers: keyboard_types::Modifiers) -> i64 {
+    [
+        (modifiers.alt(), 1),
+        (modifiers.ctrl(), 2),
+        (modifiers.meta(), 4),
+        (modifiers.shift(), 8),
+    ]
+    .into_iter()
+    .filter(|(held, _)| *held)
+    .map(|(_, bit)| bit)
+    .sum()
+}
+
+/// Chromium scrolls 40px per wheel "line".
+const WHEEL_PIXELS_PER_LINE: f64 = 40.0;
+/// A wheel "page" is one live-panel frame (`browsing::server`'s pinned
+/// 1280x800 viewport).
+const WHEEL_PIXELS_PER_PAGE: (f64, f64) = (1280.0, 800.0);
+
+/// A wheel event's delta in pixels, whatever unit the viewer's browser
+/// reported it in — Firefox reports lines, so passing the raw number
+/// through would scroll ~3px per notch.
+fn wheel_delta_pixels(delta: WheelDelta) -> (f64, f64) {
+    match delta {
+        WheelDelta::Pixels(v) => (v.x, v.y),
+        WheelDelta::Lines(v) => (v.x * WHEEL_PIXELS_PER_LINE, v.y * WHEEL_PIXELS_PER_LINE),
+        WheelDelta::Pages(v) => (v.x * WHEEL_PIXELS_PER_PAGE.0, v.y * WHEEL_PIXELS_PER_PAGE.1),
     }
 }
 
@@ -1312,6 +1347,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_browser_input_event_for_key_carries_modifiers_on_named_keys() {
+        assert_eq!(
+            browser_input_event_for_key(keyboard_types::Key::Tab, keyboard_types::Modifiers::SHIFT),
+            Some(BrowserInputEvent::PressKey { key: "Tab".to_string(), modifiers: 8 })
+        );
+        assert_eq!(
+            browser_input_event_for_key(
+                keyboard_types::Key::Backspace,
+                keyboard_types::Modifiers::CONTROL
+            ),
+            Some(BrowserInputEvent::PressKey { key: "Backspace".to_string(), modifiers: 2 })
+        );
+    }
+
+    #[test]
+    fn test_cdp_modifiers_sets_one_bit_per_held_modifier() {
+        use keyboard_types::Modifiers;
+        assert_eq!(cdp_modifiers(Modifiers::empty()), 0);
+        assert_eq!(cdp_modifiers(Modifiers::ALT), 1);
+        assert_eq!(cdp_modifiers(Modifiers::CONTROL), 2);
+        assert_eq!(cdp_modifiers(Modifiers::META), 4);
+        assert_eq!(cdp_modifiers(Modifiers::SHIFT), 8);
+        assert_eq!(cdp_modifiers(Modifiers::CONTROL | Modifiers::SHIFT), 10);
+    }
+
+    #[test]
+    fn test_wheel_delta_pixels_passes_pixels_through() {
+        assert_eq!(wheel_delta_pixels(WheelDelta::pixels(0.0, 120.0, 0.0)), (0.0, 120.0));
+    }
+
+    #[test]
+    fn test_wheel_delta_pixels_converts_lines_and_pages() {
+        assert_eq!(
+            wheel_delta_pixels(WheelDelta::from_web_attributes(1, 0.0, 3.0, 0.0)),
+            (0.0, 120.0)
+        );
+        assert_eq!(
+            wheel_delta_pixels(WheelDelta::from_web_attributes(2, 1.0, -1.0, 0.0)),
+            (1280.0, -800.0)
+        );
+    }
+
     fn mv(x: f64) -> BrowserInputEvent {
         BrowserInputEvent::MouseMove { x, y: 0.0, left_held: false }
     }
@@ -1360,7 +1438,8 @@ mod tests {
             assert_eq!(
                 browser_input_event_for_key(key, no_mods()),
                 Some(BrowserInputEvent::PressKey {
-                    key: expected_name.to_string()
+                    key: expected_name.to_string(),
+                    modifiers: 0,
                 }),
                 "expected {expected_name} to forward as a PressKey"
             );
@@ -2181,9 +2260,22 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                 return;
             }
             let handle = spawn(async move {
-                if let Ok(mut frames) = subscribe_browser_frames(id).await {
-                    while let Some(Ok(frame)) = frames.recv().await {
-                        browsing_frame.set(Some(frame.data));
+                loop {
+                    if let Ok(mut frames) = subscribe_browser_frames(id).await {
+                        while let Some(Ok(frame)) = frames.recv().await {
+                            browsing_frame.set(Some(frame.data));
+                        }
+                    }
+                    // The stream ended or never opened — a network blip, a
+                    // server restart, or the session closing. Reconnect,
+                    // unless the session really is gone (this effect then
+                    // re-runs and hides the panel).
+                    gloo_timers::future::TimeoutFuture::new(1500).await;
+                    if let Ok(state) = get_browsing_state(id).await
+                        && !state.session_open
+                    {
+                        browsing_session_open.set(false);
+                        return;
                     }
                 }
             });
@@ -2402,14 +2494,14 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                         onwheel: move |evt: Event<WheelData>| {
                                             let Some(id) = selected() else { return };
                                             let p = evt.data().element_coordinates();
-                                            let delta = evt.data().delta().strip_units();
+                                            let (delta_x, delta_y) = wheel_delta_pixels(evt.data().delta());
                                             browser_input.send((
                                                 id,
                                                 BrowserInputEvent::Wheel {
                                                     x: p.x,
                                                     y: p.y,
-                                                    delta_x: delta.x,
-                                                    delta_y: delta.y,
+                                                    delta_x,
+                                                    delta_y,
                                                 },
                                             ));
                                         },

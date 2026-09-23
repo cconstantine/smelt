@@ -50,7 +50,10 @@ pub enum BrowserInputEvent {
     MouseUp { x: f64, y: f64 },
     Wheel { x: f64, y: f64, delta_x: f64, delta_y: f64 },
     TypeText { text: String },
-    PressKey { key: String },
+    /// `modifiers` is CDP's bitmask (Alt=1, Ctrl=2, Meta=4, Shift=8), so
+    /// Shift+Tab, Shift+Arrow and Ctrl+Backspace do what they would on a
+    /// real keyboard.
+    PressKey { key: String, modifiers: i64 },
 }
 
 #[cfg(feature = "server")]
@@ -72,7 +75,7 @@ mod server {
         StartScreencastParams, StopScreencastParams,
     };
     use futures_util::{Stream, StreamExt};
-    use tokio::sync::{broadcast, watch};
+    use tokio::sync::watch;
 
     use serde::{Deserialize, Serialize};
 
@@ -117,10 +120,6 @@ mod server {
     const SCREENCAST_MAX_WIDTH: i64 = 1280;
     const SCREENCAST_MAX_HEIGHT: i64 = 800;
     const SCREENCAST_QUALITY: i64 = 60;
-    /// Small on purpose — frames are ephemeral, "latest wins" data; a slow
-    /// subscriber should drop old frames rather than backing up a large
-    /// buffer of stale ones.
-    const FRAME_CHANNEL_CAPACITY: usize = 4;
 
     /// Tags every interactive element it finds with `data-smelt-el="N"`
     /// (so `click`/`fill` can reference one precisely by re-querying that
@@ -143,8 +142,11 @@ mod server {
         let kind = tag;
         if (tag === 'a') kind = 'link';
         else if (tag === 'button' || el.getAttribute('role') === 'button') kind = 'button';
+        // A password field's value is never a label: it would go to the
+        // model (and into the saved conversation) with every page read.
+        const secret = tag === 'input' && (el.getAttribute('type') || '').toLowerCase() === 'password';
         const label = (
-            el.innerText || el.value || el.getAttribute('aria-label')
+            el.innerText || (secret ? '' : el.value) || el.getAttribute('aria-label')
             || el.getAttribute('placeholder') || el.getAttribute('name') || ''
         ).trim().slice(0, 200);
         results.push({index: i, tag, kind, label});
@@ -156,11 +158,12 @@ mod server {
     static SESSIONS: LazyLock<Mutex<HashMap<i64, Session>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
-    /// Held across the whole of `open_session` so its "is one already
-    /// open?" check and the eventual insert can't interleave with another
-    /// open for the same conversation. Opens are rare, so one lock for all
-    /// conversations is fine.
-    static OPEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// Held across the whole of `open_session` and `close_session`, so an
+    /// open's "is one already open?" check and its eventual insert can't
+    /// interleave with another open, and a close issued mid-open waits for
+    /// that open to finish rather than missing it. Opens and closes are
+    /// rare, so one lock for all conversations is fine.
+    static SESSION_LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Distinguishes one open of a conversation's session from the next,
     /// so a `FrameSubscription` outliving the session it came from can't
@@ -171,7 +174,12 @@ mod server {
         id: u64,
         page: Page,
         intercept_task: tokio::task::JoinHandle<()>,
-        frame_tx: broadcast::Sender<BrowserFrame>,
+        /// The latest frame, as a template for new viewers' receivers — a
+        /// `watch` channel rather than a broadcast one, because Chrome only
+        /// sends a frame when something on screen changes: a viewer joining
+        /// a running screencast on a still page would otherwise get
+        /// nothing. The sender lives in `run_screencast`.
+        latest_frame: watch::Receiver<Option<BrowserFrame>>,
         frame_subscriber_count: usize,
         /// Whether anyone is watching — `run_screencast` (one task for the
         /// session's whole life) starts/stops the real screencast as this
@@ -201,7 +209,7 @@ mod server {
         conversation_id: i64,
         is_addr_allowed: fn(IpAddr) -> bool,
     ) -> Result<(), String> {
-        let _opening = OPEN_LOCK.lock().await;
+        let _lifecycle = SESSION_LIFECYCLE.lock().await;
         if SESSIONS.lock().unwrap().contains_key(&conversation_id) {
             return Err(
                 "a browsing session is already open for this conversation — call \
@@ -221,16 +229,16 @@ mod server {
                 return Err(e);
             }
         };
-        let (frame_tx, _) = broadcast::channel(FRAME_CHANNEL_CAPACITY);
+        let (frame_tx, latest_frame) = watch::channel(None);
         let (want_screencast, want_rx) = watch::channel(false);
-        let screencast_task = tokio::spawn(run_screencast(page.clone(), frame_tx.clone(), want_rx));
+        let screencast_task = tokio::spawn(run_screencast(page.clone(), frame_tx, want_rx));
         SESSIONS.lock().unwrap().insert(
             conversation_id,
             Session {
                 id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
                 page,
                 intercept_task,
-                frame_tx,
+                latest_frame,
                 frame_subscriber_count: 0,
                 want_screencast,
                 screencast_task,
@@ -276,6 +284,7 @@ mod server {
     /// live-panel viewer was watching) — there's no subscriber left to
     /// notify, just real CDP/process state to tear down.
     pub async fn close_session(conversation_id: i64) -> Result<(), String> {
+        let _lifecycle = SESSION_LIFECYCLE.lock().await;
         let session = SESSIONS.lock().unwrap().remove(&conversation_id);
         if let Some(session) = session {
             session.intercept_task.abort();
@@ -294,8 +303,35 @@ mod server {
     /// first viewer; dropping this (when the panel closes or the browser
     /// tab disconnects) stops it again if this was the last one.
     pub struct FrameSubscription {
-        pub receiver: broadcast::Receiver<BrowserFrame>,
+        receiver: watch::Receiver<Option<BrowserFrame>>,
         _viewer: ViewerGuard,
+    }
+
+    impl FrameSubscription {
+        /// Starts from whatever frame the session already has, so the first
+        /// `next_frame` returns it straight away.
+        fn new(mut receiver: watch::Receiver<Option<BrowserFrame>>, viewer: ViewerGuard) -> Self {
+            if receiver.borrow().is_some() {
+                receiver.mark_changed();
+            }
+            Self {
+                receiver,
+                _viewer: viewer,
+            }
+        }
+
+        /// The next frame this viewer hasn't seen — always the newest one,
+        /// however many were produced since the last call, so a slow viewer
+        /// skips ahead instead of falling behind. `None` once the session
+        /// closes.
+        pub async fn next_frame(&mut self) -> Option<BrowserFrame> {
+            loop {
+                self.receiver.changed().await.ok()?;
+                if let Some(frame) = self.receiver.borrow_and_update().clone() {
+                    return Some(frame);
+                }
+            }
+        }
     }
 
     /// Counts as one viewer of one specific session for as long as it
@@ -323,18 +359,18 @@ mod server {
         let session = sessions
             .get_mut(&conversation_id)
             .ok_or_else(|| "no browser session is open for this conversation".to_string())?;
-        let receiver = session.frame_tx.subscribe();
+        let receiver = session.latest_frame.clone();
         session.frame_subscriber_count += 1;
         if session.frame_subscriber_count == 1 {
             session.want_screencast.send_replace(true);
         }
-        Ok(FrameSubscription {
+        Ok(FrameSubscription::new(
             receiver,
-            _viewer: ViewerGuard {
+            ViewerGuard {
                 conversation_id,
                 session_id: session.id,
             },
-        })
+        ))
     }
 
     /// Drops one viewer from the session it was counted against; the last
@@ -356,35 +392,16 @@ mod server {
         }
     }
 
-    /// The live panel's frame stream for one subscription: yields frames as
-    /// they're pulled, skipping any the reader fell too far behind on
-    /// (the broadcast channel only holds `FRAME_CHANNEL_CAPACITY`), so a
-    /// slow reader always gets the most recent frames rather than an
-    /// ever-growing backlog. Holds the subscription for as long as the
-    /// stream lives — dropping the stream (the SSE connection closing)
-    /// is what drops the viewer.
+    /// The live panel's frame stream for one subscription. Frames are
+    /// produced only as the stream is pulled, and each pull gets the newest
+    /// frame, so a slow reader never builds a backlog. The stream owns the
+    /// subscription — dropping it (the SSE connection closing) is what
+    /// drops the viewer.
     pub fn frame_stream(
         subscription: FrameSubscription,
     ) -> impl Stream<Item = Result<BrowserFrame, axum::BoxError>> + Send + 'static {
-        let FrameSubscription { receiver, _viewer } = subscription;
-        latest_wins(receiver, _viewer).map(Ok)
-    }
-
-    /// Streams `rx`'s items, skipping past a lag instead of erroring, and
-    /// ends when every sender is gone. `guard` is kept alive exactly as long
-    /// as the stream.
-    fn latest_wins<T: Clone + Send + 'static, G: Send + 'static>(
-        rx: broadcast::Receiver<T>,
-        guard: G,
-    ) -> impl Stream<Item = T> + Send + 'static {
-        futures_util::stream::unfold((rx, guard), |(mut rx, guard)| async move {
-            loop {
-                match rx.recv().await {
-                    Ok(item) => return Some((item, (rx, guard))),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                }
-            }
+        futures_util::stream::unfold(subscription, |mut sub| async move {
+            sub.next_frame().await.map(|frame| (Ok(frame), sub))
         })
     }
 
@@ -398,7 +415,7 @@ mod server {
     /// start.
     async fn run_screencast(
         page: Page,
-        frame_tx: broadcast::Sender<BrowserFrame>,
+        frame_tx: watch::Sender<Option<BrowserFrame>>,
         mut want: watch::Receiver<bool>,
     ) {
         let mut frames = match page.event_listener::<EventScreencastFrame>().await {
@@ -439,9 +456,9 @@ mod server {
                     }
                     frame = frames.next() => {
                         let Some(event) = frame else { return };
-                        let _ = frame_tx.send(BrowserFrame {
+                        frame_tx.send_replace(Some(BrowserFrame {
                             data: String::from(event.data.clone()),
-                        });
+                        }));
                         if let Err(e) = page
                             .execute(ScreencastFrameAckParams::new(event.session_id))
                             .await
@@ -539,8 +556,8 @@ mod server {
                     .map(|_| ())
                     .map_err(|e| format!("failed to send input: {e}"));
             }
-            BrowserInputEvent::PressKey { key } => {
-                for params in key_event_params(&key)? {
+            BrowserInputEvent::PressKey { key, modifiers } => {
+                for params in key_event_params(&key, modifiers)? {
                     page.execute(params)
                         .await
                         .map_err(|e| format!("failed to send key event: {e}"))?;
@@ -559,7 +576,7 @@ mod server {
     /// (Enter) goes down as `keyDown` with its text so Chrome runs its
     /// default action; one that doesn't goes down as `rawKeyDown`, the
     /// same split Puppeteer makes.
-    fn key_event_params(key: &str) -> Result<Vec<DispatchKeyEventParams>, String> {
+    fn key_event_params(key: &str, modifiers: i64) -> Result<Vec<DispatchKeyEventParams>, String> {
         let named = named_key_event_fields(key)?;
         let down_type = if named.text.is_some() {
             DispatchKeyEventType::KeyDown
@@ -570,7 +587,8 @@ mod server {
             .r#type(down_type)
             .key(named.key)
             .code(named.code)
-            .windows_virtual_key_code(named.windows_virtual_key_code);
+            .windows_virtual_key_code(named.windows_virtual_key_code)
+            .modifiers(modifiers);
         if let Some(text) = named.text {
             down = down.text(text).unmodified_text(text);
         }
@@ -578,7 +596,8 @@ mod server {
             .r#type(DispatchKeyEventType::KeyUp)
             .key(named.key)
             .code(named.code)
-            .windows_virtual_key_code(named.windows_virtual_key_code);
+            .windows_virtual_key_code(named.windows_virtual_key_code)
+            .modifiers(modifiers);
         [down, up]
             .into_iter()
             .map(|b| b.build().map_err(|e| format!("failed to build key event: {e}")))
@@ -690,6 +709,9 @@ mod server {
     /// Navigates `conversation_id`'s live session to `url` and returns
     /// the resulting page's state.
     pub async fn navigate(conversation_id: i64, url: &str) -> Result<PageState, String> {
+        // The request interceptor only sees loads that touch the network, so
+        // it can't stop a `data:` (or similar) URL — check the scheme here.
+        fetch_guard::parse_fetch_target(url)?;
         let page = live_page(conversation_id)?;
         tokio::time::timeout(NAV_TIMEOUT, page.goto(url))
             .await
@@ -758,12 +780,39 @@ mod server {
             .focus()
             .await
             .map_err(|e| format!("failed to focus element {element_index}: {e}"))?;
+        // Select what's already there so typing replaces it rather than
+        // inserting next to it — done with real key events, not by assigning
+        // `.value`, which frameworks like React don't notice.
         element
-            .type_str(value)
+            .call_js_fn(SELECT_CONTENTS_FN, false)
             .await
-            .map_err(|e| format!("failed to fill element {element_index}: {e}"))?;
+            .map_err(|e| format!("failed to clear element {element_index}: {e}"))?;
+        if value.is_empty() {
+            for params in key_event_params("Delete", 0)? {
+                page.execute(params)
+                    .await
+                    .map_err(|e| format!("failed to clear element {element_index}: {e}"))?;
+            }
+        } else {
+            element
+                .type_str(value)
+                .await
+                .map_err(|e| format!("failed to fill element {element_index}: {e}"))?;
+        }
         extract_page_state(&page).await
     }
+
+    const SELECT_CONTENTS_FN: &str = "function() {
+        if (typeof this.select === 'function') {
+            this.select();
+        } else if (this.isContentEditable) {
+            const range = document.createRange();
+            range.selectNodeContents(this);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+        }
+    }";
 
     /// Navigates back in the session's history and returns the resulting
     /// page state.
@@ -868,6 +917,17 @@ mod server {
                     "/page2",
                     axum::routing::get(|| async {
                         axum::response::Html("<html><body><h1>Page two</h1></body></html>")
+                    }),
+                )
+                .route(
+                    "/form-fields",
+                    axum::routing::get(|| async {
+                        axum::response::Html(
+                            "<html><body>\
+                             <input id=\"prefilled\" type=\"text\" value=\"1\">\
+                             <input id=\"pw\" type=\"password\">\
+                             </body></html>",
+                        )
                     }),
                 )
                 .route(
@@ -1072,13 +1132,12 @@ mod server {
                 let mut received = 0;
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
                 while received < 3 && tokio::time::Instant::now() < deadline {
-                    match tokio::time::timeout(Duration::from_secs(3), sub.receiver.recv()).await
-                    {
-                        Ok(Ok(frame)) => {
+                    match tokio::time::timeout(Duration::from_secs(3), sub.next_frame()).await {
+                        Ok(Some(frame)) => {
                             assert!(!frame.data.is_empty(), "expected non-empty frame data");
                             received += 1;
                         }
-                        Ok(Err(e)) => panic!("frame channel error: {e}"),
+                        Ok(None) => panic!("the session closed mid-stream"),
                         Err(_) => break,
                     }
                 }
@@ -1087,21 +1146,15 @@ mod server {
                     "expected acking to keep frames flowing (got {received} frame(s)) — \
                      a stall after 1 would mean the ack isn't actually unblocking more"
                 );
-            } // `sub` drops here — spawns the async unsubscribe/stop-screencast cleanup.
+            } // `sub` drops here — the last viewer leaving stops the screencast.
 
-            // Give the fire-and-forget unsubscribe cleanup a moment to
-            // run, then confirm a second subscription still works
-            // cleanly (the screencast can be stopped and restarted, not
-            // just started once).
+            // Let the stop land, then confirm a second subscription gets
+            // genuinely new frames (the screencast restarted, not just the
+            // cached last frame).
             tokio::time::sleep(Duration::from_millis(200)).await;
             let mut second_sub = subscribe_frames(conversation_id)
                 .expect("a second subscribe_frames should succeed");
-            let second_frame =
-                tokio::time::timeout(Duration::from_secs(5), second_sub.receiver.recv())
-                    .await
-                    .expect("should receive a frame within the timeout")
-                    .expect("frame channel should not error");
-            assert!(!second_frame.data.is_empty());
+            expect_fresh_frame(&mut second_sub).await;
             drop(second_sub);
 
             // --- Scenario 10: live-panel input forwarding (`send_input`)
@@ -1228,7 +1281,7 @@ mod server {
             for event in [
                 BrowserInputEvent::MouseDown { x: field_point.x, y: field_point.y },
                 BrowserInputEvent::MouseUp { x: field_point.x, y: field_point.y },
-                BrowserInputEvent::PressKey { key: "Enter".to_string() },
+                BrowserInputEvent::PressKey { key: "Enter".to_string(), modifiers: 0 },
             ] {
                 send_input(conversation_id, event).await.expect("input should succeed");
             }
@@ -1307,24 +1360,166 @@ mod server {
 
             close_session(conversation_id)
                 .await
+                .expect("close_session should succeed");
+
+            open_session_with_guard(conversation_id, allow_loopback_too)
+                .await
+                .expect("open for the remaining scenarios should succeed");
+
+            // --- Scenario 17: only http/https can be navigated to — a
+            // data: URL never reaches the network, so the request
+            // interceptor never sees it and can't be what refuses it. ---
+            let data_nav =
+                navigate(conversation_id, "data:text/html,<h1>DATA-SCHEME-LOADED</h1>").await;
+            assert!(
+                data_nav.is_err(),
+                "expected a data: URL to be refused, got: {data_nav:?}"
+            );
+
+            // --- Scenario 18: what someone types into a password field
+            // (say, logging in through the live panel) never shows up in
+            // the element list sent to the model. ---
+            navigate(conversation_id, &format!("{base}/form-fields"))
+                .await
+                .expect("navigate to the form-fields page should succeed");
+            let page = live_page(conversation_id).expect("session should still be live");
+            let pw = page.find_element("#pw").await.expect("should find #pw");
+            let pw_point = pw.clickable_point().await.expect("clickable point for #pw");
+            for event in [
+                BrowserInputEvent::MouseDown { x: pw_point.x, y: pw_point.y },
+                BrowserInputEvent::MouseUp { x: pw_point.x, y: pw_point.y },
+                BrowserInputEvent::TypeText { text: "hunter2secret".to_string() },
+            ] {
+                send_input(conversation_id, event).await.expect("input should succeed");
+            }
+            let after_password = read(conversation_id).await.expect("read should succeed");
+            assert!(
+                !format!("{after_password:?}").contains("hunter2secret"),
+                "a typed password leaked into the page state: {:?}",
+                after_password.elements
+            );
+
+            // --- Scenario 19: fill replaces a field's existing value
+            // rather than appending to it, including filling it with
+            // nothing. ---
+            let prefilled_index = after_password
+                .elements
+                .iter()
+                .find(|e| e.label == "1")
+                .map(|e| e.index)
+                .expect("the prefilled input should be in the element list");
+            fill(conversation_id, prefilled_index, "5")
+                .await
+                .expect("fill should succeed");
+            assert_eq!(field_value(&page, "#prefilled").await, "5");
+            let state = read(conversation_id).await.expect("read should succeed");
+            let prefilled_index = state
+                .elements
+                .iter()
+                .find(|e| e.label == "5")
+                .map(|e| e.index)
+                .expect("the filled input should be in the element list");
+            fill(conversation_id, prefilled_index, "")
+                .await
+                .expect("filling with nothing should succeed");
+            assert_eq!(field_value(&page, "#prefilled").await, "");
+
+            // --- Scenario 19b: named keys keep their modifiers — Shift+Tab
+            // moves focus backwards, Ctrl+Backspace deletes a word. ---
+            let state = read(conversation_id).await.expect("read should succeed");
+            let prefilled_index = state
+                .elements
+                .iter()
+                .find(|e| e.tag == "input" && e.label.is_empty())
+                .map(|e| e.index)
+                .expect("the emptied input should be in the element list");
+            fill(conversation_id, prefilled_index, "hello world")
+                .await
+                .expect("fill should succeed");
+            let press = |key: &str, modifiers: i64| BrowserInputEvent::PressKey {
+                key: key.to_string(),
+                modifiers,
+            };
+            send_input(conversation_id, press("Backspace", 2))
+                .await
+                .expect("ctrl+backspace should succeed");
+            assert_eq!(field_value(&page, "#prefilled").await, "hello ");
+            send_input(conversation_id, press("Tab", 0)).await.expect("tab should succeed");
+            send_input(conversation_id, press("Tab", 8))
+                .await
+                .expect("shift+tab should succeed");
+            let focused: String = page
+                .evaluate("document.activeElement.id")
+                .await
+                .expect("evaluate should succeed")
+                .into_value()
+                .expect("id should be a string");
+            assert_eq!(focused, "prefilled", "Shift+Tab should move focus back");
+
+            // --- Scenario 20: a second viewer joining a screencast that's
+            // already running gets a frame straight away, even on a page
+            // where nothing is changing (Chrome only sends a new frame
+            // when something on screen changes). ---
+            // page2 has no inputs, so no blinking caret keeps frames coming.
+            navigate(conversation_id, &format!("{base}/page2"))
+                .await
+                .expect("navigate to a static page should succeed");
+            let mut first_viewer = subscribe_frames(conversation_id).expect("subscribe should succeed");
+            tokio::time::timeout(Duration::from_secs(5), first_viewer.next_frame())
+                .await
+                .expect("the first viewer should get a frame")
+                .expect("the session should still be open");
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let mut second_viewer = subscribe_frames(conversation_id).expect("subscribe should succeed");
+            let joined = tokio::time::timeout(Duration::from_secs(3), second_viewer.next_frame()).await;
+            assert!(
+                matches!(joined, Ok(Some(_))),
+                "a viewer joining a running screencast on a static page got no frame: {joined:?}"
+            );
+            drop(first_viewer);
+            drop(second_viewer);
+
+            close_session(conversation_id)
+                .await
+                .expect("close_session should succeed");
+
+            // --- Scenario 21: a close that arrives while an open is still
+            // in progress (deleting the conversation mid-open) wins —
+            // the session doesn't reappear once the open finishes. ---
+            let (opened, _) = tokio::join!(
+                open_session_with_guard(conversation_id, allow_loopback_too),
+                async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    close_session(conversation_id).await
+                },
+            );
+            opened.expect("the open itself should succeed");
+            assert!(
+                !is_session_open(conversation_id),
+                "a close issued during an open left the session running"
+            );
+            close_session(conversation_id)
+                .await
                 .expect("final close_session should succeed");
         }
 
-        /// Waits for a frame produced *after* this call — anything already
-        /// buffered is discarded first, so a stalled screencast can't pass
-        /// on a stale frame.
+        async fn field_value(page: &Page, selector: &str) -> String {
+            page.evaluate(format!("document.querySelector('{selector}').value"))
+                .await
+                .expect("evaluate should succeed")
+                .into_value()
+                .expect("value should be a string")
+        }
+
+        /// Waits for a frame produced *after* this call — the current frame
+        /// is marked seen first, so a stalled screencast can't pass on a
+        /// stale one.
         async fn expect_fresh_frame(sub: &mut FrameSubscription) {
-            use tokio::sync::broadcast::error::TryRecvError;
-            loop {
-                match sub.receiver.try_recv() {
-                    Ok(_) | Err(TryRecvError::Lagged(_)) => continue,
-                    Err(_) => break,
-                }
-            }
-            let frame = tokio::time::timeout(Duration::from_secs(5), sub.receiver.recv())
+            sub.receiver.borrow_and_update();
+            let frame = tokio::time::timeout(Duration::from_secs(5), sub.next_frame())
                 .await
                 .expect("expected a fresh frame within 5s — the screencast stalled")
-                .expect("frame channel should not error");
+                .expect("the session should still be open");
             assert!(!frame.data.is_empty());
         }
 
@@ -1412,7 +1607,7 @@ mod server {
 
         #[test]
         fn test_key_event_params_sends_enter_down_with_its_text() {
-            let params = key_event_params("Enter").expect("Enter should be known");
+            let params = key_event_params("Enter", 0).expect("Enter should be known");
             assert_eq!(params.len(), 2);
             assert_eq!(params[0].r#type, DispatchKeyEventType::KeyDown);
             assert_eq!(params[0].text.as_deref(), Some("\r"));
@@ -1422,7 +1617,7 @@ mod server {
 
         #[test]
         fn test_key_event_params_sends_a_non_typing_key_down_raw() {
-            let params = key_event_params("Backspace").expect("Backspace should be known");
+            let params = key_event_params("Backspace", 0).expect("Backspace should be known");
             assert_eq!(params[0].r#type, DispatchKeyEventType::RawKeyDown);
             assert_eq!(params[0].text, None);
             assert_eq!(params[1].r#type, DispatchKeyEventType::KeyUp);
@@ -1475,25 +1670,69 @@ mod server {
             assert_eq!(params.delta_y, Some(120.0));
         }
 
-        #[tokio::test]
-        async fn test_latest_wins_skips_what_a_slow_reader_missed() {
-            let (tx, rx) = broadcast::channel(4);
-            for n in 1..=10 {
-                tx.send(n).unwrap();
-            }
-            drop(tx);
-            let received: Vec<i32> = latest_wins(rx, ()).collect().await;
-            assert_eq!(received, vec![7, 8, 9, 10]);
+        #[test]
+        fn test_key_event_params_carries_modifiers_on_both_events() {
+            let params = key_event_params("Tab", 8).expect("Tab should be known");
+            assert!(params.iter().all(|p| p.modifiers == Some(8)));
+        }
+
+        fn frame(data: &str) -> Option<BrowserFrame> {
+            Some(BrowserFrame {
+                data: data.to_string(),
+            })
+        }
+
+        /// A subscription not counted against any real session (no
+        /// session has this id), so dropping it touches nothing.
+        fn detached_subscription(
+            rx: watch::Receiver<Option<BrowserFrame>>,
+        ) -> FrameSubscription {
+            FrameSubscription::new(
+                rx,
+                ViewerGuard {
+                    conversation_id: -1,
+                    session_id: 0,
+                },
+            )
         }
 
         #[tokio::test]
-        async fn test_latest_wins_releases_its_guard_when_dropped() {
-            let (_tx, rx) = broadcast::channel::<i32>(4);
-            let guard = std::sync::Arc::new(());
-            let stream = latest_wins(rx, guard.clone());
-            assert_eq!(std::sync::Arc::strong_count(&guard), 2);
-            drop(stream);
-            assert_eq!(std::sync::Arc::strong_count(&guard), 1);
+        async fn test_a_new_viewer_gets_the_latest_frame_straight_away() {
+            let (tx, rx) = watch::channel(None);
+            tx.send_replace(frame("a"));
+            tx.send_replace(frame("b"));
+            let mut sub = detached_subscription(rx);
+            let first = tokio::time::timeout(Duration::from_millis(100), sub.next_frame()).await;
+            assert_eq!(first.expect("should not wait"), frame("b"));
+        }
+
+        #[tokio::test]
+        async fn test_a_slow_viewer_skips_to_the_newest_frame() {
+            let (tx, rx) = watch::channel(frame("a"));
+            let mut sub = detached_subscription(rx);
+            assert_eq!(sub.next_frame().await, frame("a"));
+            tx.send_replace(frame("b"));
+            tx.send_replace(frame("c"));
+            assert_eq!(sub.next_frame().await, frame("c"));
+        }
+
+        #[tokio::test]
+        async fn test_a_viewer_waits_while_there_is_no_frame_yet() {
+            let (tx, rx) = watch::channel(None);
+            let mut sub = detached_subscription(rx);
+            let early = tokio::time::timeout(Duration::from_millis(50), sub.next_frame()).await;
+            assert!(early.is_err(), "should still be waiting, got {early:?}");
+            tx.send_replace(frame("a"));
+            assert_eq!(sub.next_frame().await, frame("a"));
+        }
+
+        #[tokio::test]
+        async fn test_the_frame_stream_ends_when_the_session_closes() {
+            let (tx, rx) = watch::channel(frame("a"));
+            let mut stream = Box::pin(frame_stream(detached_subscription(rx)));
+            assert!(matches!(stream.next().await, Some(Ok(_))));
+            drop(tx);
+            assert!(stream.next().await.is_none());
         }
     }
 }
