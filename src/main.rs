@@ -3,7 +3,11 @@ mod api;
 #[cfg(feature = "server")]
 mod db;
 mod events;
+#[cfg(feature = "server")]
+mod fetch_guard;
 mod frontend;
+#[cfg(feature = "server")]
+mod http_request;
 #[cfg(feature = "server")]
 mod mcp;
 #[cfg(feature = "server")]
@@ -11,6 +15,8 @@ mod mcp_oauth;
 mod models;
 #[cfg(feature = "server")]
 mod sandbox;
+#[cfg(feature = "server")]
+mod webfetch;
 
 #[cfg(all(test, feature = "browser-test"))]
 mod browser_tests;

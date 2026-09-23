@@ -39,6 +39,17 @@ dx bundle --platform web
 # docs/projects/completed/20260818-sandbox-native-environment.md.
 scripts/build-sandbox-image.sh
 
+# ── Set up chrome-headless-shell, for real webfetch usage ──────────────────
+# The `webfetch` tool navigates a real headless browser (`chromiumoxide`,
+# driving `chrome-headless-shell` over CDP) — not just
+# `src/browser_tests.rs`'s own test tier anymore. `scripts/browser-check/setup.sh`
+# downloads the binary plus its missing shared libraries into
+# `.browser-check-cache/` (gitignored) — no root needed, safe to re-run.
+# Without this, any real `webfetch` call fails with a clear
+# "chrome-headless-shell not found" error rather than hanging or crashing.
+# See docs/projects/plans/webfetch.md.
+scripts/browser-check/setup.sh
+
 # ── Fast compile check ───────────────────────────────────────────────────────
 cargo check --features server
 cargo check --no-default-features --features web --target wasm32-unknown-unknown
