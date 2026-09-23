@@ -16,6 +16,13 @@ tokio = { version = "1", features = ["sync", "macros", "time"] }
 # feature-gated for that reason — see
 # docs/projects/plans/file-tools.md's "Diff rendering."
 similar = "2.7"
+# For frontend/pages/chat.rs's live browsing-panel keydown handling
+# (`browser_input_event_for_key`, matching against `keyboard_types::Key`)
+# — already present transitively (pulled in by `dioxus-html`), same
+# "explicit edge" reasoning as `url`/`http`/`percent-encoding` elsewhere
+# in this file. Compiles on both targets (pure Rust, no OS-specific
+# pieces), same as `similar` above, so not feature-gated either.
+keyboard-types = "0.7"
 
 # Server-only dependencies (not WASM-compatible)
 dotenvy = { version = "0.15", optional = true }

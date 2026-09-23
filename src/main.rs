@@ -1,5 +1,6 @@
 mod anthropic;
 mod api;
+mod browsing;
 #[cfg(feature = "server")]
 mod db;
 mod events;
@@ -52,8 +53,26 @@ async fn main() {
     // auto-install for. Must happen before any kube::Client is built.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // chromiumoxide (as of 0.7 and still 0.9.1) has a real, dated CDP
+    // protocol mismatch: Network.requestWillBeSentExtraInfo's
+    // ClientSecurityState requires a `privateNetworkRequestPolicy` field
+    // that current Chrome builds no longer send (renamed to
+    // `localNetworkAccessRequestPolicy`), so every such event fails to
+    // deserialize. Confirmed non-fatal — chromiumoxide's own
+    // Connection/Handler streams tolerate the error and keep running — but
+    // it logs at ERROR on every occurrence, which is noisy in a page with
+    // any real network traffic. Suppress just these two known call sites
+    // (chromiumoxide::conn's "Failed to deserialize WS response" and
+    // chromiumoxide::handler's "WS Connection error") rather than a
+    // crate-wide silence, so other chromiumoxide errors still surface.
+    let mut rust_log = std::env::var("RUST_LOG").unwrap_or_default();
+    if !rust_log.is_empty() {
+        rust_log.push(',');
+    }
+    rust_log.push_str("chromiumoxide::conn=off,chromiumoxide::handler=off");
+
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(tracing_subscriber::EnvFilter::new(rust_log))
         .init();
 
     let pool = db::init().await;
