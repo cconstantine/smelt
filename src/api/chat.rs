@@ -655,7 +655,7 @@ pub(crate) async fn wake_conversation(
         crate::events::publish(
             conversation_id,
             crate::events::ConversationEvent::NotificationDeliveryFailed {
-                detail: e.to_string(),
+                detail: chat_error_text(e),
             },
         );
     }
@@ -957,7 +957,7 @@ fn run_turn_bounded<'a>(
 /// without the "error running server function: … (details: None)" wrapper
 /// `ServerFnError`'s `Display` adds.
 #[cfg(feature = "server")]
-fn chat_error_text(error: &ServerFnError) -> String {
+pub(crate) fn chat_error_text(error: &ServerFnError) -> String {
     match error {
         ServerFnError::ServerError { message, .. } => message.clone(),
         other => other.to_string(),

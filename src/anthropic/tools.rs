@@ -1300,7 +1300,23 @@ mod server {
                 role: "user".to_string(),
                 content: vec![ContentBlock::Text { text }],
             };
-            let _ = chat::run_turn(&pool, conversation_id, message, None).await;
+            notify_model(&pool, conversation_id, message).await;
+        }
+    }
+
+    /// Runs the turn that tells the model about a task, and on failure
+    /// publishes `NotificationDeliveryFailed` so a watching tab sees it —
+    /// the same reporting `chat::wake_conversation` does for terminal
+    /// commands. There's no request in flight to return the error to.
+    async fn notify_model(pool: &PgPool, conversation_id: i64, message: AnthropicMessage) {
+        if let Err(e) = chat::run_turn(pool, conversation_id, message, None).await {
+            tracing::warn!(conversation_id, error = %e, "task notification failed to reach the model");
+            events::publish(
+                conversation_id,
+                events::ConversationEvent::NotificationDeliveryFailed {
+                    detail: chat::chat_error_text(&e),
+                },
+            );
         }
     }
 
@@ -1337,7 +1353,7 @@ mod server {
             role: "user".to_string(),
             content: vec![ContentBlock::Text { text }],
         };
-        let _ = chat::run_turn(pool, conversation_id, message, None).await;
+        notify_model(pool, conversation_id, message).await;
     }
 
     /// `ps`, scoped to `conversation_id` — the one tool in this suite that
@@ -2556,6 +2572,39 @@ mod server {
                 err.contains("github"),
                 "error should name the unresolvable server, got: {err}"
             );
+        }
+
+        /// A finished task whose notification turn fails (here: the
+        /// conversation doesn't exist) tells a watching tab, the same way
+        /// `chat::wake_conversation` does for terminal commands.
+        #[sqlx::test]
+        async fn test_a_failed_task_notification_is_published(pool: PgPool) {
+            let conversation_id = 987_654_008;
+            let mut rx = events::subscribe(conversation_id);
+            execute(
+                &pool,
+                conversation_id,
+                "toolu_notify_fails",
+                "run_async",
+                &serde_json::json!({"tool": "add", "input": {"a": 1, "b": 2}}),
+            )
+            .await
+            .expect("run_async should succeed");
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let event = tokio::time::timeout_at(deadline, rx.recv())
+                    .await
+                    .expect("no NotificationDeliveryFailed within 5s")
+                    .expect("event channel should not close");
+                if let events::ConversationEvent::NotificationDeliveryFailed { detail } = event {
+                    assert_eq!(
+                        detail, "conversation not found",
+                        "unexpected detail: {detail}"
+                    );
+                    break;
+                }
+            }
         }
 
         /// A native tool name is unaffected by the new `mcp__` routing
