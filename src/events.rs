@@ -105,6 +105,13 @@ pub enum ConversationEvent {
     BrowsingSessionUpdate {
         open: bool,
     },
+    /// Published whenever a browsing session's page URL changes — the model
+    /// navigating, a link click, a redirect, or an in-page change like
+    /// `pushState` — so the live panel's address bar can follow along.
+    /// Regenerable from `api::browsing::get_browsing_state`.
+    BrowsingUrlUpdate {
+        url: String,
+    },
 }
 
 #[cfg(feature = "server")]

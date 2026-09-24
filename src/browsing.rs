@@ -71,7 +71,8 @@ mod server {
         DispatchMouseEventType, InsertTextParams,
     };
     use chromiumoxide::cdp::browser_protocol::page::{
-        EventFrameStartedLoading, EventLoadEventFired, EventScreencastFrame,
+        EventFrameNavigated, EventFrameStartedLoading, EventLoadEventFired,
+        EventNavigatedWithinDocument, EventScreencastFrame,
         ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams,
         StopScreencastParams,
     };
@@ -183,6 +184,10 @@ mod server {
         /// from one place and can't race each other.
         want_screencast: watch::Sender<bool>,
         screencast_task: tokio::task::JoinHandle<()>,
+        /// The page's URL as of its latest navigation — kept current by
+        /// `url_task` (`watch_url`).
+        current_url: String,
+        url_task: tokio::task::JoinHandle<()>,
     }
 
     /// Opens a browsing session for `conversation_id` — refuses if one is
@@ -225,13 +230,24 @@ mod server {
                 return Err(e);
             }
         };
+        let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let url_task = match watch_url(conversation_id, session_id, &page).await {
+            Ok(task) => task,
+            Err(e) => {
+                intercept_task.abort();
+                let _ = page.close().await;
+                return Err(e);
+            }
+        };
         let (frame_tx, latest_frame) = watch::channel(None);
         let (want_screencast, want_rx) = watch::channel(false);
         let screencast_task = tokio::spawn(run_screencast(page.clone(), frame_tx, want_rx));
         SESSIONS.lock().unwrap().insert(
             conversation_id,
             Session {
-                id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+                id: session_id,
+                current_url: "about:blank".to_string(),
+                url_task,
                 page,
                 intercept_task,
                 latest_frame,
@@ -285,6 +301,7 @@ mod server {
         if let Some(session) = session {
             session.intercept_task.abort();
             session.screencast_task.abort();
+            session.url_task.abort();
             let _ = session.page.close().await;
             crate::events::publish(
                 conversation_id,
@@ -470,13 +487,99 @@ mod server {
         }
     }
 
-    /// Whether a browsing session is currently open for `conversation_id`
-    /// — for the panel's initial load
-    /// (`api::browsing::get_browsing_state`), so it can show an idle
-    /// state instead of trying to subscribe to a frame stream that
-    /// doesn't exist yet.
-    pub fn is_session_open(conversation_id: i64) -> bool {
-        SESSIONS.lock().unwrap().contains_key(&conversation_id)
+    /// Follows the page's main-frame URL, recording each change and
+    /// publishing it as a `BrowsingUrlUpdate`: full navigations
+    /// (`frameNavigated`) and in-page ones that load no new document
+    /// (`navigatedWithinDocument` — `pushState`, `#fragment` links), which
+    /// single-page apps rely on. The listeners are attached before this
+    /// returns, so no navigation after it can be missed.
+    async fn watch_url(
+        conversation_id: i64,
+        session_id: u64,
+        page: &Page,
+    ) -> Result<tokio::task::JoinHandle<()>, String> {
+        let listen_error = |e| format!("failed to watch the page's URL: {e}");
+        let mut main_frame = page.mainframe().await.map_err(listen_error)?;
+        let mut navigated = page
+            .event_listener::<EventFrameNavigated>()
+            .await
+            .map_err(listen_error)?;
+        let mut within_document = page
+            .event_listener::<EventNavigatedWithinDocument>()
+            .await
+            .map_err(listen_error)?;
+        Ok(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    event = navigated.next() => {
+                        let Some(event) = event else { return };
+                        if event.frame.parent_id.is_some() {
+                            continue;
+                        }
+                        main_frame = Some(event.frame.id.clone());
+                        // A failed load lands on Chrome's own error page
+                        // (`chrome-error://…`); report what was asked for
+                        // instead, as a browser's address bar does.
+                        let url = match &event.frame.unreachable_url {
+                            Some(unreachable) => unreachable.clone(),
+                            None => format!(
+                                "{}{}",
+                                event.frame.url,
+                                event.frame.url_fragment.as_deref().unwrap_or_default()
+                            ),
+                        };
+                        record_url(conversation_id, session_id, url);
+                    }
+                    event = within_document.next() => {
+                        let Some(event) = event else { return };
+                        if main_frame.as_ref() == Some(&event.frame_id) {
+                            record_url(conversation_id, session_id, event.url.clone());
+                        }
+                    }
+                }
+            }
+        }))
+    }
+
+    fn record_url(conversation_id: i64, session_id: u64, url: String) {
+        {
+            let mut sessions = SESSIONS.lock().unwrap();
+            let Some(session) = sessions.get_mut(&conversation_id) else {
+                return;
+            };
+            if session.id != session_id || session.current_url == url {
+                return;
+            }
+            session.current_url = url.clone();
+        }
+        crate::events::publish(
+            conversation_id,
+            crate::events::ConversationEvent::BrowsingUrlUpdate { url },
+        );
+    }
+
+    /// The session page's current URL, or `None` if no session is open.
+    pub fn current_url(conversation_id: i64) -> Option<String> {
+        SESSIONS
+            .lock()
+            .unwrap()
+            .get(&conversation_id)
+            .map(|s| s.current_url.clone())
+    }
+
+    /// What someone typed into the live panel's address bar, as a URL: a
+    /// bare host (`example.com`) gets `https://`. Whether the result is a
+    /// URL smelt will actually load is `navigate`'s call, not this one's.
+    pub fn normalize_address(input: &str) -> Result<String, String> {
+        let input = input.trim();
+        if input.is_empty() {
+            return Err("enter an address".to_string());
+        }
+        if input.contains("://") {
+            Ok(input.to_string())
+        } else {
+            Ok(format!("https://{input}"))
+        }
     }
 
     #[cfg(all(test, feature = "browser-test"))]
@@ -1542,7 +1645,7 @@ mod server {
             );
             opened.expect("the open itself should succeed");
             assert!(
-                !is_session_open(conversation_id),
+                current_url(conversation_id).is_none(),
                 "a close issued during an open left the session running"
             );
             close_session(conversation_id)
@@ -1650,6 +1753,40 @@ mod server {
                 "a popup tab was opened in the shared browser"
             );
 
+            // --- Scenario 25: the session reports every URL change as it
+            // happens — the model navigating, a link click, and an in-page
+            // change (`pushState`) that never loads a new document — so the
+            // live panel's address bar can follow along. ---
+            let mut events = crate::events::subscribe(conversation_id);
+            let start_url = format!("{base}/");
+            navigate(conversation_id, &start_url)
+                .await
+                .expect("navigate should succeed");
+            expect_url_event(&mut events, &start_url).await;
+            assert_eq!(current_url(conversation_id).as_deref(), Some(start_url.as_str()));
+            let state = read(conversation_id).await.expect("read should succeed");
+            click(conversation_id, index_of(&state, "Go to page 2"))
+                .await
+                .expect("clicking the page 2 link should succeed");
+            expect_url_event(&mut events, &format!("{base}/page2")).await;
+            live_page(conversation_id)
+                .expect("session should still be live")
+                .evaluate("history.pushState({}, '', '/pushed')")
+                .await
+                .expect("pushState should succeed");
+            expect_url_event(&mut events, &format!("{base}/pushed")).await;
+            assert_eq!(
+                current_url(conversation_id),
+                Some(format!("{base}/pushed"))
+            );
+            // A refused load shows Chrome's own error page, whose URL is
+            // `chrome-error://…` — the address bar should keep showing
+            // what was asked for, as a real browser does.
+            let refused = "http://169.254.169.254/";
+            assert!(navigate(conversation_id, refused).await.is_err());
+            expect_url_event(&mut events, refused).await;
+            assert_eq!(current_url(conversation_id).as_deref(), Some(refused));
+
             close_session(conversation_id)
                 .await
                 .expect("final close_session should succeed");
@@ -1752,6 +1889,35 @@ mod server {
                 axum::serve(listener, router).await.expect("test server error");
             });
             (format!("http://127.0.0.1:{port}/"), task)
+        }
+
+        /// Waits for a `BrowsingUrlUpdate` carrying exactly `url`, skipping
+        /// any other events (and URL updates for pages passed on the way).
+        async fn expect_url_event(
+            events: &mut tokio::sync::broadcast::Receiver<crate::events::ConversationEvent>,
+            url: &str,
+        ) {
+            let found = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut seen = Vec::new();
+                loop {
+                    match events.recv().await {
+                        Ok(crate::events::ConversationEvent::BrowsingUrlUpdate { url: got }) => {
+                            if got == url {
+                                return Ok(());
+                            }
+                            seen.push(got);
+                        }
+                        Ok(_) => {}
+                        Err(e) => return Err(format!("event channel error: {e}; saw {seen:?}")),
+                    }
+                }
+            })
+            .await;
+            match found {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => panic!("{e}"),
+                Err(_) => panic!("no BrowsingUrlUpdate for {url} within 5s"),
+            }
         }
 
         async fn field_value(page: &Page, selector: &str) -> String {
@@ -1922,6 +2088,27 @@ mod server {
         }
 
         #[test]
+        fn test_normalize_address_adds_https_to_a_bare_host() {
+            assert_eq!(normalize_address("example.com").unwrap(), "https://example.com");
+            assert_eq!(
+                normalize_address("localhost:8080/a?b=1").unwrap(),
+                "https://localhost:8080/a?b=1"
+            );
+        }
+
+        #[test]
+        fn test_normalize_address_keeps_an_explicit_scheme_and_trims() {
+            assert_eq!(normalize_address("  http://example.com/x  ").unwrap(), "http://example.com/x");
+            assert_eq!(normalize_address("https://example.com").unwrap(), "https://example.com");
+        }
+
+        #[test]
+        fn test_normalize_address_rejects_nothing() {
+            assert!(normalize_address("").is_err());
+            assert!(normalize_address("   ").is_err());
+        }
+
+        #[test]
         fn test_key_event_params_carries_modifiers_on_both_events() {
             let params = key_event_params("Tab", 8).expect("Tab should be known");
             assert!(params.iter().all(|p| p.modifiers == Some(8)));
@@ -1990,8 +2177,8 @@ mod server {
 
 #[cfg(feature = "server")]
 pub use server::{
-    click, close_session, fill, frame_stream, go_back, is_session_open, navigate, open_session,
-    read, send_input, subscribe_frames,
+    click, close_session, current_url, fill, frame_stream, go_back, navigate,
+    normalize_address, open_session, read, send_input, subscribe_frames,
 };
 
 #[cfg(all(test, feature = "browser-test"))]

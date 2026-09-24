@@ -19,7 +19,7 @@ use crate::anthropic::tools::{TodoItem, TodoStatus};
 use crate::anthropic::tools::TaskSummary;
 #[cfg(any(feature = "web", test))]
 use crate::api::chat::SandboxSnapshot;
-use crate::api::browsing::send_browser_input;
+use crate::api::browsing::{navigate_browser, send_browser_input};
 use crate::api::chat::{
     ChatEvent, ContextDetailSnapshot, ContextUsageSnapshot, create_conversation,
     delete_conversation, get_context_detail, get_conversations, get_messages, send_message,
@@ -141,6 +141,26 @@ fn cdp_modifiers(modifiers: keyboard_types::Modifiers) -> i64 {
     .filter(|(held, _)| *held)
     .map(|(_, bit)| bit)
     .sum()
+}
+
+/// The live panel address bar's text: the page's URL, except while the
+/// viewer is typing, when an arriving URL change mustn't overwrite them.
+fn address_bar_value(editing: bool, draft: &str, url: Option<&str>) -> String {
+    if editing {
+        draft.to_string()
+    } else {
+        url.unwrap_or_default().to_string()
+    }
+}
+
+/// A failed navigation's message as the viewer should read it — the
+/// server's own message, without the wrapper `ServerFnError`'s `Display`
+/// adds around it.
+fn navigation_error_message(error: &ServerFnError) -> String {
+    match error {
+        ServerFnError::ServerError { message, .. } => message.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// Chromium scrolls 40px per wheel "line".
@@ -1390,6 +1410,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_address_bar_value_follows_the_page_until_editing() {
+        assert_eq!(address_bar_value(false, "typed", Some("https://a.example/")), "https://a.example/");
+        assert_eq!(address_bar_value(false, "typed", None), "");
+    }
+
+    #[test]
+    fn test_address_bar_value_keeps_what_is_being_typed() {
+        assert_eq!(address_bar_value(true, "exam", Some("https://a.example/")), "exam");
+    }
+
+    #[test]
+    fn test_navigation_error_message_shows_just_the_server_message() {
+        let error = ServerFnError::ServerError {
+            message: "failed to load https://x/: net::ERR_BLOCKED_BY_CLIENT".to_string(),
+            code: 500,
+            details: None,
+        };
+        assert_eq!(
+            navigation_error_message(&error),
+            "failed to load https://x/: net::ERR_BLOCKED_BY_CLIENT"
+        );
+    }
+
     fn mv(x: f64) -> BrowserInputEvent {
         BrowserInputEvent::MouseMove { x, y: 0.0, left_held: false }
     }
@@ -1984,6 +2028,17 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
     // `get_browsing_state` pull and by `ConversationEvent::BrowsingSessionUpdate`.
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut browsing_session_open: Signal<bool> = use_signal(|| false);
+    // The session page's current URL, from `get_browsing_state` and
+    // `ConversationEvent::BrowsingUrlUpdate`.
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut browsing_url: Signal<Option<String>> = use_signal(|| None);
+    // The address bar's own state: what's typed, whether the viewer is
+    // typing (so incoming URL changes don't clobber it), an in-flight
+    // navigation, and the last navigation error.
+    let mut address_draft = use_signal(String::new);
+    let mut address_editing = use_signal(|| false);
+    let mut address_pending = use_signal(|| false);
+    let mut address_error: Signal<Option<String>> = use_signal(|| None);
     // Forwards the live panel's input one request at a time, in the order
     // it happened — separately spawned requests can overtake each other (a
     // mouse-up reaching the page before its mouse-down). Moves that queued
@@ -2100,6 +2155,9 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
             terminal_body_stuck.write().clear();
             browsing_session_open.set(false);
             browsing_frame.set(None);
+            browsing_url.set(None);
+            address_editing.set(false);
+            address_error.set(None);
 
             let handle = spawn(async move {
                 loop {
@@ -2131,6 +2189,7 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                         }
                         if let Ok(state) = get_browsing_state(id).await {
                             browsing_session_open.set(state.session_open);
+                            browsing_url.set(state.url);
                         }
 
                         loop {
@@ -2222,7 +2281,11 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                     browsing_session_open.set(open);
                                     if !open {
                                         browsing_frame.set(None);
+                                        browsing_url.set(None);
                                     }
+                                }
+                                Some(Ok(ConversationEvent::BrowsingUrlUpdate { url })) => {
+                                    browsing_url.set(Some(url));
                                 }
                                 Some(Err(_)) | None => break,
                             }
@@ -2465,6 +2528,64 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                             if browsing_session_open() {
                                 aside { class: "browsing-panel",
                                     h3 { "Live Browser" }
+                                    form {
+                                        class: "browsing-address-bar",
+                                        onsubmit: move |event| {
+                                            event.prevent_default();
+                                            let Some(id) = selected() else { return };
+                                            if address_pending() {
+                                                return;
+                                            }
+                                            let address = address_draft();
+                                            address_pending.set(true);
+                                            address_error.set(None);
+                                            spawn(async move {
+                                                match navigate_browser(id, address).await {
+                                                    Ok(()) => address_editing.set(false),
+                                                    Err(e) => address_error.set(Some(navigation_error_message(&e))),
+                                                }
+                                                address_pending.set(false);
+                                            });
+                                        },
+                                        input {
+                                            class: "browsing-address-input",
+                                            r#type: "text",
+                                            spellcheck: "false",
+                                            autocomplete: "off",
+                                            aria_label: "Address",
+                                            placeholder: "Enter an address",
+                                            disabled: address_pending(),
+                                            value: address_bar_value(
+                                                address_editing(),
+                                                &address_draft(),
+                                                browsing_url().as_deref(),
+                                            ),
+                                            onfocus: move |_| {
+                                                if !address_editing() {
+                                                    address_draft.set(browsing_url().unwrap_or_default());
+                                                    address_editing.set(true);
+                                                }
+                                            },
+                                            oninput: move |e| {
+                                                address_draft.set(e.value());
+                                                address_editing.set(true);
+                                            },
+                                            onblur: move |_| {
+                                                if !address_pending() {
+                                                    address_editing.set(false);
+                                                }
+                                            },
+                                            onkeydown: move |e: Event<KeyboardData>| {
+                                                if e.data().key() == keyboard_types::Key::Escape {
+                                                    address_editing.set(false);
+                                                    address_error.set(None);
+                                                }
+                                            },
+                                        }
+                                    }
+                                    if let Some(error) = address_error() {
+                                        p { class: "browsing-address-error", role: "alert", "{error}" }
+                                    }
                                     div {
                                         class: "browsing-panel-frame-wrap",
                                         tabindex: "0",

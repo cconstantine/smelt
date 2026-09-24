@@ -1848,3 +1848,36 @@ div.mcp-status-not-connected::before {
 .context-meter-swatch[data-category="free"] {
     background: var(--meter-free);
 }
+
+.browsing-address-bar {
+    margin: 0 0 8px;
+    width: 1280px;
+}
+
+.browsing-address-input {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 6px 10px;
+    border: 1px solid #d0d0d0;
+    border-radius: 6px;
+    background: #fff;
+    font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #222;
+}
+
+.browsing-address-input:focus {
+    outline: 2px solid #4a7dff;
+    outline-offset: -1px;
+    border-color: transparent;
+}
+
+.browsing-address-input:disabled {
+    color: #888;
+    background: #f3f3f3;
+}
+
+.browsing-address-error {
+    margin: -4px 0 8px;
+    font-size: 12px;
+    color: #b3261e;
+}

@@ -15,12 +15,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BrowsingState {
     pub session_open: bool,
+    /// The session page's current URL, for the panel's address bar.
+    pub url: Option<String>,
 }
 
 #[get("/api/conversations/{id}/browsing")]
 pub async fn get_browsing_state(id: i64) -> ServerFnResult<BrowsingState> {
+    let url = crate::browsing::current_url(id);
     Ok(BrowsingState {
-        session_open: crate::browsing::is_session_open(id),
+        session_open: url.is_some(),
+        url,
     })
 }
 
@@ -52,5 +56,17 @@ pub async fn send_browser_input(
 ) -> ServerFnResult<()> {
     crate::browsing::send_input(id, event)
         .await
+        .map_err(ServerFnError::new)
+}
+
+/// Navigates the session to what the viewer typed into the panel's address
+/// bar. Goes through the same `browsing::navigate` the model's
+/// `browser_navigate` uses, so the same scheme check and SSRF guard apply.
+#[post("/api/conversations/{id}/browsing/navigate")]
+pub async fn navigate_browser(id: i64, address: String) -> ServerFnResult<()> {
+    let url = crate::browsing::normalize_address(&address).map_err(ServerFnError::new)?;
+    crate::browsing::navigate(id, &url)
+        .await
+        .map(|_| ())
         .map_err(ServerFnError::new)
 }
