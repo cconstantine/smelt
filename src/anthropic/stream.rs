@@ -266,6 +266,43 @@ async fn send_and_await_response(
         .map_err(|e| format!("Claude API request failed: {e}"))
 }
 
+/// The human-readable part of an error response: Anthropic's own
+/// `error.message`, unwrapped once more when a router relays a provider's
+/// JSON error inside it (`{"error": "…"}`). Falls back to the raw body.
+fn provider_error_message(body: &str) -> String {
+    let message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.pointer("/error/message")?.as_str().map(str::to_string));
+    let Some(message) = message else {
+        return body.trim().to_string();
+    };
+    let nested = serde_json::from_str::<serde_json::Value>(&message).ok().and_then(|v| {
+        v.get("error")
+            .or_else(|| v.get("message"))?
+            .as_str()
+            .map(str::to_string)
+    });
+    nested.unwrap_or(message).trim().to_string()
+}
+
+/// Statuses worth another try: rate limiting and a provider that's
+/// temporarily unavailable or overloaded.
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 503 | 529)
+}
+
+/// Waits between attempts after a transient status — three attempts in all.
+#[cfg(not(test))]
+const RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(3),
+];
+#[cfg(test)]
+const RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(10),
+    std::time::Duration::from_millis(10),
+];
+
 /// Stream a message from the real Anthropic API, calling `on_delta` for each
 /// text chunk as it arrives (live typing effect) and returning every content
 /// block — text and/or tool_use — plus the turn's `stop_reason` once the
@@ -277,20 +314,34 @@ pub async fn stream_anthropic_message(
     request: &CreateMessageRequest,
     mut on_delta: impl FnMut(&str),
 ) -> Result<StreamedTurn, String> {
-    let response = send_and_await_response(
-        api_key,
-        auth_token,
-        request,
-        &anthropic_base_url(),
-        RESPONSE_TIMEOUT,
-    )
-    .await?;
-
-    if !response.status().is_success() {
+    // Retried only here, before anything has streamed: nothing has been
+    // shown to the viewer yet, so a retry is invisible to them.
+    let mut attempt = 0;
+    let response = loop {
+        let response = send_and_await_response(
+            api_key,
+            auth_token,
+            request,
+            &anthropic_base_url(),
+            RESPONSE_TIMEOUT,
+        )
+        .await?;
         let status = response.status();
+        if status.is_success() {
+            break response;
+        }
+        if is_transient_status(status) && attempt < RETRY_DELAYS.len() {
+            tracing::warn!(%status, attempt, "model provider unavailable; retrying");
+            tokio::time::sleep(RETRY_DELAYS[attempt]).await;
+            attempt += 1;
+            continue;
+        }
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("Anthropic API error {status}: {body}"));
-    }
+        return Err(format!(
+            "model provider error {status}: {}",
+            provider_error_message(&body)
+        ));
+    };
 
     let mut byte_stream = response.bytes_stream();
     let mut line_buffer = String::new();
@@ -620,6 +671,110 @@ mod tests {
         };
 
         stream_anthropic_message(Some("test-key"), None, &request, on_delta).await
+    }
+
+    /// The body a paused provider actually returned during the bug bash,
+    /// relayed through an Anthropic-compatible router: the provider's
+    /// message is JSON inside the Anthropic error's own `message`.
+    const PAUSED_PROVIDER_BODY: &str = r#"{"type":"error","error":{"type":"api_error","message":"{\"error\":\"Provider 'featherless-ai' is currently failing for model 'Qwen/Qwen3.8-27B' and has been paused by the circuit breaker. Retry later or use another provider.\"}"}}"#;
+
+    const OK_BODY: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\"}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    /// Serves `responses` in order (the last one repeats) and returns the
+    /// outcome plus how many requests were made.
+    async fn run_against_responses(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (Result<StreamedTurn, String>, usize) {
+        let _guard = crate::anthropic::test_support::lock_anthropic_base_url();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = count.clone();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let responses = responses.clone();
+                let served = served.clone();
+                async move {
+                    let i = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (status, body) = responses[i.min(responses.len() - 1)];
+                    let content_type = if status == 200 { "text/event-stream" } else { "application/json" };
+                    (
+                        axum::http::StatusCode::from_u16(status).expect("valid status"),
+                        [(axum::http::header::CONTENT_TYPE, content_type)],
+                        body,
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        unsafe { std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}")) };
+        let request = CreateMessageRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 100,
+            system: None,
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+            thinking: None,
+        };
+        let result = stream_anthropic_message(Some("test-key"), None, &request, |_| {}).await;
+        (result, count.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn test_a_transient_provider_error_is_retried() {
+        let (result, requests) =
+            run_against_responses(vec![(503, PAUSED_PROVIDER_BODY), (200, OK_BODY)]).await;
+        assert!(result.is_ok(), "should recover on retry: {result:?}");
+        assert_eq!(requests, 2);
+    }
+
+    #[tokio::test]
+    async fn test_a_client_error_is_not_retried() {
+        let (result, requests) =
+            run_against_responses(vec![(400, r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#)]).await;
+        assert!(result.is_err());
+        assert_eq!(requests, 1, "a 400 won't get better by retrying");
+    }
+
+    #[tokio::test]
+    async fn test_a_persistent_provider_error_gives_up_readably() {
+        let (result, requests) = run_against_responses(vec![(503, PAUSED_PROVIDER_BODY)]).await;
+        assert_eq!(requests, 3, "three attempts, then give up");
+        let error = result.expect_err("a provider that stays down should fail");
+        assert!(error.contains("Provider 'featherless-ai' is currently failing"), "got {error}");
+        assert!(!error.contains("{"), "raw JSON leaked into the message: {error}");
+    }
+
+    #[test]
+    fn test_provider_error_message_unwraps_nested_json() {
+        let message = provider_error_message(PAUSED_PROVIDER_BODY);
+        assert_eq!(
+            message,
+            "Provider 'featherless-ai' is currently failing for model 'Qwen/Qwen3.8-27B' and has \
+             been paused by the circuit breaker. Retry later or use another provider."
+        );
+    }
+
+    #[test]
+    fn test_provider_error_message_falls_back_to_the_raw_body() {
+        assert_eq!(provider_error_message("upstream exploded"), "upstream exploded");
     }
 
     #[tokio::test]

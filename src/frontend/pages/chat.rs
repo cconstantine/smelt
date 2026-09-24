@@ -2507,11 +2507,11 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                 }
                             }
                             Ok(ChatEvent::Error { message }) => fail(message),
-                            Err(e) => fail(e.to_string()),
+                            Err(e) => fail(server_error_message(&e)),
                         }
                     }
                 }
-                Err(e) => fail(e.to_string()),
+                Err(e) => fail(server_error_message(&e)),
             }
 
             replies_in_flight.write().remove(&id);

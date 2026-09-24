@@ -953,6 +953,17 @@ fn run_turn_bounded<'a>(
     })
 }
 
+/// What the chat shows when a turn fails: the server's own message,
+/// without the "error running server function: … (details: None)" wrapper
+/// `ServerFnError`'s `Display` adds.
+#[cfg(feature = "server")]
+fn chat_error_text(error: &ServerFnError) -> String {
+    match error {
+        ServerFnError::ServerError { message, .. } => message.clone(),
+        other => other.to_string(),
+    }
+}
+
 #[post("/api/conversations/{id}/messages")]
 pub async fn send_message(id: i64, content: String) -> ServerFnResult<ServerEvents<ChatEvent>> {
     let new_message = anthropic::AnthropicMessage {
@@ -993,7 +1004,7 @@ pub async fn send_message(id: i64, content: String) -> ServerFnResult<ServerEven
             Err(e) => {
                 let _ = tx
                     .send(ChatEvent::Error {
-                        message: e.to_string(),
+                        message: chat_error_text(&e),
                     })
                     .await;
             }
@@ -2077,6 +2088,15 @@ mod tests {
             "the notification message should still be persisted, got {messages:?}"
         );
         assert_eq!(messages[0].role, "user");
+    }
+
+    #[test]
+    fn test_chat_error_text_drops_the_server_function_wrapper() {
+        let error = ServerFnError::new("model provider error 503 Service Unavailable: paused");
+        assert_eq!(
+            chat_error_text(&error),
+            "model provider error 503 Service Unavailable: paused"
+        );
     }
 
     fn hello() -> anthropic::AnthropicMessage {
