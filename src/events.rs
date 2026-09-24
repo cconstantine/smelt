@@ -161,6 +161,16 @@ mod server {
         sender_for(conversation_id).subscribe()
     }
 
+    /// Drops `conversation_id`'s channel, for when the conversation is
+    /// deleted. Its remaining subscribers see the channel close, which
+    /// ends their event streams.
+    pub fn forget(conversation_id: i64) {
+        BUSES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&conversation_id);
+    }
+
     /// How many live subscriptions `conversation_id` has.
     #[cfg(test)]
     pub fn subscriber_count(conversation_id: i64) -> usize {
@@ -171,6 +181,20 @@ mod server {
     mod tests {
         use super::super::TokenUsage;
         use super::*;
+
+        #[tokio::test]
+        async fn test_forget_closes_the_conversations_channel() {
+            let conversation_id = 987_654_012;
+            let mut rx = subscribe(conversation_id);
+            forget(conversation_id);
+            let received = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .expect("the channel should close, not stay open");
+            assert!(
+                matches!(received, Err(broadcast::error::RecvError::Closed)),
+                "expected the channel to close, got {received:?}"
+            );
+        }
 
         #[tokio::test]
         async fn test_publish_with_no_subscribers_is_a_noop() {
@@ -330,7 +354,7 @@ mod server {
 }
 
 #[cfg(feature = "server")]
-pub use server::{publish, subscribe};
+pub use server::{forget, publish, subscribe};
 #[cfg(all(feature = "server", test))]
 pub use server::subscriber_count;
 

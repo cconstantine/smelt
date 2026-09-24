@@ -74,7 +74,10 @@ pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
     anthropic::tools::forget_conversation_tasks(id);
     db::delete_conversation(db::get(), id)
         .await
-        .map_err(ServerFnError::new)
+        .map_err(ServerFnError::new)?;
+    crate::events::forget(id);
+    forget_conversation_lock(id);
+    Ok(())
 }
 
 #[cfg(feature = "server")]
@@ -570,6 +573,17 @@ fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<()>> {
         .entry(conversation_id)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+/// Drops `conversation_id`'s lock, for when the conversation is deleted.
+/// A turn still holding it keeps its own handle; any later turn gets a
+/// fresh lock and then fails, since the conversation no longer exists.
+#[cfg(feature = "server")]
+fn forget_conversation_lock(conversation_id: i64) {
+    CONVERSATION_LOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&conversation_id);
 }
 
 /// The credential-requirement decision `run_turn_bounded` makes at the top
@@ -1595,6 +1609,19 @@ mod tests {
             is_error: None,
         }];
         assert!(is_safe_compaction_boundary(&blocks));
+    }
+
+    #[test]
+    fn test_forget_conversation_lock_drops_it() {
+        let conversation_id = 987_654_011;
+        let first = conversation_lock(conversation_id);
+        forget_conversation_lock(conversation_id);
+        let second = conversation_lock(conversation_id);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the deleted conversation's lock is still registered"
+        );
+        forget_conversation_lock(conversation_id);
     }
 
     /// A subscription belongs to its connection: once the response is
