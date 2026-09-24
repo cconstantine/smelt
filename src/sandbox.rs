@@ -49,8 +49,9 @@ const AGENT_PORT: u16 = 8088;
 #[derive(Debug)]
 pub enum SandboxError {
     Kube(kube::Error),
-    /// The pod didn't reach `Running` within `running_wait_timeout()`.
-    Timeout,
+    /// The pod didn't reach `Running` within `running_wait_timeout()`; the
+    /// detail is the pod's own explanation, when it gave one.
+    Timeout(Option<String>),
     /// A pod already existed for this session but wasn't `Running` (e.g.
     /// `Terminating`, `Failed`). What to do here is an open question in
     /// the plan — not resolved, just surfaced rather than guessed at.
@@ -68,13 +69,18 @@ pub enum SandboxError {
     /// `create_pod` refuses: this conversation already has a live pod. See
     /// docs/projects/plans/file-tools.md's "One pod per conversation."
     PodAlreadyExists,
+    InvalidMountPath(String),
+    StartFailed(String),
 }
 
 impl std::fmt::Display for SandboxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SandboxError::Kube(e) => write!(f, "kubernetes API error: {e}"),
-            SandboxError::Timeout => write!(f, "timed out waiting for pod to become Running"),
+            SandboxError::Timeout(None) => write!(f, "timed out waiting for pod to become Running"),
+            SandboxError::Timeout(Some(detail)) => {
+                write!(f, "timed out waiting for pod to become Running ({detail})")
+            }
             SandboxError::ExistingPodNotRunning(phase) => {
                 write!(f, "existing sandbox pod is not Running (phase: {phase})")
             }
@@ -89,6 +95,8 @@ impl std::fmt::Display for SandboxError {
                     "a pod already exists for this conversation; call terminate_pod first"
                 )
             }
+            SandboxError::InvalidMountPath(reason) => write!(f, "invalid mount path: {reason}"),
+            SandboxError::StartFailed(reason) => write!(f, "sandbox pod failed to start: {reason}"),
         }
     }
 }
@@ -124,6 +132,92 @@ const SANDBOX_HOME: &str = "/home/sandbox";
 /// Only a bare `~` or a `~/...` prefix expands, matching ordinary shell
 /// semantics for the single-user case (no `~otheruser` support — there's
 /// only ever one sandbox user). Anything else passes through unchanged.
+/// A volume's mount path is mounted into every sandbox pod, and a container
+/// can't start with a relative (or root, or `..`-escaping) mount
+/// destination — one bad volume would stop every new sandbox. Checked after
+/// `resolve_mount_path` expands `~`.
+fn validate_mount_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/') {
+        return Err(format!("{path:?} must be an absolute path (start with / or ~)"));
+    }
+    if path == "/" {
+        return Err("a volume can't be mounted over the root directory".to_string());
+    }
+    if path.split('/').any(|part| part == "..") {
+        return Err(format!("{path:?} must not contain .."));
+    }
+    Ok(())
+}
+
+/// Creates any volume claim that's missing from this namespace. Every pod
+/// mounts every configured volume, and a pod whose claim doesn't exist
+/// can never be scheduled — it just waits until the start-up timeout. A
+/// claim goes missing when the cluster is rebuilt or the claim deleted,
+/// or when the volume was created in another namespace (the browser tier
+/// shares the dev database but runs in the test namespace). Whatever the
+/// old claim held is gone either way; recreating it keeps sandboxes working.
+async fn ensure_volume_claims(
+    client: &kube::Client,
+    volumes: &[db::SandboxVolume],
+) -> Result<(), SandboxError> {
+    let pvcs = pvc_api(client);
+    for volume in volumes {
+        let claim = sandbox_volume_pvc_name(volume.id);
+        if pvcs.get_opt(&claim).await?.is_none() {
+            tracing::warn!(claim = %claim, "volume claim missing; recreating it");
+            pvcs.create(&PostParams::default(), &build_volume_pvc_spec(volume.id))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Why `pod` isn't running yet, from its first failing condition — e.g.
+/// "PodScheduled: Unschedulable: 0/1 nodes are available: persistentvolumeclaim
+/// … not found." Reported when waiting times out, so the error says why.
+fn pod_pending_detail(pod: &Pod) -> Option<String> {
+    let conditions = pod.status.as_ref()?.conditions.as_ref()?;
+    conditions.iter().find(|c| c.status == "False").map(|c| {
+        let reason = c.reason.as_deref().unwrap_or("");
+        let message = c.message.as_deref().unwrap_or("");
+        [c.type_.as_str(), reason, message]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(": ")
+    })
+}
+
+/// Container waiting states that never resolve on their own — once a pod's
+/// container is in one of these, waiting for `Running` only ends in a
+/// timeout that hides the reason.
+const FATAL_WAITING_REASONS: [&str; 7] = [
+    "CreateContainerError",
+    "CreateContainerConfigError",
+    "RunContainerError",
+    "ErrImagePull",
+    "ImagePullBackOff",
+    "InvalidImageName",
+    "CrashLoopBackOff",
+];
+
+/// Why `pod` can't start, if one of its containers is stuck in a state that
+/// won't recover (see `FATAL_WAITING_REASONS`); `None` while it's still
+/// starting normally.
+fn pod_startup_failure(pod: &Pod) -> Option<String> {
+    let statuses = pod.status.as_ref()?.container_statuses.as_ref()?;
+    statuses.iter().find_map(|status| {
+        let waiting = status.state.as_ref()?.waiting.as_ref()?;
+        let reason = waiting.reason.as_deref()?;
+        FATAL_WAITING_REASONS.contains(&reason).then(|| {
+            match waiting.message.as_deref().filter(|m| !m.is_empty()) {
+                Some(message) => format!("{reason}: {message}"),
+                None => reason.to_string(),
+            }
+        })
+    })
+}
+
 fn resolve_mount_path(path: &str) -> String {
     if path == "~" {
         SANDBOX_HOME.to_string()
@@ -340,6 +434,7 @@ impl SandboxManager {
                 false
             }
             None => {
+                ensure_volume_claims(&self.client, volumes).await?;
                 pods.create(
                     &PostParams::default(),
                     &build_pod_spec(&name, memory, cpu, volumes),
@@ -504,17 +599,22 @@ async fn wait_for_running_with_timeout(
     name: &str,
     timeout: Duration,
 ) -> Result<(), SandboxError> {
-    tokio::time::timeout(timeout, async {
+    let mut last_detail = None;
+    let waited = tokio::time::timeout(timeout, async {
         loop {
             let pod = pods.get(name).await?;
+            if let Some(reason) = pod_startup_failure(&pod) {
+                return Err(SandboxError::StartFailed(reason));
+            }
+            last_detail = pod_pending_detail(&pod);
             if pod.status.and_then(|s| s.phase).as_deref() == Some("Running") {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     })
-    .await
-    .map_err(|_| SandboxError::Timeout)?
+    .await;
+    waited.map_err(|_| SandboxError::Timeout(last_detail))?
 }
 
 async fn drain_cleanup_queue(client: kube::Client, mut rx: mpsc::UnboundedReceiver<String>) {
@@ -1089,6 +1189,7 @@ pub async fn create_volume(
     mount_path: &str,
 ) -> Result<i64, SandboxError> {
     let resolved_path = resolve_mount_path(mount_path);
+    validate_mount_path(&resolved_path).map_err(SandboxError::InvalidMountPath)?;
     let row = db::create_sandbox_volume(pool, name, &resolved_path)
         .await
         .map_err(SandboxError::Db)?;
@@ -2300,8 +2401,81 @@ mod tests {
     }
 
     use k8s_openapi::api::core::v1::{
-        ContainerState, ContainerStateTerminated, ContainerStatus, PodStatus,
+        ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
+        PodStatus,
     };
+
+    fn pod_waiting(reason: &str, message: &str) -> Pod {
+        Pod {
+            status: Some(PodStatus {
+                phase: Some("Pending".to_string()),
+                container_statuses: Some(vec![ContainerStatus {
+                    state: Some(ContainerState {
+                        waiting: Some(ContainerStateWaiting {
+                            reason: Some(reason.to_string()),
+                            message: Some(message.to_string()),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_pod_startup_failure_reports_a_container_that_cannot_start() {
+        let failure = pod_startup_failure(&pod_waiting(
+            "ImagePullBackOff",
+            "Back-off pulling image \"smelt-sandbox:missing\"",
+        ))
+        .expect("a container stuck in ImagePullBackOff is a startup failure");
+        assert!(failure.contains("ImagePullBackOff"), "got {failure}");
+        assert!(failure.contains("Back-off pulling image"), "got {failure}");
+    }
+
+    /// What a pod waiting on a volume claim that doesn't exist actually
+    /// reports (seen on this cluster): no container status yet, just an
+    /// unschedulable `PodScheduled` condition.
+    fn pod_unschedulable(message: &str) -> Pod {
+        Pod {
+            status: Some(PodStatus {
+                phase: Some("Pending".to_string()),
+                conditions: Some(vec![k8s_openapi::api::core::v1::PodCondition {
+                    type_: "PodScheduled".to_string(),
+                    status: "False".to_string(),
+                    reason: Some("Unschedulable".to_string()),
+                    message: Some(message.to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_pod_pending_detail_explains_an_unschedulable_pod() {
+        let detail = pod_pending_detail(&pod_unschedulable(
+            "0/1 nodes are available: persistentvolumeclaim \"sandbox-volume-7\" not found.",
+        ))
+        .expect("an unschedulable pod has a reason to report");
+        assert!(detail.contains("persistentvolumeclaim"), "got {detail}");
+    }
+
+    #[test]
+    fn test_pod_pending_detail_is_none_for_a_running_pod() {
+        assert_eq!(pod_pending_detail(&pod_with_phase("Running")), None);
+    }
+
+    #[test]
+    fn test_pod_startup_failure_is_none_while_a_pod_is_still_starting() {
+        assert_eq!(pod_startup_failure(&pod_waiting("ContainerCreating", "")), None);
+        assert_eq!(pod_startup_failure(&pod_with_phase("Pending")), None);
+        assert_eq!(pod_startup_failure(&pod_with_phase("Running")), None);
+    }
 
     fn pod_with_phase(phase: &str) -> Pod {
         Pod {
@@ -2441,6 +2615,36 @@ mod tests {
         assert!(
             matches!(result, Err(SandboxError::PodAlreadyExists)),
             "expected PodAlreadyExists, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_mount_path_accepts_absolute_paths() {
+        for path in ["/data", "/home/dev/.cache", "/workspace/project"] {
+            assert!(validate_mount_path(path).is_ok(), "{path} should be accepted");
+        }
+    }
+
+    #[test]
+    fn test_validate_mount_path_rejects_relative_empty_and_escaping_paths() {
+        for path in ["relative/path", "data", "", "/", "/data/../etc", "../x"] {
+            assert!(validate_mount_path(path).is_err(), "{path:?} should be rejected");
+        }
+    }
+
+    /// A relative mount path is mounted into every sandbox pod, and a
+    /// container can't start with one — so it must be refused before it's
+    /// saved (and before the cluster is touched: MANAGER is unset here).
+    #[sqlx::test]
+    async fn test_create_volume_refuses_a_relative_mount_path_before_saving_it(pool: PgPool) {
+        let result = create_volume(&pool, "cache", "relative/path").await;
+        assert!(
+            matches!(result, Err(SandboxError::InvalidMountPath(_))),
+            "expected InvalidMountPath, got {result:?}"
+        );
+        assert!(
+            db::list_sandbox_volumes(&pool).await.expect("list volumes").is_empty(),
+            "the refused volume was saved anyway"
         );
     }
 
@@ -3352,7 +3556,7 @@ mod tests {
             )
             .await;
         match result {
-            Err(SandboxError::Timeout) => {}
+            Err(SandboxError::Timeout(_)) => {}
             Err(e) => panic!("expected a Timeout error, got a different error: {e}"),
             Ok(sandbox) => {
                 std::mem::forget(sandbox);
@@ -3371,6 +3575,43 @@ mod tests {
             gone.is_ok(),
             "the pod create() gave up waiting on should have been cleaned up, not left orphaned"
         );
+    }
+
+    /// Every configured volume is mounted into every pod, but its claim can
+    /// be missing from the pod's namespace — the cluster was rebuilt, the
+    /// claim was deleted, or (as the browser tier found) the volume was
+    /// created in another namespace. The pod must still start.
+    #[tokio::test]
+    async fn test_create_recreates_a_missing_volume_claim() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let pvcs = pvc_api(&client);
+        let volume_id = 990_003;
+        let claim = sandbox_volume_pvc_name(volume_id);
+        pvcs.delete(&claim, &DeleteParams::default()).await.ok();
+        let now = chrono::Utc::now().naive_utc();
+        let volume = db::SandboxVolume {
+            id: volume_id,
+            name: "missing-claim".to_string(),
+            mount_path: "/missing-claim".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let result = manager
+            .create(&unique_session_id("missing-claim"), "128Mi", "500m", &[volume])
+            .await;
+        let claim_exists = matches!(pvcs.get_opt(&claim).await, Ok(Some(_)));
+        if let Ok(sandbox) = &result {
+            pods_api(&client)
+                .delete(&sandbox.pod_name, &immediate_delete_params())
+                .await
+                .ok();
+        }
+        pvcs.delete(&claim, &DeleteParams::default()).await.ok();
+
+        assert!(result.is_ok(), "the pod should start: {:?}", result.err().map(|e| e.to_string()));
+        assert!(claim_exists, "the missing claim should have been recreated");
     }
 
     #[tokio::test]
