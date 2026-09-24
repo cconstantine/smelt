@@ -223,8 +223,7 @@ async fn wait_for_live_client(page: &chromiumoxide::Page, conversation_id: i64) 
 /// Clicks conversation `id`'s sidebar entry — an in-app navigation, like a
 /// user's click, not a page load (which would end any reply in flight and
 /// hide the bug being tested) — and waits until the app is showing it. By
-/// id, not title: titles repeat across runs against the same database, and
-/// the sidebar doesn't refresh a title after the page loads.
+/// id, not title: titles repeat across runs against the same database.
 async fn click_conversation(page: &chromiumoxide::Page, id: i64) {
     let clicked: bool = page
         .evaluate(format!(
@@ -733,6 +732,28 @@ async fn test_end_to_end_browser_scenarios() {
         assert!(
             missing.find_element(CHAT_INPUT).await.is_err(),
             "a missing conversation shouldn't offer a message box"
+        );
+
+        // --- Scenario 11: a failed background notification belongs to its
+        // conversation — switching away clears it. ---
+        crate::events::publish(
+            other.id,
+            crate::events::ConversationEvent::NotificationDeliveryFailed {
+                detail: "scenario 11 failure".to_string(),
+            },
+        );
+        assert!(
+            wait_for_text(&watcher, "scenario 11 failure", Duration::from_secs(10)).await,
+            "the watching tab should show B's notification failure"
+        );
+        click_conversation(&watcher, streaming.id).await;
+        assert!(
+            wait_for_text(&watcher, "hello from A", Duration::from_secs(10)).await,
+            "switching to A should show A's messages"
+        );
+        assert!(
+            wait_for_text_gone(&watcher, "scenario 11 failure", Duration::from_secs(2)).await,
+            "B's notification failure followed the tab to A"
         );
     })))
     .await;
