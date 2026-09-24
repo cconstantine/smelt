@@ -176,10 +176,10 @@ fn address_bar_value(editing: bool, draft: &str, url: Option<&str>) -> String {
     }
 }
 
-/// A failed navigation's message as the viewer should read it — the
-/// server's own message, without the wrapper `ServerFnError`'s `Display`
-/// adds around it.
-fn navigation_error_message(error: &ServerFnError) -> String {
+/// A server function's error as the viewer should read it — the server's
+/// own message, without the wrapper `ServerFnError`'s `Display` adds around
+/// it ("error running server function: … (details: None)").
+fn server_error_message(error: &ServerFnError) -> String {
     match error {
         ServerFnError::ServerError { message, .. } => message.clone(),
         other => other.to_string(),
@@ -1489,14 +1489,14 @@ mod tests {
     }
 
     #[test]
-    fn test_navigation_error_message_shows_just_the_server_message() {
+    fn test_server_error_message_shows_just_the_server_message() {
         let error = ServerFnError::ServerError {
             message: "failed to load https://x/: net::ERR_BLOCKED_BY_CLIENT".to_string(),
             code: 500,
             details: None,
         };
         assert_eq!(
-            navigation_error_message(&error),
+            server_error_message(&error),
             "failed to load https://x/: net::ERR_BLOCKED_BY_CLIENT"
         );
     }
@@ -2066,6 +2066,10 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
 
     let mut messages: Signal<Vec<Message>> = use_signal(Vec::new);
     let mut load_error: Signal<Option<String>> = use_signal(|| None);
+    // The server's own "not found", distinct from a failed load: the page
+    // says so and offers no message box, instead of a send that can only
+    // fail.
+    let conversation_missing = move || load_error().as_deref() == Some("conversation not found");
     // Replies in flight, by conversation: the text streamed so far. Keyed
     // rather than a single value because a send keeps running when the
     // viewer switches conversations — a single value made the other
@@ -2197,7 +2201,7 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
             // was left scrolled.
             messages_stuck_to_bottom.set(true);
         }
-        Some(Some(Err(e))) => load_error.set(Some(e.to_string())),
+        Some(Some(Err(e))) => load_error.set(Some(server_error_message(&e))),
         Some(None) => {
             messages.set(Vec::new());
             messages_stuck_to_bottom.set(true);
@@ -2635,7 +2639,7 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                             spawn(async move {
                                                 match navigate_browser(id, address).await {
                                                     Ok(()) => address_editing.set(false),
-                                                    Err(e) => address_error.set(Some(navigation_error_message(&e))),
+                                                    Err(e) => address_error.set(Some(server_error_message(&e))),
                                                 }
                                                 address_pending.set(false);
                                             });
@@ -2983,7 +2987,11 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                         ),
                                     );
                             },
-                            if let Some(err) = load_error() {
+                            if conversation_missing() {
+                                p { class: "conversation-missing",
+                                    "This conversation doesn't exist. It may have been deleted."
+                                }
+                            } else if let Some(err) = load_error() {
                                 p { class: "error", "Error loading messages: {err}" }
                             }
                             for message in messages() {
@@ -3012,6 +3020,7 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                 p { class: "error", "A background notification failed to reach the model: {err}" }
                             }
                         }
+                        if !conversation_missing() {
                         form {
                             class: "composer",
                             onsubmit: move |event| {
@@ -3026,6 +3035,7 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                 oninput: move |e| input.set(e.value()),
                             }
                             button { r#type: "submit", disabled: is_streaming(), "Send" }
+                        }
                         }
                     }
                     }

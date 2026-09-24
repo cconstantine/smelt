@@ -53,6 +53,12 @@ pub async fn create_conversation() -> ServerFnResult<Conversation> {
 
 #[get("/api/conversations/{id}/messages")]
 pub async fn get_messages(id: i64) -> ServerFnResult<Vec<Message>> {
+    if !db::conversation_exists(db::get(), id)
+        .await
+        .map_err(ServerFnError::new)?
+    {
+        return Err(ServerFnError::new("conversation not found"));
+    }
     db::list_messages(db::get(), id)
         .await
         .map_err(ServerFnError::new)
@@ -722,13 +728,12 @@ fn run_turn_bounded<'a>(
         let lock = conversation_lock(conversation_id);
         let _guard = lock.lock().await;
 
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty());
-        require_at_least_one_credential(&api_key, &auth_token).map_err(ServerFnError::new)?;
+        if !db::conversation_exists(pool, conversation_id)
+            .await
+            .map_err(ServerFnError::new)?
+        {
+            return Err(ServerFnError::new("conversation not found"));
+        }
 
         let mut persisted = Vec::new();
         // Tracks what's been persisted since the last *real* Anthropic
@@ -754,6 +759,16 @@ fn run_turn_bounded<'a>(
             pending_new_content.extend(new_message.content.clone());
             persisted.push(saved);
         }
+
+        // Checked after saving the new message, so what the user typed
+        // survives a reload even when the turn can't run.
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty());
+        require_at_least_one_credential(&api_key, &auth_token).map_err(ServerFnError::new)?;
 
         for _ in 0..max_turns {
             // Checked at the top of every loop iteration, not just once per
@@ -2062,6 +2077,49 @@ mod tests {
             "the notification message should still be persisted, got {messages:?}"
         );
         assert_eq!(messages[0].role, "user");
+    }
+
+    fn hello() -> anthropic::AnthropicMessage {
+        anthropic::AnthropicMessage {
+            role: "user".to_string(),
+            content: vec![anthropic::ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_run_turn_for_a_missing_conversation_says_so(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        start_mock_upstream(vec![String::new()]).await;
+        let error = run_turn(&pool, 987_654_321, hello(), None)
+            .await
+            .expect_err("a turn for a conversation that doesn't exist should fail")
+            .to_string();
+        assert!(error.contains("conversation not found"), "got: {error}");
+        assert!(!error.contains("foreign key"), "a raw database error leaked: {error}");
+    }
+
+    /// With no model credentials the turn can't run, but what the user
+    /// typed is still theirs: it shouldn't vanish on the next reload.
+    #[sqlx::test]
+    async fn test_run_turn_without_credentials_still_saves_the_message(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        // SAFETY: the lock above serializes every test that touches these.
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        }
+        let result = run_turn(&pool, conversation.id, hello(), None).await;
+        assert!(result.is_err(), "no credentials should fail the turn");
+        let saved = db::list_messages(&pool, conversation.id)
+            .await
+            .expect("list messages");
+        assert_eq!(saved.len(), 1, "the user's message should have been saved");
+        assert_eq!(saved[0].role, "user");
     }
 
     #[sqlx::test]

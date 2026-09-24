@@ -694,6 +694,23 @@ async fn test_end_to_end_browser_scenarios() {
             wait_for_text(&watcher, "zebra24", Duration::from_secs(10)).await,
             "the watching tab never showed a reply it didn't send itself"
         );
+
+        // --- Scenario 10: a conversation that doesn't exist says so,
+        // rather than offering a chat box whose send fails with a raw
+        // database error. ---
+        let missing = harness
+            .browser
+            .new_page(format!("{}conversation/987654321", harness.base_url))
+            .await
+            .expect("open a conversation that doesn't exist");
+        assert!(
+            wait_for_text(&missing, "doesn't exist", Duration::from_secs(10)).await,
+            "a missing conversation should say it doesn't exist"
+        );
+        assert!(
+            missing.find_element(CHAT_INPUT).await.is_err(),
+            "a missing conversation shouldn't offer a message box"
+        );
     })))
     .await;
 
