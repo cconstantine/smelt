@@ -1231,24 +1231,25 @@ pub async fn get_context_detail(id: i64) -> ServerFnResult<ContextDetailSnapshot
 pub async fn subscribe_conversation_events(
     id: i64,
 ) -> ServerFnResult<ServerEvents<events::ConversationEvent>> {
-    Ok(ServerEvents::new(move |mut tx| async move {
-        let mut rx = events::subscribe(id);
+    // `from_stream`, not `ServerEvents::new`: `new` runs its loop as a
+    // detached task that never notices the connection closing, so every
+    // page load or reconnect used to leave a subscriber behind for good.
+    // Here the response pulls events as it sends them, and dropping it
+    // (the tab going away) drops the subscription.
+    let rx = events::subscribe(id);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
-                Ok(event) => {
-                    let _ = tx.send(event).await;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // A subscriber that fell behind just misses some
-                    // ephemeral `TaskUpdate`s — the frontend's one-shot
-                    // `get_messages`/`get_tasks` reconciliation pull on
-                    // connect covers the durable state regardless.
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Ok(event) => return Some((Ok::<_, axum::BoxError>(event), rx)),
+                // A subscriber that fell behind just misses some ephemeral
+                // updates — the frontend's reconciliation pull on connect
+                // covers the durable state regardless.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
         }
-    }))
+    });
+    Ok(ServerEvents::from_stream(stream))
 }
 
 #[cfg(test)]
@@ -1481,6 +1482,26 @@ mod tests {
             is_error: None,
         }];
         assert!(is_safe_compaction_boundary(&blocks));
+    }
+
+    /// A subscription belongs to its connection: once the response is
+    /// dropped (the tab closed or reloaded), nothing should still be
+    /// listening on the conversation's channel.
+    #[tokio::test]
+    async fn test_a_dropped_event_subscription_stops_listening() {
+        let conversation_id = 9_000_000_007;
+        let subscription = subscribe_conversation_events(conversation_id)
+            .await
+            .expect("subscribe");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(events::subscriber_count(conversation_id), 1);
+        drop(subscription);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            events::subscriber_count(conversation_id),
+            0,
+            "a dropped subscription is still listening"
+        );
     }
 
     #[test]

@@ -161,6 +161,12 @@ mod server {
         sender_for(conversation_id).subscribe()
     }
 
+    /// How many live subscriptions `conversation_id` has.
+    #[cfg(test)]
+    pub fn subscriber_count(conversation_id: i64) -> usize {
+        sender_for(conversation_id).receiver_count()
+    }
+
     #[cfg(test)]
     mod tests {
         use super::super::TokenUsage;
@@ -325,6 +331,8 @@ mod server {
 
 #[cfg(feature = "server")]
 pub use server::{publish, subscribe};
+#[cfg(all(feature = "server", test))]
+pub use server::subscriber_count;
 
 #[cfg(test)]
 mod wire_tests {
