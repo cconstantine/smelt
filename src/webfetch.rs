@@ -15,7 +15,9 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use chromiumoxide::Browser;
+use chromiumoxide::cdp::browser_protocol::browser::BrowserContextId;
+use chromiumoxide::cdp::browser_protocol::target::{CreateBrowserContextParams, CreateTargetParams};
+use chromiumoxide::{Browser, Page};
 use serde::Serialize;
 use tokio::sync::OnceCell;
 
@@ -53,6 +55,38 @@ const BROWSER_EGRESS_GUARD: fn(IpAddr) -> bool =
 /// shared browser instance rather than launching a second one.
 pub(crate) async fn shared_browser() -> Result<&'static Browser, String> {
     BROWSER.get_or_try_init(launch_browser).await
+}
+
+/// A blank page in a browser context of its own: its own cookies, site
+/// storage, cache and service workers, shared with no other page. Pass
+/// the context to `dispose_isolated` when done, which deletes all of that
+/// along with the page — nothing one conversation (or one `webfetch` call)
+/// does in the browser is visible to another.
+pub(crate) async fn new_isolated_page() -> Result<(Page, BrowserContextId), String> {
+    let browser = shared_browser().await?;
+    let context = browser
+        .create_browser_context(CreateBrowserContextParams::default())
+        .await
+        .map_err(|e| format!("failed to create a browser context: {e}"))?;
+    let mut target = CreateTargetParams::new("about:blank");
+    target.browser_context_id = Some(context.clone());
+    match browser.new_page(target).await {
+        Ok(page) => Ok((page, context)),
+        Err(e) => {
+            dispose_isolated(context).await;
+            Err(format!("failed to open a page: {e}"))
+        }
+    }
+}
+
+/// Deletes a context from `new_isolated_page`, closing its pages and
+/// discarding everything stored in it.
+pub(crate) async fn dispose_isolated(context: BrowserContextId) {
+    if let Ok(browser) = shared_browser().await
+        && let Err(e) = browser.dispose_browser_context(context).await
+    {
+        tracing::warn!("failed to dispose a browser context: {e}");
+    }
 }
 
 /// Launches the shared `chrome-headless-shell` instance — lazily, on first
@@ -104,13 +138,14 @@ async fn fetch_with_guard(
     // The request interceptor only sees loads that touch the network, so it
     // can't stop a `data:` (or similar) URL — check the scheme here.
     fetch_guard::parse_fetch_target(url)?;
-    let browser = shared_browser().await?;
-    let page = browser
-        .new_page("about:blank")
-        .await
-        .map_err(|e| format!("failed to open a page: {e}"))?;
-
-    let intercept_task = fetch_guard::spawn_request_interceptor(&page, is_addr_allowed).await?;
+    let (page, context) = new_isolated_page().await?;
+    let intercept_task = match fetch_guard::spawn_request_interceptor(&page, is_addr_allowed).await {
+        Ok(task) => task,
+        Err(e) => {
+            dispose_isolated(context).await;
+            return Err(e);
+        }
+    };
 
     // `goto` itself already resolves only once the navigated URL is fully
     // loaded (confirmed against the vendored source's own doc comment) —
@@ -125,7 +160,7 @@ async fn fetch_with_guard(
     .await;
 
     intercept_task.abort();
-    let _ = page.close().await;
+    dispose_isolated(context).await;
 
     let value = match nav_result {
         Ok(Ok(v)) => v,
@@ -363,6 +398,49 @@ mod browser_tests {
             "a fetched page reached the forbidden address {}: {hits:?}",
             forbidden.addr
         );
+
+        // --- Scenario 5: one webfetch call leaves nothing behind for the
+        // next — not cookies, not site storage — so nothing leaks between
+        // conversations through webfetch either. ---
+        {
+            use crate::browsing::browser_tests::{SEES_NO_DATA, SHOW_DATA_PAGE};
+            let router = axum::Router::new()
+                .route(
+                    "/set-data",
+                    axum::routing::get(|| async {
+                        (
+                            [(axum::http::header::SET_COOKIE, "smelt_probe=from-first; Path=/")],
+                            axum::response::Html(
+                                "<html><body>data set<script>\
+                                 localStorage.setItem('smelt_probe', 'from-first');\
+                                 </script></body></html>",
+                            ),
+                        )
+                    }),
+                )
+                .route(
+                    "/show-data",
+                    axum::routing::get(|| async { axum::response::Html(SHOW_DATA_PAGE) }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind a test-local port");
+            let base = format!("http://{}", listener.local_addr().expect("local addr"));
+            let _server = tokio::spawn(async move {
+                axum::serve(listener, router).await.expect("test server error");
+            });
+            fetch_with_guard(&format!("{base}/set-data"), allow_loopback_too)
+                .await
+                .expect("the first fetch should succeed");
+            let second = fetch_with_guard(&format!("{base}/show-data"), allow_loopback_too)
+                .await
+                .expect("the second fetch should succeed");
+            assert!(
+                second.text.contains(SEES_NO_DATA),
+                "a webfetch call saw data left by an earlier one: {:?}",
+                second.text
+            );
+        }
 
         // `src/browsing.rs`'s own real-browser scenarios run on this same
         // shared browser static — see that module's `browser_tests` doc

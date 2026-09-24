@@ -16,6 +16,7 @@ A real, two-way interactive view — not a periodic snapshot. `Page.startScreenc
 
 - An address bar above the frame shows the page's URL and follows every navigation, whoever made it: the model, a click in the panel, a redirect, or an in-page `pushState`. Typing an address there and pressing Enter navigates the session through the same `navigate` (and SSRF guard) the model uses; a bare host gets `https://`. Added after the review rounds, at the user's request.
 - Confirmed against the vendored `chromiumoxide_cdp` source before committing to the design: `Page.startScreencast`/`screencastFrameAck`/`EventScreencastFrame` and `Input.dispatchMouseEvent`/`dispatchKeyEvent` all exist with the needed shapes.
+- Nothing is shared between conversations in the browser. Each browsing session runs in a browser context of its own (its own cookies, site storage, cache and service workers), which is deleted when the session closes (and so when its conversation is deleted). Each `webfetch` call gets a throwaway context too. Closing and reopening a session within one conversation therefore starts clean. Added after the retrospective, at the user's request; before this, every conversation and every `webfetch` call shared one set of cookies and storage.
 - The session's viewport is pinned (`Emulation.setDeviceMetricsOverride`) to exactly the screencast's own bounds, so the frontend's click-coordinate math needs no scale-factor lookup — an on-screen pixel offset within the (fixed-size, non-responsive) frame `<img>` already equals a real frame pixel.
 - Runs on `webfetch`'s shared browser and `fetch_guard`'s SSRF guard. The guard applies twice: per page through CDP's Fetch-domain interception, and for all of the browser's traffic through `src/egress_proxy.rs`. The proxy covers popups, WebSockets and service workers, which per-page interception never sees.
 
@@ -84,5 +85,4 @@ The branch was called done four times. In between, three code reviews found 21 r
 **Known gaps left open:**
 - The panel's RSX wiring (input handlers, the frame `<img>`, the address bar) is only checked manually; its logic is unit-tested.
 - Browsing sessions are in-memory, so a server restart drops them.
-- All conversations share one browser profile, and so each other's cookies and site storage. Each launch now gets a fresh profile, but conversations within one server process still share it.
 - The unexplained WASM panic above.

@@ -169,6 +169,8 @@ mod server {
 
     struct Session {
         id: u64,
+        /// This session's own browser context — see `open_session_with_guard`.
+        context: chromiumoxide::cdp::browser_protocol::browser::BrowserContextId,
         page: Page,
         intercept_task: tokio::task::JoinHandle<()>,
         /// The latest frame, as a template for new viewers' receivers — a
@@ -218,15 +220,14 @@ mod server {
                     .to_string(),
             );
         }
-        let browser = crate::webfetch::shared_browser().await?;
-        let page = browser
-            .new_page("about:blank")
-            .await
-            .map_err(|e| format!("failed to open a page: {e}"))?;
+        // Each session gets a browser context of its own, so no two
+        // conversations ever share cookies, storage or service workers, and
+        // closing the session deletes everything it stored.
+        let (page, context) = crate::webfetch::new_isolated_page().await?;
         let intercept_task = match configure_session_page(&page, is_addr_allowed).await {
             Ok(task) => task,
             Err(e) => {
-                let _ = page.close().await;
+                crate::webfetch::dispose_isolated(context).await;
                 return Err(e);
             }
         };
@@ -235,7 +236,7 @@ mod server {
             Ok(task) => task,
             Err(e) => {
                 intercept_task.abort();
-                let _ = page.close().await;
+                crate::webfetch::dispose_isolated(context).await;
                 return Err(e);
             }
         };
@@ -246,6 +247,7 @@ mod server {
             conversation_id,
             Session {
                 id: session_id,
+                context,
                 current_url: "about:blank".to_string(),
                 url_task,
                 page,
@@ -302,7 +304,8 @@ mod server {
             session.intercept_task.abort();
             session.screencast_task.abort();
             session.url_task.abort();
-            let _ = session.page.close().await;
+            // Closes the page and deletes everything the session stored.
+            crate::webfetch::dispose_isolated(session.context).await;
             crate::events::publish(
                 conversation_id,
                 crate::events::ConversationEvent::BrowsingSessionUpdate { open: false },
@@ -1050,6 +1053,23 @@ mod server {
                     }),
                 )
                 .route(
+                    "/set-data",
+                    axum::routing::get(|| async {
+                        (
+                            [(axum::http::header::SET_COOKIE, "smelt_probe=from-first; Path=/")],
+                            axum::response::Html(
+                                "<html><body>data set<script>\
+                                 localStorage.setItem('smelt_probe', 'from-first');\
+                                 </script></body></html>",
+                            ),
+                        )
+                    }),
+                )
+                .route(
+                    "/show-data",
+                    axum::routing::get(|| async { axum::response::Html(SHOW_DATA_PAGE) }),
+                )
+                .route(
                     "/delayed",
                     axum::routing::get(|| async {
                         axum::response::Html(
@@ -1789,8 +1809,62 @@ mod server {
 
             close_session(conversation_id)
                 .await
-                .expect("final close_session should succeed");
+                .expect("close_session should succeed");
+
+            // --- Scenario 26: conversations share no browser data. A
+            // cookie and a localStorage value set in one conversation's
+            // session are visible to that session, invisible to another
+            // conversation's, and gone once the session is closed. ---
+            let first = conversation_id;
+            let second = conversation_id + 1;
+            open_session_with_guard(first, allow_loopback_too)
+                .await
+                .expect("open the first conversation's session");
+            open_session_with_guard(second, allow_loopback_too)
+                .await
+                .expect("open the second conversation's session");
+            navigate(first, &format!("{base}/set-data"))
+                .await
+                .expect("set data in the first session");
+            let own = navigate(first, &format!("{base}/show-data"))
+                .await
+                .expect("read data in the first session");
+            assert!(
+                own.text.contains(SEES_FIRST_DATA),
+                "the fixture should show the first session its own data, got: {:?}",
+                own.text
+            );
+            let other = navigate(second, &format!("{base}/show-data"))
+                .await
+                .expect("read data in the second session");
+            assert!(
+                other.text.contains(SEES_NO_DATA),
+                "another conversation's session saw the first one's data: {:?}",
+                other.text
+            );
+            close_session(first).await.expect("close the first session");
+            open_session_with_guard(first, allow_loopback_too)
+                .await
+                .expect("reopen the first conversation's session");
+            let reopened = navigate(first, &format!("{base}/show-data"))
+                .await
+                .expect("read data in the reopened session");
+            assert!(
+                reopened.text.contains(SEES_NO_DATA),
+                "a reopened session still had the closed session's data: {:?}",
+                reopened.text
+            );
+            close_session(first).await.expect("close the first session");
+            close_session(second).await.expect("close the second session");
         }
+
+        /// Shows whatever cookie and localStorage value the page can see.
+        pub(crate) const SHOW_DATA_PAGE: &str = "<html><body><div id=\"out\"></div><script>\
+             document.getElementById('out').innerText = 'cookie=[' + document.cookie + \
+             '] storage=[' + (localStorage.getItem('smelt_probe') || '') + ']';\
+             </script></body></html>";
+        pub(crate) const SEES_FIRST_DATA: &str = "cookie=[smelt_probe=from-first] storage=[from-first]";
+        pub(crate) const SEES_NO_DATA: &str = "cookie=[] storage=[]";
 
         /// A server on this machine's own private (non-loopback) address,
         /// logging every request that reaches it — anything logged got past
