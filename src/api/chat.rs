@@ -400,6 +400,73 @@ async fn describe_live_state(pool: &PgPool, conversation_id: i64) -> String {
     }
 }
 
+/// The conversation as plain text, for the summarization call: the latest
+/// compaction's summary and everything since (what came before it is
+/// already in that summary — including it again made every later
+/// compaction bigger than the last, until the summarization call couldn't
+/// fit at all), cut to `max_chars` by dropping the oldest part.
+#[cfg(feature = "server")]
+fn compaction_transcript(messages: &[Message], max_chars: usize) -> String {
+    let latest_boundary = messages
+        .iter()
+        .filter_map(|m| m.blocks().ok())
+        .flatten()
+        .filter_map(|block| match block {
+            anthropic::ContentBlock::CompactionSummary {
+                covers_through_message_id,
+                ..
+            } => Some(covers_through_message_id),
+            _ => None,
+        })
+        .max();
+    let mut transcript = String::new();
+    for message in messages
+        .iter()
+        .filter(|m| latest_boundary.is_none_or(|boundary| m.id > boundary))
+    {
+        let Ok(blocks) = message.blocks() else {
+            continue;
+        };
+        for block in blocks {
+            let text = match block {
+                anthropic::ContentBlock::Text { text } => text,
+                anthropic::ContentBlock::ToolUse { name, input, .. } => {
+                    format!("[called tool {name} with {input}]")
+                }
+                anthropic::ContentBlock::ToolResult { content, .. } => {
+                    format!("[tool result: {content}]")
+                }
+                anthropic::ContentBlock::Thinking { .. } => continue,
+                anthropic::ContentBlock::CompactionSummary { summary, .. } => summary,
+                // Purely structural (see its own doc comment) — noise for
+                // a *later* compaction's own summarization transcript, not
+                // real prior dialogue worth feeding back in.
+                anthropic::ContentBlock::CompactionPlaceholder { .. } => continue,
+            };
+            transcript.push_str(&message.role);
+            transcript.push_str(": ");
+            transcript.push_str(&text);
+            transcript.push('\n');
+        }
+    }
+    let total = transcript.chars().count();
+    if total <= max_chars {
+        return transcript;
+    }
+    const OMITTED: &str = "[earlier conversation omitted]\n";
+    let keep = max_chars.saturating_sub(OMITTED.chars().count());
+    let tail: String = transcript.chars().skip(total - keep).collect();
+    format!("{OMITTED}{tail}")
+}
+
+/// How much transcript the summarization call can take: the context window
+/// less room for its instructions, the live-state listing and its own
+/// output, at a conservative 3 characters per token.
+#[cfg(feature = "server")]
+fn compaction_transcript_budget() -> usize {
+    (context_window() as usize).saturating_sub(8_192) * 3
+}
+
 /// Runs one compaction pass: summarizes everything currently persisted (up
 /// through and including whatever's pending — the size trigger fired
 /// because of everything currently in the conversation, not just the
@@ -432,33 +499,7 @@ async fn compact_conversation(
     }
     let covers_through_message_id = last.id;
 
-    let mut transcript = String::new();
-    for message in &messages {
-        let Ok(blocks) = message.blocks() else {
-            continue;
-        };
-        for block in blocks {
-            let text = match block {
-                anthropic::ContentBlock::Text { text } => text,
-                anthropic::ContentBlock::ToolUse { name, input, .. } => {
-                    format!("[called tool {name} with {input}]")
-                }
-                anthropic::ContentBlock::ToolResult { content, .. } => {
-                    format!("[tool result: {content}]")
-                }
-                anthropic::ContentBlock::Thinking { .. } => continue,
-                anthropic::ContentBlock::CompactionSummary { summary, .. } => summary,
-                // Purely structural (see its own doc comment) — noise for
-                // a *later* compaction's own summarization transcript, not
-                // real prior dialogue worth feeding back in.
-                anthropic::ContentBlock::CompactionPlaceholder { .. } => continue,
-            };
-            transcript.push_str(&message.role);
-            transcript.push_str(": ");
-            transcript.push_str(&text);
-            transcript.push('\n');
-        }
-    }
+    let transcript = compaction_transcript(&messages, compaction_transcript_budget());
 
     let live_state = describe_live_state(pool, conversation_id).await;
     let prompt = format!(
@@ -1267,6 +1308,51 @@ mod tests {
             content: serde_json::to_string(&blocks).expect("ContentBlock always serializes"),
             created_at: chrono::Utc::now().naive_utc(),
         }
+    }
+
+    fn text_message(id: i64, role: &str, text: &str) -> Message {
+        message_with_blocks(id, role, vec![text_block(text)])
+    }
+
+    /// Messages 1-2 were already summarized by an earlier compaction
+    /// (3-5); only 6 is new since.
+    fn compacted_once() -> Vec<Message> {
+        let mut messages = vec![
+            text_message(1, "user", "ancient question"),
+            text_message(2, "assistant", "ancient answer"),
+        ];
+        for (offset, (role, blocks)) in compaction_messages("the earlier summary".to_string(), 2)
+            .into_iter()
+            .enumerate()
+        {
+            messages.push(message_with_blocks(3 + offset as i64, role, blocks));
+        }
+        messages.push(text_message(6, "user", "recent question"));
+        messages
+    }
+
+    #[test]
+    fn test_compaction_transcript_starts_from_the_latest_summary() {
+        let transcript = compaction_transcript(&compacted_once(), usize::MAX);
+        assert!(transcript.contains("the earlier summary"), "got {transcript}");
+        assert!(transcript.contains("recent question"), "got {transcript}");
+        assert!(
+            !transcript.contains("ancient"),
+            "messages an earlier compaction already replaced came back: {transcript}"
+        );
+    }
+
+    #[test]
+    fn test_compaction_transcript_keeps_the_most_recent_part_within_its_budget() {
+        let mut messages: Vec<Message> = (1..=50)
+            .map(|id| text_message(id, "user", &format!("message {id} {}", "x".repeat(1_000))))
+            .collect();
+        messages.push(text_message(51, "user", "the very latest"));
+        let transcript = compaction_transcript(&messages, 5_000);
+        assert!(transcript.chars().count() <= 5_000, "{} chars", transcript.chars().count());
+        assert!(transcript.contains("the very latest"));
+        assert!(transcript.contains("omitted"), "the cut should be marked");
+        assert!(!transcript.contains("message 1 "), "the oldest part should be what's dropped");
     }
 
     #[test]
