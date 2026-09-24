@@ -137,6 +137,13 @@ mod server {
             "todoread" => todoread_tool(pool, conversation_id).await,
             "webfetch" => webfetch_tool(input).await,
             "http_request" => http_request_tool(input).await,
+            "open_browser_session" => open_browser_session_tool(conversation_id).await,
+            "close_browser_session" => close_browser_session_tool(conversation_id).await,
+            "browser_navigate" => browser_navigate_tool(conversation_id, input).await,
+            "browser_click" => browser_click_tool(conversation_id, input).await,
+            "browser_fill" => browser_fill_tool(conversation_id, input).await,
+            "browser_back" => browser_back_tool(conversation_id).await,
+            "browser_read" => browser_read_tool(conversation_id).await,
             _ => execute_synchronous(name, input).await,
         }
     }
@@ -691,6 +698,88 @@ mod server {
                     },
                     "required": ["url"]
                 }),
+            },
+            ToolDefinition {
+                name: "open_browser_session".to_string(),
+                description: "Open a persistent, interactive browsing session for this \
+                               conversation — a real browser page that stays open across \
+                               multiple browser_navigate/browser_click/browser_fill/browser_back \
+                               calls, unlike webfetch's one-shot fetch. At most one session per \
+                               conversation; refuses if one is already open (close_browser_session \
+                               first). The user can watch and interact with this session live too."
+                    .to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            ToolDefinition {
+                name: "close_browser_session".to_string(),
+                description: "Close this conversation's browsing session. A no-op if none is open."
+                    .to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            ToolDefinition {
+                name: "browser_navigate".to_string(),
+                description: "Navigate the open browsing session to a URL and return the \
+                               resulting page's readable text plus a list of interactive \
+                               elements (each with an index — pass that index to browser_click/ \
+                               browser_fill). Requires open_browser_session first. http/https \
+                               only, same SSRF restriction as webfetch."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "the http:// or https:// URL to navigate to"}
+                    },
+                    "required": ["url"]
+                }),
+            },
+            ToolDefinition {
+                name: "browser_click".to_string(),
+                description: "Click the element at the given index (from the most recent \
+                               browser_navigate/browser_click/browser_fill/browser_back/ \
+                               browser_read response's elements list — an index from an older \
+                               response is meaningless) and return the resulting page's state. \
+                               May or may not navigate, depending on the element."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "element_index": {"type": "integer", "description": "an index from the most recent response's elements list"}
+                    },
+                    "required": ["element_index"]
+                }),
+            },
+            ToolDefinition {
+                name: "browser_fill".to_string(),
+                description: "Type a value into the element at the given index (an input, \
+                               textarea, ...), replacing whatever it already contained (an \
+                               empty value clears it), and return the resulting page's state. \
+                               Does not submit — call browser_click on a submit control \
+                               separately."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "element_index": {"type": "integer", "description": "an index from the most recent response's elements list"},
+                        "value": {"type": "string"}
+                    },
+                    "required": ["element_index", "value"]
+                }),
+            },
+            ToolDefinition {
+                name: "browser_back".to_string(),
+                description: "Navigate the open browsing session back in its history and \
+                               return the resulting page's state."
+                    .to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            ToolDefinition {
+                name: "browser_read".to_string(),
+                description: "Re-read the open browsing session's current page — its readable \
+                               text and a fresh interactive-element list — without taking any \
+                               action. Useful after the user interacts with the live panel \
+                               themselves."
+                    .to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
             },
         ]
     }
@@ -2017,6 +2106,45 @@ mod server {
         let body = input.get("body").and_then(Value::as_str);
         let result = crate::http_request::request(&method, &url, &headers, body).await?;
         serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
+
+    async fn open_browser_session_tool(conversation_id: i64) -> Result<String, String> {
+        crate::browsing::open_session(conversation_id).await?;
+        Ok("browser session opened".to_string())
+    }
+
+    async fn close_browser_session_tool(conversation_id: i64) -> Result<String, String> {
+        crate::browsing::close_session(conversation_id).await?;
+        Ok("browser session closed".to_string())
+    }
+
+    async fn browser_navigate_tool(conversation_id: i64, input: &Value) -> Result<String, String> {
+        let url = required_str(input, "url")?;
+        let state = crate::browsing::navigate(conversation_id, &url).await?;
+        serde_json::to_string(&state).map_err(|e| e.to_string())
+    }
+
+    async fn browser_click_tool(conversation_id: i64, input: &Value) -> Result<String, String> {
+        let element_index = required_i64(input, "element_index")?;
+        let state = crate::browsing::click(conversation_id, element_index as usize).await?;
+        serde_json::to_string(&state).map_err(|e| e.to_string())
+    }
+
+    async fn browser_fill_tool(conversation_id: i64, input: &Value) -> Result<String, String> {
+        let element_index = required_i64(input, "element_index")?;
+        let value = required_str(input, "value")?;
+        let state = crate::browsing::fill(conversation_id, element_index as usize, &value).await?;
+        serde_json::to_string(&state).map_err(|e| e.to_string())
+    }
+
+    async fn browser_back_tool(conversation_id: i64) -> Result<String, String> {
+        let state = crate::browsing::go_back(conversation_id).await?;
+        serde_json::to_string(&state).map_err(|e| e.to_string())
+    }
+
+    async fn browser_read_tool(conversation_id: i64) -> Result<String, String> {
+        let state = crate::browsing::read(conversation_id).await?;
+        serde_json::to_string(&state).map_err(|e| e.to_string())
     }
 
     #[cfg(test)]

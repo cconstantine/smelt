@@ -8,6 +8,62 @@
 
 use std::net::IpAddr;
 
+use chromiumoxide::Page;
+use chromiumoxide::cdp::browser_protocol::fetch::{
+    ContinueRequestParams, EnableParams, EventRequestPaused, FailRequestParams,
+};
+use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
+use futures_util::StreamExt;
+
+/// Enables CDP Fetch-domain request interception on `page` and spawns a
+/// background task that checks every paused request's URL against
+/// `is_addr_allowed` (via `is_request_allowed_with`), continuing it if
+/// safe and failing it (`ErrorReason::BlockedByClient`) otherwise. Shared
+/// by `src/webfetch.rs` (one page, used for the duration of a single
+/// `fetch` call) and `src/browsing.rs` (one page, kept open across many
+/// tool calls) — the interception itself works identically either way:
+/// once enabled, it stays active for every request that page makes,
+/// including subresources, redirects, and later navigations, until the
+/// page closes or the returned task is aborted. Caller owns the
+/// `JoinHandle` and is responsible for aborting it when the page is done
+/// with (`webfetch` aborts it right after its one `goto`+extract;
+/// `browsing` keeps it running for the session's whole life).
+pub async fn spawn_request_interceptor(
+    page: &Page,
+    is_addr_allowed: fn(IpAddr) -> bool,
+) -> Result<tokio::task::JoinHandle<()>, String> {
+    page.execute(EnableParams::default())
+        .await
+        .map_err(|e| format!("failed to enable request interception: {e}"))?;
+    let mut paused = page
+        .event_listener::<EventRequestPaused>()
+        .await
+        .map_err(|e| format!("failed to listen for intercepted requests: {e}"))?;
+    let intercept_page = page.clone();
+    Ok(tokio::spawn(async move {
+        while let Some(event) = paused.next().await {
+            let allowed = is_request_allowed_with(&event.request.url, is_addr_allowed).await;
+            let result = if allowed {
+                intercept_page
+                    .execute(ContinueRequestParams::new(event.request_id.clone()))
+                    .await
+                    .map(|_| ())
+            } else {
+                intercept_page
+                    .execute(FailRequestParams::new(
+                        event.request_id.clone(),
+                        ErrorReason::BlockedByClient,
+                    ))
+                    .await
+                    .map(|_| ())
+            };
+            if let Err(e) = result {
+                tracing::warn!("fetch_guard: failed to resolve intercepted request: {e}");
+            }
+        }
+    }))
+}
+
 /// The core SSRF check: is `addr` safe to let a request actually connect
 /// to? `false` for loopback/link-local/private (RFC 1918)/unspecified/
 /// multicast — every category of "not really an arbitrary public host."
@@ -75,13 +131,31 @@ pub async fn is_request_allowed_with(url: &str, is_addr_allowed: fn(IpAddr) -> b
     let Ok((host, port)) = parse_fetch_target(url) else {
         return false;
     };
-    match tokio::net::lookup_host((host.as_str(), port)).await {
-        Ok(addrs) => {
-            let addrs: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
-            !addrs.is_empty() && addrs.iter().all(|&a| is_addr_allowed(a))
-        }
-        Err(_) => false,
+    resolve_allowed(&host, port, is_addr_allowed).await.is_ok()
+}
+
+/// Resolves `host:port` and returns its addresses only if every one of them
+/// passes `is_addr_allowed` — a host with any refused address is refused
+/// outright, and a failed or empty resolution is an error, never "assume
+/// fine." Callers that go on to connect should connect to one of the
+/// returned addresses rather than resolving again, so a DNS answer that
+/// changes between check and connect can't slip through.
+pub async fn resolve_allowed(
+    host: &str,
+    port: u16,
+    is_addr_allowed: fn(IpAddr) -> bool,
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("could not resolve {host}: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("{host} resolved to no addresses"));
     }
+    if let Some(refused) = addrs.iter().find(|a| !is_addr_allowed(a.ip())) {
+        return Err(format!("{host} resolves to a refused address ({})", refused.ip()));
+    }
+    Ok(addrs)
 }
 
 /// Caps `text` to `max_chars`, same shape `fetch_command_summary`'s tail

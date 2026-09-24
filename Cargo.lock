@@ -2879,6 +2879,7 @@ checksum = "b750dcadc39a09dbadd74e118f6dd6598df77fa01df0cfcdc52c28dece74528a"
 dependencies = [
  "bitflags 2.13.1",
  "serde",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -4639,6 +4640,7 @@ dependencies = [
  "http",
  "ignore",
  "k8s-openapi",
+ "keyboard-types",
  "kube",
  "nix",
  "percent-encoding",

@@ -95,6 +95,23 @@ pub enum ConversationEvent {
     TodoListUpdate {
         items: Vec<crate::anthropic::tools::TodoItem>,
     },
+    /// Published by `open_browser_session`/`close_browser_session` — the
+    /// live panel uses this to show/hide reactively rather than only
+    /// checking on conversation (re)select, same reasoning
+    /// `SandboxPodUpdate` already established for the sandbox panel.
+    /// Ephemeral UI telemetry, regenerable at any time from
+    /// `api::browsing::get_browsing_state`. See
+    /// docs/projects/plans/web-browsing.md.
+    BrowsingSessionUpdate {
+        open: bool,
+    },
+    /// Published whenever a browsing session's page URL changes — the model
+    /// navigating, a link click, a redirect, or an in-page change like
+    /// `pushState` — so the live panel's address bar can follow along.
+    /// Regenerable from `api::browsing::get_browsing_state`.
+    BrowsingUrlUpdate {
+        url: String,
+    },
 }
 
 #[cfg(feature = "server")]

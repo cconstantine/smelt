@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use dioxus::html::geometry::PixelsVector2D;
+use dioxus::html::geometry::{PixelsVector2D, WheelDelta};
+use dioxus::html::input_data::MouseButton;
 #[cfg(feature = "web")]
 use dioxus::prelude::dioxus_core::Task;
 use dioxus::prelude::*;
@@ -18,17 +19,21 @@ use crate::anthropic::tools::{TodoItem, TodoStatus};
 use crate::anthropic::tools::TaskSummary;
 #[cfg(any(feature = "web", test))]
 use crate::api::chat::SandboxSnapshot;
+use crate::api::browsing::{navigate_browser, send_browser_input};
 use crate::api::chat::{
     ChatEvent, ContextDetailSnapshot, ContextUsageSnapshot, create_conversation,
     delete_conversation, get_context_detail, get_conversations, get_messages, send_message,
 };
-// Only called from the live event-subscription loop below, which is
-// `web`-only (see its own cfg) — a native `server`-only build never reaches
-// them.
+// Only called from the live event-subscription loops below, which are
+// `web`-only (see their own cfg) — a native `server`-only build never
+// reaches them.
 #[cfg(feature = "web")]
 use crate::api::chat::{
     get_context_usage, get_sandbox_state, get_tasks, get_todos, subscribe_conversation_events,
 };
+#[cfg(feature = "web")]
+use crate::api::browsing::{get_browsing_state, subscribe_browser_frames};
+use crate::browsing::BrowserInputEvent;
 // Only referenced by this module's own tests, which build their own
 // `SandboxSnapshot`s by hand rather than through `get_sandbox_state`.
 #[cfg(test)]
@@ -74,6 +79,128 @@ fn todo_status_class(status: TodoStatus) -> &'static str {
         TodoStatus::InProgress => "in-progress",
         TodoStatus::Completed => "completed",
     }
+}
+
+/// Maps a live-panel keydown to a `BrowserInputEvent`, or `None` for a
+/// key that isn't meaningful to forward (a bare modifier like Shift/Alt/
+/// Control on its own, an unrecognized named key, ...). A printable
+/// character forwards as `TypeText`; a named key forwards as `PressKey`
+/// only if `browsing::server::named_key_event_fields` (checked
+/// server-side too — this is just avoiding an obviously-doomed round
+/// trip) recognizes it. Unconditional (not web-gated): called from the
+/// main render body's `onkeydown` handler, part of the same shared rsx
+/// tree the server target compiles too — same reason `todo_status_class`
+/// is unconditional. A character typed with Ctrl/Cmd held is a shortcut,
+/// not text (Ctrl+V must not type a "v"), so it isn't forwarded — the
+/// caller then leaves it to the viewer's own browser. Ctrl+Alt is let
+/// through: that's how AltGr reports itself on Windows, and AltGr is
+/// ordinary typing on many layouts. A named key carries its modifiers, so
+/// Shift+Tab or Ctrl+Backspace do what they would on a real keyboard.
+fn browser_input_event_for_key(
+    key: keyboard_types::Key,
+    modifiers: keyboard_types::Modifiers,
+) -> Option<BrowserInputEvent> {
+    match key {
+        keyboard_types::Key::Character(_)
+            if (modifiers.ctrl() || modifiers.meta()) && !modifiers.alt() =>
+        {
+            None
+        }
+        keyboard_types::Key::Character(text) => Some(BrowserInputEvent::TypeText { text }),
+        named => {
+            let name = named.to_string();
+            matches!(
+                name.as_str(),
+                "Enter"
+                    | "Backspace"
+                    | "Tab"
+                    | "Escape"
+                    | "Delete"
+                    | "ArrowUp"
+                    | "ArrowDown"
+                    | "ArrowLeft"
+                    | "ArrowRight"
+            )
+            .then(|| BrowserInputEvent::PressKey {
+                key: name,
+                modifiers: cdp_modifiers(modifiers),
+            })
+        }
+    }
+}
+
+/// CDP's modifier bitmask for `Input.dispatchKeyEvent`.
+fn cdp_modifiers(modifiers: keyboard_types::Modifiers) -> i64 {
+    [
+        (modifiers.alt(), 1),
+        (modifiers.ctrl(), 2),
+        (modifiers.meta(), 4),
+        (modifiers.shift(), 8),
+    ]
+    .into_iter()
+    .filter(|(held, _)| *held)
+    .map(|(_, bit)| bit)
+    .sum()
+}
+
+/// The live panel address bar's text: the page's URL, except while the
+/// viewer is typing, when an arriving URL change mustn't overwrite them.
+fn address_bar_value(editing: bool, draft: &str, url: Option<&str>) -> String {
+    if editing {
+        draft.to_string()
+    } else {
+        url.unwrap_or_default().to_string()
+    }
+}
+
+/// A failed navigation's message as the viewer should read it — the
+/// server's own message, without the wrapper `ServerFnError`'s `Display`
+/// adds around it.
+fn navigation_error_message(error: &ServerFnError) -> String {
+    match error {
+        ServerFnError::ServerError { message, .. } => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Chromium scrolls 40px per wheel "line".
+const WHEEL_PIXELS_PER_LINE: f64 = 40.0;
+/// A wheel "page" is one live-panel frame (`browsing::server`'s pinned
+/// 1280x800 viewport).
+const WHEEL_PIXELS_PER_PAGE: (f64, f64) = (1280.0, 800.0);
+
+/// A wheel event's delta in pixels, whatever unit the viewer's browser
+/// reported it in — Firefox reports lines, so passing the raw number
+/// through would scroll ~3px per notch.
+fn wheel_delta_pixels(delta: WheelDelta) -> (f64, f64) {
+    match delta {
+        WheelDelta::Pixels(v) => (v.x, v.y),
+        WheelDelta::Lines(v) => (v.x * WHEEL_PIXELS_PER_LINE, v.y * WHEEL_PIXELS_PER_LINE),
+        WheelDelta::Pages(v) => (v.x * WHEEL_PIXELS_PER_PAGE.0, v.y * WHEEL_PIXELS_PER_PAGE.1),
+    }
+}
+
+/// Collapses each run of back-to-back mouse moves (for the same
+/// conversation) down to its last one — only the pointer's latest position
+/// matters, and forwarding every intermediate one would let a fast-moving
+/// mouse queue up far more requests than the page needs. Anything else
+/// keeps its place and order.
+fn coalesce_mouse_moves(batch: Vec<(i64, BrowserInputEvent)>) -> Vec<(i64, BrowserInputEvent)> {
+    let mut out: Vec<(i64, BrowserInputEvent)> = Vec::with_capacity(batch.len());
+    for item in batch {
+        let replaces_last = matches!(
+            (out.last(), &item),
+            (
+                Some((last_id, BrowserInputEvent::MouseMove { .. })),
+                (id, BrowserInputEvent::MouseMove { .. }),
+            ) if last_id == id
+        );
+        if replaces_last {
+            out.pop();
+        }
+        out.push(item);
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1202,6 +1329,182 @@ mod tests {
         assert_eq!(existing[0].stderr, vec!["a diagnostic".to_string()]);
     }
 
+    fn no_mods() -> keyboard_types::Modifiers {
+        keyboard_types::Modifiers::empty()
+    }
+
+    #[test]
+    fn test_browser_input_event_for_key_leaves_ctrl_and_cmd_shortcuts_to_the_viewer() {
+        for mods in [keyboard_types::Modifiers::CONTROL, keyboard_types::Modifiers::META] {
+            assert_eq!(
+                browser_input_event_for_key(keyboard_types::Key::Character("v".to_string()), mods),
+                None,
+                "{mods:?}+V should not type a v"
+            );
+        }
+    }
+
+    #[test]
+    fn test_browser_input_event_for_key_still_types_altgr_characters() {
+        // Windows reports AltGr as Ctrl+Alt.
+        assert_eq!(
+            browser_input_event_for_key(
+                keyboard_types::Key::Character("@".to_string()),
+                keyboard_types::Modifiers::CONTROL | keyboard_types::Modifiers::ALT,
+            ),
+            Some(BrowserInputEvent::TypeText { text: "@".to_string() })
+        );
+    }
+
+    #[test]
+    fn test_browser_input_event_for_key_types_shifted_characters() {
+        assert_eq!(
+            browser_input_event_for_key(
+                keyboard_types::Key::Character("A".to_string()),
+                keyboard_types::Modifiers::SHIFT,
+            ),
+            Some(BrowserInputEvent::TypeText { text: "A".to_string() })
+        );
+    }
+
+    #[test]
+    fn test_browser_input_event_for_key_carries_modifiers_on_named_keys() {
+        assert_eq!(
+            browser_input_event_for_key(keyboard_types::Key::Tab, keyboard_types::Modifiers::SHIFT),
+            Some(BrowserInputEvent::PressKey { key: "Tab".to_string(), modifiers: 8 })
+        );
+        assert_eq!(
+            browser_input_event_for_key(
+                keyboard_types::Key::Backspace,
+                keyboard_types::Modifiers::CONTROL
+            ),
+            Some(BrowserInputEvent::PressKey { key: "Backspace".to_string(), modifiers: 2 })
+        );
+    }
+
+    #[test]
+    fn test_cdp_modifiers_sets_one_bit_per_held_modifier() {
+        use keyboard_types::Modifiers;
+        assert_eq!(cdp_modifiers(Modifiers::empty()), 0);
+        assert_eq!(cdp_modifiers(Modifiers::ALT), 1);
+        assert_eq!(cdp_modifiers(Modifiers::CONTROL), 2);
+        assert_eq!(cdp_modifiers(Modifiers::META), 4);
+        assert_eq!(cdp_modifiers(Modifiers::SHIFT), 8);
+        assert_eq!(cdp_modifiers(Modifiers::CONTROL | Modifiers::SHIFT), 10);
+    }
+
+    #[test]
+    fn test_wheel_delta_pixels_passes_pixels_through() {
+        assert_eq!(wheel_delta_pixels(WheelDelta::pixels(0.0, 120.0, 0.0)), (0.0, 120.0));
+    }
+
+    #[test]
+    fn test_wheel_delta_pixels_converts_lines_and_pages() {
+        assert_eq!(
+            wheel_delta_pixels(WheelDelta::from_web_attributes(1, 0.0, 3.0, 0.0)),
+            (0.0, 120.0)
+        );
+        assert_eq!(
+            wheel_delta_pixels(WheelDelta::from_web_attributes(2, 1.0, -1.0, 0.0)),
+            (1280.0, -800.0)
+        );
+    }
+
+    #[test]
+    fn test_address_bar_value_follows_the_page_until_editing() {
+        assert_eq!(address_bar_value(false, "typed", Some("https://a.example/")), "https://a.example/");
+        assert_eq!(address_bar_value(false, "typed", None), "");
+    }
+
+    #[test]
+    fn test_address_bar_value_keeps_what_is_being_typed() {
+        assert_eq!(address_bar_value(true, "exam", Some("https://a.example/")), "exam");
+    }
+
+    #[test]
+    fn test_navigation_error_message_shows_just_the_server_message() {
+        let error = ServerFnError::ServerError {
+            message: "failed to load https://x/: net::ERR_BLOCKED_BY_CLIENT".to_string(),
+            code: 500,
+            details: None,
+        };
+        assert_eq!(
+            navigation_error_message(&error),
+            "failed to load https://x/: net::ERR_BLOCKED_BY_CLIENT"
+        );
+    }
+
+    fn mv(x: f64) -> BrowserInputEvent {
+        BrowserInputEvent::MouseMove { x, y: 0.0, left_held: false }
+    }
+
+    #[test]
+    fn test_coalesce_mouse_moves_keeps_only_the_last_of_a_run() {
+        let down = BrowserInputEvent::MouseDown { x: 3.0, y: 0.0 };
+        assert_eq!(
+            coalesce_mouse_moves(vec![(1, mv(1.0)), (1, mv(2.0)), (1, down.clone()), (1, mv(4.0)), (1, mv(5.0))]),
+            vec![(1, mv(2.0)), (1, down), (1, mv(5.0))]
+        );
+    }
+
+    #[test]
+    fn test_coalesce_mouse_moves_keeps_moves_for_different_conversations() {
+        assert_eq!(
+            coalesce_mouse_moves(vec![(1, mv(1.0)), (2, mv(2.0))]),
+            vec![(1, mv(1.0)), (2, mv(2.0))]
+        );
+    }
+
+    #[test]
+    fn test_browser_input_event_for_key_maps_a_printable_character_to_type_text() {
+        assert_eq!(
+            browser_input_event_for_key(keyboard_types::Key::Character("a".to_string()), no_mods()),
+            Some(BrowserInputEvent::TypeText {
+                text: "a".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_browser_input_event_for_key_maps_each_recognized_named_key_to_press_key() {
+        let cases = [
+            (keyboard_types::Key::Enter, "Enter"),
+            (keyboard_types::Key::Backspace, "Backspace"),
+            (keyboard_types::Key::Tab, "Tab"),
+            (keyboard_types::Key::Escape, "Escape"),
+            (keyboard_types::Key::Delete, "Delete"),
+            (keyboard_types::Key::ArrowUp, "ArrowUp"),
+            (keyboard_types::Key::ArrowDown, "ArrowDown"),
+            (keyboard_types::Key::ArrowLeft, "ArrowLeft"),
+            (keyboard_types::Key::ArrowRight, "ArrowRight"),
+        ];
+        for (key, expected_name) in cases {
+            assert_eq!(
+                browser_input_event_for_key(key, no_mods()),
+                Some(BrowserInputEvent::PressKey {
+                    key: expected_name.to_string(),
+                    modifiers: 0,
+                }),
+                "expected {expected_name} to forward as a PressKey"
+            );
+        }
+    }
+
+    #[test]
+    fn test_browser_input_event_for_key_drops_an_unrecognized_named_key() {
+        // F1 isn't in the forwarded set — same reasoning
+        // `browsing::server::named_key_event_fields` uses server-side: no
+        // point round-tripping a key the server would reject anyway.
+        assert_eq!(browser_input_event_for_key(keyboard_types::Key::F1, no_mods()), None);
+    }
+
+    #[test]
+    fn test_browser_input_event_for_key_drops_a_bare_modifier() {
+        assert_eq!(browser_input_event_for_key(keyboard_types::Key::Shift, no_mods()), None);
+        assert_eq!(browser_input_event_for_key(keyboard_types::Key::Control, no_mods()), None);
+        assert_eq!(browser_input_event_for_key(keyboard_types::Key::Alt, no_mods()), None);
+    }
+
     fn test_sandbox_terminal_entry(terminal_id: i64, pod_id: i64) -> SandboxTerminalPanelEntry {
         SandboxTerminalPanelEntry {
             terminal_id,
@@ -1719,6 +2022,44 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
     let mut sandbox_pods: Signal<Vec<SandboxPodPanelEntry>> = use_signal(Vec::new);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut sandbox_terminals: Signal<Vec<SandboxTerminalPanelEntry>> = use_signal(Vec::new);
+    // Whether the model currently has a browsing session open — drives
+    // both the panel's visibility and (via the separate effect below)
+    // the live frame subscription. Updated by the initial
+    // `get_browsing_state` pull and by `ConversationEvent::BrowsingSessionUpdate`.
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut browsing_session_open: Signal<bool> = use_signal(|| false);
+    // The session page's current URL, from `get_browsing_state` and
+    // `ConversationEvent::BrowsingUrlUpdate`.
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut browsing_url: Signal<Option<String>> = use_signal(|| None);
+    // The address bar's own state: what's typed, whether the viewer is
+    // typing (so incoming URL changes don't clobber it), an in-flight
+    // navigation, and the last navigation error.
+    let mut address_draft = use_signal(String::new);
+    let mut address_editing = use_signal(|| false);
+    let mut address_pending = use_signal(|| false);
+    let mut address_error: Signal<Option<String>> = use_signal(|| None);
+    // Forwards the live panel's input one request at a time, in the order
+    // it happened — separately spawned requests can overtake each other (a
+    // mouse-up reaching the page before its mouse-down). Moves that queued
+    // up while a request was in flight collapse to the latest one.
+    let browser_input = use_coroutine(
+        move |mut queue: UnboundedReceiver<(i64, BrowserInputEvent)>| async move {
+            while let Ok(first) = queue.recv().await {
+                let mut batch = vec![first];
+                while let Ok(next) = queue.try_recv() {
+                    batch.push(next);
+                }
+                for (id, event) in coalesce_mouse_moves(batch) {
+                    let _ = send_browser_input(id, event).await;
+                }
+            }
+        },
+    );
+    // The latest live-panel frame (base64 JPEG), `None` until the first
+    // one arrives after subscribing.
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut browsing_frame: Signal<Option<String>> = use_signal(|| None);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut tz_offset_minutes: Signal<i32> = use_signal(|| 0);
     // `None` until the first `ContextUsageUpdate`/`get_context_usage` pull
@@ -1812,6 +2153,11 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
             sandbox_terminals.set(Vec::new());
             terminal_body_els.write().clear();
             terminal_body_stuck.write().clear();
+            browsing_session_open.set(false);
+            browsing_frame.set(None);
+            browsing_url.set(None);
+            address_editing.set(false);
+            address_error.set(None);
 
             let handle = spawn(async move {
                 loop {
@@ -1840,6 +2186,10 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                         }
                         if let Ok(snapshot) = get_todos(id).await {
                             todos.set(snapshot);
+                        }
+                        if let Ok(state) = get_browsing_state(id).await {
+                            browsing_session_open.set(state.session_open);
+                            browsing_url.set(state.url);
                         }
 
                         loop {
@@ -1927,6 +2277,16 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                 Some(Ok(ConversationEvent::TodoListUpdate { items })) => {
                                     todos.set(items);
                                 }
+                                Some(Ok(ConversationEvent::BrowsingSessionUpdate { open })) => {
+                                    browsing_session_open.set(open);
+                                    if !open {
+                                        browsing_frame.set(None);
+                                        browsing_url.set(None);
+                                    }
+                                }
+                                Some(Ok(ConversationEvent::BrowsingUrlUpdate { url })) => {
+                                    browsing_url.set(Some(url));
+                                }
                                 Some(Err(_)) | None => break,
                             }
                         }
@@ -1939,6 +2299,50 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                 }
             });
             event_task.set(Some(handle));
+        });
+    }
+
+    // A second, independent live subscription — the frame stream isn't
+    // part of `ConversationEvent` (see `events::ConversationEvent`'s own
+    // doc comment on why frames get a separate channel), and only needs
+    // to run while a session is actually open, not for the conversation's
+    // whole lifetime the way the main event subscription does. Reacts to
+    // both `selected()` (conversation switch) and `browsing_session_open()`
+    // (the model opening/closing a session) — either changing tears down
+    // any existing subscription and, if a session is now open, starts a
+    // fresh one.
+    #[cfg(feature = "web")]
+    {
+        let mut frame_task: Signal<Option<Task>> = use_signal(|| None);
+        use_effect(move || {
+            if let Some(task) = frame_task.write().take() {
+                task.cancel();
+            }
+            let Some(id) = selected() else { return };
+            if !browsing_session_open() {
+                return;
+            }
+            let handle = spawn(async move {
+                loop {
+                    if let Ok(mut frames) = subscribe_browser_frames(id).await {
+                        while let Some(Ok(frame)) = frames.recv().await {
+                            browsing_frame.set(Some(frame.data));
+                        }
+                    }
+                    // The stream ended or never opened — a network blip, a
+                    // server restart, or the session closing. Reconnect,
+                    // unless the session really is gone (this effect then
+                    // re-runs and hides the panel).
+                    gloo_timers::future::TimeoutFuture::new(1500).await;
+                    if let Ok(state) = get_browsing_state(id).await
+                        && !state.session_open
+                    {
+                        browsing_session_open.set(false);
+                        return;
+                    }
+                }
+            });
+            frame_task.set(Some(handle));
         });
     }
 
@@ -2119,8 +2523,134 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                 Some(_) => {
                     let tool_names = tool_use_names_by_id(&messages());
                     rsx! {
-                    if !tasks().is_empty() || !sandbox_pods().is_empty() || !todos().is_empty() {
+                    if !tasks().is_empty() || !sandbox_pods().is_empty() || !todos().is_empty() || browsing_session_open() {
                         div { class: "side-panels-row",
+                            if browsing_session_open() {
+                                aside { class: "browsing-panel",
+                                    h3 { "Live Browser" }
+                                    form {
+                                        class: "browsing-address-bar",
+                                        onsubmit: move |event| {
+                                            event.prevent_default();
+                                            let Some(id) = selected() else { return };
+                                            if address_pending() {
+                                                return;
+                                            }
+                                            let address = address_draft();
+                                            address_pending.set(true);
+                                            address_error.set(None);
+                                            spawn(async move {
+                                                match navigate_browser(id, address).await {
+                                                    Ok(()) => address_editing.set(false),
+                                                    Err(e) => address_error.set(Some(navigation_error_message(&e))),
+                                                }
+                                                address_pending.set(false);
+                                            });
+                                        },
+                                        input {
+                                            class: "browsing-address-input",
+                                            r#type: "text",
+                                            spellcheck: "false",
+                                            autocomplete: "off",
+                                            aria_label: "Address",
+                                            placeholder: "Enter an address",
+                                            disabled: address_pending(),
+                                            value: address_bar_value(
+                                                address_editing(),
+                                                &address_draft(),
+                                                browsing_url().as_deref(),
+                                            ),
+                                            onfocus: move |_| {
+                                                if !address_editing() {
+                                                    address_draft.set(browsing_url().unwrap_or_default());
+                                                    address_editing.set(true);
+                                                }
+                                            },
+                                            oninput: move |e| {
+                                                address_draft.set(e.value());
+                                                address_editing.set(true);
+                                            },
+                                            onblur: move |_| {
+                                                if !address_pending() {
+                                                    address_editing.set(false);
+                                                }
+                                            },
+                                            onkeydown: move |e: Event<KeyboardData>| {
+                                                if e.data().key() == keyboard_types::Key::Escape {
+                                                    address_editing.set(false);
+                                                    address_error.set(None);
+                                                }
+                                            },
+                                        }
+                                    }
+                                    if let Some(error) = address_error() {
+                                        p { class: "browsing-address-error", role: "alert", "{error}" }
+                                    }
+                                    div {
+                                        class: "browsing-panel-frame-wrap",
+                                        tabindex: "0",
+                                        oncontextmenu: move |evt| evt.prevent_default(),
+                                        onmousemove: move |evt: Event<MouseData>| {
+                                            let Some(id) = selected() else { return };
+                                            let p = evt.data().element_coordinates();
+                                            let left_held = evt.data().held_buttons().contains(MouseButton::Primary);
+                                            browser_input.send((id, BrowserInputEvent::MouseMove { x: p.x, y: p.y, left_held }));
+                                        },
+                                        onmousedown: move |evt: Event<MouseData>| {
+                                            if evt.data().trigger_button() != Some(MouseButton::Primary) {
+                                                return;
+                                            }
+                                            let Some(id) = selected() else { return };
+                                            let p = evt.data().element_coordinates();
+                                            browser_input.send((id, BrowserInputEvent::MouseDown { x: p.x, y: p.y }));
+                                        },
+                                        onmouseup: move |evt: Event<MouseData>| {
+                                            if evt.data().trigger_button() != Some(MouseButton::Primary) {
+                                                return;
+                                            }
+                                            let Some(id) = selected() else { return };
+                                            let p = evt.data().element_coordinates();
+                                            browser_input.send((id, BrowserInputEvent::MouseUp { x: p.x, y: p.y }));
+                                        },
+                                        onwheel: move |evt: Event<WheelData>| {
+                                            let Some(id) = selected() else { return };
+                                            let p = evt.data().element_coordinates();
+                                            let (delta_x, delta_y) = wheel_delta_pixels(evt.data().delta());
+                                            browser_input.send((
+                                                id,
+                                                BrowserInputEvent::Wheel {
+                                                    x: p.x,
+                                                    y: p.y,
+                                                    delta_x,
+                                                    delta_y,
+                                                },
+                                            ));
+                                        },
+                                        onkeydown: move |evt: Event<KeyboardData>| {
+                                            let Some(id) = selected() else { return };
+                                            let Some(input_event) = browser_input_event_for_key(
+                                                evt.data().key(),
+                                                evt.data().modifiers(),
+                                            ) else {
+                                                // Not ours to handle (a shortcut, a bare
+                                                // modifier) — leave it to the viewer's browser.
+                                                return;
+                                            };
+                                            evt.prevent_default();
+                                            browser_input.send((id, input_event));
+                                        },
+                                        if let Some(data) = browsing_frame() {
+                                            img {
+                                                class: "browsing-panel-frame",
+                                                src: "data:image/jpeg;base64,{data}",
+                                                alt: "Live browsing session",
+                                            }
+                                        } else {
+                                            div { class: "browsing-panel-empty", "Waiting for the first frame…" }
+                                        }
+                                    }
+                                }
+                            }
                             if !todos().is_empty() {
                                 aside { class: "todo-panel",
                                     h3 { "Todos" }
