@@ -221,15 +221,16 @@ async fn wait_for_live_client(page: &chromiumoxide::Page, conversation_id: i64) 
     }
 }
 
-/// Clicks the sidebar entry whose title contains `title` — an in-app
-/// navigation, like a user's click, not a page load (which would end any
-/// reply in flight and hide the bug being tested).
-async fn click_conversation(page: &chromiumoxide::Page, title: &str) {
+/// Clicks conversation `id`'s sidebar entry — an in-app navigation, like a
+/// user's click, not a page load (which would end any reply in flight and
+/// hide the bug being tested) — and waits until the app is showing it. By
+/// id, not title: titles repeat across runs against the same database, and
+/// the sidebar doesn't refresh a title after the page loads.
+async fn click_conversation(page: &chromiumoxide::Page, id: i64) {
     let clicked: bool = page
         .evaluate(format!(
             "(() => {{
-                const item = [...document.querySelectorAll('.conversation-item')]
-                    .find(e => e.innerText.includes({title:?}));
+                const item = document.querySelector('.conversation-item[data-conversation-id=\"{id}\"]');
                 if (item) item.click();
                 return !!item;
             }})()"
@@ -238,7 +239,25 @@ async fn click_conversation(page: &chromiumoxide::Page, title: &str) {
         .expect("click a conversation")
         .into_value()
         .expect("a bool");
-    assert!(clicked, "no sidebar entry titled {title:?}");
+    assert!(clicked, "no sidebar entry for conversation {id}");
+    let path = format!("/conversation/{id}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let current: String = page
+            .evaluate("location.pathname")
+            .await
+            .expect("read the location")
+            .into_value()
+            .expect("a string");
+        if current == path {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "clicking conversation {id} left the app at {current}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// A mock Anthropic upstream whose one reply streams 25 words
@@ -616,7 +635,7 @@ async fn test_end_to_end_browser_scenarios() {
             "A's reply should start streaming"
         );
 
-        click_conversation(&chat, "seeded message in B").await;
+        click_conversation(&chat, other.id).await;
         assert!(
             wait_for_text(&chat, "seeded message in B", Duration::from_secs(5)).await,
             "should now be showing B"
@@ -634,7 +653,7 @@ async fn test_end_to_end_browser_scenarios() {
         assert!(!b.shows_reply, "A's finished reply landed in B: {b:?}");
         assert!(b.input_enabled, "B's message box is disabled after A finished: {b:?}");
 
-        click_conversation(&chat, "hello from A").await;
+        click_conversation(&chat, streaming.id).await;
         assert!(
             wait_for_text(&chat, "zebra24", Duration::from_secs(10)).await,
             "A should show its finished reply after switching back"
