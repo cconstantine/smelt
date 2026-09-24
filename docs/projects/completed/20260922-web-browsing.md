@@ -4,7 +4,7 @@
 
 ## What shipped
 
-Two connected pieces, exactly as scoped.
+The two pieces the plan scoped, plus infrastructure the review rounds showed was needed, which also changes `webfetch`: an egress proxy for all browser traffic (`src/egress_proxy.rs`), a Chrome launcher that can't leave orphaned processes (`src/headless_chrome.rs`), and a log filter for a chromiumoxide/Chrome protocol mismatch.
 
 ### Persistent browsing-session tools
 
@@ -17,42 +17,72 @@ A real, two-way interactive view — not a periodic snapshot. `Page.startScreenc
 - An address bar above the frame shows the page's URL and follows every navigation, whoever made it: the model, a click in the panel, a redirect, or an in-page `pushState`. Typing an address there and pressing Enter navigates the session through the same `navigate` (and SSRF guard) the model uses; a bare host gets `https://`. Added after the review rounds, at the user's request.
 - Confirmed against the vendored `chromiumoxide_cdp` source before committing to the design: `Page.startScreencast`/`screencastFrameAck`/`EventScreencastFrame` and `Input.dispatchMouseEvent`/`dispatchKeyEvent` all exist with the needed shapes.
 - The session's viewport is pinned (`Emulation.setDeviceMetricsOverride`) to exactly the screencast's own bounds, so the frontend's click-coordinate math needs no scale-factor lookup — an on-screen pixel offset within the (fixed-size, non-responsive) frame `<img>` already equals a real frame pixel.
-- Runs on `webfetch`'s shared browser and `fetch_guard`'s SSRF logic. CDP's Fetch-domain interception, once enabled on a page, covers that page's whole lifetime (every later navigation, every subresource). It does *not* cover anything outside that page — popups, WebSockets, service workers — which the third review found could reach internal addresses (in `webfetch` too). All browser traffic now goes through `src/egress_proxy.rs`, which applies the same guard at the network level.
+- Runs on `webfetch`'s shared browser and `fetch_guard`'s SSRF guard. The guard applies twice: per page through CDP's Fetch-domain interception, and for all of the browser's traffic through `src/egress_proxy.rs`. The proxy covers popups, WebSockets and service workers, which per-page interception never sees.
 
-**Verification:** 334 `cargo test --features server` tests passing, both build targets clean with no warnings, and a 25-scenario real-browser test (run inline inside `webfetch::browser_tests::test_fetch_scenarios`, since it shares that same process-global browser static) covering: session open/refuse-second/close/closed-errors, a real navigating click, a real non-navigating (JS-only) click, real typed input with a real page reaction, `go_back`, screencast frames actually flowing once acked (not stalling after one), the subscribe/stop/resubscribe lifecycle, real mouse+keyboard dispatch via `send_input`, plus the regressions from the pre-merge review (below). Beyond the automated tier, a full real-app pass (real `dx serve`, a real conversation, a real model call) confirmed the whole chain end-to-end: the model called `open_browser_session` then `browser_navigate`, and the live panel rendered the actual page — visually confirmed via screenshot, with growing frame data confirming more than one real frame arrived.
+**Verification:** 334 `cargo test --features server` tests passing, both build targets clean with no warnings. The browser tier (`cargo test --features "server browser-test" -- --ignored`) passes. It runs 25 browsing scenarios inline in `webfetch`'s real-browser test (they share its process-global browser). Those scenarios cover the session lifecycle, clicks that do and don't navigate (including slow pages and delayed updates), `fill` with any text, screencast frames and viewer lifecycle, input dispatch, URL tracking, and a regression test for every review finding. Alongside them run `webfetch`'s own escape checks, the sandbox-panel harness, and a test that Chrome dies with the process that launched it. Every round was also checked in the real app with a real model: the panel streaming, input, the address bar, HTTPS through the proxy, and refused internal addresses.
 
 ## Retrospective
 
+The branch was called done four times. In between, three code reviews found 21 real bugs, a security hole among them, and checking the fixes turned up a leak of orphaned Chrome processes. Nearly everything worth learning is in why they got past the original implementation.
+
 **What worked:**
-- **Reusing existing infrastructure instead of building parallel mechanisms.** The feature runs on `webfetch`'s existing shared browser and SSRF guard rather than a second copy of either. It mostly adds new *orchestration* around pieces that already worked. (The claim this bullet originally made, "zero new risk surface", was wrong: the reused per-page interception had a gap that a long-lived, clickable session made much easier to reach. See the third review below.)
-- **The user's clarifying question about panel interactivity avoided building the wrong-sized thing.** Given a choice between a simple screenshot-refresh panel and full live remote control, confirming which one was wanted *before* writing any panel code meant the whole streaming/input-forwarding design got built once, correctly scoped, rather than started small and redone.
-- **Verifying CDP primitives against the vendored source before committing to the design** (same discipline `webfetch`'s Fetch-domain work established) caught the exact fields needed (`ScreencastFrameAckParams`'s real ack semantics, `DispatchMouseEventParams`'s required fields) before writing code around assumptions.
-- **Real, non-mocked verification at multiple levels** — a Rust-level test suite with precise `clickable_point()`-based coordinates proving the backend dispatch mechanism is correct, *and* a full real-app pass (real model, real conversation, real screenshot) proving the whole chain works together — caught different classes of issue than either alone would have.
+- **Reproducing each review finding with a failing test before fixing it.** The review rounds' claims were reasoned from reading code, not run. Writing a real-browser test first and running it on the unfixed code turned each claim into a fact. It confirmed most findings, found one worse than reported (the SSRF bypass reached four ways, not one), and disproved another (`file://` was already blocked). It also caught a flawed test before it could vouch for a fix. The same habit found the orphaned-Chrome leak.
+- **Checking in the real app, not just the test tier.** Real pages, a real model and real HTTPS found things no fixture did: the address bar showing `chrome-error://…` after a refused load, and confirming the proxy works for real sites.
+- **Asking which panel was wanted before building it.** Full remote control rather than a screenshot view was settled before any panel code existed, so it was built once.
+- **Fixing at the layer where the problem actually lives.** The SSRF gap was fixed at the network (one proxy for all browser traffic) rather than by chasing popups, WebSockets and workers one at a time. The leak was fixed by the kernel killing Chrome with its parent rather than by shutdown hooks that SIGKILL skips.
 
 **What caused friction, surprise, or rework:**
-- **`browsing.rs` needed a real mid-implementation restructuring.** It was first built entirely behind `#[cfg(feature = "server")]` at the module-declaration level (like `webfetch.rs`, which never needed to change this). Partway through, adding the live-panel server functions (`subscribe_browser_frames`/`send_browser_input`) revealed the `web` build needed `BrowserFrame`/`BrowserInputEvent`/`PageElement`/`PageState` directly — requiring the exact ungated-wire-types/gated-server-logic split `anthropic::tools` and `events.rs` already use elsewhere in this codebase. The pattern was already known; it just wasn't applied from the start here, costing a real (if mechanical) rewrite pass.
-- **`chromiumoxide::Element::type_str` silently does nothing without an explicit `.focus()` first.** The vendored source's own doc *example* always chains `.click().await?.type_str(...)`, but nothing in `type_str`'s own signature or doc comment says focus is required — found only by the first real test run typing into a field with no visible effect. Same category of lesson `webfetch`'s own retrospective already named (a doc comment or example holding the answer, not the method signature alone) — recurring enough now to be worth remembering as a standing check, not a one-off.
-- **A background-command monitoring quirk recurred several times**: a `run_in_background` command issued immediately after a *previous* one produced no output file and failed instantly, with a bare retry (same command, standalone) always working. Never resolved to a root cause — treated as a known harness quirk to retry past, not a code issue.
-- **My own Playwright-based click-precision check couldn't reliably verify one specific scenario** (clicking a specific link rendered inside a flat screencast JPEG, from an external test script with no way to query its exact pixel position). Not a product gap — the underlying mechanism was independently proven at the Rust level (precise coordinates via `clickable_point()`) and via network-level inspection (exact intended coordinates sent, 200 OK, no errors) — but worth naming as a real limit of black-box UI testing against a live-video-shaped surface specifically.
+- **The original tests only covered each piece working on its own.** Most of the 21 review bugs sat at an edge none of them tried:
+  - a viewer disconnecting, or two things racing (opens, closes, screencast start/stop);
+  - a second session after a first, or a slow page;
+  - non-ASCII text, a password field;
+  - anything happening outside the one page the guard watched.
 
-**What the pre-merge review found.** A code review of the finished branch turned up ten real bugs. Six were confirmed first-hand, either against the vendored source or with a real-browser scenario that failed before its fix: the log filter, the hover-as-drag, Enter not submitting, the stale subscription, the racing opens, and frames building up without limit. The other four were fixed on the reasoning alone:
-- **The chromiumoxide log fix silenced *every* error when `RUST_LOG` is unset.** `EnvFilter` only falls back to "errors" when it's given no directives at all, and the fix always added two. Worse, the fix's own "verification" (no noise lines in a fresh repro run) couldn't tell "noise suppressed" from "all logging off" — it passed for the wrong reason. The filter is now built by `log_filter_directives`, tested by emitting real events and checking what comes out.
-- **The frame stream never released its viewer.** `ServerEvents::new` runs its closure as a detached task and discards nothing on disconnect, so every panel reload leaked a task and kept the screencast running. It also queued frames without limit for a slow viewer. Switched to `ServerEvents::from_stream`, which pulls frames only as the connection takes them and drops everything when it closes.
-- **Every mouse event was sent as a left-button event**, so hovering acted as a drag (the page saw `buttons == 1`). **Enter was sent without its `\r` text**, so it didn't submit forms.
-- **Panel input was sent as independent concurrent requests**, so events could arrive out of order. **Ctrl/Cmd+V typed a "v".**
-- **Screencast stop/start could race, a subscription outliving its session could stop the next one's screencast, two concurrent opens could both succeed (leaking a page), a failed open leaked its page, and deleting a conversation left its browsing session running.** Starts and stops now all come from one long-lived task per session. Viewers are tied to a specific session id. Opens are serialized, and a failed open closes its page.
+  The rest (Enter, hover, modifier keys, wheel units) were input details the tests missed because they checked that CDP commands were sent, not what the page actually saw.
+- **Reusing proven infrastructure was treated as adding no new risk.** Per-page interception had already been shown to cover a page's whole lifetime, and its limits were never asked about. A long-lived session the model and user can click around in made those limits far easier to hit. The same gap had been in the merged `webfetch` all along.
+- **Three checks passed for the wrong reason:**
+  - The log fix was "verified" by an empty log that was empty because *all* logging was off.
+  - The click tests used pages that react instantly, so a click that never waited looked fine.
+  - The still-page frame test was kept busy by a blinking cursor.
 
-**A second review round** found eight more, six confirmed the same way first. The one it called most serious was only partly real: `file://` navigation was already blocked, but a `data:` URL loaded, because the request interceptor only sees loads that touch the network. The confirmed ones: a typed password showing up as an element label (so it would go to the model), `fill` appending ("1" filled with "5" gave "51"), a new viewer on a still page never getting a frame, a close issued mid-open being missed, and modifiers being dropped from named keys. Also fixed, on reasoning plus a real-app check: the frame stream not reconnecting, and wheel deltas in line units scrolling almost nothing. The first test for the still-page bug passed on the broken code, because a focused password field's blinking caret kept frames coming. The same thing happened in the first round: a test passing for the wrong reason. So when a test for a suspected bug passes, find out why before trusting it.
+  Each was caught by watching the check fail first, or by asking why it passed.
+- **Library behavior was assumed from names and docs instead of read from source**, again and again:
+  - `wait_for_navigation` returns at once if the page is already loaded.
+  - `type_str` only knows a US keyboard and needs focus first.
+  - `EnvFilter` drops its default level once any directive is given.
+  - `ServerEvents::new` runs a detached task that never notices a disconnect.
+  - chromiumoxide kills Chrome only on drop, and turns popup blocking off by default.
 
-**A third review round** found three more, all confirmed with tests that failed on the unfixed code:
-- **Page traffic outside the session's one page skipped the SSRF guard entirely.** A popup (`window.open` or a `target=_blank` link), a WebSocket and a service worker each reached a server on a private address from a browsing session; the WebSocket and service worker did from `webfetch` too. CDP's per-page interception never sees them, and chromiumoxide sets up new targets internally, leaving no hook to turn interception on before they run. Fixed by putting a filtering proxy (`src/egress_proxy.rs`) in front of all browser traffic and refusing popups outright. The proxy resolves each target once and connects to the address it checked, which also removes the gap between the guard's DNS lookup and Chrome's own.
-- **Clicks didn't wait for anything.** `wait_for_navigation` returns at once whenever the current page is already loaded, which it is right after a click. So a delayed update was missed, and a click that navigated read a page that was going away (`Cannot find context with specified id`). The earlier click tests passed only because their pages reacted instantly. Clicks now watch the page's own "started loading" and "loaded" events.
-- **`fill` failed on anything a US keyboard can't type** (`Key not found: ü`), leaving the field half-filled. It now inserts text with `Input.insertText`.
+  All of it was in the vendored source the whole time. `webfetch`'s own retrospective named this lesson once already; it didn't stick.
+- **The branch grew far past its plan.** Beyond the two planned pieces, it now carries:
+  - a log-noise fix;
+  - an SSRF proxy and a Chrome launcher, both of which change already-merged `webfetch`;
+  - an address bar.
 
-**Orphaned Chrome processes.** Found while checking the third round's fixes, not by a review: 31 orphaned `chrome-headless-shell` processes were running on the dev machine. chromiumoxide only kills Chrome when its `Browser` is dropped, and `webfetch`'s shared browser is a static that never is, so every server restart and test run left one behind. They also all shared one profile directory (`/tmp/chromiumoxide-runner`), and with it cookies and service workers. A test that SIGKILLs a process owning the shared browser confirmed the leak. `src/headless_chrome.rs` now launches Chrome with a parent-death signal and a per-launch profile. A full browser-tier run no longer leaves any process behind.
+  That's 28 files and about 4,300 lines, in one PR, with one close-out. [development-process.md](../../development-process.md) already warns about exactly this (the `sandbox-visibility` example); it happened anyway, one reasonable-looking step at a time.
+- **My own slips cost time:**
+  - calling warnings "pre-existing" when this branch caused them;
+  - an edit that silently deleted a test helper;
+  - a `kill` pattern that matched its own shell;
+  - misreading a dev-server rebuild as hot-patching.
+- **Still unexplained:** one WASM panic in the panel ("misaligned pointer dereference" in `futures-channel`) on a dev server that had rebuilt mid-session. Three clean runs didn't reproduce it.
 
-The lesson worth keeping: the tests written during implementation checked the parts that worked, in isolation. None of them looked at the edges between the pieces — a disconnect, two things racing, a second session after a first. Those were exactly where every bug was.
+**What to change** (proposals — per [the confirm-before-change rule](../../development-process.md#evolving-this-process), none applied yet):
+- **Add an edge-case pass to the definition of done** in `development-process.md`. Before calling a feature done, test what happens at each of:
+  - the far side disconnecting or closing;
+  - two calls racing;
+  - a second instance, or reopening after a close;
+  - a slow or failing dependency;
+  - unusual input (non-ASCII, empty, secrets).
 
-**What to change:**
-- **Proposing** (not yet applied — needs confirmation): add a line to `development-process.md` (or `architecture.md`'s module-map intro) naming the ungated-wire-types/`#[cfg(feature = "server")] mod server`-logic split as the *default* shape for any new server-only module, decided at the start rather than discovered as a refactor once a server function needs to return/take one of its types. `anthropic::tools`, `events.rs`, and now `browsing.rs` have all landed here — worth naming once as the pattern rather than rediscovering it a fourth time.
-- **Live panel has no automated test coverage** — stated plainly in `testing.md` and `frontend.md` rather than left implicit. The tools underneath it are automated-tested; the panel's own frontend wiring (a second live stream, the frame `<img>`, mouse/keyboard capture) is manual-only, since automating "one headless browser watching another's live video feed" is a real, separate lift from `browser_tests.rs`'s existing scenarios. Not proposing a process change for this now — just making sure it's a visible, tracked gap rather than an assumed-covered blind spot.
+  And for any security boundary, write down what it does *not* cover.
+- **Require every check to be seen failing.** Extend the TDD rule from "failing test first" to any test or manual check used as evidence: confirm it fails when the thing it detects is present, before trusting it when it passes.
+- **Read the implementation of any library call relied on for timing, lifecycle or defaults**, not just its signature. Make it a named checklist item rather than a retrospective lesson, since it recurred across two projects.
+- **Fix bugs found in already-merged code in their own PR.** The proxy and the Chrome launcher should have gone out separately from this feature: they fix `webfetch` on their own merits, and bundling them made this PR harder to review.
+- **Name the ungated-wire-types / `#[cfg(feature = "server")] mod server` split as the default shape for new server-only modules** (carried over from the first retrospective): `anthropic::tools`, `events.rs` and `browsing.rs` all ended up there.
+
+**Known gaps left open:**
+- The panel's RSX wiring (input handlers, the frame `<img>`, the address bar) is only checked manually; its logic is unit-tested.
+- Browsing sessions are in-memory, so a server restart drops them.
+- All conversations share one browser profile, and so each other's cookies and site storage. Each launch now gets a fresh profile, but conversations within one server process still share it.
+- The unexplained WASM panic above.
