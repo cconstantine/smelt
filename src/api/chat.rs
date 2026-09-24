@@ -854,7 +854,9 @@ fn run_turn_bounded<'a>(
             if turn.stop_reason != "tool_use" {
                 crate::events::publish(
                     conversation_id,
-                    crate::events::ConversationEvent::MessagesAppended(persisted.clone()),
+                    crate::events::ConversationEvent::MessagesAppended {
+                        messages: persisted.clone(),
+                    },
                 );
                 return Ok(persisted);
             }
@@ -885,7 +887,9 @@ fn run_turn_bounded<'a>(
 
         crate::events::publish(
             conversation_id,
-            crate::events::ConversationEvent::MessagesAppended(persisted),
+            crate::events::ConversationEvent::MessagesAppended {
+                messages: persisted,
+            },
         );
         Err(ServerFnError::new(format!(
             "tool-use loop exceeded {max_turns} turns without reaching a final reply"

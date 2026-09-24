@@ -30,7 +30,10 @@ pub enum ConversationEvent {
         stream: Option<String>,
         latest_output: Option<String>,
     },
-    MessagesAppended(Vec<Message>),
+    /// A struct variant, not `MessagesAppended(Vec<Message>)`: this enum
+    /// is internally tagged, and serde can't write a tuple variant holding
+    /// a list that way — every send failed, silently.
+    MessagesAppended { messages: Vec<Message> },
     /// Published once on `create_pod` (already `Running` by the time it
     /// returns) and once on `terminate_pod`.
     SandboxPodUpdate {
@@ -322,3 +325,85 @@ mod server {
 
 #[cfg(feature = "server")]
 pub use server::{publish, subscribe};
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    fn one_of_each() -> Vec<ConversationEvent> {
+        vec![
+            ConversationEvent::TaskUpdate {
+                task_id: "t1".to_string(),
+                tool: "count".to_string(),
+                status: "running".to_string(),
+                stream: Some("stdout".to_string()),
+                latest_output: Some("1".to_string()),
+            },
+            ConversationEvent::MessagesAppended { messages: vec![Message {
+                id: 7,
+                conversation_id: 3,
+                role: "assistant".to_string(),
+                content: r#"[{"type":"text","text":"hi"}]"#.to_string(),
+                created_at: chrono::DateTime::from_timestamp(1_790_000_000, 0)
+                    .expect("valid timestamp")
+                    .naive_utc(),
+            }] },
+            ConversationEvent::SandboxPodUpdate {
+                pod_id: 1,
+                status: "running".to_string(),
+                terminated: false,
+            },
+            ConversationEvent::SandboxTerminalUpdate {
+                pod_id: 1,
+                terminal_id: 2,
+                status: "connected".to_string(),
+                terminated: false,
+            },
+            ConversationEvent::SandboxCommandUpdate {
+                terminal_id: 2,
+                command_id: "c1".to_string(),
+                command: Some("ls".to_string()),
+                status: "running".to_string(),
+                exit_code: None,
+                stream: None,
+                latest_output: None,
+            },
+            ConversationEvent::NotificationDeliveryFailed {
+                detail: "boom".to_string(),
+            },
+            ConversationEvent::ContextUsageUpdate {
+                usage: TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    cache_creation_input_tokens: 3,
+                    cache_read_input_tokens: 4,
+                },
+                context_window: 200_000,
+            },
+            ConversationEvent::TodoListUpdate {
+                items: vec![crate::anthropic::tools::TodoItem {
+                    content: "ship it".to_string(),
+                    status: crate::anthropic::tools::TodoStatus::Pending,
+                }],
+            },
+            ConversationEvent::BrowsingSessionUpdate { open: true },
+            ConversationEvent::BrowsingUrlUpdate {
+                url: "https://example.com/".to_string(),
+            },
+        ]
+    }
+
+    /// Every event goes to the browser as JSON, and a variant serde can't
+    /// write is silently dropped on the way — so every variant must
+    /// survive a round trip.
+    #[test]
+    fn test_every_event_round_trips_through_json() {
+        for event in one_of_each() {
+            let json = serde_json::to_string(&event)
+                .unwrap_or_else(|e| panic!("{event:?} doesn't serialize: {e}"));
+            let back: ConversationEvent = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("{json} doesn't deserialize: {e}"));
+            assert_eq!(back, event);
+        }
+    }
+}

@@ -2272,7 +2272,7 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
 
                         loop {
                             match events.recv().await {
-                                Some(Ok(ConversationEvent::MessagesAppended(rows))) => {
+                                Some(Ok(ConversationEvent::MessagesAppended { messages: rows })) => {
                                     merge_messages_by_id(&mut messages.write(), rows);
                                 }
                                 Some(Ok(ConversationEvent::TaskUpdate {

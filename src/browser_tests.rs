@@ -667,6 +667,33 @@ async fn test_end_to_end_browser_scenarios() {
             .into_value()
             .expect("a number");
         assert_eq!(copies, 1, "A's reply should appear exactly once");
+
+        // --- Scenario 9: a reply the watching tab didn't ask for — a
+        // background task's notification, another tab's send — still
+        // reaches it live, with no reload. ---
+        let watcher = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, other.id))
+            .await
+            .expect("open conversation B in a watching tab");
+        wait_for_live_client(&watcher, other.id).await;
+        crate::api::chat::run_turn(
+            pool,
+            other.id,
+            anthropic::AnthropicMessage {
+                role: "user".to_string(),
+                content: vec![anthropic::ContentBlock::Text {
+                    text: "sent from somewhere else".to_string(),
+                }],
+            },
+            None,
+        )
+        .await
+        .expect("a turn run outside the watching tab should succeed");
+        assert!(
+            wait_for_text(&watcher, "zebra24", Duration::from_secs(10)).await,
+            "the watching tab never showed a reply it didn't send itself"
+        );
     })))
     .await;
 
