@@ -53,6 +53,29 @@ use crate::models::{Conversation, Message};
 ///
 /// Only called from the `web`-only live event-subscription loop below;
 /// exercised directly by this module's own tests otherwise.
+/// The message list to show once `conversation_id`'s messages have loaded:
+/// the loaded list, plus any saved message of that conversation already on
+/// screen that the load doesn't have. Opening a conversation starts two
+/// loads — this one, and the live subscription's own merge — and this one
+/// can finish last with a snapshot taken before a just-saved message
+/// existed; replacing outright would wipe that message until a reload.
+/// Messages from any other conversation are dropped, and so are optimistic
+/// placeholders (negative ids), which the loaded copy supersedes.
+fn apply_loaded_messages(
+    current: &[Message],
+    mut loaded: Vec<Message>,
+    conversation_id: i64,
+) -> Vec<Message> {
+    let newer: Vec<Message> = current
+        .iter()
+        .filter(|m| m.conversation_id == conversation_id && m.id > 0)
+        .filter(|m| !loaded.iter().any(|l| l.id == m.id))
+        .cloned()
+        .collect();
+    loaded.extend(newer);
+    loaded
+}
+
 #[cfg(any(feature = "web", test))]
 fn merge_messages_by_id(existing: &mut Vec<Message>, incoming: Vec<Message>) {
     for message in incoming {
@@ -1206,6 +1229,50 @@ mod tests {
         }
     }
 
+    fn message_in(conversation_id: i64, id: i64) -> Message {
+        Message {
+            conversation_id,
+            ..test_message(id)
+        }
+    }
+
+    fn ids(messages: &[Message]) -> Vec<i64> {
+        messages.iter().map(|m| m.id).collect()
+    }
+
+    #[test]
+    fn test_apply_loaded_messages_keeps_a_newer_message_a_stale_load_missed() {
+        // The reply (3) arrived through a merge while an older load, fetched
+        // before it was saved, was still in flight.
+        let current = vec![message_in(7, 1), message_in(7, 2), message_in(7, 3)];
+        let loaded = vec![message_in(7, 1), message_in(7, 2)];
+        assert_eq!(ids(&apply_loaded_messages(&current, loaded, 7)), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_apply_loaded_messages_drops_another_conversations_messages() {
+        let current = vec![message_in(8, 10), message_in(8, 11)];
+        let loaded = vec![message_in(7, 1)];
+        assert_eq!(ids(&apply_loaded_messages(&current, loaded, 7)), vec![1]);
+    }
+
+    #[test]
+    fn test_apply_loaded_messages_does_not_duplicate() {
+        let current = vec![message_in(7, 1), message_in(7, 2)];
+        let loaded = vec![message_in(7, 1), message_in(7, 2)];
+        assert_eq!(ids(&apply_loaded_messages(&current, loaded, 7)), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_apply_loaded_messages_lets_the_load_replace_optimistic_placeholders() {
+        // A placeholder (negative id) stands in for a sent message until the
+        // real row arrives; keeping it alongside the loaded copy would show
+        // the message twice.
+        let current = vec![message_in(7, 1), message_in(7, -1)];
+        let loaded = vec![message_in(7, 1), message_in(7, 2)];
+        assert_eq!(ids(&apply_loaded_messages(&current, loaded, 7)), vec![1, 2]);
+    }
+
     #[test]
     fn test_merge_messages_by_id_skips_ids_already_present() {
         let mut existing = vec![test_message(1)];
@@ -2112,7 +2179,10 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
 
     use_effect(move || match initial_messages() {
         Some(Some(Ok(list))) => {
-            messages.set(list);
+            if let Some(id) = *selected.peek() {
+                let merged = apply_loaded_messages(&messages.peek(), list, id);
+                messages.set(merged);
+            }
             load_error.set(None);
             // A freshly loaded conversation should open scrolled to its
             // latest message, regardless of where a previous conversation
