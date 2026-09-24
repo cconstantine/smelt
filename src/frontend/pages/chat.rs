@@ -2253,6 +2253,7 @@ fn ChatPanel(selected: Memo<Option<i64>>, conversations_changed: Signal<u64>) ->
             address_editing.set(false);
             address_error.set(None);
             notification_delivery_error.set(None);
+            context_usage.set(None);
 
             let handle = spawn(async move {
                 loop {
