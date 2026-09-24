@@ -6,25 +6,21 @@
 //! plain HTTP GET, and why every request the page makes — not just the
 //! top-level navigation — gets checked against an SSRF guard via the CDP
 //! Fetch domain — and, since that only covers the one page, why the browser
-//! itself runs behind `crate::egress_proxy`. The guard itself (and response-text truncation) lives in
+//! itself runs behind `crate::egress_proxy`. The guard itself (and
+//! response-text truncation) lives in
 //! `src/fetch_guard.rs`, shared with `src/http_request.rs`'s plain-HTTP
 //! tool — one source of truth for SSRF logic, not two copies that could
 //! drift apart.
 
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use chromiumoxide::Browser;
-use futures_util::StreamExt;
 use serde::Serialize;
 use tokio::sync::OnceCell;
 
 use crate::fetch_guard::{self, is_safe_fetch_addr};
 
-const CHROME_BINARY: &str =
-    ".browser-check-cache/chrome/chrome-headless-shell-linux64/chrome-headless-shell";
-const LIB_DIR: &str = ".browser-check-cache/libs/usr/lib/x86_64-linux-gnu";
 /// Bounds page navigation+load — "bound the boundaries" (development-process.md):
 /// a slow/hanging page shouldn't tie up a tool call indefinitely.
 const NAV_TIMEOUT: Duration = Duration::from_secs(20);
@@ -60,30 +56,10 @@ pub(crate) async fn shared_browser() -> Result<&'static Browser, String> {
 }
 
 /// Launches the shared `chrome-headless-shell` instance — lazily, on first
-/// `webfetch` call, not at server startup, so a server that never uses
-/// `webfetch` never pays for a running Chrome process. Mirrors
-/// `src/browser_tests.rs`'s own launch config, but passes
-/// `LD_LIBRARY_PATH` via `BrowserConfigBuilder::env` (scoped to just the
-/// spawned child process) rather than mutating this process's whole
-/// environment — `browser_tests.rs` needed `unsafe` `std::env::set_var`
-/// for that because chromiumoxide's builder appeared to have no env hook
-/// at the time; it does (`.env`/`.envs`, confirmed against the vendored
-/// 0.7.0 source), which avoids the unsafe/whole-process-env-mutation
-/// concern entirely for this always-concurrent (lazy, not startup-time)
-/// call site.
+/// use, not at server startup, so a server that never browses never pays for
+/// a running Chrome. Launched via `crate::headless_chrome`, so it dies with
+/// this process.
 async fn launch_browser() -> Result<Browser, String> {
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let chrome_binary = repo_root.join(CHROME_BINARY);
-    if !chrome_binary.is_file() {
-        return Err(format!(
-            "chrome-headless-shell not found at {} — run scripts/browser-check/setup.sh first",
-            chrome_binary.display()
-        ));
-    }
-    let lib_dir = repo_root.join(LIB_DIR);
-    let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    let ld_library_path = format!("{}:{}/dri:{existing}", lib_dir.display(), lib_dir.display());
-
     // All of the browser's traffic goes through the egress proxy, which
     // applies the SSRF guard to everything — including popups, WebSockets
     // and service workers, which per-page CDP interception never sees.
@@ -93,26 +69,13 @@ async fn launch_browser() -> Result<Browser, String> {
     let proxy = crate::egress_proxy::start(BROWSER_EGRESS_GUARD)
         .await
         .map_err(|e| format!("failed to start the browser's egress proxy: {e}"))?;
-    let config = chromiumoxide::BrowserConfig::builder()
-        .chrome_executable(&chrome_binary)
-        .no_sandbox()
-        .arg("--disable-gpu")
-        .arg(format!("--proxy-server=http://{proxy}"))
-        .arg("--proxy-bypass-list=<-loopback>")
-        .arg("--block-new-web-contents")
-        .arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
-        .env("LD_LIBRARY_PATH", ld_library_path)
-        .window_size(1400, 900)
-        .build()
-        .map_err(|e| format!("invalid chrome-headless-shell launch config: {e}"))?;
-    let (browser, mut handler) = Browser::launch(config)
-        .await
-        .map_err(|e| format!("chrome-headless-shell failed to launch: {e}"))?;
-    // chromiumoxide requires this driven continuously to process the CDP
-    // connection at all (command responses, events) — same pattern
-    // `src/browser_tests.rs`'s own harness uses.
-    tokio::spawn(async move { while handler.next().await.is_some() {} });
-    Ok(browser)
+    crate::headless_chrome::launch(&[
+        format!("--proxy-server=http://{proxy}"),
+        "--proxy-bypass-list=<-loopback>".to_string(),
+        "--block-new-web-contents".to_string(),
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string(),
+    ])
+    .await
 }
 
 /// Fetches `url` in a real browser and returns its rendered readable text.
@@ -197,6 +160,93 @@ mod browser_tests {
     /// these tests, never in `fetch`'s own real default (`is_safe_fetch_addr`).
     fn allow_loopback_too(addr: IpAddr) -> bool {
         is_safe_fetch_addr(addr) || addr.is_loopback()
+    }
+
+    const OWNER_HELPER_ENV: &str = "SMELT_CHROME_OWNER_HELPER";
+
+    /// Not a test on its own: `test_chrome_exits_with_its_owning_process`
+    /// runs this in a child process (with `OWNER_HELPER_ENV` set) to own a
+    /// shared browser it can then kill. A no-op otherwise.
+    #[tokio::test]
+    #[ignore]
+    async fn chrome_owner_helper() {
+        if std::env::var(OWNER_HELPER_ENV).is_err() {
+            return;
+        }
+        shared_browser().await.expect("launch the shared browser");
+        println!("CHROME_OWNER_READY");
+        std::future::pending::<()>().await;
+    }
+
+    /// Pids of `parent`'s direct children that are Chrome processes.
+    fn chrome_children_of(parent: u32) -> Vec<u32> {
+        std::fs::read_dir("/proc")
+            .expect("read /proc")
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                // Fields after the parenthesised command name: state, ppid, ...
+                let ppid = stat
+                    .rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok());
+                let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                ppid == Some(parent) && String::from_utf8_lossy(&cmdline).contains("chrome-headless-shell")
+            })
+            .collect()
+    }
+
+    /// Alive and not a zombie waiting to be reaped.
+    fn process_is_running(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.trim_start().starts_with('Z')))
+            .is_some_and(|zombie| !zombie)
+    }
+
+    /// The shared browser is a process-wide static that's never dropped, so
+    /// nothing in smelt shuts Chrome down when smelt exits — every server
+    /// restart and test run used to leave a whole Chrome behind. Kills an
+    /// owning process the hard way (SIGKILL, as a dev-server rebuild does)
+    /// and checks its Chrome goes with it.
+    #[tokio::test]
+    #[ignore]
+    async fn test_chrome_exits_with_its_owning_process() {
+        use std::io::BufRead;
+        let mut owner = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "webfetch::browser_tests::chrome_owner_helper",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(OWNER_HELPER_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the owning process");
+        let stdout = owner.stdout.take().expect("owner stdout");
+        let ready = std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .any(|line| line.contains("CHROME_OWNER_READY"));
+        assert!(ready, "the owning process never launched its browser");
+        let chrome = chrome_children_of(owner.id());
+        assert_eq!(chrome.len(), 1, "expected exactly one Chrome under the owner, got {chrome:?}");
+        let chrome = chrome[0];
+
+        owner.kill().expect("SIGKILL the owner");
+        owner.wait().expect("reap the owner");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_is_running(chrome) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let survived = process_is_running(chrome);
+        if survived {
+            // Don't leave it behind ourselves.
+            let _ = std::process::Command::new("kill").arg(chrome.to_string()).status();
+        }
+        assert!(!survived, "Chrome (pid {chrome}) outlived the process that launched it");
     }
 
     async fn start_test_server(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {

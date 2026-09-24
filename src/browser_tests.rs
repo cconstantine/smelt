@@ -28,18 +28,12 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chromiumoxide::browser::{Browser, BrowserConfig};
-use futures_util::StreamExt;
+use chromiumoxide::browser::Browser;
 
 use crate::{anthropic, db, sandbox};
 
-const CHROME_BINARY: &str =
-    ".browser-check-cache/chrome/chrome-headless-shell-linux64/chrome-headless-shell";
-const LIB_DIR: &str = ".browser-check-cache/libs/usr/lib/x86_64-linux-gnu";
-
 struct BrowserTestHarness {
     browser: Browser,
-    handler_task: tokio::task::JoinHandle<()>,
     server_task: tokio::task::JoinHandle<()>,
     base_url: String,
 }
@@ -47,31 +41,6 @@ struct BrowserTestHarness {
 impl BrowserTestHarness {
     async fn start() -> Self {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let chrome_binary = repo_root.join(CHROME_BINARY);
-        if !chrome_binary.is_file() {
-            panic!(
-                "chrome-headless-shell not found at {} — run scripts/browser-check/setup.sh first",
-                chrome_binary.display()
-            );
-        }
-        let lib_dir = repo_root.join(LIB_DIR);
-        // chrome-headless-shell needs its bundled shared libraries (nss,
-        // atk, dbus, X11, mesa, ...) — not installed system-wide, same
-        // requirement scripts/browser-check/browser_check.py already has.
-        // chromiumoxide's builder has no direct env-var hook, so this sets
-        // it for the whole test process; the child process it spawns
-        // inherits it.
-        let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-        // SAFETY: this test binary is single-threaded at this point (no
-        // other threads have been spawned yet that could race a concurrent
-        // std::env read) — see the harness's own doc comment on why this is
-        // the one test in this module.
-        unsafe {
-            std::env::set_var(
-                "LD_LIBRARY_PATH",
-                format!("{}:{}/dri:{existing}", lib_dir.display(), lib_dir.display()),
-            );
-        }
 
         // dioxus-server's `serve_dioxus_application` needs a pre-bundled
         // WASM/assets directory — the CLI (`dx build`/`dx serve`) normally
@@ -86,8 +55,10 @@ impl BrowserTestHarness {
                 public_path.display()
             );
         }
-        // SAFETY: same single-threaded-at-startup reasoning as the
-        // LD_LIBRARY_PATH set above.
+        // SAFETY: this test binary is single-threaded at this point (no
+        // other threads have been spawned yet that could race a concurrent
+        // std::env read) — see the harness's own doc comment on why this is
+        // the one test in this module.
         unsafe {
             std::env::set_var("DIOXUS_PUBLIC_PATH", &public_path);
         }
@@ -106,21 +77,14 @@ impl BrowserTestHarness {
                 .expect("test server error");
         });
 
-        let config = BrowserConfig::builder()
-            .chrome_executable(&chrome_binary)
-            .no_sandbox()
-            .arg("--disable-gpu")
-            .window_size(1400, 900)
-            .build()
-            .expect("valid chrome-headless-shell launch config");
-        let (browser, mut handler) = Browser::launch(config)
+        // Same launcher as the app's shared browser, so this Chrome can't
+        // outlive the test process either.
+        let browser = crate::headless_chrome::launch(&[])
             .await
             .expect("chrome-headless-shell should launch");
-        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
         Self {
             browser,
-            handler_task,
             server_task,
             base_url: format!("http://127.0.0.1:{port}/"),
         }
@@ -132,8 +96,7 @@ impl BrowserTestHarness {
     /// `test_terminal_lifecycle_end_to_end`'s own cleanup already accepts.
     async fn shutdown(mut self) {
         let _ = self.browser.close().await;
-        let _ = self.browser.wait().await;
-        self.handler_task.abort();
+
         self.server_task.abort();
     }
 }

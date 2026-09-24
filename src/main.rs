@@ -10,6 +10,8 @@ mod events;
 mod fetch_guard;
 mod frontend;
 #[cfg(feature = "server")]
+mod headless_chrome;
+#[cfg(feature = "server")]
 mod http_request;
 #[cfg(feature = "server")]
 mod mcp;

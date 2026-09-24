@@ -48,6 +48,8 @@ A real, two-way interactive view — not a periodic snapshot. `Page.startScreenc
 - **Clicks didn't wait for anything.** `wait_for_navigation` returns at once whenever the current page is already loaded, which it is right after a click. So a delayed update was missed, and a click that navigated read a page that was going away (`Cannot find context with specified id`). The earlier click tests passed only because their pages reacted instantly. Clicks now watch the page's own "started loading" and "loaded" events.
 - **`fill` failed on anything a US keyboard can't type** (`Key not found: ü`), leaving the field half-filled. It now inserts text with `Input.insertText`.
 
+**Orphaned Chrome processes.** Found while checking the third round's fixes, not by a review: 31 orphaned `chrome-headless-shell` processes were running on the dev machine. chromiumoxide only kills Chrome when its `Browser` is dropped, and `webfetch`'s shared browser is a static that never is, so every server restart and test run left one behind. They also all shared one profile directory (`/tmp/chromiumoxide-runner`), and with it cookies and service workers. A test that SIGKILLs a process owning the shared browser confirmed the leak. `src/headless_chrome.rs` now launches Chrome with a parent-death signal and a per-launch profile. A full browser-tier run no longer leaves any process behind.
+
 The lesson worth keeping: the tests written during implementation checked the parts that worked, in isolation. None of them looked at the edges between the pieces — a disconnect, two things racing, a second session after a first. Those were exactly where every bug was.
 
 **What to change:**

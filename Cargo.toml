@@ -39,7 +39,9 @@ k8s-openapi = { version = "0.28", features = ["v1_34"], optional = true }
 # For sandbox_agent's send_signal handling: killpg on a discovered process
 # group, bypassing the inner shell entirely — see
 # docs/projects/plans/sandbox-terminal.md's "Signaling a running command."
-nix = { version = "0.29", default-features = false, features = ["signal"], optional = true }
+# "process" is for src/headless_chrome.rs: prctl(PR_SET_PDEATHSIG) so the
+# shared Chrome dies with smelt instead of being orphaned.
+nix = { version = "0.29", default-features = false, features = ["signal", "process"], optional = true }
 # For src/sandbox.rs's client-side WebSocket handshake over a portforwarded
 # raw stream (kube's own "ws" feature only covers exec/attach, not an
 # arbitrary application-level WS server like sandbox_agent's).
