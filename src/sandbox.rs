@@ -1268,6 +1268,16 @@ pub async fn send_signal(
 /// here: `db::delete_conversation`'s `ON DELETE CASCADE` chain removes
 /// `sandbox_pods`/`sandbox_terminals`/`terminal_commands` for real right
 /// after this runs.
+/// Whether sandbox pod `pod_id` still exists in the cluster (terminating
+/// counts as existing).
+#[cfg(all(test, feature = "browser-test"))]
+pub(crate) async fn pod_exists(pod_id: i64) -> bool {
+    matches!(
+        pods_api(&get().client).get_opt(&pod_name(pod_id)).await,
+        Ok(Some(_))
+    )
+}
+
 pub async fn teardown_conversation(pool: &PgPool, conversation_id: i64) {
     let manager = get();
     let pods = pods_api(&manager.client);
