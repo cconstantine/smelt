@@ -68,7 +68,7 @@ The branch was called done four times. In between, three code reviews found 21 r
   - misreading a dev-server rebuild as hot-patching.
 - **Still unexplained:** one WASM panic in the panel ("misaligned pointer dereference" in `futures-channel`) on a dev server that had rebuilt mid-session. Three clean runs didn't reproduce it.
 
-**What to change** (proposals — per [the confirm-before-change rule](../../development-process.md#evolving-this-process), none applied yet):
+**What to change** (all five applied to [development-process.md](../../development-process.md) after the user agreed: the edge-case pass is in the Definition of done; the other four are Rules):
 - **Add an edge-case pass to the definition of done** in `development-process.md`. Before calling a feature done, test what happens at each of:
   - the far side disconnecting or closing;
   - two calls racing;
