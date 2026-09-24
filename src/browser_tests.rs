@@ -667,6 +667,29 @@ async fn test_end_to_end_browser_scenarios() {
             .into_value()
             .expect("a number");
         assert_eq!(copies, 1, "A's reply should appear exactly once");
+        // A's first message titled it; the sidebar should show that
+        // without a reload.
+        let title_selector = format!(
+            ".conversation-item[data-conversation-id=\"{}\"] .conversation-title",
+            streaming.id
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let title: String = chat
+                .evaluate(format!("document.querySelector({title_selector:?})?.innerText ?? ''"))
+                .await
+                .expect("read A's sidebar title")
+                .into_value()
+                .expect("a string");
+            if title.contains("hello from A") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "A's sidebar title is still {title:?} after its first message"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
 
         // --- Scenario 9: a reply the watching tab didn't ask for — a
         // background task's notification, another tab's send — still

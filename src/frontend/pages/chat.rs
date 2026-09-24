@@ -1951,18 +1951,30 @@ pub fn Chat() -> Element {
         Route::SandboxVolumeNewRoute {} => None,
     });
 
+    // Bumped by the chat panel whenever its conversation gets new
+    // messages; the sidebar refetches its list when it changes, so a
+    // conversation's title (set by its first message) and its place in the
+    // list stay current without a reload.
+    let conversations_changed = use_signal(|| 0u64);
+
     rsx! {
         div { class: "chat-layout",
-            ConversationSidebar { selected }
-            ChatPanel { selected }
+            ConversationSidebar { selected, conversations_changed }
+            ChatPanel { selected, conversations_changed }
         }
     }
 }
 
 #[component]
-fn ConversationSidebar(selected: Memo<Option<i64>>) -> Element {
+fn ConversationSidebar(
+    selected: Memo<Option<i64>>,
+    conversations_changed: Signal<u64>,
+) -> Element {
     let navigator = use_navigator();
-    let initial_conversations = use_resource(get_conversations);
+    let initial_conversations = use_resource(move || {
+        let _ = conversations_changed();
+        get_conversations()
+    });
     let mut conversations: Signal<Vec<Conversation>> = use_signal(Vec::new);
     let mut loaded = use_signal(|| false);
     let mut error: Signal<Option<String>> = use_signal(|| None);
@@ -2053,7 +2065,7 @@ fn ConversationSidebar(selected: Memo<Option<i64>>) -> Element {
 }
 
 #[component]
-fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
+fn ChatPanel(selected: Memo<Option<i64>>, conversations_changed: Signal<u64>) -> Element {
     let initial_messages = use_resource(move || {
         let id = selected();
         async move {
@@ -2277,6 +2289,7 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                         loop {
                             match events.recv().await {
                                 Some(Ok(ConversationEvent::MessagesAppended { messages: rows })) => {
+                                    *conversations_changed.write() += 1;
                                     merge_messages_by_id(&mut messages.write(), rows);
                                 }
                                 Some(Ok(ConversationEvent::TaskUpdate {
@@ -2515,6 +2528,10 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
             }
 
             replies_in_flight.write().remove(&id);
+            // The first message titles a conversation, and any send moves
+            // it up the list — refresh the sidebar even if the viewer has
+            // switched away (this tab then isn't listening to `id`'s events).
+            *conversations_changed.write() += 1;
         });
     };
 
