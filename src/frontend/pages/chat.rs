@@ -2029,6 +2029,7 @@ fn ConversationSidebar(selected: Memo<Option<i64>>) -> Element {
                     for conversation in conversations() {
                         div {
                             key: "{conversation.id}",
+                            "data-conversation-id": "{conversation.id}",
                             class: if selected() == Some(conversation.id) { "conversation-item active" } else { "conversation-item" },
                             onclick: move |_| {
                                 pending_delete.set(None);
