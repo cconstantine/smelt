@@ -131,13 +131,31 @@ pub async fn is_request_allowed_with(url: &str, is_addr_allowed: fn(IpAddr) -> b
     let Ok((host, port)) = parse_fetch_target(url) else {
         return false;
     };
-    match tokio::net::lookup_host((host.as_str(), port)).await {
-        Ok(addrs) => {
-            let addrs: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
-            !addrs.is_empty() && addrs.iter().all(|&a| is_addr_allowed(a))
-        }
-        Err(_) => false,
+    resolve_allowed(&host, port, is_addr_allowed).await.is_ok()
+}
+
+/// Resolves `host:port` and returns its addresses only if every one of them
+/// passes `is_addr_allowed` — a host with any refused address is refused
+/// outright, and a failed or empty resolution is an error, never "assume
+/// fine." Callers that go on to connect should connect to one of the
+/// returned addresses rather than resolving again, so a DNS answer that
+/// changes between check and connect can't slip through.
+pub async fn resolve_allowed(
+    host: &str,
+    port: u16,
+    is_addr_allowed: fn(IpAddr) -> bool,
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("could not resolve {host}: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("{host} resolved to no addresses"));
     }
+    if let Some(refused) = addrs.iter().find(|a| !is_addr_allowed(a.ip())) {
+        return Err(format!("{host} resolves to a refused address ({})", refused.ip()));
+    }
+    Ok(addrs)
 }
 
 /// Caps `text` to `max_chars`, same shape `fetch_command_summary`'s tail

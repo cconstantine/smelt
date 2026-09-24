@@ -5,7 +5,8 @@
 //! including why a real browser (JS execution included) rather than a
 //! plain HTTP GET, and why every request the page makes — not just the
 //! top-level navigation — gets checked against an SSRF guard via the CDP
-//! Fetch domain. The guard itself (and response-text truncation) lives in
+//! Fetch domain — and, since that only covers the one page, why the browser
+//! itself runs behind `crate::egress_proxy`. The guard itself (and response-text truncation) lives in
 //! `src/fetch_guard.rs`, shared with `src/http_request.rs`'s plain-HTTP
 //! tool — one source of truth for SSRF logic, not two copies that could
 //! drift apart.
@@ -42,6 +43,16 @@ pub struct FetchResult {
 
 static BROWSER: OnceCell<Browser> = OnceCell::const_new();
 
+/// What the browser-wide egress proxy (`crate::egress_proxy`) lets through.
+/// Test builds also allow loopback, where every test fixture server lives;
+/// the strict per-call guard (`fetch_guard::spawn_request_interceptor`)
+/// still applies on top in every build.
+#[cfg(not(test))]
+const BROWSER_EGRESS_GUARD: fn(IpAddr) -> bool = is_safe_fetch_addr;
+#[cfg(test)]
+const BROWSER_EGRESS_GUARD: fn(IpAddr) -> bool =
+    |addr| is_safe_fetch_addr(addr) || addr.is_loopback();
+
 /// `pub(crate)` — `src/browsing.rs`'s persistent sessions run on this same
 /// shared browser instance rather than launching a second one.
 pub(crate) async fn shared_browser() -> Result<&'static Browser, String> {
@@ -73,10 +84,23 @@ async fn launch_browser() -> Result<Browser, String> {
     let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
     let ld_library_path = format!("{}:{}/dri:{existing}", lib_dir.display(), lib_dir.display());
 
+    // All of the browser's traffic goes through the egress proxy, which
+    // applies the SSRF guard to everything — including popups, WebSockets
+    // and service workers, which per-page CDP interception never sees.
+    // `<-loopback>` stops Chrome's default of skipping the proxy for
+    // localhost. Popups are refused outright rather than left to pile up,
+    // and WebRTC may not send UDP around the proxy.
+    let proxy = crate::egress_proxy::start(BROWSER_EGRESS_GUARD)
+        .await
+        .map_err(|e| format!("failed to start the browser's egress proxy: {e}"))?;
     let config = chromiumoxide::BrowserConfig::builder()
         .chrome_executable(&chrome_binary)
         .no_sandbox()
         .arg("--disable-gpu")
+        .arg(format!("--proxy-server=http://{proxy}"))
+        .arg("--proxy-bypass-list=<-loopback>")
+        .arg("--block-new-web-contents")
+        .arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
         .env("LD_LIBRARY_PATH", ld_library_path)
         .window_size(1400, 900)
         .build()
@@ -212,9 +236,14 @@ mod browser_tests {
         // --- Scenario 1: a real page's rendered, readable text comes back. ---
         let (url, _server) =
             start_test_server("<html><body><h1>Hello from a real page</h1></body></html>").await;
+        let proxied_before = crate::egress_proxy::requests_handled();
         let result = fetch_with_guard(&url, allow_loopback_too)
             .await
             .expect("fetch should succeed");
+        assert!(
+            crate::egress_proxy::requests_handled() > proxied_before,
+            "the browser reached a loopback page without going through the egress proxy"
+        );
         assert_eq!(result.url, url);
         assert!(
             result.text.contains("Hello from a real page"),
@@ -267,6 +296,23 @@ mod browser_tests {
                 panic!("script never finished; last text: {:?}", result.text);
             }
         }
+
+        // --- Scenario 4: a fetched page can't reach a refused address by
+        // any route the per-page interception doesn't see — a WebSocket or
+        // a service worker, both started as soon as the page loads. ---
+        let forbidden = crate::browsing::browser_tests::start_forbidden_server().await;
+        let (escape_url, _escape_server) =
+            crate::browsing::browser_tests::start_escape_test_server(&forbidden).await;
+        fetch_with_guard(&escape_url, allow_loopback_too)
+            .await
+            .expect("fetching the escape page should succeed");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let hits = forbidden.hits.lock().unwrap().clone();
+        assert!(
+            hits.is_empty(),
+            "a fetched page reached the forbidden address {}: {hits:?}",
+            forbidden.addr
+        );
 
         // `src/browsing.rs`'s own real-browser scenarios run on this same
         // shared browser static — see that module's `browser_tests` doc

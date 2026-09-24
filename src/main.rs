@@ -3,6 +3,8 @@ mod api;
 mod browsing;
 #[cfg(feature = "server")]
 mod db;
+#[cfg(feature = "server")]
+mod egress_proxy;
 mod events;
 #[cfg(feature = "server")]
 mod fetch_guard;

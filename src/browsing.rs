@@ -71,8 +71,9 @@ mod server {
         DispatchMouseEventType, InsertTextParams,
     };
     use chromiumoxide::cdp::browser_protocol::page::{
-        EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat,
-        StartScreencastParams, StopScreencastParams,
+        EventFrameStartedLoading, EventLoadEventFired, EventScreencastFrame,
+        ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams,
+        StopScreencastParams,
     };
     use futures_util::{Stream, StreamExt};
     use tokio::sync::watch;
@@ -103,16 +104,11 @@ mod server {
     const NAV_TIMEOUT: Duration = Duration::from_secs(20);
     /// Same truncation cap `webfetch`/`http_request` already use.
     const MAX_TEXT_CHARS: usize = 20_000;
-    /// Upper bound on how long `click`/`fill` wait to "settle" before
-    /// extracting the resulting page state — see `settle_after_action`'s
-    /// own doc comment for why a click has no built-in "wait until done"
-    /// signal the way `goto` does. This is a real tax paid on *every*
-    /// action that doesn't navigate (the common case — a toggle, a tab
-    /// switch, an in-place form update), so it's deliberately short; a
-    /// navigating click still resolves as soon as `wait_for_navigation`
-    /// actually fires, regardless of this bound. Value chosen empirically
-    /// against real pages during implementation, not guessed — see the
-    /// plan's "Riskiest assumptions."
+    /// How long `click`/`go_back` watch for the action to start a
+    /// navigation — and, when it doesn't, how long they wait for in-page
+    /// updates it set off (a fetch, a tab switch) before reading the page.
+    /// A real cost on every non-navigating action, so kept short; a
+    /// navigation that does start gets up to `NAV_TIMEOUT` to load.
     const ACTION_SETTLE_TIMEOUT: Duration = Duration::from_millis(600);
     /// Screencast frame bounds — deliberately conservative (bandwidth over
     /// smoothness), tunable once the panel is actually running against a
@@ -751,11 +747,14 @@ mod server {
     pub async fn click(conversation_id: i64, element_index: usize) -> Result<PageState, String> {
         let page = live_page(conversation_id)?;
         let element = find_tagged_element(&page, element_index).await?;
-        element
-            .click()
-            .await
-            .map_err(|e| format!("failed to click element {element_index}: {e}"))?;
-        settle_after_action(&page).await;
+        act_and_settle(&page, async {
+            element
+                .click()
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("failed to click element {element_index}: {e}"))
+        })
+        .await?;
         extract_page_state(&page).await
     }
 
@@ -770,12 +769,8 @@ mod server {
     ) -> Result<PageState, String> {
         let page = live_page(conversation_id)?;
         let element = find_tagged_element(&page, element_index).await?;
-        // `type_str` needs the element focused first — confirmed against
-        // the vendored source's own doc example, which always chains
-        // `.click().await?.type_str(...)`; without it, real keyboard
-        // events go nowhere and nothing on the page reacts. Found the
-        // hard way: the first real test run of `fill` typed into a field
-        // with no visible effect at all, since nothing had focus.
+        // Inserted text and key events go to whatever has focus, so focus the
+        // element first — without it, nothing on the page reacts.
         element
             .focus()
             .await
@@ -787,6 +782,9 @@ mod server {
             .call_js_fn(SELECT_CONTENTS_FN, false)
             .await
             .map_err(|e| format!("failed to clear element {element_index}: {e}"))?;
+        // `Input.insertText`, not `type_str`: `type_str` presses one key per
+        // character from a US-keyboard table and fails on anything else
+        // (accents, CJK, emoji, newlines).
         if value.is_empty() {
             for params in key_event_params("Delete", 0)? {
                 page.execute(params)
@@ -794,8 +792,7 @@ mod server {
                     .map_err(|e| format!("failed to clear element {element_index}: {e}"))?;
             }
         } else {
-            element
-                .type_str(value)
+            page.execute(InsertTextParams::new(value))
                 .await
                 .map_err(|e| format!("failed to fill element {element_index}: {e}"))?;
         }
@@ -818,28 +815,58 @@ mod server {
     /// page state.
     pub async fn go_back(conversation_id: i64) -> Result<PageState, String> {
         let page = live_page(conversation_id)?;
-        page.evaluate("history.back()")
-            .await
-            .map_err(|e| format!("failed to go back: {e}"))?;
-        settle_after_action(&page).await;
+        act_and_settle(&page, async {
+            page.evaluate("history.back()")
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("failed to go back: {e}"))
+        })
+        .await?;
         extract_page_state(&page).await
     }
 
-    /// Waits for the action that just happened to "settle" before the
-    /// caller extracts the resulting page state. `goto` conveniently
-    /// resolves only once its own navigation is fully loaded (see
-    /// `webfetch`'s own doc comment on that), but a click/fill/back has
-    /// no equivalent signal when it *doesn't* trigger a navigation (a
-    /// JS-driven tab switch, an expand/collapse toggle, ...) — there's
-    /// nothing to wait for in that case beyond giving the page a moment
-    /// to react. Races `page.wait_for_navigation()` against a fixed
-    /// timeout and takes whichever finishes first: a real navigation
-    /// resolves it immediately; no navigation just falls through to the
-    /// timeout, which is also the (bounded) cost of every non-navigating
-    /// action. Confirmed against real pages during implementation — see
-    /// the plan's "Riskiest assumptions."
-    async fn settle_after_action(page: &Page) {
-        let _ = tokio::time::timeout(ACTION_SETTLE_TIMEOUT, page.wait_for_navigation()).await;
+    /// Runs `action`, then waits for what it set off before the caller
+    /// reads the page. There's no single "done" signal for a click: it may
+    /// start a navigation (possibly to a slow page), update the page later
+    /// (a fetch, a timer), or do nothing. So: listen for the main frame to
+    /// start loading, from *before* the action (a navigation can start
+    /// before the click call even returns). If one starts within
+    /// `ACTION_SETTLE_TIMEOUT`, wait for that page's load event (bounded by
+    /// `NAV_TIMEOUT`); if not, the settle window itself has given in-page
+    /// updates time to land. `wait_for_navigation` can't do this — it
+    /// returns at once whenever the current page is already loaded, which
+    /// right after a click it almost always is.
+    async fn act_and_settle(
+        page: &Page,
+        action: impl std::future::Future<Output = Result<(), String>>,
+    ) -> Result<(), String> {
+        let main_frame = page
+            .mainframe()
+            .await
+            .map_err(|e| format!("failed to find the page's main frame: {e}"))?;
+        let mut started = page
+            .event_listener::<EventFrameStartedLoading>()
+            .await
+            .map_err(|e| format!("failed to watch for navigation: {e}"))?;
+        let mut loaded = page
+            .event_listener::<EventLoadEventFired>()
+            .await
+            .map_err(|e| format!("failed to watch for page loads: {e}"))?;
+        action.await?;
+        let navigation_started = tokio::time::timeout(ACTION_SETTLE_TIMEOUT, async {
+            while let Some(event) = started.next().await {
+                if Some(&event.frame_id) == main_frame.as_ref() {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        if navigation_started {
+            let _ = tokio::time::timeout(NAV_TIMEOUT, loaded.next()).await;
+        }
+        Ok(())
     }
 
     /// Parses the JSON array a page-evaluated element-extraction script
@@ -920,12 +947,32 @@ mod server {
                     }),
                 )
                 .route(
+                    "/delayed",
+                    axum::routing::get(|| async {
+                        axum::response::Html(
+                            "<html><body>\
+                             <button onclick=\"setTimeout(() => { document.getElementById('late').innerText = 'delayed-done'; }, 300)\">Later</button>\
+                             <div id=\"late\">waiting</div>\
+                             <a href=\"/slow\">Slow link</a>\
+                             </body></html>",
+                        )
+                    }),
+                )
+                .route(
+                    "/slow",
+                    axum::routing::get(|| async {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        axum::response::Html("<html><body><h1>Slow page</h1></body></html>")
+                    }),
+                )
+                .route(
                     "/form-fields",
                     axum::routing::get(|| async {
                         axum::response::Html(
                             "<html><body>\
                              <input id=\"prefilled\" type=\"text\" value=\"1\">\
                              <input id=\"pw\" type=\"password\">\
+                             <textarea id=\"notes\"></textarea>\
                              </body></html>",
                         )
                     }),
@@ -1500,7 +1547,211 @@ mod server {
             );
             close_session(conversation_id)
                 .await
+                .expect("close_session should succeed");
+
+            open_session_with_guard(conversation_id, allow_loopback_too)
+                .await
+                .expect("open for the remaining scenarios should succeed");
+
+            // --- Scenario 22: a click waits for what it set off. A delayed
+            // update (a fetch, a tab switch) shows up in the returned
+            // state, and a click that navigates returns the *new* page even
+            // when that page is slow to respond. ---
+            let state = navigate(conversation_id, &format!("{base}/delayed"))
+                .await
+                .expect("navigate to the delayed page should succeed");
+            let index_of = |state: &PageState, label: &str| {
+                state
+                    .elements
+                    .iter()
+                    .find(|e| e.label == label)
+                    .map(|e| e.index)
+                    .unwrap_or_else(|| panic!("no element labelled {label:?}: {:?}", state.elements))
+            };
+            let after_later = click(conversation_id, index_of(&state, "Later"))
+                .await
+                .expect("clicking Later should succeed");
+            assert!(
+                after_later.text.contains("delayed-done"),
+                "expected the click's delayed update in the returned state, got: {:?}",
+                after_later.text
+            );
+            let after_slow = click(conversation_id, index_of(&after_later, "Slow link"))
+                .await
+                .expect("clicking the slow link should succeed");
+            assert!(
+                after_slow.url.ends_with("/slow") && after_slow.text.contains("Slow page"),
+                "expected the slow page after a navigating click, got {} / {:?}",
+                after_slow.url,
+                after_slow.text
+            );
+
+            // --- Scenario 23: fill takes any text, not just what a US
+            // keyboard can type — accents, CJK, emoji, and newlines in a
+            // textarea. ---
+            let state = navigate(conversation_id, &format!("{base}/form-fields"))
+                .await
+                .expect("navigate to the form-fields page should succeed");
+            let page = live_page(conversation_id).expect("session should still be live");
+            let international = "Zürich 東京 🎉";
+            fill(conversation_id, index_of(&state, "1"), international)
+                .await
+                .expect("filling non-ASCII text should succeed");
+            assert_eq!(field_value(&page, "#prefilled").await, international);
+            let state = read(conversation_id).await.expect("read should succeed");
+            let notes_index = state
+                .elements
+                .iter()
+                .find(|e| e.tag == "textarea")
+                .map(|e| e.index)
+                .expect("the textarea should be in the element list");
+            fill(conversation_id, notes_index, "line one\nline two")
+                .await
+                .expect("filling multi-line text should succeed");
+            assert_eq!(field_value(&page, "#notes").await, "line one\nline two");
+
+            // --- Scenario 24: nothing a page does can reach an address the
+            // guard refuses — not a popup (window.open or a target=_blank
+            // link), not a WebSocket, not a service worker. The forbidden
+            // server listens on this machine's own private address, which
+            // even the test's loopback-allowing guard refuses. ---
+            let forbidden = start_forbidden_server().await;
+            let (escape_url, _escape_server) = start_escape_test_server(&forbidden).await;
+            let state = navigate(conversation_id, &escape_url)
+                .await
+                .expect("navigate to the escape page should succeed");
+            let open_pages = || async {
+                crate::webfetch::shared_browser()
+                    .await
+                    .expect("shared browser")
+                    .pages()
+                    .await
+                    .expect("list pages")
+                    .len()
+            };
+            let pages_before = open_pages().await;
+            click(conversation_id, index_of(&state, "Popup"))
+                .await
+                .expect("clicking the popup button should succeed");
+            let state = read(conversation_id).await.expect("read should succeed");
+            click(conversation_id, index_of(&state, "Blank link"))
+                .await
+                .expect("clicking the target=_blank link should succeed");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let hits = forbidden.hits.lock().unwrap().clone();
+            assert!(
+                hits.is_empty(),
+                "a page reached the forbidden address {}: {hits:?}",
+                forbidden.addr
+            );
+            assert_eq!(
+                open_pages().await,
+                pages_before,
+                "a popup tab was opened in the shared browser"
+            );
+
+            close_session(conversation_id)
+                .await
                 .expect("final close_session should succeed");
+        }
+
+        /// A server on this machine's own private (non-loopback) address,
+        /// logging every request that reaches it — anything logged got past
+        /// the address guard.
+        pub(crate) struct ForbiddenServer {
+            pub(crate) addr: std::net::SocketAddr,
+            pub(crate) hits: std::sync::Arc<Mutex<Vec<String>>>,
+            _task: tokio::task::JoinHandle<()>,
+        }
+
+        pub(crate) async fn start_forbidden_server() -> ForbiddenServer {
+            use axum::extract::ws::WebSocketUpgrade;
+            let ip = {
+                // Picks the outward-facing interface; UDP connect sends nothing.
+                let probe = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind a probe socket");
+                probe.connect("10.255.255.255:1").expect("route a probe socket");
+                probe.local_addr().expect("probe address").ip()
+            };
+            assert!(
+                !ip.is_loopback() && !allow_loopback_too(ip),
+                "this test needs a private, non-loopback address the guard refuses; got {ip}"
+            );
+            let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let record = |hits: std::sync::Arc<Mutex<Vec<String>>>, what: &'static str| {
+                move || async move {
+                    hits.lock().unwrap().push(what.to_string());
+                    "reached"
+                }
+            };
+            let ws_hits = hits.clone();
+            let router = axum::Router::new()
+                .route("/popup", axum::routing::get(record(hits.clone(), "window.open popup")))
+                .route("/blank", axum::routing::get(record(hits.clone(), "target=_blank link")))
+                .route("/sw-hit", axum::routing::get(record(hits.clone(), "service worker fetch")))
+                .route(
+                    "/ws",
+                    axum::routing::get(move |ws: WebSocketUpgrade| async move {
+                        ws_hits.lock().unwrap().push("websocket".to_string());
+                        ws.on_upgrade(|_socket| async {})
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind((ip, 0))
+                .await
+                .expect("bind on the private address");
+            let addr = listener.local_addr().expect("local addr");
+            let task = tokio::spawn(async move {
+                axum::serve(listener, router).await.expect("forbidden server error");
+            });
+            ForbiddenServer {
+                addr,
+                hits,
+                _task: task,
+            }
+        }
+
+        /// A page (on an allowed loopback address) that tries every way out
+        /// to `forbidden` it can: a WebSocket and a service worker as soon
+        /// as it loads, plus a window.open button and a target=_blank link.
+        pub(crate) async fn start_escape_test_server(
+            forbidden: &ForbiddenServer,
+        ) -> (String, tokio::task::JoinHandle<()>) {
+            let target = forbidden.addr;
+            let page: &'static str = Box::leak(
+                format!(
+                    "<html><body>\
+                     <button onclick=\"window.open('http://{target}/popup')\">Popup</button>\
+                     <a href=\"http://{target}/blank\" target=\"_blank\">Blank link</a>\
+                     <script>\
+                     try {{ new WebSocket('ws://{target}/ws'); }} catch (e) {{}}\
+                     if (navigator.serviceWorker) {{ navigator.serviceWorker.register('/sw.js'); }}\
+                     </script>\
+                     </body></html>"
+                )
+                .into_boxed_str(),
+            );
+            let worker: &'static str = Box::leak(
+                format!(
+                    "self.addEventListener('install', e => e.waitUntil(\
+                     fetch('http://{target}/sw-hit').catch(() => {{}})));"
+                )
+                .into_boxed_str(),
+            );
+            let router = axum::Router::new()
+                .route("/", axum::routing::get(move || async move { axum::response::Html(page) }))
+                .route(
+                    "/sw.js",
+                    axum::routing::get(move || async move {
+                        ([(axum::http::header::CONTENT_TYPE, "application/javascript")], worker)
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind a test-local port");
+            let port = listener.local_addr().expect("local addr").port();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, router).await.expect("test server error");
+            });
+            (format!("http://127.0.0.1:{port}/"), task)
         }
 
         async fn field_value(page: &Page, selector: &str) -> String {
