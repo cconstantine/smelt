@@ -90,10 +90,9 @@ impl BrowserTestHarness {
         }
     }
 
-    /// Best-effort, called explicitly at the end of the test rather than via
-    /// `Drop` (which can't `.await`) — same "explicit cleanup after the
-    /// test body, not guaranteed on a panic" shape
-    /// `test_terminal_lifecycle_end_to_end`'s own cleanup already accepts.
+    /// Called explicitly at the end of the test rather than via `Drop`
+    /// (which can't `.await`); the test runs its scenarios under
+    /// `catch_unwind`, so this still runs when one fails.
     async fn shutdown(mut self) {
         let _ = self.browser.close().await;
 
@@ -338,9 +337,16 @@ async fn test_end_to_end_browser_scenarios() {
     sandbox::init().await;
 
     let harness = BrowserTestHarness::start().await;
+    // Every conversation a scenario creates, so they (and their sandbox
+    // pods) can be removed afterwards — this runs against the real dev
+    // database and cluster, so leftovers show up in the app's own sidebar
+    // and pile up pods until new ones stop starting.
+    let created = std::sync::Mutex::new(Vec::new());
 
-    let outcome = tokio::time::timeout(Duration::from_secs(180), async {
-        let conversation = db::create_conversation(pool).await.expect("create conversation");
+    // `catch_unwind` so a failing scenario still gets cleaned up after;
+    // its panic is re-raised once that's done.
+    let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(180), async {
+        let conversation = new_conversation(pool, &created).await;
 
         // --- Scenario 1: cold-load panel population, one pod, two terminals
         // in it. A conversation has at most one live pod now (see
@@ -432,9 +438,7 @@ async fn test_end_to_end_browser_scenarios() {
         // verify the DOM" shape every scenario above already uses; a real
         // Anthropic call needs credentials this test environment (and CI)
         // doesn't have. ---
-        let context_conversation = db::create_conversation(pool)
-            .await
-            .expect("create context-usage conversation");
+        let context_conversation = new_conversation(pool, &created).await;
         db::create_message(
             pool,
             context_conversation.id,
@@ -545,9 +549,7 @@ async fn test_end_to_end_browser_scenarios() {
         // seeded list, then a live, full-replace update with no reload,
         // via the real todowrite tool (not a hand-built event) — see
         // docs/projects/plans/todo-list-tool.md. ---
-        let todo_conversation = db::create_conversation(pool)
-            .await
-            .expect("create todo conversation");
+        let todo_conversation = new_conversation(pool, &created).await;
         db::set_conversation_todos(
             pool,
             todo_conversation.id,
@@ -609,8 +611,8 @@ async fn test_end_to_end_browser_scenarios() {
         // upstream, so the switch lands mid-stream. ---
         let _anthropic = anthropic::test_support::lock_anthropic_base_url();
         start_slow_mock_upstream().await;
-        let streaming = db::create_conversation(pool).await.expect("create conversation A");
-        let other = db::create_conversation(pool).await.expect("create conversation B");
+        let streaming = new_conversation(pool, &created).await;
+        let other = new_conversation(pool, &created).await;
         db::create_message(
             pool,
             other.id,
@@ -665,9 +667,73 @@ async fn test_end_to_end_browser_scenarios() {
             .into_value()
             .expect("a number");
         assert_eq!(copies, 1, "A's reply should appear exactly once");
-    })
+    })))
     .await;
 
+    // Before `harness.shutdown()`: once the harness has shut down, the
+    // cluster client's connection is gone ("runtime dropped the dispatch
+    // task") and the pod deletes silently fail.
+    let created = created.into_inner().expect("the conversation list lock");
+    let pod_ids = sandbox_pod_ids(pool, &created).await;
+    remove_conversations(pool, &created).await;
     harness.shutdown().await;
-    outcome.expect("browser test should complete within the timeout, not hang");
+    match outcome {
+        Err(panic) => std::panic::resume_unwind(panic),
+        Ok(timed) => timed.expect("browser test should complete within the timeout, not hang"),
+    }
+    assert_nothing_left(pool, &created, &pod_ids).await;
+}
+
+async fn new_conversation(
+    pool: &sqlx::PgPool,
+    created: &std::sync::Mutex<Vec<i64>>,
+) -> crate::models::Conversation {
+    let conversation = db::create_conversation(pool).await.expect("create conversation");
+    created.lock().expect("the conversation list lock").push(conversation.id);
+    conversation
+}
+
+/// Ids of every sandbox pod belonging to `conversations`, read before
+/// they're removed (the rows go with the conversation).
+async fn sandbox_pod_ids(pool: &sqlx::PgPool, conversations: &[i64]) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for &conversation in conversations {
+        let rows = db::list_sandbox_pods(pool, conversation).await.unwrap_or_default();
+        ids.extend(rows.into_iter().map(|row| row.id));
+    }
+    ids
+}
+
+/// Removes `conversations` the way deleting one in the app does: its
+/// sandbox pods first, then the conversation itself (its messages, todos,
+/// terminals and so on go with it).
+async fn remove_conversations(pool: &sqlx::PgPool, conversations: &[i64]) {
+    for &conversation in conversations {
+        sandbox::teardown_conversation(pool, conversation).await;
+        if let Err(e) = db::delete_conversation(pool, conversation).await {
+            eprintln!("failed to delete test conversation {conversation}: {e}");
+        }
+    }
+}
+
+async fn assert_nothing_left(pool: &sqlx::PgPool, conversations: &[i64], pod_ids: &[i64]) {
+    let remaining: Vec<i64> = db::list_conversations(pool)
+        .await
+        .expect("list conversations")
+        .into_iter()
+        .map(|c| c.id)
+        .filter(|id| conversations.contains(id))
+        .collect();
+    assert!(remaining.is_empty(), "test conversations left in the database: {remaining:?}");
+    // A deleted pod can linger briefly while it terminates.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    for &pod_id in pod_ids {
+        while sandbox::pod_exists(pod_id).await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "test sandbox pod {pod_id} is still in the cluster"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
 }
