@@ -71,17 +71,19 @@ The `use_resource` + `use_effect`-into-a-plain-signal pairing (rather than readi
 let mut events = send_message(id, content).await?;
 while let Some(event) = events.recv().await {
     match event? {
-        ChatEvent::Delta { text } => streaming_text.write().push_str(&text),
+        ChatEvent::Delta { text } => replies_in_flight.write().get_mut(&id)?.push_str(&text),
         ChatEvent::Done { message_id, role, content } => {
-            messages.write().push(Message { id: message_id, role, content, .. });
-            streaming_text.set(String::new());
+            if *selected.peek() == Some(id) { /* push into messages, once */ }
+            replies_in_flight.write().get_mut(&id)?.clear();
         }
-        ChatEvent::Error { message } => stream_error.set(Some(message)),
+        ChatEvent::Error { message } => stream_errors.write().insert(id, message),
     }
 }
 ```
 
-`streaming_text` is rendered as a separate trailing bubble while `is_streaming` is true, so the growing reply is visible token-by-token; it's cleared and folded into `messages` once `ChatEvent::Done` arrives.
+A reply's in-progress text is rendered as a separate trailing bubble, so it's visible token by token, and folded into `messages` once `ChatEvent::Done` arrives. That state is kept **per conversation** (`replies_in_flight`, `stream_errors`, keyed by conversation id), because the send keeps running if the viewer switches conversations. The view only reads the entry for the conversation on screen: another conversation stays usable, never shows this reply, and a finished reply only goes into `messages` if its conversation is the one being viewed. If it isn't, the reply is already saved, and it loads when the viewer goes back.
+
+Loading a conversation's messages on open goes through `apply_loaded_messages`, not a plain replace. The live subscription's reconciliation merge can land first with a message saved after the load's snapshot, and a replace would wipe it.
 
 ## The live browsing panel
 

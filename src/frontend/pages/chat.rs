@@ -2065,13 +2065,20 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
 
     let mut messages: Signal<Vec<Message>> = use_signal(Vec::new);
     let mut load_error: Signal<Option<String>> = use_signal(|| None);
-    let mut streaming_text: Signal<String> = use_signal(String::new);
-    let mut is_streaming = use_signal(|| false);
-    let mut stream_error: Signal<Option<String>> = use_signal(|| None);
+    // Replies in flight, by conversation: the text streamed so far. Keyed
+    // rather than a single value because a send keeps running when the
+    // viewer switches conversations — a single value made the other
+    // conversation look busy (input disabled) and show this one's reply.
+    let mut replies_in_flight: Signal<HashMap<i64, String>> = use_signal(HashMap::new);
+    // The last send error, by conversation, for the same reason.
+    let mut stream_errors: Signal<HashMap<i64, String>> = use_signal(HashMap::new);
+    let streaming_text = move || selected().and_then(|id| replies_in_flight.read().get(&id).cloned());
+    let is_streaming = move || streaming_text().is_some();
+    let stream_error = move || selected().and_then(|id| stream_errors.read().get(&id).cloned());
     // Set when a background wake-up (a terminal command finishing with no
     // `send_message` call in flight) fails to actually reach the model —
     // see `ConversationEvent::NotificationDeliveryFailed`. Separate from
-    // `stream_error` since that one's reset at the start of every `send()`
+    // `stream_errors` since that one's reset at the start of every `send()`
     // call; this can arrive at any time, not tied to a live send.
     //
     // `mut` is only exercised by the `web`-only live-subscription loop and
@@ -2451,43 +2458,58 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
             created_at: chrono::Utc::now().naive_utc(),
         });
 
+        // Everything this task touches is keyed by `id`, the conversation
+        // it was started in — the viewer may switch away (and back) while
+        // it runs.
         spawn(async move {
-            is_streaming.set(true);
-            stream_error.set(None);
-            streaming_text.set(String::new());
+            replies_in_flight.write().insert(id, String::new());
+            stream_errors.write().remove(&id);
 
+            let mut fail = move |message: String| {
+                stream_errors.write().insert(id, message);
+            };
             match send_message(id, content).await {
                 Ok(mut events) => {
                     while let Some(event) = events.recv().await {
                         match event {
                             Ok(ChatEvent::Delta { text }) => {
-                                streaming_text.write().push_str(&text);
+                                if let Some(reply) = replies_in_flight.write().get_mut(&id) {
+                                    reply.push_str(&text);
+                                }
                             }
                             Ok(ChatEvent::Done {
                                 message_id,
                                 role,
                                 content,
                             }) => {
-                                messages.write().push(Message {
-                                    id: message_id,
-                                    conversation_id: id,
-                                    role,
-                                    content,
-                                    created_at: chrono::Utc::now().naive_utc(),
-                                });
-                                streaming_text.set(String::new());
+                                // Only into the list on screen if it's this
+                                // conversation's; otherwise it's already
+                                // stored, and loads when the viewer returns.
+                                let viewing = *selected.peek() == Some(id);
+                                let already_shown =
+                                    messages.peek().iter().any(|m| m.id == message_id);
+                                if viewing && !already_shown {
+                                    messages.write().push(Message {
+                                        id: message_id,
+                                        conversation_id: id,
+                                        role,
+                                        content,
+                                        created_at: chrono::Utc::now().naive_utc(),
+                                    });
+                                }
+                                if let Some(reply) = replies_in_flight.write().get_mut(&id) {
+                                    reply.clear();
+                                }
                             }
-                            Ok(ChatEvent::Error { message }) => {
-                                stream_error.set(Some(message));
-                            }
-                            Err(e) => stream_error.set(Some(e.to_string())),
+                            Ok(ChatEvent::Error { message }) => fail(message),
+                            Err(e) => fail(e.to_string()),
                         }
                     }
                 }
-                Err(e) => stream_error.set(Some(e.to_string())),
+                Err(e) => fail(e.to_string()),
             }
 
-            is_streaming.set(false);
+            replies_in_flight.write().remove(&id);
         });
     };
 
@@ -2495,7 +2517,7 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
     // added or streaming text grows — but only if the user was already at
     // the bottom (`messages_stuck_to_bottom`, kept current by the
     // `.messages` div's own `onscroll` handler below). Reads `messages()`
-    // and `streaming_text()` so it reruns on both a persisted message and
+    // and `replies_in_flight()` so it reruns on both a persisted message and
     // an in-flight delta.
     //
     // Also reads `tasks()`/`sandbox_pods()`/`sandbox_terminals()`: those
@@ -2504,13 +2526,13 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
     // them arrives (see the `if !tasks().is_empty() || !sandbox_pods()...`
     // gate further down). That first appearance shrinks `.chat-main` (they
     // split the column's height via flex), which happens *after* the
-    // scroll-to-bottom already ran off of `messages()`/`streaming_text()`
+    // scroll-to-bottom already ran off of `messages()`/`replies_in_flight()`
     // alone — leaving `.messages` scrolled to what used to be the bottom
     // but, now that the container is shorter, isn't anymore. Re-running
     // this effect on their arrival re-snaps to the new true bottom.
     use_effect(move || {
         let _ = messages();
-        let _ = streaming_text();
+        let _ = replies_in_flight();
         let _ = tasks();
         let _ = sandbox_pods();
         let _ = sandbox_terminals();
@@ -2979,8 +3001,8 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                     },
                                 }
                             }
-                            if is_streaming() {
-                                div { class: "message message-assistant message-streaming", "{streaming_text}" }
+                            if let Some(reply) = streaming_text() {
+                                div { class: "message message-assistant message-streaming", "{reply}" }
                             }
                             if let Some(err) = stream_error() {
                                 p { class: "error", "{err}" }
