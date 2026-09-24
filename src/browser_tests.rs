@@ -152,6 +152,165 @@ async fn click_when_present(page: &chromiumoxide::Page, selector: &str, timeout:
     }
 }
 
+const CHAT_INPUT: &str = "input[placeholder=\"Type a message...\"]";
+
+/// What the chat view shows, for scenario 8.
+#[derive(Debug, serde::Deserialize)]
+struct ViewState {
+    input_enabled: bool,
+    streaming_bubble: bool,
+    shows_reply: bool,
+}
+
+async fn view_state(page: &chromiumoxide::Page) -> ViewState {
+    page.evaluate(format!(
+        "({{
+            input_enabled: !document.querySelector({CHAT_INPUT:?}).disabled,
+            streaming_bubble: !!document.querySelector('.message-streaming'),
+            shows_reply: document.querySelector('.messages').innerText.includes('zebra'),
+        }})"
+    ))
+    .await
+    .expect("read the view")
+    .into_value()
+    .expect("view state")
+}
+
+async fn wait_for_element(
+    page: &chromiumoxide::Page,
+    selector: &str,
+    timeout: Duration,
+) -> chromiumoxide::Element {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(element) = page.find_element(selector).await {
+            return element;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{selector} never appeared");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Waits until the page's WASM client has hydrated and is live. After
+/// subscribing to the conversation's live events, the client pulls a
+/// one-shot snapshot of each panel, `get_browsing_state` last; that
+/// request having completed is the signal. (The event stream itself never
+/// completes, so it never shows up in resource timings.) Until then the
+/// server-rendered page accepts typing with no handlers attached, so
+/// input is silently lost.
+async fn wait_for_live_client(page: &chromiumoxide::Page, conversation_id: i64) {
+    let last_pull = format!("/api/conversations/{conversation_id}/browsing");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let live: bool = page
+            .evaluate(format!(
+                "performance.getEntriesByType('resource').some(e => e.name.endsWith({last_pull:?}))"
+            ))
+            .await
+            .expect("read resource timings")
+            .into_value()
+            .expect("a bool");
+        if live {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the page's client never finished loading ({last_pull} never completed)"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Clicks conversation `id`'s sidebar entry — an in-app navigation, like a
+/// user's click, not a page load (which would end any reply in flight and
+/// hide the bug being tested) — and waits until the app is showing it. By
+/// id, not title: titles repeat across runs against the same database, and
+/// the sidebar doesn't refresh a title after the page loads.
+async fn click_conversation(page: &chromiumoxide::Page, id: i64) {
+    let clicked: bool = page
+        .evaluate(format!(
+            "(() => {{
+                const item = document.querySelector('.conversation-item[data-conversation-id=\"{id}\"]');
+                if (item) item.click();
+                return !!item;
+            }})()"
+        ))
+        .await
+        .expect("click a conversation")
+        .into_value()
+        .expect("a bool");
+    assert!(clicked, "no sidebar entry for conversation {id}");
+    let path = format!("/conversation/{id}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let current: String = page
+            .evaluate("location.pathname")
+            .await
+            .expect("read the location")
+            .into_value()
+            .expect("a string");
+        if current == path {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "clicking conversation {id} left the app at {current}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A mock Anthropic upstream whose one reply streams 25 words
+/// (`zebra0`..`zebra24`) 200ms apart — slow enough to switch conversations
+/// mid-stream. Points `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY` at it; hold
+/// `anthropic::test_support::lock_anthropic_base_url` while it's in use.
+async fn start_slow_mock_upstream() {
+    fn event(name: &str, data: &str) -> String {
+        format!("event: {name}\ndata: {data}\n\n")
+    }
+    let router = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(|| async {
+            let mut chunks = vec![event("message_start", r#"{"type":"message_start"}"#)];
+            for i in 0..25 {
+                chunks.push(event(
+                    "content_block_delta",
+                    &format!(
+                        r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"zebra{i} "}}}}"#
+                    ),
+                ));
+            }
+            chunks.push(event("content_block_stop", r#"{"type":"content_block_stop","index":0}"#));
+            chunks.push(event(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            ));
+            chunks.push(event("message_stop", r#"{"type":"message_stop"}"#));
+            let body = futures_util::StreamExt::then(futures_util::stream::iter(chunks), |chunk| async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok::<_, std::io::Error>(chunk)
+            });
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                axum::body::Body::from_stream(body),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the mock upstream");
+    let addr = listener.local_addr().expect("mock upstream address");
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.ok();
+    });
+    // SAFETY: callers hold the process-wide ANTHROPIC_BASE_URL lock, which
+    // is what every test touching these variables coordinates on.
+    unsafe {
+        std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}"));
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+    }
+}
+
 async fn wait_for_text_gone(page: &chromiumoxide::Page, needle: &str, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -441,6 +600,71 @@ async fn test_end_to_end_browser_scenarios() {
             wait_for_text_gone(&todo_page, "write the plan", Duration::from_secs(5)).await,
             "todowrite is a full replace — the old list shouldn't still be showing"
         );
+
+        // --- Scenario 8: a reply streaming into one conversation stays in
+        // that conversation. Switching to another mid-stream must leave the
+        // other one usable (not disabled while the first one's reply is in
+        // flight) and must never show the first one's reply there; going
+        // back shows the finished reply, once. The model is a slow mock
+        // upstream, so the switch lands mid-stream. ---
+        let _anthropic = anthropic::test_support::lock_anthropic_base_url();
+        start_slow_mock_upstream().await;
+        let streaming = db::create_conversation(pool).await.expect("create conversation A");
+        let other = db::create_conversation(pool).await.expect("create conversation B");
+        db::create_message(
+            pool,
+            other.id,
+            "user",
+            &[anthropic::ContentBlock::Text { text: "seeded message in B".to_string() }],
+        )
+        .await
+        .expect("seed B so it has a clickable title");
+
+        let chat = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, streaming.id))
+            .await
+            .expect("open conversation A");
+        wait_for_live_client(&chat, streaming.id).await;
+        let input = wait_for_element(&chat, CHAT_INPUT, Duration::from_secs(10)).await;
+        input.focus().await.expect("focus the message box");
+        input.type_str("hello from A").await.expect("type into A");
+        input.press_key("Enter").await.expect("send in A");
+        assert!(
+            wait_for_text(&chat, "zebra0", Duration::from_secs(10)).await,
+            "A's reply should start streaming"
+        );
+
+        click_conversation(&chat, other.id).await;
+        assert!(
+            wait_for_text(&chat, "seeded message in B", Duration::from_secs(5)).await,
+            "should now be showing B"
+        );
+        for moment in ["right after switching", "a second later"] {
+            let b = view_state(&chat).await;
+            assert!(b.input_enabled, "B's message box is disabled {moment}: {b:?}");
+            assert!(!b.streaming_bubble, "B shows a streaming bubble {moment}: {b:?}");
+            assert!(!b.shows_reply, "B shows A's reply {moment}: {b:?}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        // Let A's reply finish while B is still on screen.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let b = view_state(&chat).await;
+        assert!(!b.shows_reply, "A's finished reply landed in B: {b:?}");
+        assert!(b.input_enabled, "B's message box is disabled after A finished: {b:?}");
+
+        click_conversation(&chat, streaming.id).await;
+        assert!(
+            wait_for_text(&chat, "zebra24", Duration::from_secs(10)).await,
+            "A should show its finished reply after switching back"
+        );
+        let copies: usize = chat
+            .evaluate("document.querySelector('.messages').innerText.split('zebra24').length - 1")
+            .await
+            .expect("count the reply")
+            .into_value()
+            .expect("a number");
+        assert_eq!(copies, 1, "A's reply should appear exactly once");
     })
     .await;
 
