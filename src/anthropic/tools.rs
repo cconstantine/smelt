@@ -1356,6 +1356,19 @@ mod server {
         notify_model(pool, conversation_id, message).await;
     }
 
+    /// Stops and forgets every background task belonging to
+    /// `conversation_id` — for when the conversation is deleted. No
+    /// notification turns: there's no conversation left to notify.
+    pub fn forget_conversation_tasks(conversation_id: i64) {
+        lock_tasks().retain(|_, task| {
+            let keep = task.conversation_id != conversation_id;
+            if !keep {
+                task.abort.abort();
+            }
+            keep
+        });
+    }
+
     /// `ps`, scoped to `conversation_id` — the one tool in this suite that
     /// needs the conversation scope, since without it the model could see
     /// (and poke at) another conversation's tasks.
@@ -2574,6 +2587,36 @@ mod server {
             );
         }
 
+        /// Deleting a conversation stops its background tasks and drops
+        /// their records; another conversation's tasks are untouched.
+        #[tokio::test]
+        async fn test_forget_conversation_tasks_stops_and_removes_them() {
+            let pool = test_pool();
+            let (doomed, kept) = (987_654_009, 987_654_010);
+            for (conversation_id, task_id) in [(doomed, "toolu_doomed"), (kept, "toolu_kept")] {
+                execute(
+                    &pool,
+                    conversation_id,
+                    task_id,
+                    "run_async",
+                    &serde_json::json!({"tool": "count", "input": {"target": 1000, "interval_seconds": 0.05}}),
+                )
+                .await
+                .expect("run_async should succeed");
+            }
+
+            let doomed_task = lock_tasks()["toolu_doomed"].abort.clone();
+
+            forget_conversation_tasks(doomed);
+
+            assert!(snapshot_tasks(doomed).is_empty(), "the deleted conversation's task is still listed");
+            assert_eq!(snapshot_tasks(kept).len(), 1, "the other conversation's task was touched");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(doomed_task.is_finished(), "the deleted conversation's task is still running");
+
+            forget_conversation_tasks(kept);
+        }
+
         /// A finished task whose notification turn fails (here: the
         /// conversation doesn't exist) tells a watching tab, the same way
         /// `chat::wake_conversation` does for terminal commands.
@@ -3173,6 +3216,6 @@ pub use server::execute;
 #[cfg(all(feature = "server", test))]
 pub use server::native_tool_definitions;
 #[cfg(feature = "server")]
-pub use server::snapshot_tasks;
+pub use server::{forget_conversation_tasks, snapshot_tasks};
 #[cfg(feature = "server")]
 pub use server::tool_definitions;

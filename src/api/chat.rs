@@ -71,6 +71,7 @@ pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
     // regardless, so nothing about the pod matters anymore either way.
     crate::sandbox::teardown_conversation(db::get(), id).await;
     let _ = crate::browsing::close_session(id).await;
+    anthropic::tools::forget_conversation_tasks(id);
     db::delete_conversation(db::get(), id)
         .await
         .map_err(ServerFnError::new)
