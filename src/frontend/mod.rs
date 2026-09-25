@@ -2,7 +2,8 @@ mod pages;
 
 use dioxus::prelude::*;
 use pages::{
-    Chat, McpServerEdit, McpServerNew, McpServersIndex, SandboxVolumeNew, SandboxVolumesIndex,
+    Chat, McpServerEdit, McpServerNew, McpServersIndex, PodsIndex, SandboxVolumeNew,
+    SandboxVolumesIndex,
 };
 
 #[derive(Routable, Clone, PartialEq, Debug)]
@@ -21,6 +22,8 @@ pub(crate) enum Route {
     SandboxVolumesRoute {},
     #[route("/sandbox-volumes/new")]
     SandboxVolumeNewRoute {},
+    #[route("/pods")]
+    PodsRoute {},
 }
 
 #[component]
@@ -51,6 +54,11 @@ fn SandboxVolumesRoute() -> Element {
 #[component]
 fn SandboxVolumeNewRoute() -> Element {
     rsx! { SandboxVolumeNew {} }
+}
+
+#[component]
+fn PodsRoute() -> Element {
+    rsx! { PodsIndex {} }
 }
 
 /// `id` only exists here to satisfy the `Routable` derive's requirement

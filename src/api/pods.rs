@@ -29,6 +29,9 @@ pub struct PodOverview {
     /// installed) or has no numbers for this pod yet.
     pub usage: Option<PodUsage>,
     pub terminals: i64,
+    /// The database's clock when this was read; ages are measured against
+    /// it, not the browser's clock.
+    pub observed_at: NaiveDateTime,
 }
 
 /// A pod's current resource use, from the cluster's metrics API. Lags
@@ -39,15 +42,10 @@ pub struct PodUsage {
     pub cpu_millicores: u64,
 }
 
-/// A Kubernetes CPU quantity in millicores: `"250m"`, `"2"` (cores),
-/// `"1203981n"` (nanocores, what metrics-server reports) or `"5u"`.
-#[cfg(feature = "server")]
-fn parse_cpu_millicores(quantity: &str) -> Option<u64> {
-    parse_cpu_nanocores(quantity).map(|nanos| (nanos / 1_000_000.0) as u64)
-}
-
-/// A CPU quantity in nanocores, as a float so fractional cores (`"0.5"`)
-/// and sums across containers keep their precision until the end.
+/// A Kubernetes CPU quantity in nanocores: `"250m"`, `"2"` (cores),
+/// `"1203981n"` (nanocores, what metrics-server reports) or `"5u"`. A
+/// float, so fractional cores (`"0.5"`) and sums across containers keep
+/// their precision until converted to millicores at the end.
 #[cfg(feature = "server")]
 fn parse_cpu_nanocores(quantity: &str) -> Option<f64> {
     let (number, scale) = match quantity.char_indices().last()? {
@@ -165,6 +163,7 @@ pub(crate) async fn pod_overviews(pool: &sqlx::PgPool) -> Result<Vec<PodOverview
             cpu_limit: details.cpu_limit,
             usage: usage.get(&crate::sandbox::kubernetes_pod_name(row.pod_id)).cloned(),
             terminals: row.live_terminals,
+            observed_at: row.observed_at,
         });
     }
     Ok(overviews)
@@ -233,6 +232,7 @@ mod tests {
             live_terminals: 1,
             running_commands: running,
             last_command_finished_at: finished.map(at),
+            observed_at: at(12),
         }
     }
 
@@ -251,6 +251,10 @@ mod tests {
             before,
             "a dropped subscription is still listening"
         );
+    }
+
+    fn parse_cpu_millicores(quantity: &str) -> Option<u64> {
+        parse_cpu_nanocores(quantity).map(|nanos| (nanos / 1_000_000.0) as u64)
     }
 
     #[test]

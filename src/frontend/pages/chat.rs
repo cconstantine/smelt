@@ -179,7 +179,7 @@ fn address_bar_value(editing: bool, draft: &str, url: Option<&str>) -> String {
 /// A server function's error as the viewer should read it — the server's
 /// own message, without the wrapper `ServerFnError`'s `Display` adds around
 /// it ("error running server function: … (details: None)").
-fn server_error_message(error: &ServerFnError) -> String {
+pub(crate) fn server_error_message(error: &ServerFnError) -> String {
     match error {
         ServerFnError::ServerError { message, .. } => message.clone(),
         other => other.to_string(),
@@ -1948,6 +1948,7 @@ pub fn Chat() -> Element {
         Route::McpServerNewRoute {} => None,
         Route::McpServerEditRoute { .. } => None,
         Route::SandboxVolumesRoute {} => None,
+        Route::PodsRoute {} => None,
         Route::SandboxVolumeNewRoute {} => None,
     });
 
@@ -1956,10 +1957,12 @@ pub fn Chat() -> Element {
     // conversation's title (set by its first message) and its place in the
     // list stay current without a reload.
     let conversations_changed = use_signal(|| 0u64);
+    // Bumped whenever a pod is created or goes away in any conversation.
+    let pods_changed = super::pods::use_pods_changed();
 
     rsx! {
         div { class: "chat-layout",
-            ConversationSidebar { selected, conversations_changed }
+            ConversationSidebar { selected, conversations_changed, pods_changed }
             ChatPanel { selected, conversations_changed }
         }
     }
@@ -1969,8 +1972,17 @@ pub fn Chat() -> Element {
 fn ConversationSidebar(
     selected: Memo<Option<i64>>,
     conversations_changed: Signal<u64>,
+    pods_changed: Signal<u64>,
 ) -> Element {
     let navigator = use_navigator();
+    // Which conversations have a live pod, for the dot next to their title.
+    let live_pods = use_resource(move || {
+        let _ = pods_changed();
+        crate::api::pods::get_live_pod_conversations()
+    });
+    let has_live_pod = move |id: i64| {
+        matches!(&*live_pods.read(), Some(Ok(ids)) if ids.contains(&id))
+    };
     let initial_conversations = use_resource(move || {
         let _ = conversations_changed();
         get_conversations()
@@ -2029,6 +2041,7 @@ fn ConversationSidebar(
         aside { class: "sidebar",
             button { class: "new-conversation", onclick: new_conversation, "New conversation" }
             Link { to: Route::McpServersRoute {}, class: "mcp-servers-link", "MCP servers" }
+            Link { to: Route::PodsRoute {}, class: "pods-link", "Pods" }
             if let Some(err) = error() {
                 p { class: "error", "{err}" }
             }
@@ -2048,6 +2061,9 @@ fn ConversationSidebar(
                                 navigator.push(Route::ConversationRoute { id: conversation.id });
                             },
                             span { class: "conversation-title", "{conversation.title}" }
+                            if has_live_pod(conversation.id) {
+                                span { class: "live-pod-dot", title: "sandbox pod running" }
+                            }
                             button {
                                 class: if pending_delete() == Some(conversation.id) { "delete-conversation confirm" } else { "delete-conversation" },
                                 onclick: move |evt: Event<MouseData>| {
@@ -2111,6 +2127,24 @@ fn ChatPanel(selected: Memo<Option<i64>>, conversations_changed: Signal<u64>) ->
     let mut todos: Signal<Vec<TodoItem>> = use_signal(Vec::new);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut sandbox_pods: Signal<Vec<SandboxPodPanelEntry>> = use_signal(Vec::new);
+    // The panel's Stop button: the pod armed for stopping (click once to
+    // arm, again to confirm), and the last stop's error. The pod itself
+    // disappears through the usual `SandboxPodUpdate` event.
+    let mut pending_pod_stop: Signal<Option<i64>> = use_signal(|| None);
+    let mut pod_stop_error: Signal<Option<String>> = use_signal(|| None);
+    let mut request_pod_stop = move |pod_id: i64| {
+        if pending_pod_stop() == Some(pod_id) {
+            pending_pod_stop.set(None);
+            spawn(async move {
+                match crate::api::pods::stop_pod(pod_id).await {
+                    Ok(()) => pod_stop_error.set(None),
+                    Err(e) => pod_stop_error.set(Some(server_error_message(&e))),
+                }
+            });
+        } else {
+            pending_pod_stop.set(Some(pod_id));
+        }
+    };
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut sandbox_terminals: Signal<Vec<SandboxTerminalPanelEntry>> = use_signal(Vec::new);
     // Whether the model currently has a browsing session open — drives
@@ -2853,6 +2887,16 @@ fn ChatPanel(selected: Memo<Option<i64>>, conversations_changed: Signal<u64>) ->
                                         div { key: "{pod.pod_id}", class: "sandbox-pod",
                                             div { class: "sandbox-pod-header",
                                                 span { class: "sandbox-pod-status", "{pod.status}" }
+                                                button {
+                                                    class: if pending_pod_stop() == Some(pod.pod_id) { "pod-stop confirm" } else { "pod-stop" },
+                                                    r#type: "button",
+                                                    title: "Stop this pod. Its terminals and any files outside mounted volumes are lost.",
+                                                    onclick: move |_| request_pod_stop(pod.pod_id),
+                                                    if pending_pod_stop() == Some(pod.pod_id) { "Confirm stop?" } else { "Stop pod" }
+                                                }
+                                            }
+                                            if let Some(err) = pod_stop_error() {
+                                                p { class: "error", "{err}" }
                                             }
                                             div { class: "task-terminal-stack",
                                                 for terminal in sandbox_terminals().into_iter().filter(|t| t.pod_id == pod.pod_id) {

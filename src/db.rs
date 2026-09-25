@@ -302,6 +302,8 @@ pub struct LivePodRow {
     pub live_terminals: i64,
     pub running_commands: i64,
     pub last_command_finished_at: Option<NaiveDateTime>,
+    /// The database's own `now()`, so ages are worked out on one clock.
+    pub observed_at: NaiveDateTime,
 }
 
 /// Every live pod, oldest first — the pods view's rows.
@@ -319,7 +321,8 @@ pub async fn list_live_pods(pool: &PgPool) -> Result<Vec<LivePodRow>, sqlx::Erro
                   WHERE t.pod_id = p.id AND tc.status = 'running') AS running_commands,
                 (SELECT MAX(tc.finished_at) FROM terminal_commands tc
                    JOIN sandbox_terminals t ON t.id = tc.terminal_id
-                  WHERE t.pod_id = p.id) AS last_command_finished_at
+                  WHERE t.pod_id = p.id) AS last_command_finished_at,
+                now()::timestamp AS observed_at
            FROM sandbox_pods p
            JOIN conversations c ON c.id = p.conversation_id
           WHERE p.terminated_at IS NULL
@@ -1287,6 +1290,10 @@ mod tests {
         assert_eq!(quiet_row.live_terminals, 0);
         assert_eq!(quiet_row.running_commands, 0);
         assert_eq!(quiet_row.last_command_finished_at, None);
+        assert!(
+            rows.iter().all(|r| r.observed_at >= r.created_at && r.observed_at >= r.conversation_updated_at),
+            "observed_at should be the database's current time"
+        );
 
         let with_pods = conversations_with_live_pods(&pool).await.expect("list");
         assert_eq!(with_pods, vec![busy.id, quiet.id]);

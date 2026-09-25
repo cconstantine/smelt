@@ -1887,3 +1887,115 @@ div.mcp-status-not-connected::before {
     color: #666;
     text-align: center;
 }
+
+/* --- Pods (docs/projects/plans/pod-management.md) --- */
+
+.pods-link {
+    display: block;
+    padding: 8px 10px;
+    border-radius: 8px;
+    color: #555;
+    font-size: 13px;
+    text-decoration: none;
+    text-align: center;
+    border: 1px solid #e5e5e5;
+}
+
+.pods-link:hover {
+    background: #f2f2f2;
+    color: #111;
+}
+
+/* A conversation with a live sandbox pod. */
+.live-pod-dot {
+    flex-shrink: 0;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #1baf7a;
+}
+
+.pods-page {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+}
+
+.pods-header {
+    margin-bottom: 24px;
+}
+
+.pods-back-link {
+    display: inline-block;
+    margin-bottom: 12px;
+    color: #555;
+    font-size: 13px;
+    text-decoration: none;
+}
+
+.pods-back-link:hover {
+    color: #111;
+}
+
+.pods-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.pods-table th {
+    text-align: left;
+    font-weight: 600;
+    color: #555;
+    padding: 8px 10px;
+    border-bottom: 1px solid #e5e5e5;
+}
+
+.pods-table td {
+    padding: 10px;
+    border-bottom: 1px solid #f0f0f0;
+    vertical-align: middle;
+    white-space: nowrap;
+}
+
+.pods-table td:first-child {
+    white-space: normal;
+}
+
+.pods-table a {
+    color: #111;
+}
+
+.pod-id {
+    font-size: 12px;
+}
+
+.pods-footnote {
+    margin-top: 16px;
+    font-size: 12px;
+}
+
+.pod-stop {
+    padding: 4px 10px;
+    border: 1px solid #c0392b;
+    border-radius: 6px;
+    background: #fff;
+    color: #c0392b;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.pod-stop:hover {
+    background: #fdecea;
+}
+
+.pod-stop.confirm {
+    background: #c0392b;
+    color: #fff;
+}
+
+.sandbox-pod-header .pod-stop {
+    margin-left: 10px;
+}
