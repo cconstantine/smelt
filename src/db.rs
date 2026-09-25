@@ -139,6 +139,13 @@ pub async fn create_message(
     Ok(message)
 }
 
+pub async fn conversation_exists(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM conversations WHERE id = $1)")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+}
+
 pub async fn delete_conversation(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM conversations WHERE id = $1")
         .bind(id)

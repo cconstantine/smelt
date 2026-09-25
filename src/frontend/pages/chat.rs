@@ -176,10 +176,10 @@ fn address_bar_value(editing: bool, draft: &str, url: Option<&str>) -> String {
     }
 }
 
-/// A failed navigation's message as the viewer should read it — the
-/// server's own message, without the wrapper `ServerFnError`'s `Display`
-/// adds around it.
-fn navigation_error_message(error: &ServerFnError) -> String {
+/// A server function's error as the viewer should read it — the server's
+/// own message, without the wrapper `ServerFnError`'s `Display` adds around
+/// it ("error running server function: … (details: None)").
+fn server_error_message(error: &ServerFnError) -> String {
     match error {
         ServerFnError::ServerError { message, .. } => message.clone(),
         other => other.to_string(),
@@ -1489,14 +1489,14 @@ mod tests {
     }
 
     #[test]
-    fn test_navigation_error_message_shows_just_the_server_message() {
+    fn test_server_error_message_shows_just_the_server_message() {
         let error = ServerFnError::ServerError {
             message: "failed to load https://x/: net::ERR_BLOCKED_BY_CLIENT".to_string(),
             code: 500,
             details: None,
         };
         assert_eq!(
-            navigation_error_message(&error),
+            server_error_message(&error),
             "failed to load https://x/: net::ERR_BLOCKED_BY_CLIENT"
         );
     }
@@ -1951,18 +1951,30 @@ pub fn Chat() -> Element {
         Route::SandboxVolumeNewRoute {} => None,
     });
 
+    // Bumped by the chat panel whenever its conversation gets new
+    // messages; the sidebar refetches its list when it changes, so a
+    // conversation's title (set by its first message) and its place in the
+    // list stay current without a reload.
+    let conversations_changed = use_signal(|| 0u64);
+
     rsx! {
         div { class: "chat-layout",
-            ConversationSidebar { selected }
-            ChatPanel { selected }
+            ConversationSidebar { selected, conversations_changed }
+            ChatPanel { selected, conversations_changed }
         }
     }
 }
 
 #[component]
-fn ConversationSidebar(selected: Memo<Option<i64>>) -> Element {
+fn ConversationSidebar(
+    selected: Memo<Option<i64>>,
+    conversations_changed: Signal<u64>,
+) -> Element {
     let navigator = use_navigator();
-    let initial_conversations = use_resource(get_conversations);
+    let initial_conversations = use_resource(move || {
+        let _ = conversations_changed();
+        get_conversations()
+    });
     let mut conversations: Signal<Vec<Conversation>> = use_signal(Vec::new);
     let mut loaded = use_signal(|| false);
     let mut error: Signal<Option<String>> = use_signal(|| None);
@@ -2053,7 +2065,7 @@ fn ConversationSidebar(selected: Memo<Option<i64>>) -> Element {
 }
 
 #[component]
-fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
+fn ChatPanel(selected: Memo<Option<i64>>, conversations_changed: Signal<u64>) -> Element {
     let initial_messages = use_resource(move || {
         let id = selected();
         async move {
@@ -2066,6 +2078,10 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
 
     let mut messages: Signal<Vec<Message>> = use_signal(Vec::new);
     let mut load_error: Signal<Option<String>> = use_signal(|| None);
+    // The server's own "not found", distinct from a failed load: the page
+    // says so and offers no message box, instead of a send that can only
+    // fail.
+    let conversation_missing = move || load_error().as_deref() == Some("conversation not found");
     // Replies in flight, by conversation: the text streamed so far. Keyed
     // rather than a single value because a send keeps running when the
     // viewer switches conversations — a single value made the other
@@ -2197,7 +2213,7 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
             // was left scrolled.
             messages_stuck_to_bottom.set(true);
         }
-        Some(Some(Err(e))) => load_error.set(Some(e.to_string())),
+        Some(Some(Err(e))) => load_error.set(Some(server_error_message(&e))),
         Some(None) => {
             messages.set(Vec::new());
             messages_stuck_to_bottom.set(true);
@@ -2236,6 +2252,8 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
             browsing_url.set(None);
             address_editing.set(false);
             address_error.set(None);
+            notification_delivery_error.set(None);
+            context_usage.set(None);
 
             let handle = spawn(async move {
                 loop {
@@ -2272,7 +2290,8 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
 
                         loop {
                             match events.recv().await {
-                                Some(Ok(ConversationEvent::MessagesAppended(rows))) => {
+                                Some(Ok(ConversationEvent::MessagesAppended { messages: rows })) => {
+                                    *conversations_changed.write() += 1;
                                     merge_messages_by_id(&mut messages.write(), rows);
                                 }
                                 Some(Ok(ConversationEvent::TaskUpdate {
@@ -2503,14 +2522,18 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                 }
                             }
                             Ok(ChatEvent::Error { message }) => fail(message),
-                            Err(e) => fail(e.to_string()),
+                            Err(e) => fail(server_error_message(&e)),
                         }
                     }
                 }
-                Err(e) => fail(e.to_string()),
+                Err(e) => fail(server_error_message(&e)),
             }
 
             replies_in_flight.write().remove(&id);
+            // The first message titles a conversation, and any send moves
+            // it up the list — refresh the sidebar even if the viewer has
+            // switched away (this tab then isn't listening to `id`'s events).
+            *conversations_changed.write() += 1;
         });
     };
 
@@ -2635,7 +2658,7 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                             spawn(async move {
                                                 match navigate_browser(id, address).await {
                                                     Ok(()) => address_editing.set(false),
-                                                    Err(e) => address_error.set(Some(navigation_error_message(&e))),
+                                                    Err(e) => address_error.set(Some(server_error_message(&e))),
                                                 }
                                                 address_pending.set(false);
                                             });
@@ -2983,7 +3006,11 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                         ),
                                     );
                             },
-                            if let Some(err) = load_error() {
+                            if conversation_missing() {
+                                p { class: "conversation-missing",
+                                    "This conversation doesn't exist. It may have been deleted."
+                                }
+                            } else if let Some(err) = load_error() {
                                 p { class: "error", "Error loading messages: {err}" }
                             }
                             for message in messages() {
@@ -3012,6 +3039,7 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                 p { class: "error", "A background notification failed to reach the model: {err}" }
                             }
                         }
+                        if !conversation_missing() {
                         form {
                             class: "composer",
                             onsubmit: move |event| {
@@ -3026,6 +3054,7 @@ fn ChatPanel(selected: Memo<Option<i64>>) -> Element {
                                 oninput: move |e| input.set(e.value()),
                             }
                             button { r#type: "submit", disabled: is_streaming(), "Send" }
+                        }
                         }
                     }
                     }

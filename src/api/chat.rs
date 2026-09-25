@@ -53,6 +53,12 @@ pub async fn create_conversation() -> ServerFnResult<Conversation> {
 
 #[get("/api/conversations/{id}/messages")]
 pub async fn get_messages(id: i64) -> ServerFnResult<Vec<Message>> {
+    if !db::conversation_exists(db::get(), id)
+        .await
+        .map_err(ServerFnError::new)?
+    {
+        return Err(ServerFnError::new("conversation not found"));
+    }
     db::list_messages(db::get(), id)
         .await
         .map_err(ServerFnError::new)
@@ -65,9 +71,13 @@ pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
     // regardless, so nothing about the pod matters anymore either way.
     crate::sandbox::teardown_conversation(db::get(), id).await;
     let _ = crate::browsing::close_session(id).await;
+    anthropic::tools::forget_conversation_tasks(id);
     db::delete_conversation(db::get(), id)
         .await
-        .map_err(ServerFnError::new)
+        .map_err(ServerFnError::new)?;
+    crate::events::forget(id);
+    forget_conversation_lock(id);
+    Ok(())
 }
 
 #[cfg(feature = "server")]
@@ -400,6 +410,73 @@ async fn describe_live_state(pool: &PgPool, conversation_id: i64) -> String {
     }
 }
 
+/// The conversation as plain text, for the summarization call: the latest
+/// compaction's summary and everything since (what came before it is
+/// already in that summary — including it again made every later
+/// compaction bigger than the last, until the summarization call couldn't
+/// fit at all), cut to `max_chars` by dropping the oldest part.
+#[cfg(feature = "server")]
+fn compaction_transcript(messages: &[Message], max_chars: usize) -> String {
+    let latest_boundary = messages
+        .iter()
+        .filter_map(|m| m.blocks().ok())
+        .flatten()
+        .filter_map(|block| match block {
+            anthropic::ContentBlock::CompactionSummary {
+                covers_through_message_id,
+                ..
+            } => Some(covers_through_message_id),
+            _ => None,
+        })
+        .max();
+    let mut transcript = String::new();
+    for message in messages
+        .iter()
+        .filter(|m| latest_boundary.is_none_or(|boundary| m.id > boundary))
+    {
+        let Ok(blocks) = message.blocks() else {
+            continue;
+        };
+        for block in blocks {
+            let text = match block {
+                anthropic::ContentBlock::Text { text } => text,
+                anthropic::ContentBlock::ToolUse { name, input, .. } => {
+                    format!("[called tool {name} with {input}]")
+                }
+                anthropic::ContentBlock::ToolResult { content, .. } => {
+                    format!("[tool result: {content}]")
+                }
+                anthropic::ContentBlock::Thinking { .. } => continue,
+                anthropic::ContentBlock::CompactionSummary { summary, .. } => summary,
+                // Purely structural (see its own doc comment) — noise for
+                // a *later* compaction's own summarization transcript, not
+                // real prior dialogue worth feeding back in.
+                anthropic::ContentBlock::CompactionPlaceholder { .. } => continue,
+            };
+            transcript.push_str(&message.role);
+            transcript.push_str(": ");
+            transcript.push_str(&text);
+            transcript.push('\n');
+        }
+    }
+    let total = transcript.chars().count();
+    if total <= max_chars {
+        return transcript;
+    }
+    const OMITTED: &str = "[earlier conversation omitted]\n";
+    let keep = max_chars.saturating_sub(OMITTED.chars().count());
+    let tail: String = transcript.chars().skip(total - keep).collect();
+    format!("{OMITTED}{tail}")
+}
+
+/// How much transcript the summarization call can take: the context window
+/// less room for its instructions, the live-state listing and its own
+/// output, at a conservative 3 characters per token.
+#[cfg(feature = "server")]
+fn compaction_transcript_budget() -> usize {
+    (context_window() as usize).saturating_sub(8_192) * 3
+}
+
 /// Runs one compaction pass: summarizes everything currently persisted (up
 /// through and including whatever's pending — the size trigger fired
 /// because of everything currently in the conversation, not just the
@@ -432,33 +509,7 @@ async fn compact_conversation(
     }
     let covers_through_message_id = last.id;
 
-    let mut transcript = String::new();
-    for message in &messages {
-        let Ok(blocks) = message.blocks() else {
-            continue;
-        };
-        for block in blocks {
-            let text = match block {
-                anthropic::ContentBlock::Text { text } => text,
-                anthropic::ContentBlock::ToolUse { name, input, .. } => {
-                    format!("[called tool {name} with {input}]")
-                }
-                anthropic::ContentBlock::ToolResult { content, .. } => {
-                    format!("[tool result: {content}]")
-                }
-                anthropic::ContentBlock::Thinking { .. } => continue,
-                anthropic::ContentBlock::CompactionSummary { summary, .. } => summary,
-                // Purely structural (see its own doc comment) — noise for
-                // a *later* compaction's own summarization transcript, not
-                // real prior dialogue worth feeding back in.
-                anthropic::ContentBlock::CompactionPlaceholder { .. } => continue,
-            };
-            transcript.push_str(&message.role);
-            transcript.push_str(": ");
-            transcript.push_str(&text);
-            transcript.push('\n');
-        }
-    }
+    let transcript = compaction_transcript(&messages, compaction_transcript_budget());
 
     let live_state = describe_live_state(pool, conversation_id).await;
     let prompt = format!(
@@ -522,6 +573,17 @@ fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<()>> {
         .entry(conversation_id)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+/// Drops `conversation_id`'s lock, for when the conversation is deleted.
+/// A turn still holding it keeps its own handle; any later turn gets a
+/// fresh lock and then fails, since the conversation no longer exists.
+#[cfg(feature = "server")]
+fn forget_conversation_lock(conversation_id: i64) {
+    CONVERSATION_LOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&conversation_id);
 }
 
 /// The credential-requirement decision `run_turn_bounded` makes at the top
@@ -608,7 +670,7 @@ pub(crate) async fn wake_conversation(
         crate::events::publish(
             conversation_id,
             crate::events::ConversationEvent::NotificationDeliveryFailed {
-                detail: e.to_string(),
+                detail: chat_error_text(e),
             },
         );
     }
@@ -681,13 +743,12 @@ fn run_turn_bounded<'a>(
         let lock = conversation_lock(conversation_id);
         let _guard = lock.lock().await;
 
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty());
-        require_at_least_one_credential(&api_key, &auth_token).map_err(ServerFnError::new)?;
+        if !db::conversation_exists(pool, conversation_id)
+            .await
+            .map_err(ServerFnError::new)?
+        {
+            return Err(ServerFnError::new("conversation not found"));
+        }
 
         let mut persisted = Vec::new();
         // Tracks what's been persisted since the last *real* Anthropic
@@ -713,6 +774,16 @@ fn run_turn_bounded<'a>(
             pending_new_content.extend(new_message.content.clone());
             persisted.push(saved);
         }
+
+        // Checked after saving the new message, so what the user typed
+        // survives a reload even when the turn can't run.
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty());
+        require_at_least_one_credential(&api_key, &auth_token).map_err(ServerFnError::new)?;
 
         for _ in 0..max_turns {
             // Checked at the top of every loop iteration, not just once per
@@ -854,7 +925,9 @@ fn run_turn_bounded<'a>(
             if turn.stop_reason != "tool_use" {
                 crate::events::publish(
                     conversation_id,
-                    crate::events::ConversationEvent::MessagesAppended(persisted.clone()),
+                    crate::events::ConversationEvent::MessagesAppended {
+                        messages: persisted.clone(),
+                    },
                 );
                 return Ok(persisted);
             }
@@ -885,12 +958,25 @@ fn run_turn_bounded<'a>(
 
         crate::events::publish(
             conversation_id,
-            crate::events::ConversationEvent::MessagesAppended(persisted),
+            crate::events::ConversationEvent::MessagesAppended {
+                messages: persisted,
+            },
         );
         Err(ServerFnError::new(format!(
             "tool-use loop exceeded {max_turns} turns without reaching a final reply"
         )))
     })
+}
+
+/// What the chat shows when a turn fails: the server's own message,
+/// without the "error running server function: … (details: None)" wrapper
+/// `ServerFnError`'s `Display` adds.
+#[cfg(feature = "server")]
+pub(crate) fn chat_error_text(error: &ServerFnError) -> String {
+    match error {
+        ServerFnError::ServerError { message, .. } => message.clone(),
+        other => other.to_string(),
+    }
 }
 
 #[post("/api/conversations/{id}/messages")]
@@ -933,7 +1019,7 @@ pub async fn send_message(id: i64, content: String) -> ServerFnResult<ServerEven
             Err(e) => {
                 let _ = tx
                     .send(ChatEvent::Error {
-                        message: e.to_string(),
+                        message: chat_error_text(&e),
                     })
                     .await;
             }
@@ -1227,24 +1313,25 @@ pub async fn get_context_detail(id: i64) -> ServerFnResult<ContextDetailSnapshot
 pub async fn subscribe_conversation_events(
     id: i64,
 ) -> ServerFnResult<ServerEvents<events::ConversationEvent>> {
-    Ok(ServerEvents::new(move |mut tx| async move {
-        let mut rx = events::subscribe(id);
+    // `from_stream`, not `ServerEvents::new`: `new` runs its loop as a
+    // detached task that never notices the connection closing, so every
+    // page load or reconnect used to leave a subscriber behind for good.
+    // Here the response pulls events as it sends them, and dropping it
+    // (the tab going away) drops the subscription.
+    let rx = events::subscribe(id);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
-                Ok(event) => {
-                    let _ = tx.send(event).await;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // A subscriber that fell behind just misses some
-                    // ephemeral `TaskUpdate`s — the frontend's one-shot
-                    // `get_messages`/`get_tasks` reconciliation pull on
-                    // connect covers the durable state regardless.
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Ok(event) => return Some((Ok::<_, axum::BoxError>(event), rx)),
+                // A subscriber that fell behind just misses some ephemeral
+                // updates — the frontend's reconciliation pull on connect
+                // covers the durable state regardless.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
         }
-    }))
+    });
+    Ok(ServerEvents::from_stream(stream))
 }
 
 #[cfg(test)]
@@ -1262,6 +1349,51 @@ mod tests {
             content: serde_json::to_string(&blocks).expect("ContentBlock always serializes"),
             created_at: chrono::Utc::now().naive_utc(),
         }
+    }
+
+    fn text_message(id: i64, role: &str, text: &str) -> Message {
+        message_with_blocks(id, role, vec![text_block(text)])
+    }
+
+    /// Messages 1-2 were already summarized by an earlier compaction
+    /// (3-5); only 6 is new since.
+    fn compacted_once() -> Vec<Message> {
+        let mut messages = vec![
+            text_message(1, "user", "ancient question"),
+            text_message(2, "assistant", "ancient answer"),
+        ];
+        for (offset, (role, blocks)) in compaction_messages("the earlier summary".to_string(), 2)
+            .into_iter()
+            .enumerate()
+        {
+            messages.push(message_with_blocks(3 + offset as i64, role, blocks));
+        }
+        messages.push(text_message(6, "user", "recent question"));
+        messages
+    }
+
+    #[test]
+    fn test_compaction_transcript_starts_from_the_latest_summary() {
+        let transcript = compaction_transcript(&compacted_once(), usize::MAX);
+        assert!(transcript.contains("the earlier summary"), "got {transcript}");
+        assert!(transcript.contains("recent question"), "got {transcript}");
+        assert!(
+            !transcript.contains("ancient"),
+            "messages an earlier compaction already replaced came back: {transcript}"
+        );
+    }
+
+    #[test]
+    fn test_compaction_transcript_keeps_the_most_recent_part_within_its_budget() {
+        let mut messages: Vec<Message> = (1..=50)
+            .map(|id| text_message(id, "user", &format!("message {id} {}", "x".repeat(1_000))))
+            .collect();
+        messages.push(text_message(51, "user", "the very latest"));
+        let transcript = compaction_transcript(&messages, 5_000);
+        assert!(transcript.chars().count() <= 5_000, "{} chars", transcript.chars().count());
+        assert!(transcript.contains("the very latest"));
+        assert!(transcript.contains("omitted"), "the cut should be marked");
+        assert!(!transcript.contains("message 1 "), "the oldest part should be what's dropped");
     }
 
     #[test]
@@ -1477,6 +1609,39 @@ mod tests {
             is_error: None,
         }];
         assert!(is_safe_compaction_boundary(&blocks));
+    }
+
+    #[test]
+    fn test_forget_conversation_lock_drops_it() {
+        let conversation_id = 987_654_011;
+        let first = conversation_lock(conversation_id);
+        forget_conversation_lock(conversation_id);
+        let second = conversation_lock(conversation_id);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the deleted conversation's lock is still registered"
+        );
+        forget_conversation_lock(conversation_id);
+    }
+
+    /// A subscription belongs to its connection: once the response is
+    /// dropped (the tab closed or reloaded), nothing should still be
+    /// listening on the conversation's channel.
+    #[tokio::test]
+    async fn test_a_dropped_event_subscription_stops_listening() {
+        let conversation_id = 9_000_000_007;
+        let subscription = subscribe_conversation_events(conversation_id)
+            .await
+            .expect("subscribe");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(events::subscriber_count(conversation_id), 1);
+        drop(subscription);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            events::subscriber_count(conversation_id),
+            0,
+            "a dropped subscription is still listening"
+        );
     }
 
     #[test]
@@ -1951,6 +2116,58 @@ mod tests {
             "the notification message should still be persisted, got {messages:?}"
         );
         assert_eq!(messages[0].role, "user");
+    }
+
+    #[test]
+    fn test_chat_error_text_drops_the_server_function_wrapper() {
+        let error = ServerFnError::new("model provider error 503 Service Unavailable: paused");
+        assert_eq!(
+            chat_error_text(&error),
+            "model provider error 503 Service Unavailable: paused"
+        );
+    }
+
+    fn hello() -> anthropic::AnthropicMessage {
+        anthropic::AnthropicMessage {
+            role: "user".to_string(),
+            content: vec![anthropic::ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_run_turn_for_a_missing_conversation_says_so(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        start_mock_upstream(vec![String::new()]).await;
+        let error = run_turn(&pool, 987_654_321, hello(), None)
+            .await
+            .expect_err("a turn for a conversation that doesn't exist should fail")
+            .to_string();
+        assert!(error.contains("conversation not found"), "got: {error}");
+        assert!(!error.contains("foreign key"), "a raw database error leaked: {error}");
+    }
+
+    /// With no model credentials the turn can't run, but what the user
+    /// typed is still theirs: it shouldn't vanish on the next reload.
+    #[sqlx::test]
+    async fn test_run_turn_without_credentials_still_saves_the_message(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        // SAFETY: the lock above serializes every test that touches these.
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        }
+        let result = run_turn(&pool, conversation.id, hello(), None).await;
+        assert!(result.is_err(), "no credentials should fail the turn");
+        let saved = db::list_messages(&pool, conversation.id)
+            .await
+            .expect("list messages");
+        assert_eq!(saved.len(), 1, "the user's message should have been saved");
+        assert_eq!(saved[0].role, "user");
     }
 
     #[sqlx::test]

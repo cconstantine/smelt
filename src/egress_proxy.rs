@@ -31,7 +31,7 @@ static REQUESTS_HANDLED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 /// How many requests any proxy in this process has accepted — for tests
 /// that need to prove traffic actually went through one.
-#[cfg(test)]
+#[cfg(all(test, feature = "browser-test"))]
 pub fn requests_handled() -> u64 {
     REQUESTS_HANDLED.load(std::sync::atomic::Ordering::Relaxed)
 }

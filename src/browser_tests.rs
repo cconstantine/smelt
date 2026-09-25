@@ -223,8 +223,7 @@ async fn wait_for_live_client(page: &chromiumoxide::Page, conversation_id: i64) 
 /// Clicks conversation `id`'s sidebar entry — an in-app navigation, like a
 /// user's click, not a page load (which would end any reply in flight and
 /// hide the bug being tested) — and waits until the app is showing it. By
-/// id, not title: titles repeat across runs against the same database, and
-/// the sidebar doesn't refresh a title after the page loads.
+/// id, not title: titles repeat across runs against the same database.
 async fn click_conversation(page: &chromiumoxide::Page, id: i64) {
     let clicked: bool = page
         .evaluate(format!(
@@ -667,6 +666,95 @@ async fn test_end_to_end_browser_scenarios() {
             .into_value()
             .expect("a number");
         assert_eq!(copies, 1, "A's reply should appear exactly once");
+        // A's first message titled it; the sidebar should show that
+        // without a reload.
+        let title_selector = format!(
+            ".conversation-item[data-conversation-id=\"{}\"] .conversation-title",
+            streaming.id
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let title: String = chat
+                .evaluate(format!("document.querySelector({title_selector:?})?.innerText ?? ''"))
+                .await
+                .expect("read A's sidebar title")
+                .into_value()
+                .expect("a string");
+            if title.contains("hello from A") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "A's sidebar title is still {title:?} after its first message"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // --- Scenario 9: a reply the watching tab didn't ask for — a
+        // background task's notification, another tab's send — still
+        // reaches it live, with no reload. ---
+        let watcher = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, other.id))
+            .await
+            .expect("open conversation B in a watching tab");
+        wait_for_live_client(&watcher, other.id).await;
+        crate::api::chat::run_turn(
+            pool,
+            other.id,
+            anthropic::AnthropicMessage {
+                role: "user".to_string(),
+                content: vec![anthropic::ContentBlock::Text {
+                    text: "sent from somewhere else".to_string(),
+                }],
+            },
+            None,
+        )
+        .await
+        .expect("a turn run outside the watching tab should succeed");
+        assert!(
+            wait_for_text(&watcher, "zebra24", Duration::from_secs(10)).await,
+            "the watching tab never showed a reply it didn't send itself"
+        );
+
+        // --- Scenario 10: a conversation that doesn't exist says so,
+        // rather than offering a chat box whose send fails with a raw
+        // database error. ---
+        let missing = harness
+            .browser
+            .new_page(format!("{}conversation/987654321", harness.base_url))
+            .await
+            .expect("open a conversation that doesn't exist");
+        assert!(
+            wait_for_text(&missing, "doesn't exist", Duration::from_secs(10)).await,
+            "a missing conversation should say it doesn't exist"
+        );
+        assert!(
+            missing.find_element(CHAT_INPUT).await.is_err(),
+            "a missing conversation shouldn't offer a message box"
+        );
+
+        // --- Scenario 11: a failed background notification belongs to its
+        // conversation — switching away clears it. ---
+        crate::events::publish(
+            other.id,
+            crate::events::ConversationEvent::NotificationDeliveryFailed {
+                detail: "scenario 11 failure".to_string(),
+            },
+        );
+        assert!(
+            wait_for_text(&watcher, "scenario 11 failure", Duration::from_secs(10)).await,
+            "the watching tab should show B's notification failure"
+        );
+        click_conversation(&watcher, streaming.id).await;
+        assert!(
+            wait_for_text(&watcher, "hello from A", Duration::from_secs(10)).await,
+            "switching to A should show A's messages"
+        );
+        assert!(
+            wait_for_text_gone(&watcher, "scenario 11 failure", Duration::from_secs(2)).await,
+            "B's notification failure followed the tab to A"
+        );
     })))
     .await;
 

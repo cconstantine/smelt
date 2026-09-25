@@ -50,7 +50,9 @@ pub async fn send_message(id: i64, content: String) -> ServerFnResult<ServerEven
                     let _ = tx.send(ChatEvent::Done { message_id: message.id, role: message.role, content: message.content }).await;
                 }
             }
-            Err(e) => { let _ = tx.send(ChatEvent::Error { message: e.to_string() }).await; }
+            // chat_error_text: the error's own message, without ServerFnError's
+            // "error running server function: … (details: None)" wrapper.
+            Err(e) => { let _ = tx.send(ChatEvent::Error { message: chat_error_text(&e) }).await; }
         }
     }))
 }
@@ -58,7 +60,11 @@ pub async fn send_message(id: i64, content: String) -> ServerFnResult<ServerEven
 
 Requests carry `thinking: {"type": "adaptive"}` by default (`ANTHROPIC_THINKING=0` to turn it off — see [setup.md](setup.md)), so an assistant turn's `content` can start with a `ContentBlock::Thinking { thinking, signature }` block ahead of any `Text`/`ToolUse` blocks — `run_turn` persists and replays it exactly like any other block, uninterpreted; the frontend renders it as a collapsed-by-default `<details>` (see `frontend/pages/chat.rs`'s `render_block_element`).
 
-If a request fails with Ollama's specific "error parsing tool call" 500 (its Anthropic-compat shim, at least for `gpt-oss` models, doesn't always turn a model's raw output into valid tool-call JSON — either because thinking's reasoning landed in the same text as the call, or the model just wrote invalid JSON on its own), `run_turn_bounded` retries: first with `thinking` dropped, then up to `TOOL_CALL_PARSE_RETRIES` further plain regenerations, since a local model's next sampling pass often doesn't repeat the same malformed output. Gives up and surfaces the error once that's exhausted. Any other failure (a real rate limit, a genuinely different error) propagates immediately, with no retry. See `is_ollama_thinking_tool_call_corruption`.
+If a request fails with Ollama's specific "error parsing tool call" 500 (its Anthropic-compat shim, at least for `gpt-oss` models, doesn't always turn a model's raw output into valid tool-call JSON — either because thinking's reasoning landed in the same text as the call, or the model just wrote invalid JSON on its own), `run_turn_bounded` retries: first with `thinking` dropped, then up to `TOOL_CALL_PARSE_RETRIES` further plain regenerations, since a local model's next sampling pass often doesn't repeat the same malformed output. Gives up and surfaces the error once that's exhausted. Any other failure propagates from `run_turn_bounded` immediately. See `is_ollama_thinking_tool_call_corruption`.
+
+One layer down, `anthropic::stream::stream_anthropic_message` retries a briefly unavailable provider on its own: an HTTP 429, 503 or 529 gets two more attempts, 1s and then 3s later (`RETRY_DELAYS`), before anything has streamed. Any other status fails at once. A failure reads `model provider error {status}: {message}`, where the message is the provider's own (`provider_error_message` unwraps the JSON error body, including a nested one), not the raw response.
+
+`run_turn_bounded` refuses a conversation that doesn't exist with a plain `conversation not found` (checked right after taking the conversation's lock), rather than letting the insert fail on a foreign key. `get_messages` returns the same error, which the chat page uses to show "This conversation doesn't exist" instead of a message box. The new message is saved *before* the credential check, so with no credentials configured the message is kept and only the reply fails.
 
 **`ChatEvent::Done` can fire more than once per `send_message` call** — once for each message `run_turn` persisted in that turn loop (an assistant `ToolUse` turn, the `ToolResult` turn, a final assistant reply — however many rounds the tool-use loop took). The frontend's existing "push each `Done` onto `messages`" loop handles this unchanged, since it was already written to handle an arbitrary number of `Done`s.
 
@@ -136,7 +142,7 @@ pub struct BrowsingState { session_open: bool, url: Option<String> }
 #[serde(tag = "type")]
 pub enum ConversationEvent {
     TaskUpdate { task_id: String, tool: String, status: String, stream: Option<String>, latest_output: Option<String> },
-    MessagesAppended(Vec<Message>),
+    MessagesAppended { messages: Vec<Message> },
     SandboxPodUpdate { pod_id: i64, status: String, terminated: bool },
     SandboxTerminalUpdate { pod_id: i64, terminal_id: i64, status: String, terminated: bool },
     SandboxCommandUpdate { terminal_id: i64, command_id: String, command: Option<String>, status: String, exit_code: Option<i32>, stream: Option<String>, latest_output: Option<String> },
@@ -147,6 +153,8 @@ pub enum ConversationEvent {
     BrowsingUrlUpdate { url: String },
 }
 ```
+
+`MessagesAppended` is a struct variant, not `MessagesAppended(Vec<Message>)`: the enum is internally tagged, and serde can't write a tuple variant holding a list that way. It used to be one, and every send failed silently (`wire_tests::test_every_event_round_trips_through_json` now serializes one of each variant). The stream is built with `ServerEvents::from_stream` over the broadcast receiver, for the same reason as the frame stream below: a closed connection drops the subscription. `NotificationDeliveryFailed` is published when a turn fired with no request in flight fails: `wake_conversation` (a terminal command finished) and a `run_async` task's output or completion notification.
 
 `TaskUpdate`/`Sandbox*`/`ContextUsageUpdate`/`TodoListUpdate`/`BrowsingSessionUpdate`/`BrowsingUrlUpdate` are all ephemeral UI telemetry (never persisted as such, regenerable at any time from `get_tasks`/`get_sandbox_state`/`get_context_usage`/`get_todos`/`get_browsing_state` — `ContextUsageUpdate`'s own numbers *are* separately persisted, in `conversation_context_usage`, precisely so `get_context_usage` can regenerate it, and `TodoListUpdate`'s are likewise persisted in `conversation_todos`); `MessagesAppended` is a live-delivery notification for rows `run_turn` already persisted — whether that `run_turn` call came from a live `send_message` or from a background task's own push. `SandboxPodUpdate`/`SandboxTerminalUpdate` fire on create/terminate (a `terminated: true` update means the frontend should *remove* that pod/terminal, not just relabel it — unlike a finished task, which the task panel keeps showing); `SandboxCommandUpdate` follows the exact same "started/one output line/finished" pattern `TaskUpdate` already uses, with `command` only populated on the "started" event. `ContextUsageUpdate` publishes once per completed real turn, right after `run_turn_bounded` persists that turn's usage. `TodoListUpdate` publishes on every `todowrite` call and always carries the *complete* current list (never a partial diff — `todowrite` itself is a whole-list replace, no per-item ids), so the frontend just overwrites its signal wholesale rather than merging like `TaskUpdate` requires. `BrowsingSessionUpdate` publishes from `open_browser_session`/`close_browser_session`, so the panel shows/hides reactively rather than only checking on conversation (re)select. Since the underlying `broadcast` channel has no replay, the frontend does a one-shot `get_messages`/`get_tasks`/`get_sandbox_state`/`get_context_usage`/`get_todos`/`get_browsing_state` reconciliation pull on connect/reconnect to cover anything published before it subscribed — see `architecture.md`.
 
@@ -187,6 +195,6 @@ pub async fn navigate_browser(id: i64, address: String) -> ServerFnResult<()>;
 | `send_browser_input` | `POST /api/conversations/{id}/browsing/input` | forwards one live-panel mouse/keyboard event, see above |
 | `navigate_browser` | `POST /api/conversations/{id}/browsing/navigate` | the live panel's address bar, see above |
 | `subscribe_conversation_events` | `GET /api/conversations/{id}/events` | always-open live stream, see above |
-| `delete_conversation` | `DELETE /api/conversations/{id}` | hard delete; cascades to the conversation's messages (`ON DELETE CASCADE`); deleting a nonexistent id is not an error |
+| `delete_conversation` | `DELETE /api/conversations/{id}` | hard delete; cascades to the conversation's messages (`ON DELETE CASCADE`); also tears down its sandboxes and browsing session, stops its `run_async` tasks, and drops its event channel and turn lock; deleting a nonexistent id is not an error |
 
-Not yet implemented (straightforward mechanical additions when needed): rename a conversation, concurrent-send guarding, wiring `delete_conversation` to cancel that conversation's still-running tasks.
+Not yet implemented (straightforward mechanical additions when needed): rename a conversation, concurrent-send guarding.
