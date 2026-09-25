@@ -135,10 +135,10 @@ Decided at planning (2026-09-25):
   - `testing.md`;
   - close-out as usual, including `coding-session.md`'s idle-pods item, reworded to "automatic cleanup" now that idle time is visible.
 
-## Open questions and tradeoffs
+## Decisions from review (2026-09-25)
 
-1. **One PR or two?** Part 2 (stopping a turn) doesn't depend on Part 1. Proposal: two PRs from this one plan, Part 1 first, so each is reviewable on its own (development-process.md's scope rule). Close-out happens once, on the second.
-2. **The pause after a stop.** Proposed: notices are saved but don't wake the model until the user's next message. The alternative, letting them wake it as usual, would restart the model seconds after a stop whenever a command was still running.
-3. **Homelab RBAC.** Live usage needs the RBAC change applied on homelab, and only you can do that. Until then the view says "unavailable" there. Is that fine to ship?
-4. **Idle definition.** Busy while a command runs; otherwise idle since the last command, message or pod start. File and web tool calls count only through the messages they produce. Good enough?
-5. **The sidebar marker.** A small dot, with the tooltip "sandbox pod running". Proposal: just the dot, with no busy/idle distinction in the sidebar; the pods view has the details.
+1. **One PR** for both parts, with commits kept separate per behavior.
+2. **Pause after a stop:** yes. Notices are saved, and don't wake the model until the user's next message.
+3. **Homelab RBAC:** fine to ship with usage "unavailable" there; no homelab work in this project.
+4. **Idle definition:** as proposed. Busy while a command runs; otherwise idle since the last command, message or pod start.
+5. **Sidebar marker:** a plain dot with the tooltip "sandbox pod running", with no busy/idle distinction.
