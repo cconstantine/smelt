@@ -2,186 +2,32 @@
 
 ## What
 
-Give smelt the tools and system prompt to act as a coding agent — checking
-out a repo, reading and editing files, running shell commands — as the
-app's normal way of operating, not a toggle a user picks per conversation.
-Every one of those actions (`git checkout`, file edits, command execution)
-happens inside an isolated sandbox, never against the smelt server's own
-filesystem/process.
+smelt's purpose is to be a coding agent, not a general chat app with a coding mode: every conversation is a coding session. Most of what that needs has shipped. Each piece has its own completed doc:
 
-## Why
+- A sandbox pod per conversation (`20260809-k8s-sandbox.md`)
+- Persistent terminals in it (`20260812-sandbox-terminal.md`)
+- A live panel showing what runs (`20260815-sandbox-visibility.md`)
+- File tools with diffs (`20260816-file-tools.md`), plus `glob`/`grep` (`20260922-glob-and-grep.md`)
+- Memory and CPU limits with OOM detection (`20260816-sandbox-oom.md`)
+- A custom sandbox image and volumes (`20260818-sandbox-native-environment.md`)
+- MCP servers, including GitHub (`20260817-mcp-servers.md`)
 
-smelt's purpose is to be a coding agent, not a general-purpose chat app
-that also happens to offer a coding mode. Every conversation is a coding
-session; there's no separate "plain chat" use case to preserve alongside
-it. `state.md`'s goals already call out tool-use (filesystem/shell) as the
-natural next project — this idea is that project, described as the app's
-actual direction rather than an optional add-on.
+This file keeps only what's still open.
 
-Sandboxing isn't an afterthought here: the moment tool calls can run shell
-commands and touch files, smelt's own server process is the thing an
-unreviewed model response would be acting through. The server must never
-be the thing that runs `git checkout`, writes a file, or execs a command —
-a sandbox does, and the server only talks to the sandbox.
+## Still open
 
-## Depends on
+1. **A coding-oriented system prompt.** Normal turns send no `system` prompt at all (only compaction has one). Planned as the `system-prompt` project.
+2. **Getting a repo into the sandbox.**
+   - The sandbox image (`debian:trixie-slim` plus `sudo`) has no `git` unless the model installs it itself.
+   - No git credentials reach the pod. The earlier sketch was a per-session Kubernetes `Secret`, mounted read-only into just that pod and deleted with it; the `park` service account can already manage secrets.
+   - Undecided: does the user give a repo URL per conversation, or is smelt scoped to one project per deployment?
+   - Related but different: GitHub over MCP gives API-level repo access today, and `mcp-hosted-servers.md` covers a git MCP server next to the sandbox. Neither gives the model a real local clone to build and test in.
+3. **Deleting idle pods.** A pod ends only when the model terminates it or the conversation is deleted, so a forgotten conversation keeps its pod running indefinitely.
+4. **A time limit per command.** `run_terminal_command` has none; a hung command runs until the model sends it a signal.
+5. **Confirmation before destructive actions.** A sandboxed `rm -rf` is still destructive within the session's own files. `clarifying-question-tool.md` mentions this as a motivation but doesn't design it.
+6. **Describing smelt as a coding agent.** `state.md` still calls it an "AI chat agent", and its out-of-scope list should be reread with coding as the purpose.
 
-`anthropic::types::ContentBlock` needs `tool_use`/`tool_result` variants,
-and `send_message`'s conversation loop (`src/api/chat.rs`) needs to
-round-trip them, before there's anything to attach tools to. Most of the
-wire types were deliberately kept close to the full Anthropic shape for
-exactly this — see `state.md`.
+## Deliberately deferred (not smelt code)
 
-## Sandboxing
-
-**Shipped** — the lifecycle primitive below (create/exec/delete a pod) is
-implemented in `src/sandbox.rs`; see
-`projects/completed/20260809-k8s-sandbox.md`. On top of that, a real
-persistent terminal is now wired up as eleven model-facing tools (pod/
-terminal/command as three separately-guarded lifecycles, N pods per
-conversation each with N terminals) — see
-`projects/completed/20260812-sandbox-terminal.md`. Still open from this
-section: `git clone`/credential wiring.
-
-**Update:** repo access now has a second, already-shipped option that
-doesn't depend on anything below — the agent can drive GitHub through its
-hosted MCP server (search/read/write repos, issues, PRs — API-level, not
-a local shell `git`) once one is configured via `/mcp-servers`; see
-`projects/completed/20260817-mcp-servers.md`. This does not replace the
-sandbox-mounted-credential approach sketched below (no local checkout, no
-arbitrary `git`/shell commands against a real clone), just gives an
-alternative path to "the agent can act on a repo" that was available
-sooner. Revisit whether `git clone`/credential wiring inside the sandbox
-is still worth building once it's clear whether MCP-level access already
-covers real usage.
-
-Each coding session gets its own isolated, disposable environment. Nothing
-the agent does — `git checkout`, file reads/writes, shell commands — ever
-touches the smelt server's own filesystem or process directly; the server
-only ever talks *to* the sandbox (start it, send it a command, read back
-the result), never acts as it.
-
-The environment: a Kubernetes Pod in the `smelt-park` namespace of an
-existing local k3s cluster (`homelab`), not a Docker container — smelt
-talks to it via `kube-rs`, authenticated as a namespace-scoped service
-account (`park`) whose RBAC is already close to least-privilege for this:
-`pods` (create/delete/exec/log), `secrets`, `configmaps`, `services`,
-`ingresses`, `pvc` within `smelt-park`, and nothing cluster-scoped (no
-`nodes`, `RuntimeClass`, `StorageClass`, not even the `smelt-park`
-namespace object itself).
-
-- **Isolation mechanism:** one Pod per session, created/deleted through
-  the `pods` RBAC above, commands run via the `pods/exec` subresource
-  (same shape as `docker exec`, and already permitted). Confirmed
-  empirically against `homelab`: no `gVisor`/`Kata` `RuntimeClass` is
-  installed (`runtimeClassName: gvisor`/`kata`/`kata-qemu`/`kata-fc` all
-  rejected with "not found"), so sandbox pods run under plain `runc` today
-  — the same kernel-sharing tradeoff as a bare Docker container. Adding a
-  sandboxed RuntimeClass is a `homelab`-admin task, not smelt code; revisit
-  by adding `runtimeClassName` to the pod spec once one exists, no other
-  change needed. The isolation win that's already real without it: sandbox
-  pods run on a separate physical machine from wherever smelt's own server
-  process runs, unlike a same-host Docker-in-Docker sidecar.
-- **Lifecycle:** one Pod per conversation, created on first tool use (not
-  eagerly on conversation create) and deleted when the conversation is
-  deleted or after an idle timeout — needs to line up with whatever the
-  delete-conversations idea lands on, so a deleted conversation doesn't
-  leave an orphaned pod running.
-- **Filesystem:** `git checkout`/`clone` of the target repo happens inside
-  the pod's own container filesystem (or an `emptyDir`), never a host path
-  and never smelt's own source tree. The RBAC already covers `pvc`
-  create/delete if a session's checkout ever needs to survive a pod
-  restart within its own lifetime, but nothing needs that yet.
-- **Network:** no egress restriction — not a launch requirement. The
-  `park` service account has no RBAC on `NetworkPolicy` objects at all
-  (list/get/create all forbidden), so enforcing an allowlist would mean
-  either widening that RBAC or an admin-managed policy outside smelt's own
-  control; not worth blocking on for now. Revisit with whoever admins
-  `homelab` if the threat model changes.
-- **Resource limits:** currently *not* enforced — an earlier `512Mi`/
-  `500m` limit turned out too small for real work (a `cargo build` alone
-  could exceed it) with no way to tell a real OOM kill apart from an
-  ordinary crash when it happened, so the limit was removed outright as
-  an interim fix rather than shipping a bigger number with the same
-  blind spot. `projects/plans/sandbox-oom.md` (on hold) is what
-  reintroduces a real, configurable limit paired with OOM
-  detection/attribution. The namespace still has no `LimitRange`/
-  `ResourceQuota`, so smelt itself remains the only thing that could
-  enforce a per-session cap once one exists again. A hard wall-clock
-  timeout per command still needs its own answer; nothing about Pods
-  gives that for free.
-- **Credentials:** git auth (for private repos) reaches the sandbox as a
-  per-session Kubernetes `Secret`, mounted read-only into just that pod
-  and deleted with it when the session ends — the RBAC already grants
-  `secrets` create/patch/delete/get, so this doesn't need a new mechanism
-  beyond what's already provisioned, unlike smelt's own
-  `ANTHROPIC_API_KEY`-as-host-env-var pattern.
-
-## Visibility
-
-**Shipped** — a live sandbox panel shows every pod/terminal the model has
-and each terminal's command history (stdout/stderr in true chronological
-order), streaming as it happens, no reload needed; see
-`projects/completed/20260815-sandbox-visibility.md`. File read/write/edit
-tools and file-edit diffs in the transcript have since shipped too — see
-`projects/completed/20260816-file-tools.md`. Nothing left open from this
-section.
-
-A sandbox the user can't see into is worse than no sandbox — they need to
-watch what the agent is actually doing (which commands ran, what output
-they produced, which files changed) as it happens, not just receive a
-final assistant message once the tool loop finishes.
-
-- `send_message` already streams to the browser via `ServerEvents<ChatEvent>`
-  (`ChatEvent::Delta`/`Done`/`Error`, see `architecture.md`'s "Two streams"
-  section) — the natural extension is new `ChatEvent` variants for tool
-  activity (e.g. a command starting, its live stdout/stderr, a file diff)
-  emitted alongside the existing text deltas, so tool calls render inline
-  in the same stream as the assistant's words rather than as a separate
-  polling mechanism.
-- Command output should stream as it's produced, not buffer until the
-  command exits — sandboxed commands can be long-running, and a silent UI
-  during a multi-second `cargo build` inside the sandbox reads as hung.
-- File edits are more legible as a diff than as the raw `tool_use` JSON
-  input — worth rendering a before/after diff in the transcript rather
-  than dumping the tool call's parameters.
-- Persistence: today `Message.content` is plain text (`models.md` notes
-  this was deliberately kept simple since v1 has exactly one content
-  shape). Tool activity needs to survive a page reload / reopening an old
-  conversation, not just live-stream once — this likely means storing
-  more than plain text per message once `ContentBlock` grows tool
-  variants, or a separate table keyed by message/conversation for tool
-  events. Needs a real answer at plan time, not deferred as "ephemeral is
-  fine."
-
-## Rough shape
-
-- `send_message` always builds its `CreateMessageRequest` with a
-  coding-oriented `system` prompt and the tool set attached — `system` is
-  already `None` today, so this is additive, not a rewrite of the
-  request-building path. No per-conversation branching, no `mode` field on
-  `models::Conversation`.
-- Tool execution is a new server-side component that proxies `tool_use`
-  calls into the session's sandbox and returns the result as
-  `tool_result`, **and** emits the visibility events described above as it
-  goes — this is the piece that owns "never touch the host filesystem" and
-  "the user can see what's happening," so it's worth designing and
-  reviewing on its own before wiring it into the conversation loop.
-- Start with a small, real tool set (bash + file read/write) rather than
-  reimplementing Claude Code's full toolset (edit, glob, grep, ...)
-  up front; grow it once the round-trip through `ContentBlock` and the
-  sandbox proxy are solid.
-
-## Open questions
-
-- Confirmation/approval UX for destructive tool calls, on top of the
-  sandbox itself — a sandboxed `rm -rf` is still destructive *within* the
-  session's own checkout. See the security notes on client-side tools in
-  the Claude API skill.
-- Where does the sandboxed checkout come from — does the user paste a repo
-  URL per conversation, or is smelt scoped to one project per deployment?
-  Affects the "clone inside the sandbox" step above.
-- Does `docs/projects/state.md`'s framing ("AI chat agent talking to
-  Claude") and out-of-scope list need updating to reflect that coding is
-  the intended purpose, not a future add-on? Worth revisiting when this
-  moves from idea to plan.
+- **A stronger runtime than `runc`** (gVisor/Kata `RuntimeClass`): none is installed on `homelab`. Adding one is a cluster-admin task; smelt would then only set `runtimeClassName` on the pod spec.
+- **Network egress restriction:** the `park` service account has no rights on `NetworkPolicy` objects, so it needs wider permissions or an admin-managed policy. Not a launch requirement; revisit if the threat model changes.
