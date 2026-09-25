@@ -24,7 +24,7 @@ This file keeps only what's still open.
    - Related but different: GitHub over MCP gives API-level repo access today, and `mcp-hosted-servers.md` covers a git MCP server next to the sandbox. Neither gives the model a real local clone to build and test in.
 3. **Deleting idle pods.** A pod ends only when the model terminates it or the conversation is deleted, so a forgotten conversation keeps its pod running indefinitely.
 4. **A time limit per command.** `run_terminal_command` has none; a hung command runs until the model sends it a signal.
-5. **Confirmation before destructive actions.** A sandboxed `rm -rf` is still destructive within the session's own files. `clarifying-question-tool.md` mentions this as a motivation but doesn't design it.
+5. **Confirmation before destructive actions.** A sandboxed `rm -rf` is still destructive within the session's own files. Now part of `model-safety.md`.
 6. **Describing smelt as a coding agent.** `state.md` still calls it an "AI chat agent", and its out-of-scope list should be reread with coding as the purpose.
 
 ## Deliberately deferred (not smelt code)

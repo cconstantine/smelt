@@ -39,7 +39,6 @@ The same split opencode uses, checked in its source (`packages/opencode/src/sess
      - Use `todowrite` for multi-step work.
      - Verify changes by running them (build, tests) rather than assuming.
      - Say plainly what you did and didn't verify.
-     - Ask before destructive actions the user didn't ask for, even inside the sandbox (deleting files, `git reset --hard`, dropping data).
      - Be concise.
   7. **Output:** replies show as plain text with line breaks kept, not rendered markdown. Short paragraphs and `-` lists read fine; avoid tables and heavy markdown. Code goes in plain fenced blocks.
 - **Environment section**, generated per turn and appended as its own block:
@@ -87,8 +86,8 @@ The same split opencode uses, checked in its source (`packages/opencode/src/sess
 
 ## Open questions and tradeoffs
 
-1. **Your own standing instructions?** opencode and Claude Code read project files (`AGENTS.md`/`CLAUDE.md`). smelt has no project checkout yet (the idea's item 2), so there's nothing to read. Proposal: not in this project. A per-deployment "extra instructions" setting (an env var, or a text field on a settings page) could come next if you want one now.
-2. **Asking before destructive actions** is proposed as a prompt rule only (section 6), not an approval mechanism. That's cheap, and it partly addresses the idea's item 5 without building confirmation UI.
-3. **Markdown:** tell the model to write plain text (proposed; matches today's rendering), or render markdown in the chat instead and let it write normally? Rendering is the better long-term answer but a separate UI project.
-4. **Update `state.md`'s "What smelt is" to say coding agent** as part of this close-out (the idea's item 6)? Proposal: yes, it's one paragraph.
+1. **Your own standing instructions?** *Decided: not in this project.* opencode and Claude Code read project files (`AGENTS.md`/`CLAUDE.md`). smelt has no project checkout yet (the idea's item 2), so there's nothing to read. Proposal: not in this project. A per-deployment "extra instructions" setting (an env var, or a text field on a settings page) could come next if you want one now.
+2. **Asking before destructive actions:** *decided, left out.* Model safety will be its own project; see `projects/ideas/model-safety.md`.
+3. **Markdown:** *decided, plain text only for now.* Rendering markdown in the chat will be its own project; see `projects/ideas/markdown-in-chat.md`.
+4. *Decided: yes.* **Update `state.md`'s "What smelt is" to say coding agent** as part of this close-out (the idea's item 6)? Proposal: yes, it's one paragraph.
 5. **Prompt caching** (`cache_control` on the system prompt and tools) would cut cost on long conversations. Out of scope here; the stable-within-a-day prompt keeps the door open.
