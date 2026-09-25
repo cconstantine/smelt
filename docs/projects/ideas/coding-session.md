@@ -22,7 +22,7 @@ This file keeps only what's still open.
    - No git credentials reach the pod. The earlier sketch was a per-session Kubernetes `Secret`, mounted read-only into just that pod and deleted with it; the `park` service account can already manage secrets.
    - Undecided: does the user give a repo URL per conversation, or is smelt scoped to one project per deployment?
    - Related but different: GitHub over MCP gives API-level repo access today, and `mcp-hosted-servers.md` covers a git MCP server next to the sandbox. Neither gives the model a real local clone to build and test in.
-2. **Deleting idle pods.** A pod ends only when the model terminates it or the conversation is deleted, so a forgotten conversation keeps its pod running indefinitely. See also `pod-management.md`, which gives the user a way to see and stop pods.
+2. **Stopping idle pods automatically.** A pod ends only when the model terminates it, the user stops it, or the conversation is deleted. `/pods` now shows each pod's idle time and lets the user stop it (`20260925-pod-management.md`), but nothing stops a forgotten pod on its own.
 3. **A time limit per command.** `run_terminal_command` has none; a hung command runs until the model sends it a signal.
 4. **Confirmation before destructive actions.** A sandboxed `rm -rf` is still destructive within the session's own files. Now part of `model-safety.md`.
 

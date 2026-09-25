@@ -3376,7 +3376,7 @@ mod tests {
             // --- The user stops a pod that has an open terminal and a
             // running command: everything is torn down, the command is
             // marked lost, and the model gets a user-stop notice, not a
-            // crash notice. See docs/projects/plans/pod-management.md. ---
+            // crash notice. See docs/projects/completed/20260925-pod-management.md. ---
             let conversation_g = db::create_conversation(&pool).await.expect("create conversation g");
             let mut app_events = events::subscribe_app();
             let pod_g = create_pod(&pool, conversation_g.id, None, None).await.expect("create_pod (g) should succeed");

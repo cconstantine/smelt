@@ -40,7 +40,19 @@ This isn't just style — a plain prop threaded down from `Home`/`ConversationRo
 
 `Chat` also owns a `conversations_changed: Signal<u64>` counter, passed to both `ConversationSidebar` and `ChatPanel`. The sidebar's `use_resource` reads it before calling `get_conversations()`, so bumping it refetches the list. `ChatPanel` bumps it when a `MessagesAppended` event arrives and when a send finishes, which is how a new conversation's title (set by its first message) replaces "New Conversation" without a reload.
 
-On a switch, `ChatPanel` resets every per-conversation signal before subscribing to the new conversation's events: tasks, todos, sandbox state, browsing state, the background-notification error and the context-usage meter. Anything missed here shows the previous conversation's state until something replaces it. If `get_messages` fails with `conversation not found`, the page says "This conversation doesn't exist. It may have been deleted." and hides the message box.
+On a switch, `ChatPanel` resets every per-conversation signal before subscribing to the new conversation's events: tasks, todos, sandbox state, browsing state, the background-notification error and the context-usage meter. Anything missed here shows the previous conversation's state until something replaces it. The sidebar shows a green dot on each conversation with a live sandbox pod (`get_live_pod_conversations`), refetched when `Chat`'s `pods_changed` counter moves. `ChatPanel` bumps that counter on `ConversationEvent::PodsChanged`, which arrives on the open conversation's own stream rather than a second connection (see [api.md](api.md#live-conversation-events)). So on `/`, with no conversation open, the dots only refresh on navigation. A "Pods" link sits under "MCP servers", leading to `/pods` (`pages/pods.rs`). That page:
+- lists every live pod with its conversation, status, uptime, activity (busy, or idle for how long), memory and CPU use against their limits, and terminal count;
+- has a Stop button per row, clicked once to arm and again to confirm;
+- refetches on `AppEvent::PodsChanged` (its own `subscribe_app_events` stream, through `use_pods_changed`) and every 30 seconds;
+- measures ages against the `observed_at` the server sends, not the browser's clock.
+
+The conversation's sandbox panel has the same two-click "Stop pod" button.
+
+While a turn runs, the composer shows **Stop** next to Send. That's when this tab's reply is streaming, or the server says a turn is running (`TurnState`, with `get_turn_state` in the reconnect pull, kept just before `get_browsing_state` because the browser tests use that request as the "client is live" signal). Stop calls `stop_turn` and shows "Stopped." in place of the reply; the next send clears it.
+
+**Connections are scarce.** Over plain HTTP/1.1, a browser allows 6 connections per host, shared by every tab. Each chat tab holds one always-open event stream, plus one more while a reply streams, and any other request (a Stop click, a snapshot) needs a free one. With about four smelt tabs open while a reply streams, a click can queue until something finishes. Don't add another always-open stream per tab; relay on the conversation stream instead, as `PodsChanged` does.
+
+If `get_messages` fails with `conversation not found`, the page says "This conversation doesn't exist. It may have been deleted." and hides the message box.
 
 ## Calling server functions
 

@@ -157,12 +157,40 @@ pub enum ConversationEvent {
     TodoListUpdate { items: Vec<anthropic::tools::TodoItem> },
     BrowsingSessionUpdate { open: bool },
     BrowsingUrlUpdate { url: String },
+    PodsChanged {},
+    TurnState { running: bool },
 }
 ```
 
 `MessagesAppended` is a struct variant, not `MessagesAppended(Vec<Message>)`: the enum is internally tagged, and serde can't write a tuple variant holding a list that way. It used to be one, and every send failed silently (`wire_tests::test_every_event_round_trips_through_json` now serializes one of each variant). The stream is built with `ServerEvents::from_stream` over the broadcast receiver, for the same reason as the frame stream below: a closed connection drops the subscription. `NotificationDeliveryFailed` is published when a turn fired with no request in flight fails: `wake_conversation` (a terminal command finished) and a `run_async` task's output or completion notification.
 
 `TaskUpdate`/`Sandbox*`/`ContextUsageUpdate`/`TodoListUpdate`/`BrowsingSessionUpdate`/`BrowsingUrlUpdate` are all ephemeral UI telemetry (never persisted as such, regenerable at any time from `get_tasks`/`get_sandbox_state`/`get_context_usage`/`get_todos`/`get_browsing_state` — `ContextUsageUpdate`'s own numbers *are* separately persisted, in `conversation_context_usage`, precisely so `get_context_usage` can regenerate it, and `TodoListUpdate`'s are likewise persisted in `conversation_todos`); `MessagesAppended` is a live-delivery notification for rows `run_turn` already persisted — whether that `run_turn` call came from a live `send_message` or from a background task's own push. `SandboxPodUpdate`/`SandboxTerminalUpdate` fire on create/terminate (a `terminated: true` update means the frontend should *remove* that pod/terminal, not just relabel it — unlike a finished task, which the task panel keeps showing); `SandboxCommandUpdate` follows the exact same "started/one output line/finished" pattern `TaskUpdate` already uses, with `command` only populated on the "started" event. `ContextUsageUpdate` publishes once per completed real turn, right after `run_turn_bounded` persists that turn's usage. `TodoListUpdate` publishes on every `todowrite` call and always carries the *complete* current list (never a partial diff — `todowrite` itself is a whole-list replace, no per-item ids), so the frontend just overwrites its signal wholesale rather than merging like `TaskUpdate` requires. `BrowsingSessionUpdate` publishes from `open_browser_session`/`close_browser_session`, so the panel shows/hides reactively rather than only checking on conversation (re)select. Since the underlying `broadcast` channel has no replay, the frontend does a one-shot `get_messages`/`get_tasks`/`get_sandbox_state`/`get_context_usage`/`get_todos`/`get_browsing_state` reconciliation pull on connect/reconnect to cover anything published before it subscribed — see `architecture.md`.
+
+`PodsChanged` is the app-wide `AppEvent::PodsChanged` (below), relayed on every conversation's stream: the server merges the app-wide channel into each subscription (`conversation_event_stream`). A chat tab therefore needs no second always-open connection for the sidebar's pod dots. Over plain HTTP/1.1 a browser allows only 6 connections per host, shared by every tab, and each chat tab already holds one stream (two while a reply streams). `TurnState` is published when a conversation's first turn starts and when its last one ends, including turns nobody started from a tab (a finished command, a background task, another tab). `get_turn_state` is its snapshot for reconnects.
+
+### Stopping a turn
+
+`stop_turn(id)` ends the conversation's running turn, and any turn queued behind it:
+- **How:** each conversation has a stop counter (`TURN_STOPS`, a `watch` channel). `run_turn_bounded` notes the counter's value before waiting for the turn lock, then runs the turn (`run_turn_body`) in a `select!` against it changing. A stop drops the turn wherever it's waiting (the model's stream, a tool call, a compaction), which releases the lock. Turns that start after the stop aren't affected.
+- **Left alone:** the pod, its terminals and running commands.
+- **What's left behind:** a reply that was streaming isn't saved, and tool calls the model had made but that hadn't returned have no result. `answer_unfinished_tool_calls` fixes that when each request is built: every tool call without a result gets an error result (`UNFINISHED_TOOL_CALL`), at the start of the next user message, or in a new one at the end. It isn't saved, since notices can already follow the dangling call. This also repairs a turn cut off by a server restart.
+- **The pause:** a stop also pauses the conversation (`PAUSED`, in memory). While paused, `wake_conversation` does nothing (a finished command's notice stays pending, and the next turn drains it), and a background task's notice is saved with `save_notice_between_turns` instead of starting a turn. `send_message` ends the pause. Without it, a command still running would restart the model seconds after the user stopped it.
+
+`save_notice_between_turns(pool, id, text)` saves a `user` notice only while no turn holds the conversation's lock, so it can't land between a tool call and its result (an order the API rejects). It's used by the pod-crash path and the user stopping a pod.
+
+### App-wide events and pods
+
+`subscribe_app_events` is a third always-open stream, of `AppEvent` (`src/events.rs`), for views that span conversations. Today it has a single event, `PodsChanged`, published when a pod is created (`create_pod`), goes away (`force_terminate_pod`: a model's terminate, a user's stop, a crash), or is torn down with its conversation (`delete_conversation`). Only the pods page subscribes to it directly; chat tabs get it relayed as `ConversationEvent::PodsChanged` (see above).
+
+`get_pods` returns a `PodOverview` for every live pod:
+- **From the database** (`db::list_live_pods`): its conversation, start time, and live terminal count.
+- **Activity** (`pod_activity`): busy while any terminal has a running command; otherwise idle since the latest of the last command finishing, the conversation's last message, and the pod starting.
+- **From Kubernetes:** the pod object's phase and limits (`sandbox::pod_details`), and live use from one metrics list (`sandbox::pod_metrics_list`, `metrics.k8s.io/v1beta1`).
+  - Reading metrics needs `get`/`list` on `pods` in the `metrics.k8s.io` group (`k8s/smelt-park-rbac.yaml`). Without it, or if the metrics call fails for any other reason, every pod's `usage` is `None` and the rest of the view still works.
+  - Quantities are parsed by `parse_cpu_nanocores`/`parse_memory_bytes`, and CPU is summed across containers in nanocores.
+- **`observed_at`:** the database's `now()`, so the page measures ages on the database's clock rather than the browser's.
+
+`stop_pod(pod_id)` (`sandbox::stop_pod_for_user`) tears a pod down whether or not it has terminals, the way a crash does: running commands are marked lost and terminals closed. The model is then told in one notice ("The user stopped sandbox pod N…"), saved between turns. It doesn't wake the model. `get_live_pod_conversations` lists the conversations with a live pod, for the sidebar's dots.
 
 ### The browsing panel's own live channel
 
@@ -201,6 +229,12 @@ pub async fn navigate_browser(id: i64, address: String) -> ServerFnResult<()>;
 | `send_browser_input` | `POST /api/conversations/{id}/browsing/input` | forwards one live-panel mouse/keyboard event, see above |
 | `navigate_browser` | `POST /api/conversations/{id}/browsing/navigate` | the live panel's address bar, see above |
 | `subscribe_conversation_events` | `GET /api/conversations/{id}/events` | always-open live stream, see above |
+| `stop_turn` | `POST /api/conversations/{id}/stop` | the Stop button: end the running turn and pause, see above |
+| `get_turn_state` | `GET /api/conversations/{id}/turn` | whether a turn is running, for the Stop button on (re)connect |
+| `get_pods` | `GET /api/pods` | every live pod with status, activity, limits and usage, see above |
+| `stop_pod` | `POST /api/pods/{pod_id}/stop` | the user stopping a pod, see above |
+| `get_live_pod_conversations` | `GET /api/pods/conversations` | conversations with a live pod, for the sidebar |
+| `subscribe_app_events` | `GET /api/app-events` | always-open app-wide stream (`AppEvent`), for the pods page |
 | `delete_conversation` | `DELETE /api/conversations/{id}` | hard delete; cascades to the conversation's messages (`ON DELETE CASCADE`); also tears down its sandboxes and browsing session, stops its `run_async` tasks, and drops its event channel and turn lock; deleting a nonexistent id is not an error |
 
 Not yet implemented (straightforward mechanical additions when needed): rename a conversation, concurrent-send guarding.

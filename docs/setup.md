@@ -109,3 +109,11 @@ At startup, smelt adds any built-in MCP server that isn't configured yet, matche
 - **Edits are kept.** Only the name is matched, so a changed URL, an added header or a switch to OAuth survives restarts.
 - **Deleting doesn't stick.** A deleted entry comes back on the next start. To turn search off, change its URL or tool list instead.
 - **Search queries go to Exa**, unauthenticated in keyless mode.
+
+## Pod metrics
+
+The pods page (`/pods`) shows each sandbox pod's live memory and CPU use from the cluster's metrics API (metrics-server). smelt's service account needs `get`/`list` on `pods` in the `metrics.k8s.io` group for that; `k8s/smelt-park-rbac.yaml` grants it in both namespaces.
+- **The local k3s** picks it up when the `k3s-bootstrap` compose service runs, so run `docker compose up` (or `docker compose run --rm k3s-bootstrap`) from the host after pulling the change.
+- **Another cluster** needs the manifest applied there.
+
+Until then, usage shows as "unavailable" and everything else on the page works.
