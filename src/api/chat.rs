@@ -342,8 +342,77 @@ fn history_for_request(
             anthropic::AnthropicMessage { role, content }
         })
         .collect();
-    Ok(history)
+    Ok(answer_unfinished_tool_calls(history))
 }
+
+/// Gives every tool call that has no result an error result
+/// (`UNFINISHED_TOOL_CALL`), at the start of the user message that follows
+/// it, or in a new user message if it was the last one. The API rejects a
+/// tool call not answered in the very next message, and a turn stopped
+/// by the user, or cut off by a server restart, can leave exactly that;
+/// notices saved since then may follow it too. Done when building each
+/// request rather than saved, since a saved result would land after those
+/// notices.
+#[cfg(feature = "server")]
+fn answer_unfinished_tool_calls(
+    mut history: Vec<anthropic::AnthropicMessage>,
+) -> Vec<anthropic::AnthropicMessage> {
+    let mut i = 0;
+    while i < history.len() {
+        if history[i].role == "assistant" {
+            let calls: Vec<String> = history[i]
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    anthropic::ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
+            let next_is_user = history.get(i + 1).is_some_and(|m| m.role == "user");
+            let answered: Vec<&String> = if next_is_user {
+                history[i + 1]
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        anthropic::ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let missing: Vec<anthropic::ContentBlock> = calls
+                .iter()
+                .filter(|id| !answered.contains(id))
+                .map(|id| anthropic::ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: UNFINISHED_TOOL_CALL.to_string(),
+                    is_error: Some(true),
+                })
+                .collect();
+            if !missing.is_empty() {
+                if next_is_user {
+                    history[i + 1].content.splice(0..0, missing);
+                } else {
+                    history.insert(
+                        i + 1,
+                        anthropic::AnthropicMessage {
+                            role: "user".to_string(),
+                            content: missing,
+                        },
+                    );
+                }
+            }
+        }
+        i += 1;
+    }
+    history
+}
+
+/// The error result a tool call gets when its turn ended before it
+/// finished (the user stopped the turn, or the server restarted).
+#[cfg(feature = "server")]
+const UNFINISHED_TOOL_CALL: &str = "This tool call didn't finish: the turn was stopped (by the user, or by a server restart) before it returned. Its effects, if any, are unknown.";
 
 /// The fixed part of every turn's system prompt: who the model is, how its
 /// sandbox and tools work, and how its replies are shown. Kept as prose in
@@ -1551,6 +1620,70 @@ mod tests {
         anthropic::ContentBlock::Text {
             text: text.to_string(),
         }
+    }
+
+    fn tool_use(id: &str) -> anthropic::ContentBlock {
+        anthropic::ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "add".to_string(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    fn tool_result(id: &str) -> anthropic::ContentBlock {
+        anthropic::ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: "3".to_string(),
+            is_error: None,
+        }
+    }
+
+    fn unfinished(id: &str) -> anthropic::ContentBlock {
+        anthropic::ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: UNFINISHED_TOOL_CALL.to_string(),
+            is_error: Some(true),
+        }
+    }
+
+    /// A turn stopped (or a server restarted) between a tool call and its
+    /// result leaves the call unanswered, and a notice may have landed
+    /// after it. The request gets an error result for it, at the start of
+    /// the next user message.
+    #[test]
+    fn test_history_for_request_answers_a_tool_call_left_without_a_result() {
+        let history = history_for_request(vec![
+            text_message(1, "user", "go"),
+            message_with_blocks(2, "assistant", vec![tool_use("t1")]),
+            text_message(3, "user", "notice"),
+        ])
+        .expect("history");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].role, "user");
+        assert_eq!(history[2].content, vec![unfinished("t1"), text_block("notice")]);
+    }
+
+    #[test]
+    fn test_history_for_request_answers_only_the_missing_calls_of_several() {
+        let history = history_for_request(vec![
+            text_message(1, "user", "go"),
+            message_with_blocks(2, "assistant", vec![tool_use("t1"), tool_use("t2")]),
+            message_with_blocks(3, "user", vec![tool_result("t1")]),
+        ])
+        .expect("history");
+        assert_eq!(history[2].content, vec![unfinished("t2"), tool_result("t1")]);
+    }
+
+    #[test]
+    fn test_history_for_request_adds_a_message_for_calls_left_at_the_end() {
+        let history = history_for_request(vec![
+            text_message(1, "user", "go"),
+            message_with_blocks(2, "assistant", vec![text_block("on it"), tool_use("t1")]),
+        ])
+        .expect("history");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].role, "user");
+        assert_eq!(history[2].content, vec![unfinished("t1")]);
     }
 
     #[test]
