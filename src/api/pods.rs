@@ -2,7 +2,11 @@
 //! stopping one. See docs/projects/plans/pod-management.md.
 
 use chrono::NaiveDateTime;
+use dioxus::fullstack::ServerEvents;
+use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
+
+use crate::events::AppEvent;
 
 #[cfg(feature = "server")]
 use crate::db;
@@ -32,6 +36,27 @@ fn pod_activity(row: &db::LivePodRow) -> PodActivity {
     PodActivity::IdleSince(latest)
 }
 
+/// The always-open stream of app-wide events (`AppEvent`) for the sidebar
+/// and the pods view.
+#[get("/api/app-events")]
+pub async fn subscribe_app_events() -> ServerFnResult<ServerEvents<AppEvent>> {
+    // `from_stream`, not `ServerEvents::new`, for the same reason as
+    // `subscribe_conversation_events`: dropping the response (the tab
+    // going away) drops the subscription.
+    let rx = crate::events::subscribe_app();
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => return Some((Ok::<_, axum::BoxError>(event), rx)),
+                // A listener that fell behind just refetches on the next one.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Ok(ServerEvents::from_stream(stream))
+}
+
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
@@ -54,6 +79,23 @@ mod tests {
             running_commands: running,
             last_command_finished_at: finished.map(at),
         }
+    }
+
+    /// A subscription belongs to its connection: once the response is
+    /// dropped (the tab closed or reloaded), it stops listening.
+    #[tokio::test]
+    async fn test_a_dropped_app_event_subscription_stops_listening() {
+        let before = crate::events::app_subscriber_count();
+        let subscription = subscribe_app_events().await.expect("subscribe");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(crate::events::app_subscriber_count(), before + 1);
+        drop(subscription);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            crate::events::app_subscriber_count(),
+            before,
+            "a dropped subscription is still listening"
+        );
     }
 
     #[test]

@@ -1046,6 +1046,7 @@ pub async fn create_pod(
                     terminated: false,
                 },
             );
+            events::publish_app(events::AppEvent::PodsChanged);
             Ok(row.id)
         }
         Err(e) => {
@@ -1109,6 +1110,7 @@ async fn force_terminate_pod(
                 terminated: true,
             },
         );
+        events::publish_app(events::AppEvent::PodsChanged);
     }
     Ok(row)
 }
@@ -3329,7 +3331,12 @@ mod tests {
             // marked lost, and the model gets a user-stop notice, not a
             // crash notice. See docs/projects/plans/pod-management.md. ---
             let conversation_g = db::create_conversation(&pool).await.expect("create conversation g");
+            let mut app_events = events::subscribe_app();
             let pod_g = create_pod(&pool, conversation_g.id, None, None).await.expect("create_pod (g) should succeed");
+            assert!(
+                received_pods_changed(&mut app_events).await,
+                "creating a pod should tell app-wide listeners"
+            );
             let terminal_g = create_terminal(&pool, conversation_g.id).await.expect("create_terminal (g) should succeed");
             db::create_terminal_command(&pool, conversation_g.id, terminal_g, "long-g", "sleep 300")
                 .await
@@ -3338,6 +3345,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
 
             stop_pod_for_user(&pool, pod_g).await.expect("stop_pod_for_user (g) should succeed");
+            assert!(
+                received_pods_changed(&mut app_events).await,
+                "stopping a pod should tell app-wide listeners"
+            );
 
             let command_g = db::get_terminal_command(&pool, "long-g").await.expect("get").expect("the command");
             assert_eq!(command_g.status, "lost", "a running command should be marked lost");
@@ -3551,6 +3562,24 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+
+    /// Whether a `PodsChanged` arrives on `rx` within a few seconds,
+    /// skipping any older ones still queued from earlier scenarios.
+    async fn received_pods_changed(
+        rx: &mut tokio::sync::broadcast::Receiver<events::AppEvent>,
+    ) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(events::AppEvent::PodsChanged) => return true,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
     }
 
     async fn any_message_contains(pool: &PgPool, conversation_id: i64, needle: &str) -> bool {

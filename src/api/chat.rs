@@ -77,6 +77,8 @@ pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
         .map_err(ServerFnError::new)?;
     crate::events::forget(id);
     forget_conversation_lock(id);
+    // After the delete, so a listener refetching sees the pod rows gone.
+    crate::events::publish_app(crate::events::AppEvent::PodsChanged);
     Ok(())
 }
 
