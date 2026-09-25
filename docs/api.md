@@ -58,6 +58,12 @@ pub async fn send_message(id: i64, content: String) -> ServerFnResult<ServerEven
 }
 ```
 
+Every turn request carries a **system prompt**: `system_prompt(&prompt_environment(pool).await)` in `api::chat`. It has two parts:
+- **The fixed base prompt**, `src/api/system_prompt.md`, compiled in with `include_str!`. It covers smelt as a coding agent, how the sandbox works (create the pod first, the `sandbox` user in `/home/sandbox`, `sudo`, what's lost when a pod ends), background commands and their notifications, the file tools, the web tools, working style, and that replies are shown as plain text rather than rendered markdown.
+- **An environment section** built from the database and clock for each request: today's date (UTC), the model, the configured volumes with their mount paths, and the configured MCP servers. A failed database read leaves its line out and is logged, rather than failing the turn.
+
+The prompt only changes when the date or configuration does. `test_system_prompt_only_names_real_tools` fails if the base prompt names a tool that doesn't exist, so renaming a tool means updating the prompt too. Compaction's summarization call keeps its own `COMPACTION_SYSTEM_PROMPT`.
+
 Requests carry `thinking: {"type": "adaptive"}` by default (`ANTHROPIC_THINKING=0` to turn it off — see [setup.md](setup.md)), so an assistant turn's `content` can start with a `ContentBlock::Thinking { thinking, signature }` block ahead of any `Text`/`ToolUse` blocks — `run_turn` persists and replays it exactly like any other block, uninterpreted; the frontend renders it as a collapsed-by-default `<details>` (see `frontend/pages/chat.rs`'s `render_block_element`).
 
 If a request fails with Ollama's specific "error parsing tool call" 500 (its Anthropic-compat shim, at least for `gpt-oss` models, doesn't always turn a model's raw output into valid tool-call JSON — either because thinking's reasoning landed in the same text as the call, or the model just wrote invalid JSON on its own), `run_turn_bounded` retries: first with `thinking` dropped, then up to `TOOL_CALL_PARSE_RETRIES` further plain regenerations, since a local model's next sampling pass often doesn't repeat the same malformed output. Gives up and surfaces the error once that's exhausted. Any other failure propagates from `run_turn_bounded` immediately. See `is_ollama_thinking_tool_call_corruption`.
@@ -122,7 +128,7 @@ pub struct SandboxPodSummary { pod_id: i64, status: String, terminals: Vec<Sandb
 pub struct SandboxSnapshot { pods: Vec<SandboxPodSummary> }
 ```
 
-`get_context_usage` is the always-visible indicator's one-shot pull — the last real `usage` numbers persisted for this conversation (`None` if no turn has completed yet) plus the configured model's context window. `get_context_detail` is the click-through view: the same usage numbers, plus the system prompt (currently always `None`), every available tool's full definition, and the current message count — reconstructed from current state each call, not a stored snapshot of some specific past request:
+`get_context_usage` is the always-visible indicator's one-shot pull — the last real `usage` numbers persisted for this conversation (`None` if no turn has completed yet) plus the configured model's context window. `get_context_detail` is the click-through view: the same usage numbers, plus the exact system prompt a turn sends (from the same `system_prompt`/`prompt_environment` pair), every available tool's full definition, and the current message count — reconstructed from current state each call, not a stored snapshot of some specific past request:
 
 ```rust
 pub struct ContextUsageSnapshot { usage: Option<anthropic::TokenUsage>, context_window: u32 }

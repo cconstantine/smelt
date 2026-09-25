@@ -11,21 +11,20 @@ smelt's purpose is to be a coding agent, not a general chat app with a coding mo
 - Memory and CPU limits with OOM detection (`20260816-sandbox-oom.md`)
 - A custom sandbox image and volumes (`20260818-sandbox-native-environment.md`)
 - MCP servers, including GitHub (`20260817-mcp-servers.md`)
+- A coding-agent system prompt on every turn (`20260925-system-prompt.md`)
 
 This file keeps only what's still open.
 
 ## Still open
 
-1. **A coding-oriented system prompt.** Normal turns send no `system` prompt at all (only compaction has one). Planned as the `system-prompt` project.
-2. **Getting a repo into the sandbox.**
+1. **Getting a repo into the sandbox.**
    - The sandbox image (`debian:trixie-slim` plus `sudo`) has no `git` unless the model installs it itself.
    - No git credentials reach the pod. The earlier sketch was a per-session Kubernetes `Secret`, mounted read-only into just that pod and deleted with it; the `park` service account can already manage secrets.
    - Undecided: does the user give a repo URL per conversation, or is smelt scoped to one project per deployment?
    - Related but different: GitHub over MCP gives API-level repo access today, and `mcp-hosted-servers.md` covers a git MCP server next to the sandbox. Neither gives the model a real local clone to build and test in.
-3. **Deleting idle pods.** A pod ends only when the model terminates it or the conversation is deleted, so a forgotten conversation keeps its pod running indefinitely.
-4. **A time limit per command.** `run_terminal_command` has none; a hung command runs until the model sends it a signal.
-5. **Confirmation before destructive actions.** A sandboxed `rm -rf` is still destructive within the session's own files. Now part of `model-safety.md`.
-6. **Describing smelt as a coding agent.** `state.md` still calls it an "AI chat agent", and its out-of-scope list should be reread with coding as the purpose.
+2. **Deleting idle pods.** A pod ends only when the model terminates it or the conversation is deleted, so a forgotten conversation keeps its pod running indefinitely. See also `pod-management.md`, which gives the user a way to see and stop pods.
+3. **A time limit per command.** `run_terminal_command` has none; a hung command runs until the model sends it a signal.
+4. **Confirmation before destructive actions.** A sandboxed `rm -rf` is still destructive within the session's own files. Now part of `model-safety.md`.
 
 ## Deliberately deferred (not smelt code)
 
