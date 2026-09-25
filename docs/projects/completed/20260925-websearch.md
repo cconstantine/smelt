@@ -36,7 +36,7 @@ A native `websearch` tool with Exa, Kagi and Brave adapters was planned first. C
 - **The MCP route was offered in the first answer and set aside** for "less say over results", which turned out not to matter much for one provider. The design only settled once the tradeoff was spelled out concretely.
 - **`pkill -f "dx serve --port 8081"` killed its own shell,** because the pattern was also in the command line running it. Find a process by PID (`ps` with a `[d]x`-style pattern) before killing it.
 
-**Process suggestion (not applied; needs agreement):**
-- Add to development-process.md's Plan phase: when a plan depends on an external service (availability, pricing, access terms, API shape), check each claim against the provider's current docs before presenting it, and cite the source; and look at how a comparable tool (opencode, for this project) does it in its source. Here, both would have got to the final design several rounds sooner.
+**Process change (confirmed and applied to development-process.md, Plan phase step 4):**
+- In the Plan phase: when a plan depends on an external service (availability, pricing, access terms, API shape), check each claim against the provider's current docs before presenting it, and cite the source; and look at how a comparable tool (opencode, for this project) does it in its source. Here, both would have got to the final design several rounds sooner.
 
 **Bug bash:** not due. This is the first project since the 2026-09-24 bug bash.
