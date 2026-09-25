@@ -115,6 +115,12 @@ pub enum ConversationEvent {
     BrowsingUrlUpdate {
         url: String,
     },
+    /// An app-wide `AppEvent::PodsChanged` (a pod was created or went
+    /// away, in any conversation), relayed on every conversation's stream
+    /// so a chat tab doesn't need a second always-open connection for the
+    /// sidebar's pod dots: browsers allow only 6 connections per host over
+    /// HTTP/1.1, shared across tabs.
+    PodsChanged {},
 }
 
 /// Events that aren't about one conversation, for views that span them
@@ -414,6 +420,7 @@ mod wire_tests {
 
     fn one_of_each() -> Vec<ConversationEvent> {
         vec![
+            ConversationEvent::PodsChanged {},
             ConversationEvent::TaskUpdate {
                 task_id: "t1".to_string(),
                 tool: "count".to_string(),

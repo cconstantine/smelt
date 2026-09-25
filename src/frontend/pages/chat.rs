@@ -1957,13 +1957,17 @@ pub fn Chat() -> Element {
     // conversation's title (set by its first message) and its place in the
     // list stay current without a reload.
     let conversations_changed = use_signal(|| 0u64);
-    // Bumped whenever a pod is created or goes away in any conversation.
-    let pods_changed = super::pods::use_pods_changed();
+    // Bumped by the chat panel whenever a pod is created or goes away in
+    // any conversation (`ConversationEvent::PodsChanged`, relayed on the
+    // open conversation's own stream rather than a second connection; see
+    // that variant). With no conversation open there's no stream, so the
+    // sidebar's pod dots only refresh on navigation.
+    let pods_changed = use_signal(|| 0u64);
 
     rsx! {
         div { class: "chat-layout",
             ConversationSidebar { selected, conversations_changed, pods_changed }
-            ChatPanel { selected, conversations_changed }
+            ChatPanel { selected, conversations_changed, pods_changed }
         }
     }
 }
@@ -2081,7 +2085,11 @@ fn ConversationSidebar(
 }
 
 #[component]
-fn ChatPanel(selected: Memo<Option<i64>>, conversations_changed: Signal<u64>) -> Element {
+fn ChatPanel(
+    selected: Memo<Option<i64>>,
+    conversations_changed: Signal<u64>,
+    pods_changed: Signal<u64>,
+) -> Element {
     let initial_messages = use_resource(move || {
         let id = selected();
         async move {
@@ -2417,6 +2425,9 @@ fn ChatPanel(selected: Memo<Option<i64>>, conversations_changed: Signal<u64>) ->
                                 }
                                 Some(Ok(ConversationEvent::BrowsingUrlUpdate { url })) => {
                                     browsing_url.set(Some(url));
+                                }
+                                Some(Ok(ConversationEvent::PodsChanged {})) => {
+                                    *pods_changed.write() += 1;
                                 }
                                 Some(Err(_)) | None => break,
                             }

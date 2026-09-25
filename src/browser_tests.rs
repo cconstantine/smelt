@@ -190,6 +190,49 @@ async fn wait_for_element(
     }
 }
 
+/// Waits until exactly `count` elements match `selector`. False on timeout.
+async fn wait_for_count(page: &chromiumoxide::Page, selector: &str, count: usize, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let found: usize = page
+            .evaluate(format!("document.querySelectorAll({selector:?}).length"))
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok())
+            .unwrap_or(usize::MAX);
+        if found == count {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Waits until the page's client has requested a URL ending in `suffix`,
+/// the sign it's hydrated on pages without a conversation (the
+/// server-rendered page's own fetches never show up in the browser's
+/// resource timings).
+async fn wait_for_resource(page: &chromiumoxide::Page, suffix: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let seen: bool = page
+            .evaluate(format!(
+                "performance.getEntriesByType('resource').some(e => e.name.endsWith({suffix:?}))"
+            ))
+            .await
+            .expect("read resource timings")
+            .into_value()
+            .expect("a bool");
+        if seen {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the page never requested {suffix}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Waits until the page's WASM client has hydrated and is live. After
 /// subscribing to the conversation's live events, the client pulls a
 /// one-shot snapshot of each panel, `get_browsing_state` last; that
@@ -754,6 +797,74 @@ async fn test_end_to_end_browser_scenarios() {
         assert!(
             wait_for_text_gone(&watcher, "scenario 11 failure", Duration::from_secs(2)).await,
             "B's notification failure followed the tab to A"
+        );
+
+        // Every open smelt tab holds one always-open event stream, and over
+        // plain HTTP/1.1 the browser allows only 6 connections per host
+        // across all tabs: a 7th stream-holding tab never finishes loading.
+        // Close the tabs the scenarios above are done with.
+        for tab in [chat, watcher, missing] {
+            tab.close().await.expect("close a finished tab");
+        }
+
+        // --- Scenario 12: pods. A pod created in one conversation shows up
+        // as a dot in another tab's sidebar, live; the pods page lists it;
+        // Stop there removes the row, and the dot goes away, live. ---
+        let with_pod = new_conversation(pool, &created).await;
+        db::create_message(
+            pool,
+            with_pod.id,
+            "user",
+            &[anthropic::ContentBlock::Text { text: "scenario 12".to_string() }],
+        )
+        .await
+        .expect("title it");
+        let sidebar_tab = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, other.id))
+            .await
+            .expect("open a conversation without a pod");
+        wait_for_live_client(&sidebar_tab, other.id).await;
+        let dot = format!(".conversation-item[data-conversation-id=\"{}\"] .live-pod-dot", with_pod.id);
+        assert!(
+            wait_for_count(&sidebar_tab, &dot, 0, Duration::from_secs(5)).await,
+            "no dot before the conversation has a pod"
+        );
+        let pod_id = sandbox::create_pod(pool, with_pod.id, None, None).await.expect("create_pod");
+        assert!(
+            wait_for_count(&sidebar_tab, &dot, 1, Duration::from_secs(10)).await,
+            "the sidebar should mark a conversation whose pod started, without a reload"
+        );
+
+        let pods_page = harness
+            .browser
+            .new_page(format!("{}pods", harness.base_url))
+            .await
+            .expect("open the pods page");
+        wait_for_resource(&pods_page, "/api/pods").await;
+        let row = format!("tr[data-pod-id=\"{pod_id}\"]");
+        assert!(
+            wait_for_count(&pods_page, &row, 1, Duration::from_secs(10)).await,
+            "the pods page should list the pod"
+        );
+        assert!(
+            wait_for_text(&pods_page, "scenario 12", Duration::from_secs(5)).await,
+            "the row should name its conversation"
+        );
+        let stop = format!("{row} .pod-stop");
+        wait_for_element(&pods_page, &stop, Duration::from_secs(5)).await.click().await.expect("arm stop");
+        wait_for_element(&pods_page, &format!("{row} .pod-stop.confirm"), Duration::from_secs(5))
+            .await
+            .click()
+            .await
+            .expect("confirm stop");
+        assert!(
+            wait_for_count(&pods_page, &row, 0, Duration::from_secs(20)).await,
+            "a stopped pod's row should go away"
+        );
+        assert!(
+            wait_for_count(&sidebar_tab, &dot, 0, Duration::from_secs(10)).await,
+            "the dot should go away when the pod stops, without a reload"
         );
     })))
     .await;

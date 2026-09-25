@@ -1425,20 +1425,44 @@ pub async fn subscribe_conversation_events(
     // page load or reconnect used to leave a subscriber behind for good.
     // Here the response pulls events as it sends them, and dropping it
     // (the tab going away) drops the subscription.
-    let rx = events::subscribe(id);
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+    Ok(ServerEvents::from_stream(conversation_event_stream(id)))
+}
+
+/// Everything a tab watching `id` hears: that conversation's events, plus
+/// app-wide `PodsChanged`, relayed as `ConversationEvent::PodsChanged`.
+/// Ends when the conversation's channel closes (it was deleted).
+#[cfg(feature = "server")]
+fn conversation_event_stream(
+    id: i64,
+) -> impl futures_util::Stream<Item = Result<events::ConversationEvent, axum::BoxError>> {
+    use tokio::sync::broadcast::error::RecvError;
+    // Both subscribed now, not on first poll, so nothing published in
+    // between is missed.
+    let receivers = (events::subscribe(id), events::subscribe_app());
+    futures_util::stream::unfold(receivers, |(mut conversation, mut app)| async move {
         loop {
-            match rx.recv().await {
-                Ok(event) => return Some((Ok::<_, axum::BoxError>(event), rx)),
-                // A subscriber that fell behind just misses some ephemeral
-                // updates — the frontend's reconciliation pull on connect
-                // covers the durable state regardless.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            tokio::select! {
+                received = conversation.recv() => match received {
+                    Ok(event) => return Some((Ok::<_, axum::BoxError>(event), (conversation, app))),
+                    // A subscriber that fell behind just misses some
+                    // ephemeral updates — the frontend's reconciliation
+                    // pull on connect covers the durable state regardless.
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => return None,
+                },
+                received = app.recv() => match received {
+                    Ok(events::AppEvent::PodsChanged) => {
+                        let event = events::ConversationEvent::PodsChanged {};
+                        return Some((Ok(event), (conversation, app)));
+                    }
+                    // Missing some just means one refetch covers several.
+                    Err(RecvError::Lagged(_)) => continue,
+                    // The app-wide channel lives as long as the process.
+                    Err(RecvError::Closed) => return None,
+                },
             }
         }
-    });
-    Ok(ServerEvents::from_stream(stream))
+    })
 }
 
 #[cfg(test)]
@@ -1729,6 +1753,23 @@ mod tests {
             "the deleted conversation's lock is still registered"
         );
         forget_conversation_lock(conversation_id);
+    }
+
+    /// A tab watching a conversation also hears app-wide pod changes, on
+    /// the same stream.
+    #[tokio::test]
+    async fn test_a_conversation_stream_relays_pods_changed() {
+        use futures_util::StreamExt;
+        let stream = conversation_event_stream(9_000_000_011);
+        futures_util::pin_mut!(stream);
+        events::publish_app(events::AppEvent::PodsChanged);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("PodsChanged should arrive on the conversation stream");
+        assert!(
+            matches!(event, Some(Ok(events::ConversationEvent::PodsChanged {}))),
+            "got {event:?}"
+        );
     }
 
     /// A subscription belongs to its connection: once the response is
