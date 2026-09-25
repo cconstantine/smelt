@@ -11,16 +11,17 @@ These rules are mandatory. Follow them in order. Do not skip steps.
 1. Read the user's request carefully
 2. Read [projects/state.md](projects/state.md) to understand the current codebase
 3. Ask clarifying questions if the request is ambiguous — do not assume
-4. Create a branch: `git checkout -b <short-slug>`
-5. Write a plan file at `docs/projects/plans/<short-slug>.md` containing:
-   - **Branch:** the branch name created in step 4
+4. **If the work depends on an outside service or tool, check it before presenting options.** For each claim a choice rests on (whether it's still available, pricing and free tiers, what signup or access it needs, the API's request and response shape), check the provider's current docs and cite them. Don't answer from memory with a general "worth checking" caveat. Also look at how a comparable tool solves the same problem, in its source rather than its marketing. On `websearch`, provider answers from memory had three wrong or stale claims, and a three-provider plan was written on top of them. Reading opencode's source then showed Exa's keyless MCP endpoint, which cut the project to about 60 lines.
+5. Create a branch: `git checkout -b <short-slug>`
+6. Write a plan file at `docs/projects/plans/<short-slug>.md` containing:
+   - **Branch:** the branch name created in step 5
    - **What** is being built and why
    - **Which files** will be created or modified (be specific)
    - **How** it will be implemented: data model, API shape, UI flow
    - **Open questions or tradeoffs** you are not sure about
-6. Show the plan to the user and **stop**
-7. **Wait for explicit approval** — a response like "looks good", "yes", or "go ahead"
-8. Do not write any implementation code or tests until you receive that approval
+7. Show the plan to the user and **stop**
+8. **Wait for explicit approval** — a response like "looks good", "yes", or "go ahead"
+9. Do not write any implementation code or tests until you receive that approval
 
 If the user requests changes to the plan, update the plan file and show it again. Repeat until approved.
 

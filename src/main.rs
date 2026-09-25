@@ -70,6 +70,8 @@ async fn main() {
         .expect("failed to run database migrations");
     tracing::info!("database initialized and migrations applied");
 
+    mcp::ensure_default_servers(pool).await;
+
     sandbox::init().await;
     tracing::info!("sandbox manager initialized");
 

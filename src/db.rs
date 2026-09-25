@@ -820,6 +820,22 @@ pub async fn update_mcp_server_config(
     .await
 }
 
+/// Adds an MCP server named `name` unless one with that name already
+/// exists, for the servers smelt ships with (`mcp::default_mcp_servers`).
+/// Matched by name only, so a user's edits to the entry (a key header, a
+/// new URL, OAuth) are kept. Returns whether it inserted.
+pub async fn ensure_mcp_server(pool: &PgPool, name: &str, url: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO mcp_servers (name, url) VALUES ($1, $2)
+         ON CONFLICT (name) DO NOTHING",
+    )
+    .bind(name)
+    .bind(url)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 pub async fn delete_mcp_server_config(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM mcp_servers WHERE id = $1")
         .bind(id)
@@ -2012,6 +2028,54 @@ mod tests {
             fetched.is_none(),
             "deleted volume should no longer be gettable"
         );
+    }
+
+    #[sqlx::test]
+    async fn test_ensure_mcp_server_inserts_a_missing_server_once(pool: PgPool) {
+        let inserted = ensure_mcp_server(&pool, "exa", "https://mcp.example.com/mcp")
+            .await
+            .expect("ensure mcp server");
+        assert!(inserted, "the first call should insert");
+        let again = ensure_mcp_server(&pool, "exa", "https://mcp.example.com/mcp")
+            .await
+            .expect("ensure mcp server again");
+        assert!(!again, "the second call should insert nothing");
+
+        let configs = list_mcp_server_configs(&pool).await.expect("list");
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "exa");
+        assert_eq!(configs[0].url, "https://mcp.example.com/mcp");
+        assert_eq!(configs[0].auth_mode, "static_headers");
+        assert!(configs[0].extra_headers.0.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn test_ensure_mcp_server_leaves_an_edited_entry_alone(pool: PgPool) {
+        let headers = HashMap::from([("x-api-key".to_string(), "my-key".to_string())]);
+        let existing = create_mcp_server_config(
+            &pool,
+            "exa",
+            "https://edited.example.com/mcp",
+            &headers,
+            "static_headers",
+            None,
+            None,
+        )
+        .await
+        .expect("create mcp server config");
+
+        let inserted = ensure_mcp_server(&pool, "exa", "https://mcp.example.com/mcp")
+            .await
+            .expect("ensure mcp server");
+        assert!(!inserted);
+
+        let after = get_mcp_server_config(&pool, existing.id)
+            .await
+            .expect("get")
+            .expect("the entry should still exist");
+        assert_eq!(after.url, "https://edited.example.com/mcp");
+        assert_eq!(after.extra_headers.0, headers);
+        assert_eq!(after.updated_at, existing.updated_at);
     }
 
     #[sqlx::test]

@@ -22,6 +22,30 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::anthropic::ToolDefinition;
 use crate::db::McpServerConfig;
 
+/// Exa's hosted MCP server, keyless ("free rate-limited usage without
+/// sign-in or API key"), limited to its search tool so reading a page stays
+/// with `webfetch`/`http_request`. Adding an `x-api-key` header to the entry
+/// on `/mcp-servers` lifts the free limits. See
+/// `docs/projects/completed/20260925-websearch.md`.
+pub const EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp?tools=web_search_exa";
+
+/// The MCP servers smelt ships with: `(name, url)`.
+const DEFAULT_MCP_SERVERS: &[(&str, &str)] = &[("exa", EXA_MCP_URL)];
+
+/// Adds each of `DEFAULT_MCP_SERVERS` that isn't configured yet, by name —
+/// run at startup, so one the user deleted comes back and one they edited
+/// is left as they left it. A failure is logged, not fatal: these are
+/// extras the rest of smelt doesn't depend on.
+pub async fn ensure_default_servers(pool: &sqlx::PgPool) {
+    for (name, url) in DEFAULT_MCP_SERVERS {
+        match crate::db::ensure_mcp_server(pool, name, url).await {
+            Ok(true) => tracing::info!(server = name, "added built-in MCP server"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(server = name, error = %e, "couldn't add built-in MCP server"),
+        }
+    }
+}
+
 const TOOL_NAME_PREFIX: &str = "mcp__";
 const TOOL_NAME_SEPARATOR: &str = "__";
 
@@ -552,6 +576,51 @@ mod tests {
             created_at: Default::default(),
             updated_at: Default::default(),
         }
+    }
+
+    #[sqlx::test]
+    async fn test_ensure_default_servers_adds_exa_search(pool: sqlx::PgPool) {
+        ensure_default_servers(&pool).await;
+        let exa = crate::db::get_mcp_server_config_by_name(&pool, "exa")
+            .await
+            .expect("look up exa")
+            .expect("exa should be added at startup");
+        assert_eq!(exa.url, EXA_MCP_URL);
+        assert!(exa.extra_headers.0.is_empty(), "keyless by default");
+    }
+
+    /// The real, keyless Exa service through smelt's own MCP client (the
+    /// full `rmcp` handshake, not a bare `tools/call`). Needs the internet
+    /// and depends on Exa's unpublished free limits, so it only runs when
+    /// `SMELT_LIVE_EXA=1` is set — never in CI, which runs every ignored
+    /// test in its browser job:
+    /// `SMELT_LIVE_EXA=1 cargo test --features server live_exa -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_exa_search_through_smelt_mcp_client() {
+        if std::env::var("SMELT_LIVE_EXA").as_deref() != Ok("1") {
+            eprintln!("skipped: set SMELT_LIVE_EXA=1 to run against the real Exa service");
+            return;
+        }
+        let pool = test_pool();
+        let mut config = test_config(990_101, "exa");
+        config.url = EXA_MCP_URL.to_string();
+
+        let tools = connection_check(&pool, &config)
+            .await
+            .expect("smelt's MCP client should connect to Exa keylessly");
+        assert_eq!(tools, vec!["web_search_exa".to_string()], "only search should be offered");
+
+        let result = call_tool(
+            &pool,
+            &config,
+            "web_search_exa",
+            serde_json::json!({"query": "tokio broadcast channel receiver_count", "numResults": 2}),
+        )
+        .await
+        .expect("a keyless search should succeed");
+        assert!(result.contains("https://"), "expected result URLs, got: {result}");
+        evict(config.id).await;
     }
 
     #[test]
