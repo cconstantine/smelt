@@ -1115,6 +1115,53 @@ async fn force_terminate_pod(
     Ok(row)
 }
 
+/// What the pods view shows about a pod from Kubernetes itself: its phase
+/// and its container's configured limits (as Kubernetes quantity strings).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PodDetails {
+    pub phase: Option<String>,
+    pub memory_limit: Option<String>,
+    pub cpu_limit: Option<String>,
+}
+
+/// `pod_id`'s phase and limits, or `None` if Kubernetes has no such pod.
+pub async fn pod_details(pod_id: i64) -> Result<Option<PodDetails>, SandboxError> {
+    let pods = pods_api(&get().client);
+    let Some(pod) = pods.get_opt(&pod_name(pod_id)).await? else {
+        return Ok(None);
+    };
+    let limits = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.containers.first())
+        .and_then(|container| container.resources.as_ref())
+        .and_then(|resources| resources.limits.as_ref());
+    let limit = |name: &str| limits.and_then(|l| l.get(name)).map(|q| q.0.clone());
+    Ok(Some(PodDetails {
+        phase: pod.status.as_ref().and_then(|s| s.phase.clone()),
+        memory_limit: limit("memory"),
+        cpu_limit: limit("cpu"),
+    }))
+}
+
+/// The raw `PodMetricsList` for smelt's namespace, from the cluster's
+/// metrics API (metrics-server). Needs `get`/`list` on `pods` in the
+/// `metrics.k8s.io` group (`k8s/smelt-park-rbac.yaml`); without it this is
+/// a 403 error, which callers treat as "usage unavailable".
+pub async fn pod_metrics_list() -> Result<serde_json::Value, SandboxError> {
+    let request = http::Request::get(format!(
+        "/apis/metrics.k8s.io/v1beta1/namespaces/{NAMESPACE}/pods"
+    ))
+    .body(Vec::new())
+    .expect("a static, well-formed request");
+    Ok(get().client.request::<serde_json::Value>(request).await?)
+}
+
+/// The Kubernetes pod name for `pod_id`, for matching metrics to rows.
+pub fn kubernetes_pod_name(pod_id: i64) -> String {
+    pod_name(pod_id)
+}
+
 pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInfo>, SandboxError> {
     let manager = get();
     let pods = pods_api(&manager.client);
@@ -3343,6 +3390,22 @@ mod tests {
                 .expect("create_terminal_command");
             send_command(&pool, terminal_g, "long-g", "sleep 300").await.expect("send_command");
             tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let overviews = crate::api::pods::pod_overviews(&pool).await.expect("pod_overviews");
+            let overview_g = overviews
+                .iter()
+                .find(|o| o.pod_id == pod_g)
+                .expect("the pods view should list pod (g)");
+            assert_eq!(overview_g.conversation_id, conversation_g.id);
+            assert_eq!(overview_g.status.as_deref(), Some("Running"));
+            assert_eq!(overview_g.memory_limit, Some(default_memory_limit()));
+            assert_eq!(overview_g.cpu_limit, Some(default_cpu_limit()));
+            assert_eq!(overview_g.terminals, 1);
+            assert_eq!(overview_g.activity, crate::api::pods::PodActivity::Busy, "a command is running");
+            // Usage depends on whether this cluster lets smelt read metrics
+            // yet, and on metrics-server having sampled the new pod; either
+            // way the view must come back.
+            eprintln!("pod (g) usage: {:?}", overview_g.usage);
 
             stop_pod_for_user(&pool, pod_g).await.expect("stop_pod_for_user (g) should succeed");
             assert!(

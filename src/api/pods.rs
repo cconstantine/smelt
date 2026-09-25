@@ -11,6 +11,26 @@ use crate::events::AppEvent;
 #[cfg(feature = "server")]
 use crate::db;
 
+/// One row of the pods view.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PodOverview {
+    pub pod_id: i64,
+    pub conversation_id: i64,
+    pub conversation_title: String,
+    /// Kubernetes' phase (`Running`, `Pending`, ...), or `None` when the
+    /// pod object couldn't be read.
+    pub status: Option<String>,
+    pub started_at: NaiveDateTime,
+    pub activity: PodActivity,
+    /// Kubernetes quantity strings, as configured (`"8Gi"`, `"1"`).
+    pub memory_limit: Option<String>,
+    pub cpu_limit: Option<String>,
+    /// `None` when the metrics API can't be read (not allowed, not
+    /// installed) or has no numbers for this pod yet.
+    pub usage: Option<PodUsage>,
+    pub terminals: i64,
+}
+
 /// A pod's current resource use, from the cluster's metrics API. Lags
 /// real use by up to about a minute.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -108,6 +128,67 @@ fn pod_activity(row: &db::LivePodRow) -> PodActivity {
         .max()
         .expect("created_at is always present");
     PodActivity::IdleSince(latest)
+}
+
+/// Every live pod, assembled from the database, each pod object in
+/// Kubernetes, and one metrics list. Metrics failing (most often a 403,
+/// until the RBAC change is applied) leaves every `usage` empty; a pod
+/// object that can't be read leaves its status and limits empty. Neither
+/// fails the whole view.
+#[cfg(feature = "server")]
+pub(crate) async fn pod_overviews(pool: &sqlx::PgPool) -> Result<Vec<PodOverview>, sqlx::Error> {
+    let rows = db::list_live_pods(pool).await?;
+    let usage = match crate::sandbox::pod_metrics_list().await {
+        Ok(list) => parse_pod_metrics(&list),
+        Err(e) => {
+            tracing::debug!(error = %e, "pod metrics unavailable");
+            std::collections::HashMap::new()
+        }
+    };
+    let mut overviews = Vec::with_capacity(rows.len());
+    for row in rows {
+        let details = match crate::sandbox::pod_details(row.pod_id).await {
+            Ok(details) => details.unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(pod_id = row.pod_id, error = %e, "couldn't read pod details");
+                crate::sandbox::PodDetails::default()
+            }
+        };
+        overviews.push(PodOverview {
+            pod_id: row.pod_id,
+            conversation_id: row.conversation_id,
+            conversation_title: row.conversation_title.clone(),
+            status: details.phase,
+            started_at: row.created_at,
+            activity: pod_activity(&row),
+            memory_limit: details.memory_limit,
+            cpu_limit: details.cpu_limit,
+            usage: usage.get(&crate::sandbox::kubernetes_pod_name(row.pod_id)).cloned(),
+            terminals: row.live_terminals,
+        });
+    }
+    Ok(overviews)
+}
+
+#[get("/api/pods")]
+pub async fn get_pods() -> ServerFnResult<Vec<PodOverview>> {
+    pod_overviews(db::get()).await.map_err(ServerFnError::new)
+}
+
+/// Stops a pod for the user. See `sandbox::stop_pod_for_user`.
+#[post("/api/pods/{pod_id}/stop")]
+pub async fn stop_pod(pod_id: i64) -> ServerFnResult<()> {
+    crate::sandbox::stop_pod_for_user(db::get(), pod_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// Which conversations have a live pod, for the sidebar's markers.
+#[get("/api/pods/conversations")]
+pub async fn get_live_pod_conversations() -> ServerFnResult<Vec<i64>> {
+    db::conversations_with_live_pods(db::get())
+        .await
+        .map_err(ServerFnError::new)
 }
 
 /// The always-open stream of app-wide events (`AppEvent`) for the sidebar
