@@ -162,7 +162,9 @@ cargo test --features server -- --nocapture   # show println! output
 cargo test --features server test_name        # a single test by name
 ```
 
-Most logic lives behind the `server` feature; plain `cargo test` compiles but skips it. See [Definition of done](development-process.md#definition-of-done) for the full two-target check.
+Most logic lives behind the `server` feature; plain `cargo test` compiles but skips it.
+
+`mcp::tests::test_live_exa_search_through_smelt_mcp_client` checks the built-in Exa MCP server against the real service: smelt's own MCP client connects keylessly, sees only `web_search_exa`, and gets results back. It needs the internet and depends on Exa's unpublished free limits, so it's `#[ignore]`d **and** skips unless `SMELT_LIVE_EXA=1` is set. CI's browser job runs every ignored test, and this one shouldn't depend on Exa there. Run it with `SMELT_LIVE_EXA=1 cargo test --features server live_exa -- --ignored`. See [Definition of done](development-process.md#definition-of-done) for the full two-target check.
 
 ## Browser verification
 
