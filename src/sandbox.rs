@@ -1902,6 +1902,53 @@ pub async fn stop_pod_for_user(pool: &PgPool, pod_id: i64) -> Result<(), Termina
     Ok(())
 }
 
+/// How old a live pod row must be before `reconcile_live_pods` may close
+/// it for having no pod in Kubernetes: a row is written just before its
+/// pod is created, and creating one can take a while.
+const RECONCILE_MIN_AGE_SECS: i64 = 300;
+
+/// Closes the records of pods that are live in the database but gone from
+/// Kubernetes: deleted outside smelt, lost in a cluster rebuild, evicted,
+/// or crashed while smelt wasn't connected to them. Their running commands
+/// are marked lost and their terminals closed, like a crash, but quietly:
+/// no notice to the model (saving one would move each conversation to the
+/// top of the sidebar, and old ones by the dozen); it finds out if it
+/// tries the pod again. Rows younger than `RECONCILE_MIN_AGE_SECS` are
+/// skipped. Returns how many were closed.
+///
+/// Only a real server runs this (at startup and every minute, from
+/// `main`), never the browser test harness: that shares the dev database
+/// but works in the test namespace, where the dev instance's pods don't
+/// exist, so it would close their records.
+pub async fn reconcile_live_pods(pool: &PgPool) -> Result<usize, SandboxError> {
+    let rows = db::live_pods_older_than(pool, RECONCILE_MIN_AGE_SECS)
+        .await
+        .map_err(SandboxError::Db)?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let existing: std::collections::HashSet<String> = pods_api(&get().client)
+        .list(&kube::api::ListParams::default())
+        .await?
+        .items
+        .into_iter()
+        .filter_map(|pod| pod.metadata.name)
+        .collect();
+    let mut closed = 0;
+    for row in rows {
+        if existing.contains(&pod_name(row.id)) {
+            continue;
+        }
+        close_pod_terminals(pool, row.id).await;
+        // Nothing to delete in Kubernetes; this marks the row terminated
+        // and tells the UI (the sandbox panel, the sidebar, /pods).
+        force_terminate_pod(pool, row.id).await?;
+        tracing::info!(pod_id = row.id, conversation_id = row.conversation_id, "closed the record of a pod that no longer exists");
+        closed += 1;
+    }
+    Ok(closed)
+}
+
 /// Marks every command still `running` under any of this pod's terminals
 /// `'lost'` (no real exit code to report — see
 /// `db::mark_terminal_command_lost`), and every one of the pod's live
@@ -3438,6 +3485,67 @@ mod tests {
                 !any_message_contains(&pool, conversation_g.id, "stopped unexpectedly").await,
                 "a user stop must not be reported as a crash"
             );
+
+            // --- Reconciling records with the cluster: a pod gone from
+            // Kubernetes while smelt wasn't connected (no crash detection
+            // fires) is closed quietly by the sweep; a young row whose pod
+            // may still be starting is left alone. See
+            // docs/projects/completed/20260925-pod-management.md. ---
+            let conversation_h = db::create_conversation(&pool).await.expect("create conversation h");
+            let pod_h = create_pod(&pool, conversation_h.id, None, None).await.expect("create_pod (h) should succeed");
+            let terminal_h = db::create_sandbox_terminal(&pool, pod_h).await.expect("a terminal record");
+            db::create_terminal_command(&pool, conversation_h.id, terminal_h.id, "stale-h", "sleep 300")
+                .await
+                .expect("a running command record");
+            sqlx::query("UPDATE sandbox_pods SET created_at = now() - interval '10 minutes' WHERE id = $1")
+                .bind(pod_h)
+                .execute(&pool)
+                .await
+                .expect("age the pod past the sweep's cut-off");
+            pods_api(&client).delete(&pod_name(pod_h), &immediate_delete_params()).await.expect("delete pod (h) directly");
+            let gone = tokio::time::timeout(Duration::from_secs(60), async {
+                while pods_api(&client).get_opt(&pod_name(pod_h)).await.ok().flatten().is_some() {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            })
+            .await;
+            assert!(gone.is_ok(), "pod (h) should leave Kubernetes");
+            let conversation_young = db::create_conversation(&pool).await.expect("create conversation");
+            let young = db::create_sandbox_pod(&pool, conversation_young.id).await.expect("a young pod record");
+            let updated_at = |id: i64| {
+                let pool = pool.clone();
+                async move {
+                    sqlx::query_scalar::<_, chrono::NaiveDateTime>("SELECT updated_at FROM conversations WHERE id = $1")
+                        .bind(id)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("the conversation's updated_at")
+                }
+            };
+            let updated_before = updated_at(conversation_h.id).await;
+
+            let closed = reconcile_live_pods(&pool).await.expect("reconcile_live_pods");
+
+            assert!(closed >= 1, "the sweep should close pod (h)'s record");
+            assert!(!db::sandbox_pod_is_live(&pool, pod_h).await.expect("is live"), "pod (h) should no longer be live");
+            let command_h = db::get_terminal_command(&pool, "stale-h").await.expect("get").expect("the command");
+            assert_eq!(command_h.status, "lost", "its running command should be marked lost");
+            assert!(
+                db::list_sandbox_terminals_for_pod(&pool, pod_h).await.expect("terminals").is_empty(),
+                "its terminal should be closed"
+            );
+            assert!(db::sandbox_pod_is_live(&pool, young.id).await.expect("is live"), "a young record is left alone");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                db::list_messages(&pool, conversation_h.id).await.expect("messages").is_empty(),
+                "the sweep closes records quietly, with no notice"
+            );
+            assert_eq!(
+                updated_at(conversation_h.id).await,
+                updated_before,
+                "the conversation shouldn't move in the sidebar"
+            );
+            db::terminate_sandbox_pod(&pool, young.id).await.expect("clean up the young record");
 
             // --- Exhausting reconnect attempts without Kubernetes ever
             // confirming death still cleans up *and* force-terminates the

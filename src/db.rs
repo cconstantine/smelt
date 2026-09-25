@@ -332,6 +332,19 @@ pub async fn list_live_pods(pool: &PgPool) -> Result<Vec<LivePodRow>, sqlx::Erro
     .await
 }
 
+/// Live pods created more than `min_age_secs` seconds ago, by the
+/// database's clock — the ones old enough to have a pod in Kubernetes.
+pub async fn live_pods_older_than(pool: &PgPool, min_age_secs: i64) -> Result<Vec<SandboxPod>, sqlx::Error> {
+    sqlx::query_as::<_, SandboxPod>(
+        "SELECT * FROM sandbox_pods
+          WHERE terminated_at IS NULL AND created_at < now() - make_interval(secs => $1)
+          ORDER BY id ASC",
+    )
+    .bind(min_age_secs as f64)
+    .fetch_all(pool)
+    .await
+}
+
 /// Whether `pod_id` exists and hasn't been terminated.
 pub async fn sandbox_pod_is_live(pool: &PgPool, pod_id: i64) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
