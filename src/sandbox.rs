@@ -28,7 +28,6 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::anthropic::ContentBlock;
 use crate::{db, events};
 
 // `cfg(test)` rather than an env var deliberately: the whole point is that
@@ -1828,12 +1827,86 @@ pub async fn grep(
     }
 }
 
+/// The user stopping a pod from the pods view or the sandbox panel. Tears
+/// it down whether or not terminals are open, the way a crash does:
+/// running commands are marked lost and terminals closed. The model is
+/// told in one notice, saved between turns so it can't split a tool call
+/// from its result. Doesn't wake the model: it learns on its next turn.
+pub async fn stop_pod_for_user(pool: &PgPool, pod_id: i64) -> Result<(), TerminalError> {
+    let live = db::sandbox_pod_is_live(pool, pod_id).await?;
+    if !live {
+        return Err(TerminalError::NoPod);
+    }
+    let (conversation_id, _) = close_pod_terminals(pool, pod_id).await;
+    force_terminate_pod(pool, pod_id).await?;
+    if let Some(conversation_id) = conversation_id {
+        let notice = format!(
+            "The user stopped sandbox pod {pod_id}. Its terminals, and any files outside mounted volumes, are gone. Create a new pod if you need one."
+        );
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::api::chat::save_notice_between_turns(&pool, conversation_id, notice).await {
+                tracing::warn!(conversation_id, pod_id, error = %e, "couldn't save the pod stop notice");
+            }
+        });
+    }
+    Ok(())
+}
+
 /// Marks every command still `running` under any of this pod's terminals
 /// `'lost'` (no real exit code to report — see
 /// `db::mark_terminal_command_lost`), and every one of the pod's live
 /// terminals terminated — a dead agent was hosting all of them, not just
 /// one. A safe no-op if the pod had no terminals.
 async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64, reason: Option<String>) {
+    let (conversation_id, found_live_terminal) = close_pod_terminals(pool, pod_id).await;
+    if let Some(conversation_id) = conversation_id {
+        // One pod-level notification, gated on the same "found at least one
+        // live terminal" condition that already makes a redundant second call
+        // (e.g. the pre-existing reactive path still firing after this one
+        // already ran) a harmless no-op — no separate dedup state needed. See
+        // the plan's "Detection design": the reason string, when Kubernetes
+        // gave one, is passed straight through rather than guessed at.
+        let notice = found_live_terminal.then(|| match reason {
+            Some(reason) => format!(
+                "Sandbox pod {pod_id} stopped unexpectedly ({reason}); every terminal running in it is no longer available."
+            ),
+            None => format!(
+                "Sandbox pod {pod_id} stopped unexpectedly; every terminal running in it is no longer available."
+            ),
+        });
+        // Then the same active wake as a normal command exit (see
+        // `handle_agent_message`'s "exit" branch) — a crash can leave a
+        // command marked 'lost' with nobody proactively telling the model,
+        // the identical gap. One wake covers whatever this pass just
+        // marked lost; `wake_conversation`'s own no-op-when-nothing-
+        // pending behavior makes this cheap even when nothing actually
+        // changed. Detached, notice included: this can run synchronously
+        // from *inside* an already-in-progress `run_turn`/`execute()` call
+        // that's already holding `conversation_id`'s lock (e.g.
+        // `run_terminal_command_tool` → `sandbox::send_command` →
+        // `reconnect_if_needed` → here), and both the notice (saved only
+        // between turns, see `save_notice_between_turns`) and the wake
+        // take that same non-reentrant lock. See
+        // docs/projects/plans/terminal-exit-notify.md.
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            if let Some(notice) = notice {
+                if let Err(e) = crate::api::chat::save_notice_between_turns(&pool, conversation_id, notice).await {
+                    tracing::warn!(conversation_id, pod_id, error = %e, "couldn't save the pod crash notice");
+                }
+            }
+            let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
+        });
+    }
+    deregister(pod_id);
+}
+
+/// Marks every command still running in `pod_id`'s terminals lost and
+/// closes the terminals, publishing each closure for the UI. Returns the
+/// pod's conversation (if it could be found) and whether it had any live
+/// terminal. Shared by a crash and by the user stopping the pod.
+async fn close_pod_terminals(pool: &PgPool, pod_id: i64) -> (Option<i64>, bool) {
     let conversation_id = db::sandbox_pod_conversation_id(pool, pod_id)
         .await
         .ok()
@@ -1859,53 +1932,7 @@ async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64, reason: Option<String>
             }
         }
     }
-    // One pod-level notification, gated on the same "found at least one
-    // live terminal" condition that already makes a redundant second call
-    // (e.g. the pre-existing reactive path still firing after this one
-    // already ran) a harmless no-op — no separate dedup state needed. See
-    // the plan's "Detection design": the reason string, when Kubernetes
-    // gave one, is passed straight through rather than guessed at.
-    if found_live_terminal {
-        if let Some(conversation_id) = conversation_id {
-            let text = match reason {
-                Some(reason) => format!(
-                    "Sandbox pod {pod_id} stopped unexpectedly ({reason}); every terminal running in it is no longer available."
-                ),
-                None => format!(
-                    "Sandbox pod {pod_id} stopped unexpectedly; every terminal running in it is no longer available."
-                ),
-            };
-            let _ = db::create_message(
-                pool,
-                conversation_id,
-                "user",
-                &[ContentBlock::Text { text }],
-            )
-            .await;
-        }
-    }
-    if let Some(conversation_id) = conversation_id {
-        // Same active wake as a normal command exit (see
-        // `handle_agent_message`'s "exit" branch) — a crash can leave a
-        // command marked 'lost' with nobody proactively telling the model,
-        // the identical gap. One wake covers whatever this pass just
-        // marked lost; `wake_conversation`'s own no-op-when-nothing-
-        // pending behavior makes this cheap even when nothing actually
-        // changed. Detached for a different reason than the exit-event
-        // call: this can run synchronously from *inside* an
-        // already-in-progress `run_turn`/`execute()` call that's already
-        // holding `conversation_id`'s lock (e.g. `run_terminal_command_tool`
-        // → `sandbox::send_command` → `reconnect_if_needed` → here) —
-        // awaiting `wake_conversation` directly would try to re-acquire
-        // that same non-reentrant lock and deadlock, the same hazard
-        // `cancel_task_tool`'s own comment already documents. See
-        // docs/projects/plans/terminal-exit-notify.md.
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
-        });
-    }
-    deregister(pod_id);
+    (conversation_id, found_live_terminal)
 }
 
 /// Portforward + a client-side WebSocket handshake over the forwarded
@@ -3297,6 +3324,47 @@ mod tests {
                 "a deliberate terminate_pod must never produce a crash notification"
             );
 
+            // --- The user stops a pod that has an open terminal and a
+            // running command: everything is torn down, the command is
+            // marked lost, and the model gets a user-stop notice, not a
+            // crash notice. See docs/projects/plans/pod-management.md. ---
+            let conversation_g = db::create_conversation(&pool).await.expect("create conversation g");
+            let pod_g = create_pod(&pool, conversation_g.id, None, None).await.expect("create_pod (g) should succeed");
+            let terminal_g = create_terminal(&pool, conversation_g.id).await.expect("create_terminal (g) should succeed");
+            db::create_terminal_command(&pool, conversation_g.id, terminal_g, "long-g", "sleep 300")
+                .await
+                .expect("create_terminal_command");
+            send_command(&pool, terminal_g, "long-g", "sleep 300").await.expect("send_command");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            stop_pod_for_user(&pool, pod_g).await.expect("stop_pod_for_user (g) should succeed");
+
+            let command_g = db::get_terminal_command(&pool, "long-g").await.expect("get").expect("the command");
+            assert_eq!(command_g.status, "lost", "a running command should be marked lost");
+            assert!(
+                list_terminals(&pool, conversation_g.id).await.expect("list_terminals").is_empty(),
+                "the pod's terminal should be closed"
+            );
+            assert!(
+                db::list_sandbox_pods(&pool, conversation_g.id).await.expect("list pods").is_empty(),
+                "the pod should be marked terminated"
+            );
+            assert!(
+                pods_api(&client).get_opt(&pod_name(pod_g)).await.expect("get pod").is_none_or(|p| p.metadata.deletion_timestamp.is_some()),
+                "the Kubernetes pod should be gone or going"
+            );
+            let notified = tokio::time::timeout(Duration::from_secs(10), async {
+                while !any_message_contains(&pool, conversation_g.id, "The user stopped sandbox pod").await {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await;
+            assert!(notified.is_ok(), "the model should be told the user stopped the pod");
+            assert!(
+                !any_message_contains(&pool, conversation_g.id, "stopped unexpectedly").await,
+                "a user stop must not be reported as a crash"
+            );
+
             // --- Exhausting reconnect attempts without Kubernetes ever
             // confirming death still cleans up *and* force-terminates the
             // pod — verified by create_pod succeeding again immediately
@@ -3494,7 +3562,7 @@ mod tests {
                 m.blocks().ok().is_some_and(|blocks| {
                     blocks
                         .iter()
-                        .any(|b| matches!(b, ContentBlock::Text { text } if text.contains(needle)))
+                        .any(|b| matches!(b, crate::anthropic::ContentBlock::Text { text } if text.contains(needle)))
                 })
             })
     }

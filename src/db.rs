@@ -329,6 +329,16 @@ pub async fn list_live_pods(pool: &PgPool) -> Result<Vec<LivePodRow>, sqlx::Erro
     .await
 }
 
+/// Whether `pod_id` exists and hasn't been terminated.
+pub async fn sandbox_pod_is_live(pool: &PgPool, pod_id: i64) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM sandbox_pods WHERE id = $1 AND terminated_at IS NULL)",
+    )
+    .bind(pod_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// The conversations that have a live pod — the sidebar's markers.
 pub async fn conversations_with_live_pods(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
     sqlx::query_scalar(
