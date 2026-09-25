@@ -343,6 +343,77 @@ fn history_for_request(
     Ok(history)
 }
 
+/// The fixed part of every turn's system prompt: who the model is, how its
+/// sandbox and tools work, and how its replies are shown. Kept as prose in
+/// its own file so it reads and edits like prose.
+#[cfg(feature = "server")]
+const BASE_SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
+
+/// The parts of the system prompt that depend on this deployment or the
+/// day, gathered per turn by `prompt_environment`. An empty list means
+/// "none" (or that reading it failed, which is logged), and its line is
+/// left out.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PromptEnvironment {
+    pub date: chrono::NaiveDate,
+    pub model: String,
+    /// `(name, mount path)`, the path already resolved.
+    pub volumes: Vec<(String, String)>,
+    pub mcp_servers: Vec<String>,
+}
+
+/// The system prompt sent with every turn: the base prompt, then an
+/// environment section built from `env`. Pure, so the request and the
+/// context detail view can't disagree about what's sent.
+#[cfg(feature = "server")]
+pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
+    let mut prompt = String::from(BASE_SYSTEM_PROMPT);
+    prompt.push_str("\n# Environment\n\n");
+    prompt.push_str(&format!("- Today's date: {}\n", env.date.format("%Y-%m-%d")));
+    prompt.push_str(&format!("- Model: {}\n", env.model));
+    if !env.volumes.is_empty() {
+        prompt.push_str("- Volumes (their contents survive the pod ending):\n");
+        for (name, path) in &env.volumes {
+            prompt.push_str(&format!("  - {name} mounted at {path}\n"));
+        }
+    }
+    if !env.mcp_servers.is_empty() {
+        prompt.push_str(&format!(
+            "- MCP servers: {} (their tools are named mcp__<server>__<tool>)\n",
+            env.mcp_servers.join(", ")
+        ));
+    }
+    prompt
+}
+
+/// Gathers this turn's `PromptEnvironment`. A database read that fails
+/// leaves its list empty (and is logged) rather than failing the turn: the
+/// prompt without it is still useful.
+#[cfg(feature = "server")]
+pub(crate) async fn prompt_environment(pool: &PgPool) -> PromptEnvironment {
+    let volumes = match db::list_sandbox_volumes(pool).await {
+        Ok(volumes) => volumes.into_iter().map(|v| (v.name, v.mount_path)).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list sandbox volumes for the system prompt");
+            Vec::new()
+        }
+    };
+    let mcp_servers = match db::list_mcp_server_configs(pool).await {
+        Ok(configs) => configs.into_iter().map(|c| c.name).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list MCP servers for the system prompt");
+            Vec::new()
+        }
+    };
+    PromptEnvironment {
+        date: chrono::Utc::now().date_naive(),
+        model: anthropic_model(),
+        volumes,
+        mcp_servers,
+    }
+}
+
 /// The system prompt for the dedicated summarization call `compact_conversation`
 /// makes — no tools attached, so this is the model's only instruction.
 /// Explicitly demands every live id be preserved verbatim rather than
@@ -846,7 +917,7 @@ fn run_turn_bounded<'a>(
                 // this budget with the actual reply, and 4096 left no
                 // headroom for both once thinking turned on.
                 max_tokens: MAX_TOKENS,
-                system: None,
+                system: Some(system_prompt(&prompt_environment(pool).await)),
                 messages: history,
                 stream: true,
                 tools: anthropic::tools::tool_definitions(pool).await,
@@ -1270,9 +1341,8 @@ pub async fn get_context_usage(id: i64) -> ServerFnResult<ContextUsageSnapshot> 
 /// `get_context_usage` reports — reconstructed from current state rather
 /// than a stored snapshot of what was literally sent (matches
 /// `run_turn_bounded`'s own request-building exactly, since nothing else
-/// changes `system`/the tool list between turns). `system` is `None`
-/// today because `run_turn_bounded` never sets one — see
-/// docs/projects/plans/auto-compaction.md's "not in scope."
+/// changes `system`/the tool list between turns). `system` comes from
+/// the same `system_prompt`/`prompt_environment` pair a turn uses.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ContextDetailSnapshot {
     pub system: Option<String>,
@@ -1284,7 +1354,12 @@ pub struct ContextDetailSnapshot {
 
 #[get("/api/conversations/{id}/context-detail")]
 pub async fn get_context_detail(id: i64) -> ServerFnResult<ContextDetailSnapshot> {
-    let pool = db::get();
+    context_detail(db::get(), id).await
+}
+
+/// `get_context_detail`'s body, taking the pool so tests can call it.
+#[cfg(feature = "server")]
+async fn context_detail(pool: &PgPool, id: i64) -> ServerFnResult<ContextDetailSnapshot> {
     let tools = anthropic::tools::tool_definitions(pool).await;
     let message_count = db::list_messages(pool, id)
         .await
@@ -1294,7 +1369,7 @@ pub async fn get_context_detail(id: i64) -> ServerFnResult<ContextDetailSnapshot
         .await
         .map_err(ServerFnError::new)?;
     Ok(ContextDetailSnapshot {
-        system: None,
+        system: Some(system_prompt(&prompt_environment(pool).await)),
         tools,
         message_count,
         usage,
@@ -2125,6 +2200,233 @@ mod tests {
             chat_error_text(&error),
             "model provider error 503 Service Unavailable: paused"
         );
+    }
+
+    fn prompt_env() -> PromptEnvironment {
+        PromptEnvironment {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 9, 25).expect("a valid date"),
+            model: "claude-test-model".to_string(),
+            volumes: vec![("cargo-cache".to_string(), "/home/sandbox/.cargo".to_string())],
+            mcp_servers: vec!["exa".to_string(), "github".to_string()],
+        }
+    }
+
+    #[test]
+    fn test_system_prompt_starts_with_the_base_prompt() {
+        let prompt = system_prompt(&prompt_env());
+        assert!(prompt.starts_with(BASE_SYSTEM_PROMPT), "got: {prompt}");
+    }
+
+    #[test]
+    fn test_system_prompt_describes_the_environment() {
+        let prompt = system_prompt(&prompt_env());
+        let environment = prompt
+            .strip_prefix(BASE_SYSTEM_PROMPT)
+            .expect("the environment follows the base prompt");
+        for expected in [
+            "Today's date: 2026-09-25",
+            "Model: claude-test-model",
+            "cargo-cache mounted at /home/sandbox/.cargo",
+            "MCP servers: exa, github",
+        ] {
+            assert!(environment.contains(expected), "missing {expected:?} in: {environment}");
+        }
+    }
+
+    #[test]
+    fn test_system_prompt_leaves_out_empty_volume_and_mcp_lines() {
+        let mut env = prompt_env();
+        env.volumes.clear();
+        env.mcp_servers.clear();
+        let prompt = system_prompt(&env);
+        let environment = prompt
+            .strip_prefix(BASE_SYSTEM_PROMPT)
+            .expect("the environment follows the base prompt");
+        assert!(environment.contains("Today's date: 2026-09-25"), "got: {environment}");
+        assert!(!environment.contains("mounted at"), "got: {environment}");
+        assert!(!environment.contains("MCP servers"), "got: {environment}");
+    }
+
+    /// Like `start_mock_upstream` (replies in order, the last one repeated),
+    /// but also keeps every request body it receives, parsed as JSON, so a
+    /// test can check what was actually sent. Same locking rule as
+    /// `start_mock_upstream`.
+    async fn start_recording_mock_upstream(
+        bodies: Vec<String>,
+    ) -> Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |request: String| {
+                let recorded = recorded.clone();
+                let bodies = bodies.clone();
+                async move {
+                    let parsed = serde_json::from_str(&request).expect("a JSON request body");
+                    let mut log = recorded.lock().expect("the request log");
+                    log.push(parsed);
+                    let body = bodies[(log.len() - 1).min(bodies.len() - 1)].clone();
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body)
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        unsafe {
+            std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}"));
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        }
+        requests
+    }
+
+    fn text_reply_body(text: &str) -> String {
+        sse_body(&[
+            ("message_start", r#"{"type":"message_start"}"#),
+            (
+                "content_block_delta",
+                &format!(
+                    r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{text}"}}}}"#
+                ),
+            ),
+            ("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ])
+    }
+
+    #[sqlx::test]
+    async fn test_prompt_environment_reads_volumes_and_mcp_servers(pool: PgPool) {
+        db::create_sandbox_volume(&pool, "cargo-cache", "/home/sandbox/.cargo")
+            .await
+            .expect("create volume");
+        db::ensure_mcp_server(&pool, "exa", "https://mcp.example.com/mcp")
+            .await
+            .expect("add mcp server");
+        let env = prompt_environment(&pool).await;
+        assert_eq!(env.date, chrono::Utc::now().date_naive());
+        assert_eq!(env.model, anthropic_model());
+        assert_eq!(
+            env.volumes,
+            vec![("cargo-cache".to_string(), "/home/sandbox/.cargo".to_string())]
+        );
+        assert_eq!(env.mcp_servers, vec!["exa".to_string()]);
+    }
+
+    /// Every turn's request carries the system prompt built from that
+    /// turn's environment.
+    #[sqlx::test]
+    async fn test_run_turn_sends_the_system_prompt(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        db::create_sandbox_volume(&pool, "cargo-cache", "/home/sandbox/.cargo")
+            .await
+            .expect("create volume");
+        let requests = start_recording_mock_upstream(vec![text_reply_body("Hi!")]).await;
+
+        run_turn(&pool, conversation.id, hello(), None)
+            .await
+            .expect("run_turn should succeed");
+
+        let requests = requests.lock().expect("the request log");
+        assert_eq!(requests.len(), 1);
+        let expected = system_prompt(&prompt_environment(&pool).await);
+        assert_eq!(requests[0]["system"].as_str(), Some(expected.as_str()));
+        assert!(expected.contains("cargo-cache mounted at /home/sandbox/.cargo"));
+    }
+
+    /// Compaction's summarization call keeps its own prompt; only the real
+    /// turn after it gets the agent's system prompt.
+    #[sqlx::test]
+    async fn test_compaction_keeps_its_own_system_prompt(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        db::create_message(
+            &pool,
+            conversation.id,
+            "user",
+            &[anthropic::ContentBlock::Text {
+                text: "earlier message".to_string(),
+            }],
+        )
+        .await
+        .expect("seed earlier message");
+        // Usage past the ceiling, so the next turn compacts first (see
+        // `test_run_turn_compacts_before_sending_when_usage_is_near_the_ceiling`).
+        db::upsert_conversation_usage(
+            &pool,
+            conversation.id,
+            &anthropic::TokenUsage {
+                input_tokens: 190_000,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+        )
+        .await
+        .expect("seed usage");
+        let requests = start_recording_mock_upstream(vec![
+            text_reply_body("Summary: nothing live."),
+            text_reply_body("Hi again"),
+        ])
+        .await;
+
+        run_turn(&pool, conversation.id, hello(), None)
+            .await
+            .expect("run_turn should succeed");
+
+        let requests = requests.lock().expect("the request log");
+        assert_eq!(requests.len(), 2, "a compaction call, then the real turn");
+        assert_eq!(requests[0]["system"].as_str(), Some(COMPACTION_SYSTEM_PROMPT));
+        let expected = system_prompt(&prompt_environment(&pool).await);
+        assert_eq!(requests[1]["system"].as_str(), Some(expected.as_str()));
+    }
+
+    /// The detail view shows exactly the system prompt a turn sends.
+    #[sqlx::test]
+    async fn test_context_detail_shows_the_system_prompt_a_turn_sends(pool: PgPool) {
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        let detail = context_detail(&pool, conversation.id)
+            .await
+            .expect("context detail");
+        let expected = system_prompt(&prompt_environment(&pool).await);
+        assert_eq!(detail.system.as_deref(), Some(expected.as_str()));
+    }
+
+    /// Every tool the base prompt names in backticks must exist, so
+    /// renaming or removing a tool fails here until the prompt is updated.
+    /// A backticked word counts as a tool name when it's lowercase letters
+    /// and underscores; the few that aren't tools are listed.
+    #[test]
+    fn test_system_prompt_only_names_real_tools() {
+        const NOT_TOOLS: &[&str] = &["sandbox", "sudo", "web_search"];
+        let tools: Vec<String> = anthropic::tools::native_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let named: Vec<&str> = BASE_SYSTEM_PROMPT
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|word| !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .filter(|word| !NOT_TOOLS.contains(word))
+            .collect();
+        assert!(named.len() > 10, "expected the prompt to name its tools, found {named:?}");
+        let unknown: Vec<&&str> = named.iter().filter(|word| !tools.iter().any(|t| t == **word)).collect();
+        assert!(unknown.is_empty(), "the system prompt names tools that don't exist: {unknown:?}");
     }
 
     fn hello() -> anthropic::AnthropicMessage {
