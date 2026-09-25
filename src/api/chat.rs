@@ -627,6 +627,36 @@ async fn compact_conversation(
     Ok(())
 }
 
+/// Saves `text` as a `user` notice in `conversation_id` once no turn is
+/// running there, by taking the conversation's turn lock first — so the
+/// notice can never land between a tool call and its result, an order the
+/// API rejects. For things that happen outside a turn and that the model
+/// should learn about: its pod crashing, or the user stopping it. Waits
+/// for a running turn to end, so call it from a spawned task.
+#[cfg(feature = "server")]
+pub(crate) async fn save_notice_between_turns(
+    pool: &PgPool,
+    conversation_id: i64,
+    text: String,
+) -> Result<Message, sqlx::Error> {
+    let lock = conversation_lock(conversation_id);
+    let _turn = lock.lock().await;
+    let saved = db::create_message(
+        pool,
+        conversation_id,
+        "user",
+        &[anthropic::ContentBlock::Text { text }],
+    )
+    .await?;
+    crate::events::publish(
+        conversation_id,
+        crate::events::ConversationEvent::MessagesAppended {
+            messages: vec![saved.clone()],
+        },
+    );
+    Ok(saved)
+}
+
 /// A live `send_message` call and a background task's push-triggered
 /// `run_turn` call (or two different tasks' pushes) can race for the same
 /// conversation — Anthropic's strict user/assistant alternation breaks if
@@ -2427,6 +2457,46 @@ mod tests {
         assert!(named.len() > 10, "expected the prompt to name its tools, found {named:?}");
         let unknown: Vec<&&str> = named.iter().filter(|word| !tools.iter().any(|t| t == **word)).collect();
         assert!(unknown.is_empty(), "the system prompt names tools that don't exist: {unknown:?}");
+    }
+
+    /// A notice waits for a running turn to end before it's saved, and
+    /// tells a watching tab once it is.
+    #[sqlx::test]
+    async fn test_save_notice_between_turns_waits_for_the_turn_lock(pool: PgPool) {
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        let lock = conversation_lock(conversation.id);
+        let turn = lock.lock().await;
+        let mut events = events::subscribe(conversation.id);
+
+        let saving = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                save_notice_between_turns(&pool, conversation.id, "pod stopped".to_string()).await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            db::list_messages(&pool, conversation.id).await.expect("list").is_empty(),
+            "the notice was saved while a turn held the lock"
+        );
+
+        drop(turn);
+        let saved = saving.await.expect("join").expect("save the notice");
+        assert_eq!(saved.role, "user");
+        assert_eq!(
+            saved.blocks().expect("blocks"),
+            vec![anthropic::ContentBlock::Text { text: "pod stopped".to_string() }]
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("an event")
+            .expect("open channel");
+        assert!(
+            matches!(&event, events::ConversationEvent::MessagesAppended { messages } if messages.len() == 1),
+            "got {event:?}"
+        );
     }
 
     fn hello() -> anthropic::AnthropicMessage {
