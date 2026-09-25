@@ -63,7 +63,7 @@ What the tuning changed: an explicit "after starting a command, don't check on i
 - **My edits restarted your dev server.** It watches the source files, so each prompt edit (and the temporary prompt-off edit) rebuilt and restarted it. development-process.md already describes this hazard. I noticed only when I saw your server running.
 - **My check script had no time limit** while waiting for a conversation to go quiet, and sat for 13 minutes after the clone task had finished. Fixed with a hard budget and a per-poll log.
 
-**Process suggestions (not applied; need agreement):**
+**Process changes (confirmed and applied to development-process.md, under Rules):**
 - **Stage files by name, never `git add -A` or `git commit -a`**, since you may be editing the repo at the same time.
 - **Stop only processes you started, by the PID recorded when you started them.** Never kill by name or pattern. Before editing source files for a live check, look for a dev server of yours watching the repo, and say so if one is running.
 
