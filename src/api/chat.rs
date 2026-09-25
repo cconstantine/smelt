@@ -760,6 +760,10 @@ fn forget_conversation_lock(conversation_id: i64) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&conversation_id);
+    PAUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&conversation_id);
 }
 
 /// The credential-requirement decision `run_turn_bounded` makes at the top
@@ -840,6 +844,11 @@ pub(crate) async fn wake_conversation(
     pool: &PgPool,
     conversation_id: i64,
 ) -> ServerFnResult<Vec<Message>> {
+    // After the user stopped this conversation, pending notices wait for
+    // their next message, which drains them the same way (see `PAUSED`).
+    if is_paused(conversation_id) {
+        return Ok(Vec::new());
+    }
     let result = run_turn_bounded(pool, conversation_id, None, None, MAX_TURNS).await;
     if let Err(e) = &result {
         tracing::warn!(conversation_id, error = %e, "wake_conversation failed to notify the model");
@@ -932,10 +941,43 @@ fn stop_receiver(conversation_id: i64) -> tokio::sync::watch::Receiver<u64> {
 /// nothing is running.
 #[cfg(feature = "server")]
 pub(crate) fn stop_turn_now(conversation_id: i64) {
+    // Paused even when nothing is running: the user asked the model to
+    // stop, so a command finishing right after shouldn't start it again.
+    PAUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(conversation_id);
     let stops = TURN_STOPS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(stop) = stops.get(&conversation_id) {
         stop.send_modify(|count| *count += 1);
     }
+}
+
+/// Conversations the user has stopped and not written in since. While
+/// paused, a finished command or background task doesn't wake the model:
+/// its notice is still saved, and the model sees it on the user's next
+/// message. Otherwise a stop would be undone seconds later by whatever was
+/// still running. In memory: a restart un-pauses, which is harmless.
+#[cfg(feature = "server")]
+static PAUSED: LazyLock<Mutex<std::collections::HashSet<i64>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// Whether `conversation_id` is paused after a stop (see `PAUSED`).
+#[cfg(feature = "server")]
+pub(crate) fn is_paused(conversation_id: i64) -> bool {
+    PAUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&conversation_id)
+}
+
+/// Ends the pause after a stop: the user has written again.
+#[cfg(feature = "server")]
+fn resume_turns(conversation_id: i64) {
+    PAUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&conversation_id);
 }
 
 /// A turn, ended early if the user stops it (see `TURN_STOPS`). Stopping
@@ -1216,6 +1258,8 @@ pub(crate) fn chat_error_text(error: &ServerFnError) -> String {
 
 #[post("/api/conversations/{id}/messages")]
 pub async fn send_message(id: i64, content: String) -> ServerFnResult<ServerEvents<ChatEvent>> {
+    // The user writing again ends any pause from an earlier stop.
+    resume_turns(id);
     let new_message = anthropic::AnthropicMessage {
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text: content }],
@@ -2770,6 +2814,40 @@ mod tests {
         stop_turn_now(9_000_000_012);
         let mut receiver = stop_receiver(9_000_000_012);
         assert!(!receiver.has_changed().expect("open"), "an earlier stop must not affect a new turn");
+    }
+
+    /// After a stop, a finished command doesn't wake the model; the user's
+    /// next message does, and its turn includes the command's notice.
+    #[sqlx::test]
+    async fn test_a_stopped_conversation_waits_for_the_user_before_waking(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        let requests = start_recording_mock_upstream(vec![text_reply_body("Hi!")]).await;
+
+        stop_turn_now(conversation.id);
+        assert!(is_paused(conversation.id), "a stop pauses the conversation");
+        unnotified_finished_command(&pool, conversation.id, "cmd-after-stop").await;
+        wake_conversation(&pool, conversation.id)
+            .await
+            .expect("a paused wake does nothing, successfully");
+        assert!(
+            requests.lock().expect("log").is_empty(),
+            "a paused conversation shouldn't call the model"
+        );
+
+        resume_turns(conversation.id);
+        assert!(!is_paused(conversation.id));
+        run_turn(&pool, conversation.id, hello(), None)
+            .await
+            .expect("the user's next turn runs");
+        let requests = requests.lock().expect("log");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]["messages"].to_string().contains("cmd-after-stop"),
+            "the next turn should include the command's notice"
+        );
     }
 
     /// A notice waits for a running turn to end before it's saved, and
