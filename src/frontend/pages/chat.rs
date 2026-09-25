@@ -2075,7 +2075,7 @@ fn ConversationSidebar(
                                     evt.stop_propagation();
                                     request_delete(conversation.id);
                                 },
-                                if pending_delete() == Some(conversation.id) { "Confirm?" } else { "Delete" }
+                                super::TwoStepLabel { armed: pending_delete() == Some(conversation.id), idle: "Delete", confirm: "Confirm?" }
                             }
                         }
                     }
@@ -2928,7 +2928,7 @@ fn ChatPanel(
                                                     r#type: "button",
                                                     title: "Stop this pod. Its terminals and any files outside mounted volumes are lost.",
                                                     onclick: move |_| request_pod_stop(pod.pod_id),
-                                                    if pending_pod_stop() == Some(pod.pod_id) { "Confirm stop?" } else { "Stop pod" }
+                                                    super::TwoStepLabel { armed: pending_pod_stop() == Some(pod.pod_id), idle: "Stop pod", confirm: "Confirm stop?" }
                                                 }
                                             }
                                             if let Some(err) = pod_stop_error() {

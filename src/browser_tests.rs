@@ -190,6 +190,20 @@ async fn wait_for_element(
     }
 }
 
+/// `selector`'s position and size on screen, rounded to whole pixels:
+/// `(x, y, width, height)`.
+async fn element_box(page: &chromiumoxide::Page, selector: &str) -> (i64, i64, i64, i64) {
+    let rect: Vec<f64> = page
+        .evaluate(format!(
+            "(() => {{ const r = document.querySelector({selector:?}).getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; }})()"
+        ))
+        .await
+        .expect("measure an element")
+        .into_value()
+        .expect("four numbers");
+    (rect[0].round() as i64, rect[1].round() as i64, rect[2].round() as i64, rect[3].round() as i64)
+}
+
 /// Waits until exactly `count` elements match `selector`. False on timeout.
 async fn wait_for_count(page: &chromiumoxide::Page, selector: &str, count: usize, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -852,8 +866,17 @@ async fn test_end_to_end_browser_scenarios() {
             "the row should name its conversation"
         );
         let stop = format!("{row} .pod-stop");
+        let neighbour = format!("{row} td:nth-last-child(2)");
+        let before = (element_box(&pods_page, &stop).await, element_box(&pods_page, &neighbour).await);
         wait_for_element(&pods_page, &stop, Duration::from_secs(5)).await.click().await.expect("arm stop");
-        wait_for_element(&pods_page, &format!("{row} .pod-stop.confirm"), Duration::from_secs(5))
+        let confirm = format!("{row} .pod-stop.confirm");
+        wait_for_element(&pods_page, &confirm, Duration::from_secs(5)).await;
+        let after = (element_box(&pods_page, &confirm).await, element_box(&pods_page, &neighbour).await);
+        assert_eq!(
+            before, after,
+            "arming Stop must not move or resize the button or its neighbours (button, cell to its left)"
+        );
+        wait_for_element(&pods_page, &confirm, Duration::from_secs(5))
             .await
             .click()
             .await

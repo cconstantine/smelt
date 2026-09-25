@@ -115,7 +115,7 @@ pub fn PodsIndex() -> Element {
                                             class: if pending_stop() == Some(pod.pod_id) { "pod-stop confirm" } else { "pod-stop" },
                                             r#type: "button",
                                             onclick: move |_| request_stop(pod.pod_id),
-                                            if pending_stop() == Some(pod.pod_id) { "Confirm stop?" } else { "Stop" }
+                                            super::TwoStepLabel { armed: pending_stop() == Some(pod.pod_id), idle: "Stop", confirm: "Confirm stop?" }
                                         }
                                     }
                                 }

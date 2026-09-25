@@ -81,7 +81,7 @@ pub fn SandboxVolumesIndex() -> Element {
                                 class: if pending_delete() == Some(volume.id) { "sandbox-volume-delete confirm" } else { "sandbox-volume-delete" },
                                 r#type: "button",
                                 onclick: move |_| request_delete(volume.id),
-                                if pending_delete() == Some(volume.id) { "Confirm delete?" } else { "Delete" }
+                                super::TwoStepLabel { armed: pending_delete() == Some(volume.id), idle: "Delete", confirm: "Confirm delete?" }
                             }
                         }
                     }

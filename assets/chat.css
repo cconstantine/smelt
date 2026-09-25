@@ -2015,3 +2015,19 @@ div.mcp-status-not-connected::before {
     font-size: 13px;
     margin: 4px 0;
 }
+
+/* A two-step button's label (`TwoStepLabel`): both labels share one grid
+   cell and the inactive one is hidden, so the button keeps the width of the
+   longer label in both states. */
+.two-step-label {
+    display: inline-grid;
+    justify-items: center;
+}
+
+.two-step-text {
+    grid-area: 1 / 1;
+}
+
+.two-step-text.hidden {
+    visibility: hidden;
+}
