@@ -11,6 +11,80 @@ use crate::events::AppEvent;
 #[cfg(feature = "server")]
 use crate::db;
 
+/// A pod's current resource use, from the cluster's metrics API. Lags
+/// real use by up to about a minute.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PodUsage {
+    pub memory_bytes: u64,
+    pub cpu_millicores: u64,
+}
+
+/// A Kubernetes CPU quantity in millicores: `"250m"`, `"2"` (cores),
+/// `"1203981n"` (nanocores, what metrics-server reports) or `"5u"`.
+#[cfg(feature = "server")]
+fn parse_cpu_millicores(quantity: &str) -> Option<u64> {
+    parse_cpu_nanocores(quantity).map(|nanos| (nanos / 1_000_000.0) as u64)
+}
+
+/// A CPU quantity in nanocores, as a float so fractional cores (`"0.5"`)
+/// and sums across containers keep their precision until the end.
+#[cfg(feature = "server")]
+fn parse_cpu_nanocores(quantity: &str) -> Option<f64> {
+    let (number, scale) = match quantity.char_indices().last()? {
+        (i, 'n') => (&quantity[..i], 1.0),
+        (i, 'u') => (&quantity[..i], 1_000.0),
+        (i, 'm') => (&quantity[..i], 1_000_000.0),
+        _ => (quantity, 1_000_000_000.0),
+    };
+    let value: f64 = number.parse().ok()?;
+    (value >= 0.0).then_some(value * scale)
+}
+
+/// A Kubernetes memory quantity in bytes: `"3372Ki"`, `"512Mi"`, `"1Gi"`,
+/// `"1500k"`, `"2M"`, `"1G"` or plain bytes.
+#[cfg(feature = "server")]
+fn parse_memory_bytes(quantity: &str) -> Option<u64> {
+    const UNITS: &[(&str, f64)] = &[
+        ("Ki", 1024.0),
+        ("Mi", 1024.0 * 1024.0),
+        ("Gi", 1024.0 * 1024.0 * 1024.0),
+        ("Ti", 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("k", 1e3),
+        ("M", 1e6),
+        ("G", 1e9),
+        ("T", 1e12),
+    ];
+    let (number, scale) = UNITS
+        .iter()
+        .find_map(|(suffix, scale)| quantity.strip_suffix(suffix).map(|n| (n, *scale)))
+        .unwrap_or((quantity, 1.0));
+    let value: f64 = number.parse().ok()?;
+    (value >= 0.0).then(|| (value * scale) as u64)
+}
+
+/// Usage per pod name from a `PodMetricsList` (`metrics.k8s.io/v1beta1`),
+/// summed over each pod's containers. A pod whose numbers don't parse is
+/// left out rather than shown wrong.
+#[cfg(feature = "server")]
+fn parse_pod_metrics(list: &serde_json::Value) -> std::collections::HashMap<String, PodUsage> {
+    let items = list.get("items").and_then(|items| items.as_array());
+    items
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let name = item.pointer("/metadata/name")?.as_str()?.to_string();
+            let mut nanocores = 0.0;
+            let mut memory_bytes = 0;
+            for container in item.get("containers")?.as_array()? {
+                nanocores += parse_cpu_nanocores(container.pointer("/usage/cpu")?.as_str()?)?;
+                memory_bytes += parse_memory_bytes(container.pointer("/usage/memory")?.as_str()?)?;
+            }
+            let cpu_millicores = (nanocores / 1_000_000.0) as u64;
+            Some((name, PodUsage { memory_bytes, cpu_millicores }))
+        })
+        .collect()
+}
+
 /// Whether a pod is doing anything. Busy while any of its terminals has a
 /// command running; otherwise idle since its last sign of activity.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -96,6 +170,66 @@ mod tests {
             before,
             "a dropped subscription is still listening"
         );
+    }
+
+    #[test]
+    fn test_parse_cpu_millicores_handles_each_unit() {
+        assert_eq!(parse_cpu_millicores("250m"), Some(250));
+        assert_eq!(parse_cpu_millicores("2"), Some(2000));
+        assert_eq!(parse_cpu_millicores("1203981n"), Some(1));
+        assert_eq!(parse_cpu_millicores("5500000n"), Some(5));
+        assert_eq!(parse_cpu_millicores("2500u"), Some(2));
+        assert_eq!(parse_cpu_millicores("0.5"), Some(500));
+        assert_eq!(parse_cpu_millicores("lots"), None);
+    }
+
+    #[test]
+    fn test_parse_memory_bytes_handles_each_unit() {
+        assert_eq!(parse_memory_bytes("3372Ki"), Some(3372 * 1024));
+        assert_eq!(parse_memory_bytes("512Mi"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_memory_bytes("8Gi"), Some(8 * 1024 * 1024 * 1024));
+        assert_eq!(parse_memory_bytes("1500k"), Some(1_500_000));
+        assert_eq!(parse_memory_bytes("2M"), Some(2_000_000));
+        assert_eq!(parse_memory_bytes("1G"), Some(1_000_000_000));
+        assert_eq!(parse_memory_bytes("4096"), Some(4096));
+        assert_eq!(parse_memory_bytes("big"), None);
+    }
+
+    /// Shape as documented for `metrics.k8s.io/v1beta1` `PodMetricsList`;
+    /// to be replaced by a real captured response once smelt's service
+    /// account is allowed to read metrics (see the plan).
+    const DOCUMENTED_POD_METRICS: &str = r#"{
+        "kind": "PodMetricsList",
+        "apiVersion": "metrics.k8s.io/v1beta1",
+        "metadata": {},
+        "items": [
+            {
+                "metadata": {"name": "sandbox-12", "namespace": "smelt-park"},
+                "timestamp": "2026-09-25T05:00:00Z",
+                "window": "10.052s",
+                "containers": [
+                    {"name": "sandbox", "usage": {"cpu": "1203981n", "memory": "3372Ki"}},
+                    {"name": "sidecar", "usage": {"cpu": "2000000n", "memory": "1Mi"}}
+                ]
+            },
+            {
+                "metadata": {"name": "sandbox-13", "namespace": "smelt-park"},
+                "timestamp": "2026-09-25T05:00:00Z",
+                "window": "10.052s",
+                "containers": [{"name": "sandbox", "usage": {"cpu": "weird", "memory": "1Mi"}}]
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn test_parse_pod_metrics_sums_containers_and_skips_unparseable_pods() {
+        let list: serde_json::Value = serde_json::from_str(DOCUMENTED_POD_METRICS).expect("valid JSON");
+        let usage = parse_pod_metrics(&list);
+        assert_eq!(
+            usage.get("sandbox-12"),
+            Some(&PodUsage { memory_bytes: 3372 * 1024 + 1024 * 1024, cpu_millicores: 3 })
+        );
+        assert!(!usage.contains_key("sandbox-13"), "unparseable numbers should be left out");
     }
 
     #[test]
