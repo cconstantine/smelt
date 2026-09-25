@@ -121,6 +121,13 @@ pub enum ConversationEvent {
     /// sidebar's pod dots: browsers allow only 6 connections per host over
     /// HTTP/1.1, shared across tabs.
     PodsChanged {},
+    /// Whether a model turn is running (or queued) in this conversation,
+    /// published when that changes, so every tab watching it can offer a
+    /// Stop button, including for turns it didn't start. Regenerable from
+    /// `api::chat::get_turn_state`.
+    TurnState {
+        running: bool,
+    },
 }
 
 /// Events that aren't about one conversation, for views that span them
@@ -420,6 +427,7 @@ mod wire_tests {
 
     fn one_of_each() -> Vec<ConversationEvent> {
         vec![
+            ConversationEvent::TurnState { running: true },
             ConversationEvent::PodsChanged {},
             ConversationEvent::TaskUpdate {
                 task_id: "t1".to_string(),

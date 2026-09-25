@@ -29,7 +29,8 @@ use crate::api::chat::{
 // reaches them.
 #[cfg(feature = "web")]
 use crate::api::chat::{
-    get_context_usage, get_sandbox_state, get_tasks, get_todos, subscribe_conversation_events,
+    get_context_usage, get_sandbox_state, get_tasks, get_todos, get_turn_state,
+    subscribe_conversation_events,
 };
 #[cfg(feature = "web")]
 use crate::api::browsing::{get_browsing_state, subscribe_browser_frames};
@@ -2116,6 +2117,21 @@ fn ChatPanel(
     let streaming_text = move || selected().and_then(|id| replies_in_flight.read().get(&id).cloned());
     let is_streaming = move || streaming_text().is_some();
     let stream_error = move || selected().and_then(|id| stream_errors.read().get(&id).cloned());
+    // Whether the server has a turn running (or queued) in the selected
+    // conversation, from `ConversationEvent::TurnState`: covers turns this
+    // tab didn't start (another tab, a finished command waking the model).
+    #[allow(unused_mut)]
+    let mut turn_running = use_signal(|| false);
+    let can_stop = move || is_streaming() || turn_running();
+    let stop = move |_| {
+        let Some(id) = selected() else { return };
+        // Shown as "Stopped." where the reply would have been; the next
+        // send clears it.
+        stream_errors.write().insert(id, crate::api::chat::TURN_STOPPED.to_string());
+        spawn(async move {
+            let _ = crate::api::chat::stop_turn(id).await;
+        });
+    };
     // Set when a background wake-up (a terminal command finishing with no
     // `send_message` call in flight) fails to actually reach the model —
     // see `ConversationEvent::NotificationDeliveryFailed`. Separate from
@@ -2295,6 +2311,7 @@ fn ChatPanel(
             address_editing.set(false);
             address_error.set(None);
             notification_delivery_error.set(None);
+            turn_running.set(false);
             context_usage.set(None);
 
             let handle = spawn(async move {
@@ -2325,6 +2342,11 @@ fn ChatPanel(
                         if let Ok(snapshot) = get_todos(id).await {
                             todos.set(snapshot);
                         }
+                        if let Ok(running) = get_turn_state(id).await {
+                            turn_running.set(running);
+                        }
+                        // Kept last: the browser tests take this request
+                        // completing as the sign the client is live.
                         if let Ok(state) = get_browsing_state(id).await {
                             browsing_session_open.set(state.session_open);
                             browsing_url.set(state.url);
@@ -2428,6 +2450,9 @@ fn ChatPanel(
                                 }
                                 Some(Ok(ConversationEvent::PodsChanged {})) => {
                                     *pods_changed.write() += 1;
+                                }
+                                Some(Ok(ConversationEvent::TurnState { running })) => {
+                                    turn_running.set(running);
                                 }
                                 Some(Err(_)) | None => break,
                             }
@@ -3088,7 +3113,11 @@ fn ChatPanel(
                                 div { class: "message message-assistant message-streaming", "{reply}" }
                             }
                             if let Some(err) = stream_error() {
-                                p { class: "error", "{err}" }
+                                if err == crate::api::chat::TURN_STOPPED {
+                                    p { class: "muted turn-stopped", "Stopped." }
+                                } else {
+                                    p { class: "error", "{err}" }
+                                }
                             }
                             if let Some(err) = notification_delivery_error() {
                                 p { class: "error", "A background notification failed to reach the model: {err}" }
@@ -3109,6 +3138,15 @@ fn ChatPanel(
                                 oninput: move |e| input.set(e.value()),
                             }
                             button { r#type: "submit", disabled: is_streaming(), "Send" }
+                            if can_stop() {
+                                button {
+                                    r#type: "button",
+                                    class: "stop-turn",
+                                    title: "Stop the model's current turn. Its sandbox, terminals and running commands keep going.",
+                                    onclick: stop,
+                                    "Stop"
+                                }
+                            }
                         }
                         }
                     }

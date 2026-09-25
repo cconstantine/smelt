@@ -866,6 +866,62 @@ async fn test_end_to_end_browser_scenarios() {
             wait_for_count(&sidebar_tab, &dot, 0, Duration::from_secs(10)).await,
             "the dot should go away when the pod stops, without a reload"
         );
+        for tab in [sidebar_tab, pods_page, page, todo_page] {
+            tab.close().await.expect("close a finished tab");
+        }
+
+        // --- Scenario 13: stopping a turn. The model (still the slow mock
+        // from scenario 8) is mid-reply; Stop shows in the sending tab and
+        // in a second tab watching the same conversation; stopping ends
+        // the reply for good, says "Stopped.", and leaves the chat usable. ---
+        let to_stop = new_conversation(pool, &created).await;
+        let url = format!("{}conversation/{}", harness.base_url, to_stop.id);
+        let sender = harness.browser.new_page(url.clone()).await.expect("open the sending tab");
+        let observer = harness.browser.new_page(url).await.expect("open a watching tab");
+        wait_for_live_client(&sender, to_stop.id).await;
+        wait_for_live_client(&observer, to_stop.id).await;
+        let input = wait_for_element(&sender, CHAT_INPUT, Duration::from_secs(10)).await;
+        input.focus().await.expect("focus the message box");
+        input.type_str("please stop me").await.expect("type");
+        input.press_key("Enter").await.expect("send");
+        assert!(
+            wait_for_text(&sender, "zebra0", Duration::from_secs(10)).await,
+            "the reply should start streaming"
+        );
+        assert!(
+            wait_for_count(&observer, ".stop-turn", 1, Duration::from_secs(5)).await,
+            "a tab that didn't send should also offer Stop while the turn runs"
+        );
+        wait_for_element(&sender, ".stop-turn", Duration::from_secs(5))
+            .await
+            .click()
+            .await
+            .expect("click Stop");
+        assert!(
+            wait_for_text(&sender, "Stopped.", Duration::from_secs(5)).await,
+            "stopping should say so"
+        );
+        assert!(
+            wait_for_count(&sender, ".stop-turn", 0, Duration::from_secs(5)).await
+                && wait_for_count(&observer, ".stop-turn", 0, Duration::from_secs(5)).await,
+            "Stop should go away in every tab once the turn has ended"
+        );
+        // The mock would have finished its reply 5s after it started.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            !wait_for_text(&sender, "zebra24", Duration::from_millis(500)).await,
+            "a stopped reply must not keep arriving"
+        );
+        let input = wait_for_element(&sender, CHAT_INPUT, Duration::from_secs(5)).await;
+        let disabled: bool = input
+            .call_js_fn("function() { return this.disabled; }", false)
+            .await
+            .expect("read disabled")
+            .result
+            .value
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(!disabled, "the message box should be usable after a stop");
     })))
     .await;
 

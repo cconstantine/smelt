@@ -1999,3 +1999,19 @@ div.mcp-status-not-connected::before {
 .sandbox-pod-header .pod-stop {
     margin-left: 10px;
 }
+
+/* The composer's Stop button, shown while a turn runs. */
+.composer button.stop-turn {
+    background: #fff;
+    color: #c0392b;
+    border: 1px solid #c0392b;
+}
+
+.composer button.stop-turn:hover:not(:disabled) {
+    background: #fdecea;
+}
+
+.turn-stopped {
+    font-size: 13px;
+    margin: 4px 0;
+}

@@ -980,6 +980,71 @@ fn resume_turns(conversation_id: i64) {
         .remove(&conversation_id);
 }
 
+/// How many turns are running or queued, per conversation, for the Stop
+/// button (`TurnState`).
+#[cfg(feature = "server")]
+static TURNS_IN_FLIGHT: LazyLock<Mutex<HashMap<i64, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Counts a turn as in flight for as long as it lives, including when it's
+/// dropped part-way by a stop, and publishes `TurnState` when the
+/// conversation goes from idle to busy or back.
+#[cfg(feature = "server")]
+struct TurnInFlight(i64);
+
+#[cfg(feature = "server")]
+impl TurnInFlight {
+    fn start(conversation_id: i64) -> Self {
+        let first = {
+            let mut counts = TURNS_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            let count = counts.entry(conversation_id).or_insert(0);
+            *count += 1;
+            *count == 1
+        };
+        if first {
+            crate::events::publish(
+                conversation_id,
+                crate::events::ConversationEvent::TurnState { running: true },
+            );
+        }
+        TurnInFlight(conversation_id)
+    }
+}
+
+#[cfg(feature = "server")]
+impl Drop for TurnInFlight {
+    fn drop(&mut self) {
+        let last = {
+            let mut counts = TURNS_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            match counts.get_mut(&self.0) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                _ => {
+                    counts.remove(&self.0);
+                    true
+                }
+            }
+        };
+        if last {
+            crate::events::publish(
+                self.0,
+                crate::events::ConversationEvent::TurnState { running: false },
+            );
+        }
+    }
+}
+
+/// Whether `conversation_id` has a turn running or queued.
+#[cfg(feature = "server")]
+pub(crate) fn turn_running(conversation_id: i64) -> bool {
+    TURNS_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&conversation_id)
+}
+
 /// A turn, ended early if the user stops it (see `TURN_STOPS`). Stopping
 /// drops `run_turn_body` wherever it's waiting (the model's stream, a
 /// tool call, a compaction), which releases the turn lock. What it leaves
@@ -996,6 +1061,7 @@ fn run_turn_bounded<'a>(
 {
     Box::pin(async move {
         let mut stop = stop_receiver(conversation_id);
+        let _in_flight = TurnInFlight::start(conversation_id);
         tokio::select! {
             result = run_turn_body(pool, conversation_id, new_message, on_delta, max_turns) => result,
             _ = stop.changed() => Err(ServerFnError::new(TURN_STOPPED)),
@@ -1003,9 +1069,25 @@ fn run_turn_bounded<'a>(
     })
 }
 
-/// The error a stopped turn ends with.
-#[cfg(feature = "server")]
-pub(crate) const TURN_STOPPED: &str = "stopped by the user";
+/// The error a stopped turn ends with. Not server-only: the chat page
+/// recognizes it to show "Stopped." instead of an error.
+pub const TURN_STOPPED: &str = "stopped by the user";
+
+/// The user's Stop button: ends this conversation's running turn, and
+/// keeps finished commands and tasks from starting another until they
+/// write again. See `stop_turn_now`.
+#[post("/api/conversations/{id}/stop")]
+pub async fn stop_turn(id: i64) -> ServerFnResult<()> {
+    stop_turn_now(id);
+    Ok(())
+}
+
+/// Whether a turn is running in this conversation: the Stop button's
+/// snapshot on (re)connect, kept current by `ConversationEvent::TurnState`.
+#[get("/api/conversations/{id}/turn")]
+pub async fn get_turn_state(id: i64) -> ServerFnResult<bool> {
+    Ok(turn_running(id))
+}
 
 #[cfg(feature = "server")]
 fn run_turn_body<'a>(
@@ -2486,10 +2568,17 @@ mod tests {
             "expected wake_conversation to surface the underlying failure, got {result:?}"
         );
 
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("should not time out waiting for the event")
-            .expect("event channel should not close");
+        // Skipping the turn's own `TurnState` events.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await.expect("event channel should not close") {
+                    events::ConversationEvent::TurnState { .. } => continue,
+                    other => return other,
+                }
+            }
+        })
+        .await
+        .expect("should not time out waiting for the event");
         assert!(
             matches!(
                 event,
@@ -2776,7 +2865,7 @@ mod tests {
     #[sqlx::test]
     async fn test_stop_turn_ends_a_turn_in_flight(pool: PgPool) {
         let _guard = anthropic::test_support::lock_anthropic_base_url();
-        let conversation = db::create_conversation(&pool)
+        let conversation = db::create_conversation_with_id(&pool, 9100000001)
             .await
             .expect("create conversation");
         start_hanging_mock_upstream().await;
@@ -2809,10 +2898,54 @@ mod tests {
         assert_eq!(later.lock().expect("log").len(), 1);
     }
 
+    /// Every tab can tell a turn is running, including one a background
+    /// notice started, and when it ends.
+    #[sqlx::test]
+    async fn test_turn_state_is_published_while_a_turn_runs(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation_with_id(&pool, 9100000002)
+            .await
+            .expect("create conversation");
+        start_hanging_mock_upstream().await;
+        let mut rx = events::subscribe(conversation.id);
+        assert!(!turn_running(conversation.id));
+
+        let turn = tokio::spawn({
+            let pool = pool.clone();
+            async move { run_turn(&pool, conversation.id, hello(), None).await }
+        });
+        let started = next_turn_state(&mut rx).await;
+        assert_eq!(started, Some(true), "a turn starting should say so");
+        assert!(turn_running(conversation.id));
+
+        stop_turn_now(conversation.id);
+        let _ = turn.await;
+        let ended = next_turn_state(&mut rx).await;
+        assert_eq!(ended, Some(false), "a turn ending (here, stopped) should say so");
+        assert!(!turn_running(conversation.id));
+    }
+
+    async fn next_turn_state(
+        rx: &mut tokio::sync::broadcast::Receiver<events::ConversationEvent>,
+    ) -> Option<bool> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Ok(events::ConversationEvent::TurnState { running }) => return Some(running),
+                    Ok(_) => continue,
+                    Err(_) => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     #[test]
     fn test_stop_turn_with_nothing_running_does_nothing() {
         stop_turn_now(9_000_000_012);
-        let mut receiver = stop_receiver(9_000_000_012);
+        let receiver = stop_receiver(9_000_000_012);
         assert!(!receiver.has_changed().expect("open"), "an earlier stop must not affect a new turn");
     }
 
@@ -2821,7 +2954,7 @@ mod tests {
     #[sqlx::test]
     async fn test_a_stopped_conversation_waits_for_the_user_before_waking(pool: PgPool) {
         let _guard = anthropic::test_support::lock_anthropic_base_url();
-        let conversation = db::create_conversation(&pool)
+        let conversation = db::create_conversation_with_id(&pool, 9100000003)
             .await
             .expect("create conversation");
         let requests = start_recording_mock_upstream(vec![text_reply_body("Hi!")]).await;
@@ -2854,7 +2987,7 @@ mod tests {
     /// tells a watching tab once it is.
     #[sqlx::test]
     async fn test_save_notice_between_turns_waits_for_the_turn_lock(pool: PgPool) {
-        let conversation = db::create_conversation(&pool)
+        let conversation = db::create_conversation_with_id(&pool, 9100000004)
             .await
             .expect("create conversation");
         let lock = conversation_lock(conversation.id);
@@ -2880,14 +3013,18 @@ mod tests {
             saved.blocks().expect("blocks"),
             vec![anthropic::ContentBlock::Text { text: "pod stopped".to_string() }]
         );
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-            .await
-            .expect("an event")
-            .expect("open channel");
-        assert!(
-            matches!(&event, events::ConversationEvent::MessagesAppended { messages } if messages.len() == 1),
-            "got {event:?}"
-        );
+        let appended = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match events.recv().await {
+                    Ok(events::ConversationEvent::MessagesAppended { messages }) => return messages,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event channel: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("a MessagesAppended event");
+        assert_eq!(appended.len(), 1);
     }
 
     fn hello() -> anthropic::AnthropicMessage {

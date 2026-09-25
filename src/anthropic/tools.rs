@@ -2645,7 +2645,9 @@ mod server {
                 std::env::set_var("ANTHROPIC_BASE_URL", "http://127.0.0.1:1");
                 std::env::set_var("ANTHROPIC_API_KEY", "test-key");
             }
-            let conversation = db::create_conversation(&pool).await.expect("create conversation");
+            let conversation = db::create_conversation_with_id(&pool, 9_100_000_005)
+                .await
+                .expect("create conversation");
             chat::stop_turn_now(conversation.id);
             let mut rx = events::subscribe(conversation.id);
             execute(
