@@ -59,6 +59,10 @@ rules:
   - apiGroups: [""]
     resources: ["endpoints", "events", "limitranges", "resourcequotas"]
     verbs: ["list", "get"]
+  # Live memory/CPU use for the pods view (`/pods`), from metrics-server.
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["list", "get"]
@@ -136,6 +140,10 @@ rules:
   - apiGroups: [""]
     resources: ["endpoints", "events", "limitranges", "resourcequotas"]
     verbs: ["list", "get"]
+  # Live memory/CPU use for the pods view (`/pods`), from metrics-server.
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["list", "get"]
