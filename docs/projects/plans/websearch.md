@@ -1,92 +1,45 @@
-# Web search tool (websearch)
+# Web search via Exa's hosted MCP server
 
 **Branch:** `websearch` · **Idea:** `projects/ideas/websearch.md`
 
 ## What
 
-A native `websearch(query, limit)` tool that runs a query against a search provider and returns a short, bounded list of results (title, URL, snippet, date when known). `webfetch` and `http_request` only help once the model already knows a URL. Most research starts from a question, and this closes that gap.
+Give the model web search by making Exa's hosted MCP server a built-in MCP server: smelt inserts it into `mcp_servers` at startup if it isn't already there. The model then sees Exa's `web_search_exa` tool as `mcp__exa__web_search_exa`, through the MCP client smelt already has. No new tool code and no account: Exa's hosted MCP has a keyless mode ("free rate-limited usage without sign-in or API key"). A keyless `tools/call` from this environment returned good results (title, URL, highlights) on 2026-09-25. This is the same endpoint opencode's built-in websearch uses.
 
-Three providers, all behind one tool, chosen by configuration:
+Going beyond the free limits needs no code either: add an `x-api-key` header to the entry on `/mcp-servers` (Exa's MCP accepts that, or OAuth).
 
-| Provider | Endpoint | Auth | Results | Cost (checked 2026-09-25) |
-|---|---|---|---|---|
-| **Exa** | `POST https://api.exa.ai/search` (`query`, `numResults`, `type: "auto"`, `contents.highlights`) | `x-api-key` header | `results[]`: `title`, `url`, `publishedDate`, `highlights[]` | $7/1k + $1/1k for highlights; $10/month free, no payment method |
-| **Kagi** | v1 search (see open questions for the exact shape) | `Authorization: Bot <key>` | `data.search[]`: `url`, `title`, `snippet`, `time` | $12/1k; account + payment method |
-| **Brave** | `GET https://api.search.brave.com/res/v1/web/search?q=…&count=…` | `X-Subscription-Token` header | `web.results[]`: `title`, `url`, `description`, `extra_snippets[]` (with `extra_snippets=true`) | $5/1k, $5/month free credit; account + card |
-
-Bing's API was retired in August 2025 and Google's Custom Search API is closed to new customers, so neither is an option. SearXNG (no signup) was considered and left out for now. It can be added later as a fourth adapter.
+A custom `websearch` tool with Exa, Kagi and Brave adapters was planned first and dropped for now. It's worth revisiting if the MCP route is annoying in practice: search disappearing from a turn when Exa's endpoint is unreachable, Exa's tool descriptions not fitting alongside `webfetch`, or needing results capped.
 
 ## How
 
-### Module: `src/websearch.rs` (server only, like `http_request.rs`)
+- **`db::ensure_mcp_server(pool, name, url) -> Result<bool, sqlx::Error>`**: `INSERT INTO mcp_servers (name, url) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING`, returning whether it inserted. Keyed on `name`, which is already `UNIQUE`. Every other column keeps its default: no extra headers, `static_headers` auth.
+- **At startup, in `main()`**, right after migrations: `ensure_mcp_server(pool, "exa", EXA_MCP_URL)`, logging when it inserts. A failure is logged as a warning and doesn't stop the server; search is an extra, not a requirement.
+- **Where the default lives:** a small `default_mcp_servers()` list in `src/mcp.rs` (name and URL), so a second default later is one line, and a test can check the list itself.
+- **Behavior this gives:**
+  - A fresh database gets the entry on first start.
+  - An entry the user **edited** (added an API key header, changed the URL, switched to OAuth) is left alone, since only the name is matched.
+  - An entry the user **deleted** comes back on the next start. That's what "always there" means here; see the open questions.
+  - Tests are unaffected: `#[sqlx::test]` databases run migrations, not `main()`, so no test suddenly has an external MCP server in its tool list.
+- **Why startup and not a migration:** a migration runs once, so a deleted entry would stay deleted and there'd be no "always there".
 
-```rust
-#[derive(Serialize)]
-pub struct SearchResult {
-    pub title: String,
-    pub url: String,
-    pub snippet: String,           // Exa: highlights joined; Brave: description + extra_snippets; Kagi: snippet
-    pub published: Option<String>, // as the provider gives it
-}
+## Tests (test-first)
 
-#[derive(Serialize)]
-pub struct SearchResponse {
-    pub provider: String,          // "exa" / "kagi" / "brave", so the model knows the source
-    pub query: String,
-    pub results: Vec<SearchResult>,
-}
-
-pub enum Provider { Exa, Kagi, Brave }
-
-pub struct ProviderConfig { provider: Provider, api_key: String, base_url: String }
-
-pub async fn search(query: &str, limit: usize) -> Result<SearchResponse, String>;          // reads config from env
-async fn search_with(config: &ProviderConfig, query: &str, limit: usize) -> Result<SearchResponse, String>;
-```
-
-- **One function per provider** builds the request and converts the provider's JSON into `SearchResult`s. Each is pure over a parsed body (`parse_exa`, `parse_kagi`, `parse_brave`), so it's unit-testable from a fixture without any network.
-- **Configuration** (env vars, in setup.md's table, same shape as `ANTHROPIC_API_KEY`):
-  - `EXA_API_KEY`, `KAGI_API_KEY`, `BRAVE_API_KEY`: whichever are set are available.
-  - `WEBSEARCH_PROVIDER` = `exa` | `kagi` | `brave`: which one to use. If unset, the first configured one in that order. If set to a provider with no key, startup logs a warning and the tool reports it clearly when called.
-  - `base_url` is a field, not an env var, so tests point an adapter at a local mock server by building a `ProviderConfig` directly. No process-global env lock needed.
-- **Bounds:** `limit` defaults to 5, capped at 10 (schema `minimum: 1, maximum: 10`). Each snippet is capped at ~500 characters on a char boundary, so a result set stays a few KB. One `REQUEST_TIMEOUT` (20s) on the client, as in `http_request`.
-- **Errors** are readable tool errors, not raw bodies: `websearch (brave) failed: HTTP 401: <provider's own message>`, with the provider's JSON error unwrapped where it has one (same idea as `provider_error_message` in `anthropic::stream`). No retry: a failed search is cheap for the model to retry itself, unlike a failed turn.
-- **No SSRF guard needed:** the tool only ever calls the three fixed provider hosts. The model controls the query, never the URL. The URLs *in* the results are just data; fetching one goes through `webfetch`/`http_request` and their guard as usual.
-
-### Tool wiring: `src/anthropic/tools.rs`
-
-- A `websearch` `ToolDefinition`: `query` (string, required) and `limit` (integer, 1–10). The description says it returns links and snippets, and points to `webfetch`/`http_request` to read a result in full.
-- Dispatch `"websearch" => websearch_tool(input)` next to `webfetch`/`http_request`.
-- **Only offered when a provider is configured:** `tool_definitions` leaves `websearch` out when no key is set, so the model never sees a tool that can only fail.
-
-### UI
-
-Nothing new. A `websearch` call and its result render like every other tool call and result.
-
-### Tests (test-first, per development-process.md)
-
-- **Parsing, per provider:** a fixture response parses into the right `SearchResult`s (title, URL, snippet, date), including missing optional fields and an empty result list. Per the "fixture real artifacts" rule, the fixtures should be real captured responses. Until keys exist, they start from each provider's documented example, marked as such; see open questions.
-- **Snippet shaping:** Exa's highlights joined, Brave's `description` plus `extra_snippets`, the ~500-character cap splitting on a char boundary (non-ASCII input), and HTML tags that Brave puts in descriptions (`<strong>`) removed.
-- **Request building, per provider, against a local mock server:** the right method, path, auth header and query/limit are sent, and the mock's response comes back as parsed results.
-- **Errors:** a 401 and a 429 from the mock become the readable error text, and a hang hits the timeout.
-- **Configuration:** provider selection from the env values (a pure function over the values, like `require_at_least_one_credential`, so no env mutation in tests): explicit choice, the fallback order, an explicit choice with no key, and nothing configured.
-- **Tool wiring:** `tool_definitions` includes `websearch` only when a provider is configured, and `execute` dispatches to it.
-- **Live checks, `#[ignore]`d:** one test per provider that runs a real query when its key is set in the environment, and skips with a message when it isn't. Not in CI (no keys there). Used once per provider to confirm the real API and capture real fixtures.
+- `ensure_mcp_server` inserts a missing server; a second call inserts nothing and returns `false`; an existing entry with a changed URL and headers is left exactly as it was.
+- `default_mcp_servers()` contains the Exa entry with the chosen URL.
+- **Live check, `#[ignore]`d** (it needs the internet and Exa's service, so it isn't in CI): smelt's own MCP client connects to the Exa entry keylessly, lists its tools (`web_search_exa` present), and a real `web_search_exa` call returns text containing a URL. This is the part not proven yet: the earlier check used `curl`, not smelt's `rmcp` client, which does the full MCP handshake.
+- **Manual check in the running app:** after a restart, `/mcp-servers` lists `exa`, and a real conversation asked to look something up calls `mcp__exa__web_search_exa` and uses the results.
 
 ## Which files
 
-- `src/websearch.rs`: new; providers, parsing, configuration, tests.
-- `src/main.rs`: `#[cfg(feature = "server")] mod websearch;`
-- `src/anthropic/tools.rs`: the tool definition, dispatch, the configured-only filter in `tool_definitions`, and wiring tests.
-- `src/websearch/fixtures/` (or inline `const`s): one response per provider.
-- `docs/setup.md`: the four env vars.
-- `docs/architecture.md`: a module-table row for `src/websearch.rs`.
-- Close-out: `docs/projects/completed/YYYYMMDD-websearch.md`, `docs/projects/state.md` (features, and the "on hold" note in Goals), removing `docs/projects/ideas/websearch.md` and this plan.
+- `src/db.rs`: `ensure_mcp_server` plus its tests.
+- `src/mcp.rs`: `default_mcp_servers()`, `EXA_MCP_URL`, the live check.
+- `src/main.rs`: the startup call.
+- `docs/setup.md` or `docs/architecture.md`: note that `exa` is added at startup, and how to add a key.
+- Close-out: completed doc, `docs/projects/state.md` (the web tools feature line and the "on hold" note in Goals), removing `docs/projects/ideas/websearch.md` and this plan.
 
 ## Open questions and tradeoffs
 
-1. **Real keys for verification.** The adapters can be built and tested against mocks without keys, but the only proof that each one matches the real API is a real call. Can you set any of `EXA_API_KEY` / `KAGI_API_KEY` / `BRAVE_API_KEY` in this environment (your `.env`) for the live checks? Each check is a handful of queries, well within the free credits for Exa and Brave. A provider nobody can verify would ship marked "unverified against the real API" in the completed doc.
-2. **Kagi's exact request shape.** Kagi's help page shows `GET https://kagi.com/api/v1/search?q=…`, while its API reference shows `POST /search` with a JSON body (`query`, `limit`). Proposal: follow the API reference, and settle it with the live check.
-3. **One provider per server, or the model chooses?** Proposal: one active provider (`WEBSEARCH_PROVIDER`), with no provider parameter on the tool. It's simpler, and the model has no good basis for picking between them. Alternative: an optional `provider` argument listing only the configured ones, useful for comparing results.
-4. **Exa content:** highlights only (proposed; +$1/1k, short and query-relevant), or also full page text (more tokens, and mostly overlaps `webfetch`)?
-5. **Configuration in the UI?** Env vars match how the Anthropic key is set today. A settings page for search keys could come later if switching providers turns out to be common.
+1. **Which Exa tools to expose.** The keyless defaults are `web_search_exa` and `web_fetch_exa`, and the URL's `tools=` parameter picks which ones are offered. Proposal: **`https://mcp.exa.ai/mcp?tools=web_search_exa`**, search only, so reading a page stays with `webfetch`/`http_request` and the model isn't choosing between two fetch tools. The alternative is to keep Exa's fetch too, as a lighter reader than a real browser.
+2. **A deleted entry comes back on restart.** That follows from "always there", but it means there's no way to turn Exa off short of editing its URL. If you want an off switch, a disabled flag on MCP servers would be its own small change. Proposal: leave it as is for now.
+3. **Keyless limits aren't published.** A 429 will show up as an MCP tool error the model can see. If it happens often in real use, add a key through the `/mcp-servers` page.
+4. **Queries go to Exa.** Every search query is sent to a third party, unauthenticated in keyless mode. That's inherent to any search provider; noted so it's a conscious choice.
