@@ -907,12 +907,27 @@ async fn drain_unnotified_terminal_commands(
             .await
             .map_err(ServerFnError::new)?;
         pending_new_content.extend(notification_content);
-        persisted.push(saved);
+        record_saved(conversation_id, persisted, saved);
         db::mark_terminal_command_notified(pool, &command.command_id)
             .await
             .map_err(ServerFnError::new)?;
     }
     Ok(())
+}
+
+/// Adds a message the turn just saved to `persisted` and tells every tab
+/// watching the conversation, right away: the user's own message first,
+/// then each step of a multi-step reply as it happens, rather than one
+/// batch when the turn ends.
+#[cfg(feature = "server")]
+fn record_saved(conversation_id: i64, persisted: &mut Vec<Message>, saved: Message) {
+    crate::events::publish(
+        conversation_id,
+        crate::events::ConversationEvent::MessagesAppended {
+            messages: vec![saved.clone()],
+        },
+    );
+    persisted.push(saved);
 }
 
 /// Per conversation, a counter bumped each time the user stops its turn.
@@ -1131,7 +1146,7 @@ fn run_turn_body<'a>(
             .await
             .map_err(ServerFnError::new)?;
             pending_new_content.extend(new_message.content.clone());
-            persisted.push(saved);
+            record_saved(conversation_id, &mut persisted, saved);
         }
 
         // Checked after saving the new message, so what the user typed
@@ -1257,7 +1272,7 @@ fn run_turn_body<'a>(
             let saved = db::create_message(pool, conversation_id, "assistant", &turn.content)
                 .await
                 .map_err(ServerFnError::new)?;
-            persisted.push(saved);
+            record_saved(conversation_id, &mut persisted, saved);
 
             // Real usage from this call is the ground truth for "how much
             // context is actually being used" — persisted so
@@ -1282,12 +1297,6 @@ fn run_turn_body<'a>(
             pending_new_content.clear();
 
             if turn.stop_reason != "tool_use" {
-                crate::events::publish(
-                    conversation_id,
-                    crate::events::ConversationEvent::MessagesAppended {
-                        messages: persisted.clone(),
-                    },
-                );
                 return Ok(persisted);
             }
 
@@ -1312,15 +1321,9 @@ fn run_turn_body<'a>(
                 .await
                 .map_err(ServerFnError::new)?;
             pending_new_content = result_blocks;
-            persisted.push(saved);
+            record_saved(conversation_id, &mut persisted, saved);
         }
 
-        crate::events::publish(
-            conversation_id,
-            crate::events::ConversationEvent::MessagesAppended {
-                messages: persisted,
-            },
-        );
         Err(ServerFnError::new(format!(
             "tool-use loop exceeded {max_turns} turns without reaching a final reply"
         )))
@@ -2568,11 +2571,13 @@ mod tests {
             "expected wake_conversation to surface the underlying failure, got {result:?}"
         );
 
-        // Skipping the turn's own `TurnState` events.
+        // Skipping the turn's own `TurnState` events, and the drained
+        // notice being published as soon as it's saved.
         let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 match rx.recv().await.expect("event channel should not close") {
-                    events::ConversationEvent::TurnState { .. } => continue,
+                    events::ConversationEvent::TurnState { .. }
+                    | events::ConversationEvent::MessagesAppended { .. } => continue,
                     other => return other,
                 }
             }
@@ -3255,6 +3260,81 @@ mod tests {
         assert!(
             err.to_string().contains("error parsing tool call"),
             "got {err}"
+        );
+    }
+
+    /// A two-step reply: "Adding." and a call to `add`, then (after the
+    /// tool result) "Sum is 5". For the mock upstream, in order.
+    fn text_tool_then_text_bodies() -> Vec<String> {
+        let first = sse_body(&[
+            ("message_start", r#"{"type":"message_start"}"#),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Adding."}}"#,
+            ),
+            ("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"add","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"a\":2,\"b\":3}"}}"#,
+            ),
+            ("content_block_stop", r#"{"type":"content_block_stop","index":1}"#),
+            ("message_delta", r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        vec![first, text_reply_body("Sum is 5")]
+    }
+
+    /// Collects `rx`'s events until nothing arrives for half a second.
+    async fn drain_events(
+        rx: &mut tokio::sync::broadcast::Receiver<events::ConversationEvent>,
+    ) -> Vec<events::ConversationEvent> {
+        let mut seen = Vec::new();
+        while let Ok(Ok(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+        {
+            seen.push(event);
+        }
+        seen
+    }
+
+    /// Every tab sees each message as it's saved: the user's own first,
+    /// then each step of a multi-step reply, not one batch at the end.
+    #[sqlx::test]
+    async fn test_a_turn_publishes_each_message_as_it_is_saved(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation_with_id(&pool, 9_100_000_006)
+            .await
+            .expect("create conversation");
+        start_mock_upstream(text_tool_then_text_bodies()).await;
+        let mut rx = events::subscribe(conversation.id);
+
+        run_turn(&pool, conversation.id, hello(), None)
+            .await
+            .expect("run_turn should succeed");
+
+        let batches: Vec<Vec<String>> = drain_events(&mut rx)
+            .await
+            .into_iter()
+            .filter_map(|event| match event {
+                events::ConversationEvent::MessagesAppended { messages } => {
+                    Some(messages.into_iter().map(|m| m.role).collect())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            batches,
+            vec![
+                vec!["user".to_string()],
+                vec!["assistant".to_string()],
+                vec!["user".to_string()],
+                vec!["assistant".to_string()],
+            ],
+            "one event per saved message, in order"
         );
     }
 
