@@ -711,7 +711,7 @@ pub fn McpServerEdit(id: i64) -> Element {
                         class: if pending_delete() { "mcp-delete confirm" } else { "mcp-delete" },
                         r#type: "button",
                         onclick: request_delete,
-                        if pending_delete() { "Confirm delete?" } else { "Delete server" }
+                        super::TwoStepLabel { armed: pending_delete(), idle: "Delete server", confirm: "Confirm delete?" }
                     }
                 }
             }

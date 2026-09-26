@@ -75,6 +75,11 @@ async fn main() {
     sandbox::init().await;
     tracing::info!("sandbox manager initialized");
 
+    // Keeps pod records in step with the cluster, so the sidebar's dots
+    // and /pods match it. Only here, never in the browser test harness:
+    // see `sandbox::watch_pods`.
+    tokio::spawn(sandbox::watch_pods(pool.clone()));
+
     let router = build_router();
 
     let port: u16 = std::env::var("PORT")

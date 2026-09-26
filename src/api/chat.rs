@@ -77,6 +77,8 @@ pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
         .map_err(ServerFnError::new)?;
     crate::events::forget(id);
     forget_conversation_lock(id);
+    // After the delete, so a listener refetching sees the pod rows gone.
+    crate::events::publish_app(crate::events::AppEvent::PodsChanged);
     Ok(())
 }
 
@@ -340,8 +342,77 @@ fn history_for_request(
             anthropic::AnthropicMessage { role, content }
         })
         .collect();
-    Ok(history)
+    Ok(answer_unfinished_tool_calls(history))
 }
+
+/// Gives every tool call that has no result an error result
+/// (`UNFINISHED_TOOL_CALL`), at the start of the user message that follows
+/// it, or in a new user message if it was the last one. The API rejects a
+/// tool call not answered in the very next message, and a turn stopped
+/// by the user, or cut off by a server restart, can leave exactly that;
+/// notices saved since then may follow it too. Done when building each
+/// request rather than saved, since a saved result would land after those
+/// notices.
+#[cfg(feature = "server")]
+fn answer_unfinished_tool_calls(
+    mut history: Vec<anthropic::AnthropicMessage>,
+) -> Vec<anthropic::AnthropicMessage> {
+    let mut i = 0;
+    while i < history.len() {
+        if history[i].role == "assistant" {
+            let calls: Vec<String> = history[i]
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    anthropic::ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
+            let next_is_user = history.get(i + 1).is_some_and(|m| m.role == "user");
+            let answered: Vec<&String> = if next_is_user {
+                history[i + 1]
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        anthropic::ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let missing: Vec<anthropic::ContentBlock> = calls
+                .iter()
+                .filter(|id| !answered.contains(id))
+                .map(|id| anthropic::ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: UNFINISHED_TOOL_CALL.to_string(),
+                    is_error: Some(true),
+                })
+                .collect();
+            if !missing.is_empty() {
+                if next_is_user {
+                    history[i + 1].content.splice(0..0, missing);
+                } else {
+                    history.insert(
+                        i + 1,
+                        anthropic::AnthropicMessage {
+                            role: "user".to_string(),
+                            content: missing,
+                        },
+                    );
+                }
+            }
+        }
+        i += 1;
+    }
+    history
+}
+
+/// The error result a tool call gets when its turn ended before it
+/// finished (the user stopped the turn, or the server restarted).
+#[cfg(feature = "server")]
+const UNFINISHED_TOOL_CALL: &str = "This tool call didn't finish: the turn was stopped (by the user, or by a server restart) before it returned. Its effects, if any, are unknown.";
 
 /// The fixed part of every turn's system prompt: who the model is, how its
 /// sandbox and tools work, and how its replies are shown. Kept as prose in
@@ -627,6 +698,36 @@ async fn compact_conversation(
     Ok(())
 }
 
+/// Saves `text` as a `user` notice in `conversation_id` once no turn is
+/// running there, by taking the conversation's turn lock first — so the
+/// notice can never land between a tool call and its result, an order the
+/// API rejects. For things that happen outside a turn and that the model
+/// should learn about: its pod crashing, or the user stopping it. Waits
+/// for a running turn to end, so call it from a spawned task.
+#[cfg(feature = "server")]
+pub(crate) async fn save_notice_between_turns(
+    pool: &PgPool,
+    conversation_id: i64,
+    text: String,
+) -> Result<Message, sqlx::Error> {
+    let lock = conversation_lock(conversation_id);
+    let _turn = lock.lock().await;
+    let saved = db::create_message(
+        pool,
+        conversation_id,
+        "user",
+        &[anthropic::ContentBlock::Text { text }],
+    )
+    .await?;
+    crate::events::publish(
+        conversation_id,
+        crate::events::ConversationEvent::MessagesAppended {
+            messages: vec![saved.clone()],
+        },
+    );
+    Ok(saved)
+}
+
 /// A live `send_message` call and a background task's push-triggered
 /// `run_turn` call (or two different tasks' pushes) can race for the same
 /// conversation — Anthropic's strict user/assistant alternation breaks if
@@ -652,6 +753,14 @@ fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<()>> {
 #[cfg(feature = "server")]
 fn forget_conversation_lock(conversation_id: i64) {
     CONVERSATION_LOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&conversation_id);
+    TURN_STOPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&conversation_id);
+    PAUSED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&conversation_id);
@@ -735,6 +844,11 @@ pub(crate) async fn wake_conversation(
     pool: &PgPool,
     conversation_id: i64,
 ) -> ServerFnResult<Vec<Message>> {
+    // After the user stopped this conversation, pending notices wait for
+    // their next message, which drains them the same way (see `PAUSED`).
+    if is_paused(conversation_id) {
+        return Ok(Vec::new());
+    }
     let result = run_turn_bounded(pool, conversation_id, None, None, MAX_TURNS).await;
     if let Err(e) = &result {
         tracing::warn!(conversation_id, error = %e, "wake_conversation failed to notify the model");
@@ -801,8 +915,182 @@ async fn drain_unnotified_terminal_commands(
     Ok(())
 }
 
+/// Per conversation, a counter bumped each time the user stops its turn.
+/// A turn notes the value when it starts (before waiting for the turn
+/// lock) and ends as soon as it changes, so a stop ends the running turn
+/// and any queued behind it, but not turns that start afterwards.
+#[cfg(feature = "server")]
+static TURN_STOPS: LazyLock<Mutex<HashMap<i64, tokio::sync::watch::Sender<u64>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A receiver for `conversation_id`'s stop counter, with its current value
+/// already seen, so only a later stop wakes it.
+#[cfg(feature = "server")]
+fn stop_receiver(conversation_id: i64) -> tokio::sync::watch::Receiver<u64> {
+    let mut stops = TURN_STOPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut receiver = stops
+        .entry(conversation_id)
+        .or_insert_with(|| tokio::sync::watch::channel(0).0)
+        .subscribe();
+    receiver.borrow_and_update();
+    receiver
+}
+
+/// Stops `conversation_id`'s running turn, and any queued behind it. The
+/// pod, its terminals and running commands are left alone. A no-op when
+/// nothing is running.
+#[cfg(feature = "server")]
+pub(crate) fn stop_turn_now(conversation_id: i64) {
+    // Paused even when nothing is running: the user asked the model to
+    // stop, so a command finishing right after shouldn't start it again.
+    PAUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(conversation_id);
+    let stops = TURN_STOPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(stop) = stops.get(&conversation_id) {
+        stop.send_modify(|count| *count += 1);
+    }
+}
+
+/// Conversations the user has stopped and not written in since. While
+/// paused, a finished command or background task doesn't wake the model:
+/// its notice is still saved, and the model sees it on the user's next
+/// message. Otherwise a stop would be undone seconds later by whatever was
+/// still running. In memory: a restart un-pauses, which is harmless.
+#[cfg(feature = "server")]
+static PAUSED: LazyLock<Mutex<std::collections::HashSet<i64>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// Whether `conversation_id` is paused after a stop (see `PAUSED`).
+#[cfg(feature = "server")]
+pub(crate) fn is_paused(conversation_id: i64) -> bool {
+    PAUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&conversation_id)
+}
+
+/// Ends the pause after a stop: the user has written again.
+#[cfg(feature = "server")]
+fn resume_turns(conversation_id: i64) {
+    PAUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&conversation_id);
+}
+
+/// How many turns are running or queued, per conversation, for the Stop
+/// button (`TurnState`).
+#[cfg(feature = "server")]
+static TURNS_IN_FLIGHT: LazyLock<Mutex<HashMap<i64, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Counts a turn as in flight for as long as it lives, including when it's
+/// dropped part-way by a stop, and publishes `TurnState` when the
+/// conversation goes from idle to busy or back.
+#[cfg(feature = "server")]
+struct TurnInFlight(i64);
+
+#[cfg(feature = "server")]
+impl TurnInFlight {
+    fn start(conversation_id: i64) -> Self {
+        let first = {
+            let mut counts = TURNS_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            let count = counts.entry(conversation_id).or_insert(0);
+            *count += 1;
+            *count == 1
+        };
+        if first {
+            crate::events::publish(
+                conversation_id,
+                crate::events::ConversationEvent::TurnState { running: true },
+            );
+        }
+        TurnInFlight(conversation_id)
+    }
+}
+
+#[cfg(feature = "server")]
+impl Drop for TurnInFlight {
+    fn drop(&mut self) {
+        let last = {
+            let mut counts = TURNS_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            match counts.get_mut(&self.0) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                _ => {
+                    counts.remove(&self.0);
+                    true
+                }
+            }
+        };
+        if last {
+            crate::events::publish(
+                self.0,
+                crate::events::ConversationEvent::TurnState { running: false },
+            );
+        }
+    }
+}
+
+/// Whether `conversation_id` has a turn running or queued.
+#[cfg(feature = "server")]
+pub(crate) fn turn_running(conversation_id: i64) -> bool {
+    TURNS_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&conversation_id)
+}
+
+/// A turn, ended early if the user stops it (see `TURN_STOPS`). Stopping
+/// drops `run_turn_body` wherever it's waiting (the model's stream, a
+/// tool call, a compaction), which releases the turn lock. What it leaves
+/// behind: a streaming reply isn't saved, and tool calls without results
+/// get answered on the next request (`answer_unfinished_tool_calls`).
 #[cfg(feature = "server")]
 fn run_turn_bounded<'a>(
+    pool: &'a PgPool,
+    conversation_id: i64,
+    new_message: Option<anthropic::AnthropicMessage>,
+    on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
+    max_turns: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
+{
+    Box::pin(async move {
+        let mut stop = stop_receiver(conversation_id);
+        let _in_flight = TurnInFlight::start(conversation_id);
+        tokio::select! {
+            result = run_turn_body(pool, conversation_id, new_message, on_delta, max_turns) => result,
+            _ = stop.changed() => Err(ServerFnError::new(TURN_STOPPED)),
+        }
+    })
+}
+
+/// The error a stopped turn ends with. Not server-only: the chat page
+/// recognizes it to show "Stopped." instead of an error.
+pub const TURN_STOPPED: &str = "stopped by the user";
+
+/// The user's Stop button: ends this conversation's running turn, and
+/// keeps finished commands and tasks from starting another until they
+/// write again. See `stop_turn_now`.
+#[post("/api/conversations/{id}/stop")]
+pub async fn stop_turn(id: i64) -> ServerFnResult<()> {
+    stop_turn_now(id);
+    Ok(())
+}
+
+/// Whether a turn is running in this conversation: the Stop button's
+/// snapshot on (re)connect, kept current by `ConversationEvent::TurnState`.
+#[get("/api/conversations/{id}/turn")]
+pub async fn get_turn_state(id: i64) -> ServerFnResult<bool> {
+    Ok(turn_running(id))
+}
+
+#[cfg(feature = "server")]
+fn run_turn_body<'a>(
     pool: &'a PgPool,
     conversation_id: i64,
     new_message: Option<anthropic::AnthropicMessage>,
@@ -1052,6 +1340,8 @@ pub(crate) fn chat_error_text(error: &ServerFnError) -> String {
 
 #[post("/api/conversations/{id}/messages")]
 pub async fn send_message(id: i64, content: String) -> ServerFnResult<ServerEvents<ChatEvent>> {
+    // The user writing again ends any pause from an earlier stop.
+    resume_turns(id);
     let new_message = anthropic::AnthropicMessage {
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text: content }],
@@ -1393,20 +1683,44 @@ pub async fn subscribe_conversation_events(
     // page load or reconnect used to leave a subscriber behind for good.
     // Here the response pulls events as it sends them, and dropping it
     // (the tab going away) drops the subscription.
-    let rx = events::subscribe(id);
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+    Ok(ServerEvents::from_stream(conversation_event_stream(id)))
+}
+
+/// Everything a tab watching `id` hears: that conversation's events, plus
+/// app-wide `PodsChanged`, relayed as `ConversationEvent::PodsChanged`.
+/// Ends when the conversation's channel closes (it was deleted).
+#[cfg(feature = "server")]
+fn conversation_event_stream(
+    id: i64,
+) -> impl futures_util::Stream<Item = Result<events::ConversationEvent, axum::BoxError>> {
+    use tokio::sync::broadcast::error::RecvError;
+    // Both subscribed now, not on first poll, so nothing published in
+    // between is missed.
+    let receivers = (events::subscribe(id), events::subscribe_app());
+    futures_util::stream::unfold(receivers, |(mut conversation, mut app)| async move {
         loop {
-            match rx.recv().await {
-                Ok(event) => return Some((Ok::<_, axum::BoxError>(event), rx)),
-                // A subscriber that fell behind just misses some ephemeral
-                // updates — the frontend's reconciliation pull on connect
-                // covers the durable state regardless.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            tokio::select! {
+                received = conversation.recv() => match received {
+                    Ok(event) => return Some((Ok::<_, axum::BoxError>(event), (conversation, app))),
+                    // A subscriber that fell behind just misses some
+                    // ephemeral updates — the frontend's reconciliation
+                    // pull on connect covers the durable state regardless.
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => return None,
+                },
+                received = app.recv() => match received {
+                    Ok(events::AppEvent::PodsChanged) => {
+                        let event = events::ConversationEvent::PodsChanged {};
+                        return Some((Ok(event), (conversation, app)));
+                    }
+                    // Missing some just means one refetch covers several.
+                    Err(RecvError::Lagged(_)) => continue,
+                    // The app-wide channel lives as long as the process.
+                    Err(RecvError::Closed) => return None,
+                },
             }
         }
-    });
-    Ok(ServerEvents::from_stream(stream))
+    })
 }
 
 #[cfg(test)]
@@ -1495,6 +1809,70 @@ mod tests {
         anthropic::ContentBlock::Text {
             text: text.to_string(),
         }
+    }
+
+    fn tool_use(id: &str) -> anthropic::ContentBlock {
+        anthropic::ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "add".to_string(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    fn tool_result(id: &str) -> anthropic::ContentBlock {
+        anthropic::ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: "3".to_string(),
+            is_error: None,
+        }
+    }
+
+    fn unfinished(id: &str) -> anthropic::ContentBlock {
+        anthropic::ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: UNFINISHED_TOOL_CALL.to_string(),
+            is_error: Some(true),
+        }
+    }
+
+    /// A turn stopped (or a server restarted) between a tool call and its
+    /// result leaves the call unanswered, and a notice may have landed
+    /// after it. The request gets an error result for it, at the start of
+    /// the next user message.
+    #[test]
+    fn test_history_for_request_answers_a_tool_call_left_without_a_result() {
+        let history = history_for_request(vec![
+            text_message(1, "user", "go"),
+            message_with_blocks(2, "assistant", vec![tool_use("t1")]),
+            text_message(3, "user", "notice"),
+        ])
+        .expect("history");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].role, "user");
+        assert_eq!(history[2].content, vec![unfinished("t1"), text_block("notice")]);
+    }
+
+    #[test]
+    fn test_history_for_request_answers_only_the_missing_calls_of_several() {
+        let history = history_for_request(vec![
+            text_message(1, "user", "go"),
+            message_with_blocks(2, "assistant", vec![tool_use("t1"), tool_use("t2")]),
+            message_with_blocks(3, "user", vec![tool_result("t1")]),
+        ])
+        .expect("history");
+        assert_eq!(history[2].content, vec![unfinished("t2"), tool_result("t1")]);
+    }
+
+    #[test]
+    fn test_history_for_request_adds_a_message_for_calls_left_at_the_end() {
+        let history = history_for_request(vec![
+            text_message(1, "user", "go"),
+            message_with_blocks(2, "assistant", vec![text_block("on it"), tool_use("t1")]),
+        ])
+        .expect("history");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].role, "user");
+        assert_eq!(history[2].content, vec![unfinished("t1")]);
     }
 
     #[test]
@@ -1690,13 +2068,35 @@ mod tests {
     fn test_forget_conversation_lock_drops_it() {
         let conversation_id = 987_654_011;
         let first = conversation_lock(conversation_id);
+        let _ = stop_receiver(conversation_id);
         forget_conversation_lock(conversation_id);
+        assert!(
+            !TURN_STOPS.lock().expect("stops").contains_key(&conversation_id),
+            "the deleted conversation's stop signal is still registered"
+        );
         let second = conversation_lock(conversation_id);
         assert!(
             !Arc::ptr_eq(&first, &second),
             "the deleted conversation's lock is still registered"
         );
         forget_conversation_lock(conversation_id);
+    }
+
+    /// A tab watching a conversation also hears app-wide pod changes, on
+    /// the same stream.
+    #[tokio::test]
+    async fn test_a_conversation_stream_relays_pods_changed() {
+        use futures_util::StreamExt;
+        let stream = conversation_event_stream(9_000_000_011);
+        futures_util::pin_mut!(stream);
+        events::publish_app(events::AppEvent::PodsChanged);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("PodsChanged should arrive on the conversation stream");
+        assert!(
+            matches!(event, Some(Ok(events::ConversationEvent::PodsChanged {}))),
+            "got {event:?}"
+        );
     }
 
     /// A subscription belongs to its connection: once the response is
@@ -2168,10 +2568,17 @@ mod tests {
             "expected wake_conversation to surface the underlying failure, got {result:?}"
         );
 
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("should not time out waiting for the event")
-            .expect("event channel should not close");
+        // Skipping the turn's own `TurnState` events.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await.expect("event channel should not close") {
+                    events::ConversationEvent::TurnState { .. } => continue,
+                    other => return other,
+                }
+            }
+        })
+        .await
+        .expect("should not time out waiting for the event");
         assert!(
             matches!(
                 event,
@@ -2427,6 +2834,197 @@ mod tests {
         assert!(named.len() > 10, "expected the prompt to name its tools, found {named:?}");
         let unknown: Vec<&&str> = named.iter().filter(|word| !tools.iter().any(|t| t == **word)).collect();
         assert!(unknown.is_empty(), "the system prompt names tools that don't exist: {unknown:?}");
+    }
+
+    /// A mock Anthropic upstream that accepts requests and never answers,
+    /// for a turn that stays in flight until stopped. Same locking rule as
+    /// `start_mock_upstream`.
+    async fn start_hanging_mock_upstream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                std::future::pending::<()>().await;
+                ""
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        unsafe {
+            std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}"));
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        }
+    }
+
+    /// Stopping ends an in-flight turn at once, frees the turn lock, and
+    /// keeps the user's message.
+    #[sqlx::test]
+    async fn test_stop_turn_ends_a_turn_in_flight(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation_with_id(&pool, 9100000001)
+            .await
+            .expect("create conversation");
+        start_hanging_mock_upstream().await;
+
+        let turn = tokio::spawn({
+            let pool = pool.clone();
+            async move { run_turn(&pool, conversation.id, hello(), None).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        stop_turn_now(conversation.id);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), turn)
+            .await
+            .expect("the turn should end within a second of stopping")
+            .expect("join");
+        let error = result.expect_err("a stopped turn ends with an error").to_string();
+        assert!(error.contains(TURN_STOPPED), "got: {error}");
+        assert!(
+            conversation_lock(conversation.id).try_lock().is_ok(),
+            "a stopped turn should release the turn lock"
+        );
+        let saved = db::list_messages(&pool, conversation.id).await.expect("list");
+        assert_eq!(saved.len(), 1, "the user's message is kept");
+
+        // A turn started after the stop isn't affected by it.
+        let later = start_recording_mock_upstream(vec![text_reply_body("Hi!")]).await;
+        run_turn(&pool, conversation.id, hello(), None)
+            .await
+            .expect("a later turn runs normally");
+        assert_eq!(later.lock().expect("log").len(), 1);
+    }
+
+    /// Every tab can tell a turn is running, including one a background
+    /// notice started, and when it ends.
+    #[sqlx::test]
+    async fn test_turn_state_is_published_while_a_turn_runs(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation_with_id(&pool, 9100000002)
+            .await
+            .expect("create conversation");
+        start_hanging_mock_upstream().await;
+        let mut rx = events::subscribe(conversation.id);
+        assert!(!turn_running(conversation.id));
+
+        let turn = tokio::spawn({
+            let pool = pool.clone();
+            async move { run_turn(&pool, conversation.id, hello(), None).await }
+        });
+        let started = next_turn_state(&mut rx).await;
+        assert_eq!(started, Some(true), "a turn starting should say so");
+        assert!(turn_running(conversation.id));
+
+        stop_turn_now(conversation.id);
+        let _ = turn.await;
+        let ended = next_turn_state(&mut rx).await;
+        assert_eq!(ended, Some(false), "a turn ending (here, stopped) should say so");
+        assert!(!turn_running(conversation.id));
+    }
+
+    async fn next_turn_state(
+        rx: &mut tokio::sync::broadcast::Receiver<events::ConversationEvent>,
+    ) -> Option<bool> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Ok(events::ConversationEvent::TurnState { running }) => return Some(running),
+                    Ok(_) => continue,
+                    Err(_) => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    #[test]
+    fn test_stop_turn_with_nothing_running_does_nothing() {
+        stop_turn_now(9_000_000_012);
+        let receiver = stop_receiver(9_000_000_012);
+        assert!(!receiver.has_changed().expect("open"), "an earlier stop must not affect a new turn");
+    }
+
+    /// After a stop, a finished command doesn't wake the model; the user's
+    /// next message does, and its turn includes the command's notice.
+    #[sqlx::test]
+    async fn test_a_stopped_conversation_waits_for_the_user_before_waking(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation_with_id(&pool, 9100000003)
+            .await
+            .expect("create conversation");
+        let requests = start_recording_mock_upstream(vec![text_reply_body("Hi!")]).await;
+
+        stop_turn_now(conversation.id);
+        assert!(is_paused(conversation.id), "a stop pauses the conversation");
+        unnotified_finished_command(&pool, conversation.id, "cmd-after-stop").await;
+        wake_conversation(&pool, conversation.id)
+            .await
+            .expect("a paused wake does nothing, successfully");
+        assert!(
+            requests.lock().expect("log").is_empty(),
+            "a paused conversation shouldn't call the model"
+        );
+
+        resume_turns(conversation.id);
+        assert!(!is_paused(conversation.id));
+        run_turn(&pool, conversation.id, hello(), None)
+            .await
+            .expect("the user's next turn runs");
+        let requests = requests.lock().expect("log");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]["messages"].to_string().contains("cmd-after-stop"),
+            "the next turn should include the command's notice"
+        );
+    }
+
+    /// A notice waits for a running turn to end before it's saved, and
+    /// tells a watching tab once it is.
+    #[sqlx::test]
+    async fn test_save_notice_between_turns_waits_for_the_turn_lock(pool: PgPool) {
+        let conversation = db::create_conversation_with_id(&pool, 9100000004)
+            .await
+            .expect("create conversation");
+        let lock = conversation_lock(conversation.id);
+        let turn = lock.lock().await;
+        let mut events = events::subscribe(conversation.id);
+
+        let saving = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                save_notice_between_turns(&pool, conversation.id, "pod stopped".to_string()).await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            db::list_messages(&pool, conversation.id).await.expect("list").is_empty(),
+            "the notice was saved while a turn held the lock"
+        );
+
+        drop(turn);
+        let saved = saving.await.expect("join").expect("save the notice");
+        assert_eq!(saved.role, "user");
+        assert_eq!(
+            saved.blocks().expect("blocks"),
+            vec![anthropic::ContentBlock::Text { text: "pod stopped".to_string() }]
+        );
+        let appended = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match events.recv().await {
+                    Ok(events::ConversationEvent::MessagesAppended { messages }) => return messages,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event channel: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("a MessagesAppended event");
+        assert_eq!(appended.len(), 1);
     }
 
     fn hello() -> anthropic::AnthropicMessage {

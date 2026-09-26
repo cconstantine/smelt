@@ -115,6 +115,29 @@ pub enum ConversationEvent {
     BrowsingUrlUpdate {
         url: String,
     },
+    /// An app-wide `AppEvent::PodsChanged` (a pod was created or went
+    /// away, in any conversation), relayed on every conversation's stream
+    /// so a chat tab doesn't need a second always-open connection for the
+    /// sidebar's pod dots: browsers allow only 6 connections per host over
+    /// HTTP/1.1, shared across tabs.
+    PodsChanged {},
+    /// Whether a model turn is running (or queued) in this conversation,
+    /// published when that changes, so every tab watching it can offer a
+    /// Stop button, including for turns it didn't start. Regenerable from
+    /// `api::chat::get_turn_state`.
+    TurnState {
+        running: bool,
+    },
+}
+
+/// Events that aren't about one conversation, for views that span them
+/// all: the sidebar and the pods view. `subscribe_app_events` relays them.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum AppEvent {
+    /// A pod was created or went away (stopped, crashed, or torn down with
+    /// its conversation). Carries nothing: listeners refetch.
+    PodsChanged,
 }
 
 #[cfg(feature = "server")]
@@ -171,6 +194,27 @@ mod server {
             .remove(&conversation_id);
     }
 
+    /// The app-wide channel. One sender for the whole process; it never
+    /// closes.
+    static APP_BUS: LazyLock<broadcast::Sender<super::AppEvent>> =
+        LazyLock::new(|| broadcast::channel(CHANNEL_CAPACITY).0);
+
+    /// Publishes `event` to every app-wide subscriber.
+    pub fn publish_app(event: super::AppEvent) {
+        let _ = APP_BUS.send(event);
+    }
+
+    /// Subscribes to app-wide events from this point forward.
+    pub fn subscribe_app() -> broadcast::Receiver<super::AppEvent> {
+        APP_BUS.subscribe()
+    }
+
+    /// How many live app-wide subscriptions there are.
+    #[cfg(test)]
+    pub fn app_subscriber_count() -> usize {
+        APP_BUS.receiver_count()
+    }
+
     /// How many live subscriptions `conversation_id` has.
     #[cfg(test)]
     pub fn subscriber_count(conversation_id: i64) -> usize {
@@ -181,6 +225,17 @@ mod server {
     mod tests {
         use super::super::TokenUsage;
         use super::*;
+
+        #[tokio::test]
+        async fn test_publish_app_reaches_app_subscribers() {
+            let mut rx = subscribe_app();
+            publish_app(super::super::AppEvent::PodsChanged);
+            let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("an app event should arrive")
+                .expect("the channel stays open");
+            assert_eq!(received, super::super::AppEvent::PodsChanged);
+        }
 
         #[tokio::test]
         async fn test_forget_closes_the_conversations_channel() {
@@ -354,16 +409,26 @@ mod server {
 }
 
 #[cfg(feature = "server")]
-pub use server::{forget, publish, subscribe};
+pub use server::{forget, publish, publish_app, subscribe, subscribe_app};
 #[cfg(all(feature = "server", test))]
-pub use server::subscriber_count;
+pub use server::{app_subscriber_count, subscriber_count};
 
 #[cfg(test)]
 mod wire_tests {
     use super::*;
 
+    #[test]
+    fn test_app_events_round_trip_through_json() {
+        let event = AppEvent::PodsChanged;
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert_eq!(json, r#"{"type":"PodsChanged"}"#);
+        assert_eq!(serde_json::from_str::<AppEvent>(&json).expect("deserialize"), event);
+    }
+
     fn one_of_each() -> Vec<ConversationEvent> {
         vec![
+            ConversationEvent::TurnState { running: true },
+            ConversationEvent::PodsChanged {},
             ConversationEvent::TaskUpdate {
                 task_id: "t1".to_string(),
                 tool: "count".to_string(),

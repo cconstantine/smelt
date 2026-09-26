@@ -28,7 +28,6 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::anthropic::ContentBlock;
 use crate::{db, events};
 
 // `cfg(test)` rather than an env var deliberately: the whole point is that
@@ -1047,6 +1046,7 @@ pub async fn create_pod(
                     terminated: false,
                 },
             );
+            events::publish_app(events::AppEvent::PodsChanged);
             Ok(row.id)
         }
         Err(e) => {
@@ -1110,8 +1110,56 @@ async fn force_terminate_pod(
                 terminated: true,
             },
         );
+        events::publish_app(events::AppEvent::PodsChanged);
     }
     Ok(row)
+}
+
+/// What the pods view shows about a pod from Kubernetes itself: its phase
+/// and its container's configured limits (as Kubernetes quantity strings).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PodDetails {
+    pub phase: Option<String>,
+    pub memory_limit: Option<String>,
+    pub cpu_limit: Option<String>,
+}
+
+/// `pod_id`'s phase and limits, or `None` if Kubernetes has no such pod.
+pub async fn pod_details(pod_id: i64) -> Result<Option<PodDetails>, SandboxError> {
+    let pods = pods_api(&get().client);
+    let Some(pod) = pods.get_opt(&pod_name(pod_id)).await? else {
+        return Ok(None);
+    };
+    let limits = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.containers.first())
+        .and_then(|container| container.resources.as_ref())
+        .and_then(|resources| resources.limits.as_ref());
+    let limit = |name: &str| limits.and_then(|l| l.get(name)).map(|q| q.0.clone());
+    Ok(Some(PodDetails {
+        phase: pod.status.as_ref().and_then(|s| s.phase.clone()),
+        memory_limit: limit("memory"),
+        cpu_limit: limit("cpu"),
+    }))
+}
+
+/// The raw `PodMetricsList` for smelt's namespace, from the cluster's
+/// metrics API (metrics-server). Needs `get`/`list` on `pods` in the
+/// `metrics.k8s.io` group (`k8s/smelt-park-rbac.yaml`); without it this is
+/// a 403 error, which callers treat as "usage unavailable".
+pub async fn pod_metrics_list() -> Result<serde_json::Value, SandboxError> {
+    let request = http::Request::get(format!(
+        "/apis/metrics.k8s.io/v1beta1/namespaces/{NAMESPACE}/pods"
+    ))
+    .body(Vec::new())
+    .expect("a static, well-formed request");
+    Ok(get().client.request::<serde_json::Value>(request).await?)
+}
+
+/// The Kubernetes pod name for `pod_id`, for matching metrics to rows.
+pub fn kubernetes_pod_name(pod_id: i64) -> String {
+    pod_name(pod_id)
 }
 
 pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInfo>, SandboxError> {
@@ -1828,12 +1876,217 @@ pub async fn grep(
     }
 }
 
+/// The user stopping a pod from the pods view or the sandbox panel. Tears
+/// it down whether or not terminals are open, the way a crash does:
+/// running commands are marked lost and terminals closed. The model is
+/// told in one notice, saved between turns so it can't split a tool call
+/// from its result. Doesn't wake the model: it learns on its next turn.
+pub async fn stop_pod_for_user(pool: &PgPool, pod_id: i64) -> Result<(), TerminalError> {
+    let live = db::sandbox_pod_is_live(pool, pod_id).await?;
+    if !live {
+        return Err(TerminalError::NoPod);
+    }
+    let (conversation_id, _) = close_pod_terminals(pool, pod_id).await;
+    force_terminate_pod(pool, pod_id).await?;
+    if let Some(conversation_id) = conversation_id {
+        let notice = format!(
+            "The user stopped sandbox pod {pod_id}. Its terminals, and any files outside mounted volumes, are gone. Create a new pod if you need one."
+        );
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::api::chat::save_notice_between_turns(&pool, conversation_id, notice).await {
+                tracing::warn!(conversation_id, pod_id, error = %e, "couldn't save the pod stop notice");
+            }
+        });
+    }
+    Ok(())
+}
+
+/// How old a live pod row must be before the watch's listing may close it
+/// for having no pod in Kubernetes: a row is written just before its pod
+/// is created, and creating one can take a while. Also keeps a smelt
+/// instance from closing another instance's brand-new rows (the browser
+/// test harness shares the dev database but not its namespace).
+const RECONCILE_MIN_AGE_SECS: i64 = 300;
+
+/// How long after a pod is deleted (or finishes) the watch waits before
+/// closing its record, so crash detection gets there first for a pod smelt
+/// was connected to: it closes the same records, but also tells the model.
+#[cfg(not(test))]
+const CLOSE_GRACE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
+
+/// Keeps pod records in step with Kubernetes for as long as smelt runs:
+/// subscribes to pod changes in smelt's namespace, reconciles once the
+/// first full listing arrives (and again after any reconnect, which
+/// re-lists), then closes a pod's record when the pod is deleted or reaches
+/// a phase it can't recover from. Covers pods lost while smelt wasn't
+/// connected to them: deleted outside smelt, lost in a cluster rebuild,
+/// evicted, or dead while smelt was down. See `close_if_gone`.
+///
+/// Only a real server runs this (from `main`), never the browser test
+/// harness: that shares the dev database but works in the test namespace,
+/// where the dev instance's pods don't exist.
+pub async fn watch_pods(pool: PgPool) {
+    use futures_util::StreamExt;
+    use kube::runtime::{WatchStreamExt, watcher};
+
+    let events = watcher(pods_api(&get().client), watcher::Config::default()).default_backoff();
+    futures_util::pin_mut!(events);
+    // Pods listed since the last `Init`, until `InitDone` completes the set.
+    let mut listed = std::collections::HashSet::new();
+    while let Some(event) = events.next().await {
+        match event {
+            Ok(watcher::Event::Init) => listed.clear(),
+            Ok(watcher::Event::InitApply(pod)) => {
+                if let Some(pod_id) = watched_pod_id(&pod) {
+                    if !pod_has_finished(&pod) {
+                        listed.insert(pod_id);
+                    }
+                }
+            }
+            Ok(watcher::Event::InitDone) => {
+                match db::live_pods_older_than(&pool, RECONCILE_MIN_AGE_SECS).await {
+                    Ok(rows) => {
+                        for row in rows.into_iter().filter(|row| !listed.contains(&row.id)) {
+                            close_if_gone(&pool, row.id).await;
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "couldn't list pod records to reconcile"),
+                }
+            }
+            Ok(watcher::Event::Apply(pod)) if pod_has_finished(&pod) => {
+                if let Some(pod_id) = watched_pod_id(&pod) {
+                    close_after_grace(pool.clone(), pod_id);
+                }
+            }
+            Ok(watcher::Event::Apply(_)) => {}
+            Ok(watcher::Event::Delete(pod)) => {
+                if let Some(pod_id) = watched_pod_id(&pod) {
+                    close_after_grace(pool.clone(), pod_id);
+                }
+            }
+            // The watcher backs off and retries on its own, re-listing
+            // (a fresh `Init`..`InitDone`) once it's back.
+            Err(e) => tracing::warn!(error = %e, "pod watch error"),
+        }
+    }
+}
+
+/// The smelt pod id behind a watched pod (`sandbox-{id}`), or `None` for
+/// any other pod in the namespace.
+fn watched_pod_id(pod: &Pod) -> Option<i64> {
+    pod.metadata.name.as_deref()?.strip_prefix("sandbox-")?.parse().ok()
+}
+
+/// Whether a pod has stopped for good: `Succeeded` or `Failed` (sandbox
+/// pods never restart).
+fn pod_has_finished(pod: &Pod) -> bool {
+    matches!(
+        pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+        Some("Succeeded" | "Failed")
+    )
+}
+
+/// `close_if_gone` for `pod_id`, after `CLOSE_GRACE`.
+fn close_after_grace(pool: PgPool, pod_id: i64) {
+    tokio::spawn(async move {
+        tokio::time::sleep(CLOSE_GRACE).await;
+        close_if_gone(&pool, pod_id).await;
+    });
+}
+
+/// Closes `pod_id`'s record if it's still live, smelt has no connection to
+/// it (a connected pod's end is crash detection's to report, notice
+/// included), and Kubernetes really has no running pod for it. Running
+/// commands are marked lost and terminals closed, like a crash, but
+/// quietly: no notice to the model (saving one would move the conversation
+/// to the top of the sidebar, and a cluster rebuild can leave dozens); it
+/// finds out if it tries the pod again.
+async fn close_if_gone(pool: &PgPool, pod_id: i64) {
+    match db::sandbox_pod_is_live(pool, pod_id).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't check a pod record");
+            return;
+        }
+    }
+    if registry_get(pod_id).is_some() {
+        return;
+    }
+    match pods_api(&get().client).get_opt(&pod_name(pod_id)).await {
+        Ok(Some(pod)) if !pod_has_finished(&pod) => return,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't check a pod in Kubernetes");
+            return;
+        }
+    }
+    close_pod_terminals(pool, pod_id).await;
+    // Deletes a finished pod's object if it's still there, marks the row
+    // terminated, and tells the UI (the sandbox panel, the sidebar, /pods).
+    match force_terminate_pod(pool, pod_id).await {
+        Ok(_) => tracing::info!(pod_id, "closed the record of a pod that's gone from the cluster"),
+        Err(e) => tracing::warn!(pod_id, error = %e, "couldn't close the record of a gone pod"),
+    }
+}
+
 /// Marks every command still `running` under any of this pod's terminals
 /// `'lost'` (no real exit code to report — see
 /// `db::mark_terminal_command_lost`), and every one of the pod's live
 /// terminals terminated — a dead agent was hosting all of them, not just
 /// one. A safe no-op if the pod had no terminals.
 async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64, reason: Option<String>) {
+    let (conversation_id, found_live_terminal) = close_pod_terminals(pool, pod_id).await;
+    if let Some(conversation_id) = conversation_id {
+        // One pod-level notification, gated on the same "found at least one
+        // live terminal" condition that already makes a redundant second call
+        // (e.g. the pre-existing reactive path still firing after this one
+        // already ran) a harmless no-op — no separate dedup state needed. See
+        // the plan's "Detection design": the reason string, when Kubernetes
+        // gave one, is passed straight through rather than guessed at.
+        let notice = found_live_terminal.then(|| match reason {
+            Some(reason) => format!(
+                "Sandbox pod {pod_id} stopped unexpectedly ({reason}); every terminal running in it is no longer available."
+            ),
+            None => format!(
+                "Sandbox pod {pod_id} stopped unexpectedly; every terminal running in it is no longer available."
+            ),
+        });
+        // Then the same active wake as a normal command exit (see
+        // `handle_agent_message`'s "exit" branch) — a crash can leave a
+        // command marked 'lost' with nobody proactively telling the model,
+        // the identical gap. One wake covers whatever this pass just
+        // marked lost; `wake_conversation`'s own no-op-when-nothing-
+        // pending behavior makes this cheap even when nothing actually
+        // changed. Detached, notice included: this can run synchronously
+        // from *inside* an already-in-progress `run_turn`/`execute()` call
+        // that's already holding `conversation_id`'s lock (e.g.
+        // `run_terminal_command_tool` → `sandbox::send_command` →
+        // `reconnect_if_needed` → here), and both the notice (saved only
+        // between turns, see `save_notice_between_turns`) and the wake
+        // take that same non-reentrant lock. See
+        // docs/projects/plans/terminal-exit-notify.md.
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            if let Some(notice) = notice {
+                if let Err(e) = crate::api::chat::save_notice_between_turns(&pool, conversation_id, notice).await {
+                    tracing::warn!(conversation_id, pod_id, error = %e, "couldn't save the pod crash notice");
+                }
+            }
+            let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
+        });
+    }
+    deregister(pod_id);
+}
+
+/// Marks every command still running in `pod_id`'s terminals lost and
+/// closes the terminals, publishing each closure for the UI. Returns the
+/// pod's conversation (if it could be found) and whether it had any live
+/// terminal. Shared by a crash and by the user stopping the pod.
+async fn close_pod_terminals(pool: &PgPool, pod_id: i64) -> (Option<i64>, bool) {
     let conversation_id = db::sandbox_pod_conversation_id(pool, pod_id)
         .await
         .ok()
@@ -1859,53 +2112,7 @@ async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64, reason: Option<String>
             }
         }
     }
-    // One pod-level notification, gated on the same "found at least one
-    // live terminal" condition that already makes a redundant second call
-    // (e.g. the pre-existing reactive path still firing after this one
-    // already ran) a harmless no-op — no separate dedup state needed. See
-    // the plan's "Detection design": the reason string, when Kubernetes
-    // gave one, is passed straight through rather than guessed at.
-    if found_live_terminal {
-        if let Some(conversation_id) = conversation_id {
-            let text = match reason {
-                Some(reason) => format!(
-                    "Sandbox pod {pod_id} stopped unexpectedly ({reason}); every terminal running in it is no longer available."
-                ),
-                None => format!(
-                    "Sandbox pod {pod_id} stopped unexpectedly; every terminal running in it is no longer available."
-                ),
-            };
-            let _ = db::create_message(
-                pool,
-                conversation_id,
-                "user",
-                &[ContentBlock::Text { text }],
-            )
-            .await;
-        }
-    }
-    if let Some(conversation_id) = conversation_id {
-        // Same active wake as a normal command exit (see
-        // `handle_agent_message`'s "exit" branch) — a crash can leave a
-        // command marked 'lost' with nobody proactively telling the model,
-        // the identical gap. One wake covers whatever this pass just
-        // marked lost; `wake_conversation`'s own no-op-when-nothing-
-        // pending behavior makes this cheap even when nothing actually
-        // changed. Detached for a different reason than the exit-event
-        // call: this can run synchronously from *inside* an
-        // already-in-progress `run_turn`/`execute()` call that's already
-        // holding `conversation_id`'s lock (e.g. `run_terminal_command_tool`
-        // → `sandbox::send_command` → `reconnect_if_needed` → here) —
-        // awaiting `wake_conversation` directly would try to re-acquire
-        // that same non-reentrant lock and deadlock, the same hazard
-        // `cancel_task_tool`'s own comment already documents. See
-        // docs/projects/plans/terminal-exit-notify.md.
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
-        });
-    }
-    deregister(pod_id);
+    (conversation_id, found_live_terminal)
 }
 
 /// Portforward + a client-side WebSocket handshake over the forwarded
@@ -3297,6 +3504,172 @@ mod tests {
                 "a deliberate terminate_pod must never produce a crash notification"
             );
 
+            // --- The user stops a pod that has an open terminal and a
+            // running command: everything is torn down, the command is
+            // marked lost, and the model gets a user-stop notice, not a
+            // crash notice. See docs/projects/completed/20260925-pod-management.md. ---
+            let conversation_g = db::create_conversation(&pool).await.expect("create conversation g");
+            let mut app_events = events::subscribe_app();
+            let pod_g = create_pod(&pool, conversation_g.id, None, None).await.expect("create_pod (g) should succeed");
+            assert!(
+                received_pods_changed(&mut app_events).await,
+                "creating a pod should tell app-wide listeners"
+            );
+            let terminal_g = create_terminal(&pool, conversation_g.id).await.expect("create_terminal (g) should succeed");
+            db::create_terminal_command(&pool, conversation_g.id, terminal_g, "long-g", "sleep 300")
+                .await
+                .expect("create_terminal_command");
+            send_command(&pool, terminal_g, "long-g", "sleep 300").await.expect("send_command");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let overviews = crate::api::pods::pod_overviews(&pool).await.expect("pod_overviews");
+            let overview_g = overviews
+                .iter()
+                .find(|o| o.pod_id == pod_g)
+                .expect("the pods view should list pod (g)");
+            assert_eq!(overview_g.conversation_id, conversation_g.id);
+            assert_eq!(overview_g.status.as_deref(), Some("Running"));
+            assert_eq!(overview_g.memory_limit, Some(default_memory_limit()));
+            assert_eq!(overview_g.cpu_limit, Some(default_cpu_limit()));
+            assert_eq!(overview_g.terminals, 1);
+            assert_eq!(overview_g.activity, crate::api::pods::PodActivity::Busy, "a command is running");
+            // Live usage, end to end: metrics-server samples a new pod
+            // within a minute or so, and smelt's RBAC lets it read that.
+            let usage_g = tokio::time::timeout(Duration::from_secs(90), async {
+                loop {
+                    let overviews = crate::api::pods::pod_overviews(&pool).await.expect("pod_overviews");
+                    if let Some(usage) = overviews.iter().find(|o| o.pod_id == pod_g).and_then(|o| o.usage.clone()) {
+                        return usage;
+                    }
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+            })
+            .await
+            .expect("the pods view should show pod (g)'s live usage once metrics-server has sampled it");
+            assert!(usage_g.memory_bytes > 0, "a running pod uses some memory: {usage_g:?}");
+
+            stop_pod_for_user(&pool, pod_g).await.expect("stop_pod_for_user (g) should succeed");
+            assert!(
+                received_pods_changed(&mut app_events).await,
+                "stopping a pod should tell app-wide listeners"
+            );
+
+            let command_g = db::get_terminal_command(&pool, "long-g").await.expect("get").expect("the command");
+            assert_eq!(command_g.status, "lost", "a running command should be marked lost");
+            assert!(
+                list_terminals(&pool, conversation_g.id).await.expect("list_terminals").is_empty(),
+                "the pod's terminal should be closed"
+            );
+            assert!(
+                db::list_sandbox_pods(&pool, conversation_g.id).await.expect("list pods").is_empty(),
+                "the pod should be marked terminated"
+            );
+            assert!(
+                pods_api(&client).get_opt(&pod_name(pod_g)).await.expect("get pod").is_none_or(|p| p.metadata.deletion_timestamp.is_some()),
+                "the Kubernetes pod should be gone or going"
+            );
+            let notified = tokio::time::timeout(Duration::from_secs(10), async {
+                while !any_message_contains(&pool, conversation_g.id, "The user stopped sandbox pod").await {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await;
+            assert!(notified.is_ok(), "the model should be told the user stopped the pod");
+            assert!(
+                !any_message_contains(&pool, conversation_g.id, "stopped unexpectedly").await,
+                "a user stop must not be reported as a crash"
+            );
+
+            // --- Keeping records in step with the cluster (`watch_pods`):
+            // a record whose pod vanished before the watch started is closed
+            // when the watch's first listing completes; a pod deleted while
+            // the watch runs is closed after the grace period; a young
+            // record whose pod may still be starting is left alone. All
+            // quietly. See docs/projects/completed/20260925-pod-management.md. ---
+            let updated_at = |id: i64| {
+                let pool = pool.clone();
+                async move {
+                    sqlx::query_scalar::<_, chrono::NaiveDateTime>("SELECT updated_at FROM conversations WHERE id = $1")
+                        .bind(id)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("the conversation's updated_at")
+                }
+            };
+            let wait_until_closed = |pod_id: i64| {
+                let pool = pool.clone();
+                async move {
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        while db::sandbox_pod_is_live(&pool, pod_id).await.expect("is live") {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                    })
+                    .await
+                    .is_ok()
+                }
+            };
+            let wait_until_gone_from_kubernetes = |pod_id: i64| {
+                let client = client.clone();
+                async move {
+                    tokio::time::timeout(Duration::from_secs(60), async {
+                        while pods_api(&client).get_opt(&pod_name(pod_id)).await.ok().flatten().is_some() {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    })
+                    .await
+                    .is_ok()
+                }
+            };
+
+            // Before the watch starts: pod (h) is gone from Kubernetes, and
+            // old enough that its record should have a pod.
+            let conversation_h = db::create_conversation(&pool).await.expect("create conversation h");
+            let pod_h = create_pod(&pool, conversation_h.id, None, None).await.expect("create_pod (h) should succeed");
+            let terminal_h = db::create_sandbox_terminal(&pool, pod_h).await.expect("a terminal record");
+            db::create_terminal_command(&pool, conversation_h.id, terminal_h.id, "stale-h", "sleep 300")
+                .await
+                .expect("a running command record");
+            sqlx::query("UPDATE sandbox_pods SET created_at = now() - interval '10 minutes' WHERE id = $1")
+                .bind(pod_h)
+                .execute(&pool)
+                .await
+                .expect("age the pod past the reconciliation cut-off");
+            pods_api(&client).delete(&pod_name(pod_h), &immediate_delete_params()).await.expect("delete pod (h) directly");
+            assert!(wait_until_gone_from_kubernetes(pod_h).await, "pod (h) should leave Kubernetes");
+            let conversation_young = db::create_conversation(&pool).await.expect("create conversation");
+            let young = db::create_sandbox_pod(&pool, conversation_young.id).await.expect("a young pod record");
+            let updated_before = updated_at(conversation_h.id).await;
+
+            let watch = tokio::spawn(watch_pods(pool.clone()));
+
+            assert!(wait_until_closed(pod_h).await, "the watch's first listing should close pod (h)'s record");
+            let command_h = db::get_terminal_command(&pool, "stale-h").await.expect("get").expect("the command");
+            assert_eq!(command_h.status, "lost", "its running command should be marked lost");
+            assert!(
+                db::list_sandbox_terminals_for_pod(&pool, pod_h).await.expect("terminals").is_empty(),
+                "its terminal should be closed"
+            );
+            assert!(
+                db::list_messages(&pool, conversation_h.id).await.expect("messages").is_empty(),
+                "records are closed quietly, with no notice"
+            );
+            assert_eq!(updated_at(conversation_h.id).await, updated_before, "the conversation shouldn't move in the sidebar");
+
+            // While the watch runs: pod (i) is deleted outside smelt, with no
+            // connection open, so crash detection never sees it.
+            let conversation_i = db::create_conversation(&pool).await.expect("create conversation i");
+            let pod_i = create_pod(&pool, conversation_i.id, None, None).await.expect("create_pod (i) should succeed");
+            pods_api(&client).delete(&pod_name(pod_i), &immediate_delete_params()).await.expect("delete pod (i) directly");
+            assert!(wait_until_closed(pod_i).await, "a pod deleted while the watch runs should have its record closed");
+            assert!(
+                db::list_messages(&pool, conversation_i.id).await.expect("messages").is_empty(),
+                "closed quietly, with no notice"
+            );
+
+            assert!(db::sandbox_pod_is_live(&pool, young.id).await.expect("is live"), "a young record is left alone");
+            watch.abort();
+            db::terminate_sandbox_pod(&pool, young.id).await.expect("clean up the young record");
+
             // --- Exhausting reconnect attempts without Kubernetes ever
             // confirming death still cleans up *and* force-terminates the
             // pod — verified by create_pod succeeding again immediately
@@ -3485,6 +3858,24 @@ mod tests {
         }
     }
 
+    /// Whether a `PodsChanged` arrives on `rx` within a few seconds,
+    /// skipping any older ones still queued from earlier scenarios.
+    async fn received_pods_changed(
+        rx: &mut tokio::sync::broadcast::Receiver<events::AppEvent>,
+    ) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(events::AppEvent::PodsChanged) => return true,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     async fn any_message_contains(pool: &PgPool, conversation_id: i64, needle: &str) -> bool {
         db::list_messages(pool, conversation_id)
             .await
@@ -3494,7 +3885,7 @@ mod tests {
                 m.blocks().ok().is_some_and(|blocks| {
                     blocks
                         .iter()
-                        .any(|b| matches!(b, ContentBlock::Text { text } if text.contains(needle)))
+                        .any(|b| matches!(b, crate::anthropic::ContentBlock::Text { text } if text.contains(needle)))
                 })
             })
     }

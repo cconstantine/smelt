@@ -288,6 +288,83 @@ pub async fn terminate_sandbox_pod(
     .await
 }
 
+/// One live pod, across every conversation, with what the pods view needs
+/// from the database: its conversation, and its terminals' activity.
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+pub struct LivePodRow {
+    pub pod_id: i64,
+    pub conversation_id: i64,
+    pub conversation_title: String,
+    /// Bumped by every message, so it stands in for tool activity that
+    /// leaves no per-pod record.
+    pub conversation_updated_at: NaiveDateTime,
+    pub created_at: NaiveDateTime,
+    pub live_terminals: i64,
+    pub running_commands: i64,
+    pub last_command_finished_at: Option<NaiveDateTime>,
+    /// The database's own `now()`, so ages are worked out on one clock.
+    pub observed_at: NaiveDateTime,
+}
+
+/// Every live pod, oldest first — the pods view's rows.
+pub async fn list_live_pods(pool: &PgPool) -> Result<Vec<LivePodRow>, sqlx::Error> {
+    sqlx::query_as::<_, LivePodRow>(
+        "SELECT p.id AS pod_id,
+                p.conversation_id,
+                c.title AS conversation_title,
+                c.updated_at AS conversation_updated_at,
+                p.created_at,
+                (SELECT COUNT(*) FROM sandbox_terminals t
+                  WHERE t.pod_id = p.id AND t.terminated_at IS NULL) AS live_terminals,
+                (SELECT COUNT(*) FROM terminal_commands tc
+                   JOIN sandbox_terminals t ON t.id = tc.terminal_id
+                  WHERE t.pod_id = p.id AND tc.status = 'running') AS running_commands,
+                (SELECT MAX(tc.finished_at) FROM terminal_commands tc
+                   JOIN sandbox_terminals t ON t.id = tc.terminal_id
+                  WHERE t.pod_id = p.id) AS last_command_finished_at,
+                now()::timestamp AS observed_at
+           FROM sandbox_pods p
+           JOIN conversations c ON c.id = p.conversation_id
+          WHERE p.terminated_at IS NULL
+          ORDER BY p.created_at ASC, p.id ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Live pods created more than `min_age_secs` seconds ago, by the
+/// database's clock — the ones old enough to have a pod in Kubernetes.
+pub async fn live_pods_older_than(pool: &PgPool, min_age_secs: i64) -> Result<Vec<SandboxPod>, sqlx::Error> {
+    sqlx::query_as::<_, SandboxPod>(
+        "SELECT * FROM sandbox_pods
+          WHERE terminated_at IS NULL AND created_at < now() - make_interval(secs => $1)
+          ORDER BY id ASC",
+    )
+    .bind(min_age_secs as f64)
+    .fetch_all(pool)
+    .await
+}
+
+/// Whether `pod_id` exists and hasn't been terminated.
+pub async fn sandbox_pod_is_live(pool: &PgPool, pod_id: i64) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM sandbox_pods WHERE id = $1 AND terminated_at IS NULL)",
+    )
+    .bind(pod_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// The conversations that have a live pod — the sidebar's markers.
+pub async fn conversations_with_live_pods(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT conversation_id FROM sandbox_pods
+          WHERE terminated_at IS NULL ORDER BY conversation_id ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Live pods only (`terminated_at IS NULL`) — a terminated pod's row
 /// sticks around (see the plan's "How") but shouldn't be listed as if it
 /// still existed.
@@ -820,6 +897,20 @@ pub async fn update_mcp_server_config(
     .await
 }
 
+/// A conversation with a chosen id, for tests that touch process-wide,
+/// per-conversation state (the turn lock, a stop, a pause): every
+/// `#[sqlx::test]` database numbers conversations from 1, so tests running
+/// in parallel would otherwise share that state through a common id.
+#[cfg(test)]
+pub async fn create_conversation_with_id(pool: &PgPool, id: i64) -> Result<Conversation, sqlx::Error> {
+    sqlx::query_as::<_, Conversation>(
+        "INSERT INTO conversations (id, title) OVERRIDING SYSTEM VALUE VALUES ($1, 'New Conversation') RETURNING *",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Adds an MCP server named `name` unless one with that name already
 /// exists, for the servers smelt ships with (`mcp::default_mcp_servers`).
 /// Matched by name only, so a user's edits to the entry (a key header, a
@@ -1177,6 +1268,62 @@ mod tests {
         create_conversation(pool)
             .await
             .expect("create conversation")
+    }
+
+    #[sqlx::test]
+    async fn test_list_live_pods_reports_each_live_pod_and_its_activity(pool: PgPool) {
+        let busy = test_conversation(&pool).await;
+        create_message(
+            &pool,
+            busy.id,
+            "user",
+            &[ContentBlock::Text { text: "build it".to_string() }],
+        )
+        .await
+        .expect("title the conversation");
+        let busy_pod = create_sandbox_pod(&pool, busy.id).await.expect("pod");
+        let t1 = create_sandbox_terminal(&pool, busy_pod.id).await.expect("terminal");
+        let t2 = create_sandbox_terminal(&pool, busy_pod.id).await.expect("terminal");
+        create_terminal_command(&pool, busy.id, t1.id, "cmd-done", "true")
+            .await
+            .expect("command");
+        mark_terminal_command_finished(&pool, "cmd-done", 0).await.expect("finish");
+        create_terminal_command(&pool, busy.id, t2.id, "cmd-running", "sleep 100")
+            .await
+            .expect("command");
+        let closed = create_sandbox_terminal(&pool, busy_pod.id).await.expect("terminal");
+        terminate_sandbox_terminal(&pool, closed.id).await.expect("close terminal");
+
+        let quiet = test_conversation(&pool).await;
+        let quiet_pod = create_sandbox_pod(&pool, quiet.id).await.expect("pod");
+
+        let gone = test_conversation(&pool).await;
+        let gone_pod = create_sandbox_pod(&pool, gone.id).await.expect("pod");
+        terminate_sandbox_pod(&pool, gone_pod.id).await.expect("terminate");
+
+        let rows = list_live_pods(&pool).await.expect("list live pods");
+        assert_eq!(
+            rows.iter().map(|r| r.pod_id).collect::<Vec<_>>(),
+            vec![busy_pod.id, quiet_pod.id],
+            "only live pods, oldest first"
+        );
+        let busy_row = &rows[0];
+        assert_eq!(busy_row.conversation_id, busy.id);
+        assert_eq!(busy_row.conversation_title, "build it");
+        assert_eq!(busy_row.live_terminals, 2, "a closed terminal doesn't count");
+        assert_eq!(busy_row.running_commands, 1);
+        assert!(busy_row.last_command_finished_at.is_some());
+        let quiet_row = &rows[1];
+        assert_eq!(quiet_row.live_terminals, 0);
+        assert_eq!(quiet_row.running_commands, 0);
+        assert_eq!(quiet_row.last_command_finished_at, None);
+        assert!(
+            rows.iter().all(|r| r.observed_at >= r.created_at && r.observed_at >= r.conversation_updated_at),
+            "observed_at should be the database's current time"
+        );
+
+        let with_pods = conversations_with_live_pods(&pool).await.expect("list");
+        assert_eq!(with_pods, vec![busy.id, quiet.id]);
     }
 
     /// A pod + terminal pair, for tests that only care about

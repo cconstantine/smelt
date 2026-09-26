@@ -1309,6 +1309,24 @@ mod server {
     /// the same reporting `chat::wake_conversation` does for terminal
     /// commands. There's no request in flight to return the error to.
     async fn notify_model(pool: &PgPool, conversation_id: i64, message: AnthropicMessage) {
+        // After the user stopped this conversation, the notice is kept for
+        // their next message instead of waking the model (see
+        // `chat::PAUSED`).
+        if chat::is_paused(conversation_id) {
+            let text = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Err(e) = chat::save_notice_between_turns(pool, conversation_id, text).await {
+                tracing::warn!(conversation_id, error = %e, "couldn't save a task notice while paused");
+            }
+            return;
+        }
         if let Err(e) = chat::run_turn(pool, conversation_id, message, None).await {
             tracing::warn!(conversation_id, error = %e, "task notification failed to reach the model");
             events::publish(
@@ -2615,6 +2633,49 @@ mod server {
             assert!(doomed_task.is_finished(), "the deleted conversation's task is still running");
 
             forget_conversation_tasks(kept);
+        }
+
+        /// After the user stops a conversation, a finishing task's notice is
+        /// saved but doesn't start a turn: nothing reaches the model (whose
+        /// address here goes nowhere, so a turn would fail loudly).
+        #[sqlx::test]
+        async fn test_a_paused_conversation_saves_task_notices_without_a_turn(pool: PgPool) {
+            let _guard = crate::anthropic::test_support::lock_anthropic_base_url();
+            unsafe {
+                std::env::set_var("ANTHROPIC_BASE_URL", "http://127.0.0.1:1");
+                std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+            }
+            let conversation = db::create_conversation_with_id(&pool, 9_100_000_005)
+                .await
+                .expect("create conversation");
+            chat::stop_turn_now(conversation.id);
+            let mut rx = events::subscribe(conversation.id);
+            execute(
+                &pool,
+                conversation.id,
+                "toolu_paused",
+                "run_async",
+                &serde_json::json!({"tool": "add", "input": {"a": 1, "b": 2}}),
+            )
+            .await
+            .expect("run_async should succeed");
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let mut saved = false;
+            while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+                match event {
+                    events::ConversationEvent::NotificationDeliveryFailed { detail } => {
+                        panic!("a paused conversation started a turn: {detail}")
+                    }
+                    events::ConversationEvent::MessagesAppended { messages } => {
+                        saved |= messages.iter().any(|m| m.content.contains("task-notification"));
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saved, "the task's notice should still be saved");
+            let messages = db::list_messages(&pool, conversation.id).await.expect("list");
+            assert!(messages.iter().all(|m| m.role == "user"), "no model reply: {messages:?}");
         }
 
         /// A finished task whose notification turn fails (here: the

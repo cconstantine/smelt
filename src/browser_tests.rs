@@ -190,6 +190,63 @@ async fn wait_for_element(
     }
 }
 
+/// `selector`'s position and size on screen, rounded to whole pixels:
+/// `(x, y, width, height)`.
+async fn element_box(page: &chromiumoxide::Page, selector: &str) -> (i64, i64, i64, i64) {
+    let rect: Vec<f64> = page
+        .evaluate(format!(
+            "(() => {{ const r = document.querySelector({selector:?}).getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; }})()"
+        ))
+        .await
+        .expect("measure an element")
+        .into_value()
+        .expect("four numbers");
+    (rect[0].round() as i64, rect[1].round() as i64, rect[2].round() as i64, rect[3].round() as i64)
+}
+
+/// Waits until exactly `count` elements match `selector`. False on timeout.
+async fn wait_for_count(page: &chromiumoxide::Page, selector: &str, count: usize, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let found: usize = page
+            .evaluate(format!("document.querySelectorAll({selector:?}).length"))
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok())
+            .unwrap_or(usize::MAX);
+        if found == count {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Waits until the page's client has requested a URL ending in `suffix`,
+/// the sign it's hydrated on pages without a conversation (the
+/// server-rendered page's own fetches never show up in the browser's
+/// resource timings).
+async fn wait_for_resource(page: &chromiumoxide::Page, suffix: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let seen: bool = page
+            .evaluate(format!(
+                "performance.getEntriesByType('resource').some(e => e.name.endsWith({suffix:?}))"
+            ))
+            .await
+            .expect("read resource timings")
+            .into_value()
+            .expect("a bool");
+        if seen {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the page never requested {suffix}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Waits until the page's WASM client has hydrated and is live. After
 /// subscribing to the conversation's live events, the client pulls a
 /// one-shot snapshot of each panel, `get_browsing_state` last; that
@@ -755,6 +812,139 @@ async fn test_end_to_end_browser_scenarios() {
             wait_for_text_gone(&watcher, "scenario 11 failure", Duration::from_secs(2)).await,
             "B's notification failure followed the tab to A"
         );
+
+        // Every open smelt tab holds one always-open event stream, and over
+        // plain HTTP/1.1 the browser allows only 6 connections per host
+        // across all tabs: a 7th stream-holding tab never finishes loading.
+        // Close the tabs the scenarios above are done with.
+        for tab in [chat, watcher, missing] {
+            tab.close().await.expect("close a finished tab");
+        }
+
+        // --- Scenario 12: pods. A pod created in one conversation shows up
+        // as a dot in another tab's sidebar, live; the pods page lists it;
+        // Stop there removes the row, and the dot goes away, live. ---
+        let with_pod = new_conversation(pool, &created).await;
+        db::create_message(
+            pool,
+            with_pod.id,
+            "user",
+            &[anthropic::ContentBlock::Text { text: "scenario 12".to_string() }],
+        )
+        .await
+        .expect("title it");
+        let sidebar_tab = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, other.id))
+            .await
+            .expect("open a conversation without a pod");
+        wait_for_live_client(&sidebar_tab, other.id).await;
+        let dot = format!(".conversation-item[data-conversation-id=\"{}\"] .live-pod-dot", with_pod.id);
+        assert!(
+            wait_for_count(&sidebar_tab, &dot, 0, Duration::from_secs(5)).await,
+            "no dot before the conversation has a pod"
+        );
+        let pod_id = sandbox::create_pod(pool, with_pod.id, None, None).await.expect("create_pod");
+        assert!(
+            wait_for_count(&sidebar_tab, &dot, 1, Duration::from_secs(10)).await,
+            "the sidebar should mark a conversation whose pod started, without a reload"
+        );
+
+        let pods_page = harness
+            .browser
+            .new_page(format!("{}pods", harness.base_url))
+            .await
+            .expect("open the pods page");
+        wait_for_resource(&pods_page, "/api/pods").await;
+        let row = format!("tr[data-pod-id=\"{pod_id}\"]");
+        assert!(
+            wait_for_count(&pods_page, &row, 1, Duration::from_secs(10)).await,
+            "the pods page should list the pod"
+        );
+        assert!(
+            wait_for_text(&pods_page, "scenario 12", Duration::from_secs(5)).await,
+            "the row should name its conversation"
+        );
+        let stop = format!("{row} .pod-stop");
+        let neighbour = format!("{row} td:nth-last-child(2)");
+        let before = (element_box(&pods_page, &stop).await, element_box(&pods_page, &neighbour).await);
+        wait_for_element(&pods_page, &stop, Duration::from_secs(5)).await.click().await.expect("arm stop");
+        let confirm = format!("{row} .pod-stop.confirm");
+        wait_for_element(&pods_page, &confirm, Duration::from_secs(5)).await;
+        let after = (element_box(&pods_page, &confirm).await, element_box(&pods_page, &neighbour).await);
+        assert_eq!(
+            before, after,
+            "arming Stop must not move or resize the button or its neighbours (button, cell to its left)"
+        );
+        wait_for_element(&pods_page, &confirm, Duration::from_secs(5))
+            .await
+            .click()
+            .await
+            .expect("confirm stop");
+        assert!(
+            wait_for_count(&pods_page, &row, 0, Duration::from_secs(20)).await,
+            "a stopped pod's row should go away"
+        );
+        assert!(
+            wait_for_count(&sidebar_tab, &dot, 0, Duration::from_secs(10)).await,
+            "the dot should go away when the pod stops, without a reload"
+        );
+        for tab in [sidebar_tab, pods_page, page, todo_page] {
+            tab.close().await.expect("close a finished tab");
+        }
+
+        // --- Scenario 13: stopping a turn. The model (still the slow mock
+        // from scenario 8) is mid-reply; Stop shows in the sending tab and
+        // in a second tab watching the same conversation; stopping ends
+        // the reply for good, says "Stopped.", and leaves the chat usable. ---
+        let to_stop = new_conversation(pool, &created).await;
+        let url = format!("{}conversation/{}", harness.base_url, to_stop.id);
+        let sender = harness.browser.new_page(url.clone()).await.expect("open the sending tab");
+        let observer = harness.browser.new_page(url).await.expect("open a watching tab");
+        wait_for_live_client(&sender, to_stop.id).await;
+        wait_for_live_client(&observer, to_stop.id).await;
+        let input = wait_for_element(&sender, CHAT_INPUT, Duration::from_secs(10)).await;
+        input.focus().await.expect("focus the message box");
+        input.type_str("please stop me").await.expect("type");
+        input.press_key("Enter").await.expect("send");
+        assert!(
+            wait_for_text(&sender, "zebra0", Duration::from_secs(10)).await,
+            "the reply should start streaming"
+        );
+        assert!(
+            wait_for_count(&observer, ".stop-turn", 1, Duration::from_secs(5)).await,
+            "a tab that didn't send should also offer Stop while the turn runs"
+        );
+        wait_for_element(&sender, ".stop-turn", Duration::from_secs(5))
+            .await
+            .click()
+            .await
+            .expect("click Stop");
+        assert!(
+            wait_for_text(&sender, "Stopped.", Duration::from_secs(5)).await,
+            "stopping should say so"
+        );
+        assert!(
+            wait_for_count(&sender, ".stop-turn", 0, Duration::from_secs(5)).await
+                && wait_for_count(&observer, ".stop-turn", 0, Duration::from_secs(5)).await,
+            "Stop should go away in every tab once the turn has ended"
+        );
+        // The mock would have finished its reply 5s after it started.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            !wait_for_text(&sender, "zebra24", Duration::from_millis(500)).await,
+            "a stopped reply must not keep arriving"
+        );
+        let input = wait_for_element(&sender, CHAT_INPUT, Duration::from_secs(5)).await;
+        let disabled: bool = input
+            .call_js_fn("function() { return this.disabled; }", false)
+            .await
+            .expect("read disabled")
+            .result
+            .value
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(!disabled, "the message box should be usable after a stop");
     })))
     .await;
 
