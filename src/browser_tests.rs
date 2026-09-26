@@ -63,7 +63,23 @@ impl BrowserTestHarness {
             std::env::set_var("DIOXUS_PUBLIC_PATH", &public_path);
         }
 
-        let router = crate::build_router();
+        // A plain `cargo test` build doesn't bundle assets: `asset!()`
+        // resolves to the source file's own path, which nothing serves, so
+        // every page would run unstyled (SME-40 F17). Serve the stylesheet
+        // at exactly the URL the page asks for.
+        let stylesheet_url = {
+            use dioxus::prelude::*;
+            asset!("/assets/chat.css").to_string()
+        };
+        let stylesheet = std::fs::read_to_string(repo_root.join("assets/chat.css"))
+            .expect("read assets/chat.css");
+        let router = crate::build_router().route(
+            &stylesheet_url,
+            axum::routing::get(move || {
+                let stylesheet = stylesheet.clone();
+                async move { ([(axum::http::header::CONTENT_TYPE, "text/css")], stylesheet) }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind a test-local port");
@@ -414,6 +430,16 @@ async fn test_end_to_end_browser_scenarios() {
         let terminal_a2 = sandbox::create_terminal(pool, conversation.id).await.expect("create_terminal (a2)");
 
         let page = harness.browser.new_page(&harness.base_url).await.expect("open the app");
+        // Every scenario below assumes the page is styled; a layout check
+        // on an unstyled page proves nothing (SME-40 F17: the stylesheet
+        // was a 404 in this tier, so every page ran unstyled).
+        let stylesheet_status: u16 = page
+            .evaluate("fetch(document.querySelector('link[rel=stylesheet]').href).then(r => r.status)")
+            .await
+            .expect("fetch the stylesheet")
+            .into_value()
+            .expect("a status code");
+        assert_eq!(stylesheet_status, 200, "the page's stylesheet doesn't load");
         // Freshly created conversation sorts first (most-recently-updated) —
         // clicking its sidebar entry, same as a real user, though a direct
         // `/conversation/{id}` URL would work too now that routing exists.
