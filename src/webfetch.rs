@@ -137,7 +137,13 @@ async fn fetch_with_guard(
 ) -> Result<FetchResult, String> {
     // The request interceptor only sees loads that touch the network, so it
     // can't stop a `data:` (or similar) URL — check the scheme here.
-    fetch_guard::parse_fetch_target(url)?;
+    let (host, port) = fetch_guard::parse_fetch_target(url)?;
+    // Refuse a private or local address before loading, with a reason the
+    // model can act on rather than Chrome's "net::ERR_BLOCKED_BY_CLIENT"
+    // (SME-40 F15). The interceptor still guards everything the page loads.
+    fetch_guard::resolve_allowed(&host, port, is_addr_allowed)
+        .await
+        .map_err(|e| format!("refused {url}: {e}; smelt doesn't load private or local addresses"))?;
     let (page, context) = new_isolated_page().await?;
     let intercept_task = match fetch_guard::spawn_request_interceptor(&page, is_addr_allowed).await {
         Ok(task) => task,
@@ -339,10 +345,9 @@ mod browser_tests {
 
         // --- Scenario 2: navigating straight to a loopback address is refused. ---
         let result = fetch("http://127.0.0.1:1/").await;
-        assert!(
-            result.is_err(),
-            "expected navigating straight to a loopback address to be refused"
-        );
+        let error = result.expect_err("expected navigating straight to a loopback address to be refused");
+        // And says why, not Chrome's "net::ERR_BLOCKED_BY_CLIENT" (SME-40 F15).
+        assert!(error.contains("private or local"), "the refusal should say why: {error}");
 
         // --- Scenario 2b: a data: URL is refused too — it never touches
         // the network, so the request interceptor can't be what stops it. ---
