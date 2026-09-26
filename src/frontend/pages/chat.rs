@@ -892,6 +892,37 @@ mod context_usage_tests {
 /// something a human typed at this stage, flagged as a known gap in the
 /// tool-use-round-trip plan's retrospective, not solved here). `ToolUse`/
 /// `ToolResult` render as their own centered cards, distinct from both the
+/// A message's text as shown in the chat. A background task's notices
+/// are saved in a tagged form the model reads
+/// (`<task-notification task_id=".." tool="count">finished: ..</task-notification>`);
+/// shown raw, that's markup (SME-40 F13), so they read as a sentence
+/// instead. Everything else is shown as written.
+fn display_text(text: &str) -> String {
+    task_notice_sentence(text).unwrap_or_else(|| text.to_string())
+}
+
+fn task_notice_sentence(text: &str) -> Option<String> {
+    let attr = |open: &str, name: &str| -> Option<String> {
+        let start = open.find(&format!("{name}=\""))? + name.len() + 2;
+        let len = open[start..].find('"')?;
+        Some(open[start..start + len].to_string())
+    };
+    for tag in ["task-notification", "task-output"] {
+        let closing = format!("</{tag}>");
+        if !text.starts_with(&format!("<{tag} ")) || !text.ends_with(&closing) {
+            continue;
+        }
+        let open_end = text.find('>')?;
+        let (open, body) = (&text[..open_end], &text[open_end + 1..text.len() - closing.len()]);
+        let (task_id, tool) = (attr(open, "task_id")?, attr(open, "tool")?);
+        return Some(match attr(open, "stream") {
+            Some(stream) => format!("Background task {tool} ({task_id}) {stream}: {body}"),
+            None => format!("Background task {tool} ({task_id}) {body}"),
+        });
+    }
+    None
+}
+
 /// user- and assistant-aligned bubbles, so a tool call/result reads as
 /// "the agent doing something" rather than "someone said something."
 fn render_block_element(
@@ -908,7 +939,7 @@ fn render_block_element(
     match block {
         ContentBlock::Text { text } => rsx! {
             div { key: "{key}", class: "message message-{role}",
-                div { class: "message-text", "{text}" }
+                div { class: "message-text", "{display_text(text)}" }
                 span { class: "timestamp", "{timestamp}" }
             }
         },
@@ -1524,6 +1555,19 @@ mod tests {
         assert_eq!(cdp_modifiers(Modifiers::META), 4);
         assert_eq!(cdp_modifiers(Modifiers::SHIFT), 8);
         assert_eq!(cdp_modifiers(Modifiers::CONTROL | Modifiers::SHIFT), 10);
+    }
+
+    #[test]
+    fn test_display_text_reads_task_notices_as_sentences() {
+        assert_eq!(
+            display_text(r#"<task-notification task_id="lS9Y" tool="count">finished: Counted to 3</task-notification>"#),
+            "Background task count (lS9Y) finished: Counted to 3"
+        );
+        assert_eq!(
+            display_text(r#"<task-output task_id="lS9Y" tool="count" stream="stdout">count: 1/3</task-output>"#),
+            "Background task count (lS9Y) stdout: count: 1/3"
+        );
+        assert_eq!(display_text("plain words <b>and a tag</b>"), "plain words <b>and a tag</b>");
     }
 
     /// SME-40 F2: the frame now scales to fit the panel, so a click on
