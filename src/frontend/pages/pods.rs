@@ -75,9 +75,9 @@ pub fn PodsIndex() -> Element {
         div { class: "pods-page",
             div { class: "pods-header",
                 Link { to: Route::Home {}, class: "pods-back-link", "\u{2190} Back to conversations" }
-                h1 { "Sandbox pods" }
+                h1 { "Sandboxes" }
                 p { class: "muted",
-                    "Every sandbox pod that's running, in any conversation. Stopping one loses its terminals and any files outside mounted volumes; the model is told, and makes a new pod when it needs one."
+                    "Every sandbox that's running, in any conversation. Stopping one loses its terminals and any files outside mounted volumes; the model is told, and starts a new one when it needs to."
                 }
             }
             if let Some(err) = stop_error() {

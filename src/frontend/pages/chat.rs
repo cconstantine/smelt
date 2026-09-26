@@ -2534,7 +2534,7 @@ fn ConversationSidebar(
             div { class: "sidebar-body",
             button { class: "new-conversation", onclick: move |e| { open_on_phone.set(false); new_conversation(e) }, "New conversation" }
             Link { to: Route::McpServersRoute {}, class: "mcp-servers-link", "MCP servers" }
-            Link { to: Route::PodsRoute {}, class: "pods-link", "Pods" }
+            Link { to: Route::PodsRoute {}, class: "pods-link", "Sandboxes" }
             Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
             if let Some(err) = error() {
                 p { class: "error", "{err}" }
@@ -3445,7 +3445,7 @@ fn ChatPanel(
                                                     r#type: "button",
                                                     title: "Stop this pod. Its terminals and any files outside mounted volumes are lost.",
                                                     onclick: move |_| request_pod_stop(pod.pod_id),
-                                                    super::TwoStepLabel { armed: pending_pod_stop() == Some(pod.pod_id), idle: "Stop pod", confirm: "Confirm stop?" }
+                                                    super::TwoStepLabel { armed: pending_pod_stop() == Some(pod.pod_id), idle: "Stop sandbox", confirm: "Confirm stop?" }
                                                 }
                                             }
                                             if let Some(err) = pod_stop_error() {
@@ -3540,7 +3540,7 @@ fn ChatPanel(
                                     }
                                     span { class: "context-usage-label", "{percent}% of context" }
                                 } else {
-                                    span { class: "context-usage-label", "context: —" }
+                                    span { class: "context-usage-label", "No usage yet" }
                                 }
                             }
                         }

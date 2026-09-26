@@ -268,7 +268,7 @@ async fn send_and_await_response(
     tokio::time::timeout(response_timeout, client.send())
         .await
         .map_err(|_| "timed out waiting for Anthropic to respond".to_string())?
-        .map_err(|e| format!("Claude API request failed: {e}"))
+        .map_err(|e| format!("The model request failed: {e}"))
 }
 
 /// The human-readable part of an error response: Anthropic's own
@@ -1104,6 +1104,30 @@ mod tests {
             headers.get("authorization").is_none(),
             "should not send Authorization when only api_key is set"
         );
+    }
+
+    /// SME-41 D11: a failed request names the model, not Claude, since
+    /// the endpoint is often something else (a local llama.cpp here).
+    #[tokio::test]
+    async fn test_an_unreachable_model_endpoint_is_reported_as_the_model() {
+        let result = send_and_await_response(
+            Some("key"),
+            None,
+            &CreateMessageRequest {
+                model: "local".to_string(),
+                max_tokens: 100,
+                system: None,
+                messages: vec![],
+                stream: true,
+                tools: vec![],
+                thinking: None,
+            },
+            "http://127.0.0.1:1",
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let message = result.expect_err("nothing listens on port 1");
+        assert!(message.starts_with("The model request failed"), "got: {message}");
     }
 
     #[tokio::test]

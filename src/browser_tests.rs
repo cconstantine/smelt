@@ -1139,6 +1139,15 @@ async fn test_end_to_end_browser_scenarios() {
         );
         page.close().await.expect("close the tab");
         let page = harness.browser.new_page(&harness.base_url).await.expect("open the app");
+        // Named the way a user thinks of them: "Sandboxes", not "Pods"
+        // (SME-41 D11).
+        let links: String = page
+            .evaluate("Array.from(document.querySelectorAll('.sidebar-body a')).map(a => a.innerText).join('|')")
+            .await
+            .expect("read the sidebar links")
+            .into_value()
+            .expect("text");
+        assert!(links.contains("Sandboxes") && !links.contains("Pods"), "sidebar links: {links}");
         click_when_present(&page, ".sidebar a[href='/sandbox-volumes']", Duration::from_secs(10)).await;
         assert!(
             wait_for_text(&page, "Sandbox volumes", Duration::from_secs(10)).await,
@@ -1257,6 +1266,11 @@ async fn test_end_to_end_browser_scenarios() {
             .expect("open the conversation");
         wait_for_live_client(&page, tools.id).await;
         assert!(wait_for_count(&page, ".tool-row", 2, Duration::from_secs(10)).await, "one row per call");
+        // With no usage yet, the meter says so in words (SME-41 D11).
+        assert!(
+            wait_for_text(&page, "No usage yet", Duration::from_secs(5)).await,
+            "the context meter should say there's no usage yet"
+        );
         let rows: Vec<(String, bool)> = page
             .evaluate("Array.from(document.querySelectorAll('.tool-row')).map(r => [r.querySelector('summary').innerText, r.open])")
             .await

@@ -58,7 +58,7 @@ pub fn get() -> &'static PgPool {
         .expect("Database not initialized. Call db::init() first.")
 }
 
-const DEFAULT_TITLE: &str = "New Conversation";
+const DEFAULT_TITLE: &str = "New conversation";
 
 pub async fn create_conversation(pool: &PgPool) -> Result<Conversation, sqlx::Error> {
     sqlx::query_as::<_, Conversation>("INSERT INTO conversations (title) VALUES ($1) RETURNING *")
@@ -119,12 +119,13 @@ pub async fn create_message(
     .await?;
 
     // Bump updated_at so the sidebar can sort by recency; auto-title the
-    // conversation from the first user message if it's still the default.
+    // conversation from the first user message if it's still the default (in
+// either spelling: before SME-41 the default was "New Conversation").
     sqlx::query(
         "UPDATE conversations
          SET updated_at = now(),
              title = CASE
-                 WHEN title = $1 AND $2 = 'user' THEN left($3, 60)
+                 WHEN lower(title) = lower($1) AND $2 = 'user' THEN left($3, 60)
                  ELSE title
              END
          WHERE id = $4",
@@ -904,7 +905,7 @@ pub async fn update_mcp_server_config(
 #[cfg(test)]
 pub async fn create_conversation_with_id(pool: &PgPool, id: i64) -> Result<Conversation, sqlx::Error> {
     sqlx::query_as::<_, Conversation>(
-        "INSERT INTO conversations (id, title) OVERRIDING SYSTEM VALUE VALUES ($1, 'New Conversation') RETURNING *",
+        "INSERT INTO conversations (id, title) OVERRIDING SYSTEM VALUE VALUES ($1, 'New conversation') RETURNING *",
     )
     .bind(id)
     .fetch_one(pool)
@@ -954,6 +955,29 @@ pub async fn set_mcp_server_oauth_credentials(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SME-41 D11: the default title is now sentence case; a conversation
+    /// still carrying the old "New Conversation" gets auto-titled too.
+    #[sqlx::test]
+    async fn test_an_old_style_default_title_is_still_replaced(pool: PgPool) {
+        assert_eq!(DEFAULT_TITLE, "New conversation");
+        let conversation = create_conversation(&pool).await.expect("create conversation");
+        sqlx::query("UPDATE conversations SET title = 'New Conversation' WHERE id = $1")
+            .bind(conversation.id)
+            .execute(&pool)
+            .await
+            .expect("give it the old title");
+        create_message(
+            &pool,
+            conversation.id,
+            "user",
+            &[crate::anthropic::ContentBlock::Text { text: "fix the build".to_string() }],
+        )
+        .await
+        .expect("send a message");
+        let titled = list_conversations(&pool).await.expect("list").into_iter().find(|c| c.id == conversation.id).expect("found");
+        assert_eq!(titled.title, "fix the build");
+    }
 
     #[sqlx::test]
     async fn test_create_and_list_conversations_round_trip(pool: PgPool) {
