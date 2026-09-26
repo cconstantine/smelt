@@ -334,7 +334,7 @@ body {
 /* `edit_file`'s diff card — same shape/border-left-accent as .tool-call,
    its body a real line-level diff (see diff_lines) instead of a raw
    old_string/new_string JSON dump. See
-   docs/projects/plans/file-tools.md's "Diff rendering." */
+   SME-11's "Diff rendering." */
 .file-edit-diff {
     align-self: center;
     width: 100%;
@@ -498,7 +498,7 @@ body {
    from an ordinary assistant message (dashed rule, no chat-bubble
    background) since it's the model's own housekeeping, not something it
    said. Collapsed by default, same pattern as .thinking-block. See
-   docs/projects/plans/auto-compaction.md. */
+   SME-18. */
 .compaction-summary-block {
     align-self: center;
     width: 100%;
@@ -733,7 +733,7 @@ body {
    no panel-level scrollbar, and no bleeding into a whole-page scrollbar
    either (that was worse: it dragged the sidebar and transcript along
    with it). A conversation has at most one live pod (see
-   docs/projects/plans/file-tools.md's "One pod per conversation"), so
+   SME-11's "One pod per conversation"), so
    it's multiple *terminals within that pod* that split the available
    height evenly via flex: 1, not multiple pods. */
 .sandbox-panel {
@@ -1415,7 +1415,7 @@ div.mcp-status-unreachable::before {
     border-top-color: #555;
 }
 
-/* --- OAuth (docs/projects/plans/mcp-oauth.md) --- */
+/* --- OAuth (SME-16) --- */
 
 .mcp-status-not-connected {
     background: #f2f2f2;
@@ -1485,7 +1485,7 @@ div.mcp-status-not-connected::before {
     background: #fdecea;
 }
 
-/* Sandbox volumes (docs/projects/plans/sandbox-native-environment.md) —
+/* Sandbox volumes (SME-17) —
    reuses the mcp-servers pages' visual language rather than inventing a
    second one. */
 
@@ -1643,7 +1643,7 @@ div.mcp-status-not-connected::before {
 
 /* Always-visible context-usage indicator — a thin bar sitting above the
    transcript, clickable to open the full detail view. See
-   docs/projects/plans/auto-compaction.md. */
+   SME-18. */
 .context-usage-bar {
     display: flex;
     align-items: center;
@@ -1735,7 +1735,7 @@ div.mcp-status-not-connected::before {
    charts (stacks/bars/lines) in light mode; this app has no dark mode, so
    only the light values are defined. "Free" (unused window) is a neutral
    track color, not a categorical hue — it isn't a data category with its
-   own identity. See docs/projects/plans/auto-compaction.md. */
+   own identity. See SME-18. */
 .context-meter {
     --meter-input: #2a78d6;
     --meter-output: #eb6834;
@@ -1888,7 +1888,7 @@ div.mcp-status-not-connected::before {
     text-align: center;
 }
 
-/* --- Pods (docs/projects/plans/pod-management.md) --- */
+/* --- Pods (SME-26) --- */
 
 .pods-link {
     display: block;

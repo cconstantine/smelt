@@ -1,6 +1,6 @@
 //! Thin wrapper around [`rmcp`](https://crates.io/crates/rmcp) (the
 //! official Rust MCP SDK) for smelt's externally-configured MCP servers —
-//! see `docs/projects/completed/20260817-mcp-servers.md`. `rmcp` owns the actual wire
+//! see SME-15. `rmcp` owns the actual wire
 //! protocol (JSON-RPC framing, Streamable HTTP's two response modes,
 //! session tracking, notification dispatch); this module owns the
 //! connection registry keyed by `mcp_servers.id`, the
@@ -26,7 +26,7 @@ use crate::db::McpServerConfig;
 /// sign-in or API key"), limited to its search tool so reading a page stays
 /// with `webfetch`/`http_request`. Adding an `x-api-key` header to the entry
 /// on `/mcp-servers` lifts the free limits. See
-/// `docs/projects/completed/20260925-websearch.md`.
+/// SME-24.
 pub const EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp?tools=web_search_exa";
 
 /// The MCP servers smelt ships with: `(name, url)`.
@@ -131,7 +131,7 @@ pub async fn evict(server_id: i64) {
 /// Calls `f` and, if it fails, retries exactly once. A server's very first
 /// connection attempt is the one most likely to hit a one-off transient
 /// failure (a slow DNS lookup, a dropped packet, a dev-server rebuild
-/// racing the request — see `docs/projects/completed/20260817-mcp-servers.md`'s
+/// racing the request — see SME-15's
 /// retrospective). Generic over `f`'s return type so it's unit-testable
 /// without a real network call; `connect`'s only caller wires it in below.
 async fn retry_once<F, Fut, T>(mut f: F) -> Result<T, String>
@@ -152,7 +152,7 @@ where
 /// deliberately reusing the same `build_header_map`/`custom_headers` path
 /// static-header mode already uses, rather than wiring `rmcp`'s
 /// `AuthClient`/`AuthorizedHttpClient` into the transport's HTTP client
-/// directly. See docs/projects/plans/mcp-oauth.md's "`src/mcp.rs` —
+/// directly. See SME-16's "`src/mcp.rs` —
 /// `connect()`'s new branch." A token that expires mid-connection (a
 /// long-lived cached `Connection`) isn't proactively refreshed — only the
 /// next fresh `connect()` re-fetches one; a documented limitation, not an
@@ -501,7 +501,7 @@ mod tests {
     /// registry/dispatch/namespacing logic in `mcp.rs`, not the Streamable
     /// HTTP wire format itself (that's `rmcp`'s own tested responsibility;
     /// the real HTTP path was proven separately, live, against GitHub's
-    /// hosted MCP server — see `docs/projects/completed/20260817-mcp-servers.md`).
+    /// hosted MCP server — see SME-15).
     /// Registers the resulting connection under `server_id` in the shared
     /// `REGISTRY`, bypassing `connect()`'s HTTP-specific transport
     /// construction.

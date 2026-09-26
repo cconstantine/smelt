@@ -3,7 +3,7 @@
 //! several tool calls, instead of `webfetch`'s fresh-page-per-call shape.
 //! Plus a live panel: the user can watch and interact with the same real
 //! page the model is browsing. See
-//! docs/projects/completed/20260922-web-browsing.md.
+//! SME-22.
 //!
 //! `BrowserFrame`/`BrowserInputEvent` are ungated — they cross the
 //! client/server boundary as server-function payloads (`api::browsing`'s

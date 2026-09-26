@@ -16,7 +16,7 @@ use crate::models::Message;
 /// notification for rows `db::create_message` already persisted. The three
 /// `Sandbox*` variants are the same kind of ephemeral UI telemetry as
 /// `TaskUpdate`, regenerable at any time from `api::chat::get_sandbox_state`
-/// — see `docs/projects/completed/20260815-sandbox-visibility.md`.
+/// — see SME-10.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ConversationEvent {
@@ -76,14 +76,14 @@ pub enum ConversationEvent {
     /// text is still durably persisted regardless (`wake_conversation`
     /// drains and persists it *before* the API call that might fail) — this
     /// means "the model hasn't been prompted with it yet," not "it's lost."
-    /// See `docs/projects/plans/terminal-exit-notify.md`.
+    /// See SME-13.
     NotificationDeliveryFailed {
         detail: String,
     },
     /// Published after every real turn completes — ephemeral UI telemetry,
     /// same category as `TaskUpdate`/`Sandbox*Update`, regenerable at any
     /// time from `api::chat::get_context_usage`. See
-    /// docs/projects/plans/auto-compaction.md.
+    /// SME-18.
     ContextUsageUpdate {
         usage: TokenUsage,
         context_window: u32,
@@ -94,7 +94,7 @@ pub enum ConversationEvent {
     /// signal wholesale rather than merging like `TaskUpdate` requires.
     /// Ephemeral UI telemetry, regenerable at any time from
     /// `db::get_conversation_todos`. See
-    /// docs/projects/plans/todo-list-tool.md.
+    /// SME-20.
     TodoListUpdate {
         items: Vec<crate::anthropic::tools::TodoItem>,
     },
@@ -104,7 +104,7 @@ pub enum ConversationEvent {
     /// `SandboxPodUpdate` already established for the sandbox panel.
     /// Ephemeral UI telemetry, regenerable at any time from
     /// `api::browsing::get_browsing_state`. See
-    /// docs/projects/plans/web-browsing.md.
+    /// SME-22.
     BrowsingSessionUpdate {
         open: bool,
     },

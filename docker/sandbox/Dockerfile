@@ -1,6 +1,6 @@
 # Custom sandbox image: the sandbox_agent binary IS the pod's PID 1 — no
 # `sleep infinity` placeholder plus a post-hoc `pods.exec` injection (see
-# docs/projects/plans/sandbox-native-environment.md). Built by
+# SME-17). Built by
 # scripts/build-sandbox-image.sh with a build context scoped to
 # target/sandbox-agent/ (not the repo root, which .dockerignore excludes
 # target/ from) — scripts/build-sandbox-agent.sh must have produced the

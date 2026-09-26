@@ -34,7 +34,7 @@ The turn is `api::chat::run_turn`, a *loop* (capped at `MAX_TURNS`), not one Ant
 - **`TurnState`** when the turn starts and ends.
 - **`TurnError { message }`** if the user's turn fails or is stopped (`TURN_STOPPED`). The message is the error's own text (`chat_error_text`), without `ServerFnError`'s "error running server function: … (details: None)" wrapper.
 
-**Why not stream the reply on the request itself**, as it used to (`ServerEvents<ChatEvent>`)? Because that held a second connection open per tab for the whole reply. Over plain HTTP/1.1 a browser allows 6 connections per host across all tabs, so with a few tabs open a new tab couldn't load and a click (Stop) waited for the reply to end (see [projects/completed/20260926-connection-limits.md](projects/completed/20260926-connection-limits.md)). Now a tab holds one connection, plus the browsing panel's while that's open. It also means every tab sees a reply live, and a tab that (re)connects mid-reply shows the text so far (`get_reply_in_progress`, from the in-memory `REPLIES_IN_PROGRESS`, cleared when a call starts, when its reply is saved, and when the turn ends).
+**Why not stream the reply on the request itself**, as it used to (`ServerEvents<ChatEvent>`)? Because that held a second connection open per tab for the whole reply. Over plain HTTP/1.1 a browser allows 6 connections per host across all tabs, so with a few tabs open a new tab couldn't load and a click (Stop) waited for the reply to end (see [SME-27](https://linear.app/smelt-agent/issue/SME-27)). Now a tab holds one connection, plus the browsing panel's while that's open. It also means every tab sees a reply live, and a tab that (re)connects mid-reply shows the text so far (`get_reply_in_progress`, from the in-memory `REPLIES_IN_PROGRESS`, cleared when a call starts, when its reply is saved, and when the turn ends).
 
 Every turn request carries a **system prompt**: `system_prompt(&prompt_environment(pool).await)` in `api::chat`. It has two parts:
 - **The fixed base prompt**, `src/api/system_prompt.md`, compiled in with `include_str!`. It covers smelt as a coding agent, how the sandbox works (create the pod first, the `sandbox` user in `/home/sandbox`, `sudo`, what's lost when a pod ends), background commands and their notifications, the file tools, the web tools, working style, and that replies are shown as plain text rather than rendered markdown.
@@ -54,7 +54,7 @@ One layer down, `anthropic::stream::stream_anthropic_message` retries a briefly 
 
 ## Live conversation events
 
-Seven server functions exist purely to support live-updating panels (the background-tasks panel via `run_async`, the sandbox panel — see `docs/projects/completed/20260815-sandbox-visibility.md` — the context-usage indicator/detail view — see `docs/projects/completed/20260922-auto-compaction.md` — the todo panel via `todowrite`/`todoread` — see `docs/projects/completed/20260922-todo-list-tool.md` — and the browsing-session panel — see `docs/projects/completed/20260922-web-browsing.md`) and turns pushed from outside a request:
+Seven server functions exist purely to support live-updating panels (the background-tasks panel via `run_async`, the sandbox panel — see SME-10 — the context-usage indicator/detail view — see SME-18 — the todo panel via `todowrite`/`todoread` — see SME-20 — and the browsing-session panel — see SME-22) and turns pushed from outside a request:
 
 ```rust
 #[get("/api/conversations/{id}/tasks")]

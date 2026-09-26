@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds the custom sandbox image (docker/sandbox/Dockerfile) and delivers
 # it to the cluster with no registry involved — see
-# docs/projects/plans/sandbox-native-environment.md's Phase 1. A manual
+# SME-17's Phase 1. A manual
 # step, not wired into `docker compose up` itself: unlike
 # build-sandbox-agent.sh, this needs a live cluster (DOCKER_HOST,
 # KUBECONFIG) to do anything at all, so it can only run *after* the

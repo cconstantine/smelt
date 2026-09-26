@@ -1,12 +1,12 @@
 //! Sandbox lifecycle: a disposable Kubernetes Pod per conversation, in the
 //! `smelt-park` namespace, plus a persistent terminal reached through a
 //! purpose-built agent that *is* the pod's own `ENTRYPOINT` (its real PID
-//! 1 — see `docs/projects/plans/sandbox-native-environment.md`, built on a
+//! 1 — see SME-17, built on a
 //! custom image `scripts/build-sandbox-image.sh` produces and delivers
 //! with no registry involved). Pod and terminal are separate,
 //! explicitly-managed lifecycles — see
-//! `docs/projects/plans/sandbox-terminal.md` for that design; the original
-//! pod-only mechanism is `docs/projects/plans/k8s-sandbox.md`.
+//! SME-9 for that design; the original
+//! pod-only mechanism is SME-7.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock};
@@ -66,7 +66,7 @@ pub enum SandboxError {
     /// "How" on why pod/terminal identity is DB-backed this round.
     Db(sqlx::Error),
     /// `create_pod` refuses: this conversation already has a live pod. See
-    /// docs/projects/plans/file-tools.md's "One pod per conversation."
+    /// SME-11's "One pod per conversation."
     PodAlreadyExists,
     InvalidMountPath(String),
     StartFailed(String),
@@ -382,7 +382,7 @@ impl SandboxManager {
     /// resources are immutable on an already-existing pod. `volumes` is
     /// every currently-configured `sandbox_volumes` row — every pod gets
     /// every one of them mounted, unconditionally (see
-    /// docs/projects/plans/sandbox-native-environment.md's Phase 4); an
+    /// SME-17's Phase 4); an
     /// empty slice is fine for callers (mostly tests) that don't care.
     pub async fn create(
         &self,
@@ -505,7 +505,7 @@ fn default_cpu_limit() -> String {
 /// `SANDBOX_IMAGE`, default `"docker.io/library/smelt-sandbox:latest"` —
 /// same pattern as `default_memory_limit`. The custom image
 /// `scripts/build-sandbox-image.sh` builds and delivers with no registry
-/// involved (see docs/projects/plans/sandbox-native-environment.md) — its
+/// involved (see SME-17) — its
 /// own `ENTRYPOINT` is the sandbox agent, which is what makes the agent
 /// the pod's real PID 1 rather than something injected and launched after
 /// the fact. The fully-qualified default (not just `smelt-sandbox:latest`)
@@ -570,7 +570,7 @@ fn build_pod_spec(name: &str, memory: &str, cpu: &str, volumes: &[db::SandboxVol
                 // No `command` override — the image's own `ENTRYPOINT` is
                 // the sandbox agent, so it's already running (and keeping
                 // the pod alive) the moment the container starts. See
-                // docs/projects/plans/sandbox-native-environment.md.
+                // SME-17.
                 resources: Some(ResourceRequirements {
                     limits: Some(limits),
                     ..Default::default()
@@ -760,7 +760,7 @@ pub struct TerminalInfo {
 /// `read_file`'s result — `hash` is the SHA-256 of the *full* file (not
 /// just `lines`, the requested slice), what a later `edit_file`/
 /// `write_file` call's `expected_hash` is checked against. See
-/// docs/projects/plans/file-tools.md's "Change detection, not just 'was it
+/// SME-11's "Change detection, not just 'was it
 /// read.'"
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileContents {
@@ -777,7 +777,7 @@ pub struct DirEntry {
     pub size: Option<u64>,
 }
 
-/// One `grep` match — see docs/projects/plans/glob-and-grep.md.
+/// One `grep` match — see SME-19.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GrepMatch {
     pub path: String,
@@ -858,7 +858,7 @@ struct TerminalConnection {
     /// `connect`) — lets `handle_agent_message` publish a
     /// `SandboxCommandUpdate` for every output line and completion without
     /// a per-line DB round trip. See
-    /// `docs/projects/completed/20260815-sandbox-visibility.md`.
+    /// SME-10.
     conversation_id: i64,
 }
 
@@ -926,7 +926,7 @@ fn deregister_if_current(pod_id: i64, conn: &Arc<TerminalConnection>) -> bool {
 /// The decision behind `create_pod`'s one-pod-per-conversation guard,
 /// pulled out as a pure function over an already-fetched live-pod list so
 /// it's unit-testable without a database or cluster — see
-/// docs/projects/plans/file-tools.md's "One pod per conversation."
+/// SME-11's "One pod per conversation."
 fn check_pod_guard(existing: &[db::SandboxPod]) -> Result<(), SandboxError> {
     if existing.is_empty() {
         Ok(())
@@ -1190,7 +1190,7 @@ pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInf
 /// `SANDBOX_VOLUME_STORAGE_SIZE`, default `"10Gi"` — same pattern as
 /// `default_memory_limit`. Every generic volume's PVC requests this much
 /// capacity; not currently configurable per volume (nothing in
-/// docs/projects/plans/sandbox-native-environment.md calls for that), just
+/// SME-17 calls for that), just
 /// a documented fixed default.
 fn default_volume_storage_size() -> String {
     std::env::var("SANDBOX_VOLUME_STORAGE_SIZE")
@@ -1729,7 +1729,7 @@ pub async fn read_file(
 /// Creates or overwrites `path` in this conversation's pod. `expected_hash`
 /// is `None` only for a brand-new file (the read-before-write check has
 /// nothing to have read yet) — see
-/// docs/projects/plans/file-tools.md's "Read-before-write discipline."
+/// SME-11's "Read-before-write discipline."
 /// Returns the new content's hash.
 pub async fn write_file(
     pool: &PgPool,
@@ -1814,7 +1814,7 @@ pub async fn list_directory(
 
 /// Finds files under `path` whose path relative to `path` matches
 /// `pattern`, paginated by `offset`/`limit` — see
-/// docs/projects/plans/glob-and-grep.md.
+/// SME-19.
 pub async fn glob(
     pool: &PgPool,
     conversation_id: i64,
@@ -1844,7 +1844,7 @@ pub async fn glob(
 
 /// Searches file contents under `path` for `pattern`, optionally narrowed
 /// to files matching `glob` first, paginated by `offset`/`limit` — see
-/// docs/projects/plans/glob-and-grep.md.
+/// SME-19.
 pub async fn grep(
     pool: &PgPool,
     conversation_id: i64,
@@ -2068,7 +2068,7 @@ async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64, reason: Option<String>
         // `reconnect_if_needed` → here), and both the notice (saved only
         // between turns, see `save_notice_between_turns`) and the wake
         // take that same non-reentrant lock. See
-        // docs/projects/plans/terminal-exit-notify.md.
+        // SME-13.
         let pool = pool.clone();
         tokio::spawn(async move {
             if let Some(notice) = notice {
@@ -2208,7 +2208,7 @@ struct AgentDirEntry {
 }
 
 /// Mirrors `sandbox_agent`'s `GrepMatchInfo` — see
-/// docs/projects/plans/glob-and-grep.md.
+/// SME-19.
 #[derive(Deserialize)]
 struct AgentGrepMatch {
     path: String,
@@ -2298,7 +2298,7 @@ async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, tex
                 // Actively wake the model rather than leaving it to the
                 // passive backlog drain (which only runs the next time
                 // something *else* triggers a turn) — see
-                // docs/projects/plans/terminal-exit-notify.md. Detached:
+                // SME-13. Detached:
                 // this runs inside the per-pod WebSocket reader loop, and
                 // awaiting a full model round trip here would block it from
                 // processing any further output/exit events, this pod's or
@@ -2917,12 +2917,12 @@ mod tests {
     /// there's nothing to race with. Pod isolation, previously shown via
     /// two pods in one conversation, now uses two separate conversations —
     /// a conversation can have at most one live pod, see
-    /// docs/projects/plans/file-tools.md's "One pod per conversation."
+    /// SME-11's "One pod per conversation."
     #[sqlx::test]
     async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
         // Every terminal command that finishes during this test now
         // triggers a detached `chat::wake_conversation` call (see
-        // docs/projects/plans/terminal-exit-notify.md) — without this
+        // SME-13) — without this
         // redirect, `ANTHROPIC_API_KEY` present in this environment's real
         // process env (not just this test's own doing) would send every one
         // of those as a genuine request to the live Anthropic API. Pointed
@@ -3083,7 +3083,7 @@ mod tests {
 
             // --- A terminal command's own exit event actively wakes the
             // model — no other trigger needed (see
-            // docs/projects/plans/terminal-exit-notify.md). ANTHROPIC_API_KEY
+            // SME-13). ANTHROPIC_API_KEY
             // isn't set in this test environment, so the resulting
             // wake_conversation call fails at the API step — but the
             // notification text is drained and durably persisted *before*
@@ -3288,7 +3288,7 @@ mod tests {
             assert!(subdir_entry.is_dir);
 
             // --- glob/grep: pattern-based file discovery and content
-            // search — see docs/projects/plans/glob-and-grep.md. A fresh
+            // search — see SME-19. A fresh
             // subdirectory, kept separate from example.txt's own
             // (by-now-heavily-edited) content above so this section's
             // expectations don't depend on tracking that history. ---
@@ -3455,7 +3455,7 @@ mod tests {
 
             // --- Proactive crash detection: deleting a pod out from under a
             // live connection is noticed and reported without any further
-            // tool call — see docs/projects/completed/20260816-sandbox-oom.md. ---
+            // tool call — see SME-12. ---
             let conversation_e = db::create_conversation(&pool).await.expect("create conversation e");
             let pod_e = create_pod(&pool, conversation_e.id, None, None).await.expect("create_pod (e) should succeed");
             let terminal_e = create_terminal(&pool, conversation_e.id).await.expect("create_terminal (e) should succeed");
@@ -3507,7 +3507,7 @@ mod tests {
             // --- The user stops a pod that has an open terminal and a
             // running command: everything is torn down, the command is
             // marked lost, and the model gets a user-stop notice, not a
-            // crash notice. See docs/projects/completed/20260925-pod-management.md. ---
+            // crash notice. See SME-26. ---
             let conversation_g = db::create_conversation(&pool).await.expect("create conversation g");
             let mut app_events = events::subscribe_app();
             let pod_g = create_pod(&pool, conversation_g.id, None, None).await.expect("create_pod (g) should succeed");
@@ -3585,7 +3585,7 @@ mod tests {
             // when the watch's first listing completes; a pod deleted while
             // the watch runs is closed after the grace period; a young
             // record whose pod may still be starting is left alone. All
-            // quietly. See docs/projects/completed/20260925-pod-management.md. ---
+            // quietly. See SME-26. ---
             let updated_at = |id: i64| {
                 let pool = pool.clone();
                 async move {
@@ -3677,7 +3677,7 @@ mod tests {
             // hand-built pod with no agent in it (not `create_pod`, which
             // now always has one running the instant the pod is `Running`
             // — the agent is the image's own `ENTRYPOINT`, see Phase 2 of
-            // docs/projects/plans/sandbox-native-environment.md) is what
+            // SME-17) is what
             // makes every connect() attempt genuinely and deterministically
             // fail while the pod itself stays Running throughout, exactly
             // the "stuck reporting Running but unreachable" case this path
@@ -3750,7 +3750,7 @@ mod tests {
             // --- Generic volumes: create_volume/delete_volume manage a
             // real PVC alongside the sandbox_volumes row, and a volume
             // mounted into a real pod is genuinely writable/readable —
-            // see docs/projects/plans/sandbox-native-environment.md's
+            // see SME-17's
             // Phase 4. Folded in here rather than a separate test function
             // for the same MANAGER-singleton reason as everything else in
             // this test (see docs/testing.md). ---
@@ -4187,7 +4187,7 @@ mod tests {
     }
 
     /// New observable behavior from
-    /// docs/projects/plans/sandbox-native-environment.md's Phase 3 —
+    /// SME-17's Phase 3 —
     /// commands run as the pre-created, unprivileged `sandbox` user by
     /// default (not root, unlike the old `debian:trixie-slim` image with
     /// no `USER` set), with passwordless `sudo` still available for

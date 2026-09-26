@@ -7,7 +7,7 @@ use crate::frontend::Route;
 
 /// Lists every configured volume — every sandbox pod smelt creates gets
 /// every one of these mounted, unconditionally (see
-/// docs/projects/plans/sandbox-native-environment.md's Phase 4). No edit
+/// SME-17's Phase 4). No edit
 /// page: nothing to change once a volume exists besides deleting it, same
 /// inline arm/confirm pattern `ConversationSidebar`'s delete already uses
 /// — only one row armed at a time.

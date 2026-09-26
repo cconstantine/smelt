@@ -29,7 +29,7 @@ mod browser_tests;
 /// The real Axum router `main()` serves — factored out so
 /// `src/browser_tests.rs` can build the exact same router, in-process, on a
 /// test-local port, without duplicating it. See
-/// `docs/projects/completed/20260815-sandbox-visibility.md`.
+/// SME-10.
 #[cfg(feature = "server")]
 fn build_router() -> axum::Router {
     use dioxus::prelude::DioxusRouterExt;

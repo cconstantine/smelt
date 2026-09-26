@@ -1,7 +1,7 @@
 //! `webfetch`: navigates a real headless browser (`chromiumoxide`, driving
 //! `chrome-headless-shell` over CDP — the same binary/setup
 //! `src/browser_tests.rs` already uses) to a URL and returns its rendered,
-//! readable text. See docs/projects/plans/webfetch.md for the full design,
+//! readable text. See SME-21 for the full design,
 //! including why a real browser (JS execution included) rather than a
 //! plain HTTP GET, and why every request the page makes — not just the
 //! top-level navigation — gets checked against an SSRF guard via the CDP

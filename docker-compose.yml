@@ -97,7 +97,7 @@ services:
       retries: 30
 
   # A hermetic k8s cluster for sandbox tests — see
-  # docs/projects/plans/k8s-sandbox.md. Pinned to match the real `homelab`
+  # SME-7. Pinned to match the real `homelab`
   # cluster's version, to avoid API-shape drift between the two.
   # `privileged: true` is the same category of tradeoff already accepted
   # for the `docker` sidecar above; k3s needs it to run containerd-in-a-

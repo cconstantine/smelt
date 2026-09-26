@@ -3,7 +3,7 @@
 //! `browser_navigate`/... dispatch, same split `api::chat`'s
 //! `get_sandbox_state`/`subscribe_conversation_events` already has
 //! relative to the sandbox terminal tools. See
-//! docs/projects/plans/web-browsing.md.
+//! SME-22.
 
 use dioxus::fullstack::ServerEvents;
 use dioxus::prelude::*;

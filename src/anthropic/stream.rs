@@ -18,7 +18,7 @@ pub struct StreamedTurn {
     /// `message_start`, `output_tokens` from the last `message_delta` that
     /// carried one (overwritten each time it arrives, same "last one wins"
     /// treatment `stop_reason` itself already gets). See
-    /// docs/projects/plans/auto-compaction.md.
+    /// SME-18.
     pub usage: TokenUsage,
 }
 

@@ -1,5 +1,5 @@
 //! The pods view: every live sandbox pod across all conversations, and
-//! stopping one. See docs/projects/completed/20260925-pod-management.md.
+//! stopping one. See SME-26.
 
 use chrono::NaiveDateTime;
 use dioxus::fullstack::ServerEvents;

@@ -4,7 +4,7 @@
 //! plain-HTTP `http_request`). Kept as one module deliberately — SSRF logic
 //! is exactly the kind of thing that should have a single source of truth,
 //! not two copies that could drift apart. See
-//! docs/projects/plans/webfetch.md and docs/projects/plans/http-request-tool.md.
+//! SME-21 and SME-21.
 
 use std::net::IpAddr;
 

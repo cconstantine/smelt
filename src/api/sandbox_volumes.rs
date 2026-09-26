@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{db, sandbox};
 
 /// Read-only summary of a configured generic volume for the browser — see
-/// docs/projects/plans/sandbox-native-environment.md's Phase 4. Deliberately
+/// SME-17's Phase 4. Deliberately
 /// minimal: this pass has nothing to edit or view beyond name/mount path
 /// (no upload, no browsing — see the plan's "What").
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

@@ -155,7 +155,7 @@ pub async fn delete_conversation(pool: &PgPool, id: i64) -> Result<(), sqlx::Err
 }
 
 /// Last-known real `usage` numbers for `conversation_id` — see
-/// docs/projects/plans/auto-compaction.md. `None` if no turn has completed
+/// SME-18. `None` if no turn has completed
 /// for this conversation yet (nothing to report).
 pub async fn get_conversation_usage(
     pool: &PgPool,
@@ -203,7 +203,7 @@ pub async fn upsert_conversation_usage(
 /// been called for it. Mechanical mirror of `get_conversation_usage`
 /// (flagged per development-process.md's exception): same "last-known-only"
 /// shape, just a JSONB list instead of four token counts. See
-/// docs/projects/plans/todo-list-tool.md.
+/// SME-20.
 pub async fn get_conversation_todos(
     pool: &PgPool,
     conversation_id: i64,
@@ -241,7 +241,7 @@ pub async fn set_conversation_todos(
 // --- Terminal (pod/terminal/command lifecycle) ---
 // Server-only, no client/server boundary to cross (no UI yet) — unlike
 // Conversation/Message, these don't need to live in models.rs or derive
-// anything WASM-relevant. See docs/projects/plans/sandbox-terminal.md.
+// anything WASM-relevant. See SME-9.
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, sqlx::FromRow)]
 pub struct SandboxPod {
@@ -453,7 +453,7 @@ pub async fn sandbox_terminal_pod_id(
 /// Resolves which conversation's `events::publish` bus a pod-scoped call
 /// (`terminate_pod`, `create_terminal`, `terminate_terminal`, crash
 /// cleanup) should target — see
-/// `docs/projects/completed/20260815-sandbox-visibility.md`.
+/// SME-10.
 pub async fn sandbox_pod_conversation_id(
     pool: &PgPool,
     pod_id: i64,
@@ -701,7 +701,7 @@ pub async fn list_terminal_commands(
 // /sandbox-volumes UI) --- Plain CRUD, no soft delete — configuration a
 // person edits, same precedent as mcp_servers below, not a live external
 // resource like a sandbox pod itself. See
-// docs/projects/plans/sandbox-native-environment.md's Phase 4.
+// SME-17's Phase 4.
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, sqlx::FromRow)]
 pub struct SandboxVolume {
@@ -760,7 +760,7 @@ pub async fn delete_sandbox_volume(pool: &PgPool, id: i64) -> Result<(), sqlx::E
 // --- MCP servers (externally-hosted, configured via the /mcp-servers UI) ---
 // Plain CRUD, no soft delete — this is configuration a person edits, not a
 // live external resource like a sandbox pod. See
-// docs/projects/completed/20260817-mcp-servers.md.
+// SME-15.
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, sqlx::FromRow)]
 pub struct McpServerConfig {
@@ -769,7 +769,7 @@ pub struct McpServerConfig {
     pub url: String,
     pub extra_headers: sqlx::types::Json<HashMap<String, String>>,
     /// `"static_headers"` or `"oauth"` — see
-    /// docs/projects/plans/mcp-oauth.md. A plain `String`, not a Rust enum:
+    /// SME-16. A plain `String`, not a Rust enum:
     /// the DB-level `CHECK` constraint is the source of truth for valid
     /// values, matching `terminal_commands.status`'s existing precedent
     /// elsewhere in this file.
@@ -783,7 +783,7 @@ pub struct McpServerConfig {
     pub oauth_credentials: Option<sqlx::types::Json<serde_json::Value>>,
     /// A pre-registered OAuth client, for a provider that publishes no
     /// discovery metadata and rejects Dynamic Client Registration — GitHub,
-    /// confirmed live (see docs/projects/plans/mcp-oauth.md). Set only at
+    /// confirmed live (see SME-16). Set only at
     /// creation time (`McpServerNew`), same "delete and recreate to
     /// change" precedent as `auth_mode` itself. `oauth_client_id` isn't
     /// secret — it's visible in the authorization URL sent to the browser
@@ -857,7 +857,7 @@ pub async fn get_mcp_server_config_by_name(
 /// deleted (arbitrary but deterministic; the UI never actually produces
 /// this case, since a header row is either edited or removed, never both).
 /// A URL change clears any stored `oauth_credentials` — see
-/// docs/projects/plans/mcp-oauth.md's "Data model": a grant is bound to the
+/// SME-16's "Data model": a grant is bound to the
 /// audience it was issued for, so carrying it across a URL change would
 /// silently point a stale token at a different resource.
 pub async fn update_mcp_server_config(
@@ -2336,7 +2336,7 @@ mod tests {
         .expect("set oauth credentials");
 
         // Changing the URL invalidates a grant that was issued for the old
-        // audience — see docs/projects/plans/mcp-oauth.md's "Data model."
+        // audience — see SME-16's "Data model."
         let updated = update_mcp_server_config(
             &pool,
             created.id,

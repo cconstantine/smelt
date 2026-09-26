@@ -1,7 +1,7 @@
 //! The sandbox agent: injected into and launched inside a sandbox pod by
 //! `src/sandbox.rs`, hosting N persistent named inner `bash` shells behind
 //! one WebSocket server the main smelt process talks to. See
-//! `docs/projects/plans/sandbox-terminal.md` for the full design — this
+//! SME-9 for the full design — this
 //! file implements the "Protocol" and the `sandbox_agent.rs` bullet in
 //! "Which files" exactly: one agent process per pod, multiplexing every
 //! terminal that pod hosts (`HashMap<terminal_id, Shell>`), each shell its
@@ -50,7 +50,7 @@ fn shell_quote(s: &str) -> String {
 /// SHA-256 hex digest of a file's full content — what `read_file` returns
 /// alongside its (possibly paginated) slice, and what `edit_file`/
 /// `write_file` compare an `expected_hash` against before writing. See
-/// docs/projects/plans/file-tools.md's "Change detection, not just 'was it
+/// SME-11's "Change detection, not just 'was it
 /// read.'"
 fn hash_content(content: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -91,7 +91,7 @@ fn byte_offset_to_line(text: &str, offset: usize) -> u32 {
 }
 
 /// `edit_file`'s core replace logic — see
-/// docs/projects/plans/file-tools.md's "What"/"How" on `edit_file`.
+/// SME-11's "What"/"How" on `edit_file`.
 #[derive(Debug, PartialEq)]
 enum EditError {
     /// `old_string` doesn't occur in the file at all.
@@ -160,7 +160,7 @@ fn paginate_lines(content: &str, offset: u32, limit: u32) -> (Vec<String>, usize
 
 /// Compiles `pattern` into a matcher shared by `glob`'s own `pattern` and
 /// `grep`'s optional `glob` filter — see
-/// docs/projects/plans/glob-and-grep.md's "Decisions from review."
+/// SME-19's "Decisions from review."
 /// `literal_separator(true)` is deliberate, not `globset`'s own default:
 /// checked against the real crate source (not assumed), a bare
 /// `globset::Glob` lets `*` cross a `/` (so plain `*.rs`, with no `**`,
@@ -191,7 +191,7 @@ fn compile_grep_pattern(pattern: &str, case_insensitive: bool) -> Result<regex::
 /// exhausted before every line was checked (distinct from the file simply
 /// having no more matches). One file's worth of work — the walk loop that
 /// calls this per file (only exercised by the real-cluster integration
-/// test, not unit-tested here — see docs/projects/plans/glob-and-grep.md)
+/// test, not unit-tested here — see SME-19)
 /// owns combining this across every file into the overall `scan_capped`.
 fn grep_content(
     content: &str,
@@ -229,7 +229,7 @@ fn paginate_slice<T: Clone>(items: &[T], offset: u32, limit: u32) -> (Vec<T>, us
 
 /// One `list_directory` entry — `size` is only meaningful for a file (a
 /// directory's byte size on disk isn't what a caller of this tool wants to
-/// know), see docs/projects/plans/file-tools.md's "What."
+/// know), see SME-11's "What."
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct DirEntryInfo {
     name: String,
@@ -449,7 +449,7 @@ enum ClientMessage {
     },
 }
 
-/// One `grep` match — see docs/projects/plans/glob-and-grep.md.
+/// One `grep` match — see SME-19.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct GrepMatchInfo {
     path: String,
@@ -687,7 +687,7 @@ async fn handle_client_message(text: &str, state: &Arc<AppState>, socket: &mut W
 /// Shared across `read_file`/`edit_file`/`write_file` — an unbounded file
 /// becomes an unbounded tool-result message persisted into Postgres and
 /// re-sent on every subsequent turn, see
-/// docs/projects/plans/file-tools.md's "Size bound."
+/// SME-11's "Size bound."
 const MAX_FILE_SIZE_BYTES: u64 = 256 * 1024;
 /// `list_directory`'s analogous bound, as an entry count rather than bytes
 /// — same reasoning, see the plan's "Size bound."
@@ -703,7 +703,7 @@ const MAX_GREP_FILE_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 /// worst-case walk cost on a huge tree or a pathological pattern.
 /// `scan_capped` in the response is true only when *this* was hit, not
 /// just the requested page — see
-/// docs/projects/plans/glob-and-grep.md's "Decisions from review."
+/// SME-19's "Decisions from review."
 const MAX_GLOB_SCAN: usize = 2000;
 const MAX_GREP_SCAN: usize = 1000;
 
@@ -964,7 +964,7 @@ async fn handle_list_directory(socket: &mut WebSocket, request_id: String, path:
 }
 
 /// Finds files under `path` whose path relative to `path` matches
-/// `pattern` — see docs/projects/plans/glob-and-grep.md. Real filesystem
+/// `pattern` — see SME-19. Real filesystem
 /// walk (via `ignore::WalkBuilder`, `.gitignore`-aware even outside a real
 /// git checkout), not unit-tested directly — only `compile_glob_pattern`
 /// and `paginate_slice`, its pure pieces, are; this glue is exercised by
@@ -1540,7 +1540,7 @@ mod tests {
     // --- paginate_slice: same offset/limit semantics as paginate_lines,
     // but over an already-materialized Vec<T> (glob's Vec<String> paths,
     // grep's Vec<GrepMatch>) rather than splitting `&str` into lines —
-    // see docs/projects/plans/glob-and-grep.md.
+    // see SME-19.
 
     #[test]
     fn test_paginate_slice_returns_full_slice_within_limit() {
@@ -1574,7 +1574,7 @@ mod tests {
     }
 
     // --- compile_glob_pattern: shared by glob's own `pattern` and grep's
-    // optional `glob` filter — see docs/projects/plans/glob-and-grep.md's
+    // optional `glob` filter — see SME-19's
     // "Decisions from review."
 
     #[test]
@@ -1607,7 +1607,7 @@ mod tests {
     // --- compile_grep_pattern / grep_content: grep's own regex-matching
     // core, deliberately separated from the real directory walk (which is
     // only exercised by the real-cluster integration test) — see
-    // docs/projects/plans/glob-and-grep.md.
+    // SME-19.
 
     #[test]
     fn test_compile_grep_pattern_rejects_invalid_regex() {
