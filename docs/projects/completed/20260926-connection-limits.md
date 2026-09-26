@@ -71,7 +71,7 @@ Each seen failing first:
 - **One commit on this branch doesn't build for the web** (`224aff9`: new events without the page handling them). I ran only the server tests between commits, and the next commit fixed it. PRs here are squash-merged, so it won't reach `main`, but it broke the first worktree run.
 - **A count over the whole page misfired:** the sender's message also appears as the conversation's sidebar title. Page-wide text checks need scoping to the element that matters.
 
-**Process suggestion (not applied; needs agreement):**
+**Process change (confirmed and applied to development-process.md, under Rules):**
 - Build both targets before each commit, not only before calling a feature done: `cargo check --no-default-features --features web --target wasm32-unknown-unknown` alongside the server tests. A commit that doesn't build breaks bisecting and "run the test against the old code" checks like the one above.
 
 **Bug bash: still due** (four projects since the last one).
