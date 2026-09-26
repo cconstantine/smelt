@@ -1347,6 +1347,38 @@ async fn test_end_to_end_browser_scenarios() {
         assert_ne!(fills[0], fills[1], "the main action should stand out from the secondary ones: {fills:?}");
         assert_eq!(fills[1], fills[2], "secondary actions should share one style: {fills:?}");
         page.close().await.expect("close the tab");
+
+        // --- Scenario 22: a new conversation says what smelt can do and
+        // offers example asks; one fills the message box without sending.
+        // It was a blank screen (SME-41 D12). ---
+        let empty = new_conversation(pool, &created).await;
+        let page = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, empty.id))
+            .await
+            .expect("open the empty conversation");
+        wait_for_live_client(&page, empty.id).await;
+        assert!(
+            wait_for_count(&page, ".conversation-empty .example-ask", 3, Duration::from_secs(10)).await,
+            "an empty conversation should offer example asks"
+        );
+        let example: String = page.evaluate("document.querySelector('.example-ask').innerText").await.expect("read").into_value().expect("text");
+        page.find_element(".example-ask").await.expect("an example").click().await.expect("pick it");
+        let mut filled = String::new();
+        for _ in 0..25 {
+            filled = page.evaluate(format!("document.querySelector({CHAT_INPUT:?}).value")).await.expect("read").into_value().expect("text");
+            if !filled.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(filled, example, "picking an example should fill the message box");
+        assert_eq!(
+            page.evaluate("document.querySelectorAll('.message-user').length").await.expect("count").into_value::<i64>().expect("n"),
+            0,
+            "picking an example shouldn't send it"
+        );
+        page.close().await.expect("close the tab");
     })))
     .await;
 

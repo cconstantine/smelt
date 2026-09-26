@@ -983,6 +983,14 @@ fn reply_is_only_thinking(role: &str, blocks: &[ContentBlock]) -> bool {
         && blocks.iter().all(|b| matches!(b, ContentBlock::Thinking { .. }))
 }
 
+/// Asks offered in an empty conversation (SME-41 D12): one each for code,
+/// a repository and the web, the three things smelt is for.
+const EXAMPLE_ASKS: [&str; 3] = [
+    "Write a Python script that prints the first 20 primes, then run it",
+    "Clone https://github.com/pallets/itsdangerous and run its tests",
+    "Find the latest stable Rust release and summarize what's new",
+];
+
 /// How long ago a conversation was last active, as the sidebar shows it:
 /// one unit, `now`, `5m`, `3h`, `2d`, `3w` (SME-41 D8).
 fn short_age(seconds: i64) -> String {
@@ -3627,6 +3635,25 @@ fn ChatPanel(
                                             "Error rendering message: {e}"
                                         }
                                     },
+                                }
+                            }
+                            // A new conversation says what smelt does and offers a
+                            // few asks to start from, instead of a blank screen
+                            // (SME-41 D12). Picking one fills the message box.
+                            if messages().is_empty() && !turn_running() && matches!(initial_messages(), Some(Some(Ok(_)))) {
+                                div { class: "conversation-empty",
+                                    h2 { "What should smelt work on?" }
+                                    p { "It works in a sandbox of its own: it writes and runs code, uses a terminal, reads the web, and shows you each step." }
+                                    div { class: "example-asks",
+                                        for example in EXAMPLE_ASKS {
+                                            button {
+                                                class: "example-ask",
+                                                r#type: "button",
+                                                onclick: move |_| input.set(example.to_string()),
+                                                "{example}"
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             if let Some(reply) = streaming_text() {

@@ -2418,3 +2418,56 @@ div.mcp-status-not-connected::before {
         animation: none;
     }
 }
+
+/* An empty conversation (SME-41 D12). */
+.conversation-empty {
+    align-self: center;
+    max-width: 560px;
+    margin: auto 0;
+    padding: 24px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    color: var(--text-2);
+}
+
+.conversation-empty h2 {
+    margin: 0;
+    font-size: 20px;
+    color: var(--ink);
+    text-wrap: balance;
+}
+
+.conversation-empty p {
+    margin: 0 0 6px;
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+.example-asks {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.example-ask {
+    text-align: left;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+}
+
+.example-ask:hover {
+    border-color: var(--border-strong);
+    background: var(--subtle);
+}
+
+.example-ask:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
