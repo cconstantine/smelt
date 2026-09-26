@@ -1258,6 +1258,37 @@ async fn test_end_to_end_browser_scenarios() {
         assert!(luminance[0] < 0.2 && luminance[1] < 0.25, "the page should be dark in dark mode: {luminance:?}");
         assert!(luminance[2] > 0.55, "text should be light in dark mode: {luminance:?}");
         page.close().await.expect("close the tab");
+
+        // --- Scenario 21: one primary action per form, and intro text
+        // lines up with its heading. Every button in the MCP form was
+        // solid black, "Remove" included, and intro text sat 24px in from
+        // the heading (SME-41 D6). ---
+        let page = harness.browser.new_page(format!("{}mcp-servers", harness.base_url)).await.expect("open MCP servers");
+        wait_for_element(&page, "h1", Duration::from_secs(10)).await;
+        let edges: Vec<f64> = page
+            .evaluate(
+                "(() => { const p = document.querySelector('.mcp-servers-page p.muted'); \
+                 return [document.querySelector('h1').getBoundingClientRect().left, \
+                 p.getBoundingClientRect().left + parseFloat(getComputedStyle(p).paddingLeft)]; })()",
+            )
+            .await
+            .expect("measure")
+            .into_value()
+            .expect("numbers");
+        assert!((edges[0] - edges[1]).abs() < 1.0, "intro text should line up with the heading: {edges:?}");
+        page.goto(format!("{}mcp-servers/new", harness.base_url)).await.expect("open the new-server form");
+        wait_for_element(&page, ".mcp-remove-header", Duration::from_secs(10)).await;
+        let fills: Vec<String> = page
+            .evaluate(
+                "['button[type=submit]', '.mcp-add-header', '.mcp-remove-header'].map(s => getComputedStyle(document.querySelector(s)).backgroundColor)",
+            )
+            .await
+            .expect("read the buttons")
+            .into_value()
+            .expect("colours");
+        assert_ne!(fills[0], fills[1], "the main action should stand out from the secondary ones: {fills:?}");
+        assert_eq!(fills[1], fills[2], "secondary actions should share one style: {fills:?}");
+        page.close().await.expect("close the tab");
     })))
     .await;
 

@@ -1408,8 +1408,8 @@ body {
     box-shadow: 0 0 0 3px rgba(17, 17, 17, 0.08);
 }
 
-.mcp-add-form button,
-.mcp-edit-form button,
+.mcp-add-form button[type="submit"],
+.mcp-edit-form button[type="submit"],
 .mcp-server-actions button {
     align-self: flex-start;
     padding: 8px 16px;
@@ -1422,8 +1422,8 @@ body {
     cursor: pointer;
 }
 
-.mcp-add-form button:hover,
-.mcp-edit-form button:hover,
+.mcp-add-form button[type="submit"]:hover,
+.mcp-edit-form button[type="submit"]:hover,
 .mcp-server-actions button:hover {
     background: var(--ink-hover);
 }
@@ -1553,9 +1553,17 @@ body {
     background: var(--subtle);
 }
 
+/* The destructive action: the same shape as every other button, in red
+   outline (SME-41 D6). */
 .mcp-delete {
-    border-color: var(--danger) !important;
+    padding: 8px 16px;
+    border: 1px solid var(--danger) !important;
+    border-radius: 8px;
+    background: var(--surface);
     color: var(--danger) !important;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
 }
 
 .mcp-delete.confirm {
@@ -2337,4 +2345,12 @@ div.mcp-status-not-connected::before {
 .not-found-home-link {
     color: var(--text-2);
     font-size: 14px;
+}
+
+/* Settings pages: intro text and empty states line up with the heading
+   instead of the 24px indent .muted gives elsewhere (SME-41 D6). */
+.mcp-servers-page p.muted,
+.pods-page p.muted,
+.sandbox-volumes-page p.muted {
+    padding: 0;
 }
