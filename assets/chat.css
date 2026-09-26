@@ -116,6 +116,11 @@ body {
     background: #c0392b;
     border-color: #c0392b;
     color: #fff;
+}
+
+/* Bold in both states (hidden while idle), so the width the button
+   reserves for it is the width it has when armed (SME-40 F9). */
+.delete-conversation .two-step-confirm {
     font-weight: 600;
 }
 

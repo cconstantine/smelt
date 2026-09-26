@@ -1067,6 +1067,19 @@ async fn test_end_to_end_browser_scenarios() {
         // sidebar. Sandbox volumes had no link anywhere; the only way in
         // was typing the URL (SME-40 F7). ---
         let page = harness.browser.new_page(&harness.base_url).await.expect("open the app");
+        // And the sidebar's two-step Delete keeps its size when armed: the
+        // armed label was bold, so it came out wider than the width the
+        // button had reserved for it (SME-40 F9). Arming is client-side
+        // only; closing this tab disarms it.
+        let delete = ".conversation-item .delete-conversation";
+        wait_for_element(&page, delete, Duration::from_secs(10)).await;
+        let before = element_box(&page, delete).await;
+        page.find_element(delete).await.expect("find Delete").click().await.expect("arm Delete");
+        wait_for_element(&page, ".conversation-item .delete-conversation.confirm", Duration::from_secs(5)).await;
+        let after = element_box(&page, ".conversation-item .delete-conversation.confirm").await;
+        assert_eq!(before.2, after.2, "arming the sidebar's Delete changed its width");
+        page.close().await.expect("close the tab");
+        let page = harness.browser.new_page(&harness.base_url).await.expect("open the app");
         click_when_present(&page, ".sidebar a[href='/sandbox-volumes']", Duration::from_secs(10)).await;
         assert!(
             wait_for_text(&page, "Sandbox volumes", Duration::from_secs(10)).await,
