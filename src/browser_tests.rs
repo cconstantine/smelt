@@ -1229,6 +1229,35 @@ async fn test_end_to_end_browser_scenarios() {
         let body: String = page.evaluate("document.querySelector('.tool-row').textContent").await.expect("read").into_value().expect("text");
         assert!(body.contains("command sent"), "the raw result is still there on expand: {body}");
         page.close().await.expect("close the tab");
+
+        // --- Scenario 20: dark mode follows the system setting. There was
+        // none: a dark-mode system got a bright white page (SME-41 D5). ---
+        let page = harness.browser.new_page("about:blank").await.expect("open a tab");
+        page.execute(
+            chromiumoxide::cdp::browser_protocol::emulation::SetEmulatedMediaParams::builder()
+                .feature(chromiumoxide::cdp::browser_protocol::emulation::MediaFeature::new(
+                    "prefers-color-scheme",
+                    "dark",
+                ))
+                .build(),
+        )
+        .await
+        .expect("ask for dark mode");
+        page.goto(format!("{}conversation/{}", harness.base_url, tools.id)).await.expect("open the conversation");
+        wait_for_live_client(&page, tools.id).await;
+        let luminance: Vec<f64> = page
+            .evaluate(
+                "(() => { const lum = c => { const [r, g, b] = c.match(/\\d+/g).map(Number); return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255; }; \
+                 const bg = el => getComputedStyle(el).backgroundColor; \
+                 return [lum(bg(document.body)), lum(bg(document.querySelector('.sidebar'))), lum(getComputedStyle(document.querySelector('.tool-row-text')).color)]; })()",
+            )
+            .await
+            .expect("measure the colours")
+            .into_value()
+            .expect("numbers");
+        assert!(luminance[0] < 0.2 && luminance[1] < 0.25, "the page should be dark in dark mode: {luminance:?}");
+        assert!(luminance[2] > 0.55, "text should be light in dark mode: {luminance:?}");
+        page.close().await.expect("close the tab");
     })))
     .await;
 
