@@ -2122,6 +2122,7 @@ fn ConversationSidebar(
             button { class: "new-conversation", onclick: new_conversation, "New conversation" }
             Link { to: Route::McpServersRoute {}, class: "mcp-servers-link", "MCP servers" }
             Link { to: Route::PodsRoute {}, class: "pods-link", "Pods" }
+            Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
             if let Some(err) = error() {
                 p { class: "error", "{err}" }
             }

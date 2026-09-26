@@ -1062,6 +1062,17 @@ async fn test_end_to_end_browser_scenarios() {
         assert!(layout[3] <= layout[4], "the frame overflows its panel: {layout:?}");
         crate::browsing::close_session(browsing.id).await.expect("close the browsing session");
         page.close().await.expect("close the browsing tab");
+
+        // --- Scenario 16: every settings page is reachable from the
+        // sidebar. Sandbox volumes had no link anywhere; the only way in
+        // was typing the URL (SME-40 F7). ---
+        let page = harness.browser.new_page(&harness.base_url).await.expect("open the app");
+        click_when_present(&page, ".sidebar a[href='/sandbox-volumes']", Duration::from_secs(10)).await;
+        assert!(
+            wait_for_text(&page, "Sandbox volumes", Duration::from_secs(10)).await,
+            "the sidebar's volumes link should open the volumes page"
+        );
+        page.close().await.expect("close the tab");
     })))
     .await;
 

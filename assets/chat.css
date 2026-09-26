@@ -1899,7 +1899,8 @@ div.mcp-status-not-connected::before {
 
 /* --- Pods (SME-26) --- */
 
-.pods-link {
+.pods-link,
+.sandbox-volumes-link {
     display: block;
     padding: 8px 10px;
     border-radius: 8px;
@@ -1910,7 +1911,8 @@ div.mcp-status-not-connected::before {
     border: 1px solid #e5e5e5;
 }
 
-.pods-link:hover {
+.pods-link:hover,
+.sandbox-volumes-link:hover {
     background: #f2f2f2;
     color: #111;
 }
