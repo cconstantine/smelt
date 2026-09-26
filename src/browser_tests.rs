@@ -1031,6 +1031,37 @@ async fn test_end_to_end_browser_scenarios() {
         for tab in tabs {
             tab.close().await.expect("close a finished tab");
         }
+
+        // --- Scenario 15: with a browsing session open, the chat stays
+        // usable at a laptop width (this browser is 1400x900). The live
+        // frame used to be a fixed 1280px that couldn't shrink, which
+        // squeezed the messages and input to 48px and made the page
+        // scroll sideways (SME-40 F2). ---
+        let browsing = new_conversation(pool, &created).await;
+        crate::browsing::open_session(browsing.id).await.expect("open a browsing session");
+        let page = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, browsing.id))
+            .await
+            .expect("open the browsing conversation");
+        wait_for_live_client(&page, browsing.id).await;
+        wait_for_element(&page, ".browsing-panel-frame-wrap", Duration::from_secs(10)).await;
+        let layout: Vec<f64> = page
+            .evaluate(
+                "(() => { const w = s => document.querySelector(s).getBoundingClientRect().width; \
+                 return [w('.messages'), w('.composer input'), document.documentElement.scrollWidth - document.documentElement.clientWidth, \
+                 w('.browsing-panel-frame-wrap'), w('.browsing-panel')]; })()",
+            )
+            .await
+            .expect("measure the layout")
+            .into_value()
+            .expect("numbers");
+        assert!(layout[0] >= 300.0, "the messages are too narrow to use: {layout:?}");
+        assert!(layout[1] >= 150.0, "the message box is too narrow to use: {layout:?}");
+        assert!(layout[2] <= 0.0, "the page scrolls sideways: {layout:?}");
+        assert!(layout[3] <= layout[4], "the frame overflows its panel: {layout:?}");
+        crate::browsing::close_session(browsing.id).await.expect("close the browsing session");
+        page.close().await.expect("close the browsing tab");
     })))
     .await;
 

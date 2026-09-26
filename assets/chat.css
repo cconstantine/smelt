@@ -166,6 +166,9 @@ body {
     display: flex;
     flex-direction: row;
     min-height: 0;
+    /* Lets a wide panel (the live browser) shrink instead of pushing the
+       chat off screen (SME-40 F2). */
+    min-width: 0;
 }
 
 /* At this width or above, a stacked layout leaves real horizontal space
@@ -182,6 +185,8 @@ body {
     .chat-main {
         order: -1;
         flex: 3;
+        /* Room to read and type, however wide the side panels want to be. */
+        min-width: 360px;
         border-top: none;
         border-right: 1px solid #e5e5e5;
     }
@@ -565,7 +570,8 @@ body {
    worth a proper coordinate-scaling pass if this needs to fit a smaller
    viewport later. */
 .browsing-panel {
-    flex-shrink: 0;
+    flex: 1 1 auto;
+    min-width: 0;
     border-right: 1px solid #e5e5e5;
     background: #fafafa;
     padding: 16px;
@@ -582,8 +588,11 @@ body {
 }
 
 .browsing-panel-frame-wrap {
-    width: 1280px;
-    height: 800px;
+    /* Scales down to fit the panel, keeping the page's 1280x800 shape;
+       clicks are scaled back up to page pixels (`frame_point`). */
+    width: 100%;
+    max-width: 1280px;
+    aspect-ratio: 1280 / 800;
     background: #111;
     border-radius: 4px;
     cursor: pointer;
@@ -593,8 +602,8 @@ body {
 
 .browsing-panel-frame {
     display: block;
-    width: 1280px;
-    height: 800px;
+    width: 100%;
+    height: auto;
     -webkit-user-drag: none;
     user-select: none;
 }
