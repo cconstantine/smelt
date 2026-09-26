@@ -241,7 +241,23 @@ propose first, update after the user agrees.
 
 Every three completed projects or so, run a bug bash as its own branch and PR: code sweeps of the areas most recently changed, plus hands-on sweeps of the running app with a real model. Include at least one sweep with two tabs open on the same conversation and a reload mid-reply. Most of what the 2026-09-24 bug bash found sat in flows no single project owned (a second tab, a reload, a background reply, a deleted conversation), so no project's own tests covered them. Every bug bash also runs the whole **Feature checklist** through the web UI, marking each row works, broken, model (the model didn't cooperate) or not web-checkable, so "does everything still work" is a list to re-run rather than something to reconstruct. Hands-on checks go through the browser only: no seeding the database or calling APIs directly. Write the findings up in the bug bash's ticket, each with a severity and marked confirmed in the UI, confirmed by code, or suspected; stop for the user to choose what gets fixed; then fix them in severity order, one commit per finding, test-first. See [SME-23](https://linear.app/smelt-agent/issue/SME-23) and [SME-40](https://linear.app/smelt-agent/issue/SME-40).
 
+A bug bash ends with its own retrospective, like any project (see Retrospective above): what the sweep caught and why it had been missed, what slowed it down, and what to change in the process or the Feature checklist.
+
 At each project's close-out, check how many projects have completed since the last bug bash, and say so if one is due.
+
+## Design review (every few projects, alternating with bug bashes)
+
+Every six completed projects or so, alternating with bug bashes so one kind of review happens about every three projects, run a design review as its own ticket. The Feature checklist says what should work; a design review asks whether it's good to use. Everything goes through the web UI with a real model, at a laptop width and a phone width, in five passes:
+
+1. **Visual craft**, page by page: type hierarchy, colour and what it means, consistency of repeated elements, spacing, empty states, focus, phone width.
+2. **Copy**: things named from the user's side, not the system's; buttons that say what happens; errors that say what went wrong and how to fix it.
+3. **Information design**: summary before detail, state shown in form and not only in text, interactive things that look interactive.
+4. **Workflows**, walked end to end: starting a task, following a long one, stepping in, coming back later, setting up, browsing together, housekeeping.
+5. **Information availability**: at each point in those workflows, can the user tell what the model is doing, what it changed, why something failed, how close the conversation is to its limit, and what's running?
+
+Write the findings up in the ticket, each with a category, a severity, evidence (a screenshot or exact steps) and a recommendation, then stop for the user to triage. Small polish the user picks is fixed in one PR, one commit each; anything bigger becomes its own Backlog ticket. Like a bug bash, it ends with a retrospective. See [SME-41](https://linear.app/smelt-agent/issue/SME-41).
+
+At each project's close-out, say whether a design review is due as well.
 
 ## Writing idea tickets
 
