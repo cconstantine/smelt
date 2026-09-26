@@ -892,6 +892,16 @@ mod context_usage_tests {
 /// something a human typed at this stage, flagged as a known gap in the
 /// tool-use-round-trip plan's retrospective, not solved here). `ToolUse`/
 /// `ToolResult` render as their own centered cards, distinct from both the
+/// Whether an assistant message is thinking and nothing else: no text,
+/// no tool call. A model sometimes puts its whole answer in its thinking;
+/// collapsed, that reply looked empty (SME-40 F14), so such a message's
+/// thinking is shown open.
+fn reply_is_only_thinking(role: &str, blocks: &[ContentBlock]) -> bool {
+    role == "assistant"
+        && !blocks.is_empty()
+        && blocks.iter().all(|b| matches!(b, ContentBlock::Thinking { .. }))
+}
+
 /// A message's text as shown in the chat. A background task's notices
 /// are saved in a tagged form the model reads
 /// (`<task-notification task_id=".." tool="count">finished: ..</task-notification>`);
@@ -933,6 +943,7 @@ fn render_block_element(
     tz_offset_minutes: i32,
     block: &ContentBlock,
     tool_names: &HashMap<String, String>,
+    thinking_open: bool,
 ) -> Element {
     let key = format!("{message_id}-{index}");
     let timestamp = format_timestamp(created_at, tz_offset_minutes);
@@ -948,7 +959,7 @@ fn render_block_element(
         // to read on every turn, but shouldn't cost space (or a click
         // through some separate view) when they do.
         ContentBlock::Thinking { thinking, .. } => rsx! {
-            details { key: "{key}", class: "thinking-block",
+            details { key: "{key}", class: "thinking-block", open: thinking_open,
                 summary { class: "thinking-summary",
                     span { class: "thinking-icon", "💭" }
                     span { "Thinking" }
@@ -1555,6 +1566,19 @@ mod tests {
         assert_eq!(cdp_modifiers(Modifiers::META), 4);
         assert_eq!(cdp_modifiers(Modifiers::SHIFT), 8);
         assert_eq!(cdp_modifiers(Modifiers::CONTROL | Modifiers::SHIFT), 10);
+    }
+
+    #[test]
+    fn test_a_reply_that_is_only_thinking_is_recognized() {
+        let thinking = ContentBlock::Thinking {
+            thinking: "The answer is /tmp and bar.".to_string(),
+            signature: String::new(),
+        };
+        let text = ContentBlock::Text { text: "done".to_string() };
+        assert!(reply_is_only_thinking("assistant", std::slice::from_ref(&thinking)));
+        assert!(!reply_is_only_thinking("assistant", &[thinking.clone(), text]));
+        assert!(!reply_is_only_thinking("user", std::slice::from_ref(&thinking)));
+        assert!(!reply_is_only_thinking("assistant", &[]));
     }
 
     #[test]
@@ -3212,9 +3236,12 @@ fn ChatPanel(
                             }
                             for message in messages() {
                                 match message.blocks() {
-                                    Ok(blocks) => rsx! {
-                                        for (i , block) in blocks.iter().enumerate() {
-                                            {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names)}
+                                    Ok(blocks) => {
+                                        let thinking_open = reply_is_only_thinking(&message.role, &blocks);
+                                        rsx! {
+                                            for (i , block) in blocks.iter().enumerate() {
+                                                {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names, thinking_open)}
+                                            }
                                         }
                                     },
                                     Err(e) => rsx! {
