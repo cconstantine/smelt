@@ -1902,51 +1902,135 @@ pub async fn stop_pod_for_user(pool: &PgPool, pod_id: i64) -> Result<(), Termina
     Ok(())
 }
 
-/// How old a live pod row must be before `reconcile_live_pods` may close
-/// it for having no pod in Kubernetes: a row is written just before its
-/// pod is created, and creating one can take a while.
+/// How old a live pod row must be before the watch's listing may close it
+/// for having no pod in Kubernetes: a row is written just before its pod
+/// is created, and creating one can take a while. Also keeps a smelt
+/// instance from closing another instance's brand-new rows (the browser
+/// test harness shares the dev database but not its namespace).
 const RECONCILE_MIN_AGE_SECS: i64 = 300;
 
-/// Closes the records of pods that are live in the database but gone from
-/// Kubernetes: deleted outside smelt, lost in a cluster rebuild, evicted,
-/// or crashed while smelt wasn't connected to them. Their running commands
-/// are marked lost and their terminals closed, like a crash, but quietly:
-/// no notice to the model (saving one would move each conversation to the
-/// top of the sidebar, and old ones by the dozen); it finds out if it
-/// tries the pod again. Rows younger than `RECONCILE_MIN_AGE_SECS` are
-/// skipped. Returns how many were closed.
+/// How long after a pod is deleted (or finishes) the watch waits before
+/// closing its record, so crash detection gets there first for a pod smelt
+/// was connected to: it closes the same records, but also tells the model.
+#[cfg(not(test))]
+const CLOSE_GRACE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
+
+/// Keeps pod records in step with Kubernetes for as long as smelt runs:
+/// subscribes to pod changes in smelt's namespace, reconciles once the
+/// first full listing arrives (and again after any reconnect, which
+/// re-lists), then closes a pod's record when the pod is deleted or reaches
+/// a phase it can't recover from. Covers pods lost while smelt wasn't
+/// connected to them: deleted outside smelt, lost in a cluster rebuild,
+/// evicted, or dead while smelt was down. See `close_if_gone`.
 ///
-/// Only a real server runs this (at startup and every minute, from
-/// `main`), never the browser test harness: that shares the dev database
-/// but works in the test namespace, where the dev instance's pods don't
-/// exist, so it would close their records.
-pub async fn reconcile_live_pods(pool: &PgPool) -> Result<usize, SandboxError> {
-    let rows = db::live_pods_older_than(pool, RECONCILE_MIN_AGE_SECS)
-        .await
-        .map_err(SandboxError::Db)?;
-    if rows.is_empty() {
-        return Ok(0);
-    }
-    let existing: std::collections::HashSet<String> = pods_api(&get().client)
-        .list(&kube::api::ListParams::default())
-        .await?
-        .items
-        .into_iter()
-        .filter_map(|pod| pod.metadata.name)
-        .collect();
-    let mut closed = 0;
-    for row in rows {
-        if existing.contains(&pod_name(row.id)) {
-            continue;
+/// Only a real server runs this (from `main`), never the browser test
+/// harness: that shares the dev database but works in the test namespace,
+/// where the dev instance's pods don't exist.
+pub async fn watch_pods(pool: PgPool) {
+    use futures_util::StreamExt;
+    use kube::runtime::{WatchStreamExt, watcher};
+
+    let events = watcher(pods_api(&get().client), watcher::Config::default()).default_backoff();
+    futures_util::pin_mut!(events);
+    // Pods listed since the last `Init`, until `InitDone` completes the set.
+    let mut listed = std::collections::HashSet::new();
+    while let Some(event) = events.next().await {
+        match event {
+            Ok(watcher::Event::Init) => listed.clear(),
+            Ok(watcher::Event::InitApply(pod)) => {
+                if let Some(pod_id) = watched_pod_id(&pod) {
+                    if !pod_has_finished(&pod) {
+                        listed.insert(pod_id);
+                    }
+                }
+            }
+            Ok(watcher::Event::InitDone) => {
+                match db::live_pods_older_than(&pool, RECONCILE_MIN_AGE_SECS).await {
+                    Ok(rows) => {
+                        for row in rows.into_iter().filter(|row| !listed.contains(&row.id)) {
+                            close_if_gone(&pool, row.id).await;
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "couldn't list pod records to reconcile"),
+                }
+            }
+            Ok(watcher::Event::Apply(pod)) if pod_has_finished(&pod) => {
+                if let Some(pod_id) = watched_pod_id(&pod) {
+                    close_after_grace(pool.clone(), pod_id);
+                }
+            }
+            Ok(watcher::Event::Apply(_)) => {}
+            Ok(watcher::Event::Delete(pod)) => {
+                if let Some(pod_id) = watched_pod_id(&pod) {
+                    close_after_grace(pool.clone(), pod_id);
+                }
+            }
+            // The watcher backs off and retries on its own, re-listing
+            // (a fresh `Init`..`InitDone`) once it's back.
+            Err(e) => tracing::warn!(error = %e, "pod watch error"),
         }
-        close_pod_terminals(pool, row.id).await;
-        // Nothing to delete in Kubernetes; this marks the row terminated
-        // and tells the UI (the sandbox panel, the sidebar, /pods).
-        force_terminate_pod(pool, row.id).await?;
-        tracing::info!(pod_id = row.id, conversation_id = row.conversation_id, "closed the record of a pod that no longer exists");
-        closed += 1;
     }
-    Ok(closed)
+}
+
+/// The smelt pod id behind a watched pod (`sandbox-{id}`), or `None` for
+/// any other pod in the namespace.
+fn watched_pod_id(pod: &Pod) -> Option<i64> {
+    pod.metadata.name.as_deref()?.strip_prefix("sandbox-")?.parse().ok()
+}
+
+/// Whether a pod has stopped for good: `Succeeded` or `Failed` (sandbox
+/// pods never restart).
+fn pod_has_finished(pod: &Pod) -> bool {
+    matches!(
+        pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+        Some("Succeeded" | "Failed")
+    )
+}
+
+/// `close_if_gone` for `pod_id`, after `CLOSE_GRACE`.
+fn close_after_grace(pool: PgPool, pod_id: i64) {
+    tokio::spawn(async move {
+        tokio::time::sleep(CLOSE_GRACE).await;
+        close_if_gone(&pool, pod_id).await;
+    });
+}
+
+/// Closes `pod_id`'s record if it's still live, smelt has no connection to
+/// it (a connected pod's end is crash detection's to report, notice
+/// included), and Kubernetes really has no running pod for it. Running
+/// commands are marked lost and terminals closed, like a crash, but
+/// quietly: no notice to the model (saving one would move the conversation
+/// to the top of the sidebar, and a cluster rebuild can leave dozens); it
+/// finds out if it tries the pod again.
+async fn close_if_gone(pool: &PgPool, pod_id: i64) {
+    match db::sandbox_pod_is_live(pool, pod_id).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't check a pod record");
+            return;
+        }
+    }
+    if registry_get(pod_id).is_some() {
+        return;
+    }
+    match pods_api(&get().client).get_opt(&pod_name(pod_id)).await {
+        Ok(Some(pod)) if !pod_has_finished(&pod) => return,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't check a pod in Kubernetes");
+            return;
+        }
+    }
+    close_pod_terminals(pool, pod_id).await;
+    // Deletes a finished pod's object if it's still there, marks the row
+    // terminated, and tells the UI (the sandbox panel, the sidebar, /pods).
+    match force_terminate_pod(pool, pod_id).await {
+        Ok(_) => tracing::info!(pod_id, "closed the record of a pod that's gone from the cluster"),
+        Err(e) => tracing::warn!(pod_id, error = %e, "couldn't close the record of a gone pod"),
+    }
 }
 
 /// Marks every command still `running` under any of this pod's terminals
@@ -3486,32 +3570,12 @@ mod tests {
                 "a user stop must not be reported as a crash"
             );
 
-            // --- Reconciling records with the cluster: a pod gone from
-            // Kubernetes while smelt wasn't connected (no crash detection
-            // fires) is closed quietly by the sweep; a young row whose pod
-            // may still be starting is left alone. See
-            // docs/projects/completed/20260925-pod-management.md. ---
-            let conversation_h = db::create_conversation(&pool).await.expect("create conversation h");
-            let pod_h = create_pod(&pool, conversation_h.id, None, None).await.expect("create_pod (h) should succeed");
-            let terminal_h = db::create_sandbox_terminal(&pool, pod_h).await.expect("a terminal record");
-            db::create_terminal_command(&pool, conversation_h.id, terminal_h.id, "stale-h", "sleep 300")
-                .await
-                .expect("a running command record");
-            sqlx::query("UPDATE sandbox_pods SET created_at = now() - interval '10 minutes' WHERE id = $1")
-                .bind(pod_h)
-                .execute(&pool)
-                .await
-                .expect("age the pod past the sweep's cut-off");
-            pods_api(&client).delete(&pod_name(pod_h), &immediate_delete_params()).await.expect("delete pod (h) directly");
-            let gone = tokio::time::timeout(Duration::from_secs(60), async {
-                while pods_api(&client).get_opt(&pod_name(pod_h)).await.ok().flatten().is_some() {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            })
-            .await;
-            assert!(gone.is_ok(), "pod (h) should leave Kubernetes");
-            let conversation_young = db::create_conversation(&pool).await.expect("create conversation");
-            let young = db::create_sandbox_pod(&pool, conversation_young.id).await.expect("a young pod record");
+            // --- Keeping records in step with the cluster (`watch_pods`):
+            // a record whose pod vanished before the watch started is closed
+            // when the watch's first listing completes; a pod deleted while
+            // the watch runs is closed after the grace period; a young
+            // record whose pod may still be starting is left alone. All
+            // quietly. See docs/projects/completed/20260925-pod-management.md. ---
             let updated_at = |id: i64| {
                 let pool = pool.clone();
                 async move {
@@ -3522,29 +3586,78 @@ mod tests {
                         .expect("the conversation's updated_at")
                 }
             };
+            let wait_until_closed = |pod_id: i64| {
+                let pool = pool.clone();
+                async move {
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        while db::sandbox_pod_is_live(&pool, pod_id).await.expect("is live") {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                    })
+                    .await
+                    .is_ok()
+                }
+            };
+            let wait_until_gone_from_kubernetes = |pod_id: i64| {
+                let client = client.clone();
+                async move {
+                    tokio::time::timeout(Duration::from_secs(60), async {
+                        while pods_api(&client).get_opt(&pod_name(pod_id)).await.ok().flatten().is_some() {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    })
+                    .await
+                    .is_ok()
+                }
+            };
+
+            // Before the watch starts: pod (h) is gone from Kubernetes, and
+            // old enough that its record should have a pod.
+            let conversation_h = db::create_conversation(&pool).await.expect("create conversation h");
+            let pod_h = create_pod(&pool, conversation_h.id, None, None).await.expect("create_pod (h) should succeed");
+            let terminal_h = db::create_sandbox_terminal(&pool, pod_h).await.expect("a terminal record");
+            db::create_terminal_command(&pool, conversation_h.id, terminal_h.id, "stale-h", "sleep 300")
+                .await
+                .expect("a running command record");
+            sqlx::query("UPDATE sandbox_pods SET created_at = now() - interval '10 minutes' WHERE id = $1")
+                .bind(pod_h)
+                .execute(&pool)
+                .await
+                .expect("age the pod past the reconciliation cut-off");
+            pods_api(&client).delete(&pod_name(pod_h), &immediate_delete_params()).await.expect("delete pod (h) directly");
+            assert!(wait_until_gone_from_kubernetes(pod_h).await, "pod (h) should leave Kubernetes");
+            let conversation_young = db::create_conversation(&pool).await.expect("create conversation");
+            let young = db::create_sandbox_pod(&pool, conversation_young.id).await.expect("a young pod record");
             let updated_before = updated_at(conversation_h.id).await;
 
-            let closed = reconcile_live_pods(&pool).await.expect("reconcile_live_pods");
+            let watch = tokio::spawn(watch_pods(pool.clone()));
 
-            assert!(closed >= 1, "the sweep should close pod (h)'s record");
-            assert!(!db::sandbox_pod_is_live(&pool, pod_h).await.expect("is live"), "pod (h) should no longer be live");
+            assert!(wait_until_closed(pod_h).await, "the watch's first listing should close pod (h)'s record");
             let command_h = db::get_terminal_command(&pool, "stale-h").await.expect("get").expect("the command");
             assert_eq!(command_h.status, "lost", "its running command should be marked lost");
             assert!(
                 db::list_sandbox_terminals_for_pod(&pool, pod_h).await.expect("terminals").is_empty(),
                 "its terminal should be closed"
             );
-            assert!(db::sandbox_pod_is_live(&pool, young.id).await.expect("is live"), "a young record is left alone");
-            tokio::time::sleep(Duration::from_millis(300)).await;
             assert!(
                 db::list_messages(&pool, conversation_h.id).await.expect("messages").is_empty(),
-                "the sweep closes records quietly, with no notice"
+                "records are closed quietly, with no notice"
             );
-            assert_eq!(
-                updated_at(conversation_h.id).await,
-                updated_before,
-                "the conversation shouldn't move in the sidebar"
+            assert_eq!(updated_at(conversation_h.id).await, updated_before, "the conversation shouldn't move in the sidebar");
+
+            // While the watch runs: pod (i) is deleted outside smelt, with no
+            // connection open, so crash detection never sees it.
+            let conversation_i = db::create_conversation(&pool).await.expect("create conversation i");
+            let pod_i = create_pod(&pool, conversation_i.id, None, None).await.expect("create_pod (i) should succeed");
+            pods_api(&client).delete(&pod_name(pod_i), &immediate_delete_params()).await.expect("delete pod (i) directly");
+            assert!(wait_until_closed(pod_i).await, "a pod deleted while the watch runs should have its record closed");
+            assert!(
+                db::list_messages(&pool, conversation_i.id).await.expect("messages").is_empty(),
+                "closed quietly, with no notice"
             );
+
+            assert!(db::sandbox_pod_is_live(&pool, young.id).await.expect("is live"), "a young record is left alone");
+            watch.abort();
             db::terminate_sandbox_pod(&pool, young.id).await.expect("clean up the young record");
 
             // --- Exhausting reconnect attempts without Kubernetes ever

@@ -75,21 +75,10 @@ async fn main() {
     sandbox::init().await;
     tracing::info!("sandbox manager initialized");
 
-    // Pod records whose pods are gone from Kubernetes (a cluster rebuild,
-    // a pod deleted outside smelt, one that died while smelt was down) are
-    // closed at startup and then every minute, so the sidebar's dots and
-    // /pods match the cluster. Only here, never in the browser test
-    // harness: see `sandbox::reconcile_live_pods`.
-    tokio::spawn(async move {
-        loop {
-            match sandbox::reconcile_live_pods(pool).await {
-                Ok(0) => {}
-                Ok(closed) => tracing::info!(closed, "closed records of pods that no longer exist"),
-                Err(e) => tracing::warn!(error = %e, "couldn't reconcile pod records with the cluster"),
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        }
-    });
+    // Keeps pod records in step with the cluster, so the sidebar's dots
+    // and /pods match it. Only here, never in the browser test harness:
+    // see `sandbox::watch_pods`.
+    tokio::spawn(sandbox::watch_pods(pool.clone()));
 
     let router = build_router();
 
