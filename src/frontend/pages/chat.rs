@@ -983,6 +983,18 @@ fn reply_is_only_thinking(role: &str, blocks: &[ContentBlock]) -> bool {
         && blocks.iter().all(|b| matches!(b, ContentBlock::Thinking { .. }))
 }
 
+/// How long ago a conversation was last active, as the sidebar shows it:
+/// one unit, `now`, `5m`, `3h`, `2d`, `3w` (SME-41 D8).
+fn short_age(seconds: i64) -> String {
+    match seconds {
+        s if s < 60 => "now".to_string(),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s if s < 7 * 86_400 => format!("{}d", s / 86_400),
+        s => format!("{}w", s / (7 * 86_400)),
+    }
+}
+
 /// How long a turn has been running, as shown on its "Working…" line:
 /// `8s`, `2m 05s`.
 fn format_elapsed(seconds: u64) -> String {
@@ -1787,6 +1799,16 @@ mod tests {
     }
 
     #[test]
+    fn test_short_age_uses_one_unit() {
+        assert_eq!(short_age(-5), "now");
+        assert_eq!(short_age(30), "now");
+        assert_eq!(short_age(5 * 60 + 20), "5m");
+        assert_eq!(short_age(3 * 3600 + 59 * 60), "3h");
+        assert_eq!(short_age(2 * 86400 + 5), "2d");
+        assert_eq!(short_age(15 * 86400), "2w");
+    }
+
+    #[test]
     fn test_format_elapsed_counts_seconds_then_minutes() {
         assert_eq!(format_elapsed(0), "0s");
         assert_eq!(format_elapsed(42), "42s");
@@ -2424,6 +2446,23 @@ fn ConversationSidebar(
     // Whether the conversation list is open on a phone, where it folds
     // behind a button (SME-41 D4). Ignored at wider widths.
     let mut open_on_phone = use_signal(|| false);
+    // The browser's clock, refreshed every minute, for each row's age
+    // (SME-41 D8). None until the first reading, when ages aren't shown.
+    #[allow(unused_mut)]
+    let mut now_utc: Signal<Option<chrono::NaiveDateTime>> = use_signal(|| None);
+    #[cfg(feature = "web")]
+    use_hook(move || {
+        spawn(async move {
+            loop {
+                if let Ok(value) = document::eval("return Date.now();").await
+                    && let Some(ms) = value.as_f64()
+                {
+                    now_utc.set(chrono::DateTime::from_timestamp_millis(ms as i64).map(|t| t.naive_utc()));
+                }
+                gloo_timers::future::TimeoutFuture::new(60_000).await;
+            }
+        });
+    });
 
     use_effect(move || {
         if let Some(result) = initial_conversations() {
@@ -2508,6 +2547,9 @@ fn ConversationSidebar(
                             span { class: "conversation-title", "{conversation.title}" }
                             if has_live_pod(conversation.id) {
                                 span { class: "live-pod-dot", title: "sandbox pod running" }
+                            }
+                            if let Some(now) = now_utc() {
+                                span { class: "conversation-age", {short_age((now - conversation.updated_at).num_seconds())} }
                             }
                             button {
                                 class: if pending_delete() == Some(conversation.id) { "delete-conversation confirm" } else { "delete-conversation" },

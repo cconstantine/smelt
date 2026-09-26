@@ -1107,6 +1107,25 @@ async fn test_end_to_end_browser_scenarios() {
         wait_for_element(&page, ".conversation-item .delete-conversation.confirm", Duration::from_secs(5)).await;
         let after = element_box(&page, ".conversation-item .delete-conversation.confirm").await;
         assert_eq!(before.2, after.2, "arming the sidebar's Delete changed its width");
+        // A title uses its row, and each row says how long ago the
+        // conversation was active. Titles were cut at about 15 characters
+        // with most of the row empty (SME-41 D8).
+        let row: Vec<String> = page
+            .evaluate(
+                "(() => { const item = document.querySelector('.conversation-item:not(:hover)') || document.querySelector('.conversation-item'); \
+                 const w = s => item.querySelector(s).getBoundingClientRect().width; \
+                 const age = item.querySelector('.conversation-age'); \
+                 return [String(w('.conversation-title') / item.getBoundingClientRect().width), age ? age.innerText : '']; })()",
+            )
+            .await
+            .expect("measure a sidebar row")
+            .into_value()
+            .expect("strings");
+        assert!(row[0].parse::<f64>().unwrap_or(0.0) > 0.6, "the title should use most of its row: {row:?}");
+        assert!(
+            row[1] == "now" || row[1].trim_end_matches(['m', 'h', 'd', 'w']).parse::<u32>().is_ok(),
+            "each row should say how long ago it was active: {row:?}"
+        );
         page.close().await.expect("close the tab");
         let page = harness.browser.new_page(&harness.base_url).await.expect("open the app");
         click_when_present(&page, ".sidebar a[href='/sandbox-volumes']", Duration::from_secs(10)).await;

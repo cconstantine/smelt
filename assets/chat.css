@@ -118,6 +118,7 @@ body {
 }
 
 .conversation-item {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -147,7 +148,13 @@ body {
     white-space: nowrap;
 }
 
+/* Laid over the end of the row rather than taking room from the title
+   (SME-41 D8); it covers the age while shown. */
 .delete-conversation {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
     flex-shrink: 0;
     padding: 4px 9px;
     border: 1px solid var(--border-strong);
@@ -2380,4 +2387,17 @@ div.mcp-status-not-connected::before {
 .pods-page p.muted,
 .sandbox-volumes-page p.muted {
     padding: 0;
+}
+
+/* How long ago a conversation was active (SME-41 D8). */
+.conversation-age {
+    flex-shrink: 0;
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.conversation-item:hover .conversation-age,
+.conversation-item:focus-within .conversation-age {
+    visibility: hidden;
 }
