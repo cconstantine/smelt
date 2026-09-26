@@ -1738,12 +1738,21 @@ div.mcp-status-not-connected::before {
     margin-bottom: 16px;
 }
 
-.mcp-auth-mode-choice label {
-    display: flex;
+/* Scoped under the form so it outranks the form's stacked label rule;
+   the radio sits beside its label (SME-41 D13). */
+.mcp-add-form .mcp-auth-mode-choice label,
+.mcp-edit-form .mcp-auth-mode-choice label {
+    flex-direction: row;
     align-items: center;
     gap: 6px;
     font-weight: normal;
     cursor: pointer;
+}
+
+.mcp-add-form input[type="radio"],
+.mcp-edit-form input[type="radio"] {
+    margin: 0;
+    padding: 0;
 }
 
 .mcp-oauth-panel {

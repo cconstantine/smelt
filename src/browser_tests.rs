@@ -1346,6 +1346,19 @@ async fn test_end_to_end_browser_scenarios() {
             .expect("colours");
         assert_ne!(fills[0], fills[1], "the main action should stand out from the secondary ones: {fills:?}");
         assert_eq!(fills[1], fills[2], "secondary actions should share one style: {fills:?}");
+        // Each auth choice's radio button sits beside its label, not above
+        // it (SME-41 D13).
+        let radios: Vec<f64> = page
+            .evaluate(
+                "(() => { const r = document.querySelector('input[name=mcp-new-auth-mode]').getBoundingClientRect(); \
+                 const l = document.querySelector('input[name=mcp-new-auth-mode]').parentElement.getBoundingClientRect(); \
+                 return [r.top + r.height / 2, l.top + l.height / 2, l.height]; })()",
+            )
+            .await
+            .expect("measure the radio")
+            .into_value()
+            .expect("numbers");
+        assert!((radios[0] - radios[1]).abs() < 4.0 && radios[2] < 30.0, "a radio should sit beside its label: {radios:?}");
         page.close().await.expect("close the tab");
 
         // --- Scenario 22: a new conversation says what smelt can do and
