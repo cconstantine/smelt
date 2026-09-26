@@ -2421,6 +2421,9 @@ fn ConversationSidebar(
     let mut loaded = use_signal(|| false);
     let mut error: Signal<Option<String>> = use_signal(|| None);
     let mut pending_delete: Signal<Option<i64>> = use_signal(|| None);
+    // Whether the conversation list is open on a phone, where it folds
+    // behind a button (SME-41 D4). Ignored at wider widths.
+    let mut open_on_phone = use_signal(|| false);
 
     use_effect(move || {
         if let Some(result) = initial_conversations() {
@@ -2432,7 +2435,7 @@ fn ConversationSidebar(
         }
     });
 
-    let new_conversation = move |_| {
+    let new_conversation = move |_: Event<MouseData>| {
         spawn(async move {
             match create_conversation().await {
                 Ok(conversation) => {
@@ -2468,8 +2471,18 @@ fn ConversationSidebar(
     };
 
     rsx! {
-        aside { class: "sidebar",
-            button { class: "new-conversation", onclick: new_conversation, "New conversation" }
+        aside { class: if open_on_phone() { "sidebar sidebar-open" } else { "sidebar" },
+            // Phone only (see chat.css): the list folds behind this, so the
+            // conversation, not the list, fills the screen (SME-41 D4).
+            button {
+                class: "sidebar-toggle",
+                r#type: "button",
+                aria_expanded: "{open_on_phone()}",
+                onclick: move |_| open_on_phone.toggle(),
+                if open_on_phone() { "Close" } else { "Conversations" }
+            }
+            div { class: "sidebar-body",
+            button { class: "new-conversation", onclick: move |e| { open_on_phone.set(false); new_conversation(e) }, "New conversation" }
             Link { to: Route::McpServersRoute {}, class: "mcp-servers-link", "MCP servers" }
             Link { to: Route::PodsRoute {}, class: "pods-link", "Pods" }
             Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
@@ -2489,6 +2502,7 @@ fn ConversationSidebar(
                             class: if selected() == Some(conversation.id) { "conversation-item active" } else { "conversation-item" },
                             onclick: move |_| {
                                 pending_delete.set(None);
+                                open_on_phone.set(false);
                                 navigator.push(Route::ConversationRoute { id: conversation.id });
                             },
                             span { class: "conversation-title", "{conversation.title}" }
@@ -2506,6 +2520,7 @@ fn ConversationSidebar(
                         }
                     }
                 }
+            }
             }
         }
     }

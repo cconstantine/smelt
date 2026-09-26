@@ -15,6 +15,26 @@ body {
     height: 100vh;
 }
 
+/* The phone-only button that opens the conversation list. */
+.sidebar-toggle {
+    display: none;
+    padding: 8px 12px;
+    border: 1px solid #d8d8d8;
+    border-radius: 8px;
+    background: #fff;
+    color: #333;
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+}
+
+.sidebar-body {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-height: 0;
+}
+
 .sidebar {
     width: 272px;
     flex-shrink: 0;
@@ -1165,13 +1185,47 @@ body {
         flex-direction: column;
     }
 
+    /* The list folds behind a button in a slim bar, so the conversation
+       fills the screen (SME-41 D4). */
     .sidebar {
         width: auto;
-        max-height: 35vh;
         border-right: none;
         border-bottom: 1px solid #e5e5e5;
         gap: 8px;
-        padding: 12px;
+        padding: 8px 12px;
+        overflow: visible;
+    }
+
+    .sidebar-toggle {
+        display: block;
+    }
+
+    .sidebar:not(.sidebar-open) .sidebar-body {
+        display: none;
+    }
+
+    .sidebar-open .sidebar-body {
+        max-height: 60vh;
+        overflow-y: auto;
+    }
+
+    /* The conversation first; the sandbox and task panels below it. */
+    .chat-main {
+        order: -1;
+        flex: 1 1 auto;
+        min-height: 55vh;
+    }
+
+    .side-panels-row {
+        flex: 0 0 auto;
+        max-height: 40vh;
+        overflow-y: auto;
+    }
+
+    /* Wide tables scroll in their own box rather than the page. */
+    .pods-table {
+        display: block;
+        overflow-x: auto;
     }
 
     .chat-panel {

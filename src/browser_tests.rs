@@ -1131,6 +1131,37 @@ async fn test_end_to_end_browser_scenarios() {
         assert!(layout[1] >= 300.0, "the messages are too narrow on a phone: {layout:?}");
         assert!(layout[2] >= 200.0, "the message box is too narrow on a phone: {layout:?}");
         assert!(layout[3] <= 0.0, "the page scrolls sideways on a phone: {layout:?}");
+        // The conversation comes first: the list is folded behind a
+        // button, and the chat sits above the side panels. The list and
+        // the sandbox panel used to push the transcript to the bottom of
+        // the screen (SME-41 D4).
+        let order: Vec<f64> = page
+            .evaluate(
+                "(() => { const top = s => { const e = document.querySelector(s); return e ? e.getBoundingClientRect().top : -1; }; \
+                 const list = document.querySelector('.conversation-list'); \
+                 return [list && list.offsetParent !== null ? 1 : 0, top('.chat-main'), top('.side-panels-row')]; })()",
+            )
+            .await
+            .expect("measure the order")
+            .into_value()
+            .expect("numbers");
+        assert_eq!(order[0], 0.0, "the conversation list should be folded away on a phone: {order:?}");
+        assert!(order[2] < 0.0 || order[1] < order[2], "the chat should come before the side panels: {order:?}");
+        page.find_element(".sidebar-toggle").await.expect("the list's button").click().await.expect("open the list");
+        let mut list_shown = false;
+        for _ in 0..25 {
+            list_shown = page
+                .evaluate("document.querySelector('.conversation-list').offsetParent !== null")
+                .await
+                .expect("check the list")
+                .into_value()
+                .expect("a bool");
+            if list_shown {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(list_shown, "the button should open the conversation list");
         page.close().await.expect("close the tab");
 
         // --- Scenario 18: a URL that isn't a page says so, with a way
