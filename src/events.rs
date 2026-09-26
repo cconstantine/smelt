@@ -128,6 +128,24 @@ pub enum ConversationEvent {
     TurnState {
         running: bool,
     },
+    /// A model call is starting: whatever reply text a tab is showing as
+    /// "streaming" is done with (it's saved, or it was a false start the
+    /// retry replaces). Each model call gets its own streaming bubble.
+    ReplyReset {},
+    /// More reply text as the model streams it. Published for every
+    /// turn, whoever started it, so every tab watching sees the reply
+    /// arrive live. Regenerable mid-turn from
+    /// `api::chat::get_reply_in_progress`.
+    ReplyDelta {
+        text: String,
+    },
+    /// A turn the user started by sending a message failed or was
+    /// stopped (`message` is then `api::chat::TURN_STOPPED`). Turns
+    /// started by a finished command or task report failure as
+    /// `NotificationDeliveryFailed` instead.
+    TurnError {
+        message: String,
+    },
 }
 
 /// Events that aren't about one conversation, for views that span them
@@ -150,10 +168,12 @@ mod server {
     use super::ConversationEvent;
 
     /// Bound on how many events a lagging subscriber can fall behind by
-    /// before `broadcast` starts dropping its oldest ones — generous for
-    /// this stage's traffic (a handful of task ticks and message batches),
-    /// not a tuned production value.
-    const CHANNEL_CAPACITY: usize = 64;
+    /// before `broadcast` starts dropping its oldest ones. Replies stream as
+    /// many small `ReplyDelta`s, so this leaves room for a tab that's a
+    /// moment behind; one that falls further behind catches up at the
+    /// reply's `MessagesAppended`. Each slot holds one event, cloned as
+    /// each subscriber reads it; events are small.
+    const CHANNEL_CAPACITY: usize = 1024;
 
     static BUSES: LazyLock<Mutex<HashMap<i64, broadcast::Sender<ConversationEvent>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -225,6 +245,23 @@ mod server {
     mod tests {
         use super::super::TokenUsage;
         use super::*;
+
+        /// A reply streams as many small deltas; a tab that's a moment
+        /// behind shouldn't lose any of them.
+        #[tokio::test]
+        async fn test_a_subscriber_keeps_a_burst_of_reply_deltas() {
+            let conversation_id = 9_100_000_009;
+            let mut rx = subscribe(conversation_id);
+            for i in 0..500 {
+                publish(conversation_id, ConversationEvent::ReplyDelta { text: i.to_string() });
+            }
+            for i in 0..500 {
+                match rx.try_recv() {
+                    Ok(ConversationEvent::ReplyDelta { text }) => assert_eq!(text, i.to_string()),
+                    other => panic!("delta {i}: got {other:?}"),
+                }
+            }
+        }
 
         #[tokio::test]
         async fn test_publish_app_reaches_app_subscribers() {
@@ -427,6 +464,9 @@ mod wire_tests {
 
     fn one_of_each() -> Vec<ConversationEvent> {
         vec![
+            ConversationEvent::TurnError { message: "boom".to_string() },
+            ConversationEvent::ReplyReset {},
+            ConversationEvent::ReplyDelta { text: "Hi".to_string() },
             ConversationEvent::TurnState { running: true },
             ConversationEvent::PodsChanged {},
             ConversationEvent::TaskUpdate {

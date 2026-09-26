@@ -889,7 +889,7 @@ async fn test_end_to_end_browser_scenarios() {
             wait_for_count(&sidebar_tab, &dot, 0, Duration::from_secs(10)).await,
             "the dot should go away when the pod stops, without a reload"
         );
-        for tab in [sidebar_tab, pods_page, page, todo_page] {
+        for tab in [sidebar_tab, pods_page, page, todo_page, context_page] {
             tab.close().await.expect("close a finished tab");
         }
 
@@ -945,6 +945,66 @@ async fn test_end_to_end_browser_scenarios() {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
         assert!(!disabled, "the message box should be usable after a stop");
+        for tab in [sender, observer] {
+            tab.close().await.expect("close a finished tab");
+        }
+
+        // --- Scenario 14: replies travel on the conversation stream, so
+        // every tab sees one live, a reload mid-reply keeps the text so
+        // far, and the sender sees its own message once. And five tabs, a
+        // streaming reply and a Stop from another tab fit under the
+        // browser's 6-connections-per-host limit: a tab holds one
+        // connection even while a reply streams, which leaves the sixth for
+        // ordinary requests (a tab's own loading needs one too). When the
+        // reply had its own stream, it took the sixth, and Stop queued. ---
+        let shared = new_conversation(pool, &created).await;
+        let url = format!("{}conversation/{}", harness.base_url, shared.id);
+        let mut tabs = Vec::new();
+        for _ in 0..5 {
+            let tab = harness.browser.new_page(url.clone()).await.expect("open a tab");
+            wait_for_live_client(&tab, shared.id).await;
+            tabs.push(tab);
+        }
+        let input = wait_for_element(&tabs[0], CHAT_INPUT, Duration::from_secs(10)).await;
+        input.focus().await.expect("focus the message box");
+        input.type_str("stream to everyone").await.expect("type");
+        input.press_key("Enter").await.expect("send");
+        assert!(
+            wait_for_text(&tabs[4], "zebra2", Duration::from_secs(10)).await,
+            "a tab that didn't send should see the reply stream in"
+        );
+        assert!(
+            !wait_for_text(&tabs[4], "zebra24", Duration::from_millis(100)).await,
+            "...while it's still streaming"
+        );
+        tabs[3].reload().await.expect("reload a tab mid-reply");
+        wait_for_live_client(&tabs[3], shared.id).await;
+        assert!(
+            wait_for_text(&tabs[3], "zebra", Duration::from_secs(3)).await
+                && !wait_for_text(&tabs[3], "zebra24", Duration::from_millis(100)).await,
+            "a tab reloaded mid-reply should show the reply so far"
+        );
+        let sent_count: usize = tabs[0]
+            .evaluate("document.querySelector('.messages').innerText.split('stream to everyone').length - 1")
+            .await
+            .expect("count the sent message")
+            .into_value()
+            .expect("a number");
+        assert_eq!(sent_count, 1, "the sender should see its own message once in the conversation");
+        wait_for_element(&tabs[4], ".stop-turn", Duration::from_secs(5))
+            .await
+            .click()
+            .await
+            .expect("click Stop in another tab");
+        for (i, tab) in tabs.iter().enumerate() {
+            assert!(
+                wait_for_count(tab, ".stop-turn", 0, Duration::from_secs(5)).await,
+                "tab {i}: Stop should go away once the turn has stopped"
+            );
+        }
+        for tab in tabs {
+            tab.close().await.expect("close a finished tab");
+        }
     })))
     .await;
 

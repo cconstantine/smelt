@@ -83,23 +83,11 @@ The `use_resource` + `use_effect`-into-a-plain-signal pairing (rather than readi
 
 ## Streaming into the UI
 
-`ChatPanel`'s send handler is the one place that consumes `ServerEvents` directly:
-
-```rust
-let mut events = send_message(id, content).await?;
-while let Some(event) = events.recv().await {
-    match event? {
-        ChatEvent::Delta { text } => replies_in_flight.write().get_mut(&id)?.push_str(&text),
-        ChatEvent::Done { message_id, role, content } => {
-            if *selected.peek() == Some(id) { /* push into messages, once */ }
-            replies_in_flight.write().get_mut(&id)?.clear();
-        }
-        ChatEvent::Error { message } => stream_errors.write().insert(id, message),
-    }
-}
-```
-
-A reply's in-progress text is rendered as a separate trailing bubble, so it's visible token by token, and folded into `messages` once `ChatEvent::Done` arrives. That state is kept **per conversation** (`replies_in_flight`, `stream_errors`, keyed by conversation id), because the send keeps running if the viewer switches conversations. The view only reads the entry for the conversation on screen: another conversation stays usable, never shows this reply, and a finished reply only goes into `messages` if its conversation is the one being viewed. If it isn't, the reply is already saved, and it loads when the viewer goes back.
+Sending is an ordinary request: `send()` adds an optimistic copy of the message (a negative id), calls `send_message`, and shows an error only if the request itself fails. Everything else arrives on the conversation's event stream, the same way in every tab watching the conversation:
+- `ReplyReset` starts the streaming bubble (`streaming_reply`), `ReplyDelta` adds to it, and a saved assistant message (`MessagesAppended`) or the turn ending (`TurnState { running: false }`) clears it. It's reset on a conversation switch and restored from `get_reply_in_progress` in the reconnect pull.
+- `MessagesAppended` goes through `accept_saved_messages`: each saved user message replaces one optimistic copy of itself (same text), then anything new is added. Without that the sender saw its own message twice.
+- `TurnError` sets the conversation's error, or "Stopped." for a stop.
+- The message box is disabled while a turn runs in the conversation (`TurnState`), whoever started it, and Stop is offered instead.
 
 Loading a conversation's messages on open goes through `apply_loaded_messages`, not a plain replace. The live subscription's reconciliation merge can land first with a message saved after the load's snapshot, and a replace would wipe it.
 

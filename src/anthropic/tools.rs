@@ -1327,7 +1327,10 @@ mod server {
             }
             return;
         }
-        if let Err(e) = chat::run_turn(pool, conversation_id, message, None).await {
+        // A stop is the user's doing, not a failure to reach the model.
+        if let Err(e) = chat::run_turn(pool, conversation_id, message, None).await
+            && chat::chat_error_text(&e) != chat::TURN_STOPPED
+        {
             tracing::warn!(conversation_id, error = %e, "task notification failed to reach the model");
             events::publish(
                 conversation_id,

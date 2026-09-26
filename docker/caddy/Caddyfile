@@ -1,0 +1,16 @@
+# Dev only: serves smelt over HTTPS on https://localhost:8443, so the
+# browser speaks HTTP/2 to it. Over plain HTTP/1.1 a browser allows 6
+# connections per host across all tabs, and each smelt tab holds one open
+# event stream; HTTP/2 carries up to 100 streams on one connection. See
+# docs/setup.md ("Dev over HTTPS") and
+# docs/projects/completed/*-connection-limits.md.
+#
+# `tls internal` issues the certificate from Caddy's own local CA, kept in
+# the `caddy-data` volume. Trust its root once in your browser (setup.md).
+https://localhost:8443 {
+	tls internal
+	# The dev server, `dx serve --fullstack --addr 0.0.0.0 --port 8080`,
+	# inside the `smelt` container. Event streams are passed through
+	# unbuffered, and the hot-reload WebSocket upgraded, by default.
+	reverse_proxy smelt:8080
+}
