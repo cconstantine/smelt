@@ -54,8 +54,31 @@ const BROWSER_EGRESS_GUARD: fn(IpAddr) -> bool =
 /// `pub(crate)` — `src/browsing.rs`'s persistent sessions run on this same
 /// shared browser instance rather than launching a second one.
 pub(crate) async fn shared_browser() -> Result<&'static Browser, String> {
-    BROWSER.get_or_try_init(launch_browser).await
+    BROWSER
+        .get_or_try_init(|| async {
+            BROWSER_RUNTIME
+                .spawn(launch_browser())
+                .await
+                .map_err(|e| format!("the browser launch task failed: {e}"))?
+        })
+        .await
 }
+
+/// The runtime the shared browser's long-lived tasks (its CDP handler and
+/// egress proxy) run on, for the life of the process. Launched on whatever
+/// runtime asked first, they died with it, and every later user of
+/// `BROWSER` got "send failed because receiver is gone". In the app there
+/// is only one runtime, but each `#[tokio::test]` has its own, so a second
+/// test using the browser broke (SME-40, found when the app's browser tier
+/// started opening browsing sessions).
+static BROWSER_RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("shared-browser")
+        .enable_all()
+        .build()
+        .expect("build the shared browser's runtime")
+});
 
 /// A blank page in a browser context of its own: its own cookies, site
 /// storage, cache and service workers, shared with no other page. Pass
