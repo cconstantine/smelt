@@ -246,6 +246,7 @@ const COMPACTION_CONTINUATION_PROMPT: &str = "Continue based on the summary abov
 fn compaction_messages(
     summary: String,
     covers_through_message_id: i64,
+    unanswered: &[String],
 ) -> [(&'static str, Vec<anthropic::ContentBlock>); 3] {
     [
         (
@@ -264,10 +265,46 @@ fn compaction_messages(
         (
             "user",
             vec![anthropic::ContentBlock::CompactionPlaceholder {
-                text: COMPACTION_CONTINUATION_PROMPT.to_string(),
+                text: continuation_prompt(unanswered),
             }],
         ),
     ]
+}
+
+/// The nudge after a summary. When the compaction covered messages the
+/// model hasn't answered yet (the request that triggered it, notices), it
+/// quotes them, so the model answers what was actually asked rather than
+/// the summary's gist of it (SME-40 F3).
+#[cfg(feature = "server")]
+fn continuation_prompt(unanswered: &[String]) -> String {
+    if unanswered.is_empty() {
+        return COMPACTION_CONTINUATION_PROMPT.to_string();
+    }
+    format!(
+        "{COMPACTION_CONTINUATION_PROMPT} The summary includes these latest messages, which you \
+         haven't answered yet; respond to them now:\n\n{}",
+        unanswered.join("\n\n")
+    )
+}
+
+/// The text of the user messages at the end of `messages`, after the
+/// model's last reply: what a compaction happening now would summarize
+/// before the model has answered it. Tool results aren't included; notices
+/// and the user's own words are.
+#[cfg(feature = "server")]
+fn unanswered_user_text(messages: &[Message]) -> Vec<String> {
+    let mut texts: Vec<String> = messages
+        .iter()
+        .rev()
+        .take_while(|m| m.role == "user")
+        .flat_map(|m| m.blocks().unwrap_or_default())
+        .filter_map(|block| match block {
+            anthropic::ContentBlock::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    texts.reverse();
+    texts
 }
 
 /// Builds the message history actually replayed to Anthropic — every
@@ -671,7 +708,8 @@ async fn compact_conversation(
         })
         .unwrap_or_default();
 
-    for (role, content) in compaction_messages(summary, covers_through_message_id) {
+    let unanswered = unanswered_user_text(&messages);
+    for (role, content) in compaction_messages(summary, covers_through_message_id, &unanswered) {
         db::create_message(pool, conversation_id, role, &content)
             .await
             .map_err(ServerFnError::new)?;
@@ -1790,7 +1828,7 @@ mod tests {
             text_message(1, "user", "ancient question"),
             text_message(2, "assistant", "ancient answer"),
         ];
-        for (offset, (role, blocks)) in compaction_messages("the earlier summary".to_string(), 2)
+        for (offset, (role, blocks)) in compaction_messages("the earlier summary".to_string(), 2, &[])
             .into_iter()
             .enumerate()
         {
@@ -1824,9 +1862,46 @@ mod tests {
         assert!(!transcript.contains("message 1 "), "the oldest part should be what's dropped");
     }
 
+    /// SME-40 F3: compaction runs after the new user message is saved, so
+    /// the summary covers it and the model only saw "Continue based on the
+    /// summary above" — it answered from the summary's gist, or resumed
+    /// older work, instead of the request itself.
+    #[test]
+    fn test_the_continuation_quotes_what_the_model_hasnt_answered() {
+        let messages = vec![
+            text_message(1, "user", "old question"),
+            text_message(2, "assistant", "old answer"),
+            text_message(3, "user", "Terminal command abc finished: exit code 0."),
+            message_with_blocks(
+                4,
+                "user",
+                vec![anthropic::ContentBlock::ToolResult {
+                    tool_use_id: "toolu_1".to_string(),
+                    content: "a tool result".to_string(),
+                    is_error: None,
+                }],
+            ),
+            text_message(5, "user", "Reply with just: ok"),
+        ];
+        let unanswered = unanswered_user_text(&messages);
+        assert_eq!(
+            unanswered,
+            vec![
+                "Terminal command abc finished: exit code 0.".to_string(),
+                "Reply with just: ok".to_string()
+            ]
+        );
+
+        let [_, _, (_, continuation)] = compaction_messages("the summary".to_string(), 5, &unanswered);
+        let text = format!("{continuation:?}");
+        assert!(text.contains("Reply with just: ok"), "the request isn't in the continuation: {text}");
+        assert!(text.contains("Terminal command abc finished"), "{text}");
+        assert!(!text.contains("old question"), "an answered message came back: {text}");
+    }
+
     #[test]
     fn test_compaction_messages_start_with_user_and_alternate_correctly() {
-        let inserted = compaction_messages("the summary".to_string(), 42);
+        let inserted = compaction_messages("the summary".to_string(), 42, &[]);
         let roles: Vec<&str> = inserted.iter().map(|(role, _)| *role).collect();
         assert_eq!(
             roles,
