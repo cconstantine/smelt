@@ -1137,6 +1137,53 @@ async fn test_end_to_end_browser_scenarios() {
             );
             page.close().await.expect("close the tab");
         }
+
+        // --- Scenario 19: a tool call reads as one compact line that says
+        // what it did, with its result folded in; a failed one is open. Each
+        // call and each result used to be its own card of raw JSON, 24 of
+        // them for a three-line answer (SME-41 D2). ---
+        let tools = new_conversation(pool, &created).await;
+        let call = |id: &str, name: &str, input: serde_json::Value| anthropic::ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+        };
+        let result = |id: &str, content: &str, is_error: bool| anthropic::ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: content.to_string(),
+            is_error: is_error.then_some(true),
+        };
+        db::create_message(pool, tools.id, "assistant", &[
+            call("toolu_ok", "run_terminal_command", serde_json::json!({"command": "ls /tmp", "terminal_id": 1})),
+            call("toolu_bad", "read_file", serde_json::json!({"path": "/nope.txt"})),
+        ]).await.expect("seed the calls");
+        db::create_message(pool, tools.id, "user", &[
+            result("toolu_ok", "command sent (id: abc)", false),
+            result("toolu_bad", "No such file or directory", true),
+        ]).await.expect("seed the results");
+        let page = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, tools.id))
+            .await
+            .expect("open the conversation");
+        wait_for_live_client(&page, tools.id).await;
+        assert!(wait_for_count(&page, ".tool-row", 2, Duration::from_secs(10)).await, "one row per call");
+        let rows: Vec<(String, bool)> = page
+            .evaluate("Array.from(document.querySelectorAll('.tool-row')).map(r => [r.querySelector('summary').innerText, r.open])")
+            .await
+            .expect("read the rows")
+            .into_value()
+            .expect("rows");
+        assert!(rows[0].0.contains("Ran `ls /tmp`") && !rows[0].1, "a successful call is one closed line: {rows:?}");
+        assert!(rows[1].0.contains("Read /nope.txt") && rows[1].1, "a failed call is open: {rows:?}");
+        assert_eq!(
+            page.evaluate("document.querySelectorAll('.tool-result, .tool-call').length").await.expect("count").into_value::<i64>().expect("n"),
+            0,
+            "results shouldn't be separate cards any more"
+        );
+        let body: String = page.evaluate("document.querySelector('.tool-row').textContent").await.expect("read").into_value().expect("text");
+        assert!(body.contains("command sent"), "the raw result is still there on expand: {body}");
+        page.close().await.expect("close the tab");
     })))
     .await;
 

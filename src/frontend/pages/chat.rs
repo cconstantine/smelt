@@ -592,6 +592,71 @@ fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
 /// Label for a `ToolResult` card's header, distinguishing a normal result
 /// from an error at a glance without repeating "error"/"result" as raw text
 /// the caller has to style around.
+/// A tool call described the way a person would say it ("Wrote
+/// /home/sandbox/primes.py", "Ran `python3 primes.py`"), for the compact
+/// row that replaces a raw card per call and per result (SME-41 D2). The
+/// raw input and result stay one click away.
+fn tool_summary(name: &str, input: &serde_json::Value) -> String {
+    let field = |key: &str| -> String {
+        match input.get(key) {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Null) | None => String::new(),
+            Some(other) => other.to_string(),
+        }
+    };
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        let (server, tool) = rest.split_once("__").unwrap_or(("", rest));
+        let query = field("query");
+        if tool.contains("web_search") && !query.is_empty() {
+            return format!("Searched the web for \"{query}\"");
+        }
+        return format!("Used {tool} ({server})");
+    }
+    match name {
+        "create_pod" => "Started the sandbox".to_string(),
+        "terminate_pod" => "Stopped the sandbox".to_string(),
+        "list_pods" => "Checked the sandbox".to_string(),
+        "create_terminal" => "Opened a terminal".to_string(),
+        "terminate_terminal" => "Closed a terminal".to_string(),
+        "list_terminals" => "Listed the terminals".to_string(),
+        "run_terminal_command" => format!("Ran `{}`", field("command")),
+        "send_signal" => format!("Sent {} to a command", field("signal")),
+        "terminal_command_status" => "Checked a command".to_string(),
+        "read_terminal_output" => "Read a command's output".to_string(),
+        "list_commands" => "Listed recent commands".to_string(),
+        "read_file" => format!("Read {}", field("path")),
+        "write_file" => format!("Wrote {}", field("path")),
+        "edit_file" => format!("Edited {}", field("path")),
+        "list_directory" => format!("Listed {}", field("path")),
+        "glob" => format!("Found files matching `{}`", field("pattern")),
+        "grep" => format!("Searched files for `{}`", field("pattern")),
+        "webfetch" => format!("Read {}", field("url")),
+        "http_request" => {
+            let method = field("method");
+            let method = if method.is_empty() { "GET".to_string() } else { method.to_uppercase() };
+            format!("Sent {method} {}", field("url"))
+        }
+        "open_browser_session" => "Opened a browser".to_string(),
+        "close_browser_session" => "Closed the browser".to_string(),
+        "browser_navigate" => format!("Opened {} in the browser", field("url")),
+        "browser_click" => "Clicked in the browser".to_string(),
+        "browser_fill" => "Typed into the browser".to_string(),
+        "browser_back" => "Went back in the browser".to_string(),
+        "browser_read" => "Read the browser page".to_string(),
+        "todowrite" => "Updated the todo list".to_string(),
+        "todoread" => "Checked the todo list".to_string(),
+        "add" => format!("Added {} and {}", field("a"), field("b")),
+        "count" => format!("Counted to {}", field("target")),
+        "list_tasks" => "Listed background tasks".to_string(),
+        "task_status" | "task_result" | "task_stdout" | "task_stderr" | "wait_task" => {
+            "Checked a background task".to_string()
+        }
+        "cancel_task" => "Cancelled a background task".to_string(),
+        "write_task_stdin" => "Sent input to a background task".to_string(),
+        other => format!("Used {other}"),
+    }
+}
+
 fn tool_result_label(is_error: bool) -> &'static str {
     if is_error {
         "Tool error"
@@ -615,6 +680,22 @@ fn run_async_wrapped_tool(input: &serde_json::Value) -> Option<&str> {
 /// recognizes a `run_async` result (to fold it into the compact inline
 /// summary instead of rendering its own card; the tasks sidebar already
 /// shows what actually happened).
+/// Each tool call's result, by the call's id: its content and whether it
+/// failed. A call's row shows its result folded in (SME-41 D2).
+fn tool_results_by_id(messages: &[Message]) -> HashMap<String, (String, bool)> {
+    messages
+        .iter()
+        .filter_map(|m| m.blocks().ok())
+        .flatten()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                Some((tool_use_id, (content, is_error.unwrap_or(false))))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn tool_use_names_by_id(messages: &[Message]) -> HashMap<String, String> {
     messages
         .iter()
@@ -943,6 +1024,7 @@ fn render_block_element(
     tz_offset_minutes: i32,
     block: &ContentBlock,
     tool_names: &HashMap<String, String>,
+    tool_results: &HashMap<String, (String, bool)>,
     thinking_open: bool,
 ) -> Element {
     let key = format!("{message_id}-{index}");
@@ -982,7 +1064,6 @@ fn render_block_element(
                         span { class: "tool-async-start-icon", "🔧" }
                         span { "Started" }
                         code { class: "tool-async-start-tool", "{wrapped_tool}" }
-                        span { class: "timestamp", "{timestamp}" }
                     }
                     pre { class: "tool-async-start-input", "{pretty_input}" }
                 }
@@ -992,7 +1073,8 @@ fn render_block_element(
         // generic tool-call card showing two raw JSON strings — its
         // `old_string`/`new_string` already carry everything a diff needs.
         // See SME-11's "Diff rendering."
-        ContentBlock::ToolUse { name, input, .. } if name == "edit_file" => {
+        ContentBlock::ToolUse { id, name, input } if name == "edit_file" => {
+            let failure = tool_results.get(id).filter(|(_, failed)| *failed).map(|(content, _)| content.clone());
             let path = input
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -1013,7 +1095,9 @@ fn render_block_element(
                         span { class: "tool-call-icon", "✏️" }
                         span { "Edited" }
                         code { class: "tool-call-name", "{path}" }
-                        span { class: "timestamp", "{timestamp}" }
+                    }
+                    if let Some(failure) = failure {
+                        div { class: "tool-row-failure", "Failed: {failure}" }
                     }
                     div { class: "file-edit-diff-body",
                         for (i , line) in lines.iter().enumerate() {
@@ -1027,27 +1111,41 @@ fn render_block_element(
                 }
             }
         }
-        ContentBlock::ToolUse { name, input, .. } => {
+        // One compact line per call, saying what it did, with its result
+        // folded in: the raw input and result are one click away, and a
+        // failed call starts open (SME-41 D2).
+        ContentBlock::ToolUse { id, name, input } => {
+            let summary = tool_summary(name, input);
             let pretty_input = format_tool_input(input);
+            let result = tool_results.get(id).cloned();
+            let failed = result.as_ref().is_some_and(|(_, failed)| *failed);
             rsx! {
-                div { key: "{key}", class: "tool-call",
-                    div { class: "tool-call-header",
-                        span { class: "tool-call-icon", "🔧" }
-                        span { "Called" }
-                        code { class: "tool-call-name", "{name}" }
-                        span { class: "timestamp", "{timestamp}" }
+                details {
+                    key: "{key}",
+                    class: if failed { "tool-row tool-row-failed" } else { "tool-row" },
+                    open: failed,
+                    summary { class: "tool-row-summary",
+                        span { class: "tool-row-marker" }
+                        span { class: "tool-row-text", "{summary}" }
+                        if failed {
+                            span { class: "tool-row-status", "failed" }
+                        }
                     }
-                    pre { class: "tool-call-input", "{pretty_input}" }
+                    div { class: "tool-row-detail",
+                        div { class: "tool-row-label", "{name}" }
+                        pre { class: "tool-row-input", "{pretty_input}" }
+                        if let Some((content, _)) = result {
+                            div { class: "tool-row-label", if failed { "Error" } else { "Result" } }
+                            pre { class: "tool-row-result", "{content}" }
+                        }
+                    }
                 }
             }
         }
-        // The result of a `run_async` call is just the generic "task
-        // started" boilerplate `anthropic::tools` always returns — the
-        // compact summary above already conveys that, so render nothing
-        // rather than a second, redundant card.
-        ContentBlock::ToolResult { tool_use_id, .. }
-            if tool_names.get(tool_use_id).map(String::as_str) == Some("run_async") =>
-        {
+        // A result whose call is in the conversation is shown in that
+        // call's row (or, for `run_async`, not at all: the tasks panel
+        // shows what happened). Only an orphaned result gets a card.
+        ContentBlock::ToolResult { tool_use_id, .. } if tool_names.contains_key(tool_use_id) => {
             rsx! {}
         }
         ContentBlock::ToolResult {
@@ -1592,6 +1690,35 @@ mod tests {
             "Background task count (lS9Y) stdout: count: 1/3"
         );
         assert_eq!(display_text("plain words <b>and a tag</b>"), "plain words <b>and a tag</b>");
+    }
+
+    #[test]
+    fn test_tool_summary_says_what_a_call_did() {
+        assert_eq!(tool_summary("create_pod", &serde_json::json!({})), "Started the sandbox");
+        assert_eq!(tool_summary("terminate_pod", &serde_json::json!({})), "Stopped the sandbox");
+        assert_eq!(tool_summary("create_terminal", &serde_json::json!({})), "Opened a terminal");
+        assert_eq!(
+            tool_summary("run_terminal_command", &serde_json::json!({"command": "python3 primes.py", "terminal_id": 3})),
+            "Ran `python3 primes.py`"
+        );
+        assert_eq!(tool_summary("read_terminal_output", &serde_json::json!({"command_id": "x"})), "Read a command's output");
+        assert_eq!(tool_summary("write_file", &serde_json::json!({"path": "/home/sandbox/a.py", "content": "x"})), "Wrote /home/sandbox/a.py");
+        assert_eq!(tool_summary("read_file", &serde_json::json!({"path": "/etc/hosts"})), "Read /etc/hosts");
+        assert_eq!(tool_summary("list_directory", &serde_json::json!({"path": "/tmp"})), "Listed /tmp");
+        assert_eq!(tool_summary("glob", &serde_json::json!({"pattern": "**/*.rs", "path": "/src"})), "Found files matching `**/*.rs`");
+        assert_eq!(tool_summary("grep", &serde_json::json!({"pattern": "fn main"})), "Searched files for `fn main`");
+        assert_eq!(tool_summary("webfetch", &serde_json::json!({"url": "https://example.com"})), "Read https://example.com");
+        assert_eq!(tool_summary("http_request", &serde_json::json!({"url": "https://api.x/y", "method": "POST"})), "Sent POST https://api.x/y");
+        assert_eq!(tool_summary("http_request", &serde_json::json!({"url": "https://api.x/y"})), "Sent GET https://api.x/y");
+        assert_eq!(tool_summary("browser_navigate", &serde_json::json!({"url": "https://example.com"})), "Opened https://example.com in the browser");
+        assert_eq!(tool_summary("todowrite", &serde_json::json!({"todos": []})), "Updated the todo list");
+        assert_eq!(
+            tool_summary("mcp__exa__web_search_exa", &serde_json::json!({"query": "rust 1.0 release"})),
+            "Searched the web for \"rust 1.0 release\""
+        );
+        assert_eq!(tool_summary("mcp__github__create_issue", &serde_json::json!({})), "Used create_issue (github)");
+        assert_eq!(tool_summary("add", &serde_json::json!({"a": 2, "b": 3})), "Added 2 and 3");
+        assert_eq!(tool_summary("something_new", &serde_json::json!({})), "Used something_new");
     }
 
     /// SME-40 F2: the frame now scales to fit the panel, so a click on
@@ -2840,6 +2967,7 @@ fn ChatPanel(
                 },
                 Some(_) => {
                     let tool_names = tool_use_names_by_id(&messages());
+                    let tool_results = tool_results_by_id(&messages());
                     rsx! {
                     if !tasks().is_empty() || !sandbox_pods().is_empty() || !todos().is_empty() || browsing_session_open() {
                         div { class: "side-panels-row",
@@ -3240,7 +3368,7 @@ fn ChatPanel(
                                         let thinking_open = reply_is_only_thinking(&message.role, &blocks);
                                         rsx! {
                                             for (i , block) in blocks.iter().enumerate() {
-                                                {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names, thinking_open)}
+                                                {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names, &tool_results, thinking_open)}
                                             }
                                         }
                                     },
