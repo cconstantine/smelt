@@ -48,6 +48,8 @@ On a switch, `ChatPanel` resets every per-conversation signal before subscribing
 
 The conversation's sandbox panel has the same two-click "Stop pod" button.
 
+**Two-step buttons** (click once to arm, again to confirm) use `TwoStepLabel` (`pages/mod.rs`) for their label. Both labels share one grid cell and the inactive one is hidden, so arming doesn't resize the button or move what's around it, and the confirming click lands where the first did. Browser scenario 12 checks this on `/pods`. Use it for any new two-step button.
+
 While a turn runs, the composer shows **Stop** next to Send. That's when this tab's reply is streaming, or the server says a turn is running (`TurnState`, with `get_turn_state` in the reconnect pull, kept just before `get_browsing_state` because the browser tests use that request as the "client is live" signal). Stop calls `stop_turn` and shows "Stopped." in place of the reply; the next send clears it.
 
 **Connections are scarce.** Over plain HTTP/1.1, a browser allows 6 connections per host, shared by every tab. Each chat tab holds one always-open event stream, plus one more while a reply streams, and any other request (a Stop click, a snapshot) needs a free one. With about four smelt tabs open while a reply streams, a click can queue until something finishes. Don't add another always-open stream per tab; relay on the conversation stream instead, as `PodsChanged` does.

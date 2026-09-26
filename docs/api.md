@@ -190,6 +190,11 @@ pub enum ConversationEvent {
   - Quantities are parsed by `parse_cpu_nanocores`/`parse_memory_bytes`, and CPU is summed across containers in nanocores.
 - **`observed_at`:** the database's `now()`, so the page measures ages on the database's clock rather than the browser's.
 
+**Records are reconciled with the cluster.** A pod can vanish while smelt isn't connected to it: a cluster rebuild, a pod deleted outside smelt, one that died while smelt was down. Crash detection only notices a pod with a live connection. So `sandbox::reconcile_live_pods` runs from `main()` at startup and every minute:
+- It closes any live record older than 5 minutes whose pod isn't in Kubernetes: commands are marked lost, and terminals and the pod are closed, publishing the usual events.
+- It's quiet: no notice to the model, which would move each conversation to the top of the sidebar.
+- The browser harness never runs it. It shares the dev database but uses the test namespace, so it would close the dev instance's records.
+
 `stop_pod(pod_id)` (`sandbox::stop_pod_for_user`) tears a pod down whether or not it has terminals, the way a crash does: running commands are marked lost and terminals closed. The model is then told in one notice ("The user stopped sandbox pod N…"), saved between turns. It doesn't wake the model. `get_live_pod_conversations` lists the conversations with a live pod, for the sidebar's dots.
 
 ### The browsing panel's own live channel

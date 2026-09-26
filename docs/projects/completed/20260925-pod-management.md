@@ -54,6 +54,18 @@ Each seen failing first:
   - scenario 13: Stop shows in the sending tab and a watching tab, stopping says "Stopped.", Stop goes away in both, the rest of the reply never arrives, and the input is usable.
   - Each was seen failing on a deliberately broken build.
 
+### Fixed after review
+
+You found two problems after the PR was opened (first written up as ideas `stale-live-pod-dots` and `stable-stop-button`, since removed).
+- **Dots for pods that no longer existed.** The database listed 29 live pods; the cluster had one. The other 28 were from 22–24 September: pods lost in the cluster rebuild and namespace cleanups, and pods the browser tier had created in the *test* namespace against the shared dev database. Nothing ever closed a record whose pod vanished while smelt wasn't connected to it (crash detection only works for a pod with a live connection). Some even showed as busy, because their commands were still marked running.
+  - `sandbox::reconcile_live_pods` now closes those records at startup and every minute. It runs from `main()` only, never the browser harness, which works in the test namespace and would close the dev instance's records.
+  - Running commands are marked lost and terminals closed, like a crash, but quietly: a notice per conversation would move every old one to the top of the sidebar, and the model finds out if it tries the pod again.
+  - Rows younger than 5 minutes are skipped, since a row exists briefly before its pod does.
+  - Covered by a real-cluster scenario. It was seen failing on a stub, then checked: a vanished pod is closed with its command lost and terminal closed, no notice is saved, the conversation doesn't move, and a young row is left alone.
+- **A Stop button that grew when armed.** "Stop" became "Confirm stop?" and the button widened (43 to 99 pixels in the browser tier), so the confirming click could miss.
+  - All five two-step buttons now use `TwoStepLabel`: both labels share one grid cell with the inactive one hidden, so the button is always as wide as its longer label. The five are pods Stop, sandbox-panel Stop pod, conversation delete, volume delete, and MCP server delete.
+  - Scenario 12 now measures the button and its neighbouring cell before and after arming. It was seen failing on the old buttons.
+
 ### Not done
 
 - **Apply the RBAC change to the local k3s:** run `docker compose up` (or `docker compose run --rm k3s-bootstrap`) on the host. The `docker` CLI in the dev container talks to a sidecar, not your compose stack, so I couldn't. Until then, usage shows "unavailable" locally. Homelab isn't in scope, per the review.
@@ -74,6 +86,8 @@ Each seen failing first:
 - **The connection limit came up twice.** First with the per-tab app stream (a new tab hung), then with Stop itself (the click queued behind a streaming reply while older tabs held connections). The second only showed as a timing-dependent failure, and was confirmed by closing tabs. Both are written up in frontend.md and testing.md.
 - **My edits kept rebuilding your dev server's bundle,** which the browser tier also serves. It helped once (a run I expected to be stale was current), but it means a "stale bundle" failure-first run can't be relied on while your `dx serve` is running. I switched to breaking the code on purpose instead.
 - **I couldn't apply the RBAC change to the local cluster myself,** so live usage is verified only as "unavailable degrades cleanly", not with real numbers.
+
+- **Both review findings slipped past tests that looked at the right things with the wrong data.** The sidebar tests created fresh pods in a clean test database, so a record outliving its pod never came up; the dev database had 28 of them. The pods-page scenario clicked Stop and Confirm by selector, which works whether or not the button moves. Checking the running dev app against its real data, and measuring layout rather than just finding elements, would have caught both before review.
 
 **Process suggestion (not applied; needs agreement):**
 - Add to development-process.md: before adding an always-open stream (or any long-lived request) per browser tab, count the tab's open connections against the 6-per-host HTTP/1.1 limit, and prefer relaying on an existing stream. It cost two debugging rounds here.
