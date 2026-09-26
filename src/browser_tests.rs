@@ -572,6 +572,20 @@ async fn test_end_to_end_browser_scenarios() {
             .await,
             "the detail view should show the same real usage numbers the indicator did"
         );
+        // The system prompt keeps its line breaks, and the dialog doesn't
+        // scroll sideways: it was one run-together paragraph in a dialog
+        // that scrolled both ways (SME-41 D7).
+        let prompt_view: Vec<String> = context_page
+            .evaluate(
+                "(() => { const p = document.querySelector('.context-detail-prompt'); const panel = document.querySelector('.context-detail-panel'); \
+                 return [p ? getComputedStyle(p).whiteSpace : 'missing', String(panel.scrollWidth - panel.clientWidth)]; })()",
+            )
+            .await
+            .expect("inspect the detail view")
+            .into_value()
+            .expect("strings");
+        assert_eq!(prompt_view[0], "pre-wrap", "the system prompt should keep its line breaks: {prompt_view:?}");
+        assert!(prompt_view[1].parse::<f64>().unwrap_or(1.0) <= 0.0, "the detail view scrolls sideways: {prompt_view:?}");
 
         // --- Scenario 6: a compaction event renders as a distinct,
         // collapsed-by-default divider — not an ordinary chat bubble —

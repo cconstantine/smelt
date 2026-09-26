@@ -2004,6 +2004,33 @@ div.mcp-status-not-connected::before {
     color: var(--text-2);
 }
 
+/* Long tool names and URLs wrap instead of widening the dialog, and the
+   system prompt keeps its line breaks (SME-41 D7). */
+.context-detail-panel {
+    overflow-wrap: anywhere;
+}
+
+.context-detail-heading {
+    margin: 16px 0 6px;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+}
+
+.context-detail-prompt {
+    margin: 0 0 16px;
+    padding: 12px 14px;
+    max-height: 40vh;
+    overflow: auto;
+    white-space: pre-wrap;
+    font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--text);
+    background: var(--canvas);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
 .context-detail-tool {
     border: 1px solid var(--border);
     border-radius: 8px;

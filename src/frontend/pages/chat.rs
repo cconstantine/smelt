@@ -3499,13 +3499,13 @@ fn ChatPanel(
                                         None => rsx! { p { "Loading…" } },
                                         Some(detail) => rsx! {
                                             h3 { "Context" }
-                                            p {
-                                                "System prompt: "
-                                                if let Some(system) = &detail.system {
-                                                    "{system}"
-                                                } else {
-                                                    "none set"
-                                                }
+                                            h4 { class: "context-detail-heading", "System prompt" }
+                                            if let Some(system) = &detail.system {
+                                                // Its own line breaks and headings, not one
+                                                // run-together paragraph (SME-41 D7).
+                                                pre { class: "context-detail-prompt", "{system}" }
+                                            } else {
+                                                p { class: "muted", "None set." }
                                             }
                                             p { "Messages: {detail.message_count}" }
                                             if let Some(usage) = &detail.usage {
