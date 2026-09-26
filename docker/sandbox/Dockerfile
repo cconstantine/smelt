@@ -7,7 +7,11 @@
 # binary there first.
 FROM debian:trixie-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends sudo \
+# The everyday tools most coding tasks reach for first. Without them a
+# first task started by failing and installing them (SME-41 D10);
+# anything else is still one `sudo apt-get install` away.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        sudo ca-certificates curl git python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # A regular, pre-created user — commands run unprivileged by default,

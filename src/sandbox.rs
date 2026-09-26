@@ -4223,6 +4223,17 @@ mod tests {
             "sudo should still reach root for a command that genuinely needs it"
         );
 
+        // The everyday tools are already there: a first coding task used
+        // to fail with `python3: command not found` and spend a minute
+        // installing it (SME-41 D10).
+        for tool in ["python3", "git", "curl"] {
+            let found = sandbox
+                .exec(&["sh", "-c", &format!("command -v {tool}")])
+                .await
+                .expect("exec should succeed");
+            assert!(!found.stdout.trim().is_empty(), "{tool} should be installed in the sandbox image");
+        }
+
         let pods = pods_api(&client);
         pods.delete(&sandbox.pod_name, &immediate_delete_params())
             .await
