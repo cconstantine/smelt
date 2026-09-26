@@ -983,6 +983,70 @@ fn reply_is_only_thinking(role: &str, blocks: &[ContentBlock]) -> bool {
         && blocks.iter().all(|b| matches!(b, ContentBlock::Thinking { .. }))
 }
 
+/// A notice smelt saved into the conversation for the model (a command
+/// finishing, the sandbox stopping, a background task finishing), as the
+/// short sentence the chat shows in place of a user bubble, without
+/// internal ids. `None` for anything the user actually wrote. They used
+/// to look like the user talking (SME-41 D3). `commands` maps a terminal
+/// command's id to the command line, from `terminal_commands_by_id`.
+fn system_notice(text: &str, commands: &HashMap<String, String>) -> Option<String> {
+    let command = |id: &str| match commands.get(id) {
+        Some(line) => format!("`{line}`"),
+        None => "A command".to_string(),
+    };
+    if let Some(rest) = text.strip_prefix("Terminal command ") {
+        if let Some((id, tail)) = rest.split_once(" finished: exit code ") {
+            let code = tail.trim_end_matches('.');
+            return Some(format!("{} finished (exit code {code})", command(id)));
+        }
+        if let Some((id, _)) = rest.split_once("'s outcome is unknown") {
+            return Some(format!("{} stopped: its terminal became unreachable", command(id)));
+        }
+    }
+    if let Some(rest) = text.strip_prefix("Sandbox pod ")
+        && let Some((_, tail)) = rest.split_once(" stopped unexpectedly")
+    {
+        let reason = tail
+            .strip_prefix(" (")
+            .and_then(|r| r.split_once(')'))
+            .map(|(reason, _)| format!(" ({reason})"))
+            .unwrap_or_default();
+        return Some(format!("The sandbox stopped unexpectedly{reason}; its terminals are gone"));
+    }
+    if text.starts_with("The user stopped sandbox pod ") {
+        return Some(
+            "You stopped the sandbox; its terminals, and any files outside volumes, are gone".to_string(),
+        );
+    }
+    task_notice_sentence(text)
+}
+
+/// Each terminal command's id to its command line, from the
+/// `run_terminal_command` calls and their "command sent (id: ...)" results.
+fn terminal_commands_by_id(messages: &[Message]) -> HashMap<String, String> {
+    let blocks: Vec<ContentBlock> = messages.iter().filter_map(|m| m.blocks().ok()).flatten().collect();
+    let command_lines: HashMap<&str, &str> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } if name == "run_terminal_command" => {
+                Some((id.as_str(), input.get("command")?.as_str()?))
+            }
+            _ => None,
+        })
+        .collect();
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                let line = command_lines.get(tool_use_id.as_str())?;
+                let id = content.strip_prefix("command sent (id: ")?.strip_suffix(')')?;
+                Some((id.to_string(), line.to_string()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// A message's text as shown in the chat. A background task's notices
 /// are saved in a tagged form the model reads
 /// (`<task-notification task_id=".." tool="count">finished: ..</task-notification>`);
@@ -1025,11 +1089,21 @@ fn render_block_element(
     block: &ContentBlock,
     tool_names: &HashMap<String, String>,
     tool_results: &HashMap<String, (String, bool)>,
+    commands: &HashMap<String, String>,
     thinking_open: bool,
 ) -> Element {
     let key = format!("{message_id}-{index}");
     let timestamp = format_timestamp(created_at, tz_offset_minutes);
     match block {
+        ContentBlock::Text { text } if role == "user" && system_notice(text, commands).is_some() => {
+            let notice = system_notice(text, commands).unwrap_or_default();
+            rsx! {
+                div { key: "{key}", class: "system-notice",
+                    span { class: "system-notice-text", "{notice}" }
+                    span { class: "timestamp", "{timestamp}" }
+                }
+            }
+        }
         ContentBlock::Text { text } => rsx! {
             div { key: "{key}", class: "message message-{role}",
                 div { class: "message-text", "{display_text(text)}" }
@@ -1293,6 +1367,16 @@ mod tests {
     #[test]
     fn test_run_async_wrapped_tool_missing_field_returns_none() {
         assert_eq!(run_async_wrapped_tool(&serde_json::json!({})), None);
+    }
+
+    fn message_with_blocks(id: i64, role: &str, blocks: Vec<ContentBlock>) -> Message {
+        Message {
+            id,
+            conversation_id: 1,
+            role: role.to_string(),
+            content: serde_json::to_string(&blocks).expect("ContentBlock always serializes"),
+            created_at: chrono::Utc::now().naive_utc(),
+        }
     }
 
     fn tool_use_message(id: i64, tool_use_id: &str, name: &str) -> Message {
@@ -1690,6 +1774,58 @@ mod tests {
             "Background task count (lS9Y) stdout: count: 1/3"
         );
         assert_eq!(display_text("plain words <b>and a tag</b>"), "plain words <b>and a tag</b>");
+    }
+
+    #[test]
+    fn test_system_notices_read_as_short_sentences() {
+        let commands = HashMap::from([("abc123".to_string(), "python3 primes.py".to_string())]);
+        let notice = |t: &str| system_notice(t, &commands);
+        assert_eq!(
+            notice("Terminal command abc123 finished: exit code 0.").as_deref(),
+            Some("`python3 primes.py` finished (exit code 0)")
+        );
+        assert_eq!(
+            notice("Terminal command zzz finished: exit code 127.").as_deref(),
+            Some("A command finished (exit code 127)")
+        );
+        assert_eq!(
+            notice("Terminal command abc123's outcome is unknown — the terminal became unreachable while it was running.").as_deref(),
+            Some("`python3 primes.py` stopped: its terminal became unreachable")
+        );
+        assert_eq!(
+            notice("Sandbox pod 156 stopped unexpectedly (OOMKilled); every terminal running in it is no longer available.").as_deref(),
+            Some("The sandbox stopped unexpectedly (OOMKilled); its terminals are gone")
+        );
+        assert_eq!(
+            notice("Sandbox pod 19 stopped unexpectedly; every terminal running in it is no longer available.").as_deref(),
+            Some("The sandbox stopped unexpectedly; its terminals are gone")
+        );
+        assert_eq!(
+            notice("The user stopped sandbox pod 157. Its terminals, and any files outside mounted volumes, are gone. Create a new pod if you need one.").as_deref(),
+            Some("You stopped the sandbox; its terminals, and any files outside volumes, are gone")
+        );
+        assert_eq!(
+            notice(r#"<task-notification task_id="t1" tool="count">finished: Counted to 3</task-notification>"#).as_deref(),
+            Some("Background task count (t1) finished: Counted to 3")
+        );
+        assert_eq!(notice("Please run the tests"), None);
+    }
+
+    #[test]
+    fn test_terminal_commands_are_found_by_id() {
+        let messages = vec![
+            message_with_blocks(1, "assistant", vec![ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "run_terminal_command".to_string(),
+                input: serde_json::json!({"command": "ls -la", "terminal_id": 1}),
+            }]),
+            message_with_blocks(2, "user", vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: "command sent (id: XYZ)".to_string(),
+                is_error: None,
+            }]),
+        ];
+        assert_eq!(terminal_commands_by_id(&messages).get("XYZ").map(String::as_str), Some("ls -la"));
     }
 
     #[test]
@@ -2968,6 +3104,7 @@ fn ChatPanel(
                 Some(_) => {
                     let tool_names = tool_use_names_by_id(&messages());
                     let tool_results = tool_results_by_id(&messages());
+                    let commands = terminal_commands_by_id(&messages());
                     rsx! {
                     if !tasks().is_empty() || !sandbox_pods().is_empty() || !todos().is_empty() || browsing_session_open() {
                         div { class: "side-panels-row",
@@ -3368,7 +3505,7 @@ fn ChatPanel(
                                         let thinking_open = reply_is_only_thinking(&message.role, &blocks);
                                         rsx! {
                                             for (i , block) in blocks.iter().enumerate() {
-                                                {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names, &tool_results, thinking_open)}
+                                                {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names, &tool_results, &commands, thinking_open)}
                                             }
                                         }
                                     },
