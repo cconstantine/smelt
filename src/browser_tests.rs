@@ -1008,18 +1008,22 @@ async fn test_end_to_end_browser_scenarios() {
     })))
     .await;
 
-    // Before `harness.shutdown()`: once the harness has shut down, the
-    // cluster client's connection is gone ("runtime dropped the dispatch
-    // task") and the pod deletes silently fail.
+    // Cleanup and the leftover check both run before `harness.shutdown()`.
+    // The server's handlers run on dioxus's own worker runtimes, and
+    // database and cluster connections they opened stay tied to those
+    // runtimes. Once the harness shuts down, using one either fails ("A
+    // Tokio 1.x context was found, but it is being shutdown", "runtime
+    // dropped the dispatch task") or hangs forever (SME-39).
     let created = created.into_inner().expect("the conversation list lock");
     let pod_ids = sandbox_pod_ids(pool, &created).await;
     remove_conversations(pool, &created).await;
+    let leftovers = find_leftovers(pool, &created, &pod_ids).await;
     harness.shutdown().await;
     match outcome {
         Err(panic) => std::panic::resume_unwind(panic),
         Ok(timed) => timed.expect("browser test should complete within the timeout, not hang"),
     }
-    assert_nothing_left(pool, &created, &pod_ids).await;
+    assert!(leftovers.is_empty(), "the test left things behind: {leftovers:?}");
 }
 
 async fn new_conversation(
@@ -1054,24 +1058,30 @@ async fn remove_conversations(pool: &sqlx::PgPool, conversations: &[i64]) {
     }
 }
 
-async fn assert_nothing_left(pool: &sqlx::PgPool, conversations: &[i64], pod_ids: &[i64]) {
-    let remaining: Vec<i64> = db::list_conversations(pool)
+/// What the test left behind: conversations still in the database and
+/// sandbox pods still in the cluster, described for the failure message.
+async fn find_leftovers(
+    pool: &sqlx::PgPool,
+    conversations: &[i64],
+    pod_ids: &[i64],
+) -> Vec<String> {
+    let mut leftovers: Vec<String> = db::list_conversations(pool)
         .await
         .expect("list conversations")
         .into_iter()
-        .map(|c| c.id)
-        .filter(|id| conversations.contains(id))
+        .filter(|c| conversations.contains(&c.id))
+        .map(|c| format!("conversation {} in the database", c.id))
         .collect();
-    assert!(remaining.is_empty(), "test conversations left in the database: {remaining:?}");
     // A deleted pod can linger briefly while it terminates.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     for &pod_id in pod_ids {
         while sandbox::pod_exists(pod_id).await {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "test sandbox pod {pod_id} is still in the cluster"
-            );
+            if tokio::time::Instant::now() >= deadline {
+                leftovers.push(format!("sandbox pod {pod_id} in the cluster"));
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
+    leftovers
 }
