@@ -1129,10 +1129,28 @@ fn run_turn_bounded<'a>(
     Box::pin(async move {
         let mut stop = stop_receiver(conversation_id);
         let _in_flight = TurnInFlight::start(conversation_id);
+        let unsaved = new_message.clone();
+        let saved = Arc::new(std::sync::atomic::AtomicBool::new(false));
         tokio::select! {
-            result = run_turn_body(pool, conversation_id, new_message, on_delta, max_turns) => result,
-            _ = stop.changed() => Err(ServerFnError::new(TURN_STOPPED)),
+            result = run_turn_body(pool, conversation_id, new_message, on_delta, max_turns, saved.clone()) => return result,
+            _ = stop.changed() => {}
         }
+        // Stopped before this turn saved its own message: it was queued
+        // behind the turn the user stopped. Keep the message anyway (a
+        // background task's notice, say), without running a turn for it;
+        // the conversation is paused, so the model sees it next time the
+        // user writes (SME-40 F4).
+        if let Some(message) = unsaved
+            && !saved.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let lock = conversation_lock(conversation_id);
+            let _turn = lock.lock().await;
+            match db::create_message(pool, conversation_id, &message.role, &message.content).await {
+                Ok(saved) => record_saved(conversation_id, &mut Vec::new(), saved),
+                Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't keep a stopped turn's message"),
+            }
+        }
+        Err(ServerFnError::new(TURN_STOPPED))
     })
 }
 
@@ -1196,6 +1214,7 @@ fn run_turn_body<'a>(
     new_message: Option<anthropic::AnthropicMessage>,
     mut on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
     max_turns: usize,
+    new_message_saved: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
 {
     Box::pin(async move {
@@ -1230,6 +1249,7 @@ fn run_turn_body<'a>(
             )
             .await
             .map_err(ServerFnError::new)?;
+            new_message_saved.store(true, std::sync::atomic::Ordering::SeqCst);
             pending_new_content.extend(new_message.content.clone());
             record_saved(conversation_id, &mut persisted, saved);
         }
@@ -3096,6 +3116,53 @@ mod tests {
             requests[0]["messages"].to_string().contains("cmd-after-stop"),
             "the next turn should include the command's notice"
         );
+    }
+
+    #[sqlx::test]
+    async fn test_a_notice_queued_behind_a_stopped_turn_is_still_saved(pool: PgPool) {
+        // SME-40 F4: a background task finishing during a turn queues its
+        // notice as a turn of its own, behind the running one. Stop ended
+        // both before the queued one had saved anything, so the notice was
+        // lost and the model never learned the task finished.
+        let conversation = db::create_conversation_with_id(&pool, 9100000040)
+            .await
+            .expect("create conversation");
+        let lock = conversation_lock(conversation.id);
+        let running = lock.lock().await;
+
+        let notice = r#"<task-notification task_id="t1" tool="count">finished: Counted to 2</task-notification>"#;
+        let queued = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                let message = anthropic::AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![anthropic::ContentBlock::Text { text: notice.to_string() }],
+                };
+                run_turn(&pool, conversation.id, message, None).await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        stop_turn_now(conversation.id);
+        // The running turn ends on the stop too, releasing the lock.
+        drop(running);
+        let result = queued.await.expect("join");
+        assert_eq!(
+            result.err().map(|e| chat_error_text(&e)).as_deref(),
+            Some(TURN_STOPPED)
+        );
+
+        let saved = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let messages = db::list_messages(&pool, conversation.id).await.expect("list");
+                if messages.iter().any(|m| m.content.contains("Counted to 2")) {
+                    return messages;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(saved.is_ok(), "the queued notice was lost when the turn was stopped");
+        resume_turns(conversation.id);
     }
 
     /// A notice waits for a running turn to end before it's saved, and
