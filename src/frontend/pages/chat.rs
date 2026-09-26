@@ -21,7 +21,7 @@ use crate::anthropic::tools::TaskSummary;
 use crate::api::chat::SandboxSnapshot;
 use crate::api::browsing::{navigate_browser, send_browser_input};
 use crate::api::chat::{
-    ChatEvent, ContextDetailSnapshot, ContextUsageSnapshot, create_conversation,
+    ContextDetailSnapshot, ContextUsageSnapshot, create_conversation,
     delete_conversation, get_context_detail, get_conversations, get_messages, send_message,
 };
 // Only called from the live event-subscription loops below, which are
@@ -29,8 +29,8 @@ use crate::api::chat::{
 // reaches them.
 #[cfg(feature = "web")]
 use crate::api::chat::{
-    get_context_usage, get_sandbox_state, get_tasks, get_todos, get_turn_state,
-    subscribe_conversation_events,
+    get_context_usage, get_reply_in_progress, get_sandbox_state, get_tasks, get_todos,
+    get_turn_state, subscribe_conversation_events,
 };
 #[cfg(feature = "web")]
 use crate::api::browsing::{get_browsing_state, subscribe_browser_frames};
@@ -75,6 +75,28 @@ fn apply_loaded_messages(
         .collect();
     loaded.extend(newer);
     loaded
+}
+
+#[cfg(any(feature = "web", test))]
+/// Messages the server just saved (`MessagesAppended`), into the list on
+/// screen: each saved user message replaces one optimistic copy of itself
+/// (a negative id with the same text, shown the moment it was sent), then
+/// anything not already shown is added. Without the replacement the sender
+/// sees their own message twice.
+#[cfg(any(feature = "web", test))]
+fn accept_saved_messages(existing: &mut Vec<Message>, incoming: Vec<Message>) {
+    for saved in &incoming {
+        if saved.role != "user" || existing.iter().any(|m| m.id == saved.id) {
+            continue;
+        }
+        if let Some(copy) = existing
+            .iter()
+            .position(|m| m.id < 0 && m.role == saved.role && m.content == saved.content)
+        {
+            existing.remove(copy);
+        }
+    }
+    merge_messages_by_id(existing, incoming);
 }
 
 #[cfg(any(feature = "web", test))]
@@ -1274,6 +1296,35 @@ mod tests {
         assert_eq!(ids(&apply_loaded_messages(&current, loaded, 7)), vec![1, 2]);
     }
 
+    fn user_text(id: i64, text: &str) -> Message {
+        Message {
+            id,
+            conversation_id: 1,
+            role: "user".to_string(),
+            content: serde_json::to_string(&[ContentBlock::Text { text: text.to_string() }])
+                .expect("serializes"),
+            created_at: chrono::Utc::now().naive_utc(),
+        }
+    }
+
+    #[test]
+    fn test_accept_saved_messages_replaces_the_optimistic_copy() {
+        let mut existing = vec![user_text(1, "earlier"), user_text(-1, "hello"), user_text(-2, "again")];
+        accept_saved_messages(&mut existing, vec![user_text(5, "hello")]);
+        let ids: Vec<i64> = existing.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![1, -2, 5], "the saved message replaces its own copy, not another");
+    }
+
+    #[test]
+    fn test_accept_saved_messages_replaces_one_copy_per_saved_message() {
+        let mut existing = vec![user_text(-1, "yes"), user_text(-2, "yes")];
+        accept_saved_messages(&mut existing, vec![user_text(7, "yes")]);
+        let ids: Vec<i64> = existing.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![-2, 7], "two identical sends: one replaced so far");
+        accept_saved_messages(&mut existing, vec![user_text(7, "yes")]);
+        assert_eq!(existing.len(), 2, "a repeat of an already shown message changes nothing");
+    }
+
     #[test]
     fn test_merge_messages_by_id_skips_ids_already_present() {
         let mut existing = vec![test_message(1)];
@@ -2107,22 +2158,27 @@ fn ChatPanel(
     // says so and offers no message box, instead of a send that can only
     // fail.
     let conversation_missing = move || load_error().as_deref() == Some("conversation not found");
-    // Replies in flight, by conversation: the text streamed so far. Keyed
-    // rather than a single value because a send keeps running when the
-    // viewer switches conversations — a single value made the other
-    // conversation look busy (input disabled) and show this one's reply.
-    let mut replies_in_flight: Signal<HashMap<i64, String>> = use_signal(HashMap::new);
-    // The last send error, by conversation, for the same reason.
+    // The open conversation's reply as it streams, from its event stream:
+    // `ReplyReset` starts it, `ReplyDelta` adds to it, and the reply being
+    // saved (`MessagesAppended`) or the turn ending clears it. Reset on a
+    // switch, and restored on (re)connect from `get_reply_in_progress`.
+    // Every tab watching the conversation shows it, whoever started the turn.
+    #[allow(unused_mut)]
+    let mut streaming_reply: Signal<Option<String>> = use_signal(|| None);
+    let streaming_text = move || streaming_reply().filter(|text| !text.is_empty());
+    // The last turn error, by conversation (`TurnError`, or a send the
+    // server refused).
     let mut stream_errors: Signal<HashMap<i64, String>> = use_signal(HashMap::new);
-    let streaming_text = move || selected().and_then(|id| replies_in_flight.read().get(&id).cloned());
-    let is_streaming = move || streaming_text().is_some();
     let stream_error = move || selected().and_then(|id| stream_errors.read().get(&id).cloned());
     // Whether the server has a turn running (or queued) in the selected
     // conversation, from `ConversationEvent::TurnState`: covers turns this
     // tab didn't start (another tab, a finished command waking the model).
     #[allow(unused_mut)]
     let mut turn_running = use_signal(|| false);
-    let can_stop = move || is_streaming() || turn_running();
+    // The message box waits while the model works in this conversation,
+    // whoever started the turn; Stop is offered instead.
+    let is_streaming = move || turn_running();
+    let can_stop = move || turn_running();
     let stop = move |_| {
         let Some(id) = selected() else { return };
         // Shown as "Stopped." where the reply would have been; the next
@@ -2312,6 +2368,7 @@ fn ChatPanel(
             address_error.set(None);
             notification_delivery_error.set(None);
             turn_running.set(false);
+            streaming_reply.set(None);
             context_usage.set(None);
 
             let handle = spawn(async move {
@@ -2324,7 +2381,7 @@ fn ChatPanel(
                         // connection (initial load or reconnect), not on a
                         // timer — not the polling loop this replaces.
                         if let Ok(list) = get_messages(id).await {
-                            merge_messages_by_id(&mut messages.write(), list);
+                            accept_saved_messages(&mut messages.write(), list);
                         }
                         if let Ok(snapshot) = get_tasks(id).await {
                             merge_task_snapshot(&mut tasks.write(), snapshot);
@@ -2345,6 +2402,9 @@ fn ChatPanel(
                         if let Ok(running) = get_turn_state(id).await {
                             turn_running.set(running);
                         }
+                        if let Ok(reply) = get_reply_in_progress(id).await {
+                            streaming_reply.set(reply);
+                        }
                         // Kept last: the browser tests take this request
                         // completing as the sign the client is live.
                         if let Ok(state) = get_browsing_state(id).await {
@@ -2356,7 +2416,11 @@ fn ChatPanel(
                             match events.recv().await {
                                 Some(Ok(ConversationEvent::MessagesAppended { messages: rows })) => {
                                     *conversations_changed.write() += 1;
-                                    merge_messages_by_id(&mut messages.write(), rows);
+                                    // A saved reply replaces its streaming copy.
+                                    if rows.iter().any(|m| m.role == "assistant") {
+                                        streaming_reply.set(None);
+                                    }
+                                    accept_saved_messages(&mut messages.write(), rows);
                                 }
                                 Some(Ok(ConversationEvent::TaskUpdate {
                                     task_id,
@@ -2453,6 +2517,21 @@ fn ChatPanel(
                                 }
                                 Some(Ok(ConversationEvent::TurnState { running })) => {
                                     turn_running.set(running);
+                                    if !running {
+                                        streaming_reply.set(None);
+                                    }
+                                }
+                                Some(Ok(ConversationEvent::ReplyReset {})) => {
+                                    streaming_reply.set(Some(String::new()));
+                                }
+                                Some(Ok(ConversationEvent::ReplyDelta { text })) => {
+                                    streaming_reply
+                                        .write()
+                                        .get_or_insert_with(String::new)
+                                        .push_str(&text);
+                                }
+                                Some(Ok(ConversationEvent::TurnError { message })) => {
+                                    stream_errors.write().insert(id, message);
                                 }
                                 Some(Err(_)) | None => break,
                             }
@@ -2548,58 +2627,14 @@ fn ChatPanel(
             created_at: chrono::Utc::now().naive_utc(),
         });
 
-        // Everything this task touches is keyed by `id`, the conversation
-        // it was started in — the viewer may switch away (and back) while
-        // it runs.
+        // The reply, and the turn's other messages, arrive on the
+        // conversation's own event stream; this request only starts the
+        // turn. Keyed by `id`: the viewer may switch away meanwhile.
         spawn(async move {
-            replies_in_flight.write().insert(id, String::new());
             stream_errors.write().remove(&id);
-
-            let mut fail = move |message: String| {
-                stream_errors.write().insert(id, message);
-            };
-            match send_message(id, content).await {
-                Ok(mut events) => {
-                    while let Some(event) = events.recv().await {
-                        match event {
-                            Ok(ChatEvent::Delta { text }) => {
-                                if let Some(reply) = replies_in_flight.write().get_mut(&id) {
-                                    reply.push_str(&text);
-                                }
-                            }
-                            Ok(ChatEvent::Done {
-                                message_id,
-                                role,
-                                content,
-                            }) => {
-                                // Only into the list on screen if it's this
-                                // conversation's; otherwise it's already
-                                // stored, and loads when the viewer returns.
-                                let viewing = *selected.peek() == Some(id);
-                                let already_shown =
-                                    messages.peek().iter().any(|m| m.id == message_id);
-                                if viewing && !already_shown {
-                                    messages.write().push(Message {
-                                        id: message_id,
-                                        conversation_id: id,
-                                        role,
-                                        content,
-                                        created_at: chrono::Utc::now().naive_utc(),
-                                    });
-                                }
-                                if let Some(reply) = replies_in_flight.write().get_mut(&id) {
-                                    reply.clear();
-                                }
-                            }
-                            Ok(ChatEvent::Error { message }) => fail(message),
-                            Err(e) => fail(server_error_message(&e)),
-                        }
-                    }
-                }
-                Err(e) => fail(server_error_message(&e)),
+            if let Err(e) = send_message(id, content).await {
+                stream_errors.write().insert(id, server_error_message(&e));
             }
-
-            replies_in_flight.write().remove(&id);
             // The first message titles a conversation, and any send moves
             // it up the list — refresh the sidebar even if the viewer has
             // switched away (this tab then isn't listening to `id`'s events).
@@ -2611,7 +2646,7 @@ fn ChatPanel(
     // added or streaming text grows — but only if the user was already at
     // the bottom (`messages_stuck_to_bottom`, kept current by the
     // `.messages` div's own `onscroll` handler below). Reads `messages()`
-    // and `replies_in_flight()` so it reruns on both a persisted message and
+    // and `streaming_reply()` so it reruns on both a persisted message and
     // an in-flight delta.
     //
     // Also reads `tasks()`/`sandbox_pods()`/`sandbox_terminals()`: those
@@ -2620,13 +2655,13 @@ fn ChatPanel(
     // them arrives (see the `if !tasks().is_empty() || !sandbox_pods()...`
     // gate further down). That first appearance shrinks `.chat-main` (they
     // split the column's height via flex), which happens *after* the
-    // scroll-to-bottom already ran off of `messages()`/`replies_in_flight()`
+    // scroll-to-bottom already ran off of `messages()`/`streaming_reply()`
     // alone — leaving `.messages` scrolled to what used to be the bottom
     // but, now that the container is shorter, isn't anymore. Re-running
     // this effect on their arrival re-snaps to the new true bottom.
     use_effect(move || {
         let _ = messages();
-        let _ = replies_in_flight();
+        let _ = streaming_reply();
         let _ = tasks();
         let _ = sandbox_pods();
         let _ = sandbox_terminals();

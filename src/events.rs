@@ -139,6 +139,13 @@ pub enum ConversationEvent {
     ReplyDelta {
         text: String,
     },
+    /// A turn the user started by sending a message failed or was
+    /// stopped (`message` is then `api::chat::TURN_STOPPED`). Turns
+    /// started by a finished command or task report failure as
+    /// `NotificationDeliveryFailed` instead.
+    TurnError {
+        message: String,
+    },
 }
 
 /// Events that aren't about one conversation, for views that span them
@@ -457,6 +464,7 @@ mod wire_tests {
 
     fn one_of_each() -> Vec<ConversationEvent> {
         vec![
+            ConversationEvent::TurnError { message: "boom".to_string() },
             ConversationEvent::ReplyReset {},
             ConversationEvent::ReplyDelta { text: "Hi".to_string() },
             ConversationEvent::TurnState { running: true },
