@@ -1898,7 +1898,9 @@ div.mcp-status-not-connected::before {
 
 .browsing-address-bar {
     margin: 0 0 8px;
-    width: 1280px;
+    /* As wide as the frame below it, which now scales (SME-40 F2). */
+    width: 100%;
+    max-width: 1280px;
 }
 
 .browsing-address-input {

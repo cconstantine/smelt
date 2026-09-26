@@ -1050,7 +1050,7 @@ async fn test_end_to_end_browser_scenarios() {
             .evaluate(
                 "(() => { const w = s => document.querySelector(s).getBoundingClientRect().width; \
                  return [w('.messages'), w('.composer input'), document.documentElement.scrollWidth - document.documentElement.clientWidth, \
-                 w('.browsing-panel-frame-wrap'), w('.browsing-panel')]; })()",
+                 w('.browsing-panel-frame-wrap'), w('.browsing-panel'), w('.browsing-address-bar')]; })()",
             )
             .await
             .expect("measure the layout")
@@ -1060,6 +1060,7 @@ async fn test_end_to_end_browser_scenarios() {
         assert!(layout[1] >= 150.0, "the message box is too narrow to use: {layout:?}");
         assert!(layout[2] <= 0.0, "the page scrolls sideways: {layout:?}");
         assert!(layout[3] <= layout[4], "the frame overflows its panel: {layout:?}");
+        assert!(layout[5] <= layout[4], "the address bar overflows its panel: {layout:?}");
         crate::browsing::close_session(browsing.id).await.expect("close the browsing session");
         page.close().await.expect("close the browsing tab");
 
