@@ -76,6 +76,9 @@ fn ConversationRoute(id: i64) -> Element {
 #[component]
 pub fn App() -> Element {
     rsx! {
+        // Without this a phone lays the page out at desktop width and
+        // shrinks it to fit (SME-40 F8).
+        document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
         document::Stylesheet { href: asset!("/assets/chat.css") }
         Router::<Route> {}
     }

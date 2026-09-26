@@ -1073,6 +1073,37 @@ async fn test_end_to_end_browser_scenarios() {
             "the sidebar's volumes link should open the volumes page"
         );
         page.close().await.expect("close the tab");
+
+        // --- Scenario 17: a phone-width window. The sidebar kept its
+        // 272px, the chat got about 100px and the page scrolled sideways
+        // (SME-40 F8). With `mobile` on, a page without a viewport meta tag
+        // lays out at 980px, so this also checks the tag is there. ---
+        let phone_conversation = new_conversation(pool, &created).await;
+        let page = harness.browser.new_page("about:blank").await.expect("open a tab");
+        page.execute(
+            chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(390, 844, 2.0, true),
+        )
+        .await
+        .expect("emulate a phone");
+        page.goto(format!("{}conversation/{}", harness.base_url, phone_conversation.id))
+            .await
+            .expect("open the conversation");
+        wait_for_live_client(&page, phone_conversation.id).await;
+        let layout: Vec<f64> = page
+            .evaluate(
+                "(() => { const w = s => document.querySelector(s).getBoundingClientRect().width; \
+                 return [innerWidth, w('.messages'), w('.composer input'), \
+                 document.documentElement.scrollWidth - document.documentElement.clientWidth]; })()",
+            )
+            .await
+            .expect("measure the layout")
+            .into_value()
+            .expect("numbers");
+        assert_eq!(layout[0], 390.0, "the page isn't laid out at the phone's width: {layout:?}");
+        assert!(layout[1] >= 300.0, "the messages are too narrow on a phone: {layout:?}");
+        assert!(layout[2] >= 200.0, "the message box is too narrow on a phone: {layout:?}");
+        assert!(layout[3] <= 0.0, "the page scrolls sideways on a phone: {layout:?}");
+        page.close().await.expect("close the tab");
     })))
     .await;
 

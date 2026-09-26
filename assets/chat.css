@@ -1012,6 +1012,39 @@ body {
     transition: border-color 100ms ease, box-shadow 100ms ease;
 }
 
+/* A phone-width window (SME-40 F8): the sidebar becomes a strip across
+   the top with a capped, scrollable height, and the chat gets the full
+   width below it, instead of the sidebar keeping its 272px beside a chat
+   squeezed to ~100px. */
+@media (max-width: 720px) {
+    .chat-layout {
+        flex-direction: column;
+    }
+
+    .sidebar {
+        width: auto;
+        max-height: 35vh;
+        border-right: none;
+        border-bottom: 1px solid #e5e5e5;
+        gap: 8px;
+        padding: 12px;
+    }
+
+    .chat-panel {
+        min-height: 0;
+    }
+
+    .messages,
+    .composer {
+        padding-left: 12px;
+        padding-right: 12px;
+    }
+
+    .composer input {
+        min-width: 0;
+    }
+}
+
 .composer input:focus {
     outline: none;
     border-color: #111;
