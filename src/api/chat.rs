@@ -915,6 +915,34 @@ async fn drain_unnotified_terminal_commands(
     Ok(())
 }
 
+/// The reply text streamed so far in each conversation's current model
+/// call, for a tab that connects mid-reply (`get_reply_in_progress`).
+/// Cleared when a call starts, when its reply is saved, and when the turn
+/// ends.
+#[cfg(feature = "server")]
+static REPLIES_IN_PROGRESS: LazyLock<Mutex<HashMap<i64, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// `conversation_id`'s reply so far, if a model call is streaming one.
+#[cfg(feature = "server")]
+pub(crate) fn reply_in_progress(conversation_id: i64) -> Option<String> {
+    REPLIES_IN_PROGRESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&conversation_id)
+        .filter(|text| !text.is_empty())
+        .cloned()
+}
+
+/// Ends `conversation_id`'s reply in progress (see `REPLIES_IN_PROGRESS`).
+#[cfg(feature = "server")]
+fn clear_reply_in_progress(conversation_id: i64) {
+    REPLIES_IN_PROGRESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&conversation_id);
+}
+
 /// Adds a message the turn just saved to `persisted` and tells every tab
 /// watching the conversation, right away: the user's own message first,
 /// then each step of a multi-step reply as it happens, rather than one
@@ -1043,6 +1071,8 @@ impl Drop for TurnInFlight {
             }
         };
         if last {
+            // A stopped or failed turn leaves no reply in progress.
+            clear_reply_in_progress(self.0);
             crate::events::publish(
                 self.0,
                 crate::events::ConversationEvent::TurnState { running: false },
@@ -1227,7 +1257,21 @@ fn run_turn_body<'a>(
                 thinking: thinking_enabled().then_some(anthropic::ThinkingConfig::Adaptive),
             };
 
+            // Every tab watching streams the reply: the text so far is kept
+            // for a tab that connects mid-reply, and each delta published.
             let mut relay = |delta: &str| {
+                REPLIES_IN_PROGRESS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(conversation_id)
+                    .or_default()
+                    .push_str(delta);
+                crate::events::publish(
+                    conversation_id,
+                    crate::events::ConversationEvent::ReplyDelta {
+                        text: delta.to_string(),
+                    },
+                );
                 if let Some(cb) = on_delta.as_deref_mut() {
                     cb(delta);
                 }
@@ -1245,6 +1289,13 @@ fn run_turn_body<'a>(
             let mut turn = None;
             let mut last_err = String::new();
             for attempt in 0..=TOOL_CALL_PARSE_RETRIES {
+                // A fresh bubble per model call, and per retry: a retry's
+                // text replaces a failed attempt's.
+                clear_reply_in_progress(conversation_id);
+                crate::events::publish(
+                    conversation_id,
+                    crate::events::ConversationEvent::ReplyReset {},
+                );
                 match anthropic::stream::stream_anthropic_message(
                     api_key.as_deref(),
                     auth_token.as_deref(),
@@ -1272,6 +1323,9 @@ fn run_turn_body<'a>(
             let saved = db::create_message(pool, conversation_id, "assistant", &turn.content)
                 .await
                 .map_err(ServerFnError::new)?;
+            // Saved (and about to be published as a message), so no longer
+            // "in progress".
+            clear_reply_in_progress(conversation_id);
             record_saved(conversation_id, &mut persisted, saved);
 
             // Real usage from this call is the ground truth for "how much
@@ -3299,6 +3353,96 @@ mod tests {
             seen.push(event);
         }
         seen
+    }
+
+    /// Every tab can show a reply as it streams, one bubble per model
+    /// call: a reset when each call starts, then its text.
+    #[sqlx::test]
+    async fn test_a_turn_streams_its_reply_to_every_tab(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation_with_id(&pool, 9_100_000_007)
+            .await
+            .expect("create conversation");
+        start_mock_upstream(text_tool_then_text_bodies()).await;
+        let mut rx = events::subscribe(conversation.id);
+
+        run_turn(&pool, conversation.id, hello(), None)
+            .await
+            .expect("run_turn should succeed");
+
+        let streamed: Vec<String> = drain_events(&mut rx)
+            .await
+            .into_iter()
+            .filter_map(|event| match event {
+                events::ConversationEvent::ReplyReset {} => Some("<reset>".to_string()),
+                events::ConversationEvent::ReplyDelta { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed, vec!["<reset>", "Adding.", "<reset>", "Sum is 5"]);
+        assert_eq!(reply_in_progress(conversation.id), None, "nothing in progress once the turn ends");
+    }
+
+    /// A mock upstream that streams `text` and then never finishes. Same
+    /// locking rule as `start_mock_upstream`.
+    async fn start_partial_then_hanging_mock_upstream(text: &'static str) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || async move {
+                let start = format!(
+                    "event: message_start\ndata: {{\"type\":\"message_start\"}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n"
+                );
+                let body = futures_util::StreamExt::chain(
+                    futures_util::stream::once(async move { Ok::<_, std::io::Error>(start) }),
+                    futures_util::stream::pending(),
+                );
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(body),
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        unsafe {
+            std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}"));
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        }
+    }
+
+    /// A tab that connects mid-reply can show the text so far.
+    #[sqlx::test]
+    async fn test_the_reply_so_far_is_available_mid_turn(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation_with_id(&pool, 9_100_000_008)
+            .await
+            .expect("create conversation");
+        start_partial_then_hanging_mock_upstream("Partial answer").await;
+
+        let turn = tokio::spawn({
+            let pool = pool.clone();
+            async move { run_turn(&pool, conversation.id, hello(), None).await }
+        });
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(text) = reply_in_progress(conversation.id) {
+                    return text;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the partial reply should be available mid-turn");
+        assert_eq!(seen, "Partial answer");
+
+        stop_turn_now(conversation.id);
+        let _ = turn.await;
+        assert_eq!(reply_in_progress(conversation.id), None, "a stopped turn leaves nothing in progress");
     }
 
     /// Every tab sees each message as it's saved: the user's own first,
