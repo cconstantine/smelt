@@ -21,42 +21,20 @@ pub async fn get_messages(id: i64) -> ServerFnResult<Vec<Message>> {
 
 Path parameters (`{id}`) map directly onto a same-named function argument. `ServerFnResult<T>` is `Result<T, ServerFnError>` — return it from every server function; the macro asserts on this at compile time.
 
-## Streaming: `send_message`
+## Sending a message: `send_message`
 
-`send_message` is a `ServerFnResult<ServerEvents<ChatEvent>>` — Dioxus fullstack's native SSE payload type. Since tool-use landed, it's backed by a *loop* (`api::chat::run_turn`, capped at `MAX_TURNS`), not one Anthropic call: the request now carries a `tools: Vec<ToolDefinition>` list (see `anthropic::types`), and whenever a turn's `stop_reason` is `"tool_use"`, `run_turn` executes each tool (`anthropic::tools::execute`), persists the `ToolResult` turn, and loops again. Exceeding `MAX_TURNS` ends the turn with `ChatEvent::Error` rather than looping forever.
+`send_message(id, content) -> ServerFnResult<()>` is an ordinary request (`start_turn` in `api::chat`):
+1. It checks the conversation exists (`conversation not found` otherwise).
+2. It ends any pause from an earlier stop.
+3. It starts the user's turn in a background task and returns, without waiting for the turn.
 
-```rust
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ChatEvent {
-    Delta { text: String },
-    Done { message_id: i64, role: String, content: String },
-    Error { message: String },
-}
+The turn is `api::chat::run_turn`, a *loop* (capped at `MAX_TURNS`), not one Anthropic call: whenever the model's `stop_reason` is `"tool_use"`, it runs each tool (`anthropic::tools::execute`), saves the `ToolResult` turn, and loops again. Everything it does reaches the browser on the **conversation's event stream** (`subscribe_conversation_events`, below), in every tab watching the conversation, not only the one that sent:
+- **`MessagesAppended`** for each message as it's saved: the user's own message first (which replaces the sender's optimistic copy), then each tool call, tool result and reply.
+- **`ReplyReset {}`** when each model call starts, and **`ReplyDelta { text }`** as its text streams. So each model call is its own streaming bubble, and a multi-step reply no longer runs together.
+- **`TurnState`** when the turn starts and ends.
+- **`TurnError { message }`** if the user's turn fails or is stopped (`TURN_STOPPED`). The message is the error's own text (`chat_error_text`), without `ServerFnError`'s "error running server function: … (details: None)" wrapper.
 
-#[post("/api/conversations/{id}/messages")]
-pub async fn send_message(id: i64, content: String) -> ServerFnResult<ServerEvents<ChatEvent>> {
-    let new_message = AnthropicMessage { role: "user".to_string(), content: vec![ContentBlock::Text { text: content }] };
-
-    Ok(ServerEvents::new(move |mut tx| async move {
-        // on_delta is wired straight into a synchronous unbounded_send (not
-        // the async SseTx::send wrapper) so delta ordering stays exact.
-        match run_turn(db::get(), id, new_message, Some(&mut on_delta)).await {
-            Ok(messages) => {
-                // messages[0] is the caller's own message, already shown
-                // optimistically by the frontend — only relay what run_turn
-                // produced afterward.
-                for message in messages.into_iter().skip(1) {
-                    let _ = tx.send(ChatEvent::Done { message_id: message.id, role: message.role, content: message.content }).await;
-                }
-            }
-            // chat_error_text: the error's own message, without ServerFnError's
-            // "error running server function: … (details: None)" wrapper.
-            Err(e) => { let _ = tx.send(ChatEvent::Error { message: chat_error_text(&e) }).await; }
-        }
-    }))
-}
-```
+**Why not stream the reply on the request itself**, as it used to (`ServerEvents<ChatEvent>`)? Because that held a second connection open per tab for the whole reply. Over plain HTTP/1.1 a browser allows 6 connections per host across all tabs, so with a few tabs open a new tab couldn't load and a click (Stop) waited for the reply to end (see [projects/completed/20260926-connection-limits.md](projects/completed/20260926-connection-limits.md)). Now a tab holds one connection, plus the browsing panel's while that's open. It also means every tab sees a reply live, and a tab that (re)connects mid-reply shows the text so far (`get_reply_in_progress`, from the in-memory `REPLIES_IN_PROGRESS`, cleared when a call starts, when its reply is saved, and when the turn ends).
 
 Every turn request carries a **system prompt**: `system_prompt(&prompt_environment(pool).await)` in `api::chat`. It has two parts:
 - **The fixed base prompt**, `src/api/system_prompt.md`, compiled in with `include_str!`. It covers smelt as a coding agent, how the sandbox works (create the pod first, the `sandbox` user in `/home/sandbox`, `sudo`, what's lost when a pod ends), background commands and their notifications, the file tools, the web tools, working style, and that replies are shown as plain text rather than rendered markdown.
@@ -71,23 +49,6 @@ If a request fails with Ollama's specific "error parsing tool call" 500 (its Ant
 One layer down, `anthropic::stream::stream_anthropic_message` retries a briefly unavailable provider on its own: an HTTP 429, 503 or 529 gets two more attempts, 1s and then 3s later (`RETRY_DELAYS`), before anything has streamed. Any other status fails at once. A failure reads `model provider error {status}: {message}`, where the message is the provider's own (`provider_error_message` unwraps the JSON error body, including a nested one), not the raw response.
 
 `run_turn_bounded` refuses a conversation that doesn't exist with a plain `conversation not found` (checked right after taking the conversation's lock), rather than letting the insert fail on a foreign key. `get_messages` returns the same error, which the chat page uses to show "This conversation doesn't exist" instead of a message box. The new message is saved *before* the credential check, so with no credentials configured the message is kept and only the reply fails.
-
-**`ChatEvent::Done` can fire more than once per `send_message` call** — once for each message `run_turn` persisted in that turn loop (an assistant `ToolUse` turn, the `ToolResult` turn, a final assistant reply — however many rounds the tool-use loop took). The frontend's existing "push each `Done` onto `messages`" loop handles this unchanged, since it was already written to handle an arbitrary number of `Done`s.
-
-On the client, calling `send_message(id, content).await` returns the `ServerEvents<ChatEvent>` immediately (as soon as the connection opens), and the caller iterates it as events arrive — same shape as before, just potentially more `Done`s:
-
-```rust
-let mut events = send_message(id, content).await?;
-while let Some(event) = events.recv().await {
-    match event? {
-        ChatEvent::Delta { text } => streaming_text.write().push_str(&text),
-        ChatEvent::Done { message_id, role, content } => { /* append the persisted message */ }
-        ChatEvent::Error { message } => { /* show it */ }
-    }
-}
-```
-
-Because sending a message and opening its event stream are the same call, there's no POST-then-GET race to worry about — a hazard a two-endpoint hand-rolled SSE design would need to guard against explicitly.
 
 **Some rows are no longer guaranteed to be persisted by the request that "sent" them.** A `run_async` tool call returns immediately, but the task it started can later push its own turns onto the conversation via `run_turn` from a background task — with no `send_message` call in flight at all. Those rows are stored exactly like any other turn (see [models.md](models.md)), just written outside the request/response cycle a naive reading of this API might assume. See "Live conversation events" below for how a browser tab learns about them.
 
@@ -141,7 +102,7 @@ pub struct ContextDetailSnapshot { system: Option<String>, tools: Vec<anthropic:
 pub struct BrowsingState { session_open: bool, url: Option<String> }
 ```
 
-`subscribe_conversation_events` is a second, independent `ServerEvents` stream — unlike `send_message`'s, it isn't scoped to one request; a browser tab opens it once per viewed conversation and keeps it open for as long as that conversation is selected, forwarding whatever `events::subscribe(id)` yields:
+`subscribe_conversation_events` is the conversation's `ServerEvents` stream. It isn't scoped to one request: a browser tab opens it once per viewed conversation and keeps it open for as long as that conversation is selected, forwarding whatever `events::subscribe(id)` yields:
 
 ```rust
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -225,7 +186,7 @@ pub async fn navigate_browser(id: i64, address: String) -> ServerFnResult<()>;
 | `get_conversations` | `GET /api/conversations` | ordered by `updated_at DESC` |
 | `create_conversation` | `POST /api/conversations` | default title |
 | `get_messages` | `GET /api/conversations/{id}/messages` | ordered by `created_at ASC` |
-| `send_message` | `POST /api/conversations/{id}/messages` | streams the assistant reply (and any tool-use turns), see above |
+| `send_message` | `POST /api/conversations/{id}/messages` | starts the user's turn and returns; the reply arrives on the conversation's event stream, see above |
 | `get_tasks` | `GET /api/conversations/{id}/tasks` | one-shot snapshot of `run_async` tasks for this conversation |
 | `get_todos` | `GET /api/conversations/{id}/todos` | one-shot snapshot of the current todo list, see above |
 | `get_sandbox_state` | `GET /api/conversations/{id}/sandbox` | one-shot snapshot of every pod/terminal for this conversation, see above |
@@ -238,6 +199,7 @@ pub async fn navigate_browser(id: i64, address: String) -> ServerFnResult<()>;
 | `subscribe_conversation_events` | `GET /api/conversations/{id}/events` | always-open live stream, see above |
 | `stop_turn` | `POST /api/conversations/{id}/stop` | the Stop button: end the running turn and pause, see above |
 | `get_turn_state` | `GET /api/conversations/{id}/turn` | whether a turn is running, for the Stop button on (re)connect |
+| `get_reply_in_progress` | `GET /api/conversations/{id}/reply` | the reply streamed so far, for a tab that (re)connects mid-reply |
 | `get_pods` | `GET /api/pods` | every live pod with status, activity, limits and usage, see above |
 | `stop_pod` | `POST /api/pods/{pod_id}/stop` | the user stopping a pod, see above |
 | `get_live_pod_conversations` | `GET /api/pods/conversations` | conversations with a live pod, for the sidebar |
