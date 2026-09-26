@@ -18,7 +18,7 @@ Ideas, plans and finished projects live in Linear, not in the repo: team **Smelt
 
 Each ticket gets one label: **Feature**, **Improvement** or **Bug**. Related tickets are linked as related rather than only mentioned.
 
-The project's **Current state** document (on the smelt project in Linear) describes current features, architecture and goals.
+The project's **Current state** document (on the smelt project in Linear) describes current features, architecture and goals. Its **Feature checklist** document lists every shipped feature with the steps to check it through the web UI, one row per ticket.
 
 Linear's markdown differs from GitHub's in ways that bite: don't hard-wrap lines (a wrapped line starting with `+` or `-` becomes a list item), put file names in backticks (Linear turns a bare `name.rs` into a web link), and link repo files by their GitHub URL, not a relative path.
 
@@ -202,6 +202,7 @@ Process changes follow the same confirm-before-change rule — propose first, up
 After each project completes:
 - Replace the ticket's `## Plan` section with `## What shipped` (including anything changed from the plan, and what's not done) and `## Retrospective` (see below)
 - Update the **Current state** document if features or architecture changed
+- Add or update the project's rows in the **Feature checklist**: what a user can do, and how to check it in the browser
 - File anything left undone that's worth doing as its own Backlog ticket, linked as related
 - Put the ticket id in the PR's title or body
 - Move the ticket to **Done** once the PR merges
@@ -238,7 +239,7 @@ propose first, update after the user agrees.
 
 ## Bug bash (every few projects)
 
-Every three completed projects or so, run a bug bash as its own branch and PR: code sweeps of the areas most recently changed, plus hands-on sweeps of the running app with a real model. Include at least one sweep with two tabs open on the same conversation and a reload mid-reply. Most of what the 2026-09-24 bug bash found sat in flows no single project owned (a second tab, a reload, a background reply, a deleted conversation), so no project's own tests covered them. Write the findings up as a plan first, each marked confirmed, confirmed by code, or suspected, then fix them in severity order, one commit per finding, test-first. See [SME-23](https://linear.app/smelt-agent/issue/SME-23).
+Every three completed projects or so, run a bug bash as its own branch and PR: code sweeps of the areas most recently changed, plus hands-on sweeps of the running app with a real model. Include at least one sweep with two tabs open on the same conversation and a reload mid-reply. Most of what the 2026-09-24 bug bash found sat in flows no single project owned (a second tab, a reload, a background reply, a deleted conversation), so no project's own tests covered them. Every bug bash also runs the whole **Feature checklist** through the web UI, marking each row works, broken, model (the model didn't cooperate) or not web-checkable, so "does everything still work" is a list to re-run rather than something to reconstruct. Hands-on checks go through the browser only: no seeding the database or calling APIs directly. Write the findings up in the bug bash's ticket, each with a severity and marked confirmed in the UI, confirmed by code, or suspected; stop for the user to choose what gets fixed; then fix them in severity order, one commit per finding, test-first. See [SME-23](https://linear.app/smelt-agent/issue/SME-23) and [SME-40](https://linear.app/smelt-agent/issue/SME-40).
 
 At each project's close-out, check how many projects have completed since the last bug bash, and say so if one is due.
 
