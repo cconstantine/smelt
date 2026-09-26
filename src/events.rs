@@ -121,6 +121,10 @@ pub enum ConversationEvent {
     /// sidebar's pod dots: browsers allow only 6 connections per host over
     /// HTTP/1.1, shared across tabs.
     PodsChanged {},
+    /// An app-wide `AppEvent::TurnsChanged` (a turn started or ended in
+    /// some conversation), relayed like `PodsChanged` so the sidebar can
+    /// mark which conversations are busy (SME-41 D9).
+    TurnsChanged {},
     /// Whether a model turn is running (or queued) in this conversation,
     /// published when that changes, so every tab watching it can offer a
     /// Stop button, including for turns it didn't start. Regenerable from
@@ -156,6 +160,9 @@ pub enum AppEvent {
     /// A pod was created or went away (stopped, crashed, or torn down with
     /// its conversation). Carries nothing: listeners refetch.
     PodsChanged,
+    /// A model turn started or ended in some conversation. Carries
+    /// nothing: listeners refetch `api::chat::get_busy_conversations`.
+    TurnsChanged,
 }
 
 #[cfg(feature = "server")]
@@ -460,6 +467,9 @@ mod wire_tests {
         let json = serde_json::to_string(&event).expect("serialize");
         assert_eq!(json, r#"{"type":"PodsChanged"}"#);
         assert_eq!(serde_json::from_str::<AppEvent>(&json).expect("deserialize"), event);
+        let event = AppEvent::TurnsChanged;
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert_eq!(serde_json::from_str::<AppEvent>(&json).expect("deserialize"), event);
     }
 
     fn one_of_each() -> Vec<ConversationEvent> {
@@ -469,6 +479,7 @@ mod wire_tests {
             ConversationEvent::ReplyDelta { text: "Hi".to_string() },
             ConversationEvent::TurnState { running: true },
             ConversationEvent::PodsChanged {},
+            ConversationEvent::TurnsChanged {},
             ConversationEvent::TaskUpdate {
                 task_id: "t1".to_string(),
                 tool: "count".to_string(),

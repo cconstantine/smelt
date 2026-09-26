@@ -964,6 +964,13 @@ async fn test_end_to_end_browser_scenarios() {
                 "a running turn should show that the model is working"
             );
         }
+        // And the sidebar marks the conversation as busy, so it's visible
+        // which conversations are working (SME-41 D9).
+        let busy_mark = format!(".conversation-item[data-conversation-id='{}'] .conversation-busy", to_stop.id);
+        assert!(
+            wait_for_count(&observer, &busy_mark, 1, Duration::from_secs(5)).await,
+            "the sidebar should mark a conversation whose turn is running"
+        );
         wait_for_element(&sender, ".stop-turn", Duration::from_secs(5))
             .await
             .click()
@@ -982,6 +989,10 @@ async fn test_end_to_end_browser_scenarios() {
             wait_for_count(&sender, ".turn-working", 0, Duration::from_secs(5)).await
                 && wait_for_count(&observer, ".turn-working", 0, Duration::from_secs(5)).await,
             "the working line should go away once the turn has ended"
+        );
+        assert!(
+            wait_for_count(&observer, &busy_mark, 0, Duration::from_secs(5)).await,
+            "the sidebar's busy mark should go away once the turn has ended"
         );
         // The mock would have finished its reply 5s after it started.
         tokio::time::sleep(Duration::from_secs(6)).await;

@@ -3867,6 +3867,7 @@ mod tests {
             loop {
                 match rx.recv().await {
                     Ok(events::AppEvent::PodsChanged) => return true,
+                    Ok(_) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => return false,
                 }

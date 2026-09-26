@@ -2411,11 +2411,14 @@ pub fn Chat() -> Element {
     // that variant). With no conversation open there's no stream, so the
     // sidebar's pod dots only refresh on navigation.
     let pods_changed = use_signal(|| 0u64);
+    // Bumped the same way when a turn starts or ends in any conversation
+    // (`ConversationEvent::TurnsChanged`), for the sidebar's busy marks.
+    let turns_changed = use_signal(|| 0u64);
 
     rsx! {
         div { class: "chat-layout",
-            ConversationSidebar { selected, conversations_changed, pods_changed }
-            ChatPanel { selected, conversations_changed, pods_changed }
+            ConversationSidebar { selected, conversations_changed, pods_changed, turns_changed }
+            ChatPanel { selected, conversations_changed, pods_changed, turns_changed }
         }
     }
 }
@@ -2425,6 +2428,7 @@ fn ConversationSidebar(
     selected: Memo<Option<i64>>,
     conversations_changed: Signal<u64>,
     pods_changed: Signal<u64>,
+    turns_changed: Signal<u64>,
 ) -> Element {
     let navigator = use_navigator();
     // Which conversations have a live pod, for the dot next to their title.
@@ -2435,6 +2439,13 @@ fn ConversationSidebar(
     let has_live_pod = move |id: i64| {
         matches!(&*live_pods.read(), Some(Ok(ids)) if ids.contains(&id))
     };
+    // Which conversations have a turn running, marked as working
+    // (SME-41 D9).
+    let busy = use_resource(move || {
+        let _ = turns_changed();
+        crate::api::chat::get_busy_conversations()
+    });
+    let is_busy = move |id: i64| matches!(&*busy.read(), Some(Ok(ids)) if ids.contains(&id));
     let initial_conversations = use_resource(move || {
         let _ = conversations_changed();
         get_conversations()
@@ -2545,6 +2556,9 @@ fn ConversationSidebar(
                                 navigator.push(Route::ConversationRoute { id: conversation.id });
                             },
                             span { class: "conversation-title", "{conversation.title}" }
+                            if is_busy(conversation.id) {
+                                span { class: "conversation-busy", title: "Working" }
+                            }
                             if has_live_pod(conversation.id) {
                                 span { class: "live-pod-dot", title: "sandbox pod running" }
                             }
@@ -2573,6 +2587,7 @@ fn ChatPanel(
     selected: Memo<Option<i64>>,
     conversations_changed: Signal<u64>,
     pods_changed: Signal<u64>,
+    turns_changed: Signal<u64>,
 ) -> Element {
     let initial_messages = use_resource(move || {
         let id = selected();
@@ -2967,6 +2982,9 @@ fn ChatPanel(
                                 }
                                 Some(Ok(ConversationEvent::PodsChanged {})) => {
                                     *pods_changed.write() += 1;
+                                }
+                                Some(Ok(ConversationEvent::TurnsChanged {})) => {
+                                    *turns_changed.write() += 1;
                                 }
                                 Some(Ok(ConversationEvent::TurnState { running })) => {
                                     turn_running.set(running);

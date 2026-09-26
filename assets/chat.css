@@ -2401,3 +2401,20 @@ div.mcp-status-not-connected::before {
 .conversation-item:focus-within .conversation-age {
     visibility: hidden;
 }
+
+/* A conversation whose model turn is running (SME-41 D9): the same pulse
+   as the "Working..." line in the chat. */
+.conversation-busy {
+    flex-shrink: 0;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: turn-working-pulse 1.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .conversation-busy {
+        animation: none;
+    }
+}

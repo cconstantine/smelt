@@ -18,8 +18,12 @@ pub(crate) fn use_pods_changed() -> Signal<u64> {
                 if let Ok(mut events) = crate::api::pods::subscribe_app_events().await {
                     // Anything that changed while disconnected.
                     *changed.write() += 1;
-                    while let Some(Ok(crate::events::AppEvent::PodsChanged)) = events.recv().await {
-                        *changed.write() += 1;
+                    // Other app-wide events (a turn starting, say) aren't
+                    // about pods; skip them rather than ending the loop.
+                    while let Some(Ok(event)) = events.recv().await {
+                        if event == crate::events::AppEvent::PodsChanged {
+                            *changed.write() += 1;
+                        }
                     }
                 }
                 gloo_timers::future::TimeoutFuture::new(1500).await;
