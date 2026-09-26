@@ -37,7 +37,7 @@ pub enum ContentBlock {
     /// as an ordinary new message (nothing earlier is rewritten or
     /// deleted), but replayed to Anthropic as a plain `Text` block — see
     /// `api::chat::history_for_request` — since Anthropic has no concept of
-    /// this block type. See docs/projects/plans/auto-compaction.md.
+    /// this block type. See SME-18.
     CompactionSummary {
         summary: String,
         covers_through_message_id: i64,
@@ -51,7 +51,7 @@ pub enum ContentBlock {
     /// same as `CompactionSummary`, but rendered as nothing in the
     /// transcript (see `render_block_element`) — a human reading it never
     /// typed or needs to see this, unlike the summary itself. See
-    /// docs/projects/plans/auto-compaction.md.
+    /// SME-18.
     CompactionPlaceholder {
         text: String,
     },
@@ -63,7 +63,7 @@ pub enum ContentBlock {
 /// (server-only) constructs these from a real response, but
 /// `events::ConversationEvent::ContextUsageUpdate` carries one across the
 /// wire to the browser too, so the type itself must compile for both
-/// `server` and `web` — see docs/projects/plans/auto-compaction.md.
+/// `server` and `web` — see SME-18.
 /// `#[serde(default)]` on every field: `message_delta`'s own `usage`
 /// object only ever carries `output_tokens`, not the other three, and
 /// this same type deserializes both shapes. `sqlx::FromRow` gated the same
@@ -95,7 +95,7 @@ pub struct AnthropicMessage {
 /// Ungated, unlike `AnthropicMessage`/`CreateMessageRequest` above —
 /// `api::chat::get_context_detail`'s context-visibility view sends every
 /// available tool's full definition to the browser (see
-/// docs/projects/plans/auto-compaction.md), so this specifically *is*
+/// SME-18), so this specifically *is*
 /// touched by the `web` build now, even though it started server-only in
 /// the same PR that introduced this whole split.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

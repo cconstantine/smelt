@@ -4,26 +4,47 @@ These rules are mandatory. Follow them in order. Do not skip steps.
 
 ---
 
+## Where work is tracked
+
+Ideas, plans and finished projects live in Linear, not in the repo: team **Smelt Agent** (ticket ids `SME-N`), project **smelt**. Use the Linear MCP tools to read and update them.
+
+| Status | Meaning |
+|---|---|
+| **Backlog** | An idea: what the user wants, not yet planned. |
+| **Todo** | Planned: the ticket has an approved plan and is ready to be worked on. |
+| **In Progress** | Being implemented on a branch. |
+| **Done** | Merged and closed out: the ticket records what shipped and the retrospective. |
+| **Canceled** / **Duplicate** | Dropped, or folded into another ticket. |
+
+Each ticket gets one label: **Feature**, **Improvement** or **Bug**. Related tickets are linked as related rather than only mentioned.
+
+The project's **Current state** document (on the smelt project in Linear) describes current features, architecture and goals.
+
+Linear's markdown differs from GitHub's in ways that bite: don't hard-wrap lines (a wrapped line starting with `+` or `-` becomes a list item), put file names in backticks (Linear turns a bare `name.rs` into a web link), and link repo files by their GitHub URL, not a relative path.
+
+---
+
 ## Phase 1: Plan
 
 **Do this before writing any code, any tests, or any files other than the plan itself.**
 
 1. Read the user's request carefully
-2. Read [projects/state.md](projects/state.md) to understand the current codebase
+2. Read the ticket, and the project's **Current state** document, to understand the request and the current codebase
 3. Ask clarifying questions if the request is ambiguous — do not assume
 4. **If the work depends on an outside service or tool, check it before presenting options.** For each claim a choice rests on (whether it's still available, pricing and free tiers, what signup or access it needs, the API's request and response shape), check the provider's current docs and cite them. Don't answer from memory with a general "worth checking" caveat. Also look at how a comparable tool solves the same problem, in its source rather than its marketing. On `websearch`, provider answers from memory had three wrong or stale claims, and a three-provider plan was written on top of them. Reading opencode's source then showed Exa's keyless MCP endpoint, which cut the project to about 60 lines.
 5. Create a branch: `git checkout -b <short-slug>`
-6. Write a plan file at `docs/projects/plans/<short-slug>.md` containing:
+6. Write the plan into the ticket's description, under a `## Plan` heading after the idea's own text (create a ticket first if the work has none). The plan contains:
    - **Branch:** the branch name created in step 5
    - **What** is being built and why
    - **Which files** will be created or modified (be specific)
    - **How** it will be implemented: data model, API shape, UI flow
    - **Open questions or tradeoffs** you are not sure about
-7. Show the plan to the user and **stop**
-8. **Wait for explicit approval** — a response like "looks good", "yes", or "go ahead"
-9. Do not write any implementation code or tests until you receive that approval
+7. Show the plan to the user (link the ticket) and **stop**
+8. **Wait for explicit approval** — a response like "looks good", "yes", or "go ahead". The user may also leave feedback as comments on the ticket.
+9. Once approved, move the ticket to **Todo**; move it to **In Progress** when implementation starts
+10. Do not write any implementation code or tests until you receive that approval
 
-If the user requests changes to the plan, update the plan file and show it again. Repeat until approved.
+If the user requests changes to the plan, update the ticket's plan and show it again. Repeat until approved.
 
 ---
 
@@ -176,29 +197,29 @@ Process changes follow the same confirm-before-change rule — propose first, up
 
 ---
 
-## Keeping project docs current
+## Keeping Linear current
 
 After each project completes:
-- Add a file to [projects/completed/](projects/completed/) named `YYYYMMDD-short-slug.md`
-- Update [projects/state.md](projects/state.md) if features or architecture changed
-- Remove the idea file from [projects/ideas/](projects/ideas/) if it originated there
-- Remove the plan file from [projects/plans/](projects/plans/) if one was created
-- Run a retrospective (see below)
+- Replace the ticket's `## Plan` section with `## What shipped` (including anything changed from the plan, and what's not done) and `## Retrospective` (see below)
+- Update the **Current state** document if features or architecture changed
+- File anything left undone that's worth doing as its own Backlog ticket, linked as related
+- Put the ticket id in the PR's title or body
+- Move the ticket to **Done** once the PR merges
 
-When the user mentions a new idea, add a file to [projects/ideas/](projects/ideas/) before it is forgotten.
+When the user mentions a new idea, create a **Backlog** ticket for it before it is forgotten.
 
 ---
 
 ## Retrospective (end of each project)
 
-**Close-out (this section plus "Keeping project docs current" above) is a
+**Close-out (this section plus "Keeping Linear current" above) is a
 gate on opening the project's PR, not a follow-up to do after it merges.**
 Do it on the same branch as the implementation, so the close-out commit
 rides along in the same PR — not as a separate direct-to-main commit
 afterward, which is easy to forget entirely once the PR is merged and
 attention has moved to whatever's next. Discovered on `todo-list-tool`:
 its close-out was skipped after merge and only caught because the user
-noticed the stale plan file still sitting in `projects/plans/` — checking
+noticed the stale plan file still sitting in the repo — checking
 "did the last thing get closed out" at the *start* of the next project
 relies on remembering to look backward, which is exactly what failed;
 gating it at the point the current project's own PR is created doesn't
@@ -211,30 +232,30 @@ Before considering a project closed, do a short retrospective covering:
   late that an earlier check would have surfaced.
 - **What to change**: concrete proposals to this process, the docs, or the code.
 
-Record it as a short **Retrospective** section in the project's `completed/` doc, and say whether a [bug bash](#bug-bash-every-few-projects) is due.
+Record it as a short **Retrospective** section in the project's ticket, and say whether a [bug bash](#bug-bash-every-few-projects) is due.
 Any resulting process changes follow the [confirm-before-change rule](#evolving-this-process):
 propose first, update after the user agrees.
 
 ## Bug bash (every few projects)
 
-Every three completed projects or so, run a bug bash as its own branch and PR: code sweeps of the areas most recently changed, plus hands-on sweeps of the running app with a real model. Include at least one sweep with two tabs open on the same conversation and a reload mid-reply. Most of what the 2026-09-24 bug bash found sat in flows no single project owned (a second tab, a reload, a background reply, a deleted conversation), so no project's own tests covered them. Write the findings up as a plan first, each marked confirmed, confirmed by code, or suspected, then fix them in severity order, one commit per finding, test-first. See [projects/completed/20260924-bug-bash.md](projects/completed/20260924-bug-bash.md).
+Every three completed projects or so, run a bug bash as its own branch and PR: code sweeps of the areas most recently changed, plus hands-on sweeps of the running app with a real model. Include at least one sweep with two tabs open on the same conversation and a reload mid-reply. Most of what the 2026-09-24 bug bash found sat in flows no single project owned (a second tab, a reload, a background reply, a deleted conversation), so no project's own tests covered them. Write the findings up as a plan first, each marked confirmed, confirmed by code, or suspected, then fix them in severity order, one commit per finding, test-first. See [SME-23](https://linear.app/smelt-agent/issue/SME-23).
 
 At each project's close-out, check how many projects have completed since the last bug bash, and say so if one is due.
 
-## Writing idea files
+## Writing idea tickets
 
-Idea files describe **what the user will be able to do** or **what problem gets solved** — not how it will be built. Keep them abstract and user-focused.
+Idea tickets describe **what the user will be able to do** or **what problem gets solved** — not how it will be built. Keep them abstract and user-focused.
 
-A good idea file answers:
+A good idea ticket answers:
 - What can the user do that they cannot do today?
 - What problem or friction does this remove?
 
-A good idea file does **not** include:
+A good idea ticket does **not** include:
 - Implementation approach, data models, or API design
 - File names, module structure, or technology choices
 - Anything that belongs in a plan
 
-Implementation details belong in the plan, which is written once the idea is approved and work begins. If an idea file starts to look like a plan, trim it back.
+Implementation details belong in the plan, which is written once the idea is approved and work begins. If an idea ticket starts to look like a plan, trim it back.
 
 **Example of what to avoid:** "Add a `tool_calls` table with columns `id`, `message_id`, `name`, `input`, `result` and expose it via a new server function `get_tool_calls()`..."
 

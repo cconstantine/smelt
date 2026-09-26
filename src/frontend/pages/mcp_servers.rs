@@ -80,7 +80,7 @@ fn status_summary(tool_names: &[String]) -> String {
 }
 
 /// Lists every configured server with a live "connected" indicator — see
-/// `docs/projects/completed/20260817-mcp-servers.md`. Each row links to
+/// SME-15. Each row links to
 /// `Route::McpServerEditRoute`; adding a server is its own page
 /// (`Route::McpServerNewRoute`) rather than an inline form here.
 #[component]
@@ -180,7 +180,7 @@ pub fn McpServerNew() -> Element {
     let mut auth_mode: Signal<String> = use_signal(|| "static_headers".to_string());
     // A provider with no OAuth discovery metadata and no Dynamic Client
     // Registration support (GitHub, confirmed live — see
-    // docs/projects/plans/mcp-oauth.md's "Live verification") needs a
+    // SME-16's "Live verification") needs a
     // client pre-registered by hand instead of the default DCR flow.
     // Optional and blank by default — most MCP-spec servers need neither.
     // Set only here, at creation time: same "delete and recreate to
@@ -310,7 +310,7 @@ pub fn McpServerNew() -> Element {
 /// `auth_mode` itself is fixed once a server is created — chosen only on
 /// `McpServerNew`'s form — so there's no control here to switch a server
 /// between static headers and OAuth in place; see
-/// docs/projects/plans/mcp-oauth.md's "UI flow" for why (delete and
+/// SME-16's "UI flow" for why (delete and
 /// re-create is the escape hatch for this pass).
 #[component]
 pub fn McpServerEdit(id: i64) -> Element {

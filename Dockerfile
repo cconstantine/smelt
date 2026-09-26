@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # GitHub CLI, via its official apt repo — needed to open PRs from inside
-# the container (see docs/projects/completed/ retros: this was previously
+# the container (see the retrospectives on Done tickets in Linear: this was previously
 # a manual per-session install).
 RUN mkdir -p -m 755 /etc/apt/keyrings \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \

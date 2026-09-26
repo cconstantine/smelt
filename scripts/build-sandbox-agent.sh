@@ -3,7 +3,7 @@
 # profile-independent path (target/sandbox-agent/sandbox_agent) that
 # src/sandbox.rs's `include_bytes!` references. Must run before building
 # the main server binary — see docs/setup.md and
-# docs/projects/plans/sandbox-terminal.md's "Build ordering."
+# SME-9's "Build ordering."
 #
 # Deliberately a separate script rather than a build.rs: a build.rs that
 # itself shells out to `cargo build --bin sandbox_agent` for a *second*

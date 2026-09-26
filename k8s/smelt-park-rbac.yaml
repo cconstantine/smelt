@@ -1,5 +1,5 @@
 # Recreates the RBAC scope already granted by hand on the `homelab` cluster
-# (see docs/projects/plans/k8s-sandbox.md) for the compose-provided `k3s`
+# (see SME-7) for the compose-provided `k3s`
 # test cluster. Applied by the `k3s-bootstrap` compose service; safe to
 # `kubectl apply` repeatedly (idempotent), since state persists across
 # `docker compose down`/`up` in the named `k3s` volumes.
@@ -82,7 +82,7 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ---
 # Ceiling on `create_pod`'s per-pod memory_limit/cpu_limit override (see
-# docs/projects/plans/sandbox-oom.md's "Per-pod limit overrides") — the
+# SME-12's "Per-pod limit overrides") — the
 # API server rejects any pod creation over this automatically, model
 # override or not, so nothing in application code needs to parse or
 # compare Kubernetes quantity strings itself. Only `max` is set, not

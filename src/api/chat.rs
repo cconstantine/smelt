@@ -133,7 +133,7 @@ const MAX_TOKENS: u32 = 16_384;
 /// opencode's own `max(output reserve, buffer)` term. Not currently
 /// reachable as its own binding factor since `MAX_TOKENS` already exceeds
 /// it, but kept as a named floor rather than assuming `MAX_TOKENS` always
-/// will. See docs/projects/plans/auto-compaction.md.
+/// will. See SME-18.
 #[cfg(feature = "server")]
 const COMPACTION_SAFETY_BUFFER: u32 = 4096;
 
@@ -183,7 +183,7 @@ fn estimate_tokens(blocks: &[anthropic::ContentBlock]) -> u64 {
 /// own doc comment); `new_content_estimate` is `estimate_tokens` applied
 /// to whatever's freshly being added this turn. `None` `last_usage`
 /// (nothing sent yet) never triggers — there's nothing to compact. See
-/// docs/projects/plans/auto-compaction.md.
+/// SME-18.
 #[cfg(feature = "server")]
 fn should_compact(
     last_usage: Option<&anthropic::TokenUsage>,
@@ -210,7 +210,7 @@ fn should_compact(
 /// codebase's per-turn persistence model) hasn't been included too.
 /// Anthropic rejects a request with an orphaned half outright, so this is
 /// a hard constraint on where `covers_through_message_id` may point, never
-/// best-effort. See docs/projects/plans/auto-compaction.md.
+/// best-effort. See SME-18.
 #[cfg(feature = "server")]
 fn is_safe_compaction_boundary(blocks: &[anthropic::ContentBlock]) -> bool {
     !blocks
@@ -241,7 +241,7 @@ const COMPACTION_CONTINUATION_PROMPT: &str = "Continue based on the summary abov
 /// user" and "ends with something real to respond to" on its own:
 /// `user` (structural placeholder) -> `assistant` (the summary) -> `user`
 /// (a plain continuation nudge, the thing the *next* real request
-/// actually responds to). See docs/projects/plans/auto-compaction.md.
+/// actually responds to). See SME-18.
 #[cfg(feature = "server")]
 fn compaction_messages(
     summary: String,
@@ -279,7 +279,7 @@ fn compaction_messages(
 /// earlier compaction's own summary message, is superseded), skips every
 /// message at or before that boundary, and translates the summary itself
 /// from `CompactionSummary` into a plain `Text` block — Anthropic has no
-/// concept of the former. See docs/projects/plans/auto-compaction.md.
+/// concept of the former. See SME-18.
 #[cfg(feature = "server")]
 fn history_for_request(
     messages: Vec<Message>,
@@ -485,7 +485,7 @@ summary as plain prose.";
 /// A plain-text listing of every currently-live pod/terminal/task for
 /// `conversation_id`, handed to the summarization call so it can be told
 /// directly what must survive — see `COMPACTION_SYSTEM_PROMPT` and
-/// docs/projects/plans/auto-compaction.md's "Interaction with live/
+/// SME-18's "Interaction with live/
 /// in-flight state." Best-effort: a lookup failure just omits that
 /// category rather than failing the whole compaction over it.
 #[cfg(feature = "server")]
@@ -810,7 +810,7 @@ pub(crate) fn run_turn<'a>(
 /// pending (e.g. another concurrent wake, or an unrelated live message,
 /// already handled it) — no persisted message, no API call. This is what
 /// keeps several commands finishing close together from costing one model
-/// turn each. See `docs/projects/plans/terminal-exit-notify.md`.
+/// turn each. See SME-13.
 ///
 /// On failure, publishes `ConversationEvent::NotificationDeliveryFailed`
 /// (alongside a `tracing::warn!`) so a watching browser tab sees it live —
@@ -1239,7 +1239,7 @@ fn run_turn_body<'a>(
             // since then — see `should_compact`/`estimate_tokens`. A
             // failure here fails the whole turn loudly rather than risking
             // the oversized request compaction exists to prevent — see
-            // docs/projects/plans/auto-compaction.md's "Resolved" decisions.
+            // SME-18's "Resolved" decisions.
             if should_compact(
                 last_known_usage.as_ref(),
                 estimate_tokens(&pending_new_content),
@@ -1353,7 +1353,7 @@ fn run_turn_body<'a>(
             // up through this response is now accounted for, so
             // `pending_new_content` resets — only what's persisted after
             // this point is "new" again). See
-            // docs/projects/plans/auto-compaction.md.
+            // SME-18.
             db::upsert_conversation_usage(pool, conversation_id, &turn.usage)
                 .await
                 .map_err(ServerFnError::new)?;
@@ -1458,7 +1458,7 @@ pub struct SandboxOutputLine {
 }
 
 /// One terminal's current/most recent command, hydrated for the sandbox
-/// panel's initial scrollback — see `docs/projects/completed/20260815-sandbox-visibility.md`.
+/// panel's initial scrollback — see SME-10.
 /// Only the current/most recent command is included; older history in a
 /// terminal stays reachable through the model's own `list_commands`/
 /// `read_terminal_output` tools, not duplicated here.
@@ -1629,7 +1629,7 @@ pub async fn get_sandbox_state(id: i64) -> ServerFnResult<SandboxSnapshot> {
 /// How full the model's context window is right now — the always-visible
 /// indicator's data. `usage` is `None` for a conversation with no
 /// completed turn yet (nothing to report). See
-/// docs/projects/plans/auto-compaction.md.
+/// SME-18.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ContextUsageSnapshot {
     pub usage: Option<anthropic::TokenUsage>,
@@ -1639,7 +1639,7 @@ pub struct ContextUsageSnapshot {
 /// `context_window_for(&anthropic_model())`, falling back to
 /// `ANTHROPIC_CONTEXT_WINDOW` (for a gateway/local model the built-in table
 /// doesn't recognize), falling back again to a conservative default if
-/// neither resolves it — see docs/projects/plans/auto-compaction.md's
+/// neither resolves it — see SME-18's
 /// "Resolved: the context window is looked up per-model."
 #[cfg(feature = "server")]
 fn context_window() -> u32 {

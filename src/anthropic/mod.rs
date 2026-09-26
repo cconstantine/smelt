@@ -18,7 +18,7 @@ pub use types::{AnthropicMessage, CreateMessageRequest, ThinkingConfig};
 /// can't be derived or queried, only looked up. `None` for anything else
 /// (a gateway or local Ollama model has no "Anthropic model name" to match
 /// at all) — `api::chat`'s caller falls back to `ANTHROPIC_CONTEXT_WINDOW`
-/// in that case. See docs/projects/plans/auto-compaction.md.
+/// in that case. See SME-18.
 #[cfg(feature = "server")]
 pub fn context_window_for(model: &str) -> Option<u32> {
     if model.starts_with("claude-") {

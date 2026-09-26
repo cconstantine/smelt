@@ -1,7 +1,7 @@
 //! Streams a `docker save` tarball into the cluster's node and
 //! `ctr images import`s it — the registry-free delivery mechanism for the
 //! custom sandbox image (see
-//! docs/projects/plans/sandbox-native-environment.md's Phase 1). Run by
+//! SME-17's Phase 1). Run by
 //! `scripts/build-sandbox-image.sh` after `docker build`/`docker save`,
 //! never by the main `smelt` server process at runtime.
 //!

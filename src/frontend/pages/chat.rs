@@ -555,7 +555,7 @@ enum DiffLineKind {
 /// via `similar::TextDiff::from_lines` — not a naive "all of old removed,
 /// all of new added." Pure and testable the same way
 /// `format_tool_input`/`tool_result_label` are, no DOM involved. See
-/// docs/projects/plans/file-tools.md's "Diff rendering."
+/// SME-11's "Diff rendering."
 fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
     similar::TextDiff::from_lines(old, new)
         .iter_all_changes()
@@ -651,7 +651,7 @@ fn is_scrolled_to_bottom(scroll_top: f64, scroll_height: f64, client_height: f64
 /// yet (a brand-new conversation). Clamped to 100 — a conversation caught
 /// mid-compaction, or a `context_window` estimate that's simply wrong for
 /// the configured model, shouldn't render a bar past full. See
-/// docs/projects/plans/auto-compaction.md.
+/// SME-18.
 fn context_usage_percent(snapshot: &ContextUsageSnapshot) -> Option<u32> {
     let usage = snapshot.usage.as_ref()?;
     if snapshot.context_window == 0 {
@@ -704,7 +704,7 @@ fn context_usage_breakdown(usage: &TokenUsage, context_window: u32) -> ContextUs
 /// plus the free remainder always sum to the full bar with no manual
 /// percent math). Fixed category order (input, output, cache creation,
 /// cache read, free), never reassigned by size — see
-/// `docs/projects/plans/auto-compaction.md` and the dataviz skill's
+/// SME-18 and the dataviz skill's
 /// categorical-color rule. A zero-valued category is skipped entirely
 /// (not rendered at flex-grow: 0) so it can't leave a stray 2px gap next
 /// to nothing.
@@ -935,7 +935,7 @@ fn render_block_element(
         // `edit_file` renders as an actual line-level diff instead of a
         // generic tool-call card showing two raw JSON strings — its
         // `old_string`/`new_string` already carry everything a diff needs.
-        // See docs/projects/plans/file-tools.md's "Diff rendering."
+        // See SME-11's "Diff rendering."
         ContentBlock::ToolUse { name, input, .. } if name == "edit_file" => {
             let path = input
                 .get("path")
@@ -1016,7 +1016,7 @@ fn render_block_element(
             }
         }
         // Auto-compaction's own output — visible as something that
-        // happened (per docs/projects/plans/auto-compaction.md's "visible
+        // happened (per SME-18's "visible
         // to the user" decision), collapsed by default same as `Thinking`
         // above so it doesn't dominate the transcript on every reload.
         ContentBlock::CompactionSummary { summary, .. } => rsx! {
@@ -2269,7 +2269,7 @@ fn ChatPanel(
     let mut tz_offset_minutes: Signal<i32> = use_signal(|| 0);
     // `None` until the first `ContextUsageUpdate`/`get_context_usage` pull
     // — a brand-new conversation has no turn yet to report usage for. See
-    // docs/projects/plans/auto-compaction.md.
+    // SME-18.
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut context_usage: Signal<Option<ContextUsageSnapshot>> = use_signal(|| None);
     // The click-through detail view: closed by default, fetched on demand
@@ -2951,7 +2951,7 @@ fn ChatPanel(
                                 aside { class: "sandbox-panel",
                                     h3 { "Sandbox" }
                                     // A conversation has at most one live pod (see
-                                    // docs/projects/plans/file-tools.md's "One pod
+                                    // SME-11's "One pod
                                     // per conversation") — straight through, no tab
                                     // bar needed to pick between pods anymore.
                                     for pod in sandbox_pods() {

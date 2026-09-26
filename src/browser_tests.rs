@@ -1,7 +1,7 @@
 //! The one comprehensive browser test tier — started for `sandbox-visibility`
-//! (see `docs/projects/completed/20260815-sandbox-visibility.md`), extended for
+//! (see SME-10), extended for
 //! `auto-compaction`'s context-usage indicator/detail view and compaction
-//! divider (see `docs/projects/plans/auto-compaction.md`) — per
+//! divider (see SME-18) — per
 //! `docs/testing.md`'s own note that this tier was "worth extending once
 //! another feature has a similar need for real-DOM verification." Runs the
 //! real app in-process (no `lib.rs` exists, so an external `tests/`
@@ -406,7 +406,7 @@ async fn test_end_to_end_browser_scenarios() {
 
         // --- Scenario 1: cold-load panel population, one pod, two terminals
         // in it. A conversation has at most one live pod now (see
-        // docs/projects/plans/file-tools.md's "One pod per conversation"),
+        // SME-11's "One pod per conversation"),
         // so there's no tab bar to click through — both terminals render
         // straight through as soon as the panel loads. ---
         sandbox::create_pod(pool, conversation.id, None, None).await.expect("create_pod");
@@ -488,7 +488,7 @@ async fn test_end_to_end_browser_scenarios() {
 
         // --- Scenario 5: the always-visible context-usage indicator and
         // its click-through detail view — see
-        // docs/projects/plans/auto-compaction.md. A separate conversation,
+        // SME-18. A separate conversation,
         // seeded directly (db::create_message/upsert_conversation_usage)
         // rather than sent through the model — same "bypass the model,
         // verify the DOM" shape every scenario above already uses; a real
@@ -604,7 +604,7 @@ async fn test_end_to_end_browser_scenarios() {
         // --- Scenario 7: the todo panel — cold-load population from a
         // seeded list, then a live, full-replace update with no reload,
         // via the real todowrite tool (not a hand-built event) — see
-        // docs/projects/plans/todo-list-tool.md. ---
+        // SME-20. ---
         let todo_conversation = new_conversation(pool, &created).await;
         db::set_conversation_todos(
             pool,

@@ -1,5 +1,5 @@
 //! In-process tool implementations dispatched by name. See
-//! `docs/projects/plans/tool-use-round-trip.md` for the full design — `add`
+//! SME-8 for the full design — `add`
 //! and `count` are deliberately throwaway stand-ins proving the Anthropic
 //! tool-use protocol round-trips through this codebase, not real tools.
 //! `run_async` and the task-management suite (`list_tasks`, `task_status`,
@@ -34,7 +34,7 @@ pub struct TaskSummary {
 /// client/server boundary as a server-function return value
 /// (`api::chat::get_todos`) and as a live-event payload
 /// (`events::ConversationEvent::TodoListUpdate`), both of which the `web`
-/// target compiles too. See docs/projects/plans/todo-list-tool.md.
+/// target compiles too. See SME-20.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TodoItem {
     pub content: String,
@@ -335,8 +335,8 @@ mod server {
             // --- Terminal: pod, terminal, and command are three separate,
             // explicitly-guarded lifecycles. A conversation has at most one
             // live pod at a time, each with N terminals — see
-            // docs/projects/plans/sandbox-terminal.md and
-            // docs/projects/plans/file-tools.md's "One pod per conversation."
+            // SME-9 and
+            // SME-11's "One pod per conversation."
             ToolDefinition {
                 name: "create_pod".to_string(),
                 description: "Create this conversation's sandbox pod. Refuses if one already \
@@ -499,7 +499,7 @@ mod server {
             },
             // --- File tools: read/edit/write a file, and list a
             // directory, in this conversation's sandbox pod — see
-            // docs/projects/plans/file-tools.md.
+            // SME-11.
             ToolDefinition {
                 name: "read_file".to_string(),
                 description: "Read a file from this conversation's sandbox pod. Paginated \

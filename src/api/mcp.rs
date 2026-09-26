@@ -7,7 +7,7 @@ use crate::db;
 
 /// Read-only summary of a configured MCP server for the browser — never
 /// carries header *values*, only their names (see
-/// `docs/projects/completed/20260817-mcp-servers.md`). Defined outside
+/// SME-15). Defined outside
 /// any server-gated module since this type itself crosses
 /// the client/server boundary as a server-function return value — the same
 /// placement `anthropic::tools::TaskSummary` already uses for the same
@@ -19,7 +19,7 @@ pub struct McpServerSummary {
     pub url: String,
     pub header_names: Vec<String>,
     /// `"static_headers"` or `"oauth"` — see
-    /// docs/projects/plans/mcp-oauth.md. Drives which controls
+    /// SME-16. Drives which controls
     /// `/mcp-servers`' edit page shows (header editor vs. Connect/
     /// Reconnect/Disconnect).
     pub auth_mode: String,
@@ -175,7 +175,7 @@ pub async fn delete_mcp_server(id: i64) -> ServerFnResult<()> {
 /// Starts an OAuth authorization attempt for server `id` and returns the
 /// URL the browser must navigate to (a real full-page navigation to the
 /// authorization provider, not something this call itself redirects to —
-/// see `docs/projects/plans/mcp-oauth.md`'s "UI flow"). The redirect_uri
+/// see SME-16's "UI flow"). The redirect_uri
 /// smelt registers is built from *this request's own* Host header (plus
 /// `X-Forwarded-Proto`, since a bare `Host` never carries scheme) — see the
 /// plan's "Answered by the user": derived, not a configured base URL.

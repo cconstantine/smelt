@@ -1,5 +1,5 @@
 //! OAuth authentication for MCP servers — see
-//! `docs/projects/plans/mcp-oauth.md`. `rmcp`'s own `auth` feature
+//! SME-16. `rmcp`'s own `auth` feature
 //! (`rmcp::transport::auth`) already implements the MCP-spec OAuth client
 //! (RFC 9728/8414 discovery, dynamic client registration, PKCE, refresh);
 //! this module is the wiring smelt needs around it: a Postgres-backed
@@ -212,7 +212,7 @@ pub struct CallbackParams {
 }
 
 /// A plain Axum route (`main.rs`'s `build_router()`), not a Dioxus server
-/// function — see docs/projects/plans/mcp-oauth.md's "API shape" for why:
+/// function — see SME-16's "API shape" for why:
 /// this is hit by the user's browser because the *authorization provider*
 /// redirected it, and it must respond with a real HTTP redirect back into
 /// the app, not JSON. `id` is embedded directly in the path (the

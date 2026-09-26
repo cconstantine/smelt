@@ -52,7 +52,7 @@ waiting for the background drain task to do it instead).
 
 Requires `KUBECONFIG` set and pointing at a reachable cluster with the
 `smelt-park`/`smelt-park-test` namespaces' RBAC applied (see
-[docs/projects/plans/k8s-sandbox.md](projects/plans/k8s-sandbox.md)) —
+[SME-7](https://linear.app/smelt-agent/issue/SME-7)) —
 `docker compose up -d k3s k3s-bootstrap` (or a full `docker compose up -d`)
 sets this up automatically via `docker-compose.yml`'s `KUBECONFIG` env var
 on the `smelt` service, pointing at the compose-provided `k3s` service.
@@ -243,7 +243,7 @@ dx build --platform web                  # once per frontend change — dioxus-s
 cargo test --features "server browser-test" -- --ignored --test-threads=1
 ```
 
-`#[ignore]`d by default (needs the two setup steps above, plus a real Postgres and k3s cluster reachable the same way every other real-cluster test already assumes) and deliberately just the one test for this file's own scope — see `docs/projects/completed/20260815-sandbox-visibility.md` for the design and reasoning (in-process server via a factored-out `build_router()`, `chromiumoxide` talking directly to `chrome-headless-shell` over CDP rather than a `chromedriver`/WebDriver setup this environment doesn't have). Reaches into `db`/`sandbox`/`anthropic::tools` directly to set up scenarios (bypassing the model entirely — this tier verifies the browser/live-event pipeline, not tool-selection behavior) and asserts against the rendered DOM via `page.evaluate("document.body.innerText...")`, not screenshots.
+`#[ignore]`d by default (needs the two setup steps above, plus a real Postgres and k3s cluster reachable the same way every other real-cluster test already assumes) and deliberately just the one test for this file's own scope — see SME-10 for the design and reasoning (in-process server via a factored-out `build_router()`, `chromiumoxide` talking directly to `chrome-headless-shell` over CDP rather than a `chromedriver`/WebDriver setup this environment doesn't have). Reaches into `db`/`sandbox`/`anthropic::tools` directly to set up scenarios (bypassing the model entirely — this tier verifies the browser/live-event pipeline, not tool-selection behavior) and asserts against the rendered DOM via `page.evaluate("document.body.innerText...")`, not screenshots.
 
 `src/webfetch.rs` has its own separate `#[ignore]`d, `browser-test`-gated real-browser test (`webfetch::browser_tests::test_fetch_scenarios`) — same `chrome-headless-shell` binary/setup, same `cargo test --features "server browser-test" -- --ignored --test-threads=1` invocation runs both, but a different module/concern (a feature's own browser-driving + SSRF-guard logic, not DOM/panel rendering), so it isn't a scenario folded into `browser_tests.rs`'s one test. Also different in one real way: it launches its *own* browser instance via `webfetch`'s real (production) `shared_browser`, not `browser_tests.rs`'s own harness — and, having hit the cross-runtime hazard above first-hand, is deliberately still just the one `#[tokio::test]` function covering all its scenarios sequentially, not several.
 
