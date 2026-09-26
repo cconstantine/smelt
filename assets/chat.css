@@ -267,8 +267,41 @@ body {
         border-right: 1px solid var(--border);
     }
 
+    /* The side panels stack in a column, each the column's full width,
+       instead of sitting side by side: three of them in a row shared
+       ~450px, so the live browser was tiny and the terminal pushed out of
+       sight (SME-41 D16). Small panels (todos, background tasks) size to
+       their content; the sandbox takes the rest; the column scrolls if it
+       must. With a browsing session open the column widens to half. */
     .side-panels-row {
         flex: 2;
+        flex-direction: column;
+        overflow-y: auto;
+    }
+
+    .chat-panel:has(.browsing-panel) .side-panels-row {
+        flex: 3;
+    }
+}
+
+@media (min-width: 1024px), (max-width: 720px) {
+    .side-panels-row > .todo-panel,
+    .side-panels-row > .tasks-panel {
+        width: auto;
+        flex: 0 0 auto;
+        max-height: 30vh;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .side-panels-row > .browsing-panel {
+        flex: 0 0 auto;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .side-panels-row > .sandbox-panel {
+        flex: 1 0 320px;
     }
 }
 
@@ -1269,6 +1302,7 @@ body {
 
     .side-panels-row {
         flex: 0 0 auto;
+        flex-direction: column;
         max-height: 40vh;
         overflow-y: auto;
     }

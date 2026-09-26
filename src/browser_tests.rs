@@ -1078,6 +1078,17 @@ async fn test_end_to_end_browser_scenarios() {
         // scroll sideways (SME-40 F2). ---
         let browsing = new_conversation(pool, &created).await;
         crate::browsing::open_session(browsing.id).await.expect("open a browsing session");
+        // With a todo list and a sandbox terminal open too, as in a real
+        // session: side by side, the three panels shared ~450px, so the
+        // browser was tiny and the terminal pushed out of sight (SME-41 D16).
+        db::set_conversation_todos(pool, browsing.id, &[anthropic::tools::TodoItem {
+            content: "check the page".to_string(),
+            status: anthropic::tools::TodoStatus::InProgress,
+        }])
+        .await
+        .expect("seed a todo list");
+        sandbox::create_pod(pool, browsing.id, None, None).await.expect("create_pod");
+        sandbox::create_terminal(pool, browsing.id).await.expect("create_terminal");
         let page = harness
             .browser
             .new_page(format!("{}conversation/{}", harness.base_url, browsing.id))
@@ -1100,6 +1111,20 @@ async fn test_end_to_end_browser_scenarios() {
         assert!(layout[2] <= 0.0, "the page scrolls sideways: {layout:?}");
         assert!(layout[3] <= layout[4], "the frame overflows its panel: {layout:?}");
         assert!(layout[5] <= layout[4], "the address bar overflows its panel: {layout:?}");
+        wait_for_element(&page, ".sandbox-panel .task-terminal", Duration::from_secs(10)).await;
+        let panels: Vec<f64> = page
+            .evaluate(
+                "(() => { const b = s => document.querySelector(s).getBoundingClientRect(); \
+                 const frame = b('.browsing-panel-frame-wrap'), sandbox = b('.sandbox-panel'), todo = b('.todo-panel'); \
+                 return [frame.width, sandbox.width, Math.min(sandbox.bottom, innerHeight) - Math.max(sandbox.top, 0), todo.width]; })()",
+            )
+            .await
+            .expect("measure the side panels")
+            .into_value()
+            .expect("numbers");
+        assert!(panels[0] >= 400.0, "the live browser is too small to use: {panels:?}");
+        assert!(panels[1] >= 400.0, "the sandbox panel is too narrow to read: {panels:?}");
+        assert!(panels[2] >= 240.0, "the sandbox panel should be visible without scrolling: {panels:?}");
         crate::browsing::close_session(browsing.id).await.expect("close the browsing session");
         page.close().await.expect("close the browsing tab");
 
