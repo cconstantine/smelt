@@ -21,7 +21,7 @@ pub(crate) fn TwoStepLabel(armed: bool, idle: &'static str, confirm: &'static st
     rsx! {
         span { class: "two-step-label",
             span { class: if armed { "two-step-text hidden" } else { "two-step-text" }, "{idle}" }
-            span { class: if armed { "two-step-text" } else { "two-step-text hidden" }, "{confirm}" }
+            span { class: if armed { "two-step-text two-step-confirm" } else { "two-step-text two-step-confirm hidden" }, "{confirm}" }
         }
     }
 }

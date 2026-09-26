@@ -54,8 +54,31 @@ const BROWSER_EGRESS_GUARD: fn(IpAddr) -> bool =
 /// `pub(crate)` — `src/browsing.rs`'s persistent sessions run on this same
 /// shared browser instance rather than launching a second one.
 pub(crate) async fn shared_browser() -> Result<&'static Browser, String> {
-    BROWSER.get_or_try_init(launch_browser).await
+    BROWSER
+        .get_or_try_init(|| async {
+            BROWSER_RUNTIME
+                .spawn(launch_browser())
+                .await
+                .map_err(|e| format!("the browser launch task failed: {e}"))?
+        })
+        .await
 }
+
+/// The runtime the shared browser's long-lived tasks (its CDP handler and
+/// egress proxy) run on, for the life of the process. Launched on whatever
+/// runtime asked first, they died with it, and every later user of
+/// `BROWSER` got "send failed because receiver is gone". In the app there
+/// is only one runtime, but each `#[tokio::test]` has its own, so a second
+/// test using the browser broke (SME-40, found when the app's browser tier
+/// started opening browsing sessions).
+static BROWSER_RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("shared-browser")
+        .enable_all()
+        .build()
+        .expect("build the shared browser's runtime")
+});
 
 /// A blank page in a browser context of its own: its own cookies, site
 /// storage, cache and service workers, shared with no other page. Pass
@@ -137,7 +160,13 @@ async fn fetch_with_guard(
 ) -> Result<FetchResult, String> {
     // The request interceptor only sees loads that touch the network, so it
     // can't stop a `data:` (or similar) URL — check the scheme here.
-    fetch_guard::parse_fetch_target(url)?;
+    let (host, port) = fetch_guard::parse_fetch_target(url)?;
+    // Refuse a private or local address before loading, with a reason the
+    // model can act on rather than Chrome's "net::ERR_BLOCKED_BY_CLIENT"
+    // (SME-40 F15). The interceptor still guards everything the page loads.
+    fetch_guard::resolve_allowed(&host, port, is_addr_allowed)
+        .await
+        .map_err(|e| format!("refused {url}: {e}; smelt doesn't load private or local addresses"))?;
     let (page, context) = new_isolated_page().await?;
     let intercept_task = match fetch_guard::spawn_request_interceptor(&page, is_addr_allowed).await {
         Ok(task) => task,
@@ -339,10 +368,9 @@ mod browser_tests {
 
         // --- Scenario 2: navigating straight to a loopback address is refused. ---
         let result = fetch("http://127.0.0.1:1/").await;
-        assert!(
-            result.is_err(),
-            "expected navigating straight to a loopback address to be refused"
-        );
+        let error = result.expect_err("expected navigating straight to a loopback address to be refused");
+        // And says why, not Chrome's "net::ERR_BLOCKED_BY_CLIENT" (SME-40 F15).
+        assert!(error.contains("private or local"), "the refusal should say why: {error}");
 
         // --- Scenario 2b: a data: URL is refused too — it never touches
         // the network, so the request interceptor can't be what stops it. ---

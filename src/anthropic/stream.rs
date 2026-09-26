@@ -28,6 +28,11 @@ fn anthropic_base_url() -> String {
     std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".to_string())
 }
 
+/// The Messages endpoint under `base_url`.
+fn messages_url(base_url: &str) -> String {
+    format!("{}/v1/messages", base_url.trim_end_matches('/'))
+}
+
 /// A single interpreted Anthropic SSE payload, reduced to what
 /// `stream_anthropic_message` needs to act on. Anthropic's stream carries
 /// several event types (message_start, content_block_start,
@@ -248,7 +253,7 @@ async fn send_and_await_response(
     response_timeout: std::time::Duration,
 ) -> Result<reqwest::Response, String> {
     let client = reqwest::Client::new()
-        .post(format!("{base_url}/v1/messages"))
+        .post(messages_url(base_url))
         .header("anthropic-version", "2023-06-01")
         .json(request);
     let client = if let Some(auth_token) = auth_token {
@@ -455,6 +460,15 @@ pub async fn stream_anthropic_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SME-40 F12: a base URL ending in `/` (as the dev `.env`'s does)
+    /// produced `//v1/messages`.
+    #[test]
+    fn test_messages_url_ignores_a_trailing_slash() {
+        assert_eq!(messages_url("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(messages_url("https://gateway.example/"), "https://gateway.example/v1/messages");
+        assert_eq!(messages_url("https://gateway.example/proxy/"), "https://gateway.example/proxy/v1/messages");
+    }
 
     #[test]
     fn test_interpret_text_delta_extracts_text() {

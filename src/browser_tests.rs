@@ -63,7 +63,23 @@ impl BrowserTestHarness {
             std::env::set_var("DIOXUS_PUBLIC_PATH", &public_path);
         }
 
-        let router = crate::build_router();
+        // A plain `cargo test` build doesn't bundle assets: `asset!()`
+        // resolves to the source file's own path, which nothing serves, so
+        // every page would run unstyled (SME-40 F17). Serve the stylesheet
+        // at exactly the URL the page asks for.
+        let stylesheet_url = {
+            use dioxus::prelude::*;
+            asset!("/assets/chat.css").to_string()
+        };
+        let stylesheet = std::fs::read_to_string(repo_root.join("assets/chat.css"))
+            .expect("read assets/chat.css");
+        let router = crate::build_router().route(
+            &stylesheet_url,
+            axum::routing::get(move || {
+                let stylesheet = stylesheet.clone();
+                async move { ([(axum::http::header::CONTENT_TYPE, "text/css")], stylesheet) }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind a test-local port");
@@ -414,6 +430,16 @@ async fn test_end_to_end_browser_scenarios() {
         let terminal_a2 = sandbox::create_terminal(pool, conversation.id).await.expect("create_terminal (a2)");
 
         let page = harness.browser.new_page(&harness.base_url).await.expect("open the app");
+        // Every scenario below assumes the page is styled; a layout check
+        // on an unstyled page proves nothing (SME-40 F17: the stylesheet
+        // was a 404 in this tier, so every page ran unstyled).
+        let stylesheet_status: u16 = page
+            .evaluate("fetch(document.querySelector('link[rel=stylesheet]').href).then(r => r.status)")
+            .await
+            .expect("fetch the stylesheet")
+            .into_value()
+            .expect("a status code");
+        assert_eq!(stylesheet_status, 200, "the page's stylesheet doesn't load");
         // Freshly created conversation sorts first (most-recently-updated) —
         // clicking its sidebar entry, same as a real user, though a direct
         // `/conversation/{id}` URL would work too now that routing exists.
@@ -1005,21 +1031,131 @@ async fn test_end_to_end_browser_scenarios() {
         for tab in tabs {
             tab.close().await.expect("close a finished tab");
         }
+
+        // --- Scenario 15: with a browsing session open, the chat stays
+        // usable at a laptop width (this browser is 1400x900). The live
+        // frame used to be a fixed 1280px that couldn't shrink, which
+        // squeezed the messages and input to 48px and made the page
+        // scroll sideways (SME-40 F2). ---
+        let browsing = new_conversation(pool, &created).await;
+        crate::browsing::open_session(browsing.id).await.expect("open a browsing session");
+        let page = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, browsing.id))
+            .await
+            .expect("open the browsing conversation");
+        wait_for_live_client(&page, browsing.id).await;
+        wait_for_element(&page, ".browsing-panel-frame-wrap", Duration::from_secs(10)).await;
+        let layout: Vec<f64> = page
+            .evaluate(
+                "(() => { const w = s => document.querySelector(s).getBoundingClientRect().width; \
+                 return [w('.messages'), w('.composer input'), document.documentElement.scrollWidth - document.documentElement.clientWidth, \
+                 w('.browsing-panel-frame-wrap'), w('.browsing-panel'), w('.browsing-address-bar')]; })()",
+            )
+            .await
+            .expect("measure the layout")
+            .into_value()
+            .expect("numbers");
+        assert!(layout[0] >= 300.0, "the messages are too narrow to use: {layout:?}");
+        assert!(layout[1] >= 150.0, "the message box is too narrow to use: {layout:?}");
+        assert!(layout[2] <= 0.0, "the page scrolls sideways: {layout:?}");
+        assert!(layout[3] <= layout[4], "the frame overflows its panel: {layout:?}");
+        assert!(layout[5] <= layout[4], "the address bar overflows its panel: {layout:?}");
+        crate::browsing::close_session(browsing.id).await.expect("close the browsing session");
+        page.close().await.expect("close the browsing tab");
+
+        // --- Scenario 16: every settings page is reachable from the
+        // sidebar. Sandbox volumes had no link anywhere; the only way in
+        // was typing the URL (SME-40 F7). ---
+        let page = harness.browser.new_page(&harness.base_url).await.expect("open the app");
+        // And the sidebar's two-step Delete keeps its size when armed: the
+        // armed label was bold, so it came out wider than the width the
+        // button had reserved for it (SME-40 F9). Arming is client-side
+        // only; closing this tab disarms it.
+        let delete = ".conversation-item .delete-conversation";
+        wait_for_element(&page, delete, Duration::from_secs(10)).await;
+        let before = element_box(&page, delete).await;
+        page.find_element(delete).await.expect("find Delete").click().await.expect("arm Delete");
+        wait_for_element(&page, ".conversation-item .delete-conversation.confirm", Duration::from_secs(5)).await;
+        let after = element_box(&page, ".conversation-item .delete-conversation.confirm").await;
+        assert_eq!(before.2, after.2, "arming the sidebar's Delete changed its width");
+        page.close().await.expect("close the tab");
+        let page = harness.browser.new_page(&harness.base_url).await.expect("open the app");
+        click_when_present(&page, ".sidebar a[href='/sandbox-volumes']", Duration::from_secs(10)).await;
+        assert!(
+            wait_for_text(&page, "Sandbox volumes", Duration::from_secs(10)).await,
+            "the sidebar's volumes link should open the volumes page"
+        );
+        page.close().await.expect("close the tab");
+
+        // --- Scenario 17: a phone-width window. The sidebar kept its
+        // 272px, the chat got about 100px and the page scrolled sideways
+        // (SME-40 F8). With `mobile` on, a page without a viewport meta tag
+        // lays out at 980px, so this also checks the tag is there. ---
+        let phone_conversation = new_conversation(pool, &created).await;
+        let page = harness.browser.new_page("about:blank").await.expect("open a tab");
+        page.execute(
+            chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(390, 844, 2.0, true),
+        )
+        .await
+        .expect("emulate a phone");
+        page.goto(format!("{}conversation/{}", harness.base_url, phone_conversation.id))
+            .await
+            .expect("open the conversation");
+        wait_for_live_client(&page, phone_conversation.id).await;
+        let layout: Vec<f64> = page
+            .evaluate(
+                "(() => { const w = s => document.querySelector(s).getBoundingClientRect().width; \
+                 return [innerWidth, w('.messages'), w('.composer input'), \
+                 document.documentElement.scrollWidth - document.documentElement.clientWidth]; })()",
+            )
+            .await
+            .expect("measure the layout")
+            .into_value()
+            .expect("numbers");
+        assert_eq!(layout[0], 390.0, "the page isn't laid out at the phone's width: {layout:?}");
+        assert!(layout[1] >= 300.0, "the messages are too narrow on a phone: {layout:?}");
+        assert!(layout[2] >= 200.0, "the message box is too narrow on a phone: {layout:?}");
+        assert!(layout[3] <= 0.0, "the page scrolls sideways on a phone: {layout:?}");
+        page.close().await.expect("close the tab");
+
+        // --- Scenario 18: a URL that isn't a page says so, with a way
+        // back. It used to show the router's raw "Failed to parse route"
+        // dump (SME-40 F10). ---
+        for path in ["nope", "conversation/abc"] {
+            let page = harness.browser.new_page(format!("{}{path}", harness.base_url)).await.expect("open a bad URL");
+            assert!(
+                wait_for_text(&page, "Page not found", Duration::from_secs(10)).await,
+                "/{path} should say the page doesn't exist"
+            );
+            let body: String = page.evaluate("document.body.innerText").await.expect("read").into_value().expect("text");
+            assert!(!body.contains("Failed to parse route"), "/{path} shows the router's debug output: {body}");
+            click_when_present(&page, "a[href='/']", Duration::from_secs(5)).await;
+            assert!(
+                wait_for_count(&page, ".conversation-list", 1, Duration::from_secs(10)).await,
+                "the link back should reach the conversations"
+            );
+            page.close().await.expect("close the tab");
+        }
     })))
     .await;
 
-    // Before `harness.shutdown()`: once the harness has shut down, the
-    // cluster client's connection is gone ("runtime dropped the dispatch
-    // task") and the pod deletes silently fail.
+    // Cleanup and the leftover check both run before `harness.shutdown()`.
+    // The server's handlers run on dioxus's own worker runtimes, and
+    // database and cluster connections they opened stay tied to those
+    // runtimes. Once the harness shuts down, using one either fails ("A
+    // Tokio 1.x context was found, but it is being shutdown", "runtime
+    // dropped the dispatch task") or hangs forever (SME-39).
     let created = created.into_inner().expect("the conversation list lock");
     let pod_ids = sandbox_pod_ids(pool, &created).await;
     remove_conversations(pool, &created).await;
+    let leftovers = find_leftovers(pool, &created, &pod_ids).await;
     harness.shutdown().await;
     match outcome {
         Err(panic) => std::panic::resume_unwind(panic),
         Ok(timed) => timed.expect("browser test should complete within the timeout, not hang"),
     }
-    assert_nothing_left(pool, &created, &pod_ids).await;
+    assert!(leftovers.is_empty(), "the test left things behind: {leftovers:?}");
 }
 
 async fn new_conversation(
@@ -1054,24 +1190,30 @@ async fn remove_conversations(pool: &sqlx::PgPool, conversations: &[i64]) {
     }
 }
 
-async fn assert_nothing_left(pool: &sqlx::PgPool, conversations: &[i64], pod_ids: &[i64]) {
-    let remaining: Vec<i64> = db::list_conversations(pool)
+/// What the test left behind: conversations still in the database and
+/// sandbox pods still in the cluster, described for the failure message.
+async fn find_leftovers(
+    pool: &sqlx::PgPool,
+    conversations: &[i64],
+    pod_ids: &[i64],
+) -> Vec<String> {
+    let mut leftovers: Vec<String> = db::list_conversations(pool)
         .await
         .expect("list conversations")
         .into_iter()
-        .map(|c| c.id)
-        .filter(|id| conversations.contains(id))
+        .filter(|c| conversations.contains(&c.id))
+        .map(|c| format!("conversation {} in the database", c.id))
         .collect();
-    assert!(remaining.is_empty(), "test conversations left in the database: {remaining:?}");
     // A deleted pod can linger briefly while it terminates.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     for &pod_id in pod_ids {
         while sandbox::pod_exists(pod_id).await {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "test sandbox pod {pod_id} is still in the cluster"
-            );
+            if tokio::time::Instant::now() >= deadline {
+                leftovers.push(format!("sandbox pod {pod_id} in the cluster"));
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
+    leftovers
 }

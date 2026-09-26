@@ -215,6 +215,20 @@ const WHEEL_PIXELS_PER_LINE: f64 = 40.0;
 /// 1280x800 viewport).
 const WHEEL_PIXELS_PER_PAGE: (f64, f64) = (1280.0, 800.0);
 
+/// The frame's width in the remote page's pixels (`browsing::server`'s
+/// pinned 1280x800 viewport).
+const FRAME_WIDTH: f64 = 1280.0;
+
+/// A point on the live-panel frame as shown (`shown_width` pixels wide,
+/// scaled to fit the panel) in the remote page's own pixels.
+fn frame_point(x: f64, y: f64, shown_width: f64) -> (f64, f64) {
+    if shown_width <= 0.0 {
+        return (x, y);
+    }
+    let scale = FRAME_WIDTH / shown_width;
+    (x * scale, y * scale)
+}
+
 /// A wheel event's delta in pixels, whatever unit the viewer's browser
 /// reported it in — Firefox reports lines, so passing the raw number
 /// through would scroll ~3px per notch.
@@ -878,6 +892,47 @@ mod context_usage_tests {
 /// something a human typed at this stage, flagged as a known gap in the
 /// tool-use-round-trip plan's retrospective, not solved here). `ToolUse`/
 /// `ToolResult` render as their own centered cards, distinct from both the
+/// Whether an assistant message is thinking and nothing else: no text,
+/// no tool call. A model sometimes puts its whole answer in its thinking;
+/// collapsed, that reply looked empty (SME-40 F14), so such a message's
+/// thinking is shown open.
+fn reply_is_only_thinking(role: &str, blocks: &[ContentBlock]) -> bool {
+    role == "assistant"
+        && !blocks.is_empty()
+        && blocks.iter().all(|b| matches!(b, ContentBlock::Thinking { .. }))
+}
+
+/// A message's text as shown in the chat. A background task's notices
+/// are saved in a tagged form the model reads
+/// (`<task-notification task_id=".." tool="count">finished: ..</task-notification>`);
+/// shown raw, that's markup (SME-40 F13), so they read as a sentence
+/// instead. Everything else is shown as written.
+fn display_text(text: &str) -> String {
+    task_notice_sentence(text).unwrap_or_else(|| text.to_string())
+}
+
+fn task_notice_sentence(text: &str) -> Option<String> {
+    let attr = |open: &str, name: &str| -> Option<String> {
+        let start = open.find(&format!("{name}=\""))? + name.len() + 2;
+        let len = open[start..].find('"')?;
+        Some(open[start..start + len].to_string())
+    };
+    for tag in ["task-notification", "task-output"] {
+        let closing = format!("</{tag}>");
+        if !text.starts_with(&format!("<{tag} ")) || !text.ends_with(&closing) {
+            continue;
+        }
+        let open_end = text.find('>')?;
+        let (open, body) = (&text[..open_end], &text[open_end + 1..text.len() - closing.len()]);
+        let (task_id, tool) = (attr(open, "task_id")?, attr(open, "tool")?);
+        return Some(match attr(open, "stream") {
+            Some(stream) => format!("Background task {tool} ({task_id}) {stream}: {body}"),
+            None => format!("Background task {tool} ({task_id}) {body}"),
+        });
+    }
+    None
+}
+
 /// user- and assistant-aligned bubbles, so a tool call/result reads as
 /// "the agent doing something" rather than "someone said something."
 fn render_block_element(
@@ -888,13 +943,14 @@ fn render_block_element(
     tz_offset_minutes: i32,
     block: &ContentBlock,
     tool_names: &HashMap<String, String>,
+    thinking_open: bool,
 ) -> Element {
     let key = format!("{message_id}-{index}");
     let timestamp = format_timestamp(created_at, tz_offset_minutes);
     match block {
         ContentBlock::Text { text } => rsx! {
             div { key: "{key}", class: "message message-{role}",
-                div { class: "message-text", "{text}" }
+                div { class: "message-text", "{display_text(text)}" }
                 span { class: "timestamp", "{timestamp}" }
             }
         },
@@ -903,7 +959,7 @@ fn render_block_element(
         // to read on every turn, but shouldn't cost space (or a click
         // through some separate view) when they do.
         ContentBlock::Thinking { thinking, .. } => rsx! {
-            details { key: "{key}", class: "thinking-block",
+            details { key: "{key}", class: "thinking-block", open: thinking_open,
                 summary { class: "thinking-summary",
                     span { class: "thinking-icon", "💭" }
                     span { "Thinking" }
@@ -1513,6 +1569,42 @@ mod tests {
     }
 
     #[test]
+    fn test_a_reply_that_is_only_thinking_is_recognized() {
+        let thinking = ContentBlock::Thinking {
+            thinking: "The answer is /tmp and bar.".to_string(),
+            signature: String::new(),
+        };
+        let text = ContentBlock::Text { text: "done".to_string() };
+        assert!(reply_is_only_thinking("assistant", std::slice::from_ref(&thinking)));
+        assert!(!reply_is_only_thinking("assistant", &[thinking.clone(), text]));
+        assert!(!reply_is_only_thinking("user", std::slice::from_ref(&thinking)));
+        assert!(!reply_is_only_thinking("assistant", &[]));
+    }
+
+    #[test]
+    fn test_display_text_reads_task_notices_as_sentences() {
+        assert_eq!(
+            display_text(r#"<task-notification task_id="lS9Y" tool="count">finished: Counted to 3</task-notification>"#),
+            "Background task count (lS9Y) finished: Counted to 3"
+        );
+        assert_eq!(
+            display_text(r#"<task-output task_id="lS9Y" tool="count" stream="stdout">count: 1/3</task-output>"#),
+            "Background task count (lS9Y) stdout: count: 1/3"
+        );
+        assert_eq!(display_text("plain words <b>and a tag</b>"), "plain words <b>and a tag</b>");
+    }
+
+    /// SME-40 F2: the frame now scales to fit the panel, so a click on
+    /// the shrunk frame is scaled back up to the page's own pixels.
+    #[test]
+    fn test_frame_point_scales_a_shrunk_frame_back_to_page_pixels() {
+        assert_eq!(frame_point(100.0, 50.0, 1280.0), (100.0, 50.0));
+        assert_eq!(frame_point(100.0, 50.0, 640.0), (200.0, 100.0));
+        // Before the first resize event arrives, don't scale by nonsense.
+        assert_eq!(frame_point(100.0, 50.0, 0.0), (100.0, 50.0));
+    }
+
+    #[test]
     fn test_wheel_delta_pixels_passes_pixels_through() {
         assert_eq!(wheel_delta_pixels(WheelDelta::pixels(0.0, 120.0, 0.0)), (0.0, 120.0));
     }
@@ -2002,6 +2094,7 @@ pub fn Chat() -> Element {
         Route::SandboxVolumesRoute {} => None,
         Route::PodsRoute {} => None,
         Route::SandboxVolumeNewRoute {} => None,
+        Route::NotFound { .. } => None,
     });
 
     // Bumped by the chat panel whenever its conversation gets new
@@ -2098,6 +2191,7 @@ fn ConversationSidebar(
             button { class: "new-conversation", onclick: new_conversation, "New conversation" }
             Link { to: Route::McpServersRoute {}, class: "mcp-servers-link", "MCP servers" }
             Link { to: Route::PodsRoute {}, class: "pods-link", "Pods" }
+            Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
             if let Some(err) = error() {
                 p { class: "error", "{err}" }
             }
@@ -2242,6 +2336,9 @@ fn ChatPanel(
     // navigation, and the last navigation error.
     let mut address_draft = use_signal(String::new);
     let mut address_editing = use_signal(|| false);
+    // The live frame's width as shown; it scales to fit the panel, and
+    // clicks on it are scaled back up to the page's own pixels.
+    let mut frame_shown_width = use_signal(|| FRAME_WIDTH);
     let mut address_pending = use_signal(|| false);
     let mut address_error: Signal<Option<String>> = use_signal(|| None);
     // Forwards the live panel's input one request at a time, in the order
@@ -2811,11 +2908,17 @@ fn ChatPanel(
                                         class: "browsing-panel-frame-wrap",
                                         tabindex: "0",
                                         oncontextmenu: move |evt| evt.prevent_default(),
+                                        onresize: move |evt: Event<ResizeData>| {
+                                            if let Ok(size) = evt.data().get_content_box_size() {
+                                                frame_shown_width.set(size.width);
+                                            }
+                                        },
                                         onmousemove: move |evt: Event<MouseData>| {
                                             let Some(id) = selected() else { return };
                                             let p = evt.data().element_coordinates();
+                                            let (x, y) = frame_point(p.x, p.y, frame_shown_width());
                                             let left_held = evt.data().held_buttons().contains(MouseButton::Primary);
-                                            browser_input.send((id, BrowserInputEvent::MouseMove { x: p.x, y: p.y, left_held }));
+                                            browser_input.send((id, BrowserInputEvent::MouseMove { x, y, left_held }));
                                         },
                                         onmousedown: move |evt: Event<MouseData>| {
                                             if evt.data().trigger_button() != Some(MouseButton::Primary) {
@@ -2823,7 +2926,8 @@ fn ChatPanel(
                                             }
                                             let Some(id) = selected() else { return };
                                             let p = evt.data().element_coordinates();
-                                            browser_input.send((id, BrowserInputEvent::MouseDown { x: p.x, y: p.y }));
+                                            let (x, y) = frame_point(p.x, p.y, frame_shown_width());
+                                            browser_input.send((id, BrowserInputEvent::MouseDown { x, y }));
                                         },
                                         onmouseup: move |evt: Event<MouseData>| {
                                             if evt.data().trigger_button() != Some(MouseButton::Primary) {
@@ -2831,17 +2935,19 @@ fn ChatPanel(
                                             }
                                             let Some(id) = selected() else { return };
                                             let p = evt.data().element_coordinates();
-                                            browser_input.send((id, BrowserInputEvent::MouseUp { x: p.x, y: p.y }));
+                                            let (x, y) = frame_point(p.x, p.y, frame_shown_width());
+                                            browser_input.send((id, BrowserInputEvent::MouseUp { x, y }));
                                         },
                                         onwheel: move |evt: Event<WheelData>| {
                                             let Some(id) = selected() else { return };
                                             let p = evt.data().element_coordinates();
+                                            let (x, y) = frame_point(p.x, p.y, frame_shown_width());
                                             let (delta_x, delta_y) = wheel_delta_pixels(evt.data().delta());
                                             browser_input.send((
                                                 id,
                                                 BrowserInputEvent::Wheel {
-                                                    x: p.x,
-                                                    y: p.y,
+                                                    x,
+                                                    y,
                                                     delta_x,
                                                     delta_y,
                                                 },
@@ -3130,9 +3236,12 @@ fn ChatPanel(
                             }
                             for message in messages() {
                                 match message.blocks() {
-                                    Ok(blocks) => rsx! {
-                                        for (i , block) in blocks.iter().enumerate() {
-                                            {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names)}
+                                    Ok(blocks) => {
+                                        let thinking_open = reply_is_only_thinking(&message.role, &blocks);
+                                        rsx! {
+                                            for (i , block) in blocks.iter().enumerate() {
+                                                {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names, thinking_open)}
+                                            }
                                         }
                                     },
                                     Err(e) => rsx! {

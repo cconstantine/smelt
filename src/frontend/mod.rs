@@ -24,6 +24,9 @@ pub(crate) enum Route {
     SandboxVolumeNewRoute {},
     #[route("/pods")]
     PodsRoute {},
+    // Anything else, including a conversation id that isn't a number.
+    #[route("/:..segments")]
+    NotFound { segments: Vec<String> },
 }
 
 #[component]
@@ -61,6 +64,20 @@ fn PodsRoute() -> Element {
     rsx! { PodsIndex {} }
 }
 
+/// A URL that isn't one of smelt's pages. Without this the router showed
+/// its raw "Failed to parse route" dump (SME-40 F10).
+#[component]
+fn NotFound(segments: Vec<String>) -> Element {
+    let path = segments.join("/");
+    rsx! {
+        div { class: "not-found-page",
+            h1 { "Page not found" }
+            p { class: "muted", "There's no page at /{path}." }
+            Link { to: Route::Home {}, class: "not-found-home-link", "\u{2190} Back to conversations" }
+        }
+    }
+}
+
 /// `id` only exists here to satisfy the `Routable` derive's requirement
 /// that this component's props match the route's fields — `Chat` reads
 /// the current conversation straight from the router itself (see its
@@ -76,6 +93,9 @@ fn ConversationRoute(id: i64) -> Element {
 #[component]
 pub fn App() -> Element {
     rsx! {
+        // Without this a phone lays the page out at desktop width and
+        // shrinks it to fit (SME-40 F8).
+        document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
         document::Stylesheet { href: asset!("/assets/chat.css") }
         Router::<Route> {}
     }

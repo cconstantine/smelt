@@ -49,7 +49,8 @@ fn build_router() -> axum::Router {
 #[tokio::main]
 async fn main() {
     // Optional: absent in prod, where real env vars are set directly.
-    let _ = dotenvy::dotenv();
+    // Reported once logging is set up, below.
+    let dotenv_problem = dotenv_problem(dotenvy::dotenv());
 
     // kube's rustls-tls stack only auto-installs a default CryptoProvider
     // when built with its aws-lc-rs feature (which needs cmake/nasm); this
@@ -62,6 +63,9 @@ async fn main() {
             &std::env::var("RUST_LOG").unwrap_or_default(),
         )))
         .init();
+    if let Some(problem) = dotenv_problem {
+        tracing::error!("{problem}");
+    }
 
     let pool = db::init().await;
     sqlx::migrate!()
@@ -108,6 +112,48 @@ fn log_filter_directives(rust_log: &str) -> String {
     let rust_log = rust_log.trim();
     let base = if rust_log.is_empty() { "error" } else { rust_log };
     format!("{base},chromiumoxide::conn=off,chromiumoxide::handler=off")
+}
+
+/// What to tell the user about loading `.env`: nothing when it loaded or
+/// there isn't one (production sets real env vars instead), otherwise the
+/// parse error. dotenvy stops at a line it can't parse, so that line and
+/// every one after it are silently not applied (SME-40 F6: an unquoted
+/// value with a space dropped `ANTHROPIC_MODEL`).
+#[cfg(feature = "server")]
+fn dotenv_problem(result: Result<std::path::PathBuf, dotenvy::Error>) -> Option<String> {
+    match result {
+        Ok(_) => None,
+        Err(e) if e.not_found() => None,
+        Err(e) => Some(format!(
+            "couldn't load .env: {e}. That line and every line after it were not applied; \
+             quote a value that contains spaces"
+        )),
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod dotenv_tests {
+    use super::dotenv_problem;
+
+    #[test]
+    fn test_an_unparseable_env_file_is_reported() {
+        let dir = std::env::temp_dir().join(format!("smelt-dotenv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join(".env");
+        std::fs::write(&path, "A=1\nANTHROPIC_MODEL=Qwen3.8-Flash-Next (UD-Q2_K_XL)\nB=2\n").expect("write");
+        let problem = dotenv_problem(dotenvy::from_path_iter(&path).and_then(|iter| {
+            iter.collect::<Result<Vec<_>, _>>().map(|_| path.clone())
+        }));
+        let problem = problem.expect("an unparseable line should be reported");
+        assert!(problem.contains(".env"), "{problem}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_a_missing_env_file_is_fine() {
+        let missing = std::env::temp_dir().join("smelt-no-such-dir/.env");
+        assert_eq!(dotenv_problem(dotenvy::from_path(&missing).map(|_| missing.clone())), None);
+    }
 }
 
 #[cfg(all(test, feature = "server"))]

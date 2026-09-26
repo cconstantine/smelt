@@ -116,6 +116,11 @@ body {
     background: #c0392b;
     border-color: #c0392b;
     color: #fff;
+}
+
+/* Bold in both states (hidden while idle), so the width the button
+   reserves for it is the width it has when armed (SME-40 F9). */
+.delete-conversation .two-step-confirm {
     font-weight: 600;
 }
 
@@ -166,6 +171,9 @@ body {
     display: flex;
     flex-direction: row;
     min-height: 0;
+    /* Lets a wide panel (the live browser) shrink instead of pushing the
+       chat off screen (SME-40 F2). */
+    min-width: 0;
 }
 
 /* At this width or above, a stacked layout leaves real horizontal space
@@ -182,6 +190,8 @@ body {
     .chat-main {
         order: -1;
         flex: 3;
+        /* Room to read and type, however wide the side panels want to be. */
+        min-width: 360px;
         border-top: none;
         border-right: 1px solid #e5e5e5;
     }
@@ -565,7 +575,8 @@ body {
    worth a proper coordinate-scaling pass if this needs to fit a smaller
    viewport later. */
 .browsing-panel {
-    flex-shrink: 0;
+    flex: 1 1 auto;
+    min-width: 0;
     border-right: 1px solid #e5e5e5;
     background: #fafafa;
     padding: 16px;
@@ -582,8 +593,11 @@ body {
 }
 
 .browsing-panel-frame-wrap {
-    width: 1280px;
-    height: 800px;
+    /* Scales down to fit the panel, keeping the page's 1280x800 shape;
+       clicks are scaled back up to page pixels (`frame_point`). */
+    width: 100%;
+    max-width: 1280px;
+    aspect-ratio: 1280 / 800;
     background: #111;
     border-radius: 4px;
     cursor: pointer;
@@ -593,8 +607,8 @@ body {
 
 .browsing-panel-frame {
     display: block;
-    width: 1280px;
-    height: 800px;
+    width: 100%;
+    height: auto;
     -webkit-user-drag: none;
     user-select: none;
 }
@@ -1001,6 +1015,39 @@ body {
     border-radius: 10px;
     font-size: 15px;
     transition: border-color 100ms ease, box-shadow 100ms ease;
+}
+
+/* A phone-width window (SME-40 F8): the sidebar becomes a strip across
+   the top with a capped, scrollable height, and the chat gets the full
+   width below it, instead of the sidebar keeping its 272px beside a chat
+   squeezed to ~100px. */
+@media (max-width: 720px) {
+    .chat-layout {
+        flex-direction: column;
+    }
+
+    .sidebar {
+        width: auto;
+        max-height: 35vh;
+        border-right: none;
+        border-bottom: 1px solid #e5e5e5;
+        gap: 8px;
+        padding: 12px;
+    }
+
+    .chat-panel {
+        min-height: 0;
+    }
+
+    .messages,
+    .composer {
+        padding-left: 12px;
+        padding-right: 12px;
+    }
+
+    .composer input {
+        min-width: 0;
+    }
 }
 
 .composer input:focus {
@@ -1851,7 +1898,9 @@ div.mcp-status-not-connected::before {
 
 .browsing-address-bar {
     margin: 0 0 8px;
-    width: 1280px;
+    /* As wide as the frame below it, which now scales (SME-40 F2). */
+    width: 100%;
+    max-width: 1280px;
 }
 
 .browsing-address-input {
@@ -1890,7 +1939,8 @@ div.mcp-status-not-connected::before {
 
 /* --- Pods (SME-26) --- */
 
-.pods-link {
+.pods-link,
+.sandbox-volumes-link {
     display: block;
     padding: 8px 10px;
     border-radius: 8px;
@@ -1901,7 +1951,8 @@ div.mcp-status-not-connected::before {
     border: 1px solid #e5e5e5;
 }
 
-.pods-link:hover {
+.pods-link:hover,
+.sandbox-volumes-link:hover {
     background: #f2f2f2;
     color: #111;
 }
@@ -2030,4 +2081,23 @@ div.mcp-status-not-connected::before {
 
 .two-step-text.hidden {
     visibility: hidden;
+}
+
+/* --- A URL that isn't a page (SME-40 F10) --- */
+
+.not-found-page {
+    max-width: 480px;
+    margin: 80px auto;
+    padding: 0 16px;
+    text-align: center;
+}
+
+.not-found-page h1 {
+    font-size: 22px;
+    margin-bottom: 8px;
+}
+
+.not-found-home-link {
+    color: #555;
+    font-size: 14px;
 }

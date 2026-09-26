@@ -246,6 +246,7 @@ const COMPACTION_CONTINUATION_PROMPT: &str = "Continue based on the summary abov
 fn compaction_messages(
     summary: String,
     covers_through_message_id: i64,
+    unanswered: &[String],
 ) -> [(&'static str, Vec<anthropic::ContentBlock>); 3] {
     [
         (
@@ -264,10 +265,46 @@ fn compaction_messages(
         (
             "user",
             vec![anthropic::ContentBlock::CompactionPlaceholder {
-                text: COMPACTION_CONTINUATION_PROMPT.to_string(),
+                text: continuation_prompt(unanswered),
             }],
         ),
     ]
+}
+
+/// The nudge after a summary. When the compaction covered messages the
+/// model hasn't answered yet (the request that triggered it, notices), it
+/// quotes them, so the model answers what was actually asked rather than
+/// the summary's gist of it (SME-40 F3).
+#[cfg(feature = "server")]
+fn continuation_prompt(unanswered: &[String]) -> String {
+    if unanswered.is_empty() {
+        return COMPACTION_CONTINUATION_PROMPT.to_string();
+    }
+    format!(
+        "{COMPACTION_CONTINUATION_PROMPT} The summary includes these latest messages, which you \
+         haven't answered yet; respond to them now:\n\n{}",
+        unanswered.join("\n\n")
+    )
+}
+
+/// The text of the user messages at the end of `messages`, after the
+/// model's last reply: what a compaction happening now would summarize
+/// before the model has answered it. Tool results aren't included; notices
+/// and the user's own words are.
+#[cfg(feature = "server")]
+fn unanswered_user_text(messages: &[Message]) -> Vec<String> {
+    let mut texts: Vec<String> = messages
+        .iter()
+        .rev()
+        .take_while(|m| m.role == "user")
+        .flat_map(|m| m.blocks().unwrap_or_default())
+        .filter_map(|block| match block {
+            anthropic::ContentBlock::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    texts.reverse();
+    texts
 }
 
 /// Builds the message history actually replayed to Anthropic — every
@@ -671,10 +708,13 @@ async fn compact_conversation(
         })
         .unwrap_or_default();
 
-    for (role, content) in compaction_messages(summary, covers_through_message_id) {
-        db::create_message(pool, conversation_id, role, &content)
+    let unanswered = unanswered_user_text(&messages);
+    for (role, content) in compaction_messages(summary, covers_through_message_id, &unanswered) {
+        let saved = db::create_message(pool, conversation_id, role, &content)
             .await
             .map_err(ServerFnError::new)?;
+        // Watching tabs show the divider as it happens (SME-40 F5).
+        record_saved(conversation_id, &mut Vec::new(), saved);
     }
     Ok(())
 }
@@ -1091,10 +1131,28 @@ fn run_turn_bounded<'a>(
     Box::pin(async move {
         let mut stop = stop_receiver(conversation_id);
         let _in_flight = TurnInFlight::start(conversation_id);
+        let unsaved = new_message.clone();
+        let saved = Arc::new(std::sync::atomic::AtomicBool::new(false));
         tokio::select! {
-            result = run_turn_body(pool, conversation_id, new_message, on_delta, max_turns) => result,
-            _ = stop.changed() => Err(ServerFnError::new(TURN_STOPPED)),
+            result = run_turn_body(pool, conversation_id, new_message, on_delta, max_turns, saved.clone()) => return result,
+            _ = stop.changed() => {}
         }
+        // Stopped before this turn saved its own message: it was queued
+        // behind the turn the user stopped. Keep the message anyway (a
+        // background task's notice, say), without running a turn for it;
+        // the conversation is paused, so the model sees it next time the
+        // user writes (SME-40 F4).
+        if let Some(message) = unsaved
+            && !saved.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let lock = conversation_lock(conversation_id);
+            let _turn = lock.lock().await;
+            match db::create_message(pool, conversation_id, &message.role, &message.content).await {
+                Ok(saved) => record_saved(conversation_id, &mut Vec::new(), saved),
+                Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't keep a stopped turn's message"),
+            }
+        }
+        Err(ServerFnError::new(TURN_STOPPED))
     })
 }
 
@@ -1158,6 +1216,7 @@ fn run_turn_body<'a>(
     new_message: Option<anthropic::AnthropicMessage>,
     mut on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
     max_turns: usize,
+    new_message_saved: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
 {
     Box::pin(async move {
@@ -1192,6 +1251,7 @@ fn run_turn_body<'a>(
             )
             .await
             .map_err(ServerFnError::new)?;
+            new_message_saved.store(true, std::sync::atomic::Ordering::SeqCst);
             pending_new_content.extend(new_message.content.clone());
             record_saved(conversation_id, &mut persisted, saved);
         }
@@ -1790,7 +1850,7 @@ mod tests {
             text_message(1, "user", "ancient question"),
             text_message(2, "assistant", "ancient answer"),
         ];
-        for (offset, (role, blocks)) in compaction_messages("the earlier summary".to_string(), 2)
+        for (offset, (role, blocks)) in compaction_messages("the earlier summary".to_string(), 2, &[])
             .into_iter()
             .enumerate()
         {
@@ -1824,9 +1884,46 @@ mod tests {
         assert!(!transcript.contains("message 1 "), "the oldest part should be what's dropped");
     }
 
+    /// SME-40 F3: compaction runs after the new user message is saved, so
+    /// the summary covers it and the model only saw "Continue based on the
+    /// summary above" — it answered from the summary's gist, or resumed
+    /// older work, instead of the request itself.
+    #[test]
+    fn test_the_continuation_quotes_what_the_model_hasnt_answered() {
+        let messages = vec![
+            text_message(1, "user", "old question"),
+            text_message(2, "assistant", "old answer"),
+            text_message(3, "user", "Terminal command abc finished: exit code 0."),
+            message_with_blocks(
+                4,
+                "user",
+                vec![anthropic::ContentBlock::ToolResult {
+                    tool_use_id: "toolu_1".to_string(),
+                    content: "a tool result".to_string(),
+                    is_error: None,
+                }],
+            ),
+            text_message(5, "user", "Reply with just: ok"),
+        ];
+        let unanswered = unanswered_user_text(&messages);
+        assert_eq!(
+            unanswered,
+            vec![
+                "Terminal command abc finished: exit code 0.".to_string(),
+                "Reply with just: ok".to_string()
+            ]
+        );
+
+        let [_, _, (_, continuation)] = compaction_messages("the summary".to_string(), 5, &unanswered);
+        let text = format!("{continuation:?}");
+        assert!(text.contains("Reply with just: ok"), "the request isn't in the continuation: {text}");
+        assert!(text.contains("Terminal command abc finished"), "{text}");
+        assert!(!text.contains("old question"), "an answered message came back: {text}");
+    }
+
     #[test]
     fn test_compaction_messages_start_with_user_and_alternate_correctly() {
-        let inserted = compaction_messages("the summary".to_string(), 42);
+        let inserted = compaction_messages("the summary".to_string(), 42, &[]);
         let roles: Vec<&str> = inserted.iter().map(|(role, _)| *role).collect();
         assert_eq!(
             roles,
@@ -3023,6 +3120,53 @@ mod tests {
         );
     }
 
+    #[sqlx::test]
+    async fn test_a_notice_queued_behind_a_stopped_turn_is_still_saved(pool: PgPool) {
+        // SME-40 F4: a background task finishing during a turn queues its
+        // notice as a turn of its own, behind the running one. Stop ended
+        // both before the queued one had saved anything, so the notice was
+        // lost and the model never learned the task finished.
+        let conversation = db::create_conversation_with_id(&pool, 9100000040)
+            .await
+            .expect("create conversation");
+        let lock = conversation_lock(conversation.id);
+        let running = lock.lock().await;
+
+        let notice = r#"<task-notification task_id="t1" tool="count">finished: Counted to 2</task-notification>"#;
+        let queued = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                let message = anthropic::AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![anthropic::ContentBlock::Text { text: notice.to_string() }],
+                };
+                run_turn(&pool, conversation.id, message, None).await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        stop_turn_now(conversation.id);
+        // The running turn ends on the stop too, releasing the lock.
+        drop(running);
+        let result = queued.await.expect("join");
+        assert_eq!(
+            result.err().map(|e| chat_error_text(&e)).as_deref(),
+            Some(TURN_STOPPED)
+        );
+
+        let saved = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let messages = db::list_messages(&pool, conversation.id).await.expect("list");
+                if messages.iter().any(|m| m.content.contains("Counted to 2")) {
+                    return messages;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(saved.is_ok(), "the queued notice was lost when the turn was stopped");
+        resume_turns(conversation.id);
+    }
+
     /// A notice waits for a running turn to end before it's saved, and
     /// tells a watching tab once it is.
     #[sqlx::test]
@@ -3822,9 +3966,22 @@ mod tests {
             }],
         };
 
+        let mut events = events::subscribe(conversation.id);
         let messages = run_turn(&pool, conversation.id, new_message, None)
             .await
             .expect("run_turn should succeed");
+
+        // SME-40 F5: the compaction's messages reach watching tabs live,
+        // like every other saved message, not only after a reload.
+        let published_summary = drain_events(&mut events).await.into_iter().any(|event| match event {
+            events::ConversationEvent::MessagesAppended { messages } => messages.iter().any(|m| {
+                m.blocks().unwrap_or_default().iter().any(|b| {
+                    matches!(b, anthropic::ContentBlock::CompactionSummary { .. })
+                })
+            }),
+            _ => false,
+        });
+        assert!(published_summary, "the compaction summary wasn't published to watching tabs");
 
         let all_messages = db::list_messages(&pool, conversation.id)
             .await

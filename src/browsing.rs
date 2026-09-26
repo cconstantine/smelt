@@ -169,6 +169,9 @@ mod server {
 
     struct Session {
         id: u64,
+        /// The address check this session's loads go through; `navigate`
+        /// checks a new address against it before loading anything.
+        is_addr_allowed: fn(IpAddr) -> bool,
         /// This session's own browser context — see `open_session_with_guard`.
         context: chromiumoxide::cdp::browser_protocol::browser::BrowserContextId,
         page: Page,
@@ -247,6 +250,7 @@ mod server {
             conversation_id,
             Session {
                 id: session_id,
+                is_addr_allowed,
                 context,
                 current_url: "about:blank".to_string(),
                 url_task,
@@ -813,8 +817,20 @@ mod server {
     pub async fn navigate(conversation_id: i64, url: &str) -> Result<PageState, String> {
         // The request interceptor only sees loads that touch the network, so
         // it can't stop a `data:` (or similar) URL — check the scheme here.
-        fetch_guard::parse_fetch_target(url)?;
+        let (host, port) = fetch_guard::parse_fetch_target(url)?;
         let page = live_page(conversation_id)?;
+        // Checked before loading, so a refused address leaves the session
+        // on its current page instead of Chrome's blank error page, and
+        // the error says why (SME-40 F11). The interceptor still guards
+        // everything the page loads after this, redirects included.
+        let is_addr_allowed = SESSIONS
+            .lock()
+            .unwrap()
+            .get(&conversation_id)
+            .map_or(fetch_guard::is_safe_fetch_addr as fn(IpAddr) -> bool, |s| s.is_addr_allowed);
+        fetch_guard::resolve_allowed(&host, port, is_addr_allowed)
+            .await
+            .map_err(|e| format!("refused {url}: {e}; smelt doesn't load private or local addresses"))?;
         tokio::time::timeout(NAV_TIMEOUT, page.goto(url))
             .await
             .map_err(|_| format!("timed out loading {url}"))?
@@ -1799,13 +1815,17 @@ mod server {
                 current_url(conversation_id),
                 Some(format!("{base}/pushed"))
             );
-            // A refused load shows Chrome's own error page, whose URL is
-            // `chrome-error://…` — the address bar should keep showing
-            // what was asked for, as a real browser does.
+            // A refused address isn't loaded at all: the error says why,
+            // and the session stays on the page it was on. It used to load
+            // and be blocked mid-way, leaving Chrome's blank error page
+            // (`chrome-error://chromewebdata/`) as the current page, which
+            // the model then read (SME-40 F11).
             let refused = "http://169.254.169.254/";
-            assert!(navigate(conversation_id, refused).await.is_err());
-            expect_url_event(&mut events, refused).await;
-            assert_eq!(current_url(conversation_id).as_deref(), Some(refused));
+            let error = navigate(conversation_id, refused).await.expect_err("a refused address");
+            assert!(error.contains("private or local"), "the refusal should say why: {error}");
+            assert_eq!(current_url(conversation_id), Some(format!("{base}/pushed")));
+            let still_here = read(conversation_id).await.expect("read after a refusal");
+            assert_eq!(still_here.url, format!("{base}/pushed"), "the session left its page");
 
             close_session(conversation_id)
                 .await
