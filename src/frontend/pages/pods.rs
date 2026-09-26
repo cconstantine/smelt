@@ -18,8 +18,12 @@ pub(crate) fn use_pods_changed() -> Signal<u64> {
                 if let Ok(mut events) = crate::api::pods::subscribe_app_events().await {
                     // Anything that changed while disconnected.
                     *changed.write() += 1;
-                    while let Some(Ok(crate::events::AppEvent::PodsChanged)) = events.recv().await {
-                        *changed.write() += 1;
+                    // Other app-wide events (a turn starting, say) aren't
+                    // about pods; skip them rather than ending the loop.
+                    while let Some(Ok(event)) = events.recv().await {
+                        if event == crate::events::AppEvent::PodsChanged {
+                            *changed.write() += 1;
+                        }
                     }
                 }
                 gloo_timers::future::TimeoutFuture::new(1500).await;
@@ -71,9 +75,9 @@ pub fn PodsIndex() -> Element {
         div { class: "pods-page",
             div { class: "pods-header",
                 Link { to: Route::Home {}, class: "pods-back-link", "\u{2190} Back to conversations" }
-                h1 { "Sandbox pods" }
+                h1 { "Sandboxes" }
                 p { class: "muted",
-                    "Every sandbox pod that's running, in any conversation. Stopping one loses its terminals and any files outside mounted volumes; the model is told, and makes a new pod when it needs one."
+                    "Every sandbox that's running, in any conversation. Stopping one loses its terminals and any files outside mounted volumes; the model is told, and starts a new one when it needs to."
                 }
             }
             if let Some(err) = stop_error() {

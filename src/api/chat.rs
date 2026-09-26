@@ -1073,6 +1073,7 @@ impl TurnInFlight {
                 conversation_id,
                 crate::events::ConversationEvent::TurnState { running: true },
             );
+            crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
         }
         TurnInFlight(conversation_id)
     }
@@ -1101,8 +1102,28 @@ impl Drop for TurnInFlight {
                 self.0,
                 crate::events::ConversationEvent::TurnState { running: false },
             );
+            crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
         }
     }
+}
+
+/// Every conversation with a turn running or queued, for the sidebar's
+/// "working" marks (SME-41 D9).
+#[cfg(feature = "server")]
+pub(crate) fn busy_conversations() -> Vec<i64> {
+    TURNS_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .copied()
+        .collect()
+}
+
+/// Which conversations have a turn running, for the sidebar. Kept current
+/// by `AppEvent::TurnsChanged`, relayed as `ConversationEvent::TurnsChanged`.
+#[get("/api/conversations/busy")]
+pub async fn get_busy_conversations() -> ServerFnResult<Vec<i64>> {
+    Ok(busy_conversations())
 }
 
 /// Whether `conversation_id` has a turn running or queued.
@@ -1786,7 +1807,8 @@ pub async fn subscribe_conversation_events(
 }
 
 /// Everything a tab watching `id` hears: that conversation's events, plus
-/// app-wide `PodsChanged`, relayed as `ConversationEvent::PodsChanged`.
+/// the app-wide `PodsChanged` and `TurnsChanged`, relayed as their
+/// `ConversationEvent` namesakes for the sidebar.
 /// Ends when the conversation's channel closes (it was deleted).
 #[cfg(feature = "server")]
 fn conversation_event_stream(
@@ -1810,6 +1832,10 @@ fn conversation_event_stream(
                 received = app.recv() => match received {
                     Ok(events::AppEvent::PodsChanged) => {
                         let event = events::ConversationEvent::PodsChanged {};
+                        return Some((Ok(event), (conversation, app)));
+                    }
+                    Ok(events::AppEvent::TurnsChanged) => {
+                        let event = events::ConversationEvent::TurnsChanged {};
                         return Some((Ok(event), (conversation, app)));
                     }
                     // Missing some just means one refetch covers several.
@@ -2231,6 +2257,53 @@ mod tests {
             .expect("PodsChanged should arrive on the conversation stream");
         assert!(
             matches!(event, Some(Ok(events::ConversationEvent::PodsChanged {}))),
+            "got {event:?}"
+        );
+    }
+
+    /// SME-41 D9: a turn starting or ending is announced app-wide, and
+    /// the conversation is listed as busy while it runs, so the sidebar
+    /// can mark it in every tab.
+    #[tokio::test]
+    async fn test_a_running_turn_marks_its_conversation_busy() {
+        let conversation_id = 9_000_000_041;
+        let mut app = events::subscribe_app();
+        let next_turns_changed = |app: &mut tokio::sync::broadcast::Receiver<events::AppEvent>| {
+            let mut app = app.resubscribe();
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    loop {
+                        if let Ok(events::AppEvent::TurnsChanged) = app.recv().await {
+                            return;
+                        }
+                    }
+                })
+                .await
+                .is_ok()
+            }
+        };
+        let started = next_turns_changed(&mut app);
+        let turn = TurnInFlight::start(conversation_id);
+        assert!(started.await, "starting a turn should announce it");
+        assert!(busy_conversations().contains(&conversation_id));
+
+        let ended = next_turns_changed(&mut app);
+        drop(turn);
+        assert!(ended.await, "ending a turn should announce it");
+        assert!(!busy_conversations().contains(&conversation_id));
+    }
+
+    #[tokio::test]
+    async fn test_a_conversation_stream_relays_turns_changed() {
+        use futures_util::StreamExt;
+        let stream = conversation_event_stream(9_000_000_042);
+        futures_util::pin_mut!(stream);
+        events::publish_app(events::AppEvent::TurnsChanged);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("TurnsChanged should arrive on the conversation stream");
+        assert!(
+            matches!(event, Some(Ok(events::ConversationEvent::TurnsChanged {}))),
             "got {event:?}"
         );
     }

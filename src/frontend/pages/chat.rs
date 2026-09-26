@@ -592,6 +592,71 @@ fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
 /// Label for a `ToolResult` card's header, distinguishing a normal result
 /// from an error at a glance without repeating "error"/"result" as raw text
 /// the caller has to style around.
+/// A tool call described the way a person would say it ("Wrote
+/// /home/sandbox/primes.py", "Ran `python3 primes.py`"), for the compact
+/// row that replaces a raw card per call and per result (SME-41 D2). The
+/// raw input and result stay one click away.
+fn tool_summary(name: &str, input: &serde_json::Value) -> String {
+    let field = |key: &str| -> String {
+        match input.get(key) {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Null) | None => String::new(),
+            Some(other) => other.to_string(),
+        }
+    };
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        let (server, tool) = rest.split_once("__").unwrap_or(("", rest));
+        let query = field("query");
+        if tool.contains("web_search") && !query.is_empty() {
+            return format!("Searched the web for \"{query}\"");
+        }
+        return format!("Used {tool} ({server})");
+    }
+    match name {
+        "create_pod" => "Started the sandbox".to_string(),
+        "terminate_pod" => "Stopped the sandbox".to_string(),
+        "list_pods" => "Checked the sandbox".to_string(),
+        "create_terminal" => "Opened a terminal".to_string(),
+        "terminate_terminal" => "Closed a terminal".to_string(),
+        "list_terminals" => "Listed the terminals".to_string(),
+        "run_terminal_command" => format!("Ran `{}`", field("command")),
+        "send_signal" => format!("Sent {} to a command", field("signal")),
+        "terminal_command_status" => "Checked a command".to_string(),
+        "read_terminal_output" => "Read a command's output".to_string(),
+        "list_commands" => "Listed recent commands".to_string(),
+        "read_file" => format!("Read {}", field("path")),
+        "write_file" => format!("Wrote {}", field("path")),
+        "edit_file" => format!("Edited {}", field("path")),
+        "list_directory" => format!("Listed {}", field("path")),
+        "glob" => format!("Found files matching `{}`", field("pattern")),
+        "grep" => format!("Searched files for `{}`", field("pattern")),
+        "webfetch" => format!("Read {}", field("url")),
+        "http_request" => {
+            let method = field("method");
+            let method = if method.is_empty() { "GET".to_string() } else { method.to_uppercase() };
+            format!("Sent {method} {}", field("url"))
+        }
+        "open_browser_session" => "Opened a browser".to_string(),
+        "close_browser_session" => "Closed the browser".to_string(),
+        "browser_navigate" => format!("Opened {} in the browser", field("url")),
+        "browser_click" => "Clicked in the browser".to_string(),
+        "browser_fill" => "Typed into the browser".to_string(),
+        "browser_back" => "Went back in the browser".to_string(),
+        "browser_read" => "Read the browser page".to_string(),
+        "todowrite" => "Updated the todo list".to_string(),
+        "todoread" => "Checked the todo list".to_string(),
+        "add" => format!("Added {} and {}", field("a"), field("b")),
+        "count" => format!("Counted to {}", field("target")),
+        "list_tasks" => "Listed background tasks".to_string(),
+        "task_status" | "task_result" | "task_stdout" | "task_stderr" | "wait_task" => {
+            "Checked a background task".to_string()
+        }
+        "cancel_task" => "Cancelled a background task".to_string(),
+        "write_task_stdin" => "Sent input to a background task".to_string(),
+        other => format!("Used {other}"),
+    }
+}
+
 fn tool_result_label(is_error: bool) -> &'static str {
     if is_error {
         "Tool error"
@@ -615,6 +680,22 @@ fn run_async_wrapped_tool(input: &serde_json::Value) -> Option<&str> {
 /// recognizes a `run_async` result (to fold it into the compact inline
 /// summary instead of rendering its own card; the tasks sidebar already
 /// shows what actually happened).
+/// Each tool call's result, by the call's id: its content and whether it
+/// failed. A call's row shows its result folded in (SME-41 D2).
+fn tool_results_by_id(messages: &[Message]) -> HashMap<String, (String, bool)> {
+    messages
+        .iter()
+        .filter_map(|m| m.blocks().ok())
+        .flatten()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                Some((tool_use_id, (content, is_error.unwrap_or(false))))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn tool_use_names_by_id(messages: &[Message]) -> HashMap<String, String> {
     messages
         .iter()
@@ -902,6 +983,100 @@ fn reply_is_only_thinking(role: &str, blocks: &[ContentBlock]) -> bool {
         && blocks.iter().all(|b| matches!(b, ContentBlock::Thinking { .. }))
 }
 
+/// Asks offered in an empty conversation (SME-41 D12): one each for code,
+/// a repository and the web, the three things smelt is for.
+const EXAMPLE_ASKS: [&str; 3] = [
+    "Write a Python script that prints the first 20 primes, then run it",
+    "Clone https://github.com/pallets/itsdangerous and run its tests",
+    "Find the latest stable Rust release and summarize what's new",
+];
+
+/// How long ago a conversation was last active, as the sidebar shows it:
+/// one unit, `now`, `5m`, `3h`, `2d`, `3w` (SME-41 D8).
+fn short_age(seconds: i64) -> String {
+    match seconds {
+        s if s < 60 => "now".to_string(),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s if s < 7 * 86_400 => format!("{}d", s / 86_400),
+        s => format!("{}w", s / (7 * 86_400)),
+    }
+}
+
+/// How long a turn has been running, as shown on its "Working…" line:
+/// `8s`, `2m 05s`.
+fn format_elapsed(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
+}
+
+/// A notice smelt saved into the conversation for the model (a command
+/// finishing, the sandbox stopping, a background task finishing), as the
+/// short sentence the chat shows in place of a user bubble, without
+/// internal ids. `None` for anything the user actually wrote. They used
+/// to look like the user talking (SME-41 D3). `commands` maps a terminal
+/// command's id to the command line, from `terminal_commands_by_id`.
+fn system_notice(text: &str, commands: &HashMap<String, String>) -> Option<String> {
+    let command = |id: &str| match commands.get(id) {
+        Some(line) => format!("`{line}`"),
+        None => "A command".to_string(),
+    };
+    if let Some(rest) = text.strip_prefix("Terminal command ") {
+        if let Some((id, tail)) = rest.split_once(" finished: exit code ") {
+            let code = tail.trim_end_matches('.');
+            return Some(format!("{} finished (exit code {code})", command(id)));
+        }
+        if let Some((id, _)) = rest.split_once("'s outcome is unknown") {
+            return Some(format!("{} stopped: its terminal became unreachable", command(id)));
+        }
+    }
+    if let Some(rest) = text.strip_prefix("Sandbox pod ")
+        && let Some((_, tail)) = rest.split_once(" stopped unexpectedly")
+    {
+        let reason = tail
+            .strip_prefix(" (")
+            .and_then(|r| r.split_once(')'))
+            .map(|(reason, _)| format!(" ({reason})"))
+            .unwrap_or_default();
+        return Some(format!("The sandbox stopped unexpectedly{reason}; its terminals are gone"));
+    }
+    if text.starts_with("The user stopped sandbox pod ") {
+        return Some(
+            "You stopped the sandbox; its terminals, and any files outside volumes, are gone".to_string(),
+        );
+    }
+    task_notice_sentence(text)
+}
+
+/// Each terminal command's id to its command line, from the
+/// `run_terminal_command` calls and their "command sent (id: ...)" results.
+fn terminal_commands_by_id(messages: &[Message]) -> HashMap<String, String> {
+    let blocks: Vec<ContentBlock> = messages.iter().filter_map(|m| m.blocks().ok()).flatten().collect();
+    let command_lines: HashMap<&str, &str> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } if name == "run_terminal_command" => {
+                Some((id.as_str(), input.get("command")?.as_str()?))
+            }
+            _ => None,
+        })
+        .collect();
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                let line = command_lines.get(tool_use_id.as_str())?;
+                let id = content.strip_prefix("command sent (id: ")?.strip_suffix(')')?;
+                Some((id.to_string(), line.to_string()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// A message's text as shown in the chat. A background task's notices
 /// are saved in a tagged form the model reads
 /// (`<task-notification task_id=".." tool="count">finished: ..</task-notification>`);
@@ -943,11 +1118,22 @@ fn render_block_element(
     tz_offset_minutes: i32,
     block: &ContentBlock,
     tool_names: &HashMap<String, String>,
+    tool_results: &HashMap<String, (String, bool)>,
+    commands: &HashMap<String, String>,
     thinking_open: bool,
 ) -> Element {
     let key = format!("{message_id}-{index}");
     let timestamp = format_timestamp(created_at, tz_offset_minutes);
     match block {
+        ContentBlock::Text { text } if role == "user" && system_notice(text, commands).is_some() => {
+            let notice = system_notice(text, commands).unwrap_or_default();
+            rsx! {
+                div { key: "{key}", class: "system-notice",
+                    span { class: "system-notice-text", "{notice}" }
+                    span { class: "timestamp", "{timestamp}" }
+                }
+            }
+        }
         ContentBlock::Text { text } => rsx! {
             div { key: "{key}", class: "message message-{role}",
                 div { class: "message-text", "{display_text(text)}" }
@@ -982,7 +1168,6 @@ fn render_block_element(
                         span { class: "tool-async-start-icon", "🔧" }
                         span { "Started" }
                         code { class: "tool-async-start-tool", "{wrapped_tool}" }
-                        span { class: "timestamp", "{timestamp}" }
                     }
                     pre { class: "tool-async-start-input", "{pretty_input}" }
                 }
@@ -992,7 +1177,8 @@ fn render_block_element(
         // generic tool-call card showing two raw JSON strings — its
         // `old_string`/`new_string` already carry everything a diff needs.
         // See SME-11's "Diff rendering."
-        ContentBlock::ToolUse { name, input, .. } if name == "edit_file" => {
+        ContentBlock::ToolUse { id, name, input } if name == "edit_file" => {
+            let failure = tool_results.get(id).filter(|(_, failed)| *failed).map(|(content, _)| content.clone());
             let path = input
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -1013,7 +1199,9 @@ fn render_block_element(
                         span { class: "tool-call-icon", "✏️" }
                         span { "Edited" }
                         code { class: "tool-call-name", "{path}" }
-                        span { class: "timestamp", "{timestamp}" }
+                    }
+                    if let Some(failure) = failure {
+                        div { class: "tool-row-failure", "Failed: {failure}" }
                     }
                     div { class: "file-edit-diff-body",
                         for (i , line) in lines.iter().enumerate() {
@@ -1027,27 +1215,41 @@ fn render_block_element(
                 }
             }
         }
-        ContentBlock::ToolUse { name, input, .. } => {
+        // One compact line per call, saying what it did, with its result
+        // folded in: the raw input and result are one click away, and a
+        // failed call starts open (SME-41 D2).
+        ContentBlock::ToolUse { id, name, input } => {
+            let summary = tool_summary(name, input);
             let pretty_input = format_tool_input(input);
+            let result = tool_results.get(id).cloned();
+            let failed = result.as_ref().is_some_and(|(_, failed)| *failed);
             rsx! {
-                div { key: "{key}", class: "tool-call",
-                    div { class: "tool-call-header",
-                        span { class: "tool-call-icon", "🔧" }
-                        span { "Called" }
-                        code { class: "tool-call-name", "{name}" }
-                        span { class: "timestamp", "{timestamp}" }
+                details {
+                    key: "{key}",
+                    class: if failed { "tool-row tool-row-failed" } else { "tool-row" },
+                    open: failed,
+                    summary { class: "tool-row-summary",
+                        span { class: "tool-row-marker" }
+                        span { class: "tool-row-text", "{summary}" }
+                        if failed {
+                            span { class: "tool-row-status", "failed" }
+                        }
                     }
-                    pre { class: "tool-call-input", "{pretty_input}" }
+                    div { class: "tool-row-detail",
+                        div { class: "tool-row-label", "{name}" }
+                        pre { class: "tool-row-input", "{pretty_input}" }
+                        if let Some((content, _)) = result {
+                            div { class: "tool-row-label", if failed { "Error" } else { "Result" } }
+                            pre { class: "tool-row-result", "{content}" }
+                        }
+                    }
                 }
             }
         }
-        // The result of a `run_async` call is just the generic "task
-        // started" boilerplate `anthropic::tools` always returns — the
-        // compact summary above already conveys that, so render nothing
-        // rather than a second, redundant card.
-        ContentBlock::ToolResult { tool_use_id, .. }
-            if tool_names.get(tool_use_id).map(String::as_str) == Some("run_async") =>
-        {
+        // A result whose call is in the conversation is shown in that
+        // call's row (or, for `run_async`, not at all: the tasks panel
+        // shows what happened). Only an orphaned result gets a card.
+        ContentBlock::ToolResult { tool_use_id, .. } if tool_names.contains_key(tool_use_id) => {
             rsx! {}
         }
         ContentBlock::ToolResult {
@@ -1195,6 +1397,16 @@ mod tests {
     #[test]
     fn test_run_async_wrapped_tool_missing_field_returns_none() {
         assert_eq!(run_async_wrapped_tool(&serde_json::json!({})), None);
+    }
+
+    fn message_with_blocks(id: i64, role: &str, blocks: Vec<ContentBlock>) -> Message {
+        Message {
+            id,
+            conversation_id: 1,
+            role: role.to_string(),
+            content: serde_json::to_string(&blocks).expect("ContentBlock always serializes"),
+            created_at: chrono::Utc::now().naive_utc(),
+        }
     }
 
     fn tool_use_message(id: i64, tool_use_id: &str, name: &str) -> Message {
@@ -1592,6 +1804,105 @@ mod tests {
             "Background task count (lS9Y) stdout: count: 1/3"
         );
         assert_eq!(display_text("plain words <b>and a tag</b>"), "plain words <b>and a tag</b>");
+    }
+
+    #[test]
+    fn test_short_age_uses_one_unit() {
+        assert_eq!(short_age(-5), "now");
+        assert_eq!(short_age(30), "now");
+        assert_eq!(short_age(5 * 60 + 20), "5m");
+        assert_eq!(short_age(3 * 3600 + 59 * 60), "3h");
+        assert_eq!(short_age(2 * 86400 + 5), "2d");
+        assert_eq!(short_age(15 * 86400), "2w");
+    }
+
+    #[test]
+    fn test_format_elapsed_counts_seconds_then_minutes() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(42), "42s");
+        assert_eq!(format_elapsed(125), "2m 05s");
+        assert_eq!(format_elapsed(3600), "60m 00s");
+    }
+
+    #[test]
+    fn test_system_notices_read_as_short_sentences() {
+        let commands = HashMap::from([("abc123".to_string(), "python3 primes.py".to_string())]);
+        let notice = |t: &str| system_notice(t, &commands);
+        assert_eq!(
+            notice("Terminal command abc123 finished: exit code 0.").as_deref(),
+            Some("`python3 primes.py` finished (exit code 0)")
+        );
+        assert_eq!(
+            notice("Terminal command zzz finished: exit code 127.").as_deref(),
+            Some("A command finished (exit code 127)")
+        );
+        assert_eq!(
+            notice("Terminal command abc123's outcome is unknown — the terminal became unreachable while it was running.").as_deref(),
+            Some("`python3 primes.py` stopped: its terminal became unreachable")
+        );
+        assert_eq!(
+            notice("Sandbox pod 156 stopped unexpectedly (OOMKilled); every terminal running in it is no longer available.").as_deref(),
+            Some("The sandbox stopped unexpectedly (OOMKilled); its terminals are gone")
+        );
+        assert_eq!(
+            notice("Sandbox pod 19 stopped unexpectedly; every terminal running in it is no longer available.").as_deref(),
+            Some("The sandbox stopped unexpectedly; its terminals are gone")
+        );
+        assert_eq!(
+            notice("The user stopped sandbox pod 157. Its terminals, and any files outside mounted volumes, are gone. Create a new pod if you need one.").as_deref(),
+            Some("You stopped the sandbox; its terminals, and any files outside volumes, are gone")
+        );
+        assert_eq!(
+            notice(r#"<task-notification task_id="t1" tool="count">finished: Counted to 3</task-notification>"#).as_deref(),
+            Some("Background task count (t1) finished: Counted to 3")
+        );
+        assert_eq!(notice("Please run the tests"), None);
+    }
+
+    #[test]
+    fn test_terminal_commands_are_found_by_id() {
+        let messages = vec![
+            message_with_blocks(1, "assistant", vec![ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "run_terminal_command".to_string(),
+                input: serde_json::json!({"command": "ls -la", "terminal_id": 1}),
+            }]),
+            message_with_blocks(2, "user", vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: "command sent (id: XYZ)".to_string(),
+                is_error: None,
+            }]),
+        ];
+        assert_eq!(terminal_commands_by_id(&messages).get("XYZ").map(String::as_str), Some("ls -la"));
+    }
+
+    #[test]
+    fn test_tool_summary_says_what_a_call_did() {
+        assert_eq!(tool_summary("create_pod", &serde_json::json!({})), "Started the sandbox");
+        assert_eq!(tool_summary("terminate_pod", &serde_json::json!({})), "Stopped the sandbox");
+        assert_eq!(tool_summary("create_terminal", &serde_json::json!({})), "Opened a terminal");
+        assert_eq!(
+            tool_summary("run_terminal_command", &serde_json::json!({"command": "python3 primes.py", "terminal_id": 3})),
+            "Ran `python3 primes.py`"
+        );
+        assert_eq!(tool_summary("read_terminal_output", &serde_json::json!({"command_id": "x"})), "Read a command's output");
+        assert_eq!(tool_summary("write_file", &serde_json::json!({"path": "/home/sandbox/a.py", "content": "x"})), "Wrote /home/sandbox/a.py");
+        assert_eq!(tool_summary("read_file", &serde_json::json!({"path": "/etc/hosts"})), "Read /etc/hosts");
+        assert_eq!(tool_summary("list_directory", &serde_json::json!({"path": "/tmp"})), "Listed /tmp");
+        assert_eq!(tool_summary("glob", &serde_json::json!({"pattern": "**/*.rs", "path": "/src"})), "Found files matching `**/*.rs`");
+        assert_eq!(tool_summary("grep", &serde_json::json!({"pattern": "fn main"})), "Searched files for `fn main`");
+        assert_eq!(tool_summary("webfetch", &serde_json::json!({"url": "https://example.com"})), "Read https://example.com");
+        assert_eq!(tool_summary("http_request", &serde_json::json!({"url": "https://api.x/y", "method": "POST"})), "Sent POST https://api.x/y");
+        assert_eq!(tool_summary("http_request", &serde_json::json!({"url": "https://api.x/y"})), "Sent GET https://api.x/y");
+        assert_eq!(tool_summary("browser_navigate", &serde_json::json!({"url": "https://example.com"})), "Opened https://example.com in the browser");
+        assert_eq!(tool_summary("todowrite", &serde_json::json!({"todos": []})), "Updated the todo list");
+        assert_eq!(
+            tool_summary("mcp__exa__web_search_exa", &serde_json::json!({"query": "rust 1.0 release"})),
+            "Searched the web for \"rust 1.0 release\""
+        );
+        assert_eq!(tool_summary("mcp__github__create_issue", &serde_json::json!({})), "Used create_issue (github)");
+        assert_eq!(tool_summary("add", &serde_json::json!({"a": 2, "b": 3})), "Added 2 and 3");
+        assert_eq!(tool_summary("something_new", &serde_json::json!({})), "Used something_new");
     }
 
     /// SME-40 F2: the frame now scales to fit the panel, so a click on
@@ -2108,11 +2419,14 @@ pub fn Chat() -> Element {
     // that variant). With no conversation open there's no stream, so the
     // sidebar's pod dots only refresh on navigation.
     let pods_changed = use_signal(|| 0u64);
+    // Bumped the same way when a turn starts or ends in any conversation
+    // (`ConversationEvent::TurnsChanged`), for the sidebar's busy marks.
+    let turns_changed = use_signal(|| 0u64);
 
     rsx! {
         div { class: "chat-layout",
-            ConversationSidebar { selected, conversations_changed, pods_changed }
-            ChatPanel { selected, conversations_changed, pods_changed }
+            ConversationSidebar { selected, conversations_changed, pods_changed, turns_changed }
+            ChatPanel { selected, conversations_changed, pods_changed, turns_changed }
         }
     }
 }
@@ -2122,6 +2436,7 @@ fn ConversationSidebar(
     selected: Memo<Option<i64>>,
     conversations_changed: Signal<u64>,
     pods_changed: Signal<u64>,
+    turns_changed: Signal<u64>,
 ) -> Element {
     let navigator = use_navigator();
     // Which conversations have a live pod, for the dot next to their title.
@@ -2132,6 +2447,13 @@ fn ConversationSidebar(
     let has_live_pod = move |id: i64| {
         matches!(&*live_pods.read(), Some(Ok(ids)) if ids.contains(&id))
     };
+    // Which conversations have a turn running, marked as working
+    // (SME-41 D9).
+    let busy = use_resource(move || {
+        let _ = turns_changed();
+        crate::api::chat::get_busy_conversations()
+    });
+    let is_busy = move |id: i64| matches!(&*busy.read(), Some(Ok(ids)) if ids.contains(&id));
     let initial_conversations = use_resource(move || {
         let _ = conversations_changed();
         get_conversations()
@@ -2140,6 +2462,26 @@ fn ConversationSidebar(
     let mut loaded = use_signal(|| false);
     let mut error: Signal<Option<String>> = use_signal(|| None);
     let mut pending_delete: Signal<Option<i64>> = use_signal(|| None);
+    // Whether the conversation list is open on a phone, where it folds
+    // behind a button (SME-41 D4). Ignored at wider widths.
+    let mut open_on_phone = use_signal(|| false);
+    // The browser's clock, refreshed every minute, for each row's age
+    // (SME-41 D8). None until the first reading, when ages aren't shown.
+    #[allow(unused_mut)]
+    let mut now_utc: Signal<Option<chrono::NaiveDateTime>> = use_signal(|| None);
+    #[cfg(feature = "web")]
+    use_hook(move || {
+        spawn(async move {
+            loop {
+                if let Ok(value) = document::eval("return Date.now();").await
+                    && let Some(ms) = value.as_f64()
+                {
+                    now_utc.set(chrono::DateTime::from_timestamp_millis(ms as i64).map(|t| t.naive_utc()));
+                }
+                gloo_timers::future::TimeoutFuture::new(60_000).await;
+            }
+        });
+    });
 
     use_effect(move || {
         if let Some(result) = initial_conversations() {
@@ -2151,7 +2493,7 @@ fn ConversationSidebar(
         }
     });
 
-    let new_conversation = move |_| {
+    let new_conversation = move |_: Event<MouseData>| {
         spawn(async move {
             match create_conversation().await {
                 Ok(conversation) => {
@@ -2187,10 +2529,20 @@ fn ConversationSidebar(
     };
 
     rsx! {
-        aside { class: "sidebar",
-            button { class: "new-conversation", onclick: new_conversation, "New conversation" }
+        aside { class: if open_on_phone() { "sidebar sidebar-open" } else { "sidebar" },
+            // Phone only (see chat.css): the list folds behind this, so the
+            // conversation, not the list, fills the screen (SME-41 D4).
+            button {
+                class: "sidebar-toggle",
+                r#type: "button",
+                aria_expanded: "{open_on_phone()}",
+                onclick: move |_| open_on_phone.toggle(),
+                if open_on_phone() { "Close" } else { "Conversations" }
+            }
+            div { class: "sidebar-body",
+            button { class: "new-conversation", onclick: move |e| { open_on_phone.set(false); new_conversation(e) }, "New conversation" }
             Link { to: Route::McpServersRoute {}, class: "mcp-servers-link", "MCP servers" }
-            Link { to: Route::PodsRoute {}, class: "pods-link", "Pods" }
+            Link { to: Route::PodsRoute {}, class: "pods-link", "Sandboxes" }
             Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
             if let Some(err) = error() {
                 p { class: "error", "{err}" }
@@ -2208,11 +2560,18 @@ fn ConversationSidebar(
                             class: if selected() == Some(conversation.id) { "conversation-item active" } else { "conversation-item" },
                             onclick: move |_| {
                                 pending_delete.set(None);
+                                open_on_phone.set(false);
                                 navigator.push(Route::ConversationRoute { id: conversation.id });
                             },
                             span { class: "conversation-title", "{conversation.title}" }
+                            if is_busy(conversation.id) {
+                                span { class: "conversation-busy", title: "Working" }
+                            }
                             if has_live_pod(conversation.id) {
                                 span { class: "live-pod-dot", title: "sandbox pod running" }
+                            }
+                            if let Some(now) = now_utc() {
+                                span { class: "conversation-age", {short_age((now - conversation.updated_at).num_seconds())} }
                             }
                             button {
                                 class: if pending_delete() == Some(conversation.id) { "delete-conversation confirm" } else { "delete-conversation" },
@@ -2226,6 +2585,7 @@ fn ConversationSidebar(
                     }
                 }
             }
+            }
         }
     }
 }
@@ -2235,6 +2595,7 @@ fn ChatPanel(
     selected: Memo<Option<i64>>,
     conversations_changed: Signal<u64>,
     pods_changed: Signal<u64>,
+    turns_changed: Signal<u64>,
 ) -> Element {
     let initial_messages = use_resource(move || {
         let id = selected();
@@ -2273,6 +2634,24 @@ fn ChatPanel(
     // whoever started the turn; Stop is offered instead.
     let is_streaming = move || turn_running();
     let can_stop = move || turn_running();
+    // Seconds this tab has seen the current turn running, for the
+    // "Working…" line (SME-41 D1). Ticks once a second while a turn runs,
+    // and resets when it ends. Web only.
+    #[allow(unused_mut)]
+    let mut turn_elapsed = use_signal(|| 0u64);
+    #[cfg(feature = "web")]
+    use_hook(move || {
+        spawn(async move {
+            loop {
+                gloo_timers::future::TimeoutFuture::new(1000).await;
+                if *turn_running.peek() {
+                    *turn_elapsed.write() += 1;
+                } else if *turn_elapsed.peek() != 0 {
+                    turn_elapsed.set(0);
+                }
+            }
+        });
+    });
     let stop = move |_| {
         let Some(id) = selected() else { return };
         // Shown as "Stopped." where the reply would have been; the next
@@ -2612,6 +2991,9 @@ fn ChatPanel(
                                 Some(Ok(ConversationEvent::PodsChanged {})) => {
                                     *pods_changed.write() += 1;
                                 }
+                                Some(Ok(ConversationEvent::TurnsChanged {})) => {
+                                    *turns_changed.write() += 1;
+                                }
                                 Some(Ok(ConversationEvent::TurnState { running })) => {
                                     turn_running.set(running);
                                     if !running {
@@ -2840,6 +3222,8 @@ fn ChatPanel(
                 },
                 Some(_) => {
                     let tool_names = tool_use_names_by_id(&messages());
+                    let tool_results = tool_results_by_id(&messages());
+                    let commands = terminal_commands_by_id(&messages());
                     rsx! {
                     if !tasks().is_empty() || !sandbox_pods().is_empty() || !todos().is_empty() || browsing_session_open() {
                         div { class: "side-panels-row",
@@ -3069,7 +3453,7 @@ fn ChatPanel(
                                                     r#type: "button",
                                                     title: "Stop this pod. Its terminals and any files outside mounted volumes are lost.",
                                                     onclick: move |_| request_pod_stop(pod.pod_id),
-                                                    super::TwoStepLabel { armed: pending_pod_stop() == Some(pod.pod_id), idle: "Stop pod", confirm: "Confirm stop?" }
+                                                    super::TwoStepLabel { armed: pending_pod_stop() == Some(pod.pod_id), idle: "Stop sandbox", confirm: "Confirm stop?" }
                                                 }
                                             }
                                             if let Some(err) = pod_stop_error() {
@@ -3164,7 +3548,7 @@ fn ChatPanel(
                                     }
                                     span { class: "context-usage-label", "{percent}% of context" }
                                 } else {
-                                    span { class: "context-usage-label", "context: —" }
+                                    span { class: "context-usage-label", "No usage yet" }
                                 }
                             }
                         }
@@ -3183,13 +3567,13 @@ fn ChatPanel(
                                         None => rsx! { p { "Loading…" } },
                                         Some(detail) => rsx! {
                                             h3 { "Context" }
-                                            p {
-                                                "System prompt: "
-                                                if let Some(system) = &detail.system {
-                                                    "{system}"
-                                                } else {
-                                                    "none set"
-                                                }
+                                            h4 { class: "context-detail-heading", "System prompt" }
+                                            if let Some(system) = &detail.system {
+                                                // Its own line breaks and headings, not one
+                                                // run-together paragraph (SME-41 D7).
+                                                pre { class: "context-detail-prompt", "{system}" }
+                                            } else {
+                                                p { class: "muted", "None set." }
                                             }
                                             p { "Messages: {detail.message_count}" }
                                             if let Some(usage) = &detail.usage {
@@ -3240,7 +3624,7 @@ fn ChatPanel(
                                         let thinking_open = reply_is_only_thinking(&message.role, &blocks);
                                         rsx! {
                                             for (i , block) in blocks.iter().enumerate() {
-                                                {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names, thinking_open)}
+                                                {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names, &tool_results, &commands, thinking_open)}
                                             }
                                         }
                                     },
@@ -3253,8 +3637,33 @@ fn ChatPanel(
                                     },
                                 }
                             }
+                            // A new conversation says what smelt does and offers a
+                            // few asks to start from, instead of a blank screen
+                            // (SME-41 D12). Picking one fills the message box.
+                            if messages().is_empty() && !turn_running() && matches!(initial_messages(), Some(Some(Ok(_)))) {
+                                div { class: "conversation-empty",
+                                    h2 { "What should smelt work on?" }
+                                    p { "It works in a sandbox of its own: it writes and runs code, uses a terminal, reads the web, and shows you each step." }
+                                    div { class: "example-asks",
+                                        for example in EXAMPLE_ASKS {
+                                            button {
+                                                class: "example-ask",
+                                                r#type: "button",
+                                                onclick: move |_| input.set(example.to_string()),
+                                                "{example}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(reply) = streaming_text() {
                                 div { class: "message message-assistant message-streaming", "{reply}" }
+                            }
+                            if turn_running() {
+                                div { class: "turn-working", role: "status",
+                                    span { class: "turn-working-dot" }
+                                    span { "Working… {format_elapsed(turn_elapsed())}" }
+                                }
                             }
                             if let Some(err) = stream_error() {
                                 if err == crate::api::chat::TURN_STOPPED {

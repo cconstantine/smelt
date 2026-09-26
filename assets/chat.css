@@ -1,3 +1,47 @@
+/* Colour tokens: one light palette, and a dark one that follows the
+   system setting (SME-41 D5). Components use these, never literals; the
+   terminal's always-dark palette and the context meter's data colours are
+   the only exceptions. */
+:root {
+    color-scheme: light;
+    --canvas: #fafafa;
+    --surface: #ffffff;
+    --subtle: #f2f2f3;
+    --border: #e5e5e6;
+    --border-strong: #d0d0d3;
+    --ink: #111113;
+    --ink-hover: #2b2b2e;
+    --text: #333336;
+    --text-2: #56565c;
+    --muted: #85858c;
+    --danger: #c0392b;
+    --danger-bg: #fdecea;
+    --ok: #1e7e34;
+    --ok-bg: #e8f7ed;
+    --accent: #3b6fd8;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        color-scheme: dark;
+        --canvas: #141518;
+        --surface: #1c1d21;
+        --subtle: #25262b;
+        --border: #2e3036;
+        --border-strong: #41444c;
+        --ink: #ececf1;
+        --ink-hover: #d4d5dc;
+        --text: #d7d8de;
+        --text-2: #b0b2bb;
+        --muted: #8a8d97;
+        --danger: #f0786a;
+        --danger-bg: #3a1b18;
+        --ok: #5cc98a;
+        --ok-bg: #16301f;
+        --accent: #7aa2ff;
+    }
+}
+
 * {
     box-sizing: border-box;
 }
@@ -5,8 +49,8 @@
 body {
     margin: 0;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    color: #1a1a1a;
-    background: #fafafa;
+    color: var(--ink);
+    background: var(--canvas);
     -webkit-font-smoothing: antialiased;
 }
 
@@ -15,11 +59,31 @@ body {
     height: 100vh;
 }
 
+/* The phone-only button that opens the conversation list. */
+.sidebar-toggle {
+    display: none;
+    padding: 8px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+}
+
+.sidebar-body {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-height: 0;
+}
+
 .sidebar {
     width: 272px;
     flex-shrink: 0;
-    border-right: 1px solid #e5e5e5;
-    background: #fff;
+    border-right: 1px solid var(--border);
+    background: var(--surface);
     padding: 16px;
     display: flex;
     flex-direction: column;
@@ -29,10 +93,10 @@ body {
 
 .new-conversation {
     padding: 10px 14px;
-    border: 1px solid #111;
+    border: 1px solid var(--ink);
     border-radius: 10px;
-    background: #111;
-    color: #fff;
+    background: var(--ink);
+    color: var(--surface);
     font-size: 14px;
     font-weight: 600;
     cursor: pointer;
@@ -40,7 +104,7 @@ body {
 }
 
 .new-conversation:hover {
-    background: #2b2b2b;
+    background: var(--ink-hover);
 }
 
 .new-conversation:active {
@@ -54,6 +118,7 @@ body {
 }
 
 .conversation-item {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -66,12 +131,12 @@ body {
 }
 
 .conversation-item:hover {
-    background: #f2f2f4;
+    background: var(--subtle);
 }
 
 .conversation-item.active {
-    background: #ececec;
-    border-left-color: #111;
+    background: var(--subtle);
+    border-left-color: var(--ink);
     font-weight: 600;
 }
 
@@ -83,13 +148,19 @@ body {
     white-space: nowrap;
 }
 
+/* Laid over the end of the row rather than taking room from the title
+   (SME-41 D8); it covers the age while shown. */
 .delete-conversation {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
     flex-shrink: 0;
     padding: 4px 9px;
-    border: 1px solid #d8d8d8;
+    border: 1px solid var(--border-strong);
     border-radius: 6px;
-    background: #fff;
-    color: #666;
+    background: var(--surface);
+    color: var(--text-2);
     font-size: 12px;
     line-height: 1.4;
     cursor: pointer;
@@ -106,16 +177,16 @@ body {
 }
 
 .delete-conversation:hover {
-    background: #f5f5f5;
-    border-color: #c5c5c5;
-    color: #333;
+    background: var(--canvas);
+    border-color: var(--border-strong);
+    color: var(--text);
 }
 
 .delete-conversation.confirm {
     opacity: 1;
-    background: #c0392b;
-    border-color: #c0392b;
-    color: #fff;
+    background: var(--danger);
+    border-color: var(--danger);
+    color: var(--surface);
 }
 
 /* Bold in both states (hidden while idle), so the width the button
@@ -125,9 +196,9 @@ body {
 }
 
 .delete-conversation.confirm:hover {
-    background: #a5311f;
-    border-color: #a5311f;
-    color: #fff;
+    background: var(--danger);
+    border-color: var(--danger);
+    color: var(--surface);
 }
 
 /* Below WIDE_LAYOUT_BREAKPOINT (see the media query further down): the
@@ -158,7 +229,7 @@ body {
     flex-direction: column;
     min-width: 0;
     min-height: 0;
-    border-top: 1px solid #e5e5e5;
+    border-top: 1px solid var(--border);
 }
 
 /* The stacked region above chat (narrow layout): background tasks and/or
@@ -193,11 +264,44 @@ body {
         /* Room to read and type, however wide the side panels want to be. */
         min-width: 360px;
         border-top: none;
-        border-right: 1px solid #e5e5e5;
+        border-right: 1px solid var(--border);
     }
 
+    /* The side panels stack in a column, each the column's full width,
+       instead of sitting side by side: three of them in a row shared
+       ~450px, so the live browser was tiny and the terminal pushed out of
+       sight (SME-41 D16). Small panels (todos, background tasks) size to
+       their content; the sandbox takes the rest; the column scrolls if it
+       must. With a browsing session open the column widens to half. */
     .side-panels-row {
         flex: 2;
+        flex-direction: column;
+        overflow-y: auto;
+    }
+
+    .chat-panel:has(.browsing-panel) .side-panels-row {
+        flex: 3;
+    }
+}
+
+@media (min-width: 1024px), (max-width: 720px) {
+    .side-panels-row > .todo-panel,
+    .side-panels-row > .tasks-panel {
+        width: auto;
+        flex: 0 0 auto;
+        max-height: 30vh;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .side-panels-row > .browsing-panel {
+        flex: 0 0 auto;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .side-panels-row > .sandbox-panel {
+        flex: 1 0 320px;
     }
 }
 
@@ -206,12 +310,12 @@ body {
     display: flex;
     align-items: center;
     justify-content: center;
-    color: #999;
+    color: var(--muted);
     font-size: 14px;
 }
 
 .muted {
-    color: #999;
+    color: var(--muted);
     padding: 24px;
     font-size: 14px;
 }
@@ -237,15 +341,15 @@ body {
 
 .message-user {
     align-self: flex-end;
-    background: #111;
-    color: #fff;
+    background: var(--ink);
+    color: var(--surface);
     border-bottom-right-radius: 4px;
 }
 
 .message-assistant {
     align-self: flex-start;
-    background: #eee;
-    color: #111;
+    background: var(--subtle);
+    color: var(--ink);
     border-bottom-left-radius: 4px;
 }
 
@@ -281,24 +385,24 @@ body {
     align-self: center;
     width: 100%;
     max-width: 65ch;
-    border: 1px solid #e5e5e5;
+    border: 1px solid var(--border);
     border-left-width: 3px;
     border-radius: 8px;
     padding: 10px 14px;
-    background: #fff;
+    background: var(--surface);
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
 }
 
 .tool-call {
-    border-left-color: #8a8fa3;
+    border-left-color: var(--muted);
 }
 
 .tool-result {
-    border-left-color: #2e7d32;
+    border-left-color: var(--ok);
 }
 
 .tool-result-error {
-    border-left-color: #c0392b;
+    border-left-color: var(--danger);
 }
 
 .tool-call-header,
@@ -308,11 +412,11 @@ body {
     gap: 6px;
     font-size: 13px;
     font-weight: 600;
-    color: #555;
+    color: var(--text-2);
 }
 
 .tool-result-error .tool-result-header {
-    color: #c0392b;
+    color: var(--danger);
 }
 
 .tool-call-icon,
@@ -324,10 +428,10 @@ body {
 .tool-call-name {
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
     font-size: 12px;
-    background: #f2f2f4;
+    background: var(--subtle);
     padding: 1px 6px;
     border-radius: 4px;
-    color: #111;
+    color: var(--ink);
 }
 
 .tool-call-input,
@@ -338,7 +442,146 @@ body {
     line-height: 1.5;
     white-space: pre-wrap;
     word-break: break-word;
-    color: #333;
+    color: var(--text);
+}
+
+/* The model is working (SME-41 D1): shown under the transcript for as
+   long as a turn runs, in every tab watching. */
+.turn-working {
+    align-self: flex-start;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.turn-working-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: turn-working-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes turn-working-pulse {
+    0%, 100% { opacity: 0.25; }
+    50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .turn-working-dot {
+        animation: none;
+    }
+}
+
+/* Something that happened, not something anyone said (SME-41 D3): a
+   command finishing, the sandbox stopping, a background task ending. */
+.system-notice {
+    align-self: center;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    max-width: min(640px, 100%);
+    font-size: 12.5px;
+    color: var(--muted);
+    text-align: center;
+}
+
+.system-notice .timestamp {
+    color: var(--muted);
+    font-size: 11px;
+}
+
+/* A tool call as one compact line with its result folded in (SME-41 D2):
+   the answer, not the tool traffic, is what the transcript is for. */
+.tool-row {
+    align-self: flex-start;
+    max-width: min(760px, 100%);
+    font-size: 13px;
+    color: var(--text-2);
+}
+
+.tool-row-summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+    cursor: pointer;
+    list-style: none;
+}
+
+.tool-row-summary::-webkit-details-marker {
+    display: none;
+}
+
+.tool-row-summary:hover .tool-row-text {
+    color: var(--ink);
+}
+
+.tool-row-marker {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--ok);
+    flex-shrink: 0;
+}
+
+.tool-row-failed .tool-row-marker {
+    background: var(--danger);
+}
+
+.tool-row-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tool-row[open] .tool-row-text {
+    white-space: normal;
+}
+
+.tool-row-status {
+    color: var(--danger);
+    font-weight: 600;
+}
+
+.tool-row-detail {
+    margin: 4px 0 6px 15px;
+    padding: 8px 10px;
+    border-left: 2px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.tool-row-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+}
+
+.tool-row-input,
+.tool-row-result {
+    margin: 0;
+    font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text);
+    max-height: 320px;
+    overflow: auto;
+}
+
+.tool-row-failed .tool-row-result {
+    color: var(--danger);
+}
+
+.tool-row-failure {
+    padding: 6px 12px;
+    font-size: 13px;
+    color: var(--danger);
 }
 
 /* `edit_file`'s diff card — same shape/border-left-accent as .tool-call,
@@ -349,12 +592,12 @@ body {
     align-self: center;
     width: 100%;
     max-width: 65ch;
-    border: 1px solid #e5e5e5;
+    border: 1px solid var(--border);
     border-left-width: 3px;
-    border-left-color: #8a8fa3;
+    border-left-color: var(--muted);
     border-radius: 8px;
     padding: 10px 14px;
-    background: #fff;
+    background: var(--surface);
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
 }
 
@@ -371,17 +614,17 @@ body {
 
 .file-edit-diff-line {
     padding: 0 8px;
-    color: #333;
+    color: var(--text);
 }
 
 .file-edit-diff-line-removed {
-    background: #ffeef0;
-    color: #82071e;
+    background: var(--danger-bg);
+    color: var(--danger);
 }
 
 .file-edit-diff-line-added {
-    background: #e6ffed;
-    color: #22863a;
+    background: var(--ok-bg);
+    color: var(--ok);
 }
 
 /* `run_async` gets a single collapsed line instead of the full tool-call
@@ -400,7 +643,7 @@ body {
     gap: 6px;
     padding: 3px 4px;
     font-size: 12.5px;
-    color: #777;
+    color: var(--muted);
     cursor: pointer;
     list-style: none;
     user-select: none;
@@ -413,7 +656,7 @@ body {
 .tool-async-start-summary::before {
     content: "▸";
     font-size: 9px;
-    color: #aaa;
+    color: var(--muted);
     transition: transform 100ms ease;
 }
 
@@ -428,10 +671,10 @@ body {
 .tool-async-start-tool {
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
     font-size: 11.5px;
-    background: #f2f2f4;
+    background: var(--subtle);
     padding: 1px 6px;
     border-radius: 4px;
-    color: #111;
+    color: var(--ink);
 }
 
 .tool-async-start-summary .timestamp {
@@ -445,7 +688,7 @@ body {
     line-height: 1.5;
     white-space: pre-wrap;
     word-break: break-word;
-    color: #555;
+    color: var(--text-2);
 }
 
 /* A model's reasoning, when present — same collapsed-by-default <details>
@@ -463,7 +706,7 @@ body {
     gap: 6px;
     padding: 3px 4px;
     font-size: 12.5px;
-    color: #777;
+    color: var(--muted);
     cursor: pointer;
     list-style: none;
     user-select: none;
@@ -477,7 +720,7 @@ body {
 .thinking-summary::before {
     content: "▸";
     font-size: 9px;
-    color: #aaa;
+    color: var(--muted);
     transition: transform 100ms ease;
 }
 
@@ -500,7 +743,7 @@ body {
     line-height: 1.5;
     white-space: pre-wrap;
     word-break: break-word;
-    color: #888;
+    color: var(--muted);
     font-style: italic;
 }
 
@@ -514,8 +757,8 @@ body {
     width: 100%;
     max-width: 65ch;
     margin: 12px 0;
-    border-top: 1px dashed #c3c2b7;
-    border-bottom: 1px dashed #c3c2b7;
+    border-top: 1px dashed var(--border-strong);
+    border-bottom: 1px dashed var(--border-strong);
     padding: 6px 0;
 }
 
@@ -526,7 +769,7 @@ body {
     padding: 3px 4px;
     font-size: 12.5px;
     font-weight: 600;
-    color: #52514e;
+    color: var(--text-2);
     cursor: pointer;
     list-style: none;
     user-select: none;
@@ -539,7 +782,7 @@ body {
 .compaction-summary-header::before {
     content: "▸";
     font-size: 9px;
-    color: #898781;
+    color: var(--muted);
     transition: transform 100ms ease;
 }
 
@@ -561,7 +804,7 @@ body {
     line-height: 1.5;
     white-space: pre-wrap;
     word-break: break-word;
-    color: #52514e;
+    color: var(--text-2);
 }
 
 /* Live browsing panel — lives in .side-panels-row, renders first
@@ -577,8 +820,8 @@ body {
 .browsing-panel {
     flex: 1 1 auto;
     min-width: 0;
-    border-right: 1px solid #e5e5e5;
-    background: #fafafa;
+    border-right: 1px solid var(--border);
+    background: var(--canvas);
     padding: 16px;
     overflow: auto;
 }
@@ -587,7 +830,7 @@ body {
     margin: 0 0 12px;
     font-size: 12px;
     font-weight: 600;
-    color: #777;
+    color: var(--muted);
     text-transform: uppercase;
     letter-spacing: 0.03em;
 }
@@ -598,7 +841,7 @@ body {
     width: 100%;
     max-width: 1280px;
     aspect-ratio: 1280 / 800;
-    background: #111;
+    background: var(--ink);
     border-radius: 4px;
     cursor: pointer;
     outline: none;
@@ -619,7 +862,7 @@ body {
     display: flex;
     align-items: center;
     justify-content: center;
-    color: #999;
+    color: var(--muted);
     font-size: 13px;
 }
 
@@ -628,8 +871,8 @@ body {
 .todo-panel {
     width: 280px;
     flex-shrink: 0;
-    border-right: 1px solid #e5e5e5;
-    background: #fafafa;
+    border-right: 1px solid var(--border);
+    background: var(--canvas);
     padding: 16px;
     overflow-y: auto;
 }
@@ -638,7 +881,7 @@ body {
     margin: 0 0 12px;
     font-size: 12px;
     font-weight: 600;
-    color: #777;
+    color: var(--muted);
     text-transform: uppercase;
     letter-spacing: 0.03em;
 }
@@ -672,16 +915,16 @@ body {
     height: 14px;
     margin-top: 1px;
     border-radius: 3px;
-    border: 1.5px solid #999;
+    border: 1.5px solid var(--muted);
     flex-shrink: 0;
     font-size: 9px;
     line-height: 1;
-    color: #fff;
+    color: var(--surface);
 }
 
 .todo-item-in-progress .todo-item-marker {
-    border-color: #2a78d6;
-    background: linear-gradient(135deg, #2a78d6 50%, transparent 50%);
+    border-color: var(--accent);
+    background: linear-gradient(135deg, var(--accent) 50%, transparent 50%);
 }
 
 .todo-item-completed .todo-item-marker {
@@ -704,7 +947,7 @@ body {
 }
 
 .todo-item-completed .todo-item-content {
-    color: #999;
+    color: var(--muted);
     text-decoration: line-through;
 }
 
@@ -717,8 +960,8 @@ body {
 .tasks-panel {
     width: 320px;
     flex-shrink: 0;
-    border-right: 1px solid #e5e5e5;
-    background: #fafafa;
+    border-right: 1px solid var(--border);
+    background: var(--canvas);
     padding: 16px;
     overflow-y: auto;
 }
@@ -727,7 +970,7 @@ body {
     margin: 0 0 12px;
     font-size: 12px;
     font-weight: 600;
-    color: #777;
+    color: var(--muted);
     text-transform: uppercase;
     letter-spacing: 0.03em;
 }
@@ -756,7 +999,7 @@ body {
     display: flex;
     flex-direction: column;
     min-height: 0;
-    background: #fafafa;
+    background: var(--canvas);
     padding: 16px;
 }
 
@@ -800,7 +1043,7 @@ body {
     margin: 0 0 12px;
     font-size: 12px;
     font-weight: 600;
-    color: #777;
+    color: var(--muted);
     text-transform: uppercase;
     letter-spacing: 0.03em;
 }
@@ -815,11 +1058,11 @@ body {
     align-items: baseline;
     margin-bottom: 8px;
     font-size: 12px;
-    color: #555;
+    color: var(--text-2);
 }
 
 .sandbox-pod-status {
-    color: #888;
+    color: var(--muted);
 }
 
 /* Each background task gets its own terminal-window-styled widget — the
@@ -956,7 +1199,7 @@ body {
 .sandbox-command-block {
     margin-bottom: 10px;
     padding-bottom: 10px;
-    border-bottom: 1px solid #333;
+    border-bottom: 1px solid var(--text);
 }
 
 .sandbox-command-block:last-child {
@@ -981,7 +1224,7 @@ body {
 
 .sandbox-command-status {
     flex-shrink: 0;
-    color: #888;
+    color: var(--muted);
     font-size: 11px;
 }
 
@@ -1004,14 +1247,14 @@ body {
     display: flex;
     gap: 10px;
     padding: 16px 24px;
-    border-top: 1px solid #e5e5e5;
-    background: #fff;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
 }
 
 .composer input {
     flex: 1;
     padding: 10px 14px;
-    border: 1px solid #d0d0d0;
+    border: 1px solid var(--border-strong);
     border-radius: 10px;
     font-size: 15px;
     transition: border-color 100ms ease, box-shadow 100ms ease;
@@ -1026,13 +1269,48 @@ body {
         flex-direction: column;
     }
 
+    /* The list folds behind a button in a slim bar, so the conversation
+       fills the screen (SME-41 D4). */
     .sidebar {
         width: auto;
-        max-height: 35vh;
         border-right: none;
-        border-bottom: 1px solid #e5e5e5;
+        border-bottom: 1px solid var(--border);
         gap: 8px;
-        padding: 12px;
+        padding: 8px 12px;
+        overflow: visible;
+    }
+
+    .sidebar-toggle {
+        display: block;
+    }
+
+    .sidebar:not(.sidebar-open) .sidebar-body {
+        display: none;
+    }
+
+    .sidebar-open .sidebar-body {
+        max-height: 60vh;
+        overflow-y: auto;
+    }
+
+    /* The conversation first; the sandbox and task panels below it. */
+    .chat-main {
+        order: -1;
+        flex: 1 1 auto;
+        min-height: 55vh;
+    }
+
+    .side-panels-row {
+        flex: 0 0 auto;
+        flex-direction: column;
+        max-height: 40vh;
+        overflow-y: auto;
+    }
+
+    /* Wide tables scroll in their own box rather than the page. */
+    .pods-table {
+        display: block;
+        overflow-x: auto;
     }
 
     .chat-panel {
@@ -1052,21 +1330,21 @@ body {
 
 .composer input:focus {
     outline: none;
-    border-color: #111;
+    border-color: var(--ink);
     box-shadow: 0 0 0 3px rgba(17, 17, 17, 0.08);
 }
 
 .composer input:disabled {
-    background: #f7f7f7;
-    color: #999;
+    background: var(--canvas);
+    color: var(--muted);
 }
 
 .composer button {
     padding: 10px 18px;
     border: none;
     border-radius: 10px;
-    background: #111;
-    color: #fff;
+    background: var(--ink);
+    color: var(--surface);
     font-size: 14px;
     font-weight: 600;
     cursor: pointer;
@@ -1074,7 +1352,7 @@ body {
 }
 
 .composer button:hover:not(:disabled) {
-    background: #2b2b2b;
+    background: var(--ink-hover);
 }
 
 .composer button:active:not(:disabled) {
@@ -1087,8 +1365,8 @@ body {
 }
 
 .error {
-    color: #c0392b;
-    background: #fdecea;
+    color: var(--danger);
+    background: var(--danger-bg);
     border-radius: 8px;
     padding: 8px 12px;
     font-size: 13px;
@@ -1100,16 +1378,16 @@ body {
     display: block;
     padding: 8px 10px;
     border-radius: 8px;
-    color: #555;
+    color: var(--text-2);
     font-size: 13px;
     text-decoration: none;
     text-align: center;
-    border: 1px solid #e5e5e5;
+    border: 1px solid var(--border);
 }
 
 .mcp-servers-link:hover {
-    background: #f2f2f2;
-    color: #111;
+    background: var(--subtle);
+    color: var(--ink);
 }
 
 .mcp-servers-page {
@@ -1125,13 +1403,13 @@ body {
 .mcp-back-link {
     display: inline-block;
     margin-bottom: 12px;
-    color: #555;
+    color: var(--text-2);
     font-size: 13px;
     text-decoration: none;
 }
 
 .mcp-back-link:hover {
-    color: #111;
+    color: var(--ink);
 }
 
 .mcp-add-form,
@@ -1140,9 +1418,9 @@ body {
     flex-direction: column;
     gap: 10px;
     padding: 16px;
-    border: 1px solid #e5e5e5;
+    border: 1px solid var(--border);
     border-radius: 12px;
-    background: #fff;
+    background: var(--surface);
     margin-bottom: 24px;
 }
 
@@ -1153,13 +1431,13 @@ body {
     gap: 4px;
     font-size: 13px;
     font-weight: 600;
-    color: #333;
+    color: var(--text);
 }
 
 .mcp-add-form input,
 .mcp-edit-form input {
     padding: 8px 12px;
-    border: 1px solid #d0d0d0;
+    border: 1px solid var(--border-strong);
     border-radius: 8px;
     font-size: 14px;
 }
@@ -1167,41 +1445,41 @@ body {
 .mcp-add-form input:focus,
 .mcp-edit-form input:focus {
     outline: none;
-    border-color: #111;
+    border-color: var(--ink);
     box-shadow: 0 0 0 3px rgba(17, 17, 17, 0.08);
 }
 
-.mcp-add-form button,
-.mcp-edit-form button,
+.mcp-add-form button[type="submit"],
+.mcp-edit-form button[type="submit"],
 .mcp-server-actions button {
     align-self: flex-start;
     padding: 8px 16px;
-    border: 1px solid #111;
+    border: 1px solid var(--ink);
     border-radius: 8px;
-    background: #111;
-    color: #fff;
+    background: var(--ink);
+    color: var(--surface);
     font-size: 13px;
     font-weight: 600;
     cursor: pointer;
 }
 
-.mcp-add-form button:hover,
-.mcp-edit-form button:hover,
+.mcp-add-form button[type="submit"]:hover,
+.mcp-edit-form button[type="submit"]:hover,
 .mcp-server-actions button:hover {
-    background: #2b2b2b;
+    background: var(--ink-hover);
 }
 
 .mcp-save-edit:disabled {
-    background: #e5e5e5;
-    border-color: #e5e5e5;
-    color: #999;
+    background: var(--border);
+    border-color: var(--border);
+    color: var(--muted);
     cursor: not-allowed;
 }
 
 .mcp-save-edit.saving:disabled {
-    background: #111;
-    border-color: #111;
-    color: #fff;
+    background: var(--ink);
+    border-color: var(--ink);
+    color: var(--surface);
     cursor: default;
 }
 
@@ -1212,7 +1490,7 @@ body {
     margin-right: 6px;
     vertical-align: -1px;
     border: 2px solid rgba(255, 255, 255, 0.35);
-    border-top-color: #fff;
+    border-top-color: var(--surface);
     border-radius: 50%;
     animation: mcp-save-spin 0.7s linear infinite;
 }
@@ -1245,8 +1523,8 @@ body {
     padding: 8px 12px;
     font-size: 14px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    color: #333;
-    background: #f7f7f7;
+    color: var(--text);
+    background: var(--canvas);
     border: 1px solid transparent;
     border-radius: 8px;
 }
@@ -1254,10 +1532,10 @@ body {
 .mcp-remove-header,
 .mcp-add-header {
     padding: 6px 10px;
-    border: 1px solid #d0d0d0;
+    border: 1px solid var(--border-strong);
     border-radius: 8px;
-    background: #fff;
-    color: #555;
+    background: var(--surface);
+    color: var(--text-2);
     font-size: 12px;
     cursor: pointer;
     white-space: nowrap;
@@ -1265,7 +1543,7 @@ body {
 
 .mcp-remove-header:hover,
 .mcp-add-header:hover {
-    background: #f2f2f2;
+    background: var(--subtle);
 }
 
 .mcp-server-list {
@@ -1276,9 +1554,9 @@ body {
 
 .mcp-server-row {
     padding: 14px 16px;
-    border: 1px solid #e5e5e5;
+    border: 1px solid var(--border);
     border-radius: 12px;
-    background: #fff;
+    background: var(--surface);
     display: flex;
     flex-direction: column;
     gap: 10px;
@@ -1297,7 +1575,7 @@ body {
 
 .mcp-server-url {
     font-size: 13px;
-    color: #666;
+    color: var(--text-2);
     word-break: break-all;
 }
 
@@ -1308,39 +1586,47 @@ body {
 }
 
 .mcp-server-actions button {
-    background: #fff;
-    color: #111;
+    background: var(--surface);
+    color: var(--ink);
 }
 
 .mcp-server-actions button:hover {
-    background: #f2f2f2;
+    background: var(--subtle);
 }
 
+/* The destructive action: the same shape as every other button, in red
+   outline (SME-41 D6). */
 .mcp-delete {
-    border-color: #c0392b !important;
-    color: #c0392b !important;
+    padding: 8px 16px;
+    border: 1px solid var(--danger) !important;
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--danger) !important;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
 }
 
 .mcp-delete.confirm {
-    background: #c0392b !important;
-    color: #fff !important;
+    background: var(--danger) !important;
+    color: var(--surface) !important;
 }
 
 .mcp-new-server-link {
     display: inline-block;
     margin-top: 12px;
     padding: 8px 16px;
-    border: 1px solid #111;
+    border: 1px solid var(--ink);
     border-radius: 8px;
-    background: #111;
-    color: #fff;
+    background: var(--ink);
+    color: var(--surface);
     font-size: 13px;
     font-weight: 600;
     text-decoration: none;
 }
 
 .mcp-new-server-link:hover {
-    background: #2b2b2b;
+    background: var(--ink-hover);
 }
 
 .mcp-server-row-link {
@@ -1353,8 +1639,8 @@ body {
 }
 
 .mcp-server-row-link:hover {
-    border-color: #bbb;
-    background: #fafafa;
+    border-color: var(--border-strong);
+    background: var(--canvas);
 }
 
 .mcp-status {
@@ -1377,18 +1663,18 @@ body {
 }
 
 .mcp-status-checking {
-    background: #f2f2f2;
-    color: #777;
+    background: var(--subtle);
+    color: var(--muted);
 }
 
 .mcp-status-connected {
-    background: #e8f7ed;
-    color: #1e7e34;
+    background: var(--ok-bg);
+    color: var(--ok);
 }
 
 .mcp-status-unreachable {
-    background: #fdecea;
-    color: #c0392b;
+    background: var(--danger-bg);
+    color: var(--danger);
 }
 
 div.mcp-status-connected,
@@ -1421,7 +1707,7 @@ div.mcp-status-unreachable::before {
     margin: 8px 0 0;
     padding-left: 18px;
     font-size: 13px;
-    color: #444;
+    color: var(--text);
     max-height: 220px;
     overflow-y: auto;
 }
@@ -1434,39 +1720,39 @@ div.mcp-status-unreachable::before {
 .mcp-refresh-status {
     margin-top: 10px;
     padding: 6px 12px;
-    border: 1px solid #d0d0d0;
+    border: 1px solid var(--border-strong);
     border-radius: 8px;
-    background: #fff;
-    color: #555;
+    background: var(--surface);
+    color: var(--text-2);
     font-size: 12px;
     cursor: pointer;
 }
 
 .mcp-refresh-status:hover {
-    background: #f2f2f2;
+    background: var(--subtle);
 }
 
 .mcp-refresh-status:disabled {
     cursor: default;
-    color: #999;
+    color: var(--muted);
 }
 
 .mcp-refresh-status:disabled:hover {
-    background: #fff;
+    background: var(--surface);
 }
 
 .mcp-refresh-spinner {
     /* .mcp-save-spinner's white ring is invisible on this button's light
        background — same spinner shape, just recolored for a light button. */
     border-color: rgba(0, 0, 0, 0.15);
-    border-top-color: #555;
+    border-top-color: var(--text-2);
 }
 
 /* --- OAuth (SME-16) --- */
 
 .mcp-status-not-connected {
-    background: #f2f2f2;
-    color: #777;
+    background: var(--subtle);
+    color: var(--muted);
 }
 
 div.mcp-status-not-connected {
@@ -1486,12 +1772,21 @@ div.mcp-status-not-connected::before {
     margin-bottom: 16px;
 }
 
-.mcp-auth-mode-choice label {
-    display: flex;
+/* Scoped under the form so it outranks the form's stacked label rule;
+   the radio sits beside its label (SME-41 D13). */
+.mcp-add-form .mcp-auth-mode-choice label,
+.mcp-edit-form .mcp-auth-mode-choice label {
+    flex-direction: row;
     align-items: center;
     gap: 6px;
     font-weight: normal;
     cursor: pointer;
+}
+
+.mcp-add-form input[type="radio"],
+.mcp-edit-form input[type="radio"] {
+    margin: 0;
+    padding: 0;
 }
 
 .mcp-oauth-panel {
@@ -1513,23 +1808,23 @@ div.mcp-status-not-connected::before {
 }
 
 .mcp-oauth-connect {
-    border: 1px solid #1e7e34;
-    background: #e8f7ed;
-    color: #1e7e34;
+    border: 1px solid var(--ok);
+    background: var(--ok-bg);
+    color: var(--ok);
 }
 
 .mcp-oauth-connect:hover {
-    background: #d7f0de;
+    background: var(--ok-bg);
 }
 
 .mcp-oauth-disconnect {
-    border: 1px solid #d0d0d0;
-    background: #fff;
-    color: #c0392b;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--danger);
 }
 
 .mcp-oauth-disconnect:hover {
-    background: #fdecea;
+    background: var(--danger-bg);
 }
 
 /* Sandbox volumes (SME-17) —
@@ -1549,30 +1844,30 @@ div.mcp-status-not-connected::before {
 .sandbox-volumes-back-link {
     display: inline-block;
     margin-bottom: 12px;
-    color: #555;
+    color: var(--text-2);
     font-size: 13px;
     text-decoration: none;
 }
 
 .sandbox-volumes-back-link:hover {
-    color: #111;
+    color: var(--ink);
 }
 
 .sandbox-volumes-new-link {
     display: inline-block;
     margin-top: 12px;
     padding: 8px 16px;
-    border: 1px solid #111;
+    border: 1px solid var(--ink);
     border-radius: 8px;
-    background: #111;
-    color: #fff;
+    background: var(--ink);
+    color: var(--surface);
     font-size: 13px;
     font-weight: 600;
     text-decoration: none;
 }
 
 .sandbox-volumes-new-link:hover {
-    background: #2b2b2b;
+    background: var(--ink-hover);
 }
 
 .sandbox-volume-list {
@@ -1583,9 +1878,9 @@ div.mcp-status-not-connected::before {
 
 .sandbox-volume-row {
     padding: 14px 16px;
-    border: 1px solid #e5e5e5;
+    border: 1px solid var(--border);
     border-radius: 12px;
-    background: #fff;
+    background: var(--surface);
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -1606,17 +1901,17 @@ div.mcp-status-not-connected::before {
 .sandbox-volume-path {
     font-size: 13px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    color: #666;
+    color: var(--text-2);
     word-break: break-all;
 }
 
 .sandbox-volume-delete {
     align-self: flex-start;
     padding: 8px 16px;
-    border: 1px solid #c0392b;
+    border: 1px solid var(--danger);
     border-radius: 8px;
-    background: #fff;
-    color: #c0392b;
+    background: var(--surface);
+    color: var(--danger);
     font-size: 13px;
     font-weight: 600;
     cursor: pointer;
@@ -1624,12 +1919,12 @@ div.mcp-status-not-connected::before {
 }
 
 .sandbox-volume-delete:hover {
-    background: #fdecea;
+    background: var(--danger-bg);
 }
 
 .sandbox-volume-delete.confirm {
-    background: #c0392b;
-    color: #fff;
+    background: var(--danger);
+    color: var(--surface);
 }
 
 .sandbox-volume-add-form {
@@ -1637,9 +1932,9 @@ div.mcp-status-not-connected::before {
     flex-direction: column;
     gap: 10px;
     padding: 16px;
-    border: 1px solid #e5e5e5;
+    border: 1px solid var(--border);
     border-radius: 12px;
-    background: #fff;
+    background: var(--surface);
     margin-bottom: 24px;
 }
 
@@ -1649,42 +1944,42 @@ div.mcp-status-not-connected::before {
     gap: 4px;
     font-size: 13px;
     font-weight: 600;
-    color: #333;
+    color: var(--text);
 }
 
 .sandbox-volume-add-form input {
     padding: 8px 12px;
-    border: 1px solid #d0d0d0;
+    border: 1px solid var(--border-strong);
     border-radius: 8px;
     font-size: 14px;
 }
 
 .sandbox-volume-add-form input:focus {
     outline: none;
-    border-color: #111;
+    border-color: var(--ink);
     box-shadow: 0 0 0 3px rgba(17, 17, 17, 0.08);
 }
 
 .sandbox-volume-add-form button {
     align-self: flex-start;
     padding: 8px 16px;
-    border: 1px solid #111;
+    border: 1px solid var(--ink);
     border-radius: 8px;
-    background: #111;
-    color: #fff;
+    background: var(--ink);
+    color: var(--surface);
     font-size: 13px;
     font-weight: 600;
     cursor: pointer;
 }
 
 .sandbox-volume-add-form button:hover {
-    background: #2b2b2b;
+    background: var(--ink-hover);
 }
 
 .sandbox-volume-add-form button:disabled {
-    background: #e5e5e5;
-    border-color: #e5e5e5;
-    color: #999;
+    background: var(--border);
+    border-color: var(--border);
+    color: var(--muted);
     cursor: not-allowed;
 }
 
@@ -1696,15 +1991,15 @@ div.mcp-status-not-connected::before {
     align-items: center;
     gap: 10px;
     padding: 8px 24px;
-    border-bottom: 1px solid #e5e5e5;
-    background: #fff;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
     cursor: pointer;
     font-size: 12px;
-    color: #555;
+    color: var(--text-2);
 }
 
 .context-usage-bar:hover {
-    background: #fafafa;
+    background: var(--canvas);
 }
 
 .context-usage-track {
@@ -1712,13 +2007,13 @@ div.mcp-status-not-connected::before {
     max-width: 200px;
     height: 6px;
     border-radius: 3px;
-    background: #e5e5e5;
+    background: var(--border);
     overflow: hidden;
 }
 
 .context-usage-fill {
     height: 100%;
-    background: #111;
+    background: var(--ink);
     transition: width 200ms ease;
 }
 
@@ -1742,7 +2037,7 @@ div.mcp-status-not-connected::before {
     max-height: 80vh;
     width: 90%;
     overflow-y: auto;
-    background: #fff;
+    background: var(--surface);
     border-radius: 12px;
     padding: 24px;
 }
@@ -1756,11 +2051,38 @@ div.mcp-status-not-connected::before {
     font-size: 20px;
     line-height: 1;
     cursor: pointer;
-    color: #666;
+    color: var(--text-2);
+}
+
+/* Long tool names and URLs wrap instead of widening the dialog, and the
+   system prompt keeps its line breaks (SME-41 D7). */
+.context-detail-panel {
+    overflow-wrap: anywhere;
+}
+
+.context-detail-heading {
+    margin: 16px 0 6px;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+}
+
+.context-detail-prompt {
+    margin: 0 0 16px;
+    padding: 12px 14px;
+    max-height: 40vh;
+    overflow: auto;
+    white-space: pre-wrap;
+    font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--text);
+    background: var(--canvas);
+    border: 1px solid var(--border);
+    border-radius: 8px;
 }
 
 .context-detail-tool {
-    border: 1px solid #e5e5e5;
+    border: 1px solid var(--border);
     border-radius: 8px;
     padding: 10px 14px;
     margin-bottom: 10px;
@@ -1770,7 +2092,7 @@ div.mcp-status-not-connected::before {
     white-space: pre-wrap;
     word-break: break-word;
     font-size: 12px;
-    background: #fafafa;
+    background: var(--canvas);
     padding: 8px;
     border-radius: 6px;
 }
@@ -1811,7 +2133,7 @@ div.mcp-status-not-connected::before {
 }
 
 .context-meter-segment:focus-visible {
-    outline: 2px solid #111;
+    outline: 2px solid var(--ink);
     outline-offset: 2px;
 }
 
@@ -1840,8 +2162,8 @@ div.mcp-status-not-connected::before {
     bottom: calc(100% + 6px);
     left: 50%;
     transform: translateX(-50%);
-    background: #111;
-    color: #fff;
+    background: var(--ink);
+    color: var(--surface);
     padding: 4px 8px;
     border-radius: 6px;
     font-size: 12px;
@@ -1863,7 +2185,7 @@ div.mcp-status-not-connected::before {
     gap: 6px 14px;
     margin-top: 8px;
     font-size: 12px;
-    color: #52514e;
+    color: var(--text-2);
 }
 
 .context-meter-legend-item {
@@ -1907,33 +2229,33 @@ div.mcp-status-not-connected::before {
     box-sizing: border-box;
     width: 100%;
     padding: 6px 10px;
-    border: 1px solid #d0d0d0;
+    border: 1px solid var(--border-strong);
     border-radius: 6px;
-    background: #fff;
+    background: var(--surface);
     font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
-    color: #222;
+    color: var(--ink);
 }
 
 .browsing-address-input:focus {
-    outline: 2px solid #4a7dff;
+    outline: 2px solid var(--accent);
     outline-offset: -1px;
     border-color: transparent;
 }
 
 .browsing-address-input:disabled {
-    color: #888;
-    background: #f3f3f3;
+    color: var(--muted);
+    background: var(--subtle);
 }
 
 .browsing-address-error {
     margin: -4px 0 8px;
     font-size: 12px;
-    color: #b3261e;
+    color: var(--danger);
 }
 
 .conversation-missing {
     margin: 48px auto;
-    color: #666;
+    color: var(--text-2);
     text-align: center;
 }
 
@@ -1944,17 +2266,17 @@ div.mcp-status-not-connected::before {
     display: block;
     padding: 8px 10px;
     border-radius: 8px;
-    color: #555;
+    color: var(--text-2);
     font-size: 13px;
     text-decoration: none;
     text-align: center;
-    border: 1px solid #e5e5e5;
+    border: 1px solid var(--border);
 }
 
 .pods-link:hover,
 .sandbox-volumes-link:hover {
-    background: #f2f2f2;
-    color: #111;
+    background: var(--subtle);
+    color: var(--ink);
 }
 
 /* A conversation with a live sandbox pod. */
@@ -1979,13 +2301,13 @@ div.mcp-status-not-connected::before {
 .pods-back-link {
     display: inline-block;
     margin-bottom: 12px;
-    color: #555;
+    color: var(--text-2);
     font-size: 13px;
     text-decoration: none;
 }
 
 .pods-back-link:hover {
-    color: #111;
+    color: var(--ink);
 }
 
 .pods-table {
@@ -1997,14 +2319,14 @@ div.mcp-status-not-connected::before {
 .pods-table th {
     text-align: left;
     font-weight: 600;
-    color: #555;
+    color: var(--text-2);
     padding: 8px 10px;
-    border-bottom: 1px solid #e5e5e5;
+    border-bottom: 1px solid var(--border);
 }
 
 .pods-table td {
     padding: 10px;
-    border-bottom: 1px solid #f0f0f0;
+    border-bottom: 1px solid var(--subtle);
     vertical-align: middle;
     white-space: nowrap;
 }
@@ -2014,7 +2336,7 @@ div.mcp-status-not-connected::before {
 }
 
 .pods-table a {
-    color: #111;
+    color: var(--ink);
 }
 
 .pod-id {
@@ -2028,10 +2350,10 @@ div.mcp-status-not-connected::before {
 
 .pod-stop {
     padding: 4px 10px;
-    border: 1px solid #c0392b;
+    border: 1px solid var(--danger);
     border-radius: 6px;
-    background: #fff;
-    color: #c0392b;
+    background: var(--surface);
+    color: var(--danger);
     font-size: 12px;
     font-weight: 600;
     cursor: pointer;
@@ -2039,12 +2361,12 @@ div.mcp-status-not-connected::before {
 }
 
 .pod-stop:hover {
-    background: #fdecea;
+    background: var(--danger-bg);
 }
 
 .pod-stop.confirm {
-    background: #c0392b;
-    color: #fff;
+    background: var(--danger);
+    color: var(--surface);
 }
 
 .sandbox-pod-header .pod-stop {
@@ -2053,13 +2375,13 @@ div.mcp-status-not-connected::before {
 
 /* The composer's Stop button, shown while a turn runs. */
 .composer button.stop-turn {
-    background: #fff;
-    color: #c0392b;
-    border: 1px solid #c0392b;
+    background: var(--surface);
+    color: var(--danger);
+    border: 1px solid var(--danger);
 }
 
 .composer button.stop-turn:hover:not(:disabled) {
-    background: #fdecea;
+    background: var(--danger-bg);
 }
 
 .turn-stopped {
@@ -2098,6 +2420,97 @@ div.mcp-status-not-connected::before {
 }
 
 .not-found-home-link {
-    color: #555;
+    color: var(--text-2);
     font-size: 14px;
+}
+
+/* Settings pages: intro text and empty states line up with the heading
+   instead of the 24px indent .muted gives elsewhere (SME-41 D6). */
+.mcp-servers-page p.muted,
+.pods-page p.muted,
+.sandbox-volumes-page p.muted {
+    padding: 0;
+}
+
+/* How long ago a conversation was active (SME-41 D8). */
+.conversation-age {
+    flex-shrink: 0;
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.conversation-item:hover .conversation-age,
+.conversation-item:focus-within .conversation-age {
+    visibility: hidden;
+}
+
+/* A conversation whose model turn is running (SME-41 D9): the same pulse
+   as the "Working..." line in the chat. */
+.conversation-busy {
+    flex-shrink: 0;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: turn-working-pulse 1.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .conversation-busy {
+        animation: none;
+    }
+}
+
+/* An empty conversation (SME-41 D12). */
+.conversation-empty {
+    align-self: center;
+    max-width: 560px;
+    margin: auto 0;
+    padding: 24px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    color: var(--text-2);
+}
+
+.conversation-empty h2 {
+    margin: 0;
+    font-size: 20px;
+    color: var(--ink);
+    text-wrap: balance;
+}
+
+.conversation-empty p {
+    margin: 0 0 6px;
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+.example-asks {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.example-ask {
+    text-align: left;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+}
+
+.example-ask:hover {
+    border-color: var(--border-strong);
+    background: var(--subtle);
+}
+
+.example-ask:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
 }

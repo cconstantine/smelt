@@ -572,6 +572,20 @@ async fn test_end_to_end_browser_scenarios() {
             .await,
             "the detail view should show the same real usage numbers the indicator did"
         );
+        // The system prompt keeps its line breaks, and the dialog doesn't
+        // scroll sideways: it was one run-together paragraph in a dialog
+        // that scrolled both ways (SME-41 D7).
+        let prompt_view: Vec<String> = context_page
+            .evaluate(
+                "(() => { const p = document.querySelector('.context-detail-prompt'); const panel = document.querySelector('.context-detail-panel'); \
+                 return [p ? getComputedStyle(p).whiteSpace : 'missing', String(panel.scrollWidth - panel.clientWidth)]; })()",
+            )
+            .await
+            .expect("inspect the detail view")
+            .into_value()
+            .expect("strings");
+        assert_eq!(prompt_view[0], "pre-wrap", "the system prompt should keep its line breaks: {prompt_view:?}");
+        assert!(prompt_view[1].parse::<f64>().unwrap_or(1.0) <= 0.0, "the detail view scrolls sideways: {prompt_view:?}");
 
         // --- Scenario 6: a compaction event renders as a distinct,
         // collapsed-by-default divider — not an ordinary chat bubble —
@@ -941,6 +955,22 @@ async fn test_end_to_end_browser_scenarios() {
             wait_for_count(&observer, ".stop-turn", 1, Duration::from_secs(5)).await,
             "a tab that didn't send should also offer Stop while the turn runs"
         );
+        // And both say the model is working, with how long it's been at it:
+        // before, a slow model's turn looked like nothing at all was
+        // happening (SME-41 D1).
+        for tab in [&sender, &observer] {
+            assert!(
+                wait_for_count(tab, ".turn-working", 1, Duration::from_secs(5)).await,
+                "a running turn should show that the model is working"
+            );
+        }
+        // And the sidebar marks the conversation as busy, so it's visible
+        // which conversations are working (SME-41 D9).
+        let busy_mark = format!(".conversation-item[data-conversation-id='{}'] .conversation-busy", to_stop.id);
+        assert!(
+            wait_for_count(&observer, &busy_mark, 1, Duration::from_secs(5)).await,
+            "the sidebar should mark a conversation whose turn is running"
+        );
         wait_for_element(&sender, ".stop-turn", Duration::from_secs(5))
             .await
             .click()
@@ -954,6 +984,15 @@ async fn test_end_to_end_browser_scenarios() {
             wait_for_count(&sender, ".stop-turn", 0, Duration::from_secs(5)).await
                 && wait_for_count(&observer, ".stop-turn", 0, Duration::from_secs(5)).await,
             "Stop should go away in every tab once the turn has ended"
+        );
+        assert!(
+            wait_for_count(&sender, ".turn-working", 0, Duration::from_secs(5)).await
+                && wait_for_count(&observer, ".turn-working", 0, Duration::from_secs(5)).await,
+            "the working line should go away once the turn has ended"
+        );
+        assert!(
+            wait_for_count(&observer, &busy_mark, 0, Duration::from_secs(5)).await,
+            "the sidebar's busy mark should go away once the turn has ended"
         );
         // The mock would have finished its reply 5s after it started.
         tokio::time::sleep(Duration::from_secs(6)).await;
@@ -1039,6 +1078,17 @@ async fn test_end_to_end_browser_scenarios() {
         // scroll sideways (SME-40 F2). ---
         let browsing = new_conversation(pool, &created).await;
         crate::browsing::open_session(browsing.id).await.expect("open a browsing session");
+        // With a todo list and a sandbox terminal open too, as in a real
+        // session: side by side, the three panels shared ~450px, so the
+        // browser was tiny and the terminal pushed out of sight (SME-41 D16).
+        db::set_conversation_todos(pool, browsing.id, &[anthropic::tools::TodoItem {
+            content: "check the page".to_string(),
+            status: anthropic::tools::TodoStatus::InProgress,
+        }])
+        .await
+        .expect("seed a todo list");
+        sandbox::create_pod(pool, browsing.id, None, None).await.expect("create_pod");
+        sandbox::create_terminal(pool, browsing.id).await.expect("create_terminal");
         let page = harness
             .browser
             .new_page(format!("{}conversation/{}", harness.base_url, browsing.id))
@@ -1061,6 +1111,20 @@ async fn test_end_to_end_browser_scenarios() {
         assert!(layout[2] <= 0.0, "the page scrolls sideways: {layout:?}");
         assert!(layout[3] <= layout[4], "the frame overflows its panel: {layout:?}");
         assert!(layout[5] <= layout[4], "the address bar overflows its panel: {layout:?}");
+        wait_for_element(&page, ".sandbox-panel .task-terminal", Duration::from_secs(10)).await;
+        let panels: Vec<f64> = page
+            .evaluate(
+                "(() => { const b = s => document.querySelector(s).getBoundingClientRect(); \
+                 const frame = b('.browsing-panel-frame-wrap'), sandbox = b('.sandbox-panel'), todo = b('.todo-panel'); \
+                 return [frame.width, sandbox.width, Math.min(sandbox.bottom, innerHeight) - Math.max(sandbox.top, 0), todo.width]; })()",
+            )
+            .await
+            .expect("measure the side panels")
+            .into_value()
+            .expect("numbers");
+        assert!(panels[0] >= 400.0, "the live browser is too small to use: {panels:?}");
+        assert!(panels[1] >= 400.0, "the sandbox panel is too narrow to read: {panels:?}");
+        assert!(panels[2] >= 240.0, "the sandbox panel should be visible without scrolling: {panels:?}");
         crate::browsing::close_session(browsing.id).await.expect("close the browsing session");
         page.close().await.expect("close the browsing tab");
 
@@ -1079,8 +1143,36 @@ async fn test_end_to_end_browser_scenarios() {
         wait_for_element(&page, ".conversation-item .delete-conversation.confirm", Duration::from_secs(5)).await;
         let after = element_box(&page, ".conversation-item .delete-conversation.confirm").await;
         assert_eq!(before.2, after.2, "arming the sidebar's Delete changed its width");
+        // A title uses its row, and each row says how long ago the
+        // conversation was active. Titles were cut at about 15 characters
+        // with most of the row empty (SME-41 D8).
+        let row: Vec<String> = page
+            .evaluate(
+                "(() => { const item = document.querySelector('.conversation-item:not(:hover)') || document.querySelector('.conversation-item'); \
+                 const w = s => item.querySelector(s).getBoundingClientRect().width; \
+                 const age = item.querySelector('.conversation-age'); \
+                 return [String(w('.conversation-title') / item.getBoundingClientRect().width), age ? age.innerText : '']; })()",
+            )
+            .await
+            .expect("measure a sidebar row")
+            .into_value()
+            .expect("strings");
+        assert!(row[0].parse::<f64>().unwrap_or(0.0) > 0.6, "the title should use most of its row: {row:?}");
+        assert!(
+            row[1] == "now" || row[1].trim_end_matches(['m', 'h', 'd', 'w']).parse::<u32>().is_ok(),
+            "each row should say how long ago it was active: {row:?}"
+        );
         page.close().await.expect("close the tab");
         let page = harness.browser.new_page(&harness.base_url).await.expect("open the app");
+        // Named the way a user thinks of them: "Sandboxes", not "Pods"
+        // (SME-41 D11).
+        let links: String = page
+            .evaluate("Array.from(document.querySelectorAll('.sidebar-body a')).map(a => a.innerText).join('|')")
+            .await
+            .expect("read the sidebar links")
+            .into_value()
+            .expect("text");
+        assert!(links.contains("Sandboxes") && !links.contains("Pods"), "sidebar links: {links}");
         click_when_present(&page, ".sidebar a[href='/sandbox-volumes']", Duration::from_secs(10)).await;
         assert!(
             wait_for_text(&page, "Sandbox volumes", Duration::from_secs(10)).await,
@@ -1117,6 +1209,37 @@ async fn test_end_to_end_browser_scenarios() {
         assert!(layout[1] >= 300.0, "the messages are too narrow on a phone: {layout:?}");
         assert!(layout[2] >= 200.0, "the message box is too narrow on a phone: {layout:?}");
         assert!(layout[3] <= 0.0, "the page scrolls sideways on a phone: {layout:?}");
+        // The conversation comes first: the list is folded behind a
+        // button, and the chat sits above the side panels. The list and
+        // the sandbox panel used to push the transcript to the bottom of
+        // the screen (SME-41 D4).
+        let order: Vec<f64> = page
+            .evaluate(
+                "(() => { const top = s => { const e = document.querySelector(s); return e ? e.getBoundingClientRect().top : -1; }; \
+                 const list = document.querySelector('.conversation-list'); \
+                 return [list && list.offsetParent !== null ? 1 : 0, top('.chat-main'), top('.side-panels-row')]; })()",
+            )
+            .await
+            .expect("measure the order")
+            .into_value()
+            .expect("numbers");
+        assert_eq!(order[0], 0.0, "the conversation list should be folded away on a phone: {order:?}");
+        assert!(order[2] < 0.0 || order[1] < order[2], "the chat should come before the side panels: {order:?}");
+        page.find_element(".sidebar-toggle").await.expect("the list's button").click().await.expect("open the list");
+        let mut list_shown = false;
+        for _ in 0..25 {
+            list_shown = page
+                .evaluate("document.querySelector('.conversation-list').offsetParent !== null")
+                .await
+                .expect("check the list")
+                .into_value()
+                .expect("a bool");
+            if list_shown {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(list_shown, "the button should open the conversation list");
         page.close().await.expect("close the tab");
 
         // --- Scenario 18: a URL that isn't a page says so, with a way
@@ -1137,6 +1260,163 @@ async fn test_end_to_end_browser_scenarios() {
             );
             page.close().await.expect("close the tab");
         }
+
+        // --- Scenario 19: a tool call reads as one compact line that says
+        // what it did, with its result folded in; a failed one is open. Each
+        // call and each result used to be its own card of raw JSON, 24 of
+        // them for a three-line answer (SME-41 D2). ---
+        let tools = new_conversation(pool, &created).await;
+        let call = |id: &str, name: &str, input: serde_json::Value| anthropic::ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+        };
+        let result = |id: &str, content: &str, is_error: bool| anthropic::ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: content.to_string(),
+            is_error: is_error.then_some(true),
+        };
+        db::create_message(pool, tools.id, "assistant", &[
+            call("toolu_ok", "run_terminal_command", serde_json::json!({"command": "ls /tmp", "terminal_id": 1})),
+            call("toolu_bad", "read_file", serde_json::json!({"path": "/nope.txt"})),
+        ]).await.expect("seed the calls");
+        db::create_message(pool, tools.id, "user", &[
+            result("toolu_ok", "command sent (id: abc)", false),
+            result("toolu_bad", "No such file or directory", true),
+        ]).await.expect("seed the results");
+        let page = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, tools.id))
+            .await
+            .expect("open the conversation");
+        wait_for_live_client(&page, tools.id).await;
+        assert!(wait_for_count(&page, ".tool-row", 2, Duration::from_secs(10)).await, "one row per call");
+        // With no usage yet, the meter says so in words (SME-41 D11).
+        assert!(
+            wait_for_text(&page, "No usage yet", Duration::from_secs(5)).await,
+            "the context meter should say there's no usage yet"
+        );
+        let rows: Vec<(String, bool)> = page
+            .evaluate("Array.from(document.querySelectorAll('.tool-row')).map(r => [r.querySelector('summary').innerText, r.open])")
+            .await
+            .expect("read the rows")
+            .into_value()
+            .expect("rows");
+        assert!(rows[0].0.contains("Ran `ls /tmp`") && !rows[0].1, "a successful call is one closed line: {rows:?}");
+        assert!(rows[1].0.contains("Read /nope.txt") && rows[1].1, "a failed call is open: {rows:?}");
+        assert_eq!(
+            page.evaluate("document.querySelectorAll('.tool-result, .tool-call').length").await.expect("count").into_value::<i64>().expect("n"),
+            0,
+            "results shouldn't be separate cards any more"
+        );
+        let body: String = page.evaluate("document.querySelector('.tool-row').textContent").await.expect("read").into_value().expect("text");
+        assert!(body.contains("command sent"), "the raw result is still there on expand: {body}");
+        page.close().await.expect("close the tab");
+
+        // --- Scenario 20: dark mode follows the system setting. There was
+        // none: a dark-mode system got a bright white page (SME-41 D5). ---
+        let page = harness.browser.new_page("about:blank").await.expect("open a tab");
+        page.execute(
+            chromiumoxide::cdp::browser_protocol::emulation::SetEmulatedMediaParams::builder()
+                .feature(chromiumoxide::cdp::browser_protocol::emulation::MediaFeature::new(
+                    "prefers-color-scheme",
+                    "dark",
+                ))
+                .build(),
+        )
+        .await
+        .expect("ask for dark mode");
+        page.goto(format!("{}conversation/{}", harness.base_url, tools.id)).await.expect("open the conversation");
+        wait_for_live_client(&page, tools.id).await;
+        let luminance: Vec<f64> = page
+            .evaluate(
+                "(() => { const lum = c => { const [r, g, b] = c.match(/\\d+/g).map(Number); return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255; }; \
+                 const bg = el => getComputedStyle(el).backgroundColor; \
+                 return [lum(bg(document.body)), lum(bg(document.querySelector('.sidebar'))), lum(getComputedStyle(document.querySelector('.tool-row-text')).color)]; })()",
+            )
+            .await
+            .expect("measure the colours")
+            .into_value()
+            .expect("numbers");
+        assert!(luminance[0] < 0.2 && luminance[1] < 0.25, "the page should be dark in dark mode: {luminance:?}");
+        assert!(luminance[2] > 0.55, "text should be light in dark mode: {luminance:?}");
+        page.close().await.expect("close the tab");
+
+        // --- Scenario 21: one primary action per form, and intro text
+        // lines up with its heading. Every button in the MCP form was
+        // solid black, "Remove" included, and intro text sat 24px in from
+        // the heading (SME-41 D6). ---
+        let page = harness.browser.new_page(format!("{}mcp-servers", harness.base_url)).await.expect("open MCP servers");
+        wait_for_element(&page, "h1", Duration::from_secs(10)).await;
+        let edges: Vec<f64> = page
+            .evaluate(
+                "(() => { const p = document.querySelector('.mcp-servers-page p.muted'); \
+                 return [document.querySelector('h1').getBoundingClientRect().left, \
+                 p.getBoundingClientRect().left + parseFloat(getComputedStyle(p).paddingLeft)]; })()",
+            )
+            .await
+            .expect("measure")
+            .into_value()
+            .expect("numbers");
+        assert!((edges[0] - edges[1]).abs() < 1.0, "intro text should line up with the heading: {edges:?}");
+        page.goto(format!("{}mcp-servers/new", harness.base_url)).await.expect("open the new-server form");
+        wait_for_element(&page, ".mcp-remove-header", Duration::from_secs(10)).await;
+        let fills: Vec<String> = page
+            .evaluate(
+                "['button[type=submit]', '.mcp-add-header', '.mcp-remove-header'].map(s => getComputedStyle(document.querySelector(s)).backgroundColor)",
+            )
+            .await
+            .expect("read the buttons")
+            .into_value()
+            .expect("colours");
+        assert_ne!(fills[0], fills[1], "the main action should stand out from the secondary ones: {fills:?}");
+        assert_eq!(fills[1], fills[2], "secondary actions should share one style: {fills:?}");
+        // Each auth choice's radio button sits beside its label, not above
+        // it (SME-41 D13).
+        let radios: Vec<f64> = page
+            .evaluate(
+                "(() => { const r = document.querySelector('input[name=mcp-new-auth-mode]').getBoundingClientRect(); \
+                 const l = document.querySelector('input[name=mcp-new-auth-mode]').parentElement.getBoundingClientRect(); \
+                 return [r.top + r.height / 2, l.top + l.height / 2, l.height]; })()",
+            )
+            .await
+            .expect("measure the radio")
+            .into_value()
+            .expect("numbers");
+        assert!((radios[0] - radios[1]).abs() < 4.0 && radios[2] < 30.0, "a radio should sit beside its label: {radios:?}");
+        page.close().await.expect("close the tab");
+
+        // --- Scenario 22: a new conversation says what smelt can do and
+        // offers example asks; one fills the message box without sending.
+        // It was a blank screen (SME-41 D12). ---
+        let empty = new_conversation(pool, &created).await;
+        let page = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, empty.id))
+            .await
+            .expect("open the empty conversation");
+        wait_for_live_client(&page, empty.id).await;
+        assert!(
+            wait_for_count(&page, ".conversation-empty .example-ask", 3, Duration::from_secs(10)).await,
+            "an empty conversation should offer example asks"
+        );
+        let example: String = page.evaluate("document.querySelector('.example-ask').innerText").await.expect("read").into_value().expect("text");
+        page.find_element(".example-ask").await.expect("an example").click().await.expect("pick it");
+        let mut filled = String::new();
+        for _ in 0..25 {
+            filled = page.evaluate(format!("document.querySelector({CHAT_INPUT:?}).value")).await.expect("read").into_value().expect("text");
+            if !filled.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(filled, example, "picking an example should fill the message box");
+        assert_eq!(
+            page.evaluate("document.querySelectorAll('.message-user').length").await.expect("count").into_value::<i64>().expect("n"),
+            0,
+            "picking an example shouldn't send it"
+        );
+        page.close().await.expect("close the tab");
     })))
     .await;
 
