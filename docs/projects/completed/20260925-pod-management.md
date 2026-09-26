@@ -38,8 +38,8 @@
 
 Each seen failing first:
 - **Database:** the live-pods query, including only live pods and ignoring closed terminals.
-- **Pure functions:** the idle calculation, and Kubernetes quantity and metrics parsing (against the documented response shape; see "Not done").
-- **Real cluster:** a user stopping a pod with an open terminal and a running command. The command is marked lost, the terminal and pod are gone, the notice arrives, and it's not reported as a crash. `PodsChanged` is published on create and stop, and the pods view reports status, limits, busy and terminals correctly.
+- **Pure functions:** the idle calculation, and Kubernetes quantity and metrics parsing. The parsing fixture is a real metrics-server response (`src/api/pod_metrics_fixture.json`), captured once the RBAC change was applied; a hand-made one covers several containers and unparseable values.
+- **Real cluster:** a user stopping a pod with an open terminal and a running command. The command is marked lost, the terminal and pod are gone, the notice arrives, and it's not reported as a crash. `PodsChanged` is published on create and stop, and the pods view reports status, limits, busy, terminals and, within 90 seconds, live usage.
 - **Notices:** a notice waits for a held turn lock.
 - **Event streams:** the app-wide stream drops its subscription with the tab, and the conversation stream relays `PodsChanged`.
 - **Stopping:**
@@ -69,8 +69,7 @@ You found two problems after the PR was opened (first written up as ideas `stale
 
 ### Not done
 
-- **Apply the RBAC change to the local k3s:** run `docker compose up` (or `docker compose run --rm k3s-bootstrap`) on the host. The `docker` CLI in the dev container talks to a sidecar, not your compose stack, so I couldn't. Until then, usage shows "unavailable" locally. Homelab isn't in scope, per the review.
-- **The metrics fixture is the documented response shape, not a captured one.** It should be replaced by a real capture once the RBAC change is applied (the "fixture real artifacts" rule).
+- **Homelab's RBAC** isn't updated, per the review, so usage shows "unavailable" there. The local k3s has it (you ran `docker compose run --rm k3s-bootstrap` on the host; the dev container's `docker` talks to a sidecar, so I couldn't).
 - **The HTTP/1.1 connection limit is a real ceiling for the user too.** A chat tab holds one always-open stream, and two while a reply streams. With about four smelt tabs open while a reply streams, a new tab can hang, or a Stop click can wait until the reply finishes. Serving over HTTP/2 (which browsers only use over TLS), or carrying replies on the conversation stream instead of a separate one, would lift it. Not in this project; worth an idea if it bites.
 - **No live dot updates on `/`** with no conversation open (see "Changes from the plan").
 - **Automatic idle cleanup** stays in `coding-session.md`, now reworded as "stopping idle pods automatically".
@@ -86,7 +85,7 @@ You found two problems after the PR was opened (first written up as ideas `stale
 - **Process-wide state keyed by per-test ids.** The new pause and stop registries are keyed by conversation id, and every `#[sqlx::test]` database numbers conversations from 1. So one test's stop paused another test's conversation, and five unrelated tests failed, only in a full run. Fixed with unique ids (`create_conversation_with_id`) and written up in testing.md.
 - **The connection limit came up twice.** First with the per-tab app stream (a new tab hung), then with Stop itself (the click queued behind a streaming reply while older tabs held connections). The second only showed as a timing-dependent failure, and was confirmed by closing tabs. Both are written up in frontend.md and testing.md.
 - **My edits kept rebuilding your dev server's bundle,** which the browser tier also serves. It helped once (a run I expected to be stale was current), but it means a "stale bundle" failure-first run can't be relied on while your `dx serve` is running. I switched to breaking the code on purpose instead.
-- **I couldn't apply the RBAC change to the local cluster myself,** so live usage is verified only as "unavailable degrades cleanly", not with real numbers.
+- **I couldn't apply the RBAC change to the local cluster myself** (the dev container's `docker` talks to a sidecar). Until you ran the bootstrap, live usage was verified only as "unavailable degrades cleanly". Afterwards: the parsing fixture became a real captured response, and the real-cluster test now waits for its pod's live usage to appear in the pods view (about 20 seconds after the pod starts).
 
 - **Both review findings slipped past tests that looked at the right things with the wrong data.** The sidebar tests created fresh pods in a clean test database, so a record outliving its pod never came up; the dev database had 28 of them. The pods-page scenario clicked Stop and Confirm by selector, which works whether or not the button moves. Checking the running dev app against its real data, and measuring layout rather than just finding elements, would have caught both before review.
 

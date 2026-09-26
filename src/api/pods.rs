@@ -280,10 +280,25 @@ mod tests {
         assert_eq!(parse_memory_bytes("big"), None);
     }
 
-    /// Shape as documented for `metrics.k8s.io/v1beta1` `PodMetricsList`;
-    /// to be replaced by a real captured response once smelt's service
-    /// account is allowed to read metrics (see the plan).
-    const DOCUMENTED_POD_METRICS: &str = r#"{
+    /// A real `PodMetricsList` from the local k3s's metrics-server,
+    /// captured 2026-09-26 for a sandbox-image pod in the test namespace.
+    const CAPTURED_POD_METRICS: &str = include_str!("pod_metrics_fixture.json");
+
+    #[test]
+    fn test_parse_pod_metrics_reads_a_real_response() {
+        let list: serde_json::Value = serde_json::from_str(CAPTURED_POD_METRICS).expect("valid JSON");
+        let usage = parse_pod_metrics(&list);
+        assert_eq!(
+            usage.get("metrics-fixture-capture"),
+            Some(&PodUsage { memory_bytes: 1156 * 1024, cpu_millicores: 0 }),
+            "736969 nanocores is under one millicore"
+        );
+        assert_eq!(usage.len(), 1);
+    }
+
+    /// Hand-made, for what the captured response doesn't show: a pod with
+    /// several containers, and one whose numbers don't parse.
+    const EDGE_CASE_POD_METRICS: &str = r#"{
         "kind": "PodMetricsList",
         "apiVersion": "metrics.k8s.io/v1beta1",
         "metadata": {},
@@ -308,7 +323,7 @@ mod tests {
 
     #[test]
     fn test_parse_pod_metrics_sums_containers_and_skips_unparseable_pods() {
-        let list: serde_json::Value = serde_json::from_str(DOCUMENTED_POD_METRICS).expect("valid JSON");
+        let list: serde_json::Value = serde_json::from_str(EDGE_CASE_POD_METRICS).expect("valid JSON");
         let usage = parse_pod_metrics(&list);
         assert_eq!(
             usage.get("sandbox-12"),

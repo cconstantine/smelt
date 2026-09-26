@@ -3533,10 +3533,20 @@ mod tests {
             assert_eq!(overview_g.cpu_limit, Some(default_cpu_limit()));
             assert_eq!(overview_g.terminals, 1);
             assert_eq!(overview_g.activity, crate::api::pods::PodActivity::Busy, "a command is running");
-            // Usage depends on whether this cluster lets smelt read metrics
-            // yet, and on metrics-server having sampled the new pod; either
-            // way the view must come back.
-            eprintln!("pod (g) usage: {:?}", overview_g.usage);
+            // Live usage, end to end: metrics-server samples a new pod
+            // within a minute or so, and smelt's RBAC lets it read that.
+            let usage_g = tokio::time::timeout(Duration::from_secs(90), async {
+                loop {
+                    let overviews = crate::api::pods::pod_overviews(&pool).await.expect("pod_overviews");
+                    if let Some(usage) = overviews.iter().find(|o| o.pod_id == pod_g).and_then(|o| o.usage.clone()) {
+                        return usage;
+                    }
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+            })
+            .await
+            .expect("the pods view should show pod (g)'s live usage once metrics-server has sampled it");
+            assert!(usage_g.memory_bytes > 0, "a running pod uses some memory: {usage_g:?}");
 
             stop_pod_for_user(&pool, pod_g).await.expect("stop_pod_for_user (g) should succeed");
             assert!(
