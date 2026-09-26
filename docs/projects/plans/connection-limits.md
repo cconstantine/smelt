@@ -90,10 +90,10 @@ Two changes:
 - `src/browser_tests.rs`: the new and adjusted scenarios.
 - Docs: `api.md` (streaming section rewritten), `frontend.md`, `architecture.md` (the "two streams" description), `testing.md` (the connection-limit notes). Close-out as usual.
 
-## Open questions and tradeoffs
+## Decisions (2026-09-26)
 
-1. **Stacking.** This branch builds on `pod-management`. If #28 merges first I'll merge `main` in; otherwise its PR goes up stacked on #28. OK?
-2. **Dev proxy port and trust.** Proposal: `https://localhost:8443`, `tls internal`, with a documented step to trust Caddy's root certificate. The alternative is mkcert on the host, which is simpler for the browser but a host install.
-3. **Bug-bash #14 (one bubble for a multi-step reply)** comes almost for free with `ReplyReset`. Include it? Proposal: yes.
-4. **The browsing panel's frame stream** stays its own connection while the panel is open (frames are large and frequent; see `api.md`). Proposal: leave it, since HTTP/2 covers it in production and it only exists while the panel is open.
-5. **Should the browser tier run over HTTP/2 too?** That needs TLS in the in-process test server. Proposal: no. Keeping it on HTTP/1.1 means the limit stays visible in tests.
+1. **Stacked on #28** with GitHub's stacked pull requests: stack #30, #28 then #29 (this branch, a draft). Linked with `gh stack link` by PR number. `gh stack sync`/`rebase` aren't used: they rebase and force-push, and this repo merges instead. When #28 merges, `main` is merged into this branch.
+2. **Dev proxy:** `https://localhost:8443`, `tls internal`, with a documented step to trust Caddy's root certificate. (Proposal taken; the user didn't choose otherwise.)
+3. **Bug-bash #14** (a multi-step reply as one bubble) is included, via `ReplyReset`.
+4. **The browsing panel's frame stream** stays its own connection.
+5. **The browser tier** stays on HTTP/1.1.
