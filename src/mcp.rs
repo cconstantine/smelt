@@ -46,6 +46,20 @@ pub async fn ensure_default_servers(pool: &sqlx::PgPool) {
     }
 }
 
+/// How long listing tools for a model call waits for a server that isn't
+/// connected yet. A healthy server connects in a second or two; one that
+/// doesn't answer is left out of this call rather than holding it up.
+const TOOL_LIST_WAIT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(1)
+} else {
+    std::time::Duration::from_secs(10)
+};
+
+/// After a failed connection, model calls skip the server for this long
+/// instead of trying (and waiting) again on every call. The status page
+/// still tries each time it's opened.
+const RETRY_AFTER_FAILURE: std::time::Duration = std::time::Duration::from_secs(300);
+
 const TOOL_NAME_PREFIX: &str = "mcp__";
 const TOOL_NAME_SEPARATOR: &str = "__";
 
@@ -107,7 +121,8 @@ impl ClientHandler for SmeltClientHandler {
 }
 
 struct Connection {
-    service: RunningService<RoleClient, SmeltClientHandler>,
+    // Shared so a tool call can run without holding `REGISTRY`'s lock.
+    service: Arc<RunningService<RoleClient, SmeltClientHandler>>,
     tools: Vec<McpTool>,
     stale: Arc<AtomicBool>,
 }
@@ -126,6 +141,46 @@ static REGISTRY: LazyLock<AsyncMutex<HashMap<i64, Connection>>> =
 /// A future `tool_definitions_for`/`call_tool` call reconnects fresh.
 pub async fn evict(server_id: i64) {
     REGISTRY.lock().await.remove(&server_id);
+    lock_failures().remove(&server_id);
+}
+
+/// When each server last failed to connect, so model calls can skip it
+/// for `RETRY_AFTER_FAILURE` instead of waiting on it every time.
+static FAILED_AT: LazyLock<std::sync::Mutex<HashMap<i64, std::time::Instant>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn lock_failures() -> std::sync::MutexGuard<'static, HashMap<i64, std::time::Instant>> {
+    FAILED_AT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn failed_recently(server_id: i64) -> bool {
+    lock_failures()
+        .get(&server_id)
+        .is_some_and(|at| at.elapsed() < RETRY_AFTER_FAILURE)
+}
+
+/// One lock per server, held while connecting to it, so two callers don't
+/// both connect to the same server, and a slow server only holds up
+/// callers that want that server, not `REGISTRY` as a whole.
+static CONNECTING: LazyLock<std::sync::Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn connect_lock(server_id: i64) -> Arc<AsyncMutex<()>> {
+    CONNECTING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(server_id)
+        .or_default()
+        .clone()
+}
+
+/// Whether `ensure_connected` should try a server that failed recently.
+#[derive(Clone, Copy, PartialEq)]
+enum Attempt {
+    /// Model calls: skip a server that failed within `RETRY_AFTER_FAILURE`.
+    SkipRecentFailures,
+    /// The status page: the user is asking, so always try.
+    Always,
 }
 
 /// Calls `f` and, if it fails, retries exactly once. A server's very first
@@ -226,7 +281,7 @@ async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connec
     })?;
 
     Ok(Connection {
-        service,
+        service: Arc::new(service),
         tools,
         stale,
     })
@@ -238,26 +293,64 @@ async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connec
 /// notification fired). A `list_all_tools` failure on an existing
 /// connection is treated as "the connection is broken," not just "the list
 /// is stale": the entry is dropped so the fallback below reconnects fully.
-async fn ensure_connected(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<(), String> {
-    let mut registry = REGISTRY.lock().await;
-
-    if let Some(conn) = registry.get_mut(&config.id) {
-        if conn.stale.swap(false, Ordering::SeqCst) {
-            match conn.service.list_all_tools().await {
-                Ok(tools) => conn.tools = tools,
-                Err(_) => {
-                    registry.remove(&config.id);
-                }
-            }
-        }
-        if registry.contains_key(&config.id) {
+async fn ensure_connected(
+    pool: &sqlx::PgPool,
+    config: &McpServerConfig,
+    attempt: Attempt,
+) -> Result<(), String> {
+    let existing = {
+        let registry = REGISTRY.lock().await;
+        registry
+            .get(&config.id)
+            .map(|conn| (conn.service.clone(), conn.stale.swap(false, Ordering::SeqCst)))
+    };
+    if let Some((service, stale)) = existing {
+        if !stale {
             return Ok(());
+        }
+        match service.list_all_tools().await {
+            Ok(tools) => {
+                if let Some(conn) = REGISTRY.lock().await.get_mut(&config.id) {
+                    conn.tools = tools;
+                }
+                return Ok(());
+            }
+            Err(_) => {
+                REGISTRY.lock().await.remove(&config.id);
+            }
         }
     }
 
-    let connection = retry_once(|| connect(pool, config)).await?;
-    registry.insert(config.id, connection);
-    Ok(())
+    let skip_error = || {
+        format!(
+            "MCP server {:?} failed to connect recently; model calls try it again after {} minutes",
+            config.name,
+            RETRY_AFTER_FAILURE.as_secs() / 60
+        )
+    };
+    if attempt == Attempt::SkipRecentFailures && failed_recently(config.id) {
+        return Err(skip_error());
+    }
+    let lock = connect_lock(config.id);
+    let _connecting = lock.lock().await;
+    // Someone else may have connected, or failed, while this waited.
+    if REGISTRY.lock().await.contains_key(&config.id) {
+        return Ok(());
+    }
+    if attempt == Attempt::SkipRecentFailures && failed_recently(config.id) {
+        return Err(skip_error());
+    }
+    match retry_once(|| connect(pool, config)).await {
+        Ok(connection) => {
+            lock_failures().remove(&config.id);
+            REGISTRY.lock().await.insert(config.id, connection);
+            Ok(())
+        }
+        Err(e) => {
+            lock_failures().insert(config.id, std::time::Instant::now());
+            Err(e)
+        }
+    }
 }
 
 fn mcp_tool_to_definition(server_name: &str, tool: &McpTool) -> ToolDefinition {
@@ -278,22 +371,44 @@ pub async fn tool_definitions_for(
     pool: &sqlx::PgPool,
     configs: &[McpServerConfig],
 ) -> Vec<ToolDefinition> {
-    let mut definitions = Vec::new();
-    for config in configs {
-        if let Err(e) = ensure_connected(pool, config).await {
-            tracing::warn!(server = %config.name, error = %e, "MCP server unreachable this turn; its tools are unavailable");
-            continue;
+    // All servers at once, each given at most `TOOL_LIST_WAIT`. A connect
+    // that takes longer carries on in the background (it's spawned, so
+    // giving up on it here doesn't cancel it), and its tools show up on a
+    // later call once it's connected.
+    let attempts = configs.iter().map(|config| {
+        let (pool, config) = (pool.clone(), config.clone());
+        let name = config.name.clone();
+        let task = tokio::spawn(async move {
+            ensure_connected(&pool, &config, Attempt::SkipRecentFailures).await
+        });
+        async move {
+            match tokio::time::timeout(TOOL_LIST_WAIT, task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!(server = %name, error = %e, "MCP server unreachable this turn; its tools are unavailable");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(server = %name, error = %e, "MCP connect task failed");
+                }
+                Err(_) => {
+                    tracing::warn!(server = %name, "MCP server still connecting; its tools are left out of this call");
+                }
+            }
         }
-        let registry = REGISTRY.lock().await;
-        if let Some(conn) = registry.get(&config.id) {
-            definitions.extend(
-                conn.tools
-                    .iter()
-                    .map(|tool| mcp_tool_to_definition(&config.name, tool)),
-            );
-        }
-    }
-    definitions
+    });
+    futures_util::future::join_all(attempts).await;
+
+    let registry = REGISTRY.lock().await;
+    configs
+        .iter()
+        .filter_map(|config| registry.get(&config.id).map(|conn| (config, conn)))
+        .flat_map(|(config, conn)| {
+            conn.tools
+                .iter()
+                .map(|tool| mcp_tool_to_definition(&config.name, tool))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Attempts a real connection to `config`'s server and reports its current
@@ -307,7 +422,7 @@ pub async fn connection_check(
     pool: &sqlx::PgPool,
     config: &McpServerConfig,
 ) -> Result<Vec<String>, String> {
-    ensure_connected(pool, config).await?;
+    ensure_connected(pool, config, Attempt::Always).await?;
     let registry = REGISTRY.lock().await;
     let conn = registry.get(&config.id).ok_or_else(|| {
         format!(
@@ -346,10 +461,12 @@ pub async fn call_tool(
         }
     };
 
-    ensure_connected(pool, config).await?;
-    let registry = REGISTRY.lock().await;
-    let conn = registry
+    ensure_connected(pool, config, Attempt::SkipRecentFailures).await?;
+    let service = REGISTRY
+        .lock()
+        .await
         .get(&config.id)
+        .map(|conn| conn.service.clone())
         .ok_or_else(|| format!("not connected to MCP server {:?}", config.name))?;
 
     let mut request = CallToolRequestParams::new(tool_name.to_string());
@@ -357,7 +474,7 @@ pub async fn call_tool(
         request = request.with_arguments(arguments);
     }
 
-    let result = conn.service.call_tool(request).await.map_err(|e| {
+    let result = service.call_tool(request).await.map_err(|e| {
         format!(
             "MCP tool call to {:?} on {:?} failed: {e}",
             tool_name, config.name
@@ -543,7 +660,7 @@ mod tests {
         REGISTRY.lock().await.insert(
             server_id,
             Connection {
-                service,
+                service: Arc::new(service),
                 tools,
                 stale,
             },
@@ -798,6 +915,110 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             2,
             "expected no more than one retry"
+        );
+    }
+
+    /// A server that accepts connections and never answers, like a host
+    /// that's up but whose MCP server is wedged.
+    async fn start_hanging_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        format!("http://{addr}/mcp")
+    }
+
+    /// A server that accepts and immediately hangs up, counting how many
+    /// times anyone tried.
+    async fn start_refusing_server() -> (String, Arc<std::sync::atomic::AtomicU32>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = attempts.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(socket);
+            }
+        });
+        (format!("http://{addr}/mcp"), attempts)
+    }
+
+    fn config_at(id: i64, url: String) -> McpServerConfig {
+        McpServerConfig {
+            url,
+            ..test_config(id, "unreachable")
+        }
+    }
+
+    /// SME-40 F1: connecting to one slow server held the global registry
+    /// lock, so every other MCP operation (another server's tools, the
+    /// status page, deleting a server) waited up to a minute behind it.
+    #[tokio::test]
+    async fn test_a_hanging_server_doesnt_block_other_servers() {
+        let hanging = config_at(-1101, start_hanging_server().await);
+        let listing = tokio::spawn(async move {
+            tool_definitions_for(&test_pool(), &[hanging]).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let other = tokio::time::timeout(std::time::Duration::from_secs(1), evict(-1102)).await;
+        assert!(other.is_ok(), "evicting another server waited behind the hanging connect");
+        listing.abort();
+    }
+
+    /// SME-40 F1: listing tools for a turn waited the full connect timeout
+    /// (twice, with the retry) for every unreachable server, on every model
+    /// call. It now waits a bounded time and leaves the server out.
+    #[tokio::test]
+    async fn test_listing_tools_waits_a_bounded_time_for_a_hanging_server() {
+        let hanging = config_at(-1103, start_hanging_server().await);
+        let started = std::time::Instant::now();
+        let tools = tokio::time::timeout(
+            TOOL_LIST_WAIT + std::time::Duration::from_secs(2),
+            tool_definitions_for(&test_pool(), &[hanging]),
+        )
+        .await
+        .expect("listing tools should give up on a hanging server");
+        assert!(tools.is_empty());
+        assert!(started.elapsed() < TOOL_LIST_WAIT + std::time::Duration::from_secs(1));
+    }
+
+    /// SME-40 F1: a server that just failed isn't tried again on the next
+    /// turn; turns skip it until `RETRY_AFTER_FAILURE` has passed.
+    #[tokio::test]
+    async fn test_a_failed_server_isnt_retried_on_every_turn() {
+        let (url, attempts) = start_refusing_server().await;
+        let refusing = config_at(-1104, url);
+        tool_definitions_for(&test_pool(), std::slice::from_ref(&refusing)).await;
+        let after_first = attempts.load(Ordering::SeqCst);
+        assert!(after_first > 0, "the first turn should try the server");
+
+        tool_definitions_for(&test_pool(), std::slice::from_ref(&refusing)).await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            after_first,
+            "the next turn tried a server that had just failed"
+        );
+    }
+
+    /// The status page is the user asking, so it tries even a server that
+    /// just failed.
+    #[tokio::test]
+    async fn test_the_status_check_retries_a_failed_server() {
+        let (url, attempts) = start_refusing_server().await;
+        let refusing = config_at(-1105, url);
+        tool_definitions_for(&test_pool(), std::slice::from_ref(&refusing)).await;
+        let after_first = attempts.load(Ordering::SeqCst);
+
+        assert!(connection_check(&test_pool(), &refusing).await.is_err());
+        assert!(
+            attempts.load(Ordering::SeqCst) > after_first,
+            "the status check should make a fresh attempt"
         );
     }
 }
