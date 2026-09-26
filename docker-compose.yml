@@ -161,7 +161,24 @@ services:
       - ./scripts/k3s-bootstrap.sh:/scripts/k3s-bootstrap.sh:ro
     restart: "no"
 
+  # Dev only: HTTPS (and so HTTP/2) in front of the dev server, at
+  # https://localhost:8443. See docker/caddy/Caddyfile and docs/setup.md.
+  caddy:
+    image: caddy:2
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./docker/caddy:/etc/caddy:ro
+      # Caddy's local CA, which issues the certificate: keep it, or the
+      # browser has to trust a new root after every `docker compose down -v`.
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - smelt
+
 volumes:
+  caddy-data:
+  caddy-config:
   bash-history:
   gh-config:
   claude-config:

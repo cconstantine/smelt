@@ -117,3 +117,24 @@ The pods page (`/pods`) shows each sandbox pod's live memory and CPU use from th
 - **Another cluster** needs the manifest applied there.
 
 Until then, usage shows as "unavailable" and everything else on the page works.
+
+## Dev over HTTPS (HTTP/2)
+
+Over plain HTTP/1.1 (`http://localhost:8180`) a browser allows 6 connections per host, shared by every tab. Each smelt tab holds one open event stream (plus one more while the browsing panel is open), and ordinary requests need a free one too. So with about five smelt tabs open, a new tab can hang while loading, or a click waits. Over HTTP/2 the browser multiplexes up to 100 streams on one connection, and browsers only speak HTTP/2 over TLS. Production (homelab's TLS front end for `*.constantlee.us`) already negotiates HTTP/2.
+
+For dev, the compose stack's `caddy` service serves the dev server at **`https://localhost:8443`** (`docker/caddy/Caddyfile`), with a certificate from Caddy's own local CA (`tls internal`). Everything else is unchanged; `http://localhost:8180` still works, and the browser tests use it.
+
+**Trust Caddy's root certificate once**, so the browser accepts the certificate without a warning:
+1. Find it in the `caddy-data` volume, in Caddy's data directory under `pki/authorities/local/`:
+   ```bash
+   docker compose exec caddy ls /data/caddy/pki/authorities/local/
+   docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt ./caddy-root.crt
+   ```
+   (Caddy's docs name the directory but not the file; check the `ls` output if `root.crt` isn't there.)
+2. Import `caddy-root.crt` into your browser's certificate authorities (in Chrome: Settings → Privacy and security → Security → Manage certificates → Authorities → Import, trusting it for websites).
+
+Accepting the browser's warning once also works, but the warning comes back whenever the browser forgets the exception.
+
+**Check it's HTTP/2:** open `https://localhost:8443`, then DevTools → Network, add the "Protocol" column (right-click a column header). smelt's requests should say `h2`.
+
+**MCP OAuth** redirects are built from `SMELT_BASE_URL` (`http://localhost:8180/` in the compose file). When using the HTTPS address for an OAuth flow, set it to `https://localhost:8443/`.
