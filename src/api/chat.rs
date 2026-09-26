@@ -710,9 +710,11 @@ async fn compact_conversation(
 
     let unanswered = unanswered_user_text(&messages);
     for (role, content) in compaction_messages(summary, covers_through_message_id, &unanswered) {
-        db::create_message(pool, conversation_id, role, &content)
+        let saved = db::create_message(pool, conversation_id, role, &content)
             .await
             .map_err(ServerFnError::new)?;
+        // Watching tabs show the divider as it happens (SME-40 F5).
+        record_saved(conversation_id, &mut Vec::new(), saved);
     }
     Ok(())
 }
@@ -3964,9 +3966,22 @@ mod tests {
             }],
         };
 
+        let mut events = events::subscribe(conversation.id);
         let messages = run_turn(&pool, conversation.id, new_message, None)
             .await
             .expect("run_turn should succeed");
+
+        // SME-40 F5: the compaction's messages reach watching tabs live,
+        // like every other saved message, not only after a reload.
+        let published_summary = drain_events(&mut events).await.into_iter().any(|event| match event {
+            events::ConversationEvent::MessagesAppended { messages } => messages.iter().any(|m| {
+                m.blocks().unwrap_or_default().iter().any(|b| {
+                    matches!(b, anthropic::ContentBlock::CompactionSummary { .. })
+                })
+            }),
+            _ => false,
+        });
+        assert!(published_summary, "the compaction summary wasn't published to watching tabs");
 
         let all_messages = db::list_messages(&pool, conversation.id)
             .await
