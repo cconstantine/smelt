@@ -941,6 +941,15 @@ async fn test_end_to_end_browser_scenarios() {
             wait_for_count(&observer, ".stop-turn", 1, Duration::from_secs(5)).await,
             "a tab that didn't send should also offer Stop while the turn runs"
         );
+        // And both say the model is working, with how long it's been at it:
+        // before, a slow model's turn looked like nothing at all was
+        // happening (SME-41 D1).
+        for tab in [&sender, &observer] {
+            assert!(
+                wait_for_count(tab, ".turn-working", 1, Duration::from_secs(5)).await,
+                "a running turn should show that the model is working"
+            );
+        }
         wait_for_element(&sender, ".stop-turn", Duration::from_secs(5))
             .await
             .click()
@@ -954,6 +963,11 @@ async fn test_end_to_end_browser_scenarios() {
             wait_for_count(&sender, ".stop-turn", 0, Duration::from_secs(5)).await
                 && wait_for_count(&observer, ".stop-turn", 0, Duration::from_secs(5)).await,
             "Stop should go away in every tab once the turn has ended"
+        );
+        assert!(
+            wait_for_count(&sender, ".turn-working", 0, Duration::from_secs(5)).await
+                && wait_for_count(&observer, ".turn-working", 0, Duration::from_secs(5)).await,
+            "the working line should go away once the turn has ended"
         );
         // The mock would have finished its reply 5s after it started.
         tokio::time::sleep(Duration::from_secs(6)).await;

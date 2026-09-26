@@ -983,6 +983,16 @@ fn reply_is_only_thinking(role: &str, blocks: &[ContentBlock]) -> bool {
         && blocks.iter().all(|b| matches!(b, ContentBlock::Thinking { .. }))
 }
 
+/// How long a turn has been running, as shown on its "Working…" line:
+/// `8s`, `2m 05s`.
+fn format_elapsed(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
+}
+
 /// A notice smelt saved into the conversation for the model (a command
 /// finishing, the sandbox stopping, a background task finishing), as the
 /// short sentence the chat shows in place of a user bubble, without
@@ -1777,6 +1787,14 @@ mod tests {
     }
 
     #[test]
+    fn test_format_elapsed_counts_seconds_then_minutes() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(42), "42s");
+        assert_eq!(format_elapsed(125), "2m 05s");
+        assert_eq!(format_elapsed(3600), "60m 00s");
+    }
+
+    #[test]
     fn test_system_notices_read_as_short_sentences() {
         let commands = HashMap::from([("abc123".to_string(), "python3 primes.py".to_string())]);
         let notice = |t: &str| system_notice(t, &commands);
@@ -2536,6 +2554,24 @@ fn ChatPanel(
     // whoever started the turn; Stop is offered instead.
     let is_streaming = move || turn_running();
     let can_stop = move || turn_running();
+    // Seconds this tab has seen the current turn running, for the
+    // "Working…" line (SME-41 D1). Ticks once a second while a turn runs,
+    // and resets when it ends. Web only.
+    #[allow(unused_mut)]
+    let mut turn_elapsed = use_signal(|| 0u64);
+    #[cfg(feature = "web")]
+    use_hook(move || {
+        spawn(async move {
+            loop {
+                gloo_timers::future::TimeoutFuture::new(1000).await;
+                if *turn_running.peek() {
+                    *turn_elapsed.write() += 1;
+                } else if *turn_elapsed.peek() != 0 {
+                    turn_elapsed.set(0);
+                }
+            }
+        });
+    });
     let stop = move |_| {
         let Some(id) = selected() else { return };
         // Shown as "Stopped." where the reply would have been; the next
@@ -3520,6 +3556,12 @@ fn ChatPanel(
                             }
                             if let Some(reply) = streaming_text() {
                                 div { class: "message message-assistant message-streaming", "{reply}" }
+                            }
+                            if turn_running() {
+                                div { class: "turn-working", role: "status",
+                                    span { class: "turn-working-dot" }
+                                    span { "Working… {format_elapsed(turn_elapsed())}" }
+                                }
                             }
                             if let Some(err) = stream_error() {
                                 if err == crate::api::chat::TURN_STOPPED {
