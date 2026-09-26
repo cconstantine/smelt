@@ -24,6 +24,9 @@ pub(crate) enum Route {
     SandboxVolumeNewRoute {},
     #[route("/pods")]
     PodsRoute {},
+    // Anything else, including a conversation id that isn't a number.
+    #[route("/:..segments")]
+    NotFound { segments: Vec<String> },
 }
 
 #[component]
@@ -59,6 +62,20 @@ fn SandboxVolumeNewRoute() -> Element {
 #[component]
 fn PodsRoute() -> Element {
     rsx! { PodsIndex {} }
+}
+
+/// A URL that isn't one of smelt's pages. Without this the router showed
+/// its raw "Failed to parse route" dump (SME-40 F10).
+#[component]
+fn NotFound(segments: Vec<String>) -> Element {
+    let path = segments.join("/");
+    rsx! {
+        div { class: "not-found-page",
+            h1 { "Page not found" }
+            p { class: "muted", "There's no page at /{path}." }
+            Link { to: Route::Home {}, class: "not-found-home-link", "\u{2190} Back to conversations" }
+        }
+    }
 }
 
 /// `id` only exists here to satisfy the `Routable` derive's requirement

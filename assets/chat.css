@@ -2080,3 +2080,22 @@ div.mcp-status-not-connected::before {
 .two-step-text.hidden {
     visibility: hidden;
 }
+
+/* --- A URL that isn't a page (SME-40 F10) --- */
+
+.not-found-page {
+    max-width: 480px;
+    margin: 80px auto;
+    padding: 0 16px;
+    text-align: center;
+}
+
+.not-found-page h1 {
+    font-size: 22px;
+    margin-bottom: 8px;
+}
+
+.not-found-home-link {
+    color: #555;
+    font-size: 14px;
+}

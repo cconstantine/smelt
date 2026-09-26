@@ -2026,6 +2026,7 @@ pub fn Chat() -> Element {
         Route::SandboxVolumesRoute {} => None,
         Route::PodsRoute {} => None,
         Route::SandboxVolumeNewRoute {} => None,
+        Route::NotFound { .. } => None,
     });
 
     // Bumped by the chat panel whenever its conversation gets new

@@ -1117,6 +1117,25 @@ async fn test_end_to_end_browser_scenarios() {
         assert!(layout[2] >= 200.0, "the message box is too narrow on a phone: {layout:?}");
         assert!(layout[3] <= 0.0, "the page scrolls sideways on a phone: {layout:?}");
         page.close().await.expect("close the tab");
+
+        // --- Scenario 18: a URL that isn't a page says so, with a way
+        // back. It used to show the router's raw "Failed to parse route"
+        // dump (SME-40 F10). ---
+        for path in ["nope", "conversation/abc"] {
+            let page = harness.browser.new_page(format!("{}{path}", harness.base_url)).await.expect("open a bad URL");
+            assert!(
+                wait_for_text(&page, "Page not found", Duration::from_secs(10)).await,
+                "/{path} should say the page doesn't exist"
+            );
+            let body: String = page.evaluate("document.body.innerText").await.expect("read").into_value().expect("text");
+            assert!(!body.contains("Failed to parse route"), "/{path} shows the router's debug output: {body}");
+            click_when_present(&page, "a[href='/']", Duration::from_secs(5)).await;
+            assert!(
+                wait_for_count(&page, ".conversation-list", 1, Duration::from_secs(10)).await,
+                "the link back should reach the conversations"
+            );
+            page.close().await.expect("close the tab");
+        }
     })))
     .await;
 
