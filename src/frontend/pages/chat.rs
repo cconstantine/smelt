@@ -4060,7 +4060,10 @@ fn ChatPanel(
                                                     let shown_hash = shown_hash.clone();
                                                     repo_action_error.set(None);
                                                     spawn(async move {
-                                                        if let Err(e) = decide_repo_trust(id, request_id, shown_hash, true).await {
+                                                        if let Err(e) = decide_repo_trust(id, request_id, shown_hash, true).await
+                                                            // Not if the user has moved on to another conversation.
+                                                            && selected() == Some(id)
+                                                        {
                                                             repo_action_error.set(Some(e.to_string()));
                                                         }
                                                     });
@@ -4079,7 +4082,10 @@ fn ChatPanel(
                                                     let shown_hash = shown_hash.clone();
                                                     repo_action_error.set(None);
                                                     spawn(async move {
-                                                        if let Err(e) = decide_repo_trust(id, request_id, shown_hash, false).await {
+                                                        if let Err(e) = decide_repo_trust(id, request_id, shown_hash, false).await
+                                                            // Not if the user has moved on to another conversation.
+                                                            && selected() == Some(id)
+                                                        {
                                                             repo_action_error.set(Some(e.to_string()));
                                                         }
                                                     });
