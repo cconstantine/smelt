@@ -32,7 +32,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
-const LISTEN_ADDR: &str = "0.0.0.0:8088";
+/// Loopback only. The WebSocket runs commands with no login, and the pod's
+/// Docker containers share its network: on 0.0.0.0 any of them could
+/// reach this at the bridge gateway (SME-33). smelt reaches it through a
+/// Kubernetes port-forward, which dials localhost in the pod.
+const LISTEN_ADDR: &str = "127.0.0.1:8088";
 const PID_FILE: &str = "/tmp/sandbox_agent.pid";
 const MARKER_PREFIX: &str = "MARKER:";
 /// Bounded retry for the one real race left once PID discovery moved from

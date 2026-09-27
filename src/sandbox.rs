@@ -4083,6 +4083,22 @@ mod tests {
                 "nested container cgroup {nested:?} should be under the sidecar's {own:?}"
             );
 
+            // A container can't reach the sandbox agent, whose WebSocket
+            // runs commands with no login, at the bridge gateway.
+            let agent = first
+                .exec(&[
+                    "docker",
+                    "run",
+                    "--rm",
+                    "local/base",
+                    "bash",
+                    "-c",
+                    &format!("</dev/tcp/{}/{AGENT_PORT}", DOCKER_BRIDGE_IP.split('/').next().unwrap_or_default()),
+                ])
+                .await
+                .expect("exec agent probe");
+            assert_ne!(agent.exit_code, 0, "a container reached the sandbox agent at the gateway");
+
             // dockerd never listens on TCP.
             for port in [2375, 2376] {
                 let tcp = first
