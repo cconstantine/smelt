@@ -4427,7 +4427,7 @@ mod tests {
         let checks = tokio::time::timeout(Duration::from_secs(120), async {
             let main_commit = make_origin_repo(&sandbox).await;
 
-            let cloned = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin", false)
+            let cloned = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin", ".smelt-clone-t-")
                 .await
                 .expect("clone the default branch");
             assert_eq!(cloned.commit.as_deref(), Some(main_commit.as_str()));
@@ -4453,7 +4453,7 @@ mod tests {
                 "file:///tmp/origin.git",
                 Some("feature"),
                 "origin-feature",
-                false,
+                ".smelt-clone-t-",
             )
             .await
             .expect("clone a branch");
@@ -4490,34 +4490,36 @@ mod tests {
             assert_eq!(read.content, "Use \u{FFFD} tabs.\n");
             assert_eq!(read.file_bytes, 12);
 
-            let missing = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/nope.git", None, "nope", false)
+            let missing = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/nope.git", None, "nope", ".smelt-clone-t-")
                 .await
                 .expect_err("a missing repo fails");
             assert!(missing.contains("does not appear to be a git repository"), "{missing}");
 
             // The directory is taken: git's own message, not a silent overwrite.
-            let taken = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin", false)
+            let taken = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin", ".smelt-clone-t-")
                 .await
                 .expect_err("an existing directory fails");
             assert!(taken.contains("already exists"), "{taken}");
 
-            // Retrying a failed clone clears what an interrupted one left
-            // behind in the (persistent) directory (SME-32 code review,
-            // finding 4).
-            let partial = sandbox
-                .exec(&["sh", "-c", "mkdir -p /workspace/partial/.git && echo half > /workspace/partial/half-written"])
+            // A clone is staged in a directory of its own and moved into
+            // place only when it succeeds: what an earlier, cut-off
+            // attempt left (maybe still being written) is its own staging
+            // directory, removed first, never the target (SME-32 code
+            // review 4).
+            let stale = sandbox
+                .exec(&["sh", "-c", "mkdir -p /workspace/.smelt-clone-t-old/.git && echo half > /workspace/.smelt-clone-t-old/half-written"])
                 .await
-                .expect("exec make partial");
-            assert_eq!(partial.exit_code, 0);
-            let replaced = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "partial", true)
+                .expect("exec make stale");
+            assert_eq!(stale.exit_code, 0);
+            let staged = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "staged", ".smelt-clone-t-")
                 .await
-                .expect("a retry replaces the leftover directory");
-            assert_eq!(replaced.commit.as_deref(), Some(main_commit.as_str()));
-            let gone = sandbox
-                .exec(&["test", "-e", "/workspace/partial/half-written"])
+                .expect("a clone past a stale staging directory");
+            assert_eq!(staged.commit.as_deref(), Some(main_commit.as_str()));
+            let after = sandbox
+                .exec(&["sh", "-c", "cat /workspace/staged/AGENTS.md; ls -a /workspace | grep -c smelt-clone || true"])
                 .await
-                .expect("exec test");
-            assert_eq!(gone.exit_code, 1, "the leftover is gone");
+                .expect("exec check");
+            assert_eq!(after.stdout, "Run make test before committing.\n0\n", "the clone is in place and no staging directory is left");
         })
         .await;
 
@@ -5186,28 +5188,6 @@ mod tests {
                 .expect("exec cat");
             assert_eq!(kept.stdout, "precious\n");
 
-            // A directory a clone attempt made, cut off halfway, is cleared
-            // by the retry.
-            let half = db::create_conversation_repo(&pool, conversation_a.id, "file:///tmp/origin.git", "file/tmp/origin", None, "half")
-                .await
-                .expect("seed a repo");
-            db::set_repo_dir_created(&pool, half.id, true).await.expect("seed dir_created");
-            db::set_repo_failed(&pool, half.id, crate::git::CLONE_INTERRUPTED).await.expect("seed interrupted");
-            let partial = exec_with(
-                &client,
-                &pod_name(pod_a),
-                "sandbox",
-                &["sh", "-c", "mkdir -p /workspace/half/.git && echo x > /workspace/half/partial"],
-                None,
-            )
-            .await
-            .expect("exec partial");
-            assert_eq!(partial.exit_code, 0);
-            let replaced = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, Some("half"))
-                .await
-                .expect("a retry replaces what its own attempt left");
-            assert_eq!(replaced.status, crate::git::RepoStatus::Ready);
-
             // A brand-new empty repo clones: its branch, no commit yet.
             let empty = exec_with(&client, &pod_name(pod_a), "sandbox", &["git", "init", "-q", "--bare", "-b", "main", "/tmp/empty.git"], None)
                 .await
@@ -5689,7 +5669,7 @@ mod tests {
                 kept.stderr
             );
             let repos = crate::git::list_repos(&pool, conversation_a.id).await.expect("list repos");
-            assert_eq!(repos.len(), 5, "origin, retry, mywork, half, empty: {repos:?}");
+            assert_eq!(repos.len(), 4, "origin, retry, mywork, empty: {repos:?}");
             assert_eq!(repos[0].status, crate::git::RepoStatus::Ready, "{repos:?}");
             assert_eq!(repos[0].instructions, crate::git::InstructionsState::Changed, "still to reload: {repos:?}");
             assert_eq!(repos[1].status, crate::git::RepoStatus::Ready, "{repos:?}");
