@@ -893,12 +893,27 @@ mod server {
     /// The user's "Work on a repo": the repo is recorded first, so a
     /// message sent while the sandbox starts waits for the clone; then the
     /// conversation's sandbox is started if it has none, and it's cloned.
+    #[cfg(test)]
     pub async fn attach_repo(
         pool: &PgPool,
         conversation_id: i64,
         url: &str,
         branch: Option<&str>,
     ) -> Result<RepoSummary, String> {
+        let (shown, pending) = start_attach(pool, conversation_id, url, branch).await?;
+        Ok(finish_attach(pool, conversation_id, pending).await?.unwrap_or(shown))
+    }
+
+    /// The part of "Work on a repo" that answers the button: records trust
+    /// and the repo (as cloning, so a message sent meanwhile waits for it).
+    /// Returns what to show now, and the repo `finish_attach` still has to
+    /// clone (`None`: already checked out). Touches no pod.
+    pub async fn start_attach(
+        pool: &PgPool,
+        conversation_id: i64,
+        url: &str,
+        branch: Option<&str>,
+    ) -> Result<(RepoSummary, Option<db::ConversationRepo>), String> {
         let url = url.trim();
         let branch = branch.map(str::trim).filter(|b| !b.is_empty());
         let (key, dir, retry) = match plan_clone(pool, conversation_id, url, branch, None).await? {
@@ -908,9 +923,7 @@ mod server {
                 db::set_repo_trust(pool, &repo.remote_key, true)
                     .await
                     .map_err(|e| e.to_string())?;
-                // The sandbox may still need starting.
-                ensure_sandbox(pool, conversation_id).await?;
-                return summarise(pool, repo).await;
+                return Ok((summarise(pool, repo).await?, None));
             }
             ClonePlan::Clone { key, dir, retry } => (key, dir, retry),
         };
@@ -920,6 +933,21 @@ mod server {
             .await
             .map_err(|e| e.to_string())?;
         let repo = record_clone(pool, conversation_id, url, branch, &key, &dir, retry).await?;
+        Ok((summarise(pool, repo.clone()).await?, Some(repo)))
+    }
+
+    /// The rest of "Work on a repo", run apart from the button's request:
+    /// starts the sandbox if needed, and clones `pending`. Returns the
+    /// cloned repo, or `None` when there was nothing to clone.
+    pub async fn finish_attach(
+        pool: &PgPool,
+        conversation_id: i64,
+        pending: Option<db::ConversationRepo>,
+    ) -> Result<Option<RepoSummary>, String> {
+        let Some(repo) = pending else {
+            ensure_sandbox(pool, conversation_id).await?;
+            return Ok(None);
+        };
         let guard = CloneGuard::new(pool, repo.id, conversation_id);
         let pod_id = match ensure_sandbox(pool, conversation_id).await {
             Ok(pod_id) => pod_id,
@@ -930,7 +958,7 @@ mod server {
                 return Err(e);
             }
         };
-        run_clone(pool, conversation_id, pod_id, repo, guard).await
+        run_clone(pool, conversation_id, pod_id, repo, guard).await.map(Some)
     }
 
     /// The conversation's live pod, started if it has none.
@@ -1634,6 +1662,22 @@ mod server {
 
         /// "Work on a repo" on a repo the model already cloned still
         /// counts as the user picking it (SME-32 code review 7, finding 4).
+        /// The Clone button's request only records: the sandbox and the
+        /// clone run after it, so a closed tab can't cut them off (SME-32
+        /// code review 8, finding 1).
+        #[sqlx::test]
+        async fn test_starting_work_on_a_repo_records_it_without_touching_a_pod(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let (shown, pending) = start_attach(&pool, conversation.id, "git@github.com:o/r.git", None)
+                .await
+                .expect("start");
+            assert_eq!(shown.status, RepoStatus::Cloning);
+            assert_eq!(pending.expect("still to clone").id, shown.id);
+            assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("get"), Some(true));
+            assert!(db::list_sandbox_pods(&pool, conversation.id).await.expect("pods").is_empty(), "no pod yet");
+            assert!(!wait_for_clones(&pool, conversation.id, std::time::Duration::ZERO).await, "a turn waits for it");
+        }
+
         #[sqlx::test]
         async fn test_work_on_a_repo_trusts_an_existing_checkout(pool: PgPool) {
             let conversation = db::create_conversation(&pool).await.expect("conversation");

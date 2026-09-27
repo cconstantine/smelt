@@ -67,13 +67,22 @@ pub async fn list_conversation_repos(id: i64) -> ServerFnResult<Vec<RepoSummary>
     git::list_repos(db::get(), id).await.map_err(ServerFnError::new)
 }
 
-/// "Work on a repo": starts the sandbox if needed and clones `url`.
+/// "Work on a repo": records the repo and returns at once; the sandbox
+/// start and the clone run in the background, so a closed tab can't cut
+/// them off. The panel follows them through `ReposUpdate`.
 #[post("/api/conversations/{id}/repos")]
 pub async fn attach_repo(id: i64, url: String, branch: String) -> ServerFnResult<RepoSummary> {
+    let pool = db::get();
     let branch = Some(branch.trim()).filter(|b| !b.is_empty());
-    git::attach_repo(db::get(), id, url.trim(), branch)
+    let (shown, pending) = git::start_attach(pool, id, url.trim(), branch)
         .await
-        .map_err(ServerFnError::new)
+        .map_err(ServerFnError::new)?;
+    tokio::spawn(async move {
+        if let Err(e) = git::finish_attach(pool, id, pending).await {
+            tracing::warn!(conversation_id = id, error = %e, "\"Work on a repo\" failed");
+        }
+    });
+    Ok(shown)
 }
 
 #[post("/api/git/identity")]
