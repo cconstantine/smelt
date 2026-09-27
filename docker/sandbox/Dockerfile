@@ -58,7 +58,10 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 # it, without any agent-level privilege-drop dance: the agent itself just
 # runs as `sandbox` (via USER below), and every shell it spawns inherits
 # that same identity by ordinary fork/exec.
-RUN useradd -m -s /bin/bash sandbox \
+# uid/gid pinned: the Docker sidecar hands /workspace to 1000:1000 (see
+# src/sandbox.rs's SANDBOX_OWNER), knowing no names from this image.
+RUN groupadd -g 1000 sandbox \
+    && useradd -m -u 1000 -g 1000 -s /bin/bash sandbox \
     && echo "sandbox ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/sandbox \
     && chmod 0440 /etc/sudoers.d/sandbox
 

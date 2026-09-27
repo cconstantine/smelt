@@ -16,7 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 #[cfg(test)]
 use futures_util::FutureExt;
 use k8s_openapi::api::core::v1::{
-    Container, EmptyDirVolumeSource, ExecAction, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    Container, EmptyDirVolumeSource, EnvVar, ExecAction, PersistentVolumeClaim, PersistentVolumeClaimSpec,
     PersistentVolumeClaimVolumeSource, Pod, PodSpec, Probe, ResourceRequirements, SecurityContext,
     Volume, VolumeMount, VolumeResourceRequirements,
 };
@@ -743,6 +743,9 @@ const DOCKER_DATA_VOLUME: &str = "docker-data";
 /// The `docker` group's GID in the sandbox image
 /// (docker/sandbox/Dockerfile); dockerd gives it the socket.
 const DOCKER_GID: u32 = 2375;
+/// The sandbox user's uid:gid, pinned in the image
+/// (docker/sandbox/Dockerfile); the Docker sidecar gives it /workspace.
+const SANDBOX_OWNER: &str = "1000:1000";
 
 /// The conversation's Docker data PVC, `sandbox-docker-<id>`.
 fn docker_pvc_name(conversation_id: i64) -> String {
@@ -1079,6 +1082,11 @@ fn build_pod_spec(
                     "start-dockerd".to_string(),
                 ]),
                 args: Some(dockerd_args()),
+                env: Some(vec![EnvVar {
+                    name: "WORKSPACE_OWNER".to_string(),
+                    value: Some(SANDBOX_OWNER.to_string()),
+                    ..Default::default()
+                }]),
                 startup_probe: Some(Probe {
                     exec: Some(ExecAction {
                         command: Some(vec![
@@ -3443,6 +3451,13 @@ mod tests {
         }
         assert_eq!(mount_path_of(docker, "docker-data"), Some("/var/lib/docker"));
         assert_eq!(mount_path_of(sandbox, "docker-data"), None);
+        // The sidecar (root, started first) hands /workspace to the sandbox user.
+        let owner = docker
+            .env
+            .as_ref()
+            .and_then(|env| env.iter().find(|e| e.name == "WORKSPACE_OWNER"))
+            .and_then(|e| e.value.as_deref());
+        assert_eq!(owner, Some(SANDBOX_OWNER));
 
         let volumes = spec.volumes.expect("pod should have volumes");
         let data = volumes.iter().find(|v| v.name == "docker-data").expect("docker-data volume");
@@ -5044,6 +5059,13 @@ mod tests {
                 (0, "lifecycle@example.com"),
                 "a new pod has the stored key and identity"
             );
+            // /workspace is the conversation's claim, whose root the
+            // provisioner owns; the sandbox user gets it (SME-32 code
+            // review 2, finding 6).
+            let owner = exec_with(&client, &pod_name(pod_a), "sandbox", &["stat", "-c", "%U:%G", "/workspace"], None)
+                .await
+                .expect("exec stat");
+            assert_eq!(owner.stdout.trim(), "sandbox:sandbox", "/workspace belongs to the sandbox user");
 
             // clone_repo records the repo and checks it out in the pod.
             let origin = exec_with(
