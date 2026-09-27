@@ -1767,12 +1767,36 @@ async fn force_terminate_pod(
 }
 
 /// What the pods view shows about a pod from Kubernetes itself: its phase
-/// and its container's configured limits (as Kubernetes quantity strings).
+/// and each of its containers' configured limits (as Kubernetes quantity
+/// strings): the sandbox container's and, since SME-33, the Docker
+/// sidecar's. The view adds them up, as it does their usage.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PodDetails {
     pub phase: Option<String>,
-    pub memory_limit: Option<String>,
-    pub cpu_limit: Option<String>,
+    pub memory_limits: Vec<String>,
+    pub cpu_limits: Vec<String>,
+}
+
+/// Every running container's memory and CPU limits in `pod`: its
+/// containers and its native sidecars (init containers that keep running).
+fn pod_container_limits(pod: &Pod) -> (Vec<String>, Vec<String>) {
+    let Some(spec) = pod.spec.as_ref() else {
+        return (Vec::new(), Vec::new());
+    };
+    let sidecars = spec
+        .init_containers
+        .iter()
+        .flatten()
+        .filter(|c| c.restart_policy.as_deref() == Some("Always"));
+    let running: Vec<&Container> = spec.containers.iter().chain(sidecars).collect();
+    let limits = |name: &str| -> Vec<String> {
+        running
+            .iter()
+            .filter_map(|c| c.resources.as_ref()?.limits.as_ref()?.get(name))
+            .map(|q| q.0.clone())
+            .collect()
+    };
+    (limits("memory"), limits("cpu"))
 }
 
 /// `pod_id`'s phase and limits, or `None` if Kubernetes has no such pod.
@@ -1781,17 +1805,11 @@ pub async fn pod_details(pod_id: i64) -> Result<Option<PodDetails>, SandboxError
     let Some(pod) = pods.get_opt(&pod_name(pod_id)).await? else {
         return Ok(None);
     };
-    let limits = pod
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.containers.first())
-        .and_then(|container| container.resources.as_ref())
-        .and_then(|resources| resources.limits.as_ref());
-    let limit = |name: &str| limits.and_then(|l| l.get(name)).map(|q| q.0.clone());
+    let (memory_limits, cpu_limits) = pod_container_limits(&pod);
     Ok(Some(PodDetails {
         phase: pod.status.as_ref().and_then(|s| s.phase.clone()),
-        memory_limit: limit("memory"),
-        cpu_limit: limit("cpu"),
+        memory_limits,
+        cpu_limits,
     }))
 }
 
@@ -3475,6 +3493,15 @@ mod tests {
     }
 
     #[test]
+    fn test_pod_container_limits_include_the_docker_sidecar() {
+        let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker_for_conversation(42), &[]);
+        assert_eq!(
+            pod_container_limits(&pod),
+            (vec!["1Gi".to_string(), "2Gi".to_string()], vec!["1".to_string(), "2".to_string()])
+        );
+    }
+
+    #[test]
     fn test_docker_pvc_spec_is_named_labelled_and_sized_for_the_conversation() {
         let pvc = build_docker_pvc_spec(42);
         assert_eq!(pvc.metadata.name.as_deref(), Some("sandbox-docker-42"));
@@ -5067,8 +5094,15 @@ mod tests {
                 .expect("the pods view should list pod (g)");
             assert_eq!(overview_g.conversation_id, conversation_g.id);
             assert_eq!(overview_g.status.as_deref(), Some("Running"));
-            assert_eq!(overview_g.memory_limit, Some(default_memory_limit()));
-            assert_eq!(overview_g.cpu_limit, Some(default_cpu_limit()));
+            // The sandbox container's and the Docker sidecar's, added up (SME-33).
+            assert_eq!(
+                overview_g.memory_limit,
+                crate::api::pods::sum_memory_limits(&[default_memory_limit(), default_docker_memory_limit()])
+            );
+            assert_eq!(
+                overview_g.cpu_limit,
+                crate::api::pods::sum_cpu_limits(&[default_cpu_limit(), default_docker_cpu_limit()])
+            );
             assert_eq!(overview_g.terminals, 1);
             assert_eq!(overview_g.activity, crate::api::pods::PodActivity::Busy, "a command is running");
             // Live usage, end to end: metrics-server samples a new pod

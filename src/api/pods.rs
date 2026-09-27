@@ -80,6 +80,42 @@ fn parse_memory_bytes(quantity: &str) -> Option<u64> {
     (value >= 0.0).then(|| (value * scale) as u64)
 }
 
+/// A pod's containers' memory limits added up, as a quantity: `"16Gi"`,
+/// `"1536Mi"`. `None` if there are none or one doesn't parse.
+#[cfg(feature = "server")]
+pub(crate) fn sum_memory_limits(limits: &[String]) -> Option<String> {
+    if limits.is_empty() {
+        return None;
+    }
+    let bytes = limits.iter().map(|l| parse_memory_bytes(l)).sum::<Option<u64>>()?;
+    const MI: u64 = 1024 * 1024;
+    const GI: u64 = 1024 * MI;
+    Some(if bytes % GI == 0 {
+        format!("{}Gi", bytes / GI)
+    } else if bytes % MI == 0 {
+        format!("{}Mi", bytes / MI)
+    } else {
+        bytes.to_string()
+    })
+}
+
+/// A pod's containers' CPU limits added up, as a quantity: `"2"`, `"1250m"`.
+#[cfg(feature = "server")]
+pub(crate) fn sum_cpu_limits(limits: &[String]) -> Option<String> {
+    if limits.is_empty() {
+        return None;
+    }
+    let millicores = limits
+        .iter()
+        .map(|l| parse_cpu_nanocores(l).map(|nanos| (nanos / 1_000_000.0).round() as u64))
+        .sum::<Option<u64>>()?;
+    Some(if millicores % 1000 == 0 {
+        (millicores / 1000).to_string()
+    } else {
+        format!("{millicores}m")
+    })
+}
+
 /// Usage per pod name from a `PodMetricsList` (`metrics.k8s.io/v1beta1`),
 /// summed over each pod's containers. A pod whose numbers don't parse is
 /// left out rather than shown wrong.
@@ -159,8 +195,8 @@ pub(crate) async fn pod_overviews(pool: &sqlx::PgPool) -> Result<Vec<PodOverview
             status: details.phase,
             started_at: row.created_at,
             activity: pod_activity(&row),
-            memory_limit: details.memory_limit,
-            cpu_limit: details.cpu_limit,
+            memory_limit: sum_memory_limits(&details.memory_limits),
+            cpu_limit: sum_cpu_limits(&details.cpu_limits),
             usage: usage.get(&crate::sandbox::kubernetes_pod_name(row.pod_id)).cloned(),
             terminals: row.live_terminals,
             observed_at: row.observed_at,
@@ -266,6 +302,19 @@ mod tests {
         assert_eq!(parse_cpu_millicores("2500u"), Some(2));
         assert_eq!(parse_cpu_millicores("0.5"), Some(500));
         assert_eq!(parse_cpu_millicores("lots"), None);
+    }
+
+    #[test]
+    fn test_sum_limits_adds_a_pods_containers() {
+        let q = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(sum_memory_limits(&q(&["8Gi", "8Gi"])), Some("16Gi".to_string()));
+        assert_eq!(sum_memory_limits(&q(&["1Gi", "512Mi"])), Some("1536Mi".to_string()));
+        assert_eq!(sum_memory_limits(&q(&["128Mi"])), Some("128Mi".to_string()));
+        assert_eq!(sum_memory_limits(&q(&["8Gi", "lots"])), None);
+        assert_eq!(sum_memory_limits(&[]), None);
+        assert_eq!(sum_cpu_limits(&q(&["1", "1"])), Some("2".to_string()));
+        assert_eq!(sum_cpu_limits(&q(&["1", "250m"])), Some("1250m".to_string()));
+        assert_eq!(sum_cpu_limits(&q(&["x"])), None);
     }
 
     #[test]
