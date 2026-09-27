@@ -666,7 +666,9 @@ mod server {
                 .map_err(|e| e.to_string())?,
         };
         publish_repos(pool, conversation_id).await;
+        let guard = CloneGuard::new(pool, repo.id, conversation_id);
         let outcome = clone_repo_row(pool, pod_id, &repo).await;
+        guard.finish();
         publish_repos(pool, conversation_id).await;
         outcome?;
         let repos = db::list_conversation_repos(pool, conversation_id)
@@ -722,6 +724,49 @@ mod server {
             nested: file.nested,
         });
         record_clone_instructions(pool, repo_id, loaded).await
+    }
+
+    /// What a clone cut off before it finished is marked with.
+    pub const CLONE_INTERRUPTED: &str =
+        "The clone was interrupted (the turn was stopped, or smelt restarted). Clone it again.";
+
+    /// Marks a clone failed if it's dropped before `finish`: the turn was
+    /// stopped, or the request went away, mid-clone.
+    pub(crate) struct CloneGuard {
+        pool: PgPool,
+        repo_id: i64,
+        conversation_id: i64,
+        finished: bool,
+    }
+
+    impl CloneGuard {
+        pub(crate) fn new(pool: &PgPool, repo_id: i64, conversation_id: i64) -> Self {
+            CloneGuard {
+                pool: pool.clone(),
+                repo_id,
+                conversation_id,
+                finished: false,
+            }
+        }
+
+        pub(crate) fn finish(mut self) {
+            self.finished = true;
+        }
+    }
+
+    impl Drop for CloneGuard {
+        fn drop(&mut self) {
+            if self.finished {
+                return;
+            }
+            let (pool, repo_id, conversation_id) = (self.pool.clone(), self.repo_id, self.conversation_id);
+            tokio::spawn(async move {
+                if let Err(e) = db::set_repo_failed(&pool, repo_id, CLONE_INTERRUPTED).await {
+                    tracing::warn!(repo_id, error = %e, "couldn't mark an interrupted clone failed");
+                }
+                publish_repos(&pool, conversation_id).await;
+            });
+        }
     }
 
     /// Clones one recorded repo into pod `pod_id` and records how it went.
@@ -1259,6 +1304,34 @@ mod server {
             // A repo of another conversation can't be reloaded from this one.
             let elsewhere = db::create_conversation(&pool).await.expect("conversation");
             assert!(reload_instructions(&pool, elsewhere.id, repo.id).await.is_err());
+        }
+
+        #[sqlx::test]
+        async fn test_a_clone_dropped_midway_is_marked_interrupted(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let repo = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
+                .await
+                .expect("repo");
+            // Finished: left alone.
+            CloneGuard::new(&pool, repo.id, conversation.id).finish();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let row = db::get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
+            assert_eq!(row.status, "cloning");
+            // Dropped mid-clone: marked failed, so turns stop waiting on it.
+            drop(CloneGuard::new(&pool, repo.id, conversation.id));
+            let marked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let row = db::get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
+                    if row.status == "failed" {
+                        return row;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("the dropped clone is marked failed");
+            assert_eq!(marked.error.as_deref(), Some(CLONE_INTERRUPTED));
+            assert!(wait_for_clones(&pool, conversation.id, std::time::Duration::from_millis(100)).await);
         }
 
         #[sqlx::test]

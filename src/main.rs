@@ -88,6 +88,12 @@ async fn main() {
     // and /pods match it. Only here, never in the browser test harness:
     // see `sandbox::watch_pods`.
     tokio::spawn(sandbox::watch_pods(pool.clone()));
+    // Clones the last run was in the middle of never finished (SME-32).
+    match db::fail_unfinished_clones(pool, git::CLONE_INTERRUPTED).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(clones = n, "marked clones a restart cut off as failed"),
+        Err(e) => tracing::warn!(error = %e, "couldn't mark interrupted clones failed"),
+    }
     // Docker data claims whose conversation deletion didn't reach them (SME-33).
     tokio::spawn({
         let pool = pool.clone();

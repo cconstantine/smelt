@@ -1113,6 +1113,19 @@ pub async fn set_repo_error(pool: &PgPool, id: i64, error: &str) -> Result<(), s
     Ok(())
 }
 
+/// At startup: a clone still marked cloning was cut off by the restart.
+/// Returns how many there were.
+pub async fn fail_unfinished_clones(pool: &PgPool, error: &str) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE conversation_repos SET status = 'failed', error = $1, updated_at = now()
+          WHERE status = 'cloning'",
+    )
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn set_repo_failed(pool: &PgPool, id: i64, error: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE conversation_repos SET status = 'failed', error = $2, updated_at = now()
@@ -2620,6 +2633,17 @@ mod tests {
         assert_eq!(listed[0].error, None);
         assert_eq!(listed[0].checked_out_branch.as_deref(), Some("dev"));
         assert_eq!(listed[0].commit_sha.as_deref(), Some("abc123"));
+
+        // After a restart, a clone still marked cloning was cut off.
+        let other = create_conversation(&pool).await.expect("conversation");
+        let unfinished = create_conversation_repo(&pool, other.id, "u", "k", None, "x")
+            .await
+            .expect("repo");
+        assert_eq!(fail_unfinished_clones(&pool, "interrupted").await.expect("sweep"), 1);
+        let row = get_conversation_repo(&pool, unfinished.id).await.expect("get").expect("exists");
+        assert_eq!((row.status.as_str(), row.error.as_deref()), ("failed", Some("interrupted")));
+        let untouched = get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
+        assert_eq!(untouched.status, "ready", "a finished clone is left alone");
 
         // Loading and unloading instructions.
         let loaded = LoadedInstructions {
