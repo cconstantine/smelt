@@ -62,7 +62,7 @@ pub type DialFuture = Pin<Box<dyn Future<Output = Result<Box<dyn PodIo>, String>
 /// with its failures turned into sentences the model (or the user, in the
 /// live panel) can act on.
 pub fn sandbox_dial(pool: PgPool, conversation_id: i64) -> SandboxDial {
-    Arc::new(move |port| {
+    let dial: SandboxDial = Arc::new(move |port| {
         let pool = pool.clone();
         Box::pin(async move {
             crate::sandbox::open_pod_port(&pool, conversation_id, port)
@@ -74,6 +74,21 @@ pub fn sandbox_dial(pool: PgPool, conversation_id: i64) -> SandboxDial {
                     ),
                     other => format!("Couldn't reach port {port} in the sandbox: {other}"),
                 })
+        })
+    });
+    with_timeout(dial, HANDSHAKE_TIMEOUT)
+}
+
+/// `dial`, bounded: a port-forward that hasn't opened within `limit` fails
+/// with a message saying so. The one place opening a port-forward is
+/// bounded, so every caller of `sandbox_dial` inherits it.
+pub fn with_timeout(dial: SandboxDial, limit: Duration) -> SandboxDial {
+    Arc::new(move |port| {
+        let opening = dial(port);
+        Box::pin(async move {
+            tokio::time::timeout(limit, opening)
+                .await
+                .unwrap_or_else(|_| Err(format!("Timed out connecting to port {port} in the sandbox.")))
         })
     })
 }
@@ -195,14 +210,10 @@ async fn handle_sandbox(
     rest: Vec<u8>,
     dial: SandboxDial,
 ) -> Result<(), String> {
-    let mut upstream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, dial(request.port)).await {
-        Ok(Ok(upstream)) => upstream,
-        Ok(Err(message)) => {
-            respond_with_body(&mut client, "502 Bad Gateway", &message).await;
-            return Err(message);
-        }
-        Err(_) => {
-            let message = format!("Timed out connecting to port {} in the sandbox.", request.port);
+    // `sandbox_dial` bounds opening the port-forward (`with_timeout`).
+    let mut upstream = match dial(request.port).await {
+        Ok(upstream) => upstream,
+        Err(message) => {
             respond_with_body(&mut client, "502 Bad Gateway", &message).await;
             return Err(message);
         }
@@ -614,6 +625,20 @@ mod tests {
         };
         assert!(error.contains("no running sandbox"), "got {error:?}");
         assert!(error.contains("create_pod"), "should say how to get one: {error:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_dial_that_never_opens_times_out_with_a_reason() {
+        let never: SandboxDial = Arc::new(|_| Box::pin(std::future::pending()) as DialFuture);
+        let dial = with_timeout(never, Duration::from_millis(100));
+        let result = tokio::time::timeout(Duration::from_secs(5), dial(3000))
+            .await
+            .expect("the bounded dial must give up on its own");
+        let error = match result {
+            Ok(_) => panic!("a dial that never opens can't succeed"),
+            Err(e) => e,
+        };
+        assert!(error.contains("port 3000") && error.contains("Timed out"), "got {error:?}");
     }
 
     #[tokio::test]

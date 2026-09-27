@@ -539,6 +539,96 @@ mod server {
         }
 
         #[tokio::test]
+        async fn test_a_dev_server_that_dies_mid_response_ends_it_and_the_next_request_redials() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // First connection: promises 100 bytes, sends 7, dies. Later
+            // ones answer properly.
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_addr = upstream.local_addr().unwrap();
+            tokio::spawn(async move {
+                let mut first = true;
+                while let Ok((mut socket, _)) = upstream.accept().await {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    if std::mem::take(&mut first) {
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+                            .await;
+                    } else {
+                        let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+                    }
+                }
+            });
+            let dials = Dials::default();
+            let (preview, template) = start_preview(dial_for_upstream(upstream_addr, dials.clone())).await;
+            let client = client_for(preview, &["3000-42.preview.localhost"]);
+            let url = format!("{}/", template.url_for(42, 3000));
+
+            let cut_short = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                client.get(&url).send().await?.text().await
+            })
+            .await
+            .expect("a response cut short must end, not hang");
+            assert!(cut_short.is_err(), "a truncated body must be an error, got {cut_short:?}");
+
+            let next = client.get(&url).send().await.expect("the next request").text().await.expect("its body");
+            assert_eq!(next, "ok");
+        }
+
+        #[tokio::test]
+        async fn test_an_upstream_closed_between_requests_is_redialled_on_the_same_connection() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Answers one request per connection, then closes it — like a
+            // dev server dropping an idle keep-alive connection.
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_addr = upstream.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = upstream.accept().await {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+                }
+            });
+            let dials = Dials::default();
+            let (preview, _) = start_preview(dial_for_upstream(upstream_addr, dials.clone())).await;
+            let host = format!("3000-42.preview.localhost:{}", preview.port());
+            // One browser connection for both requests.
+            let mut stream = TcpStream::connect(preview).await.unwrap();
+            let mut replies = Vec::new();
+            for _ in 0..2 {
+                stream
+                    .write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                let mut buf = vec![0u8; 4096];
+                let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+                    .await
+                    .expect("a reply in time")
+                    .unwrap();
+                replies.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                // Let the proxy see the upstream close before the next one.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            for reply in &replies {
+                assert!(reply.starts_with("HTTP/1.1 200") && reply.ends_with("ok"), "got {replies:?}");
+            }
+            assert_eq!(dials.lock().unwrap().len(), 2, "the closed upstream was replaced");
+        }
+
+        #[tokio::test]
+        async fn test_a_request_without_a_host_is_not_found() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let dials = Dials::default();
+            let (preview, _) = start_preview(dial_for_upstream(start_upstream().await, dials.clone())).await;
+            let mut stream = TcpStream::connect(preview).await.unwrap();
+            stream.write_all(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n").await.unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).await.unwrap();
+            assert!(reply.starts_with("HTTP/1.1 404"), "got {reply:?}");
+            assert!(dials.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
         async fn test_a_websocket_passes_through_to_the_dev_server() {
             let upstream = start_upstream().await;
             let (preview, template) = start_preview(dial_for_upstream(upstream, Dials::default())).await;
