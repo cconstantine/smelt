@@ -3062,6 +3062,13 @@ fn ChatPanel(
             tasks.set(Vec::new());
             todos.set(Vec::new());
             repos.set(Vec::new());
+            // "Work on a repo" and the trust cards belong to the conversation
+            // they were used in (SME-32 code review 8).
+            repo_url.set(String::new());
+            repo_branch.set(String::new());
+            repo_attaching.set(false);
+            repo_attach_error.set(None);
+            repo_action_error.set(None);
             task_body_els.write().clear();
             task_body_stuck.write().clear();
             sandbox_pods.set(Vec::new());
@@ -3948,7 +3955,12 @@ fn ChatPanel(
                                             repo_attaching.set(true);
                                             repo_attach_error.set(None);
                                             spawn(async move {
-                                                match attach_repo(id, url, branch).await {
+                                                let result = attach_repo(id, url, branch).await;
+                                                // The user may have moved on to another conversation.
+                                                if selected() != Some(id) {
+                                                    return;
+                                                }
+                                                match result {
                                                     Ok(_) => {
                                                         repo_url.set(String::new());
                                                         repo_branch.set(String::new());
@@ -4046,6 +4058,7 @@ fn ChatPanel(
                                                 move |_| {
                                                     let Some(id) = selected() else { return };
                                                     let shown_hash = shown_hash.clone();
+                                                    repo_action_error.set(None);
                                                     spawn(async move {
                                                         if let Err(e) = decide_repo_trust(id, request_id, shown_hash, true).await {
                                                             repo_action_error.set(Some(e.to_string()));
@@ -4064,6 +4077,7 @@ fn ChatPanel(
                                                 move |_| {
                                                     let Some(id) = selected() else { return };
                                                     let shown_hash = shown_hash.clone();
+                                                    repo_action_error.set(None);
                                                     spawn(async move {
                                                         if let Err(e) = decide_repo_trust(id, request_id, shown_hash, false).await {
                                                             repo_action_error.set(Some(e.to_string()));
