@@ -395,19 +395,22 @@ pub async fn install_git_files(
     pod_name: &str,
     files: &[crate::git::PodFile],
 ) -> Result<(), SandboxError> {
+    // Never emptied: a clone or push running during a reinstall must
+    // still find its key. Keys are written over in place, and only the
+    // ones no longer in `files` removed afterwards.
     let keys_dir = format!("{}/keys", crate::git::POD_GIT_DIR);
-    let reset = exec_with(
+    let made = exec_with(
         client,
         pod_name,
         "sandbox",
-        &["sh", "-c", r#"rm -rf "$1" && mkdir -m 700 "$1" 2>&1"#, "sh", &keys_dir],
+        &["sh", "-c", r#"mkdir -p -m 700 "$1" 2>&1"#, "sh", &keys_dir],
         None,
     )
     .await?;
-    if reset.exit_code != 0 {
+    if made.exit_code != 0 {
         return Err(SandboxError::GitSetup(format!(
-            "couldn't reset {keys_dir}: {}",
-            reset.stdout.trim()
+            "couldn't make {keys_dir}: {}",
+            made.stdout.trim()
         )));
     }
     for file in files {
@@ -437,6 +440,29 @@ pub async fn install_git_files(
                 written.stdout.trim()
             )));
         }
+    }
+    let keep: Vec<&str> = files
+        .iter()
+        .filter_map(|f| f.path.strip_prefix(&format!("{keys_dir}/")))
+        .collect();
+    let mut prune = vec![
+        "sh",
+        "-c",
+        r#"cd "$1" && shift && for f in * .[!.]*; do
+               [ -e "$f" ] || continue
+               keep=; for k in "$@"; do [ "$f" = "$k" ] && keep=1; done
+               [ -n "$keep" ] || rm -f -- "$f"
+           done 2>&1"#,
+        "sh",
+        &keys_dir,
+    ];
+    prune.extend(keep);
+    let pruned = exec_with(client, pod_name, "sandbox", &prune, None).await?;
+    if pruned.exit_code != 0 {
+        return Err(SandboxError::GitSetup(format!(
+            "couldn't remove deleted keys from {keys_dir}: {}",
+            pruned.stdout.trim()
+        )));
     }
     Ok(())
 }
@@ -4329,6 +4355,23 @@ mod tests {
                 .await
                 .expect("exec git config");
             assert_eq!(name.stdout.trim(), "Ada \"Countess\" Lovelace");
+
+            // Reinstalling (a key added elsewhere, the identity saved)
+            // never leaves the key missing, even for a moment: a push
+            // running then would fail (SME-32 code review 2, finding 5).
+            let watch = sandbox.exec(&[
+                "sh",
+                "-c",
+                "for i in $(seq 1 300); do [ -e /etc/smelt/keys/test-key ] || echo missing; sleep 0.01; done",
+            ]);
+            let reinstall = async {
+                for _ in 0..3 {
+                    install_git_files(&client, &pod_name, &files).await.expect("reinstall");
+                }
+            };
+            let (watched, ()) = tokio::join!(watch, reinstall);
+            let watched = watched.expect("exec watch");
+            assert!(!watched.stdout.contains("missing"), "the key vanished during a reinstall");
 
             // The key is deleted: a reinstall without it removes the file.
             let files = crate::git::pod_git_files(&[], &identity);
