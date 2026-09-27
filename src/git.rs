@@ -370,9 +370,12 @@ mod server {
 
     /// A checkout directory is one name under `/workspace`.
     pub fn validate_checkout_dir(dir: &str) -> Result<(), String> {
+        // A leading dot is fine (`org/.github`); `.` and `..` aren't names.
         let valid = !dir.is_empty()
             && dir.len() <= 100
-            && !dir.starts_with(['.', '-'])
+            && dir != "."
+            && dir != ".."
+            && !dir.starts_with('-')
             && dir
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
@@ -381,7 +384,7 @@ mod server {
         } else {
             Err(format!(
                 "{dir:?} can't be a checkout directory: use one name of letters, digits, \
-                 -, _ or ., not starting with . or -."
+                 -, _ or ., not starting with -."
             ))
         }
     }
@@ -1376,10 +1379,12 @@ mod server {
 
         #[test]
         fn test_checkout_dirs_are_one_plain_name() {
-            for ok in ["smelt", "my.repo", "repo-2", "a_b"] {
+            // A repo like `org/.github` gets its own name by default.
+            let github = default_checkout_dir("git@github.com:org/.github.git").expect("a dir");
+            for ok in ["smelt", "my.repo", "repo-2", "a_b", ".github", github.as_str()] {
                 assert!(validate_checkout_dir(ok).is_ok(), "{ok}");
             }
-            for bad in ["", ".", "..", "../x", "a/b", ".hidden", "-rf", "has space", &"x".repeat(101)] {
+            for bad in ["", ".", "..", "../x", "a/b", "-rf", "has space", &"x".repeat(101)] {
                 assert!(validate_checkout_dir(bad).is_err(), "{bad:?}");
             }
         }
