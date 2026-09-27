@@ -11,6 +11,7 @@ mod events;
 #[cfg(feature = "server")]
 mod fetch_guard;
 mod frontend;
+mod git;
 #[cfg(feature = "server")]
 mod headless_chrome;
 #[cfg(feature = "server")]

@@ -2495,6 +2495,7 @@ pub fn Chat() -> Element {
         Route::McpServerEditRoute { .. } => None,
         Route::SandboxVolumesRoute {} => None,
         Route::PodsRoute {} => None,
+        Route::GitRoute {} => None,
         Route::SandboxVolumeNewRoute {} => None,
         Route::NotFound { .. } => None,
     });
@@ -2635,6 +2636,7 @@ fn ConversationSidebar(
             Link { to: Route::McpServersRoute {}, class: "mcp-servers-link", "MCP servers" }
             Link { to: Route::PodsRoute {}, class: "pods-link", "Sandboxes" }
             Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
+            Link { to: Route::GitRoute {}, class: "sandbox-volumes-link git-link", "Git" }
             if let Some(err) = error() {
                 p { class: "error", "{err}" }
             }

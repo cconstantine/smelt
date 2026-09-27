@@ -78,6 +78,8 @@ pub enum SandboxError {
     PodAlreadyExists,
     InvalidMountPath(String),
     StartFailed(String),
+    /// Writing the SSH keys and git config into a pod failed (SME-32).
+    GitSetup(String),
 }
 
 impl std::fmt::Display for SandboxError {
@@ -104,6 +106,7 @@ impl std::fmt::Display for SandboxError {
             }
             SandboxError::InvalidMountPath(reason) => write!(f, "invalid mount path: {reason}"),
             SandboxError::StartFailed(reason) => write!(f, "sandbox pod failed to start: {reason}"),
+            SandboxError::GitSetup(reason) => write!(f, "couldn't set up git in the pod: {reason}"),
         }
     }
 }
@@ -316,57 +319,148 @@ impl Sandbox {
         container: &str,
         command: &[&str],
     ) -> Result<ExecResult, SandboxError> {
-        let pods = pods_api(&self.client);
-        let mut attached = pods
-            .exec(
-                &self.pod_name,
-                command.iter().copied(),
-                &AttachParams::default().container(container),
-            )
-            .await?;
-
-        let mut stdout_reader = attached
-            .stdout()
-            .expect("stdout requested by AttachParams::default()");
-        // Requested (so the exec session doesn't wait on a caller that will
-        // never read it) but discarded — no caller has needed stderr
-        // separately from stdout yet.
-        let mut stderr_reader = attached
-            .stderr()
-            .expect("stderr requested by AttachParams::default()");
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        let (stdout_res, stderr_res) = tokio::join!(
-            stdout_reader.read_to_string(&mut stdout),
-            stderr_reader.read_to_string(&mut stderr),
-        );
-        stdout_res.map_err(SandboxError::Io)?;
-        stderr_res.map_err(SandboxError::Io)?;
-
-        let status = attached.take_status();
-        attached.join().await.ok();
-        let status = match status {
-            Some(fut) => fut.await,
-            None => None,
-        };
-
-        Ok(ExecResult {
-            stdout,
-            exit_code: extract_exit_code(status),
-        })
+        exec_with(&self.client, &self.pod_name, container, command, None).await
     }
+}
+
+/// kube exec in `pod_name`'s `container`. `stdin`, when given, is written
+/// and then closed, so a command like `cat > file` sees its end. kube
+/// closes just the stdin stream on a v5 connection (k3s has it); an older
+/// server closes the whole connection and the exit code comes back
+/// missing, which callers treat as a failure.
+async fn exec_with(
+    client: &kube::Client,
+    pod_name: &str,
+    container: &str,
+    command: &[&str],
+    stdin: Option<&[u8]>,
+) -> Result<ExecResult, SandboxError> {
+    let pods = pods_api(client);
+    let mut attached = pods
+        .exec(
+            pod_name,
+            command.iter().copied(),
+            &AttachParams::default()
+                .container(container)
+                .stdin(stdin.is_some()),
+        )
+        .await?;
+    if let Some(input) = stdin {
+        use tokio::io::AsyncWriteExt;
+        let mut writer = attached.stdin().expect("stdin requested above");
+        writer.write_all(input).await.map_err(SandboxError::Io)?;
+        writer.shutdown().await.map_err(SandboxError::Io)?;
+        drop(writer);
+    }
+
+    let mut stdout_reader = attached
+        .stdout()
+        .expect("stdout requested by AttachParams::default()");
+    // Requested (so the exec session doesn't wait on a caller that will
+    // never read it) but discarded — no caller has needed stderr
+    // separately from stdout yet.
+    let mut stderr_reader = attached
+        .stderr()
+        .expect("stderr requested by AttachParams::default()");
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let (stdout_res, stderr_res) = tokio::join!(
+        stdout_reader.read_to_string(&mut stdout),
+        stderr_reader.read_to_string(&mut stderr),
+    );
+    stdout_res.map_err(SandboxError::Io)?;
+    stderr_res.map_err(SandboxError::Io)?;
+
+    let status = attached.take_status();
+    attached.join().await.ok();
+    let status = match status {
+        Some(fut) => fut.await,
+        None => None,
+    };
+
+    Ok(ExecResult {
+        stdout,
+        exit_code: extract_exit_code(status),
+    })
+}
+
+/// Writes git's files (`git::pod_git_files`) into a pod's sandbox
+/// container. The keys directory is replaced wholesale, so a key deleted
+/// since the last install goes too.
+pub async fn install_git_files(
+    client: &kube::Client,
+    pod_name: &str,
+    files: &[crate::git::PodFile],
+) -> Result<(), SandboxError> {
+    let keys_dir = format!("{}/keys", crate::git::POD_GIT_DIR);
+    let reset = exec_with(
+        client,
+        pod_name,
+        "sandbox",
+        &["sh", "-c", r#"rm -rf "$1" && mkdir -m 700 "$1" 2>&1"#, "sh", &keys_dir],
+        None,
+    )
+    .await?;
+    if reset.exit_code != 0 {
+        return Err(SandboxError::GitSetup(format!(
+            "couldn't reset {keys_dir}: {}",
+            reset.stdout.trim()
+        )));
+    }
+    for file in files {
+        // Written beside the target and renamed over it, so ssh or git
+        // never reads half a file; umask keeps a key private from its
+        // first byte.
+        let mode = format!("{:o}", file.mode);
+        let written = exec_with(
+            client,
+            pod_name,
+            "sandbox",
+            &[
+                "sh",
+                "-c",
+                r#"umask 077 && cat > "$1.new" && chmod "$2" "$1.new" && mv "$1.new" "$1" 2>&1"#,
+                "sh",
+                &file.path,
+                &mode,
+            ],
+            Some(file.content.as_bytes()),
+        )
+        .await?;
+        if written.exit_code != 0 {
+            return Err(SandboxError::GitSetup(format!(
+                "couldn't write {}: {}",
+                file.path,
+                written.stdout.trim()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `install_git_files` for a live pod of smelt's own, by id.
+pub async fn install_git_files_in_pod(
+    pod_id: i64,
+    files: &[crate::git::PodFile],
+) -> Result<(), SandboxError> {
+    install_git_files(&get().client, &pod_name(pod_id), files).await
 }
 
 /// On success the exec protocol's terminal `Status` carries no exit code at
 /// all (implying 0); on a non-zero exit it's a `StatusCause` with
 /// `reason == "ExitCode"` and the code itself, as a string, in `message`.
 /// Verified against a real cluster, not assumed — see the plan.
-#[cfg_attr(not(test), allow(dead_code))]
+///
+/// No status at all means the connection ended before the API server said
+/// how the command did, so it counts as a failure (-1), not a success.
 fn extract_exit_code(
     status: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Status>,
 ) -> i32 {
+    let Some(status) = status else {
+        return -1;
+    };
     status
-        .and_then(|s| s.details)
+        .details
         .and_then(|d| d.causes)
         .into_iter()
         .flatten()
@@ -1501,6 +1595,15 @@ pub async fn create_pod(
         .await
     {
         Ok(sandbox) => {
+            // Keys and the commit identity, before anything can run a git
+            // command (SME-32). A pod without them would fail its first
+            // push with a confusing ssh error, so a failure here is the
+            // pod's failure.
+            if let Err(e) = crate::git::install_into_pod(pool, row.id).await {
+                let _ = manager.delete(sandbox).await;
+                let _ = db::terminate_sandbox_pod(pool, row.id).await;
+                return Err(SandboxError::GitSetup(e));
+            }
             std::mem::forget(sandbox);
             events::publish(
                 conversation_id,
@@ -4069,6 +4172,102 @@ mod tests {
     /// actual pod-creation call site.
     const VOLUME_MOUNT_SESSION_LABEL: &str = "volume-mount";
 
+    /// A pod gets the user's SSH keys and commit identity where ssh and git
+    /// read them, and a reinstall after a key is deleted removes it
+    /// (SME-32).
+    #[tokio::test]
+    async fn test_git_files_reach_ssh_and_git_in_a_real_pod() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let sandbox = manager
+            .create(&unique_session_id("git-files"), "256Mi", "250m", &[])
+            .await
+            .expect("create pod");
+        let pod_name = sandbox.pod_name.clone();
+
+        let checks = tokio::time::timeout(Duration::from_secs(120), async {
+            let key = crate::git::generate_key("test-key");
+            let identity = crate::git::GitIdentity {
+                name: "Ada \"Countess\" Lovelace".to_string(),
+                email: "ada@example.com".to_string(),
+            };
+            let files =
+                crate::git::pod_git_files(&[("test-key".to_string(), key.private_key.clone())], &identity);
+            install_git_files(&client, &pod_name, &files)
+                .await
+                .expect("install git files");
+
+            let mode = sandbox
+                .exec(&["stat", "-c", "%a %U", "/etc/smelt/keys/test-key"])
+                .await
+                .expect("exec stat");
+            assert_eq!(mode.stdout.trim(), "600 sandbox", "key file mode and owner");
+
+            // The file is the key, byte for byte: ssh derives the same public half.
+            let derived = sandbox
+                .exec(&["ssh-keygen", "-y", "-f", "/etc/smelt/keys/test-key"])
+                .await
+                .expect("exec ssh-keygen");
+            let expected: Vec<&str> = key.public_key.split(' ').take(2).collect();
+            let got: Vec<&str> = derived.stdout.trim().split(' ').take(2).collect();
+            assert_eq!(got, expected, "derived public key");
+
+            let ssh = sandbox
+                .exec(&["ssh", "-G", "github.com"])
+                .await
+                .expect("exec ssh -G");
+            assert!(
+                ssh.stdout.contains("identityfile /etc/smelt/keys/test-key"),
+                "ssh -G github.com: {}",
+                ssh.stdout
+            );
+            let known = sandbox
+                .exec(&["ssh-keygen", "-F", "github.com", "-f", "/etc/ssh/ssh_known_hosts"])
+                .await
+                .expect("exec ssh-keygen -F");
+            assert_eq!(known.exit_code, 0, "github.com is a known host: {}", known.stdout);
+
+            let name = sandbox
+                .exec(&["git", "config", "user.name"])
+                .await
+                .expect("exec git config");
+            assert_eq!(name.stdout.trim(), "Ada \"Countess\" Lovelace");
+
+            // The key is deleted: a reinstall without it removes the file.
+            let files = crate::git::pod_git_files(&[], &identity);
+            install_git_files(&client, &pod_name, &files)
+                .await
+                .expect("reinstall git files");
+            let gone = sandbox
+                .exec(&["test", "-e", "/etc/smelt/keys/test-key"])
+                .await
+                .expect("exec test");
+            assert_eq!(gone.exit_code, 1, "a deleted key's file is removed");
+            let ssh = sandbox
+                .exec(&["ssh", "-G", "github.com"])
+                .await
+                .expect("exec ssh -G");
+            assert!(!ssh.stdout.contains("/etc/smelt/keys/"), "{}", ssh.stdout);
+        })
+        .await;
+
+        manager.delete(sandbox).await.expect("delete pod");
+        checks.expect("checks finished within the timeout");
+    }
+
+    #[test]
+    fn test_exec_with_no_status_is_a_failure_not_a_success() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
+        // The connection closed before the API server said how it ended.
+        assert_eq!(extract_exit_code(None), -1);
+        // What a successful exec actually ends with: no causes at all.
+        let success = Status {
+            status: Some("Success".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(extract_exit_code(Some(success)), 0);
+    }
+
     // Not a real UUID — just enough entropy to avoid pod-name collisions
     // between concurrent test runs, without adding a `uuid` dependency.
     fn uuid_like() -> String {
@@ -4588,7 +4787,35 @@ mod tests {
 
             // --- One pod per conversation: create_pod refuses a second
             // live pod, list reflects reality ---
+            // A stored key and commit identity reach every new pod (SME-32).
+            let key = crate::git::generate_key("lifecycle");
+            db::create_ssh_key(&pool, "lifecycle", &key.public_key, &key.private_key)
+                .await
+                .expect("store key");
+            db::set_git_identity(
+                &pool,
+                &crate::git::GitIdentity {
+                    name: "Lifecycle Test".to_string(),
+                    email: "lifecycle@example.com".to_string(),
+                },
+            )
+            .await
+            .expect("store identity");
             let pod_a = create_pod(&pool, conversation_a.id, PodLimitOverrides::default()).await.expect("create_pod (a) should succeed");
+            let git_check = exec_with(
+                &client,
+                &pod_name(pod_a),
+                "sandbox",
+                &["sh", "-c", "test -s /etc/smelt/keys/lifecycle && git config user.email"],
+                None,
+            )
+            .await
+            .expect("exec git check");
+            assert_eq!(
+                (git_check.exit_code, git_check.stdout.trim()),
+                (0, "lifecycle@example.com"),
+                "a new pod has the stored key and identity"
+            );
             let duplicate = create_pod(&pool, conversation_a.id, PodLimitOverrides::default()).await;
             assert!(
                 matches!(duplicate, Err(SandboxError::PodAlreadyExists)),

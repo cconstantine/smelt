@@ -794,6 +794,75 @@ pub async fn delete_sandbox_volume(pool: &PgPool, id: i64) -> Result<(), sqlx::E
     Ok(())
 }
 
+// --- Git: SSH keys and the commit identity (SME-32) ---
+
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+pub struct SshKey {
+    pub id: i64,
+    pub name: String,
+    pub public_key: String,
+    /// Plain text for now: see SME-48.
+    pub private_key: String,
+    pub created_at: NaiveDateTime,
+}
+
+pub async fn create_ssh_key(
+    pool: &PgPool,
+    name: &str,
+    public_key: &str,
+    private_key: &str,
+) -> Result<SshKey, sqlx::Error> {
+    sqlx::query_as::<_, SshKey>(
+        "INSERT INTO ssh_keys (name, public_key, private_key) VALUES ($1, $2, $3) RETURNING *",
+    )
+    .bind(name)
+    .bind(public_key)
+    .bind(private_key)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_ssh_keys(pool: &PgPool) -> Result<Vec<SshKey>, sqlx::Error> {
+    sqlx::query_as::<_, SshKey>("SELECT * FROM ssh_keys ORDER BY name ASC")
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn delete_ssh_key(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM ssh_keys WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The commit identity; empty strings when it has never been set.
+pub async fn get_git_identity(pool: &PgPool) -> Result<crate::git::GitIdentity, sqlx::Error> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT author_name, author_email FROM git_settings")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row
+        .map(|(name, email)| crate::git::GitIdentity { name, email })
+        .unwrap_or_default())
+}
+
+pub async fn set_git_identity(
+    pool: &PgPool,
+    identity: &crate::git::GitIdentity,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO git_settings (author_name, author_email) VALUES ($1, $2)
+         ON CONFLICT (id) DO UPDATE
+         SET author_name = $1, author_email = $2, updated_at = now()",
+    )
+    .bind(&identity.name)
+    .bind(&identity.email)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // --- MCP servers (externally-hosted, configured via the /mcp-servers UI) ---
 // Plain CRUD, no soft delete — this is configuration a person edits, not a
 // live external resource like a sandbox pod. See
@@ -2203,6 +2272,58 @@ mod tests {
         .await
         .expect("query should succeed");
         assert!(result.is_none());
+    }
+
+    #[sqlx::test]
+    async fn test_ssh_keys_round_trip_and_list_by_name(pool: PgPool) {
+        let work = create_ssh_key(&pool, "work", "ssh-ed25519 AAAA work", "PRIVATE-W")
+            .await
+            .expect("create key");
+        create_ssh_key(&pool, "github", "ssh-ed25519 AAAA gh", "PRIVATE-G")
+            .await
+            .expect("create key");
+
+        let listed = list_ssh_keys(&pool).await.expect("list keys");
+        let names: Vec<&str> = listed.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(names, vec!["github", "work"]);
+        assert_eq!(listed[1], work);
+        assert_eq!(listed[1].private_key, "PRIVATE-W");
+
+        delete_ssh_key(&pool, work.id).await.expect("delete key");
+        let names: Vec<String> = list_ssh_keys(&pool)
+            .await
+            .expect("list keys")
+            .into_iter()
+            .map(|k| k.name)
+            .collect();
+        assert_eq!(names, vec!["github"]);
+    }
+
+    #[sqlx::test]
+    async fn test_ssh_key_names_are_unique(pool: PgPool) {
+        create_ssh_key(&pool, "github", "pub", "priv").await.expect("first");
+        assert!(create_ssh_key(&pool, "github", "pub2", "priv2").await.is_err());
+    }
+
+    #[sqlx::test]
+    async fn test_git_identity_is_empty_until_set_then_updates_in_place(pool: PgPool) {
+        assert_eq!(
+            get_git_identity(&pool).await.expect("get"),
+            crate::git::GitIdentity::default()
+        );
+        let first = crate::git::GitIdentity {
+            name: "Ada".into(),
+            email: "ada@example.com".into(),
+        };
+        set_git_identity(&pool, &first).await.expect("set");
+        assert_eq!(get_git_identity(&pool).await.expect("get"), first);
+
+        let second = crate::git::GitIdentity {
+            name: "Ada Lovelace".into(),
+            email: "ada@lovelace.dev".into(),
+        };
+        set_git_identity(&pool, &second).await.expect("set again");
+        assert_eq!(get_git_identity(&pool).await.expect("get"), second);
     }
 
     #[sqlx::test]

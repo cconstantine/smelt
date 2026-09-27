@@ -2542,3 +2542,99 @@ div.mcp-status-not-connected::before {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
 }
+
+/* --- Git settings (SME-32) --- reuses the sandbox volumes page's layout,
+   rows and forms. */
+
+.git-section {
+    margin-bottom: 32px;
+}
+
+.git-section h2 {
+    font-size: 17px;
+    margin: 0 0 8px;
+}
+
+.git-key-form h3 {
+    font-size: 15px;
+    margin: 0;
+}
+
+.git-key-row {
+    align-items: flex-start;
+}
+
+.git-key-row .sandbox-volume-summary {
+    min-width: 0;
+}
+
+.git-public-key {
+    font-size: 12px;
+    color: var(--text-2);
+    word-break: break-all;
+}
+
+.git-key-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    align-items: stretch;
+}
+
+.git-key-copy {
+    padding: 8px 16px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--ink);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.git-key-copy:hover {
+    background: var(--subtle);
+}
+
+.git-key-form {
+    margin-top: 16px;
+}
+
+.git-private-key-input {
+    padding: 8px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    resize: vertical;
+}
+
+.git-key-form-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.sandbox-volume-add-form button.git-key-mode {
+    border-color: var(--border-strong);
+    background: var(--surface);
+    color: var(--text-2);
+}
+
+.sandbox-volume-add-form button.git-key-mode:hover {
+    background: var(--subtle);
+    color: var(--ink);
+}
+
+@media (max-width: 720px) {
+    .git-key-row {
+        flex-direction: column;
+    }
+
+    .git-key-actions {
+        flex-direction: row;
+    }
+}
