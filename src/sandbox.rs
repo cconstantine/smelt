@@ -13,6 +13,8 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+#[cfg(test)]
+use futures_util::FutureExt;
 use k8s_openapi::api::core::v1::{
     Container, EmptyDirVolumeSource, ExecAction, PersistentVolumeClaim, PersistentVolumeClaimSpec,
     PersistentVolumeClaimVolumeSource, Pod, PodSpec, Probe, ResourceRequirements, SecurityContext,
@@ -298,12 +300,23 @@ impl Sandbox {
     /// terminal protocol, which is what production code actually uses.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn exec(&self, command: &[&str]) -> Result<ExecResult, SandboxError> {
+        self.exec_in("sandbox", command).await
+    }
+
+    /// `exec` in a named container of the pod — `"docker"` for the Docker
+    /// sidecar (SME-33).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn exec_in(
+        &self,
+        container: &str,
+        command: &[&str],
+    ) -> Result<ExecResult, SandboxError> {
         let pods = pods_api(&self.client);
         let mut attached = pods
             .exec(
                 &self.pod_name,
                 command.iter().copied(),
-                &AttachParams::default(),
+                &AttachParams::default().container(container),
             )
             .await?;
 
@@ -3626,6 +3639,157 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         )
+    }
+
+    /// Docker in a real sandbox pod behaves like Docker on a Linux machine,
+    /// and stays inside the pod (SME-33). One test so the pods, the claim
+    /// and the base image are made once.
+    #[tokio::test]
+    async fn test_docker_in_a_sandbox_pod_works_and_stays_inside_the_pod() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let pods = pods_api(&client);
+        let conversation_id = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64
+            + 1_000_000_000;
+        let docker = DockerSidecar {
+            memory: "1Gi".to_string(),
+            cpu: "500m".to_string(),
+            storage: DockerStorage::Conversation(conversation_id),
+        };
+        ensure_docker_pvc(&client, conversation_id).await.expect("ensure docker claim");
+        // Every pod this test makes, so cleanup below finds them even after
+        // a failed assertion unwinds out of the checks.
+        let created: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+
+        let checks = tokio::time::timeout(Duration::from_secs(300), async {
+            let first = manager
+                .create_with_docker(&unique_session_id("docker"), "256Mi", "250m", &docker, &[])
+                .await
+                .expect("create pod with docker");
+            created.lock().expect("created").push(first.pod_name.clone());
+
+            // The very first command works: the pod only runs once dockerd answers.
+            let info = first
+                .exec(&["docker", "info", "--format", "{{.ServerVersion}}"])
+                .await
+                .expect("exec docker info");
+            assert_eq!(info.exit_code, 0, "docker info right after create: {}", info.stdout);
+            assert!(info.stdout.starts_with("29."), "server version: {}", info.stdout);
+
+            // A base image from the sandbox's own files: no Docker Hub.
+            let import = first
+                .exec(&[
+                    "bash",
+                    "-c",
+                    "sudo tar -C / -c bin sbin lib lib64 usr etc 2>/dev/null | docker import - local/base",
+                ])
+                .await
+                .expect("exec import");
+            assert_eq!(import.exit_code, 0, "import base image: {}", import.stdout);
+
+            let run = first
+                .exec(&["docker", "run", "--rm", "local/base", "echo", "hello-from-docker"])
+                .await
+                .expect("exec docker run");
+            assert_eq!(run.stdout.trim(), "hello-from-docker");
+
+            // A relative bind mount from /workspace sees the sandbox's files.
+            let compose = first
+                .exec(&[
+                    "bash",
+                    "-c",
+                    "mkdir -p /workspace/proj/src && echo from-workspace > /workspace/proj/src/f \
+                     && cd /workspace/proj \
+                     && printf 'services:\\n  web:\\n    image: local/base\\n    command: [cat, /data/f]\\n    volumes: [./src:/data]\\n' > compose.yml \
+                     && docker compose run --rm -q web 2>&1",
+                ])
+                .await
+                .expect("exec compose");
+            assert!(
+                compose.stdout.contains("from-workspace"),
+                "compose bind mount from /workspace: {}",
+                compose.stdout
+            );
+
+            // Nested containers live under the sidecar's own cgroup, so its
+            // memory limit applies, never at the node's cgroup root.
+            let started = first
+                .exec(&["docker", "run", "-d", "local/base", "sleep", "300"])
+                .await
+                .expect("exec docker run -d");
+            let id = started.stdout.trim().to_string();
+            let where_ = first
+                .exec_in(
+                    "docker",
+                    &[
+                        "sh",
+                        "-c",
+                        &format!(
+                            "own=$(dirname $(sed -n 's/^0:://p' /proc/1/cgroup)); \
+                             pid=$(docker --host={DOCKER_HOST} inspect -f '{{{{.State.Pid}}}}' {id}); \
+                             echo \"$own\"; sed -n 's/^0:://p' /proc/$pid/cgroup"
+                        ),
+                    ],
+                )
+                .await
+                .expect("exec in docker sidecar");
+            let mut lines = where_.stdout.lines();
+            let own = lines.next().unwrap_or_default().to_string();
+            let nested = lines.next().unwrap_or_default().to_string();
+            assert!(
+                !own.is_empty() && nested.starts_with(&format!("{own}/docker/")),
+                "nested container cgroup {nested:?} should be under the sidecar's {own:?}"
+            );
+
+            // dockerd never listens on TCP.
+            for port in [2375, 2376] {
+                let tcp = first
+                    .exec(&["bash", "-c", &format!("</dev/tcp/127.0.0.1/{port}")])
+                    .await
+                    .expect("exec tcp probe");
+                assert_ne!(tcp.exit_code, 0, "nothing should listen on {port}");
+            }
+
+            // Images live on the conversation's claim, so a new pod has them.
+            let first_name = first.pod_name.clone();
+            pods.delete(&first_name, &immediate_delete_params()).await.ok();
+            std::mem::forget(first);
+            while pods.get_opt(&first_name).await.ok().flatten().is_some() {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            let second = manager
+                .create_with_docker(&unique_session_id("docker"), "256Mi", "250m", &docker, &[])
+                .await
+                .expect("recreate pod on the same claim");
+            created.lock().expect("created").push(second.pod_name.clone());
+            let images = second
+                .exec(&["docker", "image", "ls", "-q", "local/base"])
+                .await
+                .expect("exec image ls");
+            assert!(!images.stdout.trim().is_empty(), "local/base should survive a new pod");
+            std::mem::forget(second);
+        });
+        let outcome = std::panic::AssertUnwindSafe(checks).catch_unwind().await;
+
+        // Delete what this test made directly, not through the cleanup queue,
+        // whether or not the checks passed.
+        let created = created.into_inner().expect("created");
+        for name in &created {
+            pods.delete(name, &immediate_delete_params()).await.ok();
+        }
+        for name in &created {
+            while pods.get_opt(name).await.ok().flatten().is_some() {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+        pvc_api(&client)
+            .delete(&docker_pvc_name(conversation_id), &DeleteParams::default())
+            .await
+            .ok();
+        match outcome {
+            Ok(finished) => finished.expect("docker test should finish within the timeout"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     /// A conversation's Docker claim is created once and reused, and
