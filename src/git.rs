@@ -125,13 +125,24 @@ mod server {
     /// The identity of a remote repository, whatever URL form named it:
     /// `git@github.com:o/r.git`, `ssh://git@github.com/o/r`,
     /// `https://github.com/o/r.git` and `https://github.com/O/R/` are all
-    /// `github.com/o/r`. What trust decisions are remembered by. Lowercased,
-    /// since the common hosts treat owner and repo names that way. `None`
+    /// `github.com/o/r`. What trust decisions are remembered by. The host
+    /// is lowercased, and the path too on hosts that ignore its case. `None`
     /// for anything that isn't a clonable URL.
     pub fn remote_key(url: &str) -> Option<String> {
         let (host, path) = parse_remote(url)?;
-        Some(format!("{host}/{path}").to_lowercase())
+        let host = host.to_lowercase();
+        // Only these hosts treat owner and repo names without regard to
+        // case; elsewhere `Team/Repo` and `team/repo` can be two repos, and
+        // must not share a trust decision.
+        let path = if CASE_INSENSITIVE_HOSTS.contains(&host.as_str()) {
+            path.to_lowercase()
+        } else {
+            path
+        };
+        Some(format!("{host}/{path}"))
     }
+
+    const CASE_INSENSITIVE_HOSTS: [&str; 3] = ["github.com", "gitlab.com", "bitbucket.org"];
 
     /// The directory a clone of `url` goes in, under `/workspace`: the
     /// repo's own name, like `git clone` picks.
@@ -1898,6 +1909,17 @@ mod server {
             );
             // A local path in the pod (tests use bare repos this way).
             assert_eq!(remote_key("file:///tmp/origin.git").as_deref(), Some("file/tmp/origin"));
+        }
+
+        /// Case only folds where the host ignores it: elsewhere two repos
+        /// differing in case are two repos (SME-32 code review 7, finding 6).
+        #[test]
+        fn test_remote_key_keeps_path_case_on_other_hosts() {
+            assert_eq!(remote_key("git@GitLab.com:Group/Project.git").as_deref(), Some("gitlab.com/group/project"));
+            assert_eq!(remote_key("https://Bitbucket.org/Team/Repo").as_deref(), Some("bitbucket.org/team/repo"));
+            assert_eq!(remote_key("git@git.Example.com:Team/Repo.git").as_deref(), Some("git.example.com/Team/Repo"));
+            assert_ne!(remote_key("git@example.com:Team/Repo"), remote_key("git@example.com:team/repo"));
+            assert_eq!(remote_key("file:///tmp/Origin.git").as_deref(), Some("file/tmp/Origin"));
         }
 
         #[test]
