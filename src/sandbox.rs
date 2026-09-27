@@ -2946,6 +2946,47 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+        // The user's preview proxy over the same real port-forward: three
+        // requests on one kept-alive connection. Each would take over a
+        // second if anything waited for the port-forward's late end of
+        // stream (see `open_pod_port`).
+        let through_preview = {
+            use crate::egress_proxy::{DialFuture, SandboxDial};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let preview_addr = listener.local_addr().expect("local addr");
+            let template = crate::preview::PreviewTemplate::parse(&format!(
+                "http://{{port}}-{{conversation}}.preview.localhost:{}",
+                preview_addr.port()
+            ))
+            .expect("a template");
+            let (dial_client, dial_pool) = (client.clone(), pool.clone());
+            let dial_for: crate::preview::DialFor = Arc::new(move |conversation| {
+                let (client, pool) = (dial_client.clone(), dial_pool.clone());
+                Arc::new(move |port| {
+                    let (client, pool) = (client.clone(), pool.clone());
+                    Box::pin(async move {
+                        open_pod_port_with(&pool, conversation, port, move || client)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }) as DialFuture
+                }) as SandboxDial
+            });
+            let server = tokio::spawn(crate::preview::serve(listener, template.clone(), dial_for));
+            let http = reqwest::Client::builder()
+                .resolve(&format!("{AGENT_PORT}-{}.preview.localhost", with_pod.id), preview_addr)
+                .build()
+                .expect("a client");
+            let started = std::time::Instant::now();
+            let mut statuses = Vec::new();
+            for _ in 0..3 {
+                match http.get(format!("{}/no-such-path", template.url_for(with_pod.id, AGENT_PORT))).send().await {
+                    Ok(response) => statuses.push(response.status().as_u16()),
+                    Err(_) => statuses.push(0),
+                }
+            }
+            server.abort();
+            (statuses, started.elapsed())
+        };
         let without_pod_result = open(without_pod.id, AGENT_PORT).await;
         let closed_reply = match open(with_pod.id, 9).await {
             Ok(mut stream) => Ok(http_get_over(&mut stream, "/").await),
@@ -2961,6 +3002,9 @@ mod tests {
             "a conversation without a pod must not reach any pod"
         );
         assert_eq!(closed_reply.expect("open an unused port"), "", "nothing listens on port 9");
+        let (statuses, elapsed) = through_preview;
+        assert_eq!(statuses, vec![404, 404, 404], "the agent's 404 through the preview each time");
+        assert!(elapsed < Duration::from_secs(2), "three preview requests took {elapsed:?}");
     }
 
     #[test]

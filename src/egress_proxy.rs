@@ -53,11 +53,10 @@ pub async fn start(is_addr_allowed: fn(IpAddr) -> bool) -> std::io::Result<Socke
 /// Opens a connection to a port in one conversation's sandbox pod —
 /// `sandbox::open_pod_port` for that conversation, or a stand-in in tests.
 /// An `Err` is a message the proxy shows as the reason it couldn't connect.
-pub type SandboxDial = Arc<
-    dyn Fn(u16) -> Pin<Box<dyn Future<Output = Result<Box<dyn PodIo>, String>> + Send>>
-        + Send
-        + Sync,
->;
+pub type SandboxDial = Arc<dyn Fn(u16) -> DialFuture + Send + Sync>;
+
+/// What a `SandboxDial` returns.
+pub type DialFuture = Pin<Box<dyn Future<Output = Result<Box<dyn PodIo>, String>> + Send>>;
 
 /// The real `SandboxDial` for `conversation_id`: `sandbox::open_pod_port`,
 /// with its failures turned into sentences the model (or the user, in the
