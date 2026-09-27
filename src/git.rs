@@ -189,43 +189,11 @@ mod server {
         url: &str,
         branch: Option<&str>,
         dir: &str,
-        stage_prefix: &str,
     ) -> Result<ClonedRepo, String> {
         if parse_remote(url).is_none() {
             return Err(format!("{url} isn't a git URL smelt can clone."));
         }
         let path = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
-        // The clone is staged in a directory of its own and moved into
-        // place only when it has succeeded, so the target is never half
-        // written and never deleted: a clone that was cut off (and may
-        // still be running in the pod) only ever wrote its own staging
-        // directory. Stale ones from earlier attempts go first; this one's
-        // name is new, so it can't meet a clone still running.
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        let stage = format!("{}/{stage_prefix}{nonce}", crate::sandbox::WORKSPACE_DIR);
-        let prepared = crate::sandbox::exec_with(
-            client,
-            pod_name,
-            "sandbox",
-            &[
-                "sh",
-                "-c",
-                r#"if [ -e "$1" ]; then echo "fatal: destination path '$1' already exists." >&2; exit 3; fi
-                   rm -rf -- "$2"*"#,
-                "sh",
-                &path,
-                &format!("{}/{stage_prefix}", crate::sandbox::WORKSPACE_DIR),
-            ],
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        if prepared.exit_code != 0 {
-            return Err(prepared.stderr.trim().to_string());
-        }
         // No prompts: nothing can answer one, and a clone waiting on a
         // password or a host key would hang until the timeout.
         let mut command = vec![
@@ -240,7 +208,7 @@ mod server {
         if let Some(branch) = branch {
             command.extend(["--branch", branch]);
         }
-        command.extend(["--", url, &stage]);
+        command.extend(["--", url, &path]);
         let clone = tokio::time::timeout(
             CLONE_TIMEOUT,
             crate::sandbox::exec_with(client, pod_name, "sandbox", &command, None),
@@ -248,27 +216,24 @@ mod server {
         .await
         .map_err(|_| format!("{CLONE_TIMED_OUT} ({} minutes) cloning {url}.", CLONE_TIMEOUT.as_secs() / 60))?
         .map_err(|e| e.to_string())?;
+        // Git refuses a directory that already exists and isn't empty, and
+        // removes one it made itself when it fails. Only a clone that was
+        // cut off (Stop, the timeout, a restart) leaves one behind, which
+        // the error says how to deal with.
         if clone.exit_code != 0 {
-            let _ = crate::sandbox::exec_with(client, pod_name, "sandbox", &["rm", "-rf", "--", &stage], None).await;
             let output = format!("{}{}", clone.stdout, clone.stderr);
-            let output = output.trim().replace(&stage, &path);
+            let output = output.trim();
+            if output.contains("already exists") {
+                return Err(format!(
+                    "{output} If it's what's left of an earlier clone that was cut off, delete it \
+                     (rm -rf {path}) and clone again; otherwise clone into another directory."
+                ));
+            }
             return Err(if output.is_empty() {
                 format!("git clone {url} failed (exit code {})", clone.exit_code)
             } else {
-                output
+                output.to_string()
             });
-        }
-        // `mv -T` renames onto the target, refusing one that isn't empty
-        // (something appeared there meanwhile): nothing there is replaced.
-        let placed = crate::sandbox::exec_with(client, pod_name, "sandbox", &["mv", "-T", "--", &stage, &path], None)
-            .await
-            .map_err(|e| e.to_string())?;
-        if placed.exit_code != 0 {
-            let _ = crate::sandbox::exec_with(client, pod_name, "sandbox", &["rm", "-rf", "--", &stage], None).await;
-            return Err(format!(
-                "fatal: destination path '{path}' already exists ({}).",
-                placed.stderr.trim()
-            ));
         }
         // The branch from HEAD itself, and the commit only if there is
         // one: a brand-new empty repo has a branch but no commit yet.
@@ -963,7 +928,6 @@ mod server {
             &repo.url,
             repo.branch.as_deref(),
             &repo.dir,
-            &format!(".smelt-clone-{}-", repo.id),
         )
         .await;
         match outcome {

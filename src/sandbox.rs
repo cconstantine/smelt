@@ -4427,7 +4427,7 @@ mod tests {
         let checks = tokio::time::timeout(Duration::from_secs(120), async {
             let main_commit = make_origin_repo(&sandbox).await;
 
-            let cloned = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin", ".smelt-clone-t-")
+            let cloned = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin")
                 .await
                 .expect("clone the default branch");
             assert_eq!(cloned.commit.as_deref(), Some(main_commit.as_str()));
@@ -4454,7 +4454,6 @@ mod tests {
                 "file:///tmp/origin.git",
                 Some("feature"),
                 "origin-feature",
-                ".smelt-clone-t-",
             )
             .await
             .expect("clone a branch");
@@ -4489,36 +4488,24 @@ mod tests {
             assert_eq!(read.content, "Use \u{FFFD} tabs.\n");
             assert_eq!(read.file_bytes, 12);
 
-            let missing = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/nope.git", None, "nope", ".smelt-clone-t-")
+            let missing = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/nope.git", None, "nope")
                 .await
                 .expect_err("a missing repo fails");
             assert!(missing.contains("does not appear to be a git repository"), "{missing}");
 
             // The directory is taken: git's own message, not a silent overwrite.
-            let taken = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin", ".smelt-clone-t-")
+            let taken = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin")
                 .await
                 .expect_err("an existing directory fails");
             assert!(taken.contains("already exists"), "{taken}");
-
-            // A clone is staged in a directory of its own and moved into
-            // place only when it succeeds: what an earlier, cut-off
-            // attempt left (maybe still being written) is its own staging
-            // directory, removed first, never the target (SME-32 code
-            // review 4).
-            let stale = sandbox
-                .exec(&["sh", "-c", "mkdir -p /workspace/.smelt-clone-t-old/.git && echo half > /workspace/.smelt-clone-t-old/half-written"])
+            // Git refuses an existing directory; the error says what to do
+            // when it's what a cut-off clone left (SME-32 code review 5).
+            assert!(taken.contains("delete it"), "{taken}");
+            let untouched = sandbox
+                .exec(&["cat", "/workspace/origin/AGENTS.md"])
                 .await
-                .expect("exec make stale");
-            assert_eq!(stale.exit_code, 0);
-            let staged = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "staged", ".smelt-clone-t-")
-                .await
-                .expect("a clone past a stale staging directory");
-            assert_eq!(staged.commit.as_deref(), Some(main_commit.as_str()));
-            let after = sandbox
-                .exec(&["sh", "-c", "cat /workspace/staged/AGENTS.md; ls -a /workspace | grep -c smelt-clone || true"])
-                .await
-                .expect("exec check");
-            assert_eq!(after.stdout, "Run make test before committing.\n0\n", "the clone is in place and no staging directory is left");
+                .expect("exec cat");
+            assert_eq!(untouched.stdout, "Run make test before committing.\n", "the existing checkout is left alone");
         })
         .await;
 
