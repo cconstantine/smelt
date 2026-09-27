@@ -26,4 +26,14 @@ docker save -o "$TAR_PATH" smelt-sandbox:latest
 
 cargo run --bin sandbox_image_import --features server -- "$TAR_PATH"
 
-echo "smelt-sandbox:latest built and imported into the cluster"
+# The pod's Docker sidecar (SME-33) runs dockerd from docker:dind. Delivered
+# the same way, so pods start without a pull and CI doesn't depend on
+# Docker Hub at pod-start time. Keep the tag in step with
+# src/sandbox.rs's default_docker_image.
+DOCKER_IMAGE=docker:29-dind
+DOCKER_TAR_PATH=target/sandbox-image/docker-dind.tar
+docker pull -q "$DOCKER_IMAGE"
+docker save -o "$DOCKER_TAR_PATH" "$DOCKER_IMAGE"
+cargo run --bin sandbox_image_import --features server -- "$DOCKER_TAR_PATH"
+
+echo "smelt-sandbox:latest and $DOCKER_IMAGE built and imported into the cluster"
