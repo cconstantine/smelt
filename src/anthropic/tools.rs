@@ -694,12 +694,16 @@ mod server {
                                the link too, so share it once the server is up. Says whether \
                                anything is listening on that port yet. Your own browser tools \
                                (webfetch, browser_navigate) reach the same server at \
-                               http://localhost:<port>/: use that there, not this link."
+                               http://localhost:<port>/: use that there, not this link. For a \
+                               Docker container's port that isn't published, give the \
+                               container's address as `host`; your browser tools reach it at \
+                               http://<address>:<port>/."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "port": {"type": "integer", "description": "the port the server listens on inside the sandbox, e.g. 5173"}
+                        "port": {"type": "integer", "description": "the port the server listens on inside the sandbox, e.g. 5173"},
+                        "host": {"type": "string", "description": "a Docker container's address in the sandbox, from `docker inspect`, for a server running in that container; leave out for the sandbox itself or a port published with -p"}
                     },
                     "required": ["port"]
                 }),
@@ -2201,7 +2205,20 @@ mod server {
             .and_then(|p| u16::try_from(p).ok())
             .filter(|&p| p != 0)
             .ok_or("port must be a number from 1 to 65535")?;
-        crate::sandbox::check_reachable_port(port).map_err(|e| e.to_string())?;
+        let host = match input.get("host") {
+            None | Some(Value::Null) => crate::sandbox::PodHost::Localhost,
+            Some(host) => host
+                .as_str()
+                .and_then(crate::docker_net::container_address)
+                .map(crate::sandbox::PodHost::Container)
+                .ok_or(
+                    "host must be a Docker container's address in the sandbox, as `docker inspect` \
+                     shows it (in 172.20.0.0/14); leave it out for a server in the sandbox itself",
+                )?,
+        };
+        if host == crate::sandbox::PodHost::Localhost {
+            crate::sandbox::check_reachable_port(port).map_err(|e| e.to_string())?;
+        }
         let pod_id = crate::sandbox::live_pod_id(pool, conversation_id)
             .await
             .map_err(|e| match e {
@@ -2212,34 +2229,46 @@ mod server {
             })?;
         let template = crate::preview::configured_template()
             .map_err(|e| format!("Previews are off on this smelt: {e}"))?;
-        let listening = crate::sandbox::pod_port_is_listening(pool, conversation_id, port)
+        let listening = crate::sandbox::pod_port_is_listening(pool, conversation_id, host, port)
             .await
             .map_err(|e| e.to_string())?;
-        let ports = db::add_pod_preview(pool, pod_id, port)
+        let stored_host = match host {
+            crate::sandbox::PodHost::Localhost => String::new(),
+            crate::sandbox::PodHost::Container(ip) => ip.to_string(),
+        };
+        let where_ = match host {
+            crate::sandbox::PodHost::Localhost => format!("localhost:{port}"),
+            crate::sandbox::PodHost::Container(ip) => format!("{ip}:{port}"),
+        };
+        let ports = db::add_pod_preview(pool, pod_id, &stored_host, port)
             .await
             .map_err(|e| e.to_string())?;
         crate::events::publish(
             conversation_id,
             crate::events::ConversationEvent::SandboxPreviewUpdate {
                 pod_id,
-                previews: crate::preview::preview_links(&template, conversation_id, &ports),
+                previews: crate::preview::preview_links(
+                    &template,
+                    conversation_id,
+                    &crate::preview::stored_previews(&ports),
+                ),
             },
         );
         let note = if listening {
             format!(
                 "The user can open this link in their own browser; the sandbox panel shows it too. \
-                 Your own browser tools reach the same server at http://localhost:{port}/, so use \
+                 Your own browser tools reach the same server at http://{where_}/, so use \
                  that address with them, not this link."
             )
         } else {
             format!(
-                "Nothing is listening on port {port} in the sandbox yet, so the link won't load \
+                "Nothing is listening on {where_} in the sandbox yet, so the link won't load \
                  until something does. Check the server started and which port it uses. The link \
                  is saved in the sandbox panel either way."
             )
         };
         Ok(serde_json::json!({
-            "url": template.url_for(conversation_id, port),
+            "url": template.url_for(conversation_id, host, port),
             "port": port,
             "listening": listening,
             "note": note,
@@ -2482,6 +2511,21 @@ mod server {
                 .await
                 .expect_err("the agent's port is never previewed");
             assert!(message.contains("sandbox agent"), "{message}");
+        }
+
+        #[sqlx::test]
+        async fn test_sandbox_preview_url_refuses_a_host_that_is_not_a_container_in_the_pod(pool: sqlx::PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("create conversation");
+            for host in ["10.0.0.5", "172.24.0.1", "web", "localhost", ""] {
+                let message = sandbox_preview_url_tool(
+                    &pool,
+                    conversation.id,
+                    &serde_json::json!({"port": 3000, "host": host}),
+                )
+                .await
+                .expect_err("not a container address");
+                assert!(message.contains("docker inspect"), "{host:?}: {message}");
+            }
         }
 
         #[sqlx::test]

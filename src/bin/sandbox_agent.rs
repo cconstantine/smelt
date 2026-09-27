@@ -46,6 +46,8 @@ const LISTEN_ADDR: &str = "127.0.0.1:8088";
 /// only dial localhost, so smelt reaches a container's IP by connecting
 /// here and naming it. Loopback only, like `LISTEN_ADDR`.
 const RELAY_ADDR: &str = "127.0.0.1:8089";
+/// What the relay answers once it has connected to the target.
+const RELAY_CONNECTED: &[u8] = b"ok\n";
 /// The one line a relay connection starts with, `ip:port\n`, is at most this long.
 const RELAY_TARGET_MAX: usize = 64;
 const PID_FILE: &str = "/tmp/sandbox_agent.pid";
@@ -1425,9 +1427,12 @@ fn relay_target(line: &str) -> Result<std::net::SocketAddrV4, String> {
 }
 
 /// Serves `RELAY_ADDR`: each connection names a container address on its
-/// first line, then carries raw bytes to and from it. A refused or failed
-/// target just closes the connection, the same as a port nothing listens
-/// on, which is how smelt reports it.
+/// first line. Once connected, the relay answers `RELAY_CONNECTED`, then
+/// carries raw bytes to and from it. A refused or failed target just
+/// closes the connection, the same as a port nothing listens on, which is
+/// how smelt reports it. The answer matters: a connect to an address no
+/// container has yet hangs rather than fails, and without it smelt would
+/// take that silence for a server waiting for a request.
 async fn serve_relay(listener: tokio::net::TcpListener) {
     loop {
         let Ok((client, _)) = listener.accept().await else {
@@ -1462,6 +1467,7 @@ async fn relay(client: tokio::net::TcpStream) -> Result<(), String> {
     // Bytes the client sent after its target line are already buffered.
     let buffered = client.buffer().to_vec();
     let mut client = client.into_inner();
+    client.write_all(RELAY_CONNECTED).await.map_err(|e| e.to_string())?;
     upstream.write_all(&buffered).await.map_err(|e| e.to_string())?;
     tokio::io::copy_bidirectional(&mut client, &mut upstream)
         .await

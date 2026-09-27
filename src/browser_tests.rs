@@ -1479,7 +1479,10 @@ async fn test_end_to_end_browser_scenarios() {
         .expect("start the server");
         let mut listening = false;
         for _ in 0..50 {
-            if sandbox::pod_port_is_listening(pool, serving.id, 8000).await.expect("probe port 8000") {
+            if sandbox::pod_port_is_listening(pool, serving.id, sandbox::PodHost::Localhost, 8000)
+                .await
+                .expect("probe port 8000")
+            {
                 listening = true;
                 break;
             }
@@ -1515,7 +1518,7 @@ async fn test_end_to_end_browser_scenarios() {
         let shared: serde_json::Value = serde_json::from_str(&shared).expect("the tool's JSON");
         assert_eq!(shared["listening"], true, "got {shared}");
         let link = shared["url"].as_str().expect("a url").to_string();
-        assert_eq!(link, crate::preview::configured_template().expect("the template").url_for(serving.id, 8000));
+        assert_eq!(link, crate::preview::configured_template().expect("the template").url_for(serving.id, crate::sandbox::PodHost::Localhost, 8000));
         // Without a reload: it arrives on the conversation's live stream.
         wait_for_element(&page, ".sandbox-preview", Duration::from_secs(10)).await;
         let href: String = page
@@ -1535,6 +1538,101 @@ async fn test_end_to_end_browser_scenarios() {
         wait_for_live_client(&page, serving.id).await;
         // Still there after a reload: `get_sandbox_state` brings it back.
         wait_for_element(&page, ".sandbox-preview", Duration::from_secs(10)).await;
+
+        // SME-33: a Docker container in the pod, its port not published, as
+        // both browsers reach it on a Linux host: at its own address. A
+        // network with a fixed address saves reading it from the terminal;
+        // the base image is the sandbox's own files, so no Docker Hub.
+        let container = std::net::Ipv4Addr::new(172, 21, 9, 9);
+        anthropic::tools::execute(
+            pool,
+            serving.id,
+            &unique_id("write"),
+            "write_file",
+            &serde_json::json!({
+                "path": "/workspace/site/index.html",
+                "content": "<html><body><h1>Hello from a Docker container</h1></body></html>",
+            }),
+        )
+        .await
+        .expect("write the container's page");
+        let docker_terminal = sandbox::create_terminal(pool, serving.id).await.expect("create_terminal");
+        anthropic::tools::execute(
+            pool,
+            serving.id,
+            &unique_id("container"),
+            "run_terminal_command",
+            &serde_json::json!({
+                "terminal_id": docker_terminal,
+                "command": format!(
+                    "sudo tar -C / -c bin sbin lib lib64 usr etc 2>/dev/null | docker import - local/base \
+                     && docker network create --subnet 172.21.9.0/24 site \
+                     && docker run -d --network site --ip {container} -v /workspace/site:/w -w /w \
+                        local/base python3 -m http.server 8001"
+                ),
+            }),
+        )
+        .await
+        .expect("start the container");
+        let host = sandbox::PodHost::Container(container);
+        let mut listening = false;
+        for _ in 0..300 {
+            if sandbox::pod_port_is_listening(pool, serving.id, host, 8001).await.expect("probe the container") {
+                listening = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(listening, "the container's server never started listening");
+
+        // The model's side: webfetch and a browsing session.
+        let fetched = anthropic::tools::execute(
+            pool,
+            serving.id,
+            &unique_id("fetch"),
+            "webfetch",
+            &serde_json::json!({"url": format!("http://{container}:8001/")}),
+        )
+        .await
+        .expect("webfetch the container");
+        assert!(fetched.contains("Hello from a Docker container"), "got {fetched}");
+        let refused = anthropic::tools::execute(
+            pool,
+            serving.id,
+            &unique_id("fetch"),
+            "webfetch",
+            &serde_json::json!({"url": "http://172.24.0.1:8001/"}),
+        )
+        .await;
+        assert!(refused.is_err(), "a private address outside the pod's Docker range must stay refused: {refused:?}");
+        crate::browsing::open_session(serving.id, crate::egress_proxy::sandbox_dial(pool.clone(), serving.id))
+            .await
+            .expect("open a browsing session");
+        let seen = crate::browsing::navigate(serving.id, &format!("http://{container}:8001/")).await;
+        crate::browsing::close_session(serving.id).await.expect("close the browsing session");
+        let seen = seen.expect("the model's browser should load the container's server");
+        assert!(seen.text.contains("Hello from a Docker container"), "got {:?}", seen.text);
+
+        // The user's side: a preview of the container, in the panel and in a tab.
+        let shared = anthropic::tools::execute(
+            pool,
+            serving.id,
+            &unique_id("preview"),
+            "sandbox_preview_url",
+            &serde_json::json!({"port": 8001, "host": container.to_string()}),
+        )
+        .await
+        .expect("share the container's preview");
+        let shared: serde_json::Value = serde_json::from_str(&shared).expect("the tool's JSON");
+        assert_eq!(shared["listening"], true, "got {shared}");
+        let link = shared["url"].as_str().expect("a url").to_string();
+        assert!(wait_for_text(&page, "172.21.9.9:8001", Duration::from_secs(10)).await, "the panel should name the container");
+        let preview_tab = harness.browser.new_page(link).await.expect("open the container's preview");
+        assert!(
+            wait_for_text(&preview_tab, "Hello from a Docker container", Duration::from_secs(10)).await,
+            "the container's preview link should show its server"
+        );
+        preview_tab.close().await.expect("close the preview tab");
         page.close().await.expect("close the tab");
     })))
     .await;

@@ -49,6 +49,9 @@ const AGENT_PORT: u16 = 8088;
 /// The agent's relay into the pod's Docker networks (`RELAY_ADDR` in
 /// src/bin/sandbox_agent.rs), SME-33.
 const RELAY_PORT: u16 = 8089;
+/// Longer than the relay's own 5s connect timeout, so its answer, or its
+/// giving up, arrives first.
+const RELAY_CONNECT_WAIT: Duration = Duration::from_secs(7);
 
 #[derive(Debug)]
 pub enum SandboxError {
@@ -1637,13 +1640,22 @@ async fn dial_pod(
         .take_stream(forward_to)
         .expect("stream requested for the forwarded port");
     if let PodHost::Container(ip) = host {
-        // The relay's one line; a target it refuses closes the stream,
+        // The relay's one line, then its answer once it has connected
+        // (`RELAY_CONNECTED` in src/bin/sandbox_agent.rs). A target it
+        // refuses, or can't reach, gets a stream that's already ended,
         // which reads the same as a port nothing listens on.
         use tokio::io::AsyncWriteExt;
         stream
             .write_all(format!("{ip}:{port}\n").as_bytes())
             .await
             .map_err(|e| TerminalError::Sandbox(SandboxError::Io(e)))?;
+        let mut answer = [0u8; 3];
+        let connected = tokio::time::timeout(RELAY_CONNECT_WAIT, stream.read_exact(&mut answer))
+            .await
+            .is_ok_and(|read| read.is_ok() && &answer == b"ok\n");
+        if !connected {
+            return Ok(Box::new(tokio::io::join(tokio::io::empty(), tokio::io::sink())));
+        }
     }
     Ok(Box::new(stream))
 }
@@ -1655,8 +1667,13 @@ async fn dial_pod(
 /// k3s); a listening server keeps the connection open waiting for a
 /// request. `LISTEN_PROBE` is well past the first and far below a request
 /// timeout.
-pub async fn pod_port_is_listening(pool: &PgPool, conversation_id: i64, port: u16) -> Result<bool, TerminalError> {
-    pod_port_is_listening_with(pool, conversation_id, port, || get().client.clone()).await
+pub async fn pod_port_is_listening(
+    pool: &PgPool,
+    conversation_id: i64,
+    host: PodHost,
+    port: u16,
+) -> Result<bool, TerminalError> {
+    pod_port_is_listening_with(pool, conversation_id, host, port, || get().client.clone()).await
 }
 
 const LISTEN_PROBE: Duration = Duration::from_millis(500);
@@ -1664,18 +1681,24 @@ const LISTEN_PROBE: Duration = Duration::from_millis(500);
 async fn pod_port_is_listening_with(
     pool: &PgPool,
     conversation_id: i64,
+    host: PodHost,
     port: u16,
     client: impl FnOnce() -> kube::Client,
 ) -> Result<bool, TerminalError> {
-    let mut stream = open_pod_port_with(pool, conversation_id, PodHost::Localhost, port, client).await?;
+    let stream = open_pod_port_with(pool, conversation_id, host, port, client).await?;
+    Ok(stream_is_listening(stream).await)
+}
+
+/// `pod_port_is_listening`'s judgement of a freshly opened stream.
+async fn stream_is_listening(mut stream: Box<dyn PodIo>) -> bool {
     let mut first = [0u8; 1];
-    Ok(match tokio::time::timeout(LISTEN_PROBE, stream.read(&mut first)).await {
+    match tokio::time::timeout(LISTEN_PROBE, stream.read(&mut first)).await {
         // Still open: something accepted the connection and is waiting.
         Err(_) => true,
         // A server that speaks first (SSH, a database) is listening too.
         Ok(Ok(n)) => n > 0,
         Ok(Err(_)) => false,
-    })
+    }
 }
 
 /// The conversation's live pod's id, for callers outside this module —
@@ -3913,7 +3936,7 @@ mod tests {
             let started = std::time::Instant::now();
             let mut statuses = Vec::new();
             for _ in 0..3 {
-                match http.get(format!("{}/no-such-path", template.url_for(with_pod.id, 8000))).send().await {
+                match http.get(format!("{}/no-such-path", template.url_for(with_pod.id, PodHost::Localhost, 8000))).send().await {
                     Ok(response) => statuses.push(response.status().as_u16()),
                     Err(_) => statuses.push(0),
                 }
@@ -3923,9 +3946,9 @@ mod tests {
         };
         let (probe_client, probe_pool) = (client.clone(), pool.clone());
         let server_listening =
-            pod_port_is_listening_with(&probe_pool, with_pod.id, 8000, || probe_client.clone()).await;
+            pod_port_is_listening_with(&probe_pool, with_pod.id, PodHost::Localhost, 8000, || probe_client.clone()).await;
         let agent_port_result = open(with_pod.id, AGENT_PORT).await;
-        let unused_listening = pod_port_is_listening_with(&probe_pool, with_pod.id, 9, || probe_client.clone()).await;
+        let unused_listening = pod_port_is_listening_with(&probe_pool, with_pod.id, PodHost::Localhost, 9, || probe_client.clone()).await;
         let without_pod_result = open(without_pod.id, 8000).await;
         let closed_reply = match open(with_pod.id, 9).await {
             Ok(mut stream) => Ok(http_get_over(&mut stream, "/").await),
@@ -4169,6 +4192,16 @@ mod tests {
                 fetch(PodHost::Container(std::net::Ipv4Addr::new(10, 43, 0, 1)), 443).await,
                 "",
                 "the relay must refuse an address outside the Docker range"
+            );
+            // An address no container has yet (one still starting) isn't
+            // listening: the relay mustn't look open while it's connecting.
+            let nobody = dial_pod(&client, &first.pod_name, PodHost::Container(std::net::Ipv4Addr::new(172, 21, 200, 200)), 8001)
+                .await
+                .expect("dial_pod");
+            assert!(!stream_is_listening(nobody).await, "nothing is at 172.21.200.200:8001");
+            assert!(
+                stream_is_listening(dial_pod(&client, &first.pod_name, PodHost::Container(container_ip), 8001).await.expect("dial_pod")).await,
+                "the unpublished container is listening"
             );
 
             // A container can't reach the sandbox agent, whose WebSocket
@@ -5896,3 +5929,4 @@ mod tests {
         );
     }
 }
+

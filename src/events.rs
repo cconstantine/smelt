@@ -15,7 +15,22 @@ use crate::models::Message;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SandboxPreview {
     pub port: u16,
+    /// A Docker container's address in the pod, or `None` for the pod's
+    /// own localhost (SME-33).
+    #[serde(default)]
+    pub host: Option<String>,
     pub url: String,
+}
+
+impl SandboxPreview {
+    /// What the preview reaches, as the panel names it: `port 3000`, or a
+    /// container's `172.21.0.2:3000`.
+    pub fn label(&self) -> String {
+        match &self.host {
+            Some(host) => format!("{host}:{}", self.port),
+            None => format!("port {}", self.port),
+        }
+    }
 }
 
 /// `TaskUpdate` is ephemeral UI telemetry, regenerable at any time from the
@@ -474,6 +489,17 @@ pub use server::{app_subscriber_count, subscriber_count};
 
 #[cfg(test)]
 mod wire_tests {
+    #[test]
+    fn test_a_preview_label_names_the_port_or_the_container() {
+        let preview = |host: Option<&str>| SandboxPreview {
+            port: 3000,
+            host: host.map(str::to_string),
+            url: String::new(),
+        };
+        assert_eq!(preview(None).label(), "port 3000");
+        assert_eq!(preview(Some("172.21.0.2")).label(), "172.21.0.2:3000");
+    }
+
     use super::*;
 
     #[test]
@@ -518,10 +544,18 @@ mod wire_tests {
             },
             ConversationEvent::SandboxPreviewUpdate {
                 pod_id: 1,
-                previews: vec![SandboxPreview {
-                    port: 3000,
-                    url: "http://3000-3.preview.localhost:8181".to_string(),
-                }],
+                previews: vec![
+                    SandboxPreview {
+                        port: 3000,
+                        host: None,
+                        url: "http://3000-3.preview.localhost:8181".to_string(),
+                    },
+                    SandboxPreview {
+                        port: 3000,
+                        host: Some("172.21.0.2".to_string()),
+                        url: "http://172-21-0-2-3000-3.preview.localhost:8181".to_string(),
+                    },
+                ],
             },
             ConversationEvent::SandboxTerminalUpdate {
                 pod_id: 1,

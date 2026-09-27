@@ -15,6 +15,8 @@
 /// The default `SMELT_PREVIEW_URL`: `*.localhost` resolves to this machine
 /// in browsers with no DNS set up, and `8181` is the port compose
 /// publishes.
+use crate::sandbox::PodHost;
+
 pub const DEFAULT_PREVIEW_URL: &str = "http://{port}-{conversation}.preview.localhost:8181";
 
 /// Where the preview listener binds unless `SMELT_PREVIEW_ADDR` says
@@ -39,13 +41,31 @@ pub fn configured_template() -> Result<PreviewTemplate, String> {
 pub fn preview_links(
     template: &PreviewTemplate,
     conversation_id: i64,
-    ports: &[u16],
+    previews: &[(PodHost, u16)],
 ) -> Vec<crate::events::SandboxPreview> {
-    ports
+    previews
         .iter()
-        .map(|&port| crate::events::SandboxPreview {
+        .map(|&(host, port)| crate::events::SandboxPreview {
             port,
-            url: template.url_for(conversation_id, port),
+            host: match host {
+                PodHost::Localhost => None,
+                PodHost::Container(ip) => Some(ip.to_string()),
+            },
+            url: template.url_for(conversation_id, host, port),
+        })
+        .collect()
+}
+
+/// Previews as `db::list_pod_previews` stores them — `""` for the pod's
+/// localhost, or a container's address — as hosts in the pod.
+pub fn stored_previews(rows: &[(String, u16)]) -> Vec<(PodHost, u16)> {
+    rows.iter()
+        .filter_map(|(host, port)| {
+            let host = match host.as_str() {
+                "" => PodHost::Localhost,
+                address => PodHost::Container(crate::docker_net::container_address(address)?),
+            };
+            Some((host, *port))
         })
         .collect()
 }
@@ -103,33 +123,79 @@ impl PreviewTemplate {
         })
     }
 
-    /// The preview's base URL for `port` in `conversation_id`'s sandbox.
-    pub fn url_for(&self, conversation_id: i64, port: u16) -> String {
+    /// The preview's base URL for `host:port` in `conversation_id`'s
+    /// sandbox: the pod's own localhost, or a Docker container there.
+    pub fn url_for(&self, conversation_id: i64, host: PodHost, port: u16) -> String {
+        let slot = port_slot(host, port);
         let (first, second) = if self.port_first {
-            (port.to_string(), conversation_id.to_string())
+            (slot, conversation_id.to_string())
         } else {
-            (conversation_id.to_string(), port.to_string())
+            (conversation_id.to_string(), slot)
         };
         format!("{}://{}{first}{}{second}{}", self.scheme, self.before, self.between, self.after)
     }
 
-    /// The conversation and port a request's `Host` header names, if it's
-    /// a preview address at all.
-    pub fn match_host(&self, host: &str) -> Option<(i64, u16)> {
+    /// The conversation, host in its pod, and port a request's `Host`
+    /// header names, if it's a preview address at all.
+    pub fn match_host(&self, host: &str) -> Option<(i64, PodHost, u16)> {
         let host = host.to_ascii_lowercase();
         let middle = host.strip_prefix(&self.before)?.strip_suffix(&self.after)?;
-        let first_len = middle.bytes().take_while(u8::is_ascii_digit).count();
-        let (first, rest) = middle.split_at(first_len);
-        let second = rest.strip_prefix(&self.between)?;
-        let is_number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-        if !is_number(first) || !is_number(second) {
+        // The conversation is digits only, so it's split off from its own
+        // side; the port slot may hold a dashed container address.
+        let (slot, conversation) = if self.port_first {
+            middle.rsplit_once(&self.between)?
+        } else {
+            let (conversation, slot) = middle.split_once(&self.between)?;
+            (slot, conversation)
+        };
+        if !is_number(conversation) {
             return None;
         }
-        let (port, conversation) = if self.port_first { (first, second) } else { (second, first) };
-        let port: u16 = port.parse().ok().filter(|&p| p != 0)?;
         let conversation: i64 = conversation.parse().ok().filter(|&c| c > 0)?;
-        Some((conversation, port))
+        let (pod_host, port) = parse_port_slot(slot)?;
+        Some((conversation, pod_host, port))
     }
+}
+
+/// What fills a preview address's `{port}` slot: the port for the pod's
+/// own localhost, or a container's address and port with dashes for dots,
+/// e.g. `172-21-0-2-3000` (SME-33).
+fn port_slot(host: PodHost, port: u16) -> String {
+    match host {
+        PodHost::Localhost => port.to_string(),
+        PodHost::Container(ip) => {
+            let [a, b, c, d] = ip.octets();
+            format!("{a}-{b}-{c}-{d}-{port}")
+        }
+    }
+}
+
+/// `port_slot` read back: a port alone, or a container address in the
+/// pod's Docker range followed by a port.
+fn parse_port_slot(slot: &str) -> Option<(PodHost, u16)> {
+    let parts: Vec<&str> = slot.split('-').collect();
+    if !parts.iter().all(|p| is_number(p)) {
+        return None;
+    }
+    let (host, port) = match parts[..] {
+        [port] => (PodHost::Localhost, port),
+        [a, b, c, d, port] => {
+            let address = format!("{a}.{b}.{c}.{d}");
+            let ip = crate::docker_net::container_address(&address)?;
+            // "172.021.0.2" would parse the same; only one spelling counts.
+            if ip.to_string() != address {
+                return None;
+            }
+            (PodHost::Container(ip), port)
+        }
+        _ => return None,
+    };
+    let port: u16 = port.parse().ok().filter(|&p| p != 0)?;
+    Some((host, port))
+}
+
+fn is_number(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 pub use server::*;
@@ -146,6 +212,7 @@ mod server {
     use tokio::net::TcpListener;
 
     use super::PreviewTemplate;
+    use crate::sandbox::PodHost;
     use crate::egress_proxy::SandboxDial;
 
     /// How to reach a conversation's sandbox: `egress_proxy::sandbox_dial`
@@ -216,6 +283,7 @@ mod server {
     /// and port it's to.
     struct Upstream {
         conversation: i64,
+        host: PodHost,
         port: u16,
         sender: SendRequest<Body>,
     }
@@ -229,7 +297,7 @@ mod server {
         cached: &CachedUpstream,
     ) -> Response<Body> {
         let host = request.headers().get(HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
-        let Some((conversation, port)) = template.match_host(host) else {
+        let Some((conversation, pod_host, port)) = template.match_host(host) else {
             return text_response(StatusCode::NOT_FOUND, "This isn't a sandbox preview address.");
         };
         // Only this conversation's own previews, and someone opening the link
@@ -244,7 +312,7 @@ mod server {
         };
         let is_home = |host: &str, port: Option<u16>| {
             let authority = port.map_or_else(|| host.to_string(), |port| format!("{host}:{port}"));
-            template.match_host(&authority).is_some_and(|(origin_conversation, _)| origin_conversation == conversation)
+            template.match_host(&authority).is_some_and(|(origin_conversation, _, _)| origin_conversation == conversation)
         };
         if !crate::fetch_guard::allows_request_from(&source, is_home) {
             return text_response(
@@ -254,11 +322,10 @@ mod server {
             );
         }
         // The dev server sees itself addressed as it would locally, so a
-        // host check (Vite's, for one) accepts the request.
-        request.headers_mut().insert(
-            HOST,
-            HeaderValue::from_str(&format!("localhost:{port}")).expect("a valid Host"),
-        );
+        // host check (Vite's, for one) accepts the request: `localhost`, or
+        // the container's own address, as from a Linux host (SME-33).
+        let local = local_authority(pod_host, port);
+        request.headers_mut().insert(HOST, HeaderValue::from_str(&local).expect("a valid Host"));
         let downstream_upgrade = request
             .headers()
             .contains_key(UPGRADE)
@@ -283,16 +350,18 @@ mod server {
         let mut cached = cached.lock().await;
         let reusable = cached
             .take()
-            .filter(|up| up.conversation == conversation && up.port == port && !up.sender.is_closed());
+            .filter(|up| {
+                up.conversation == conversation && up.host == pod_host && up.port == port && !up.sender.is_closed()
+            });
         let (mut sender, mut reused) = match reusable {
             Some(up) => (up.sender, true),
-            None => match connect(dial_for, conversation, port).await {
+            None => match connect(dial_for, conversation, pod_host, port).await {
                 Ok(sender) => (sender, false),
                 Err(response) => return response,
             },
         };
         if reused && sender.ready().await.is_err() {
-            sender = match connect(dial_for, conversation, port).await {
+            sender = match connect(dial_for, conversation, pod_host, port).await {
                 Ok(sender) => sender,
                 Err(response) => return response,
             };
@@ -302,7 +371,7 @@ mod server {
         let first_try = match (first_try, retry) {
             (Err(e), Some(retry)) if reused => {
                 tracing::debug!(conversation, port, "preview: reused connection gone, retrying: {e}");
-                sender = match connect(dial_for, conversation, port).await {
+                sender = match connect(dial_for, conversation, pod_host, port).await {
                     Ok(sender) => sender,
                     Err(response) => return response,
                 };
@@ -317,11 +386,12 @@ mod server {
                 tracing::debug!(conversation, port, reused, "preview: no response: {e}");
                 let message = if reused {
                     format!(
-                        "The connection to port {port} in this conversation's sandbox closed. \
-                         Reload to try again."
+                        "The connection to {} in this conversation's sandbox closed. \
+                         Reload to try again.",
+                        what(pod_host, port)
                     )
                 } else {
-                    format!("Nothing is listening on port {port} in this conversation's sandbox.")
+                    format!("Nothing is listening on {} in this conversation's sandbox.", what(pod_host, port))
                 };
                 return text_response(StatusCode::BAD_GATEWAY, &message);
             }
@@ -343,11 +413,11 @@ mod server {
                     }
                 });
             }
-            _ => *cached = Some(Upstream { conversation, port, sender }),
+            _ => *cached = Some(Upstream { conversation, host: pod_host, port, sender }),
         }
         drop(cached);
 
-        rewrite_location(&mut response, port, &template.url_for(conversation, port));
+        rewrite_location(&mut response, pod_host, port, &template.url_for(conversation, pod_host, port));
         response.map(Body::new)
     }
 
@@ -356,9 +426,10 @@ mod server {
     async fn connect(
         dial_for: &DialFor,
         conversation: i64,
+        host: PodHost,
         port: u16,
     ) -> Result<SendRequest<Body>, Response<Body>> {
-        let stream = dial_for(conversation)(crate::sandbox::PodHost::Localhost, port)
+        let stream = dial_for(conversation)(host, port)
             .await
             .map_err(|message| text_response(StatusCode::BAD_GATEWAY, &message))?;
         let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
@@ -366,7 +437,7 @@ mod server {
             .map_err(|e| {
                 text_response(
                     StatusCode::BAD_GATEWAY,
-                    &format!("Couldn't talk to port {port} in the sandbox: {e}"),
+                    &format!("Couldn't talk to {} in the sandbox: {e}", what(host, port)),
                 )
             })?;
         tokio::spawn(async move {
@@ -379,11 +450,33 @@ mod server {
 
     /// Points a redirect to the dev server's own local address back at the
     /// preview, so following it stays on the preview.
-    fn rewrite_location(response: &mut Response<Incoming>, port: u16, preview_base: &str) {
+    /// What a preview reaches, for a message: `port 3000`, or a container's
+    /// `172.21.0.2:3000`.
+    fn what(host: PodHost, port: u16) -> String {
+        match host {
+            PodHost::Localhost => format!("port {port}"),
+            PodHost::Container(ip) => format!("{ip}:{port}"),
+        }
+    }
+
+    /// `host:port` as the dev server would be addressed from the pod, or
+    /// from a Linux host for a container.
+    fn local_authority(host: PodHost, port: u16) -> String {
+        match host {
+            PodHost::Localhost => format!("localhost:{port}"),
+            PodHost::Container(ip) => format!("{ip}:{port}"),
+        }
+    }
+
+    fn rewrite_location(response: &mut Response<Incoming>, host: PodHost, port: u16, preview_base: &str) {
         let Some(location) = response.headers().get(LOCATION).and_then(|l| l.to_str().ok()) else {
             return;
         };
-        let rewritten = ["localhost", "127.0.0.1", "[::1]"].iter().find_map(|host| {
+        let names: Vec<String> = match host {
+            PodHost::Localhost => ["localhost", "127.0.0.1", "[::1]"].map(String::from).to_vec(),
+            PodHost::Container(ip) => vec![ip.to_string()],
+        };
+        let rewritten = names.iter().find_map(|host| {
             let local = format!("http://{host}:{port}");
             let rest = location.strip_prefix(&local)?;
             (rest.is_empty() || rest.starts_with(['/', '?', '#'])).then(|| format!("{preview_base}{rest}"))
@@ -431,6 +524,12 @@ mod server {
                     }),
                 )
                 .route(
+                    "/redirect-container",
+                    axum::routing::get(|| async {
+                        (StatusCode::FOUND, [(hyper::header::LOCATION, "http://172.21.0.2:3000/landed")])
+                    }),
+                )
+                .route(
                     "/ws",
                     axum::routing::get(|ws: WebSocketUpgrade| async move {
                         ws.on_upgrade(|mut socket| async move {
@@ -455,6 +554,22 @@ mod server {
                 let dials = dials.clone();
                 Arc::new(move |_host, port| {
                     dials.lock().unwrap().push((conversation, port));
+                    Box::pin(async move {
+                        let stream = TcpStream::connect(upstream).await.map_err(|e| e.to_string())?;
+                        Ok(Box::new(stream) as Box<dyn PodIo>)
+                    }) as DialFuture
+                }) as SandboxDial
+            })
+        }
+
+        /// Every dial made, with the host in the pod: (conversation, host, port).
+        type HostDials = Arc<Mutex<Vec<(i64, PodHost, u16)>>>;
+
+        fn dial_hosts_to_upstream(upstream: SocketAddr, dials: HostDials) -> DialFor {
+            Arc::new(move |conversation| {
+                let dials = dials.clone();
+                Arc::new(move |host, port| {
+                    dials.lock().unwrap().push((conversation, host, port));
                     Box::pin(async move {
                         let stream = TcpStream::connect(upstream).await.map_err(|e| e.to_string())?;
                         Ok(Box::new(stream) as Box<dyn PodIo>)
@@ -492,7 +607,7 @@ mod server {
             let dials = Dials::default();
             let (preview, template) = start_preview(dial_for_upstream(upstream, dials.clone())).await;
             let client = client_for(preview, &["3000-42.preview.localhost"]);
-            let response = client.get(format!("{}/", template.url_for(42, 3000))).send().await.unwrap();
+            let response = client.get(format!("{}/", template.url_for(42, PodHost::Localhost, 3000))).send().await.unwrap();
             assert_eq!(response.status(), 200);
             assert_eq!(response.text().await.unwrap(), "host=localhost:3000");
             assert_eq!(*dials.lock().unwrap(), vec![(42, 3000)]);
@@ -506,7 +621,7 @@ mod server {
             let client = client_for(preview, &["3000-7.preview.localhost", "5173-8.preview.localhost"]);
             for (conversation, port) in [(7, 3000), (8, 5173)] {
                 let response = client
-                    .get(format!("{}/", template.url_for(conversation, port)))
+                    .get(format!("{}/", template.url_for(conversation, PodHost::Localhost, port)))
                     .send()
                     .await
                     .unwrap();
@@ -538,9 +653,9 @@ mod server {
             let dials = Dials::default();
             let (preview, template) = start_preview(dial_for_upstream(upstream, dials.clone())).await;
             let client = client_for(preview, &["3000-42.preview.localhost"]);
-            let url = format!("{}/", template.url_for(42, 3000));
-            let other_port = template.url_for(42, 5173);
-            let other_conversation = template.url_for(7, 3000);
+            let url = format!("{}/", template.url_for(42, PodHost::Localhost, 3000));
+            let other_port = template.url_for(42, PodHost::Localhost, 5173);
+            let other_conversation = template.url_for(7, PodHost::Localhost, 3000);
             let refused: [&[(&str, &str)]; 3] = [
                 &[("origin", "https://evil.example"), ("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "cors")],
                 &[("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "no-cors")],
@@ -583,7 +698,7 @@ mod server {
             });
             let (preview, template) = start_preview(dial_for).await;
             let client = client_for(preview, &["3000-42.preview.localhost"]);
-            let response = client.get(format!("{}/", template.url_for(42, 3000))).send().await.unwrap();
+            let response = client.get(format!("{}/", template.url_for(42, PodHost::Localhost, 3000))).send().await.unwrap();
             assert_eq!(response.status(), 502);
             assert_eq!(response.text().await.unwrap(), "This conversation has no running sandbox.");
         }
@@ -601,7 +716,7 @@ mod server {
             });
             let (preview, template) = start_preview(dial_for_upstream(silent_addr, Dials::default())).await;
             let client = client_for(preview, &["3000-42.preview.localhost"]);
-            let response = client.get(format!("{}/", template.url_for(42, 3000))).send().await.unwrap();
+            let response = client.get(format!("{}/", template.url_for(42, PodHost::Localhost, 3000))).send().await.unwrap();
             assert_eq!(response.status(), 502);
             let body = response.text().await.unwrap();
             assert!(body.contains("Nothing is listening on port 3000"), "got {body:?}");
@@ -613,15 +728,36 @@ mod server {
             let (preview, template) = start_preview(dial_for_upstream(upstream, Dials::default())).await;
             let client = client_for(preview, &["3000-42.preview.localhost"]);
             let response = client
-                .get(format!("{}/redirect", template.url_for(42, 3000)))
+                .get(format!("{}/redirect", template.url_for(42, PodHost::Localhost, 3000)))
                 .send()
                 .await
                 .unwrap();
             assert_eq!(response.status(), 302);
             assert_eq!(
                 response.headers().get("location").unwrap(),
-                &format!("{}/landed", template.url_for(42, 3000))
+                &format!("{}/landed", template.url_for(42, PodHost::Localhost, 3000))
             );
+        }
+
+        /// A container's preview dials that container, which sees itself
+        /// addressed as it would from a Linux host, and a redirect to its
+        /// own address stays on the preview (SME-33).
+        #[tokio::test]
+        async fn test_a_container_preview_reaches_that_container() {
+            let upstream = start_upstream().await;
+            let dials = HostDials::default();
+            let (preview, template) = start_preview(dial_hosts_to_upstream(upstream, dials.clone())).await;
+            let container = PodHost::Container(std::net::Ipv4Addr::new(172, 21, 0, 2));
+            let client = client_for(preview, &["172-21-0-2-3000-42.preview.localhost"]);
+            let base = template.url_for(42, container, 3000);
+            let response = client.get(format!("{base}/")).send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.text().await.unwrap(), "host=172.21.0.2:3000");
+            assert_eq!(*dials.lock().unwrap(), vec![(42, container, 3000)]);
+
+            let response = client.get(format!("{base}/redirect-container")).send().await.unwrap();
+            assert_eq!(response.status(), 302);
+            assert_eq!(response.headers().get("location").unwrap(), &format!("{base}/landed"));
         }
 
         #[tokio::test]
@@ -631,7 +767,7 @@ mod server {
             let (preview, template) = start_preview(dial_for_upstream(upstream, dials.clone())).await;
             let client = client_for(preview, &["3000-42.preview.localhost"]);
             for _ in 0..3 {
-                let response = client.get(format!("{}/", template.url_for(42, 3000))).send().await.unwrap();
+                let response = client.get(format!("{}/", template.url_for(42, PodHost::Localhost, 3000))).send().await.unwrap();
                 assert_eq!(response.text().await.unwrap(), "host=localhost:3000");
             }
             assert_eq!(dials.lock().unwrap().len(), 1, "one connection, one port-forward");
@@ -661,7 +797,7 @@ mod server {
             let dials = Dials::default();
             let (preview, template) = start_preview(dial_for_upstream(upstream_addr, dials.clone())).await;
             let client = client_for(preview, &["3000-42.preview.localhost"]);
-            let url = format!("{}/", template.url_for(42, 3000));
+            let url = format!("{}/", template.url_for(42, PodHost::Localhost, 3000));
 
             let cut_short = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 client.get(&url).send().await?.text().await
@@ -806,7 +942,7 @@ mod server {
         async fn test_a_websocket_passes_through_to_the_dev_server() {
             let upstream = start_upstream().await;
             let (preview, template) = start_preview(dial_for_upstream(upstream, Dials::default())).await;
-            let url = format!("{}/ws", template.url_for(42, 5173)).replace("http://", "ws://");
+            let url = format!("{}/ws", template.url_for(42, PodHost::Localhost, 5173)).replace("http://", "ws://");
             let stream = TcpStream::connect(preview).await.unwrap();
             let (mut socket, _) = tokio_tungstenite::client_async(url, stream).await.expect("upgrade");
             socket
@@ -834,23 +970,55 @@ mod tests {
     #[test]
     fn test_the_default_template_builds_and_matches_dev_addresses() {
         let t = template(DEFAULT_PREVIEW_URL);
-        assert_eq!(t.url_for(42, 3000), "http://3000-42.preview.localhost:8181");
-        assert_eq!(t.match_host("3000-42.preview.localhost:8181"), Some((42, 3000)));
-        assert_eq!(t.match_host("3000-42.Preview.LOCALHOST:8181"), Some((42, 3000)));
+        assert_eq!(t.url_for(42, PodHost::Localhost, 3000), "http://3000-42.preview.localhost:8181");
+        assert_eq!(t.match_host("3000-42.preview.localhost:8181"), Some((42, PodHost::Localhost, 3000)));
+        assert_eq!(t.match_host("3000-42.Preview.LOCALHOST:8181"), Some((42, PodHost::Localhost, 3000)));
     }
 
     #[test]
     fn test_a_production_template_under_a_wildcard_domain() {
         let t = template("https://{port}-{conversation}-smelt.constantlee.us");
-        assert_eq!(t.url_for(7, 5173), "https://5173-7-smelt.constantlee.us");
-        assert_eq!(t.match_host("5173-7-smelt.constantlee.us"), Some((7, 5173)));
+        assert_eq!(t.url_for(7, PodHost::Localhost, 5173), "https://5173-7-smelt.constantlee.us");
+        assert_eq!(t.match_host("5173-7-smelt.constantlee.us"), Some((7, PodHost::Localhost, 5173)));
     }
 
     #[test]
     fn test_the_placeholders_can_come_in_either_order() {
         let t = template("https://c{conversation}-p{port}.example.com");
-        assert_eq!(t.url_for(12, 8080), "https://c12-p8080.example.com");
-        assert_eq!(t.match_host("c12-p8080.example.com"), Some((12, 8080)));
+        assert_eq!(t.url_for(12, PodHost::Localhost, 8080), "https://c12-p8080.example.com");
+        assert_eq!(t.match_host("c12-p8080.example.com"), Some((12, PodHost::Localhost, 8080)));
+    }
+
+    #[test]
+    fn test_a_container_preview_carries_its_address_in_the_port_slot() {
+        let container = PodHost::Container(std::net::Ipv4Addr::new(172, 21, 0, 2));
+        let t = template(DEFAULT_PREVIEW_URL);
+        assert_eq!(t.url_for(42, container, 3000), "http://172-21-0-2-3000-42.preview.localhost:8181");
+        assert_eq!(
+            t.match_host("172-21-0-2-3000-42.preview.localhost:8181"),
+            Some((42, container, 3000))
+        );
+        let t = template("https://c{conversation}-p{port}.example.com");
+        assert_eq!(t.url_for(12, container, 8080), "https://c12-p172-21-0-2-8080.example.com");
+        assert_eq!(t.match_host("c12-p172-21-0-2-8080.example.com"), Some((12, container, 8080)));
+    }
+
+    #[test]
+    fn test_container_preview_hosts_outside_the_pod_or_malformed_do_not_match() {
+        let t = template(DEFAULT_PREVIEW_URL);
+        for host in [
+            // Outside the pod's Docker range.
+            "172-24-0-1-3000-42.preview.localhost:8181",
+            "10-43-0-1-443-42.preview.localhost:8181",
+            // Not an address and a port.
+            "21-0-2-3000-42.preview.localhost:8181",
+            "172-21-0-2-42.preview.localhost:8181",
+            "172-21-0-2-0-42.preview.localhost:8181",
+            "172-21-0-256-3000-42.preview.localhost:8181",
+            "172-21-0-2-3000--42.preview.localhost:8181",
+        ] {
+            assert_eq!(t.match_host(host), None, "{host:?} is not a preview");
+        }
     }
 
     #[test]
@@ -879,12 +1047,19 @@ mod tests {
     #[test]
     fn test_preview_links_pair_each_port_with_its_address() {
         let t = template(DEFAULT_PREVIEW_URL);
-        let links = preview_links(&t, 9, &[3000, 5173]);
+        let container = PodHost::Container(std::net::Ipv4Addr::new(172, 21, 0, 2));
+        let links = preview_links(&t, 9, &[(PodHost::Localhost, 3000), (PodHost::Localhost, 5173), (container, 3000)]);
+        let link = |port, host: Option<&str>, url: &str| crate::events::SandboxPreview {
+            port,
+            host: host.map(str::to_string),
+            url: url.to_string(),
+        };
         assert_eq!(
             links,
             vec![
-                crate::events::SandboxPreview { port: 3000, url: "http://3000-9.preview.localhost:8181".to_string() },
-                crate::events::SandboxPreview { port: 5173, url: "http://5173-9.preview.localhost:8181".to_string() },
+                link(3000, None, "http://3000-9.preview.localhost:8181"),
+                link(5173, None, "http://5173-9.preview.localhost:8181"),
+                link(3000, Some("172.21.0.2"), "http://172-21-0-2-3000-9.preview.localhost:8181"),
             ]
         );
     }
