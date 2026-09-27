@@ -641,6 +641,17 @@ mod tests {
         assert!(error.contains("port 3000") && error.contains("Timed out"), "got {error:?}");
     }
 
+    #[sqlx::test]
+    async fn test_sandbox_dial_refuses_the_sandbox_agents_port(pool: PgPool) {
+        let conversation = crate::db::create_conversation(&pool).await.expect("create conversation");
+        let dial = sandbox_dial(pool, conversation.id);
+        let error = match dial(8088).await {
+            Ok(_) => panic!("the sandbox agent's port must never be reachable"),
+            Err(e) => e,
+        };
+        assert!(error.contains("sandbox agent"), "got {error:?}");
+    }
+
     #[tokio::test]
     async fn test_dropping_a_routed_proxy_stops_it_accepting() {
         let upstream = start_upstream().await;

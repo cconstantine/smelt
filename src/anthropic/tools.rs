@@ -2192,6 +2192,7 @@ mod server {
             .and_then(|p| u16::try_from(p).ok())
             .filter(|&p| p != 0)
             .ok_or("port must be a number from 1 to 65535")?;
+        crate::sandbox::check_reachable_port(port).map_err(|e| e.to_string())?;
         let pod_id = crate::sandbox::live_pod_id(pool, conversation_id)
             .await
             .map_err(|e| match e {
@@ -2445,6 +2446,15 @@ mod server {
                 .await
                 .expect_err("no pod, no preview");
             assert!(message.contains("create_pod"), "should say how to get a sandbox: {message}");
+        }
+
+        #[sqlx::test]
+        async fn test_sandbox_preview_url_refuses_the_sandbox_agents_port(pool: sqlx::PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("create conversation");
+            let message = sandbox_preview_url_tool(&pool, conversation.id, &serde_json::json!({"port": 8088}))
+                .await
+                .expect_err("the agent's port is never previewed");
+            assert!(message.contains("sandbox agent"), "{message}");
         }
 
         #[sqlx::test]
