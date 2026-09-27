@@ -17,7 +17,8 @@ use futures_util::StreamExt;
 
 /// Enables CDP Fetch-domain request interception on `page` and spawns a
 /// background task that checks every paused request's URL against
-/// `is_addr_allowed` (via `is_request_allowed_with`), continuing it if
+/// `is_addr_allowed` (via `check_load`, which also lets a `localhost`-style
+/// host through when `sandbox_routed` — see there), continuing it if
 /// safe and failing it (`ErrorReason::BlockedByClient`) otherwise. Shared
 /// by `src/webfetch.rs` (one page, used for the duration of a single
 /// `fetch` call) and `src/browsing.rs` (one page, kept open across many
@@ -31,6 +32,7 @@ use futures_util::StreamExt;
 pub async fn spawn_request_interceptor(
     page: &Page,
     is_addr_allowed: fn(IpAddr) -> bool,
+    sandbox_routed: bool,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     page.execute(EnableParams::default())
         .await
@@ -42,7 +44,9 @@ pub async fn spawn_request_interceptor(
     let intercept_page = page.clone();
     Ok(tokio::spawn(async move {
         while let Some(event) = paused.next().await {
-            let allowed = is_request_allowed_with(&event.request.url, is_addr_allowed).await;
+            let allowed = check_load(&event.request.url, is_addr_allowed, sandbox_routed)
+                .await
+                .is_ok();
             let result = if allowed {
                 intercept_page
                     .execute(ContinueRequestParams::new(event.request_id.clone()))
@@ -89,6 +93,18 @@ pub fn is_safe_fetch_addr(addr: IpAddr) -> bool {
     }
 }
 
+/// Whether `host` names "this machine" the way a model writes it —
+/// `localhost`, `127.0.0.1` or `::1` (bracketed or not). In a browser
+/// context with a sandbox route, these mean the conversation's own pod
+/// rather than smelt's server (SME-42); everywhere else they stay refused
+/// like any other loopback address. The one definition shared by the
+/// egress proxy and the per-page checks, so the two can't drift apart.
+pub fn is_sandbox_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = host.strip_suffix('.').unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
 /// Parses `url` and, if it's a well-formed `http`/`https` URL, returns its
 /// `(host, port)` — pure and synchronous; only the DNS resolution that
 /// follows (`is_request_allowed`) needs to be async. Rejects every other
@@ -110,9 +126,9 @@ pub fn parse_fetch_target(url: &str) -> Result<(String, u16), String> {
 
 /// Test-only convenience: `is_request_allowed_with` against the real
 /// default guard, so a test doesn't have to spell out `is_safe_fetch_addr`
-/// every time. Real callers (`webfetch`'s interception loop,
-/// `http_request`'s redirect loop) call `is_request_allowed_with` directly
-/// with whichever predicate that specific call was given.
+/// every time. The real caller (`http_request`'s redirect loop) calls
+/// `is_request_allowed_with` directly with whichever predicate that call
+/// was given; browser pages use `check_load` instead.
 #[cfg(test)]
 pub async fn is_request_allowed(url: &str) -> bool {
     is_request_allowed_with(url, is_safe_fetch_addr).await
@@ -132,6 +148,25 @@ pub async fn is_request_allowed_with(url: &str, is_addr_allowed: fn(IpAddr) -> b
         return false;
     };
     resolve_allowed(&host, port, is_addr_allowed).await.is_ok()
+}
+
+/// Whether a page may load `url` — the check both the per-page request
+/// interceptor and the pre-navigation checks make. With `sandbox_routed`
+/// (the page's browser context has a sandbox route, SME-42), a
+/// `localhost`-style host is let through without resolving: the context's
+/// own proxy sends it to the conversation's pod, never to this machine.
+/// Every other host must resolve only to addresses `is_addr_allowed`
+/// accepts. The error says why, for the model to read.
+pub async fn check_load(
+    url: &str,
+    is_addr_allowed: fn(IpAddr) -> bool,
+    sandbox_routed: bool,
+) -> Result<(), String> {
+    let (host, port) = parse_fetch_target(url)?;
+    if sandbox_routed && is_sandbox_host(&host) {
+        return Ok(());
+    }
+    resolve_allowed(&host, port, is_addr_allowed).await.map(|_| ())
 }
 
 /// Resolves `host:port` and returns its addresses only if every one of them
@@ -283,5 +318,52 @@ mod tests {
         let (text, truncated) = truncate(long, 20_000);
         assert_eq!(text.chars().count(), 20_000);
         assert!(truncated);
+    }
+
+    #[test]
+    fn test_is_sandbox_host_matches_the_ways_a_model_writes_this_machine() {
+        for host in ["localhost", "LocalHost", "localhost.", "127.0.0.1", "::1", "[::1]"] {
+            assert!(is_sandbox_host(host), "{host} should mean the sandbox");
+        }
+    }
+
+    #[test]
+    fn test_is_sandbox_host_leaves_every_other_host_alone() {
+        for host in ["example.com", "127.0.0.2", "app.localhost", "localhost.example.com", "10.0.0.1", "0.0.0.0", ""] {
+            assert!(!is_sandbox_host(host), "{host:?} should not mean the sandbox");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_load_lets_a_routed_context_load_localhost() {
+        for url in ["http://localhost:3000/", "http://127.0.0.1:5173/x", "http://[::1]:8000/"] {
+            assert_eq!(check_load(url, is_safe_fetch_addr, true).await, Ok(()), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_load_refuses_localhost_without_a_sandbox_route() {
+        let error = check_load("http://localhost:3000/", is_safe_fetch_addr, false)
+            .await
+            .expect_err("loopback without a route must be refused");
+        assert!(error.contains("refused address"), "got {error:?}");
+    }
+
+    #[tokio::test]
+    async fn test_check_load_still_refuses_other_private_hosts_in_a_routed_context() {
+        for url in ["http://10.0.0.5/", "http://169.254.169.254/", "http://127.0.0.2:3000/"] {
+            assert!(check_load(url, is_safe_fetch_addr, true).await.is_err(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_load_refuses_non_http_schemes_even_when_routed() {
+        assert!(check_load("file:///etc/passwd", is_safe_fetch_addr, true).await.is_err());
+        assert!(check_load("data:text/html,hi", is_safe_fetch_addr, true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_check_load_allows_a_public_address() {
+        assert_eq!(check_load("http://1.1.1.1/", is_safe_fetch_addr, false).await, Ok(()));
     }
 }

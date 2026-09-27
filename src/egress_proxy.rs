@@ -12,13 +12,18 @@
 //! different host. Every target is resolved here, every resolved address is
 //! checked, and the connection goes to exactly the address that was checked.
 
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::fetch_guard;
+use crate::sandbox::PodIo;
+use sqlx::PgPool;
 
 /// Largest request head accepted — far above anything a browser sends.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
@@ -41,27 +46,95 @@ pub fn requests_handled() -> u64 {
 pub async fn start(is_addr_allowed: fn(IpAddr) -> bool) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((client, _)) => {
-                    tokio::spawn(async move {
-                        if let Err(e) = handle(client, is_addr_allowed).await {
-                            tracing::debug!("egress proxy: {e}");
-                        }
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("egress proxy: accept failed: {e}");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        }
-    });
+    tokio::spawn(accept_loop(listener, is_addr_allowed, None));
     Ok(addr)
 }
 
-async fn handle(mut client: TcpStream, is_addr_allowed: fn(IpAddr) -> bool) -> Result<(), String> {
+/// Opens a connection to a port in one conversation's sandbox pod —
+/// `sandbox::open_pod_port` for that conversation, or a stand-in in tests.
+/// An `Err` is a message the proxy shows as the reason it couldn't connect.
+pub type SandboxDial = Arc<
+    dyn Fn(u16) -> Pin<Box<dyn Future<Output = Result<Box<dyn PodIo>, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The real `SandboxDial` for `conversation_id`: `sandbox::open_pod_port`,
+/// with its failures turned into sentences the model (or the user, in the
+/// live panel) can act on.
+pub fn sandbox_dial(pool: PgPool, conversation_id: i64) -> SandboxDial {
+    Arc::new(move |port| {
+        let pool = pool.clone();
+        Box::pin(async move {
+            crate::sandbox::open_pod_port(&pool, conversation_id, port)
+                .await
+                .map_err(|e| match e {
+                    crate::sandbox::TerminalError::NoPod => format!(
+                        "This conversation has no running sandbox, so there's nothing at \
+                         localhost:{port}. Start one with create_pod and run the server there."
+                    ),
+                    other => format!("Couldn't reach port {port} in the sandbox: {other}"),
+                })
+        })
+    })
+}
+
+/// A proxy from `start_with_sandbox`. It stops accepting connections when
+/// dropped; connections already open finish on their own.
+pub struct RoutedProxy {
+    pub addr: SocketAddr,
+    accept_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RoutedProxy {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+    }
+}
+
+/// Like `start`, but for one conversation's browser context: requests for
+/// `localhost`, `127.0.0.1` or `::1` (`fetch_guard::is_sandbox_host`) go to
+/// that port in the conversation's sandbox through `dial`, instead of being
+/// refused as loopback. Every other host goes through `is_addr_allowed`
+/// exactly as with `start`. See SME-42.
+pub async fn start_with_sandbox(
+    is_addr_allowed: fn(IpAddr) -> bool,
+    dial: SandboxDial,
+) -> std::io::Result<RoutedProxy> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let accept_task = tokio::spawn(accept_loop(listener, is_addr_allowed, Some(dial)));
+    Ok(RoutedProxy { addr, accept_task })
+}
+
+async fn accept_loop(
+    listener: TcpListener,
+    is_addr_allowed: fn(IpAddr) -> bool,
+    sandbox: Option<SandboxDial>,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((client, _)) => {
+                let sandbox = sandbox.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle(client, is_addr_allowed, sandbox).await {
+                        tracing::debug!("egress proxy: {e}");
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!("egress proxy: accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+async fn handle(
+    mut client: TcpStream,
+    is_addr_allowed: fn(IpAddr) -> bool,
+    sandbox: Option<SandboxDial>,
+) -> Result<(), String> {
     let (head, rest) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_head(&mut client))
         .await
         .map_err(|_| "timed out reading the request".to_string())??;
@@ -74,6 +147,11 @@ async fn handle(mut client: TcpStream, is_addr_allowed: fn(IpAddr) -> bool) -> R
             return Err(e);
         }
     };
+    if let Some(dial) = sandbox
+        && fetch_guard::is_sandbox_host(&request.host)
+    {
+        return handle_sandbox(client, request, rest, dial).await;
+    }
     let addrs = match fetch_guard::resolve_allowed(&request.host, request.port, is_addr_allowed).await
     {
         Ok(addrs) => addrs,
@@ -105,6 +183,62 @@ async fn handle(mut client: TcpStream, is_addr_allowed: fn(IpAddr) -> bool) -> R
     Ok(())
 }
 
+/// The sandbox route: `request` goes to its port in the conversation's pod,
+/// through `dial`. There's no address to check — `dial` can only reach that
+/// one pod. A plain request's first reply bytes are read before anything
+/// goes back, so a port nothing listens on (the stream ends without a
+/// byte) becomes a readable 502 rather than an empty reply. The tunnel then
+/// runs until either side closes; nothing here waits on the pod side's end
+/// of stream, which a port-forward reports about a second late.
+async fn handle_sandbox(
+    mut client: TcpStream,
+    request: ProxyRequest,
+    rest: Vec<u8>,
+    dial: SandboxDial,
+) -> Result<(), String> {
+    let mut upstream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, dial(request.port)).await {
+        Ok(Ok(upstream)) => upstream,
+        Ok(Err(message)) => {
+            respond_with_body(&mut client, "502 Bad Gateway", &message).await;
+            return Err(message);
+        }
+        Err(_) => {
+            let message = format!("Timed out connecting to port {} in the sandbox.", request.port);
+            respond_with_body(&mut client, "502 Bad Gateway", &message).await;
+            return Err(message);
+        }
+    };
+    let io = |e: std::io::Error| e.to_string();
+    match &request.forward_head {
+        None => {
+            client
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .map_err(io)?;
+            upstream.write_all(&rest).await.map_err(io)?;
+        }
+        Some(forward_head) => {
+            upstream.write_all(forward_head).await.map_err(io)?;
+            upstream.write_all(&rest).await.map_err(io)?;
+            let mut first = vec![0u8; 16 * 1024];
+            let n = upstream.read(&mut first).await.map_err(io)?;
+            if n == 0 {
+                let message = format!(
+                    "Nothing is listening on port {} in this conversation's sandbox.",
+                    request.port
+                );
+                respond_with_body(&mut client, "502 Bad Gateway", &message).await;
+                return Err(message);
+            }
+            client.write_all(&first[..n]).await.map_err(io)?;
+        }
+    }
+    tokio::io::copy_bidirectional(&mut client, &mut upstream)
+        .await
+        .map_err(io)?;
+    Ok(())
+}
+
 /// Reads up to and including the blank line ending the request head;
 /// returns the head and whatever bytes arrived after it.
 async fn read_head(client: &mut TcpStream) -> Result<(Vec<u8>, Vec<u8>), String> {
@@ -124,6 +258,21 @@ async fn read_head(client: &mut TcpStream) -> Result<(Vec<u8>, Vec<u8>), String>
         }
         buf.extend_from_slice(&chunk[..n]);
     }
+}
+
+/// Like `respond`, with a plain-text body saying what went wrong — shown
+/// as the page to whoever loaded it, the model or the user.
+async fn respond_with_body(client: &mut TcpStream, status: &str, body: &str) {
+    let _ = client
+        .write_all(
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await;
 }
 
 async fn respond(client: &mut TcpStream, status: &str) {
@@ -210,6 +359,22 @@ fn host_and_port(url: &str) -> Result<(String, u16), String> {
         .port_or_known_default()
         .ok_or_else(|| format!("no port in {url:?}"))?;
     Ok((host, port))
+}
+
+/// A stand-in for `sandbox::open_pod_port` in tests: records each port
+/// it's asked for and connects to `upstream` whatever the port.
+#[cfg(test)]
+pub(crate) fn dial_to(
+    upstream: SocketAddr,
+    dialed: Arc<std::sync::Mutex<Vec<u16>>>,
+) -> SandboxDial {
+    Arc::new(move |port| {
+        dialed.lock().unwrap().push(port);
+        Box::pin(async move {
+            let stream = TcpStream::connect(upstream).await.map_err(|e| e.to_string())?;
+            Ok(Box::new(stream) as Box<dyn PodIo>)
+        })
+    })
 }
 
 #[cfg(test)]
@@ -354,5 +519,124 @@ mod tests {
         let proxy = start(fetch_guard::is_safe_fetch_addr).await.unwrap();
         let (_, reply) = connect_through(proxy, upstream).await;
         assert!(reply.starts_with("HTTP/1.1 403"), "got {reply:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_sandbox_route_sends_localhost_to_the_sandbox_despite_the_strict_guard() {
+        let upstream = start_upstream().await;
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
+            .await
+            .unwrap();
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            let response = client_via(proxy.addr).get(format!("http://{host}:3000/")).send().await.unwrap();
+            assert_eq!(response.status(), 200, "{host}");
+            assert_eq!(response.text().await.unwrap(), "upstream says hi", "{host}");
+        }
+        assert_eq!(*dialed.lock().unwrap(), vec![3000, 3000, 3000]);
+    }
+
+    #[tokio::test]
+    async fn test_a_sandbox_route_tunnels_connect_to_localhost_through_the_sandbox() {
+        let upstream = start_upstream().await;
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
+            .await
+            .unwrap();
+        let target: SocketAddr = "127.0.0.1:5173".parse().unwrap();
+        let (mut tunnel, reply) = connect_through(proxy.addr, target).await;
+        assert!(reply.starts_with("HTTP/1.1 200"), "got {reply:?}");
+        tunnel
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost:5173\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tunnel.read_to_string(&mut response).await.unwrap();
+        assert!(response.ends_with("upstream says hi"), "got {response:?}");
+        assert_eq!(*dialed.lock().unwrap(), vec![5173]);
+    }
+
+    #[tokio::test]
+    async fn test_a_sandbox_route_still_guards_every_other_host() {
+        let upstream = start_upstream().await;
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
+            .await
+            .unwrap();
+        // Loopback, but not one of the names that mean the sandbox.
+        let response = client_via(proxy.addr)
+            .get(format!("http://127.0.0.2:{}/", upstream.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        assert!(dialed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_sandbox_route_that_cannot_connect_says_why() {
+        let dial: SandboxDial = Arc::new(|_| {
+            Box::pin(async { Err("This conversation has no running sandbox.".to_string()) })
+        });
+        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial).await.unwrap();
+        let response = client_via(proxy.addr).get("http://localhost:3000/").send().await.unwrap();
+        assert_eq!(response.status(), 502);
+        assert_eq!(response.text().await.unwrap(), "This conversation has no running sandbox.");
+    }
+
+    #[tokio::test]
+    async fn test_a_sandbox_port_with_nothing_listening_says_so() {
+        // Connects, then closes without a byte — what a port-forward to an
+        // unused port does.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(silent, dialed))
+            .await
+            .unwrap();
+        let response = client_via(proxy.addr).get("http://localhost:3000/").send().await.unwrap();
+        assert_eq!(response.status(), 502);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("Nothing is listening on port 3000"), "got {body:?}");
+    }
+
+    #[sqlx::test]
+    async fn test_sandbox_dial_without_a_pod_says_how_to_get_one(pool: PgPool) {
+        let conversation = crate::db::create_conversation(&pool).await.expect("create conversation");
+        let dial = sandbox_dial(pool, conversation.id);
+        let error = match dial(3000).await {
+            Ok(_) => panic!("a conversation without a pod has nothing to connect to"),
+            Err(e) => e,
+        };
+        assert!(error.contains("no running sandbox"), "got {error:?}");
+        assert!(error.contains("create_pod"), "should say how to get one: {error:?}");
+    }
+
+    #[tokio::test]
+    async fn test_dropping_a_routed_proxy_stops_it_accepting() {
+        let upstream = start_upstream().await;
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed))
+            .await
+            .unwrap();
+        let addr = proxy.addr;
+        drop(proxy);
+        tokio::task::yield_now().await;
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut stream = TcpStream::connect(addr).await?;
+            stream.write_all(b"GET http://localhost:3000/ HTTP/1.1\r\n\r\n").await?;
+            let mut buf = [0u8; 16];
+            stream.read(&mut buf).await
+        })
+        .await;
+        assert!(
+            !matches!(result, Ok(Ok(n)) if n > 0),
+            "a dropped proxy must not answer, got {result:?}"
+        );
     }
 }

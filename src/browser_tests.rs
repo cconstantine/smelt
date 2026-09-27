@@ -1077,7 +1077,9 @@ async fn test_end_to_end_browser_scenarios() {
         // squeezed the messages and input to 48px and made the page
         // scroll sideways (SME-40 F2). ---
         let browsing = new_conversation(pool, &created).await;
-        crate::browsing::open_session(browsing.id).await.expect("open a browsing session");
+        crate::browsing::open_session(browsing.id, crate::egress_proxy::sandbox_dial(pool.clone(), browsing.id))
+            .await
+            .expect("open a browsing session");
         // With a todo list and a sandbox terminal open too, as in a real
         // session: side by side, the three panels shared ~450px, so the
         // browser was tiny and the terminal pushed out of sight (SME-41 D16).

@@ -135,9 +135,9 @@ mod server {
             "grep" => grep_tool(pool, conversation_id, input).await,
             "todowrite" => todowrite_tool(pool, conversation_id, input).await,
             "todoread" => todoread_tool(pool, conversation_id).await,
-            "webfetch" => webfetch_tool(input).await,
+            "webfetch" => webfetch_tool(pool, conversation_id, input).await,
             "http_request" => http_request_tool(input).await,
-            "open_browser_session" => open_browser_session_tool(conversation_id).await,
+            "open_browser_session" => open_browser_session_tool(pool, conversation_id).await,
             "close_browser_session" => close_browser_session_tool(conversation_id).await,
             "browser_navigate" => browser_navigate_tool(conversation_id, input).await,
             "browser_click" => browser_click_tool(conversation_id, input).await,
@@ -2131,9 +2131,10 @@ mod server {
         serde_json::to_string(&todos).map_err(|e| e.to_string())
     }
 
-    async fn webfetch_tool(input: &Value) -> Result<String, String> {
+    async fn webfetch_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
         let url = required_str(input, "url")?;
-        let result = crate::webfetch::fetch(&url).await?;
+        let sandbox = crate::egress_proxy::sandbox_dial(pool.clone(), conversation_id);
+        let result = crate::webfetch::fetch(&url, Some(sandbox)).await?;
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
@@ -2158,8 +2159,9 @@ mod server {
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
-    async fn open_browser_session_tool(conversation_id: i64) -> Result<String, String> {
-        crate::browsing::open_session(conversation_id).await?;
+    async fn open_browser_session_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
+        let sandbox = crate::egress_proxy::sandbox_dial(pool.clone(), conversation_id);
+        crate::browsing::open_session(conversation_id, sandbox).await?;
         Ok("browser session opened".to_string())
     }
 
