@@ -634,6 +634,7 @@ mod server {
             .await
             .map_err(|e| e.to_string())?;
         let mut touched = std::collections::BTreeSet::from([conversation_id]);
+        let mut also_mine = Vec::new();
         for other in others {
             let _ = db::delete_instruction_request(pool, other.id).await;
             let other_repo = get_repo(pool, other.repo_id).await?;
@@ -650,7 +651,9 @@ mod server {
                     repo.url
                 )
             };
-            if other.conversation_id != conversation_id {
+            if other.conversation_id == conversation_id {
+                also_mine.push(other_file);
+            } else {
                 let _ = crate::api::chat::save_notice_between_turns(pool, other.conversation_id, notice).await;
             }
             touched.insert(other.conversation_id);
@@ -659,7 +662,7 @@ mod server {
             publish_repos(pool, id).await;
         }
 
-        let notice = if trusted {
+        let mut notice = if trusted {
             format!(
                 "The user trusts {}: {file} is now in your Project instructions, as they read it. \
                  Follow it from now on.",
@@ -672,6 +675,16 @@ mod server {
                 repo.url
             )
         };
+        // The conversation's other requests for this repo were dropped
+        // with the decision; say so, rather than leave the model waiting.
+        if !also_mine.is_empty() {
+            let files = also_mine.join(", ");
+            notice.push_str(&if trusted {
+                format!(" {files} weren't loaded with it; call load_instructions again for any you still need (the repo is trusted now, so they load at once).")
+            } else {
+                format!(" {files} won't be loaded either.")
+            });
+        }
         crate::api::chat::save_notice_between_turns(pool, conversation_id, notice.clone())
             .await
             .map_err(|e| e.to_string())?;
@@ -1499,6 +1512,31 @@ mod server {
 
             decide_trust(&pool, conversation.id, newer.id, &newer.hash, true).await.expect("trust what's shown now");
             assert_eq!(project_instructions(&pool, conversation.id).await.expect("loaded")[0].content, "swapped in");
+        }
+
+        /// Deciding on one card drops the same conversation's other
+        /// requests for that repo; the model is told which (SME-32 code
+        /// review 5, finding 2).
+        #[sqlx::test]
+        async fn test_the_model_hears_about_its_other_requests_for_the_repo(pool: PgPool) {
+            for trusted in [true, false] {
+                let conversation = db::create_conversation(&pool).await.expect("conversation");
+                let repo = cloned_repo(&pool, conversation.id).await;
+                request_or_load(&pool, conversation.id, &repo, "AGENTS.md", &file("top")).await.expect("ask");
+                request_or_load(&pool, conversation.id, &repo, "web/AGENTS.md", &file("web")).await.expect("ask");
+                let requests = only_repo(&pool, conversation.id).await.trust_requests;
+                assert_eq!(requests.len(), 2);
+                let top = requests.iter().find(|r| r.path.ends_with("/r/AGENTS.md")).expect("top-level request");
+                let notice = decide_trust(&pool, conversation.id, top.id, &top.hash, trusted).await.expect("decide");
+                assert!(notice.contains("/workspace/r/web/AGENTS.md"), "{trusted}: {notice}");
+                if trusted {
+                    assert!(notice.contains("load_instructions again"), "{notice}");
+                } else {
+                    assert!(notice.contains("won't be loaded"), "{notice}");
+                }
+                assert!(only_repo(&pool, conversation.id).await.trust_requests.is_empty());
+                db::delete_repo_trust(&pool, "github.com/o/r").await.expect("reset for the next round");
+            }
         }
 
         #[sqlx::test]
