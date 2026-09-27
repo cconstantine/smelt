@@ -176,6 +176,33 @@ mod server {
         Some((host, path.to_string()))
     }
 
+    /// The command that clones `url` into `path`: under coreutils
+    /// `timeout`, so the pod itself stops a clone that runs too long (git
+    /// then removes its partial checkout), rather than smelt only dropping
+    /// its connection while git carries on. No prompts: nothing can answer
+    /// one, and a clone waiting on a password or a host key would hang.
+    pub fn clone_command(url: &str, branch: Option<&str>, path: &str) -> Vec<String> {
+        let mut command: Vec<String> = [
+            "env",
+            "GIT_TERMINAL_PROMPT=0",
+            "timeout",
+            "--kill-after=10",
+            &CLONE_TIMEOUT.as_secs().to_string(),
+            "git",
+            "-c",
+            "core.sshCommand=ssh -o BatchMode=yes",
+            "clone",
+            "--quiet",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        if let Some(branch) = branch {
+            command.extend(["--branch".to_string(), branch.to_string()]);
+        }
+        command.extend(["--".to_string(), url.to_string(), path.to_string()]);
+        command
+    }
+
     /// What a finished clone checked out.
     #[derive(Clone, Debug, PartialEq)]
     pub struct ClonedRepo {
@@ -197,28 +224,23 @@ mod server {
             return Err(format!("{url} isn't a git URL smelt can clone."));
         }
         let path = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
-        // No prompts: nothing can answer one, and a clone waiting on a
-        // password or a host key would hang until the timeout.
-        let mut command = vec![
-            "env",
-            "GIT_TERMINAL_PROMPT=0",
-            "git",
-            "-c",
-            "core.sshCommand=ssh -o BatchMode=yes",
-            "clone",
-            "--quiet",
-        ];
-        if let Some(branch) = branch {
-            command.extend(["--branch", branch]);
-        }
-        command.extend(["--", url, &path]);
+        let command = clone_command(url, branch, &path);
+        let command: Vec<&str> = command.iter().map(String::as_str).collect();
+        let timed_out = || format!("{CLONE_TIMED_OUT} ({} minutes) cloning {url}.", CLONE_TIMEOUT.as_secs() / 60);
+        // The pod's own `timeout` stops the clone; smelt waits a little
+        // longer, in case the connection itself stalls.
         let clone = tokio::time::timeout(
-            CLONE_TIMEOUT,
+            CLONE_TIMEOUT + std::time::Duration::from_secs(30),
             crate::sandbox::exec_with(client, pod_name, "sandbox", &command, None),
         )
         .await
-        .map_err(|_| format!("{CLONE_TIMED_OUT} ({} minutes) cloning {url}.", CLONE_TIMEOUT.as_secs() / 60))?
+        .map_err(|_| timed_out())?
         .map_err(|e| e.to_string())?;
+        // `timeout`'s own exit codes: 124 when it stopped git, 137 when it
+        // had to kill it.
+        if matches!(clone.exit_code, 124 | 137) {
+            return Err(timed_out());
+        }
         // Git refuses a directory that already exists and isn't empty, and
         // removes one it made itself when it fails. Only a clone that was
         // cut off (Stop, the timeout, a restart) leaves one behind, which
@@ -229,7 +251,8 @@ mod server {
             if output.contains("already exists") {
                 return Err(format!(
                     "{output} If it's what's left of an earlier clone that was cut off, delete it \
-                     (rm -rf {path}) and clone again; otherwise clone into another directory."
+                     (rm -rf {path}) and clone again, but after a clone that was just stopped, wait \
+                     a moment first: it may still be running. Otherwise clone into another directory."
                 ));
             }
             return Err(if output.is_empty() {
@@ -1772,6 +1795,21 @@ mod server {
             ] {
                 assert!(resolve_instructions_path(&repos, bad).is_err(), "{bad}");
             }
+        }
+
+        #[test]
+        fn test_the_clone_runs_under_the_pods_own_timeout() {
+            let command = clone_command("git@github.com:o/r.git", Some("dev"), "/workspace/r");
+            let secs = CLONE_TIMEOUT.as_secs().to_string();
+            assert_eq!(
+                command,
+                vec![
+                    "env", "GIT_TERMINAL_PROMPT=0", "timeout", "--kill-after=10", &secs, "git", "-c",
+                    "core.sshCommand=ssh -o BatchMode=yes", "clone", "--quiet", "--branch", "dev", "--",
+                    "git@github.com:o/r.git", "/workspace/r",
+                ]
+            );
+            assert!(!clone_command("u", None, "/workspace/r").contains(&"--branch".to_string()));
         }
 
         #[test]
