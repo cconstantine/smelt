@@ -44,12 +44,12 @@ pub async fn forget_repo_trust(remote: String) -> ServerFnResult<()> {
         .map_err(ServerFnError::new)
 }
 
-/// The trust card's answer about request `request_id`. The model is told,
-/// and woken to carry on.
+/// The trust card's answer about request `request_id`, with the hash of
+/// the file the card showed. The model is told, and woken to carry on.
 #[post("/api/conversations/{id}/instruction-requests/{request_id}")]
-pub async fn decide_repo_trust(id: i64, request_id: i64, trusted: bool) -> ServerFnResult<()> {
+pub async fn decide_repo_trust(id: i64, request_id: i64, shown_hash: String, trusted: bool) -> ServerFnResult<()> {
     let pool = db::get();
-    git::decide_trust(pool, id, request_id, trusted)
+    git::decide_trust(pool, id, request_id, &shown_hash, trusted)
         .await
         .map_err(ServerFnError::new)?;
     tokio::spawn(async move {

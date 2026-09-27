@@ -5117,7 +5117,8 @@ mod tests {
             assert_eq!(repos[0].trust_requests.len(), 1);
             assert_eq!(repos[0].trust_requests[0].content, "Run make test.\n");
             // Trusted, that file is in the model's context.
-            crate::git::decide_trust(&pool, conversation_a.id, repos[0].trust_requests[0].id, true)
+            let shown = &repos[0].trust_requests[0];
+            crate::git::decide_trust(&pool, conversation_a.id, shown.id, &shown.hash, true)
                 .await
                 .expect("trust");
             let loaded = crate::git::project_instructions(&pool, conversation_a.id)

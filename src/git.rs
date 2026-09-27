@@ -60,6 +60,9 @@ pub struct TrustRequest {
     /// The file, e.g. `/workspace/smelt/AGENTS.md`.
     pub path: String,
     pub content: String,
+    /// sha256 of `content`: the card sends it back with the decision, so
+    /// Trust loads only the version the user read.
+    pub hash: String,
 }
 
 /// An `AGENTS.md` loaded into the model's context: what the system prompt
@@ -368,6 +371,7 @@ mod server {
                     id: r.id,
                     path: format!("{path}/{}", r.path),
                     content: r.content,
+                    hash: r.hash,
                 })
                 .collect(),
             loaded_instructions: loaded,
@@ -596,6 +600,7 @@ mod server {
         pool: &PgPool,
         conversation_id: i64,
         request_id: i64,
+        shown_hash: &str,
         trusted: bool,
     ) -> Result<String, String> {
         let request = db::get_instruction_request(pool, request_id)
@@ -603,6 +608,11 @@ mod server {
             .map_err(|e| e.to_string())?
             .filter(|r| r.conversation_id == conversation_id)
             .ok_or_else(|| "No such request in this conversation (it may have been answered already).".to_string())?;
+        // Trust loads only the version the user read: the model asking
+        // again replaces the request's copy, and the card follows.
+        if trusted && request.hash != shown_hash {
+            return Err("The file changed since the card showed it. Read the card again, then decide.".to_string());
+        }
         let repo = get_repo(pool, request.repo_id).await?;
         db::set_repo_trust(pool, &repo.remote_key, trusted)
             .await
@@ -1448,9 +1458,9 @@ mod server {
             request_or_load(&pool, first.id, &repo, "AGENTS.md", &file("what the user read")).await.expect("ask");
             // Another conversation's copy, which the user never saw.
             request_or_load(&pool, second.id, &other, "AGENTS.md", &file("injected")).await.expect("ask");
-            let request = only_repo(&pool, first.id).await.trust_requests[0].id;
+            let shown = only_repo(&pool, first.id).await.trust_requests.remove(0);
 
-            let notice = decide_trust(&pool, first.id, request, true).await.expect("trust");
+            let notice = decide_trust(&pool, first.id, shown.id, &shown.hash, true).await.expect("trust");
             assert!(notice.contains("/workspace/r/AGENTS.md"), "{notice}");
             assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("get"), Some(true));
             let loaded = project_instructions(&pool, first.id).await.expect("loaded");
@@ -1467,13 +1477,37 @@ mod server {
             assert!(told.iter().any(|m| m.content.contains("load_instructions again")), "told to ask again");
         }
 
+        /// The file changed (the model asked again) while the card was
+        /// open: Trust on what the user read doesn't load the newer copy
+        /// (SME-32 code review 5, finding 1).
+        #[sqlx::test]
+        async fn test_trust_refuses_a_file_that_changed_since_it_was_shown(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let repo = cloned_repo(&pool, conversation.id).await;
+            request_or_load(&pool, conversation.id, &repo, "AGENTS.md", &file("what the user read")).await.expect("ask");
+            let shown = only_repo(&pool, conversation.id).await.trust_requests.remove(0);
+            request_or_load(&pool, conversation.id, &repo, "AGENTS.md", &file("swapped in")).await.expect("ask again");
+
+            let refused = decide_trust(&pool, conversation.id, shown.id, &shown.hash, true)
+                .await
+                .expect_err("the file changed");
+            assert!(refused.contains("changed"), "{refused}");
+            assert!(project_instructions(&pool, conversation.id).await.expect("loaded").is_empty());
+            assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("get"), None, "nothing decided");
+            let newer = only_repo(&pool, conversation.id).await.trust_requests.remove(0);
+            assert_eq!(newer.content, "swapped in", "the card shows the newer copy");
+
+            decide_trust(&pool, conversation.id, newer.id, &newer.hash, true).await.expect("trust what's shown now");
+            assert_eq!(project_instructions(&pool, conversation.id).await.expect("loaded")[0].content, "swapped in");
+        }
+
         #[sqlx::test]
         async fn test_declining_loads_nothing_and_later_loads_are_refused(pool: PgPool) {
             let conversation = db::create_conversation(&pool).await.expect("conversation");
             let repo = cloned_repo(&pool, conversation.id).await;
             request_or_load(&pool, conversation.id, &repo, "AGENTS.md", &file("x")).await.expect("ask");
-            let request = only_repo(&pool, conversation.id).await.trust_requests[0].id;
-            let notice = decide_trust(&pool, conversation.id, request, false).await.expect("decline");
+            let shown = only_repo(&pool, conversation.id).await.trust_requests.remove(0);
+            let notice = decide_trust(&pool, conversation.id, shown.id, &shown.hash, false).await.expect("decline");
             assert!(notice.contains("not to trust"), "{notice}");
             assert!(project_instructions(&pool, conversation.id).await.expect("loaded").is_empty());
             assert!(only_repo(&pool, conversation.id).await.trust_requests.is_empty());
@@ -1486,8 +1520,8 @@ mod server {
             let elsewhere = db::create_conversation(&pool).await.expect("conversation");
             let repo = cloned_repo(&pool, conversation.id).await;
             request_or_load(&pool, conversation.id, &repo, "AGENTS.md", &file("x")).await.expect("ask");
-            let request = only_repo(&pool, conversation.id).await.trust_requests[0].id;
-            assert!(decide_trust(&pool, elsewhere.id, request, true).await.is_err());
+            let shown = only_repo(&pool, conversation.id).await.trust_requests.remove(0);
+            assert!(decide_trust(&pool, elsewhere.id, shown.id, &shown.hash, true).await.is_err());
             assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("get"), None);
         }
 

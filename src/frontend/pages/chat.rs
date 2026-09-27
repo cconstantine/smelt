@@ -4042,28 +4042,36 @@ fn ChatPanel(
                                         button {
                                             class: "trust-card-trust",
                                             r#type: "button",
-                                            onclick: move |_| {
-                                                let Some(id) = selected() else { return };
+                                            onclick: {
                                                 let request_id = request.id;
-                                                spawn(async move {
-                                                    if let Err(e) = decide_repo_trust(id, request_id, true).await {
-                                                        repo_action_error.set(Some(e.to_string()));
-                                                    }
-                                                });
+                                                let shown_hash = request.hash.clone();
+                                                move |_| {
+                                                    let Some(id) = selected() else { return };
+                                                    let shown_hash = shown_hash.clone();
+                                                    spawn(async move {
+                                                        if let Err(e) = decide_repo_trust(id, request_id, shown_hash, true).await {
+                                                            repo_action_error.set(Some(e.to_string()));
+                                                        }
+                                                    });
+                                                }
                                             },
                                             "Trust"
                                         }
                                         button {
                                             class: "trust-card-decline",
                                             r#type: "button",
-                                            onclick: move |_| {
-                                                let Some(id) = selected() else { return };
+                                            onclick: {
                                                 let request_id = request.id;
-                                                spawn(async move {
-                                                    if let Err(e) = decide_repo_trust(id, request_id, false).await {
-                                                        repo_action_error.set(Some(e.to_string()));
-                                                    }
-                                                });
+                                                let shown_hash = request.hash.clone();
+                                                move |_| {
+                                                    let Some(id) = selected() else { return };
+                                                    let shown_hash = shown_hash.clone();
+                                                    spawn(async move {
+                                                        if let Err(e) = decide_repo_trust(id, request_id, shown_hash, false).await {
+                                                            repo_action_error.set(Some(e.to_string()));
+                                                        }
+                                                    });
+                                                }
                                             },
                                             "Don't trust"
                                         }
