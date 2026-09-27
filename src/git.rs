@@ -716,8 +716,7 @@ mod server {
         guard: CloneGuard,
         replace_leftover: bool,
     ) -> Result<RepoSummary, String> {
-        let outcome = clone_repo_row(pool, pod_id, &repo, replace_leftover).await;
-        guard.finish();
+        let outcome = clone_repo_row(pool, pod_id, &repo, replace_leftover, guard).await;
         publish_repos(pool, conversation_id).await;
         outcome?;
         summarise(pool, get_repo(pool, repo.id).await?).await
@@ -881,19 +880,34 @@ mod server {
     }
 
     /// Clones one recorded repo into pod `pod_id` and records how it went.
+    /// Records a finished clone, and disarms its guard: whatever runs
+    /// afterwards (reading its AGENTS.md) being cut off doesn't make the
+    /// clone "interrupted".
+    async fn record_cloned(
+        pool: &PgPool,
+        repo_id: i64,
+        cloned: &ClonedRepo,
+        guard: CloneGuard,
+    ) -> Result<(), String> {
+        db::set_repo_cloned(pool, repo_id, &cloned.branch, &cloned.commit)
+            .await
+            .map_err(|e| e.to_string())?;
+        guard.finish();
+        Ok(())
+    }
+
     async fn clone_repo_row(
         pool: &PgPool,
         pod_id: i64,
         repo: &db::ConversationRepo,
         replace_leftover: bool,
+        guard: CloneGuard,
     ) -> Result<(), String> {
         let client = sandbox::kube_client();
         let pod_name = sandbox::kubernetes_pod_name(pod_id);
         match clone_into_pod(&client, &pod_name, &repo.url, repo.branch.as_deref(), &repo.dir, replace_leftover).await {
             Ok(cloned) => {
-                db::set_repo_cloned(pool, repo.id, &cloned.branch, &cloned.commit)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                record_cloned(pool, repo.id, &cloned, guard).await?;
                 // The clone is good even if its instructions can't be read;
                 // the panel says why they aren't loaded.
                 if let Err(e) = load_instructions(pool, repo.id, &client, &pod_name, &repo.dir, &cloned.commit).await {
@@ -904,6 +918,7 @@ mod server {
             }
             Err(e) => {
                 let _ = db::set_repo_failed(pool, repo.id, &e).await;
+                guard.finish();
                 Err(e)
             }
         }
@@ -1469,6 +1484,24 @@ mod server {
             .expect("the dropped clone is marked failed");
             assert_eq!(marked.error.as_deref(), Some(CLONE_INTERRUPTED));
             assert!(wait_for_clones(&pool, conversation.id, std::time::Duration::from_millis(100)).await);
+        }
+
+        #[sqlx::test]
+        async fn test_a_stop_after_the_clone_is_recorded_doesnt_mark_it_interrupted(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let repo = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
+                .await
+                .expect("repo");
+            let guard = CloneGuard::new(&pool, repo.id, conversation.id);
+            let cloned = ClonedRepo {
+                commit: "abc".to_string(),
+                branch: "main".to_string(),
+            };
+            record_cloned(&pool, repo.id, &cloned, guard).await.expect("record");
+            // What follows (reading AGENTS.md) is cut off here.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let row = db::get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
+            assert_eq!((row.status.as_str(), row.error.as_deref()), ("ready", None));
         }
 
         #[sqlx::test]
