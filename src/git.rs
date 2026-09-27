@@ -644,12 +644,7 @@ mod server {
         let outcome = request_or_load(pool, conversation_id, repo, &rel_path, &file).await?;
         publish_repos(pool, conversation_id).await;
         Ok(match outcome {
-            LoadOutcome::Loaded => format!(
-                "Loaded {full} into your Project instructions ({} bytes{}). It's there on every \
-                 turn from now on; call load_instructions again after it changes.",
-                file.file_bytes,
-                if file.file_bytes as usize > file.content.len() { ", cut to 32 KiB" } else { "" }
-            ),
+            LoadOutcome::Loaded => loaded_message(&full, &file),
             LoadOutcome::AwaitingTrust => format!(
                 "The user hasn't said whether to trust {}, so they're being asked, with {full} \
                  shown to them. Don't read or follow that file meanwhile. You'll get a message \
@@ -657,6 +652,16 @@ mod server {
                 repo.url
             ),
         })
+    }
+
+    /// What the model is told when `file` (at `full`) is loaded.
+    pub fn loaded_message(full: &str, file: &db::InstructionsFile) -> String {
+        format!(
+            "Loaded {full} into your Project instructions ({} bytes{}). It's there on every \
+             turn from now on; call load_instructions again after it changes.",
+            file.file_bytes,
+            if file.file_bytes > INSTRUCTIONS_MAX_BYTES as i64 { ", cut to 32 KiB" } else { "" }
+        )
     }
 
     /// The user's answer on the trust card for request `request_id`, from
@@ -2030,6 +2035,26 @@ mod server {
             ] {
                 assert!(resolve_instructions_path(&repos, bad).is_err(), "{bad}");
             }
+        }
+
+        /// "Cut" is about the file's size, not its decoded length, which
+        /// invalid bytes inflate (SME-32 code review 9, finding 3).
+        #[test]
+        fn test_the_model_is_told_when_a_loaded_file_was_cut() {
+            let swollen = db::InstructionsFile {
+                content: "\u{FFFD}".repeat(32_000),
+                file_bytes: 40_000,
+                hash: "h".to_string(),
+                commit: None,
+            };
+            assert!(loaded_message("/workspace/r/AGENTS.md", &swollen).contains("cut to 32 KiB"));
+            let whole = db::InstructionsFile {
+                content: "short".to_string(),
+                file_bytes: 5,
+                hash: "h".to_string(),
+                commit: None,
+            };
+            assert!(!loaded_message("/workspace/r/AGENTS.md", &whole).contains("cut"));
         }
 
         #[test]
