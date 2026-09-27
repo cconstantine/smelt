@@ -118,6 +118,7 @@ pub enum ConversationEvent {
     TodoListUpdate { items: Vec<anthropic::tools::TodoItem> },
     BrowsingSessionUpdate { open: bool },
     BrowsingUrlUpdate { url: String },
+    ReposUpdate { repos: Vec<git::RepoSummary> },
     PodsChanged {},
     TurnState { running: bool },
 }
@@ -126,6 +127,8 @@ pub enum ConversationEvent {
 `MessagesAppended` is a struct variant, not `MessagesAppended(Vec<Message>)`: the enum is internally tagged, and serde can't write a tuple variant holding a list that way. It used to be one, and every send failed silently (`wire_tests::test_every_event_round_trips_through_json` now serializes one of each variant). The stream is built with `ServerEvents::from_stream` over the broadcast receiver, for the same reason as the frame stream below: a closed connection drops the subscription. `NotificationDeliveryFailed` is published when a turn fired with no request in flight fails: `wake_conversation` (a terminal command finished) and a `run_async` task's output or completion notification.
 
 `TaskUpdate`/`Sandbox*`/`ContextUsageUpdate`/`TodoListUpdate`/`BrowsingSessionUpdate`/`BrowsingUrlUpdate` are all ephemeral UI telemetry (never persisted as such, regenerable at any time from `get_tasks`/`get_sandbox_state`/`get_context_usage`/`get_todos`/`get_browsing_state` — `ContextUsageUpdate`'s own numbers *are* separately persisted, in `conversation_context_usage`, precisely so `get_context_usage` can regenerate it, and `TodoListUpdate`'s are likewise persisted in `conversation_todos`); `MessagesAppended` is a live-delivery notification for rows `run_turn` already persisted — whether that `run_turn` call came from a live `send_message` or from a background task's own push. `SandboxPodUpdate`/`SandboxTerminalUpdate` fire on create/terminate (a `terminated: true` update means the frontend should *remove* that pod/terminal, not just relabel it — unlike a finished task, which the task panel keeps showing); `SandboxCommandUpdate` follows the exact same "started/one output line/finished" pattern `TaskUpdate` already uses, with `command` only populated on the "started" event. `ContextUsageUpdate` publishes once per completed real turn, right after `run_turn_bounded` persists that turn's usage. `TodoListUpdate` publishes on every `todowrite` call and always carries the *complete* current list (never a partial diff — `todowrite` itself is a whole-list replace, no per-item ids), so the frontend just overwrites its signal wholesale rather than merging like `TaskUpdate` requires. `BrowsingSessionUpdate` publishes from `open_browser_session`/`close_browser_session`, so the panel shows/hides reactively rather than only checking on conversation (re)select. `SandboxPreviewUpdate` publishes from `sandbox_preview_url` and carries the pod's whole preview list (port and link), which the panel takes as is; `get_sandbox_state` returns the same list per pod (SME-42). Since the underlying `broadcast` channel has no replay, the frontend does a one-shot `get_messages`/`get_tasks`/`get_sandbox_state`/`get_context_usage`/`get_todos`/`get_browsing_state` reconciliation pull on connect/reconnect to cover anything published before it subscribed — see `architecture.md`.
+
+`ReposUpdate` carries the conversation's whole repo list (SME-32): each repo's path, what's checked out, clone status and where its `AGENTS.md` stands (none, loaded, changed, awaiting trust, not trusted). It's published when a repo is added, starts or finishes cloning, when a trust decision or Reload changes what's loaded, and when the after-turn check finds an `AGENTS.md` changed. `list_conversation_repos` is its snapshot.
 
 `PodsChanged` is the app-wide `AppEvent::PodsChanged` (below), relayed on every conversation's stream: the server merges the app-wide channel into each subscription (`conversation_event_stream`). A chat tab therefore needs no second always-open connection for the sidebar's pod dots. Over plain HTTP/1.1 a browser allows only 6 connections per host, shared by every tab, and each chat tab already holds one stream (two while a reply streams). `TurnState` is published when a conversation's first turn starts and when its last one ends, including turns nobody started from a tab (a finished command, a background task, another tab). `get_turn_state` is its snapshot for reconnects.
 
@@ -204,6 +207,15 @@ pub async fn navigate_browser(id: i64, address: String) -> ServerFnResult<()>;
 | `stop_pod` | `POST /api/pods/{pod_id}/stop` | the user stopping a pod, see above |
 | `get_live_pod_conversations` | `GET /api/pods/conversations` | conversations with a live pod, for the sidebar |
 | `subscribe_app_events` | `GET /api/app-events` | always-open app-wide stream (`AppEvent`), for the pods page |
+| `list_conversation_repos` | `GET /api/conversations/{id}/repos` | the conversation's repos, for the sandbox panel, see `ReposUpdate` above |
+| `attach_repo` | `POST /api/conversations/{id}/repos` | "Work on a repo": trusts the remote, starts the sandbox if needed and clones |
+| `decide_repo_trust` | `POST /api/conversations/{id}/repos/{repo_id}/trust` | the trust card's answer; remembered for the remote, loads or unloads its AGENTS.md everywhere, tells and wakes the model |
+| `reload_repo_instructions` | `POST /api/conversations/{id}/repos/{repo_id}/reload` | loads the checkout's current AGENTS.md; tells the model |
+| `get_git_settings` | `GET /api/git` | the `/git` page: commit identity, SSH keys (public halves), trust decisions |
+| `save_git_identity` | `POST /api/git/identity` | commit name and email; reaches running pods at once |
+| `generate_ssh_key` / `import_ssh_key` | `POST /api/git/keys`, `POST /api/git/keys/import` | a new ed25519 key, or a pasted unencrypted OpenSSH private key; installed in running pods at once |
+| `delete_ssh_key` | `DELETE /api/git/keys/{id}` | removed from running pods at once |
+| `forget_repo_trust` | `POST /api/git/trust/forget` | the user is asked again next time the remote is cloned |
 | `delete_conversation` | `DELETE /api/conversations/{id}` | hard delete; cascades to the conversation's messages (`ON DELETE CASCADE`); also tears down its sandboxes and browsing session, stops its `run_async` tasks, and drops its event channel and turn lock; deleting a nonexistent id is not an error |
 
 Not yet implemented (straightforward mechanical additions when needed): rename a conversation, concurrent-send guarding.
