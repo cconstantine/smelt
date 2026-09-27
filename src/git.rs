@@ -1092,15 +1092,36 @@ mod server {
         format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
     }
 
+    /// Runs `install` (read the keys, then write them into a pod) with no
+    /// other install in between, so an install that read the keys before a
+    /// change can't write them over one that read them after.
+    async fn with_install_lock<F: std::future::Future>(install: F) -> F::Output {
+        static INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _held = INSTALLING.lock().await;
+        install.await
+    }
+
     /// Installs the stored keys and commit identity into pod `pod_id`.
     pub async fn install_into_pod(pool: &PgPool, pod_id: i64) -> Result<(), String> {
-        let keys = db::list_ssh_keys(pool).await.map_err(|e| e.to_string())?;
-        let identity = db::get_git_identity(pool).await.map_err(|e| e.to_string())?;
-        let keys: Vec<(String, String)> = keys.into_iter().map(|k| (k.name, k.private_key)).collect();
-        sandbox::install_git_files_in_pod(pod_id, &pod_git_files(&keys, &identity))
+        with_install_lock(async {
+            let keys = db::list_ssh_keys(pool).await.map_err(|e| e.to_string())?;
+            let identity = db::get_git_identity(pool).await.map_err(|e| e.to_string())?;
+            let keys: Vec<(String, String)> = keys.into_iter().map(|k| (k.name, k.private_key)).collect();
+            // Bounded: every install waits on this lock, so a stalled exec
+            // mustn't hold it.
+            tokio::time::timeout(
+                INSTALL_TIMEOUT,
+                sandbox::install_git_files_in_pod(pod_id, &pod_git_files(&keys, &identity)),
+            )
             .await
+            .map_err(|_| format!("writing git files into the pod took over {}s", INSTALL_TIMEOUT.as_secs()))?
             .map_err(|e| e.to_string())
+        })
+        .await
     }
+
+    /// How long writing the git files into one pod may take.
+    const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// After a key or the identity changes: every live pod gets the new
     /// files, so a key added mid-conversation works without a new pod. A
@@ -1444,6 +1465,30 @@ mod server {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[tokio::test]
+        async fn test_an_install_that_read_old_keys_cant_write_over_a_newer_one() {
+            let installed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            // A reads the keys first but slowly; B reads the newer ones
+            // after it started, and quickly.
+            let a = {
+                let installed = installed.clone();
+                tokio::spawn(with_install_lock(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    installed.lock().expect("log").push("old");
+                }))
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let b = {
+                let installed = installed.clone();
+                tokio::spawn(with_install_lock(async move {
+                    installed.lock().expect("log").push("new");
+                }))
+            };
+            a.await.expect("a");
+            b.await.expect("b");
+            assert_eq!(installed.lock().expect("log").last(), Some(&"new"), "the pod ends with the newest keys");
+        }
 
         #[test]
         fn test_instructions_state_follows_trust_and_changes() {
