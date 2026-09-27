@@ -608,19 +608,26 @@ mod server {
         }
     }
 
-    /// Records `url` as one of the conversation's repos and clones it into
-    /// the conversation's pod, at `/workspace/<dir>` (the repo's name when
-    /// `dir` is `None`). The same repo and branch already checked out is
-    /// returned as it is rather than cloned twice.
-    pub async fn clone_repo(
+    /// What a clone request comes to, before anything is written.
+    enum ClonePlan {
+        /// The same repo and branch is already checked out.
+        Existing(db::ConversationRepo),
+        /// Clone into `dir`, retrying `retry`'s failed attempt there if set.
+        Clone {
+            key: String,
+            dir: String,
+            retry: Option<i64>,
+        },
+    }
+
+    /// Checks a clone request against the conversation's repos.
+    async fn plan_clone(
         pool: &PgPool,
         conversation_id: i64,
         url: &str,
         branch: Option<&str>,
         dir: Option<&str>,
-    ) -> Result<RepoSummary, String> {
-        let url = url.trim();
-        let branch = branch.map(str::trim).filter(|b| !b.is_empty());
+    ) -> Result<ClonePlan, String> {
         let key = remote_key(url).ok_or_else(|| format!("{url} isn't a git URL smelt can clone."))?;
         let named_dir = dir.map(str::trim).filter(|d| !d.is_empty());
         let dir = match named_dir {
@@ -640,70 +647,130 @@ mod server {
                 && r.status != "failed"
                 && (named_dir.is_none() || r.dir == dir)
         }) {
-            return summarise(pool, same.clone()).await;
+            return Ok(ClonePlan::Existing(same.clone()));
         }
-        if let Some(other) = existing.iter().find(|r| r.dir == dir) {
-            if other.remote_key != key || other.status != "failed" {
+        let retry = match existing.iter().find(|r| r.dir == dir) {
+            // A failed earlier attempt at the same directory is retried in
+            // place rather than recorded twice.
+            Some(failed) if failed.remote_key == key && failed.status == "failed" => Some(failed.id),
+            Some(other) => {
                 return Err(format!(
                     "/workspace/{dir} is already used by {}. Pick another directory.",
                     other.url
                 ));
             }
-        }
-
-        let pod_id = sandbox::live_pod_id(pool, conversation_id).await.map_err(|_| {
-            "This conversation has no sandbox yet: call create_pod first.".to_string()
-        })?;
-
-        // A failed earlier attempt at the same directory is retried in
-        // place rather than recorded twice, with what's asked for now.
-        let repo = match existing.into_iter().find(|r| r.dir == dir) {
-            Some(failed) => db::retry_repo_clone(pool, failed.id, url, branch)
-                .await
-                .map_err(|e| e.to_string())?,
-            None => db::create_conversation_repo(pool, conversation_id, url, &key, branch, &dir)
-                .await
-                .map_err(|e| e.to_string())?,
+            None => None,
         };
+        Ok(ClonePlan::Clone { key, dir, retry })
+    }
+
+    /// Writes a planned clone down as `cloning`, so a turn waits for it.
+    async fn record_clone(
+        pool: &PgPool,
+        conversation_id: i64,
+        url: &str,
+        branch: Option<&str>,
+        key: &str,
+        dir: &str,
+        retry: Option<i64>,
+    ) -> Result<db::ConversationRepo, String> {
+        let repo = match retry {
+            // With what's asked for now, not what failed.
+            Some(id) => db::retry_repo_clone(pool, id, url, branch).await,
+            None => db::create_conversation_repo(pool, conversation_id, url, key, branch, dir).await,
+        }
+        .map_err(|e| e.to_string())?;
         publish_repos(pool, conversation_id).await;
-        let guard = CloneGuard::new(pool, repo.id, conversation_id);
+        Ok(repo)
+    }
+
+    /// Clones a recorded repo into pod `pod_id`; `guard` marks it
+    /// interrupted if this is dropped first.
+    async fn run_clone(
+        pool: &PgPool,
+        conversation_id: i64,
+        pod_id: i64,
+        repo: db::ConversationRepo,
+        guard: CloneGuard,
+    ) -> Result<RepoSummary, String> {
         let outcome = clone_repo_row(pool, pod_id, &repo).await;
         guard.finish();
         publish_repos(pool, conversation_id).await;
         outcome?;
-        let repos = db::list_conversation_repos(pool, conversation_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        let cloned = repos
-            .into_iter()
-            .find(|r| r.id == repo.id)
-            .ok_or_else(|| "the repo vanished while it was cloned".to_string())?;
-        summarise(pool, cloned).await
+        summarise(pool, get_repo(pool, repo.id).await?).await
     }
 
-    /// The user's "Work on a repo": starts the conversation's sandbox if it
-    /// has none, then clones.
+    /// Records `url` as one of the conversation's repos and clones it into
+    /// the conversation's pod, at `/workspace/<dir>` (the repo's name when
+    /// `dir` is `None`). The same repo and branch already checked out is
+    /// returned as it is rather than cloned twice.
+    pub async fn clone_repo(
+        pool: &PgPool,
+        conversation_id: i64,
+        url: &str,
+        branch: Option<&str>,
+        dir: Option<&str>,
+    ) -> Result<RepoSummary, String> {
+        let url = url.trim();
+        let branch = branch.map(str::trim).filter(|b| !b.is_empty());
+        let (key, dir, retry) = match plan_clone(pool, conversation_id, url, branch, dir).await? {
+            ClonePlan::Existing(repo) => return summarise(pool, repo).await,
+            ClonePlan::Clone { key, dir, retry } => (key, dir, retry),
+        };
+        let pod_id = sandbox::live_pod_id(pool, conversation_id).await.map_err(|_| {
+            "This conversation has no sandbox yet: call create_pod first.".to_string()
+        })?;
+        let repo = record_clone(pool, conversation_id, url, branch, &key, &dir, retry).await?;
+        let guard = CloneGuard::new(pool, repo.id, conversation_id);
+        run_clone(pool, conversation_id, pod_id, repo, guard).await
+    }
+
+    /// The user's "Work on a repo": the repo is recorded first, so a
+    /// message sent while the sandbox starts waits for the clone; then the
+    /// conversation's sandbox is started if it has none, and it's cloned.
     pub async fn attach_repo(
         pool: &PgPool,
         conversation_id: i64,
         url: &str,
         branch: Option<&str>,
     ) -> Result<RepoSummary, String> {
-        if remote_key(url).is_none() {
-            return Err(format!("{} isn't a git URL smelt can clone.", url.trim()));
-        }
+        let url = url.trim();
+        let branch = branch.map(str::trim).filter(|b| !b.is_empty());
+        let (key, dir, retry) = match plan_clone(pool, conversation_id, url, branch, None).await? {
+            ClonePlan::Existing(repo) => {
+                // Already checked out; the sandbox may still need starting.
+                ensure_sandbox(pool, conversation_id).await?;
+                return summarise(pool, repo).await;
+            }
+            ClonePlan::Clone { key, dir, retry } => (key, dir, retry),
+        };
         // The user named this repo, so its AGENTS.md is trusted without
         // asking (SME-32's plan, open question 1).
-        let key = remote_key(url).expect("checked above");
         db::set_repo_trust(pool, &key, true)
             .await
             .map_err(|e| e.to_string())?;
-        if sandbox::live_pod_id(pool, conversation_id).await.is_err() {
-            sandbox::create_pod(pool, conversation_id, sandbox::PodLimitOverrides::default())
-                .await
-                .map_err(|e| format!("Couldn't start the sandbox: {e}"))?;
+        let repo = record_clone(pool, conversation_id, url, branch, &key, &dir, retry).await?;
+        let guard = CloneGuard::new(pool, repo.id, conversation_id);
+        let pod_id = match ensure_sandbox(pool, conversation_id).await {
+            Ok(pod_id) => pod_id,
+            Err(e) => {
+                guard.finish();
+                let _ = db::set_repo_failed(pool, repo.id, &e).await;
+                publish_repos(pool, conversation_id).await;
+                return Err(e);
+            }
+        };
+        run_clone(pool, conversation_id, pod_id, repo, guard).await
+    }
+
+    /// The conversation's live pod, started if it has none.
+    async fn ensure_sandbox(pool: &PgPool, conversation_id: i64) -> Result<i64, String> {
+        if let Ok(pod_id) = sandbox::live_pod_id(pool, conversation_id).await {
+            return Ok(pod_id);
         }
-        clone_repo(pool, conversation_id, url, branch, None).await
+        sandbox::create_pod(pool, conversation_id, sandbox::PodLimitOverrides::default())
+            .await
+            .map_err(|e| format!("Couldn't start the sandbox: {e}"))
     }
 
     /// Reads the checkout's `AGENTS.md` and loads it into the model's

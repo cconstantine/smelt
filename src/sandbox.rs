@@ -5521,8 +5521,22 @@ mod tests {
             assert!(pods_after.is_empty(), "no pods should be listed after terminating it, got {pods_after:?}");
 
             // "Work on a repo" on a conversation with no sandbox starts one.
-            let attached = crate::git::attach_repo(&pool, conversation_a.id, "file:///tmp/missing.git", None)
+            // The repo is recorded first, so a message sent while the
+            // sandbox starts waits for the clone (SME-32 code review,
+            // finding 3).
+            let attaching = tokio::spawn({
+                let pool = pool.clone();
+                let id = conversation_a.id;
+                async move { crate::git::attach_repo(&pool, id, "file:///tmp/missing.git", None).await }
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !crate::git::wait_for_clones(&pool, conversation_a.id, Duration::ZERO).await,
+                "a turn started while the sandbox starts should see the clone coming"
+            );
+            let attached = attaching
                 .await
+                .expect("attach task")
                 .expect_err("this origin doesn't exist");
             assert!(attached.contains("does not appear to be a git repository"), "{attached}");
             // The user named it, so it counts as trusted.
