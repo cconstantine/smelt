@@ -4438,14 +4438,15 @@ mod tests {
                 .expect("exec cat");
             assert_eq!(agents.stdout, "Run make test before committing.\n");
 
-            let read = crate::git::read_agents_file(&client, &pod_name, "origin")
+            let read = crate::git::read_instructions_file(&client, &pod_name, "/workspace/origin/AGENTS.md")
                 .await
                 .expect("read AGENTS.md")
                 .expect("origin has an AGENTS.md");
             assert_eq!(read.content, "Run make test before committing.\n");
             assert_eq!(read.file_bytes, 33);
             assert_eq!(read.hash.len(), 64, "sha256 hex: {}", read.hash);
-            assert!(read.nested.is_empty(), "main has no nested files: {:?}", read.nested);
+            let listed = crate::git::list_agents_files(&client, &pod_name, "origin").await.expect("list");
+            assert_eq!(listed, vec!["AGENTS.md".to_string()], "main has no nested files");
 
             let feature = crate::git::clone_into_pod(
                 &client,
@@ -4459,21 +4460,19 @@ mod tests {
             .expect("clone a branch");
             assert_eq!(feature.branch, "feature");
             assert_ne!(feature.commit.as_deref(), Some(main_commit.as_str()));
-            let read = crate::git::read_agents_file(&client, &pod_name, "origin-feature")
-                .await
-                .expect("read AGENTS.md")
-                .expect("feature has an AGENTS.md");
-            assert_eq!(read.nested, vec!["web/AGENTS.md".to_string()]);
+            let listed = crate::git::list_agents_files(&client, &pod_name, "origin-feature").await.expect("list");
+            assert_eq!(listed, vec!["AGENTS.md".to_string(), "web/AGENTS.md".to_string()], "top-level first");
 
             let bare = sandbox
                 .exec(&["git", "init", "-q", "/workspace/no-agents"])
                 .await
                 .expect("exec git init");
             assert_eq!(bare.exit_code, 0);
-            let none = crate::git::read_agents_file(&client, &pod_name, "no-agents")
+            let none = crate::git::read_instructions_file(&client, &pod_name, "/workspace/no-agents/AGENTS.md")
                 .await
-                .expect("read a repo without one");
+                .expect("read a missing file");
             assert_eq!(none, None);
+            assert!(crate::git::list_agents_files(&client, &pod_name, "no-agents").await.expect("list").is_empty());
 
             // Bytes that aren't UTF-8 (or a 1 MiB cut through a character)
             // still load, with the bad bytes replaced (SME-32 code review,
@@ -4483,7 +4482,7 @@ mod tests {
                 .await
                 .expect("exec make bad bytes");
             assert_eq!(bad.exit_code, 0, "{}", bad.stderr);
-            let read = crate::git::read_agents_file(&client, &pod_name, "bad-bytes")
+            let read = crate::git::read_instructions_file(&client, &pod_name, "/workspace/bad-bytes/AGENTS.md")
                 .await
                 .expect("a file with invalid UTF-8 reads")
                 .expect("it exists");
@@ -5118,19 +5117,28 @@ mod tests {
             assert_eq!(repo.status, crate::git::RepoStatus::Ready);
             assert_eq!(repo.commit.as_deref(), Some(origin.stdout.trim()));
             assert_eq!(repo.branch.as_deref(), Some("main"));
-            // Its AGENTS.md waits on the user: the model cloned a remote
-            // they haven't decided about.
-            assert_eq!(repo.instructions, crate::git::InstructionsState::AwaitingTrust);
-            assert_eq!(repo.instructions_preview.as_deref(), Some("Run make test.\n"));
+            // The clone lists its AGENTS.md; nothing loads by itself.
+            assert_eq!(repo.agents_files, vec!["AGENTS.md".to_string()]);
             assert!(crate::git::project_instructions(&pool, conversation_a.id).await.expect("loaded").is_empty());
-            // Trusted, it's loaded into the model's context.
-            crate::git::decide_trust(&pool, conversation_a.id, repo.id, true).await.expect("trust");
+            // The model asks to load it: a remote the user hasn't decided
+            // about, so they're asked, with exactly that file.
+            let asked = crate::git::load_instructions(&pool, conversation_a.id, "/workspace/origin/AGENTS.md")
+                .await
+                .expect("load_instructions");
+            assert!(asked.contains("being asked"), "{asked}");
+            let repos = crate::git::list_repos(&pool, conversation_a.id).await.expect("list repos");
+            assert_eq!(repos[0].trust_requests.len(), 1);
+            assert_eq!(repos[0].trust_requests[0].content, "Run make test.\n");
+            // Trusted, that file is in the model's context.
+            crate::git::decide_trust(&pool, conversation_a.id, repos[0].trust_requests[0].id, true)
+                .await
+                .expect("trust");
             let loaded = crate::git::project_instructions(&pool, conversation_a.id)
                 .await
                 .expect("project instructions");
             assert_eq!(loaded.len(), 1, "{loaded:?}");
             assert_eq!(loaded[0].content, "Run make test.\n");
-            assert_eq!(loaded[0].path, "/workspace/origin");
+            assert_eq!(loaded[0].path, "/workspace/origin/AGENTS.md");
             assert_eq!(loaded[0].commit, repo.commit);
             // A failed clone retried with another branch (or URL) clones
             // what's asked for now, not what failed (SME-32 code review,
@@ -5215,7 +5223,8 @@ mod tests {
             .expect("exec write");
             assert_eq!(wrote.exit_code, 0, "{}", wrote.stderr);
 
-            // AGENTS.md changes in the checkout: noticed, not reloaded.
+            // AGENTS.md changes in the checkout: what's loaded stays until
+            // the model loads it again, which a trusted repo allows at once.
             let edited = exec_with(
                 &client,
                 &pod_name(pod_a),
@@ -5226,11 +5235,15 @@ mod tests {
             .await
             .expect("exec edit");
             assert_eq!(edited.exit_code, 0, "{}", edited.stderr);
-            crate::git::refresh_instructions(&pool, conversation_a.id).await;
-            let repos = crate::git::list_repos(&pool, conversation_a.id).await.expect("list repos");
-            assert_eq!(repos[0].instructions, crate::git::InstructionsState::Changed, "{repos:?}");
             let loaded = crate::git::project_instructions(&pool, conversation_a.id).await.expect("loaded");
             assert_eq!(loaded[0].content, "Run make test.\n", "still the loaded version");
+            let reloaded = crate::git::load_instructions(&pool, conversation_a.id, "/workspace/origin/AGENTS.md")
+                .await
+                .expect("load again");
+            assert!(reloaded.starts_with("Loaded"), "{reloaded}");
+            let loaded = crate::git::project_instructions(&pool, conversation_a.id).await.expect("loaded");
+            assert_eq!(loaded.len(), 1, "replaced, not added: {loaded:?}");
+            assert_eq!(loaded[0].content, "Run make test.\nRun make lint too.\n");
             let duplicate = create_pod(&pool, conversation_a.id, PodLimitOverrides::default()).await;
             assert!(
                 matches!(duplicate, Err(SandboxError::PodAlreadyExists)),
@@ -5671,7 +5684,7 @@ mod tests {
             let repos = crate::git::list_repos(&pool, conversation_a.id).await.expect("list repos");
             assert_eq!(repos.len(), 4, "origin, retry, mywork, empty: {repos:?}");
             assert_eq!(repos[0].status, crate::git::RepoStatus::Ready, "{repos:?}");
-            assert_eq!(repos[0].instructions, crate::git::InstructionsState::Changed, "still to reload: {repos:?}");
+            assert_eq!(repos[0].loaded_instructions, vec!["AGENTS.md".to_string()], "{repos:?}");
             assert_eq!(repos[1].status, crate::git::RepoStatus::Ready, "{repos:?}");
             terminate_pod(&pool, conversation_a.id).await.expect("terminate the second pod (a)");
 

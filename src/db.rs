@@ -880,68 +880,176 @@ pub struct ConversationRepo {
     pub commit_sha: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
-    /// Its AGENTS.md as loaded into the model's context, `None` when
-    /// nothing is (see the migration).
-    pub instructions: Option<String>,
-    pub instructions_bytes: Option<i64>,
-    pub instructions_hash: Option<String>,
-    pub instructions_commit: Option<String>,
-    pub nested_instructions: Vec<String>,
-    /// The AGENTS.md as last read from the checkout (see the migration).
-    pub found_instructions: Option<String>,
-    pub found_bytes: Option<i64>,
-    pub found_hash: Option<String>,
-    pub found_commit: Option<String>,
-    pub found_nested: Vec<String>,
+    /// The checkout's AGENTS.md files, relative to it, top-level first.
+    pub agents_files: Vec<String>,
 }
 
-impl ConversationRepo {
-    /// What was last read from the checkout, in the shape it's loaded in.
-    pub fn found(&self) -> Option<LoadedInstructions> {
-        Some(LoadedInstructions {
-            content: self.found_instructions.clone()?,
-            file_bytes: self.found_bytes.unwrap_or_default(),
-            hash: self.found_hash.clone().unwrap_or_default(),
-            commit: self.found_commit.clone(),
-            nested: self.found_nested.clone(),
-        })
-    }
-}
-
-/// Records what was read from a repo's checkout (`None`: no AGENTS.md).
-pub async fn set_repo_found(
-    pool: &PgPool,
-    id: i64,
-    found: Option<&LoadedInstructions>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE conversation_repos
-            SET found_instructions = $2, found_bytes = $3, found_hash = $4,
-                found_commit = $5, found_nested = $6, updated_at = now()
-          WHERE id = $1",
-    )
-    .bind(id)
-    .bind(found.map(|l| l.content.as_str()))
-    .bind(found.map(|l| l.file_bytes))
-    .bind(found.map(|l| l.hash.as_str()))
-    .bind(found.and_then(|l| l.commit.as_deref()))
-    .bind(found.map(|l| l.nested.clone()).unwrap_or_default())
-    .execute(pool)
-    .await?;
+/// Records the checkout's AGENTS.md files, after a clone.
+pub async fn set_repo_agents_files(pool: &PgPool, id: i64, files: &[String]) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE conversation_repos SET agents_files = $2, updated_at = now() WHERE id = $1")
+        .bind(id)
+        .bind(files)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
-/// Every conversation's repos with this remote, for a trust decision.
-pub async fn list_repos_with_remote(
+/// An AGENTS.md as read from a checkout, to load or to ask about.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstructionsFile {
+    /// At most 32 KiB of it.
+    pub content: String,
+    pub file_bytes: i64,
+    pub hash: String,
+    pub commit: Option<String>,
+}
+
+/// An AGENTS.md in the model's context (see the migration).
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+pub struct LoadedInstruction {
+    pub id: i64,
+    pub conversation_id: i64,
+    pub repo_id: i64,
+    pub path: String,
+    pub content: String,
+    pub file_bytes: i64,
+    pub hash: String,
+    pub commit_sha: Option<String>,
+    pub loaded_at: NaiveDateTime,
+}
+
+/// Loads `path` of repo `repo_id` into the conversation's context, or
+/// replaces what was loaded from it.
+pub async fn load_instruction(
+    pool: &PgPool,
+    conversation_id: i64,
+    repo_id: i64,
+    path: &str,
+    file: &InstructionsFile,
+) -> Result<LoadedInstruction, sqlx::Error> {
+    sqlx::query_as::<_, LoadedInstruction>(
+        "INSERT INTO loaded_instructions (conversation_id, repo_id, path, content, file_bytes, hash, commit_sha)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (repo_id, path) DO UPDATE
+            SET content = $4, file_bytes = $5, hash = $6, commit_sha = $7, loaded_at = now()
+         RETURNING *",
+    )
+    .bind(conversation_id)
+    .bind(repo_id)
+    .bind(path)
+    .bind(&file.content)
+    .bind(file.file_bytes)
+    .bind(&file.hash)
+    .bind(file.commit.as_deref())
+    .fetch_one(pool)
+    .await
+}
+
+/// The conversation's loaded AGENTS.md files, oldest first.
+pub async fn list_loaded_instructions(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Vec<LoadedInstruction>, sqlx::Error> {
+    sqlx::query_as::<_, LoadedInstruction>(
+        "SELECT * FROM loaded_instructions WHERE conversation_id = $1 ORDER BY id ASC",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// A load waiting on the user's trust decision (see the migration).
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+pub struct InstructionRequest {
+    pub id: i64,
+    pub conversation_id: i64,
+    pub repo_id: i64,
+    pub path: String,
+    pub content: String,
+    pub file_bytes: i64,
+    pub hash: String,
+    pub commit_sha: Option<String>,
+    pub created_at: NaiveDateTime,
+}
+
+impl InstructionRequest {
+    pub fn file(&self) -> InstructionsFile {
+        InstructionsFile {
+            content: self.content.clone(),
+            file_bytes: self.file_bytes,
+            hash: self.hash.clone(),
+            commit: self.commit_sha.clone(),
+        }
+    }
+}
+
+/// Asks about `path` of repo `repo_id`, replacing an earlier request for
+/// the same file (the card then shows the newest copy).
+pub async fn request_instruction(
+    pool: &PgPool,
+    conversation_id: i64,
+    repo_id: i64,
+    path: &str,
+    file: &InstructionsFile,
+) -> Result<InstructionRequest, sqlx::Error> {
+    sqlx::query_as::<_, InstructionRequest>(
+        "INSERT INTO instruction_requests (conversation_id, repo_id, path, content, file_bytes, hash, commit_sha)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (repo_id, path) DO UPDATE
+            SET content = $4, file_bytes = $5, hash = $6, commit_sha = $7, created_at = now()
+         RETURNING *",
+    )
+    .bind(conversation_id)
+    .bind(repo_id)
+    .bind(path)
+    .bind(&file.content)
+    .bind(file.file_bytes)
+    .bind(&file.hash)
+    .bind(file.commit.as_deref())
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn get_instruction_request(pool: &PgPool, id: i64) -> Result<Option<InstructionRequest>, sqlx::Error> {
+    sqlx::query_as::<_, InstructionRequest>("SELECT * FROM instruction_requests WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn list_instruction_requests(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Vec<InstructionRequest>, sqlx::Error> {
+    sqlx::query_as::<_, InstructionRequest>(
+        "SELECT * FROM instruction_requests WHERE conversation_id = $1 ORDER BY id ASC",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Every conversation's requests about repos with this remote.
+pub async fn list_instruction_requests_for_remote(
     pool: &PgPool,
     remote_key: &str,
-) -> Result<Vec<ConversationRepo>, sqlx::Error> {
-    sqlx::query_as::<_, ConversationRepo>(
-        "SELECT * FROM conversation_repos WHERE remote_key = $1 ORDER BY id ASC",
+) -> Result<Vec<InstructionRequest>, sqlx::Error> {
+    sqlx::query_as::<_, InstructionRequest>(
+        "SELECT r.* FROM instruction_requests r
+           JOIN conversation_repos c ON c.id = r.repo_id
+          WHERE c.remote_key = $1 ORDER BY r.id ASC",
     )
     .bind(remote_key)
     .fetch_all(pool)
     .await
+}
+
+pub async fn delete_instruction_request(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM instruction_requests WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn get_conversation_repo(pool: &PgPool, id: i64) -> Result<Option<ConversationRepo>, sqlx::Error> {
@@ -990,39 +1098,6 @@ pub async fn delete_repo_trust(pool: &PgPool, remote_key: &str) -> Result<(), sq
         .bind(remote_key)
         .execute(pool)
         .await?;
-    Ok(())
-}
-
-/// What gets loaded for a repo's AGENTS.md; see `ConversationRepo`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct LoadedInstructions {
-    pub content: String,
-    pub file_bytes: i64,
-    pub hash: String,
-    pub commit: Option<String>,
-    pub nested: Vec<String>,
-}
-
-/// Loads (`Some`) or unloads (`None`) a repo's instructions.
-pub async fn set_repo_instructions(
-    pool: &PgPool,
-    id: i64,
-    loaded: Option<&LoadedInstructions>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE conversation_repos
-            SET instructions = $2, instructions_bytes = $3, instructions_hash = $4,
-                instructions_commit = $5, nested_instructions = $6, updated_at = now()
-          WHERE id = $1",
-    )
-    .bind(id)
-    .bind(loaded.map(|l| l.content.as_str()))
-    .bind(loaded.map(|l| l.file_bytes))
-    .bind(loaded.map(|l| l.hash.as_str()))
-    .bind(loaded.and_then(|l| l.commit.as_deref()))
-    .bind(loaded.map(|l| l.nested.clone()).unwrap_or_default())
-    .execute(pool)
-    .await?;
     Ok(())
 }
 
@@ -2627,32 +2702,43 @@ mod tests {
         let untouched = get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
         assert_eq!(untouched.status, "ready", "a finished clone is left alone");
 
-        // Loading and unloading instructions.
-        let loaded = LoadedInstructions {
-            content: "Run make test.\n".to_string(),
-            file_bytes: 15,
-            hash: "abc".to_string(),
-            commit: Some("abc123".to_string()),
-            nested: vec!["web/AGENTS.md".to_string()],
-        };
-        set_repo_instructions(&pool, repo.id, Some(&loaded)).await.expect("load");
-        let row = &list_conversation_repos(&pool, conversation.id).await.expect("list")[0];
-        assert_eq!(row.instructions.as_deref(), Some("Run make test.\n"));
-        assert_eq!(row.instructions_bytes, Some(15));
-        assert_eq!(row.instructions_hash.as_deref(), Some("abc"));
-        assert_eq!(row.instructions_commit.as_deref(), Some("abc123"));
-        assert_eq!(row.nested_instructions, vec!["web/AGENTS.md".to_string()]);
-        set_repo_instructions(&pool, repo.id, None).await.expect("unload");
-        let row = &list_conversation_repos(&pool, conversation.id).await.expect("list")[0];
-        assert_eq!((row.instructions.clone(), row.instructions_hash.clone()), (None, None));
-        assert!(row.nested_instructions.is_empty());
-
-        // What was read from the checkout, apart from what's loaded.
-        set_repo_found(&pool, repo.id, Some(&loaded)).await.expect("found");
+        // The checkout's AGENTS.md files.
+        set_repo_agents_files(&pool, repo.id, &["AGENTS.md".to_string(), "web/AGENTS.md".to_string()])
+            .await
+            .expect("agents files");
         let row = get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
-        assert_eq!(row.found(), Some(loaded.clone()));
-        assert_eq!(row.instructions, None, "finding doesn't load");
-        assert_eq!(list_repos_with_remote(&pool, "github.com/o/r").await.expect("by remote").len(), 1);
+        assert_eq!(row.agents_files, vec!["AGENTS.md".to_string(), "web/AGENTS.md".to_string()]);
+
+        // Loading an AGENTS.md, and loading it again replaces it.
+        let file = |content: &str| InstructionsFile {
+            content: content.to_string(),
+            file_bytes: content.len() as i64,
+            hash: format!("hash-{content}"),
+            commit: Some("abc123".to_string()),
+        };
+        load_instruction(&pool, conversation.id, repo.id, "AGENTS.md", &file("v1")).await.expect("load");
+        load_instruction(&pool, conversation.id, repo.id, "AGENTS.md", &file("v2")).await.expect("reload");
+        load_instruction(&pool, conversation.id, repo.id, "web/AGENTS.md", &file("web")).await.expect("load nested");
+        let loaded = list_loaded_instructions(&pool, conversation.id).await.expect("list loaded");
+        let paths: Vec<(&str, &str)> = loaded.iter().map(|l| (l.path.as_str(), l.content.as_str())).collect();
+        assert_eq!(paths, vec![("AGENTS.md", "v2"), ("web/AGENTS.md", "web")]);
+        assert_eq!(loaded[0].commit_sha.as_deref(), Some("abc123"));
+
+        // A request waiting on trust; asking again replaces it.
+        request_instruction(&pool, conversation.id, repo.id, "AGENTS.md", &file("seen")).await.expect("request");
+        let request = request_instruction(&pool, conversation.id, repo.id, "AGENTS.md", &file("newer"))
+            .await
+            .expect("request again");
+        let requests = list_instruction_requests(&pool, conversation.id).await.expect("list requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].file(), file("newer"));
+        assert_eq!(
+            list_instruction_requests_for_remote(&pool, "github.com/o/r").await.expect("by remote"),
+            requests
+        );
+        assert_eq!(get_instruction_request(&pool, request.id).await.expect("get"), Some(request.clone()));
+        delete_instruction_request(&pool, request.id).await.expect("delete request");
+        assert!(list_instruction_requests(&pool, conversation.id).await.expect("list").is_empty());
 
         // Trust decisions, remembered per remote either way.
         assert_eq!(get_repo_trust(&pool, "github.com/o/r").await.expect("get"), None);

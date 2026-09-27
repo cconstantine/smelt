@@ -1634,29 +1634,31 @@ async fn test_end_to_end_browser_scenarios() {
         );
         preview_tab.close().await.expect("close the preview tab");
 
-        // --- A repo's AGENTS.md waits for the user's trust (SME-32): the
-        // chat shows the file with Trust / Don't trust, and trusting loads
-        // it (the panel then says so). Seeded as a clone of an unknown
-        // remote; the model the decision wakes is the mock upstream. ---
+        // --- A repo's AGENTS.md waits for the user's trust (SME-32): when
+        // the model asks to load one from an unknown remote, the chat shows
+        // the file with Trust / Don't trust, and trusting loads exactly
+        // that file. The model the decision wakes is the mock upstream. ---
         let trusting = new_conversation(pool, &created).await;
         let remote = format!("example.com/browser-tier/{}", unique_id("trust"));
         let repo = db::create_conversation_repo(pool, trusting.id, &format!("https://{remote}.git"), &remote, None, "trust-me")
             .await
             .expect("seed a repo");
         db::set_repo_cloned(pool, repo.id, "main", Some("abc1234def")).await.expect("seed the clone");
-        crate::git::record_clone_instructions(
+        // The model asked to load its AGENTS.md (load_instructions).
+        db::request_instruction(
             pool,
+            trusting.id,
             repo.id,
-            Some(db::LoadedInstructions {
+            "AGENTS.md",
+            &db::InstructionsFile {
                 content: "Browser tier rule: always run the linter.\n".to_string(),
                 file_bytes: 42,
                 hash: "browser-tier-hash".to_string(),
                 commit: Some("abc1234def".to_string()),
-                nested: vec![],
-            }),
+            },
         )
         .await
-        .expect("seed the found AGENTS.md");
+        .expect("seed the request");
         let trust_page = harness
             .browser
             .new_page(&format!("{}conversation/{}", harness.base_url, trusting.id))

@@ -2761,30 +2761,6 @@ div.mcp-status-not-connected::before {
     font-size: 13px;
 }
 
-.sandbox-repo-instructions-Changed,
-.sandbox-repo-instructions-AwaitingTrust {
-    color: var(--accent);
-}
-
-.sandbox-repo-instructions-NotTrusted {
-    color: var(--text-2);
-}
-
-.sandbox-repo-reload {
-    padding: 2px 10px;
-    border: 1px solid var(--border-strong);
-    border-radius: 6px;
-    background: var(--surface);
-    color: var(--ink);
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-}
-
-.sandbox-repo-reload:hover {
-    background: var(--subtle);
-}
-
 /* Asking the user whether to trust a repo's AGENTS.md (SME-32). */
 
 .trust-card {

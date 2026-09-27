@@ -489,7 +489,22 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
                 crate::git::RepoStatus::Cloning => "still cloning".to_string(),
                 crate::git::RepoStatus::Failed => "clone failed".to_string(),
             };
-            prompt.push_str(&format!("  - {}: {} ({state})\n", repo.path, repo.url));
+            prompt.push_str(&format!("  - {}: {} ({state})", repo.path, repo.url));
+            if !repo.agents_files.is_empty() {
+                let files: Vec<String> = repo
+                    .agents_files
+                    .iter()
+                    .map(|f| {
+                        if repo.loaded_instructions.contains(f) {
+                            format!("{f} (loaded)")
+                        } else {
+                            f.clone()
+                        }
+                    })
+                    .collect();
+                prompt.push_str(&format!("; AGENTS.md files: {}", files.join(", ")));
+            }
+            prompt.push('\n');
         }
     }
     prompt.push_str(&crate::git::render_project_instructions(&env.instructions));
@@ -865,26 +880,13 @@ pub(crate) fn run_turn<'a>(
     on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
 {
-    Box::pin(async move {
-        let result = run_turn_bounded(
-            pool,
-            conversation_id,
-            Some(new_message),
-            on_delta,
-            MAX_TURNS,
-        )
-        .await;
-        spawn_instructions_refresh(pool, conversation_id);
-        result
-    })
-}
-
-/// After a turn, the model may have changed a repo's AGENTS.md (or pulled
-/// a new one): noticed in the background, for the user to reload (SME-32).
-#[cfg(feature = "server")]
-fn spawn_instructions_refresh(pool: &PgPool, conversation_id: i64) {
-    let pool = pool.clone();
-    tokio::spawn(async move { crate::git::refresh_instructions(&pool, conversation_id).await });
+    run_turn_bounded(
+        pool,
+        conversation_id,
+        Some(new_message),
+        on_delta,
+        MAX_TURNS,
+    )
 }
 
 /// Wakes `conversation_id`'s turn loop because a terminal command reached a
@@ -916,7 +918,6 @@ pub(crate) async fn wake_conversation(
         return Ok(Vec::new());
     }
     let result = run_turn_bounded(pool, conversation_id, None, None, MAX_TURNS).await;
-    spawn_instructions_refresh(pool, conversation_id);
     // A stop is the user's doing, not a failure to reach the model.
     if let Err(e) = &result
         && chat_error_text(e) != TURN_STOPPED
@@ -2917,20 +2918,20 @@ mod tests {
             commit: Some("43835b44f939".to_string()),
             status: crate::git::RepoStatus::Ready,
             error: None,
-            instructions: crate::git::InstructionsState::None,
-            instructions_preview: None,
+            agents_files: vec!["AGENTS.md".to_string(), "web/AGENTS.md".to_string()],
+            loaded_instructions: vec!["AGENTS.md".to_string()],
+            trust_requests: vec![],
         }];
         env.instructions = vec![crate::git::ProjectInstructions {
             repo_url: "git@github.com:o/smelt.git".to_string(),
-            path: "/workspace/smelt".to_string(),
+            path: "/workspace/smelt/AGENTS.md".to_string(),
             commit: Some("43835b44f939".to_string()),
             content: "Run make test.\n".to_string(),
             file_bytes: 15,
-            nested: Vec::new(),
         }];
         let prompt = system_prompt(&env);
         assert!(
-            prompt.contains("- Repositories:\n  - /workspace/smelt: git@github.com:o/smelt.git (main)\n"),
+            prompt.contains("- Repositories:\n  - /workspace/smelt: git@github.com:o/smelt.git (main); AGENTS.md files: AGENTS.md (loaded), web/AGENTS.md\n"),
             "{prompt}"
         );
         assert!(
@@ -3043,26 +3044,28 @@ mod tests {
             .await
             .expect("repo");
         db::set_repo_cloned(&pool, repo.id, "main", Some("abc123")).await.expect("cloned");
-        let loaded = db::LoadedInstructions {
+        db::set_repo_agents_files(&pool, repo.id, &["AGENTS.md".to_string(), "web/AGENTS.md".to_string()])
+            .await
+            .expect("agents files");
+        let loaded = db::InstructionsFile {
             content: "Run make test.\n".to_string(),
             file_bytes: 15,
             hash: "h".to_string(),
             commit: Some("abc123".to_string()),
-            nested: vec!["web/AGENTS.md".to_string()],
         };
-        db::set_repo_instructions(&pool, repo.id, Some(&loaded)).await.expect("load");
+        db::load_instruction(&pool, conversation.id, repo.id, "AGENTS.md", &loaded).await.expect("load");
         let env = prompt_environment(&pool, conversation.id).await;
+        assert_eq!(env.repos[0].loaded_instructions, vec!["AGENTS.md".to_string()]);
         assert_eq!(env.repos.len(), 1);
         assert_eq!(env.repos[0].path, "/workspace/r");
         assert_eq!(
             env.instructions,
             vec![crate::git::ProjectInstructions {
                 repo_url: "git@github.com:o/r.git".to_string(),
-                path: "/workspace/r".to_string(),
+                path: "/workspace/r/AGENTS.md".to_string(),
                 commit: Some("abc123".to_string()),
                 content: "Run make test.\n".to_string(),
                 file_bytes: 15,
-                nested: vec!["web/AGENTS.md".to_string()],
             }]
         );
         assert_eq!(env.date, chrono::Utc::now().date_naive());
@@ -3167,17 +3170,16 @@ mod tests {
         let repo = db::create_conversation_repo(&pool, conversation.id, "git@github.com:o/r.git", "github.com/o/r", None, "r")
             .await
             .expect("repo");
-        let loaded = db::LoadedInstructions {
+        let loaded = db::InstructionsFile {
             content: "Run make test.\n".to_string(),
             file_bytes: 15,
             hash: "h".to_string(),
             commit: Some("abc123".to_string()),
-            nested: vec![],
         };
-        db::set_repo_instructions(&pool, repo.id, Some(&loaded)).await.expect("load");
+        db::load_instruction(&pool, conversation.id, repo.id, "AGENTS.md", &loaded).await.expect("load");
         let detail = context_detail(&pool, conversation.id).await.expect("context detail");
         assert_eq!(detail.instructions.len(), 1);
-        assert_eq!(detail.instructions[0].path, "/workspace/r");
+        assert_eq!(detail.instructions[0].path, "/workspace/r/AGENTS.md");
         assert_eq!(detail.instructions[0].content, "Run make test.\n");
     }
 

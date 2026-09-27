@@ -36,7 +36,7 @@ use crate::api::chat::{
 use crate::api::browsing::{get_browsing_state, subscribe_browser_frames};
 #[cfg(feature = "web")]
 use crate::api::git::list_conversation_repos;
-use crate::api::git::{attach_repo, decide_repo_trust, reload_repo_instructions};
+use crate::api::git::{attach_repo, decide_repo_trust};
 use crate::git::{RepoStatus, RepoSummary};
 use crate::browsing::BrowserInputEvent;
 // Only referenced by this module's own tests, which build their own
@@ -700,15 +700,15 @@ fn instructions_source(doc: &crate::git::ProjectInstructions) -> String {
     }
 }
 
-/// What the sandbox panel says about a repo's `AGENTS.md`, if anything.
-fn instructions_label(state: crate::git::InstructionsState) -> Option<&'static str> {
-    use crate::git::InstructionsState as S;
-    match state {
-        S::None => None,
-        S::Loaded => Some("AGENTS.md loaded"),
-        S::Changed => Some("AGENTS.md changed since it was loaded"),
-        S::AwaitingTrust => Some("AGENTS.md waiting for you to trust this repo"),
-        S::NotTrusted => Some("AGENTS.md not loaded: you didn't trust this repo"),
+/// What the sandbox panel says about a repo's `AGENTS.md` files, if it
+/// has any: which the model has loaded.
+fn instructions_label(repo: &RepoSummary) -> Option<String> {
+    if !repo.loaded_instructions.is_empty() {
+        Some(format!("Loaded {}", repo.loaded_instructions.join(", ")))
+    } else if !repo.agents_files.is_empty() {
+        Some("AGENTS.md not loaded".to_string())
+    } else {
+        None
     }
 }
 
@@ -1989,7 +1989,6 @@ mod tests {
             commit: Some("43835b44f939".to_string()),
             content: "Run make test.\n".to_string(),
             file_bytes: 15,
-            nested: vec![],
         };
         assert_eq!(instructions_source(&doc), "git@github.com:o/r.git at 43835b4 \u{b7} 15 bytes");
         doc.file_bytes = 50_000;
@@ -2000,13 +1999,25 @@ mod tests {
     }
 
     #[test]
-    fn test_instructions_label_says_where_agents_md_stands() {
-        use crate::git::InstructionsState as S;
-        assert_eq!(instructions_label(S::None), None);
-        assert_eq!(instructions_label(S::Loaded), Some("AGENTS.md loaded"));
-        assert_eq!(instructions_label(S::Changed), Some("AGENTS.md changed since it was loaded"));
-        assert_eq!(instructions_label(S::AwaitingTrust), Some("AGENTS.md waiting for you to trust this repo"));
-        assert_eq!(instructions_label(S::NotTrusted), Some("AGENTS.md not loaded: you didn't trust this repo"));
+    fn test_instructions_label_says_which_agents_md_files_are_loaded() {
+        let mut repo = RepoSummary {
+            id: 1,
+            url: "u".to_string(),
+            path: "/workspace/r".to_string(),
+            requested_branch: None,
+            branch: None,
+            commit: None,
+            status: RepoStatus::Ready,
+            error: None,
+            agents_files: vec![],
+            loaded_instructions: vec![],
+            trust_requests: vec![],
+        };
+        assert_eq!(instructions_label(&repo), None, "no AGENTS.md files");
+        repo.agents_files = vec!["AGENTS.md".to_string(), "web/AGENTS.md".to_string()];
+        assert_eq!(instructions_label(&repo).as_deref(), Some("AGENTS.md not loaded"));
+        repo.loaded_instructions = vec!["AGENTS.md".to_string(), "web/AGENTS.md".to_string()];
+        assert_eq!(instructions_label(&repo).as_deref(), Some("Loaded AGENTS.md, web/AGENTS.md"));
     }
 
     #[test]
@@ -2020,8 +2031,9 @@ mod tests {
             commit: None,
             status: RepoStatus::Cloning,
             error: None,
-            instructions: crate::git::InstructionsState::None,
-            instructions_preview: None,
+            agents_files: vec![],
+            loaded_instructions: vec![],
+            trust_requests: vec![],
         };
         assert_eq!(repo_detail(&repo), "Cloning dev\u{2026}");
         repo.requested_branch = None;
@@ -3713,27 +3725,11 @@ fn ChatPanel(
                                                             title: "{repo.url}",
                                                             code { class: "sandbox-repo-path", "{repo.path}" }
                                                             span { class: "sandbox-repo-detail", "{repo_detail(&repo)}" }
-                                                            if let Some(label) = instructions_label(repo.instructions) {
+                                                            if let Some(label) = instructions_label(&repo) {
                                                                 span {
-                                                                    class: "sandbox-repo-instructions sandbox-repo-instructions-{repo.instructions:?}",
+                                                                    class: "sandbox-repo-instructions",
+                                                                    title: "The model loads a repo's AGENTS.md files with load_instructions. Loaded ones are in its context on every turn; see the context view.",
                                                                     "{label}"
-                                                                }
-                                                            }
-                                                            if repo.instructions == crate::git::InstructionsState::Changed {
-                                                                button {
-                                                                    class: "sandbox-repo-reload",
-                                                                    r#type: "button",
-                                                                    title: "Load AGENTS.md as the checkout has it now. The model is told.",
-                                                                    onclick: move |_| {
-                                                                        let Some(id) = selected() else { return };
-                                                                        let repo_id = repo.id;
-                                                                        spawn(async move {
-                                                                            if let Err(e) = reload_repo_instructions(id, repo_id).await {
-                                                                                repo_action_error.set(Some(e.to_string()));
-                                                                            }
-                                                                        });
-                                                                    },
-                                                                    "Reload"
                                                                 }
                                                             }
                                                             if let Some(err) = repo.error.clone() {
@@ -3857,7 +3853,7 @@ fn ChatPanel(
                                                 for doc in &detail.instructions {
                                                     details { class: "context-detail-instructions",
                                                         summary {
-                                                            code { "{doc.path}/AGENTS.md" }
+                                                            code { "{doc.path}" }
                                                             span { class: "muted", " {instructions_source(doc)}" }
                                                         }
                                                         pre { class: "context-detail-prompt", "{doc.content}" }
@@ -4028,19 +4024,19 @@ fn ChatPanel(
                             }
                             // A repo's AGENTS.md waits for the user's trust before it
                             // becomes instructions the model follows (SME-32).
-                            for repo in repos().into_iter().filter(|r| r.instructions == crate::git::InstructionsState::AwaitingTrust) {
-                                div { key: "trust-{repo.id}", class: "trust-card", role: "group", aria_label: "Trust {repo.url}?",
+                            for (repo, request) in repos().into_iter().flat_map(|r| r.trust_requests.clone().into_iter().map(move |q| (r.clone(), q))) {
+                                div { key: "trust-{request.id}", class: "trust-card", role: "group", aria_label: "Trust {repo.url}?",
                                     p { class: "trust-card-question",
                                         "Trust "
                                         code { "{repo.url}" }
                                         "?"
                                     }
                                     p { class: "muted",
-                                        "Its AGENTS.md, below, would become instructions the model follows on every turn in any conversation on this repo. Only trust repos whose instructions you're happy for the model to follow. You'll be asked once per repo."
+                                        "The model wants to load this AGENTS.md as instructions it follows on every turn. Trust loads exactly the file below, and later ones from this repo load without asking. Only trust repos whose instructions you're happy for the model to follow."
                                     }
                                     details { class: "trust-card-preview", open: true,
-                                        summary { "{repo.path}/AGENTS.md" }
-                                        pre { "{repo.instructions_preview.clone().unwrap_or_default()}" }
+                                        summary { "{request.path}" }
+                                        pre { "{request.content}" }
                                     }
                                     div { class: "trust-card-buttons",
                                         button {
@@ -4048,9 +4044,9 @@ fn ChatPanel(
                                             r#type: "button",
                                             onclick: move |_| {
                                                 let Some(id) = selected() else { return };
-                                                let repo_id = repo.id;
+                                                let request_id = request.id;
                                                 spawn(async move {
-                                                    if let Err(e) = decide_repo_trust(id, repo_id, true).await {
+                                                    if let Err(e) = decide_repo_trust(id, request_id, true).await {
                                                         repo_action_error.set(Some(e.to_string()));
                                                     }
                                                 });
@@ -4062,9 +4058,9 @@ fn ChatPanel(
                                             r#type: "button",
                                             onclick: move |_| {
                                                 let Some(id) = selected() else { return };
-                                                let repo_id = repo.id;
+                                                let request_id = request.id;
                                                 spawn(async move {
-                                                    if let Err(e) = decide_repo_trust(id, repo_id, false).await {
+                                                    if let Err(e) = decide_repo_trust(id, request_id, false).await {
                                                         repo_action_error.set(Some(e.to_string()));
                                                     }
                                                 });

@@ -44,25 +44,18 @@ pub async fn forget_repo_trust(remote: String) -> ServerFnResult<()> {
         .map_err(ServerFnError::new)
 }
 
-/// The trust card's answer. The model is told, and woken to carry on.
-#[post("/api/conversations/{id}/repos/{repo_id}/trust")]
-pub async fn decide_repo_trust(id: i64, repo_id: i64, trusted: bool) -> ServerFnResult<()> {
+/// The trust card's answer about request `request_id`. The model is told,
+/// and woken to carry on.
+#[post("/api/conversations/{id}/instruction-requests/{request_id}")]
+pub async fn decide_repo_trust(id: i64, request_id: i64, trusted: bool) -> ServerFnResult<()> {
     let pool = db::get();
-    git::decide_trust(pool, id, repo_id, trusted)
+    git::decide_trust(pool, id, request_id, trusted)
         .await
         .map_err(ServerFnError::new)?;
     tokio::spawn(async move {
         let _ = crate::api::chat::wake_conversation(pool, id).await;
     });
     Ok(())
-}
-
-/// Reload: loads what the checkout's AGENTS.md says now.
-#[post("/api/conversations/{id}/repos/{repo_id}/reload")]
-pub async fn reload_repo_instructions(id: i64, repo_id: i64) -> ServerFnResult<()> {
-    git::reload_instructions(db::get(), id, repo_id)
-        .await
-        .map_err(ServerFnError::new)
 }
 
 /// The conversation's repos, for the sandbox panel.
