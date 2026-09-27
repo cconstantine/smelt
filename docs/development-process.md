@@ -209,6 +209,7 @@ After each project completes:
 - Add or update the project's rows in the **Feature checklist**: what a user can do, and how to check it in the browser
 - File anything left undone that's worth doing as its own Backlog ticket, linked as related
 - Put the ticket id in the PR's title or body
+- Review the PR once it's open (see [Code review](#code-review-after-opening-the-pr))
 - Move the ticket to **Done** once the PR merges
 
 When the user mentions a new idea, create a **Backlog** ticket for it before it is forgotten.
@@ -240,6 +241,18 @@ Before considering a project closed, do a short retrospective covering:
 Record it as a short **Retrospective** section in the project's ticket, and say whether a [bug bash](#bug-bash-every-few-projects) is due.
 Any resulting process changes follow the [confirm-before-change rule](#evolving-this-process):
 propose first, update after the user agrees.
+
+## Code review (after opening the PR)
+
+Every PR gets a code review once it's open, while CI runs: `/code-review <PR number>`. It reads the whole diff for bugs, including security gaps, which a project's own tests are poorly placed to find because they were written with the same assumptions as the code.
+
+1. **Check each finding before reporting it.** Confirm it against the code (and, where it's cheap, reproduce it) so the report says which findings are real.
+2. **Report the findings and stop.** Give each one a severity, what goes wrong and a suggested fix, and let the user choose what gets fixed. Fixing changes the PR under review, so it waits for their go-ahead.
+3. **Fix on the PR's branch, test-first, one commit per finding.** A failing test first, as in Phase 2; for a finding about a browser's behaviour, a browser-tier scenario shown failing with the fix switched off. A finding in already-merged code gets its own PR (see Rules).
+4. **Review again after fixing.** Fixes change the code, and a second pass looks with fresh eyes. Repeat until a review comes back with nothing the user wants fixed.
+5. **Record it in the ticket**: a short code-review part in What shipped listing each finding and its fix.
+
+On SME-42, the first review found that both new routes could reach the sandbox agent's command WebSocket (any website could have run commands in the sandbox). The project's own real-cluster tests had used that very port as their test server. The second review, after the fixes, found a stalled POST and cross-site requests to the sandbox. None of the four were caught by the tests, the browser tier or the hands-on check.
 
 ## Bug bash (every few projects)
 
