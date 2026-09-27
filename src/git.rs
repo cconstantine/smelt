@@ -622,7 +622,8 @@ mod server {
         let url = url.trim();
         let branch = branch.map(str::trim).filter(|b| !b.is_empty());
         let key = remote_key(url).ok_or_else(|| format!("{url} isn't a git URL smelt can clone."))?;
-        let dir = match dir.map(str::trim).filter(|d| !d.is_empty()) {
+        let named_dir = dir.map(str::trim).filter(|d| !d.is_empty());
+        let dir = match named_dir {
             Some(dir) => dir.to_string(),
             None => default_checkout_dir(url).expect("remote_key parsed it"),
         };
@@ -631,10 +632,14 @@ mod server {
         let existing = db::list_conversation_repos(pool, conversation_id)
             .await
             .map_err(|e| e.to_string())?;
-        if let Some(same) = existing
-            .iter()
-            .find(|r| r.remote_key == key && r.branch.as_deref() == branch && r.status != "failed")
-        {
+        // The same repo and branch is already checked out; a directory
+        // named on purpose asks for a checkout there, though.
+        if let Some(same) = existing.iter().find(|r| {
+            r.remote_key == key
+                && r.branch.as_deref() == branch
+                && r.status != "failed"
+                && (named_dir.is_none() || r.dir == dir)
+        }) {
             return summarise(pool, same.clone()).await;
         }
         if let Some(other) = existing.iter().find(|r| r.dir == dir) {
@@ -651,12 +656,11 @@ mod server {
         })?;
 
         // A failed earlier attempt at the same directory is retried in
-        // place rather than recorded twice.
+        // place rather than recorded twice, with what's asked for now.
         let repo = match existing.into_iter().find(|r| r.dir == dir) {
-            Some(failed) => {
-                db::set_repo_cloning(pool, failed.id).await.map_err(|e| e.to_string())?;
-                failed
-            }
+            Some(failed) => db::retry_repo_clone(pool, failed.id, url, branch)
+                .await
+                .map_err(|e| e.to_string())?,
             None => db::create_conversation_repo(pool, conversation_id, url, &key, branch, &dir)
                 .await
                 .map_err(|e| e.to_string())?,

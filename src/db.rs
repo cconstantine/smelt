@@ -1061,17 +1061,25 @@ pub async fn list_conversation_repos(
     .await
 }
 
-/// A clone is starting (again): the last one's outcome is cleared.
-pub async fn set_repo_cloning(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query(
+/// A failed clone is being retried, with the URL and branch asked for
+/// this time (the same remote, maybe written another way).
+pub async fn retry_repo_clone(
+    pool: &PgPool,
+    id: i64,
+    url: &str,
+    branch: Option<&str>,
+) -> Result<ConversationRepo, sqlx::Error> {
+    sqlx::query_as::<_, ConversationRepo>(
         "UPDATE conversation_repos
-            SET status = 'cloning', error = NULL, updated_at = now()
-          WHERE id = $1",
+            SET url = $2, branch = $3, status = 'cloning', error = NULL, updated_at = now()
+          WHERE id = $1
+      RETURNING *",
     )
     .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(())
+    .bind(url)
+    .bind(branch)
+    .fetch_one(pool)
+    .await
 }
 
 pub async fn set_repo_cloned(
@@ -2600,7 +2608,11 @@ mod tests {
         let listed = list_conversation_repos(&pool, conversation.id).await.expect("list");
         assert_eq!((listed[0].status.as_str(), listed[0].error.as_deref()), ("failed", Some("fatal: nope")));
 
-        set_repo_cloning(&pool, repo.id).await.expect("retry");
+        let retried = retry_repo_clone(&pool, repo.id, "ssh://git@github.com/o/r", None)
+            .await
+            .expect("retry");
+        assert_eq!((retried.status.as_str(), retried.error.as_deref()), ("cloning", None));
+        assert_eq!((retried.url.as_str(), retried.branch.as_deref()), ("ssh://git@github.com/o/r", None));
         set_repo_cloned(&pool, repo.id, "dev", "abc123").await.expect("cloned");
         let listed = list_conversation_repos(&pool, conversation.id).await.expect("list");
         assert_eq!(listed.len(), 1);
