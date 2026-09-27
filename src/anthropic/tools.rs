@@ -668,8 +668,7 @@ mod server {
             ToolDefinition {
                 name: "clone_repo".to_string(),
                 description: "Clone a git repository into this conversation's sandbox pod, \
-                               at /workspace/<dir> (the repo's name by default), and remember \
-                               it: a new pod for this conversation clones it again. Use this \
+                               at /workspace/<dir> (the repo's name by default). Use this \
                                rather than `git clone` in a terminal. Needs a pod (create_pod \
                                first). Takes an SSH URL (git@github.com:owner/repo.git) or an \
                                https one; https only works for public repos, and pushing \

@@ -1093,7 +1093,7 @@ fn system_notice(text: &str, commands: &HashMap<String, String>) -> Option<Strin
     }
     if text.starts_with("The user stopped sandbox pod ") {
         return Some(
-            "You stopped the sandbox; its terminals, and any files outside volumes, are gone".to_string(),
+            "You stopped the sandbox; its terminals are gone, and /workspace is kept".to_string(),
         );
     }
     task_notice_sentence(text)
@@ -1897,8 +1897,8 @@ mod tests {
             Some("The sandbox stopped unexpectedly; its terminals are gone")
         );
         assert_eq!(
-            notice("The user stopped sandbox pod 157. Its terminals, and any files outside mounted volumes, are gone. Create a new pod if you need one.").as_deref(),
-            Some("You stopped the sandbox; its terminals, and any files outside volumes, are gone")
+            notice("The user stopped sandbox pod 157. Its terminals, and any files outside /workspace and mounted volumes, are gone. Create a new pod if you need one.").as_deref(),
+            Some("You stopped the sandbox; its terminals are gone, and /workspace is kept")
         );
         assert_eq!(
             notice(r#"<task-notification task_id="t1" tool="count">finished: Counted to 3</task-notification>"#).as_deref(),
@@ -3618,7 +3618,7 @@ fn ChatPanel(
                                                 button {
                                                     class: if pending_pod_stop() == Some(pod.pod_id) { "pod-stop confirm" } else { "pod-stop" },
                                                     r#type: "button",
-                                                    title: "Stop this pod. Its terminals and any files outside mounted volumes are lost.",
+                                                    title: "Stop this pod. Its terminals and any files outside /workspace and mounted volumes are lost.",
                                                     onclick: move |_| request_pod_stop(pod.pod_id),
                                                     super::TwoStepLabel { armed: pending_pod_stop() == Some(pod.pod_id), idle: "Stop sandbox", confirm: "Confirm stop?" }
                                                 }

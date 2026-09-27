@@ -508,7 +508,7 @@ impl SandboxManager {
         let docker = DockerSidecar {
             memory: "512Mi".to_string(),
             cpu: "250m".to_string(),
-            storage: DockerStorage::Ephemeral,
+            storage: PodStorage::Ephemeral,
         };
         self.create_with_docker(session_id, memory, cpu, &docker, volumes).await
     }
@@ -683,13 +683,15 @@ fn running_wait_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Where a pod's Docker sidecar keeps `/var/lib/docker` (SME-33).
+/// Where a pod keeps what should outlive it: the Docker sidecar's
+/// `/var/lib/docker` (SME-33) and `/workspace` (SME-32).
 #[derive(Debug, Clone, PartialEq)]
-pub enum DockerStorage {
-    /// The conversation's own PVC (`sandbox-docker-<id>`), so images and
-    /// build cache outlive the pod.
+pub enum PodStorage {
+    /// The conversation's own PVCs (`sandbox-docker-<id>` and
+    /// `sandbox-workspace-<id>`), so images, build cache and the
+    /// conversation's files outlive the pod.
     Conversation(i64),
-    /// An emptyDir that dies with the pod, for tests, which have no
+    /// emptyDirs that die with the pod, for tests, which have no
     /// conversation.
     #[cfg(test)]
     Ephemeral,
@@ -701,7 +703,7 @@ pub enum DockerStorage {
 pub struct DockerSidecar {
     pub memory: String,
     pub cpu: String,
-    pub storage: DockerStorage,
+    pub storage: PodStorage,
 }
 
 /// `SANDBOX_DOCKER_MEMORY_LIMIT`, default `"8Gi"` — see
@@ -743,6 +745,11 @@ fn docker_pvc_name(conversation_id: i64) -> String {
     format!("sandbox-docker-{conversation_id}")
 }
 
+/// The conversation's /workspace PVC, `sandbox-workspace-<id>` (SME-32).
+fn workspace_pvc_name(conversation_id: i64) -> String {
+    format!("sandbox-workspace-{conversation_id}")
+}
+
 /// Label naming a conversation, on its Docker data PVC and on every pod
 /// that mounts that PVC.
 const CONVERSATION_LABEL: &str = "smelt/conversation";
@@ -757,9 +764,36 @@ fn default_docker_storage_size() -> String {
         .unwrap_or_else(|| "20Gi".to_string())
 }
 
-fn build_docker_pvc_spec(conversation_id: i64) -> PersistentVolumeClaim {
+/// `SANDBOX_WORKSPACE_STORAGE_SIZE`, default `"20Gi"` — see
+/// `default_memory_limit`. Each conversation's /workspace PVC requests
+/// this much.
+fn default_workspace_storage_size() -> String {
+    std::env::var("SANDBOX_WORKSPACE_STORAGE_SIZE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "20Gi".to_string())
+}
+
+/// A conversation's claims: its Docker data and its /workspace (SME-32),
+/// both kept across its pods and deleted with it.
+fn conversation_pvc_specs(conversation_id: i64) -> [PersistentVolumeClaim; 2] {
+    [
+        build_conversation_pvc_spec(
+            docker_pvc_name(conversation_id),
+            conversation_id,
+            default_docker_storage_size(),
+        ),
+        build_conversation_pvc_spec(
+            workspace_pvc_name(conversation_id),
+            conversation_id,
+            default_workspace_storage_size(),
+        ),
+    ]
+}
+
+fn build_conversation_pvc_spec(name: String, conversation_id: i64, size: String) -> PersistentVolumeClaim {
     let mut requests = std::collections::BTreeMap::new();
-    requests.insert("storage".to_string(), Quantity(default_docker_storage_size()));
+    requests.insert("storage".to_string(), Quantity(size));
     let mut labels = std::collections::BTreeMap::new();
     labels.insert(
         CONVERSATION_LABEL.to_string(),
@@ -768,7 +802,7 @@ fn build_docker_pvc_spec(conversation_id: i64) -> PersistentVolumeClaim {
 
     PersistentVolumeClaim {
         metadata: ObjectMeta {
-            name: Some(docker_pvc_name(conversation_id)),
+            name: Some(name),
             namespace: Some(NAMESPACE.to_string()),
             labels: Some(labels),
             ..Default::default()
@@ -795,6 +829,8 @@ fn orphaned_docker_claims(
         .iter()
         .filter_map(|c| c.metadata.labels.as_ref()?.get(CONVERSATION_LABEL)?.parse().ok())
         .filter(|id| !live.contains(id))
+        .collect::<std::collections::BTreeSet<i64>>()
+        .into_iter()
         .collect()
 }
 
@@ -803,7 +839,7 @@ fn orphaned_docker_claims(
 /// missed. Run once at startup by `main`, never from tests: tests share
 /// the namespace but each has its own database, so from a test every
 /// other test's claim would look orphaned.
-pub async fn sweep_orphaned_docker_claims(pool: &PgPool) {
+pub async fn sweep_orphaned_conversation_claims(pool: &PgPool) {
     let client = &get().client;
     let selector = ListParams::default().labels(CONVERSATION_LABEL);
     // Claims first, then conversations: a claim only exists for a
@@ -824,7 +860,7 @@ pub async fn sweep_orphaned_docker_claims(pool: &PgPool) {
     };
     for conversation_id in orphaned_docker_claims(&claims, &live) {
         tracing::info!(conversation_id, "deleting a deleted conversation's docker data claim");
-        delete_docker_pvc(client, conversation_id).await;
+        delete_conversation_pvcs(client, conversation_id).await;
     }
 }
 
@@ -922,31 +958,36 @@ async fn wait_for_conversation_pods_gone(
     })?
 }
 
-/// Creates the conversation's Docker data PVC unless it already exists,
-/// so a conversation's later pods reuse its images and build cache.
-async fn ensure_docker_pvc(client: &kube::Client, conversation_id: i64) -> Result<(), SandboxError> {
+/// Creates the conversation's claims unless they already exist, so its
+/// later pods reuse its images and build cache and find /workspace as the
+/// last pod left it.
+async fn ensure_conversation_pvcs(client: &kube::Client, conversation_id: i64) -> Result<(), SandboxError> {
     let pvcs = pvc_api(client);
-    if pvcs.get_opt(&docker_pvc_name(conversation_id)).await?.is_some() {
-        return Ok(());
+    for spec in conversation_pvc_specs(conversation_id) {
+        let name = spec.metadata.name.clone().expect("named above");
+        if pvcs.get_opt(&name).await?.is_some() {
+            continue;
+        }
+        match pvcs.create(&PostParams::default(), &spec).await {
+            // Another create for the same conversation got there first.
+            Err(kube::Error::Api(e)) if e.code == 409 => {}
+            other => {
+                other?;
+            }
+        }
     }
-    match pvcs
-        .create(&PostParams::default(), &build_docker_pvc_spec(conversation_id))
-        .await
-    {
-        // Another create for the same conversation got there first.
-        Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
-        other => other.map(|_| ()).map_err(SandboxError::from),
-    }
+    Ok(())
 }
 
 /// Best-effort, like the rest of conversation teardown: logged, never
 /// returned. The startup sweep catches whatever this misses.
-async fn delete_docker_pvc(client: &kube::Client, conversation_id: i64) {
-    let name = docker_pvc_name(conversation_id);
-    match pvc_api(client).delete(&name, &DeleteParams::default()).await {
-        Ok(_) => {}
-        Err(kube::Error::Api(e)) if e.code == 404 => {}
-        Err(e) => tracing::warn!(claim = %name, error = %e, "failed to delete docker data claim"),
+async fn delete_conversation_pvcs(client: &kube::Client, conversation_id: i64) {
+    for name in [docker_pvc_name(conversation_id), workspace_pvc_name(conversation_id)] {
+        match pvc_api(client).delete(&name, &DeleteParams::default()).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => tracing::warn!(claim = %name, error = %e, "failed to delete a conversation's claim"),
+        }
     }
 }
 
@@ -979,7 +1020,7 @@ fn build_pod_spec(
 ) -> Pod {
     let (mut pod_volumes, user_mounts) = volume_mounts_for(volumes);
     pod_volumes.extend([
-        empty_dir_volume(WORKSPACE_VOLUME),
+        workspace_volume(&docker.storage),
         empty_dir_volume(DOCKER_SOCK_VOLUME),
         docker_data_volume(&docker.storage),
     ]);
@@ -996,11 +1037,11 @@ fn build_pod_spec(
     // Only a pod on a conversation's claim needs finding by conversation:
     // see `wait_for_conversation_pods_gone`.
     let labels = match docker.storage {
-        DockerStorage::Conversation(conversation_id) => Some(
+        PodStorage::Conversation(conversation_id) => Some(
             [(CONVERSATION_LABEL.to_string(), conversation_id.to_string())].into(),
         ),
         #[cfg(test)]
-        DockerStorage::Ephemeral => None,
+        PodStorage::Ephemeral => None,
     };
 
     Pod {
@@ -1103,9 +1144,26 @@ fn empty_dir_volume(name: &str) -> Volume {
     }
 }
 
-fn docker_data_volume(storage: &DockerStorage) -> Volume {
+/// /workspace: the conversation's own claim, so a new pod finds it as the
+/// last one left it (SME-32).
+fn workspace_volume(storage: &PodStorage) -> Volume {
     match storage {
-        DockerStorage::Conversation(conversation_id) => Volume {
+        PodStorage::Conversation(conversation_id) => Volume {
+            name: WORKSPACE_VOLUME.to_string(),
+            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                claim_name: workspace_pvc_name(*conversation_id),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        #[cfg(test)]
+        PodStorage::Ephemeral => empty_dir_volume(WORKSPACE_VOLUME),
+    }
+}
+
+fn docker_data_volume(storage: &PodStorage) -> Volume {
+    match storage {
+        PodStorage::Conversation(conversation_id) => Volume {
             name: DOCKER_DATA_VOLUME.to_string(),
             persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
                 claim_name: docker_pvc_name(*conversation_id),
@@ -1114,7 +1172,7 @@ fn docker_data_volume(storage: &DockerStorage) -> Volume {
             ..Default::default()
         },
         #[cfg(test)]
-        DockerStorage::Ephemeral => empty_dir_volume(DOCKER_DATA_VOLUME),
+        PodStorage::Ephemeral => empty_dir_volume(DOCKER_DATA_VOLUME),
     }
 }
 
@@ -1590,7 +1648,7 @@ pub async fn create_pod(
         let _ = db::terminate_sandbox_pod(pool, row.id).await;
         return Err(e);
     }
-    if let Err(e) = ensure_docker_pvc(&manager.client, conversation_id).await {
+    if let Err(e) = ensure_conversation_pvcs(&manager.client, conversation_id).await {
         let _ = db::terminate_sandbox_pod(pool, row.id).await;
         return Err(e);
     }
@@ -1608,7 +1666,6 @@ pub async fn create_pod(
                 let _ = db::terminate_sandbox_pod(pool, row.id).await;
                 return Err(SandboxError::GitSetup(e));
             }
-            crate::git::reclone_repos(pool, conversation_id, row.id).await;
             std::mem::forget(sandbox);
             events::publish(
                 conversation_id,
@@ -1660,7 +1717,7 @@ impl PodLimitOverrides {
         let docker = DockerSidecar {
             memory: self.docker_memory.unwrap_or_else(default_docker_memory_limit),
             cpu: self.docker_cpu.unwrap_or_else(default_docker_cpu_limit),
-            storage: DockerStorage::Conversation(conversation_id),
+            storage: PodStorage::Conversation(conversation_id),
         };
         (
             self.memory.unwrap_or_else(default_memory_limit),
@@ -2220,7 +2277,7 @@ pub async fn teardown_conversation(pool: &PgPool, conversation_id: i64) {
         }
     }
     // After the pods: Kubernetes holds a claim until no pod mounts it.
-    delete_docker_pvc(&manager.client, conversation_id).await;
+    delete_conversation_pvcs(&manager.client, conversation_id).await;
 }
 
 /// Returns the existing registry entry for `pod_id` if there is one;
@@ -2669,7 +2726,7 @@ pub async fn stop_pod_for_user(pool: &PgPool, pod_id: i64) -> Result<(), Termina
     force_terminate_pod(pool, pod_id).await?;
     if let Some(conversation_id) = conversation_id {
         let notice = format!(
-            "The user stopped sandbox pod {pod_id}. Its terminals, and any files outside mounted volumes, are gone. Create a new pod if you need one."
+            "The user stopped sandbox pod {pod_id}. Its terminals, and any files outside /workspace and mounted volumes, are gone. Create a new pod if you need one."
         );
         let pool = pool.clone();
         tokio::spawn(async move {
@@ -3300,7 +3357,7 @@ mod tests {
         DockerSidecar {
             memory: "2Gi".to_string(),
             cpu: "2".to_string(),
-            storage: DockerStorage::Conversation(conversation_id),
+            storage: PodStorage::Conversation(conversation_id),
         }
     }
 
@@ -3389,23 +3446,30 @@ mod tests {
             data.persistent_volume_claim.as_ref().map(|p| p.claim_name.as_str()),
             Some("sandbox-docker-42")
         );
-        for shared in ["workspace", "docker-sock"] {
-            let v = volumes.iter().find(|v| v.name == shared).expect(shared);
-            assert!(v.empty_dir.is_some(), "{shared} should be an emptyDir");
-        }
+        // /workspace outlives the pod on a claim of its own (SME-32); the
+        // socket dies with it.
+        let workspace = volumes.iter().find(|v| v.name == "workspace").expect("workspace volume");
+        assert_eq!(
+            workspace.persistent_volume_claim.as_ref().map(|p| p.claim_name.as_str()),
+            Some("sandbox-workspace-42")
+        );
+        let sock = volumes.iter().find(|v| v.name == "docker-sock").expect("docker-sock volume");
+        assert!(sock.empty_dir.is_some(), "docker-sock should be an emptyDir");
     }
 
     #[test]
-    fn test_pod_spec_ephemeral_docker_storage_is_an_empty_dir() {
+    fn test_pod_spec_ephemeral_storage_is_empty_dirs() {
         let docker = DockerSidecar {
-            storage: DockerStorage::Ephemeral,
+            storage: PodStorage::Ephemeral,
             ..docker_for_conversation(42)
         };
         let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker, &[]);
         let volumes = pod.spec.and_then(|s| s.volumes).expect("pod should have volumes");
-        let data = volumes.iter().find(|v| v.name == "docker-data").expect("docker-data volume");
-        assert!(data.empty_dir.is_some());
-        assert!(data.persistent_volume_claim.is_none());
+        for name in ["docker-data", "workspace"] {
+            let v = volumes.iter().find(|v| v.name == name).expect(name);
+            assert!(v.empty_dir.is_some(), "{name}");
+            assert!(v.persistent_volume_claim.is_none(), "{name}");
+        }
     }
 
     #[test]
@@ -3436,7 +3500,7 @@ mod tests {
             "create_pod finds a conversation's still-stopping pods by this label"
         );
         let ephemeral = DockerSidecar {
-            storage: DockerStorage::Ephemeral,
+            storage: PodStorage::Ephemeral,
             ..docker_for_conversation(42)
         };
         let unlabelled = build_pod_spec("sandbox-1", "1Gi", "1", &ephemeral, &[]);
@@ -3466,6 +3530,13 @@ mod tests {
         ];
         let live = std::collections::HashSet::from([1]);
         assert_eq!(orphaned_docker_claims(&claims, &live), vec![2]);
+        // A conversation has two claims (Docker data and /workspace): it's
+        // named once.
+        let both = vec![
+            claim("sandbox-docker-4", Some("4")),
+            claim("sandbox-workspace-4", Some("4")),
+        ];
+        assert_eq!(orphaned_docker_claims(&both, &live), vec![4]);
     }
 
     #[test]
@@ -3480,7 +3551,7 @@ mod tests {
         assert_eq!(cpu, default_cpu_limit());
         assert_eq!(docker.memory, default_docker_memory_limit());
         assert_eq!(docker.cpu, "4");
-        assert_eq!(docker.storage, DockerStorage::Conversation(7));
+        assert_eq!(docker.storage, PodStorage::Conversation(7));
     }
 
     fn pod_with_docker_status(restarts: i32, last_reason: Option<&str>) -> Pod {
@@ -3611,7 +3682,9 @@ mod tests {
 
     #[test]
     fn test_docker_pvc_spec_is_named_labelled_and_sized_for_the_conversation() {
-        let pvc = build_docker_pvc_spec(42);
+        let [pvc, workspace] = conversation_pvc_specs(42);
+        assert_eq!(workspace.metadata.name.as_deref(), Some("sandbox-workspace-42"));
+        assert_eq!(workspace.metadata.labels, pvc.metadata.labels);
         assert_eq!(pvc.metadata.name.as_deref(), Some("sandbox-docker-42"));
         assert_eq!(
             pvc.metadata
@@ -4370,9 +4443,9 @@ mod tests {
         let docker = DockerSidecar {
             memory: "1Gi".to_string(),
             cpu: "500m".to_string(),
-            storage: DockerStorage::Conversation(conversation_id),
+            storage: PodStorage::Conversation(conversation_id),
         };
-        ensure_docker_pvc(&client, conversation_id).await.expect("ensure docker claim");
+        ensure_conversation_pvcs(&client, conversation_id).await.expect("ensure docker claim");
         // Every pod this test makes, so cleanup below finds them even after
         // a failed assertion unwinds out of the checks.
         let created: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
@@ -4586,7 +4659,7 @@ mod tests {
         let docker = DockerSidecar {
             memory: "512Mi".to_string(),
             cpu: "500m".to_string(),
-            storage: DockerStorage::Ephemeral,
+            storage: PodStorage::Ephemeral,
         };
         let sandbox = manager
             .create_with_docker(&unique_session_id("docker-oom"), "128Mi", "250m", &docker, &[])
@@ -4680,9 +4753,9 @@ mod tests {
         let docker = DockerSidecar {
             memory: "256Mi".to_string(),
             cpu: "250m".to_string(),
-            storage: DockerStorage::Conversation(conversation_id),
+            storage: PodStorage::Conversation(conversation_id),
         };
-        ensure_docker_pvc(&client, conversation_id).await.expect("ensure docker claim");
+        ensure_conversation_pvcs(&client, conversation_id).await.expect("ensure docker claim");
         let sandbox = manager
             .create_with_docker(&unique_session_id("stopping"), "128Mi", "250m", &docker, &[])
             .await
@@ -4719,16 +4792,16 @@ mod tests {
             + 1_000_000_000;
         let name = docker_pvc_name(conversation_id);
 
-        ensure_docker_pvc(&client, conversation_id).await.expect("first ensure should create");
+        ensure_conversation_pvcs(&client, conversation_id).await.expect("first ensure should create");
         let first = pvcs.get_opt(&name).await.expect("get claim");
         let first_uid = first.and_then(|p| p.metadata.uid);
         assert!(first_uid.is_some(), "ensure_docker_pvc should create {name}");
 
-        ensure_docker_pvc(&client, conversation_id).await.expect("second ensure should reuse");
+        ensure_conversation_pvcs(&client, conversation_id).await.expect("second ensure should reuse");
         let second_uid = pvcs.get_opt(&name).await.expect("get claim").and_then(|p| p.metadata.uid);
         assert_eq!(first_uid, second_uid, "a second ensure must reuse the claim, not replace it");
 
-        delete_docker_pvc(&client, conversation_id).await;
+        delete_conversation_pvcs(&client, conversation_id).await;
         let gone = tokio::time::timeout(Duration::from_secs(30), async {
             while pvcs.get_opt(&name).await.expect("get claim").is_some() {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -4809,6 +4882,10 @@ mod tests {
                 .ok();
             pvcs_precheck
                 .delete(&docker_pvc_name(n), &DeleteParams::default())
+                .await
+                .ok();
+            pvcs_precheck
+                .delete(&workspace_pvc_name(n), &DeleteParams::default())
                 .await
                 .ok();
         }
@@ -4916,6 +4993,16 @@ mod tests {
                 .await
                 .expect("clone_repo again");
             assert_eq!(again.id, repo.id);
+            let wrote = exec_with(
+                &client,
+                &pod_name(pod_a),
+                "sandbox",
+                &["sh", "-c", "echo 'not pushed yet' > /workspace/origin/uncommitted.txt"],
+                None,
+            )
+            .await
+            .expect("exec write");
+            assert_eq!(wrote.exit_code, 0, "{}", wrote.stderr);
             let duplicate = create_pod(&pool, conversation_a.id, PodLimitOverrides::default()).await;
             assert!(
                 matches!(duplicate, Err(SandboxError::PodAlreadyExists)),
@@ -5333,19 +5420,29 @@ mod tests {
                 "terminate_pod should no longer be idempotent — a second call resolves to NoPod, got {repeat:?}"
             );
 
-            // A new pod clones the conversation's repos again. This origin
-            // lived in the old pod's /tmp, so the retry fails, with git's
-            // own reason recorded.
-            create_pod(&pool, conversation_a.id, PodLimitOverrides::default())
+            // /workspace is the conversation's own: the next pod has the
+            // checkout, uncommitted work included.
+            let pod_a2 = create_pod(&pool, conversation_a.id, PodLimitOverrides::default())
                 .await
                 .expect("a second pod for conversation a");
+            let kept = exec_with(
+                &client,
+                &pod_name(pod_a2),
+                "sandbox",
+                &["sh", "-c", "cat /workspace/origin/uncommitted.txt && git -C /workspace/origin status --porcelain"],
+                None,
+            )
+            .await
+            .expect("exec check workspace");
+            assert_eq!(
+                (kept.exit_code, kept.stdout.as_str()),
+                (0, "not pushed yet\n?? uncommitted.txt\n"),
+                "the checkout and its uncommitted file survive the pod: {}",
+                kept.stderr
+            );
             let repos = crate::git::list_repos(&pool, conversation_a.id).await.expect("list repos");
             assert_eq!(repos.len(), 1);
-            assert_eq!(repos[0].status, crate::git::RepoStatus::Failed, "{repos:?}");
-            assert!(
-                repos[0].error.as_deref().unwrap_or("").contains("does not appear to be a git repository"),
-                "{repos:?}"
-            );
+            assert_eq!(repos[0].status, crate::git::RepoStatus::Ready, "{repos:?}");
             terminate_pod(&pool, conversation_a.id).await.expect("terminate the second pod (a)");
 
             let pods_after = list_pods(&pool, conversation_a.id).await.expect("list_pods");
@@ -5693,6 +5790,21 @@ mod tests {
                 .and_then(|v| v.persistent_volume_claim)
                 .map(|c| c.claim_name);
             assert_eq!(data_claim.as_deref(), Some(docker_claim.as_str()), "pod j should mount its conversation's claim");
+            // And /workspace is on a claim of its own (SME-32).
+            let workspace_claim = workspace_pvc_name(conversation_j.id);
+            assert!(
+                docker_pvcs.get_opt(&workspace_claim).await.expect("get_opt").is_some(),
+                "create_pod should create the conversation's workspace claim {workspace_claim}"
+            );
+            let spec_j = pods_api(&client).get(&pod_name(pod_j)).await.expect("get pod j").spec.expect("spec");
+            let mounted_workspace = spec_j
+                .volumes
+                .unwrap_or_default()
+                .into_iter()
+                .find(|v| v.name == WORKSPACE_VOLUME)
+                .and_then(|v| v.persistent_volume_claim)
+                .map(|c| c.claim_name);
+            assert_eq!(mounted_workspace.as_deref(), Some(workspace_claim.as_str()), "pod j's /workspace is its conversation's claim");
 
             teardown_conversation(&pool, conversation_j.id).await;
             // The claim's `pvc-protection` finalizer holds it until the pod
@@ -5704,6 +5816,13 @@ mod tests {
             })
             .await;
             assert!(docker_claim_gone.is_ok(), "teardown_conversation should delete the docker data claim");
+            let workspace_claim_gone = tokio::time::timeout(Duration::from_secs(60), async {
+                while docker_pvcs.get_opt(&workspace_claim).await.ok().flatten().is_some() {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            })
+            .await;
+            assert!(workspace_claim_gone.is_ok(), "teardown_conversation should delete the workspace claim");
 
             // --- Generic volumes: create_volume/delete_volume manage a
             // real PVC alongside the sandbox_volumes row, and a volume
@@ -5909,7 +6028,7 @@ mod tests {
                 &DockerSidecar {
                     memory: "512Mi".to_string(),
                     cpu: "250m".to_string(),
-                    storage: DockerStorage::Ephemeral,
+                    storage: PodStorage::Ephemeral,
                 },
                 &[],
                 Duration::from_millis(1),

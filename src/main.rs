@@ -91,7 +91,7 @@ async fn main() {
     // Docker data claims whose conversation deletion didn't reach them (SME-33).
     tokio::spawn({
         let pool = pool.clone();
-        async move { sandbox::sweep_orphaned_docker_claims(&pool).await }
+        async move { sandbox::sweep_orphaned_conversation_claims(&pool).await }
     });
 
     // Each sandbox's dev servers, for the user's browser, on a listener of

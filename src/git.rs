@@ -330,29 +330,6 @@ mod server {
         clone_repo(pool, conversation_id, url, branch, None).await
     }
 
-    /// A new pod for a conversation gets its repos back: each is cloned
-    /// again, at the branch it was asked for. A repo that fails is marked
-    /// failed, with git's reason, and doesn't fail the pod.
-    pub async fn reclone_repos(pool: &PgPool, conversation_id: i64, pod_id: i64) {
-        let repos = match db::list_conversation_repos(pool, conversation_id).await {
-            Ok(repos) => repos,
-            Err(e) => {
-                tracing::warn!(conversation_id, error = %e, "couldn't list repos to clone again");
-                return;
-            }
-        };
-        for repo in repos {
-            if db::set_repo_cloning(pool, repo.id).await.is_err() {
-                continue;
-            }
-            publish_repos(pool, conversation_id).await;
-            if let Err(e) = clone_repo_row(pool, pod_id, &repo).await {
-                tracing::warn!(conversation_id, repo = %repo.url, error = %e, "couldn't clone a repo again");
-            }
-            publish_repos(pool, conversation_id).await;
-        }
-    }
-
     /// Clones one recorded repo into pod `pod_id` and records how it went.
     async fn clone_repo_row(pool: &PgPool, pod_id: i64, repo: &db::ConversationRepo) -> Result<(), String> {
         let client = sandbox::kube_client();
