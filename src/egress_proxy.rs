@@ -211,7 +211,7 @@ async fn handle_sandbox(
     dial: SandboxDial,
 ) -> Result<(), String> {
     // `sandbox_dial` bounds opening the port-forward (`with_timeout`).
-    let mut upstream = match dial(request.port).await {
+    let upstream = match dial(request.port).await {
         Ok(upstream) => upstream,
         Err(message) => {
             respond_with_body(&mut client, "502 Bad Gateway", &message).await;
@@ -219,34 +219,42 @@ async fn handle_sandbox(
         }
     };
     let io = |e: std::io::Error| e.to_string();
+    let (mut from_page, mut to_page) = client.into_split();
+    let (mut from_pod, mut to_pod) = tokio::io::split(upstream);
     match &request.forward_head {
-        None => {
-            client
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await
-                .map_err(io)?;
-            upstream.write_all(&rest).await.map_err(io)?;
-        }
-        Some(forward_head) => {
-            upstream.write_all(forward_head).await.map_err(io)?;
-            upstream.write_all(&rest).await.map_err(io)?;
-            let mut first = vec![0u8; 16 * 1024];
-            let n = upstream.read(&mut first).await.map_err(io)?;
-            if n == 0 {
-                let message = format!(
-                    "Nothing is listening on port {} in this conversation's sandbox.",
-                    request.port
-                );
-                respond_with_body(&mut client, "502 Bad Gateway", &message).await;
-                return Err(message);
-            }
-            client.write_all(&first[..n]).await.map_err(io)?;
-        }
+        None => to_page
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .map_err(io)?,
+        Some(forward_head) => to_pod.write_all(forward_head).await.map_err(io)?,
     }
-    tokio::io::copy_bidirectional(&mut client, &mut upstream)
-        .await
-        .map_err(io)?;
-    Ok(())
+    to_pod.write_all(&rest).await.map_err(io)?;
+    // Everything else the page sends goes on to the pod from here — a
+    // request body can follow its head in writes of its own (Chrome does
+    // this for a larger POST), and the pod won't answer until it has it.
+    let page_to_pod = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut from_page, &mut to_pod).await;
+        let _ = to_pod.shutdown().await;
+    });
+    if request.forward_head.is_some() {
+        let mut first = vec![0u8; 16 * 1024];
+        let n = from_pod.read(&mut first).await.map_err(io)?;
+        if n == 0 {
+            page_to_pod.abort();
+            let message = format!(
+                "Nothing is listening on port {} in this conversation's sandbox.",
+                request.port
+            );
+            respond_with_body(&mut to_page, "502 Bad Gateway", &message).await;
+            return Err(message);
+        }
+        to_page.write_all(&first[..n]).await.map_err(io)?;
+    }
+    let result = tokio::io::copy(&mut from_pod, &mut to_page).await;
+    let _ = to_page.shutdown().await;
+    // The pod's side is done; nothing it could still receive would be read.
+    page_to_pod.abort();
+    result.map(|_| ()).map_err(io)
 }
 
 /// Reads up to and including the blank line ending the request head;
@@ -272,7 +280,7 @@ async fn read_head(client: &mut TcpStream) -> Result<(Vec<u8>, Vec<u8>), String>
 
 /// Like `respond`, with a plain-text body saying what went wrong — shown
 /// as the page to whoever loaded it, the model or the user.
-async fn respond_with_body(client: &mut TcpStream, status: &str, body: &str) {
+async fn respond_with_body(client: &mut (impl tokio::io::AsyncWrite + Unpin), status: &str, body: &str) {
     let _ = client
         .write_all(
             format!(
@@ -544,6 +552,36 @@ mod tests {
             assert_eq!(response.text().await.unwrap(), "upstream says hi", "{host}");
         }
         assert_eq!(*dialed.lock().unwrap(), vec![3000, 3000, 3000]);
+    }
+
+    /// Chrome sends a larger POST's body after its head, in a write of its
+    /// own. The route must pass it on while waiting for the reply.
+    #[tokio::test]
+    async fn test_a_sandbox_route_passes_on_a_body_sent_after_the_head() {
+        let router = axum::Router::new().route("/echo", axum::routing::post(|body: String| async move { body }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed))
+            .await
+            .unwrap();
+        let mut stream = TcpStream::connect(proxy.addr).await.unwrap();
+        stream
+            .write_all(
+                b"POST http://localhost:3000/echo HTTP/1.1\r\nHost: localhost:3000\r\n\
+                  Content-Type: text/plain\r\nContent-Length: 5\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stream.write_all(b"hello").await.unwrap();
+        let mut reply = String::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut reply))
+            .await
+            .expect("the POST must be answered, not left waiting for its body")
+            .unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200") && reply.ends_with("hello"), "got {reply:?}");
     }
 
     #[tokio::test]
