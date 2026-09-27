@@ -1044,6 +1044,24 @@ pub async fn list_instruction_requests_for_remote(
     .await
 }
 
+/// Unloads every conversation's instructions from repos with this remote
+/// (the user declined it). Returns `(conversation, checkout dir, path)` of
+/// each file unloaded.
+pub async fn unload_instructions_for_remote(
+    pool: &PgPool,
+    remote_key: &str,
+) -> Result<Vec<(i64, String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "DELETE FROM loaded_instructions l
+          USING conversation_repos c
+          WHERE c.id = l.repo_id AND c.remote_key = $1
+      RETURNING l.conversation_id, c.dir, l.path",
+    )
+    .bind(remote_key)
+    .fetch_all(pool)
+    .await
+}
+
 /// Drops a pending request for `path` of repo `repo_id`, if there is one.
 pub async fn delete_instruction_request_for(pool: &PgPool, repo_id: i64, path: &str) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM instruction_requests WHERE repo_id = $1 AND path = $2")
