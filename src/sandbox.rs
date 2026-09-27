@@ -1696,7 +1696,7 @@ pub async fn create_pod(
             // command (SME-32). A pod without them would fail its first
             // push with a confusing ssh error, so a failure here is the
             // pod's failure.
-            if let Err(e) = crate::git::install_into_pod(pool, row.id).await {
+            if let Err(e) = crate::git::install_into_new_pod(pool, row.id).await {
                 let _ = manager.delete(sandbox).await;
                 let _ = db::terminate_sandbox_pod(pool, row.id).await;
                 return Err(SandboxError::GitSetup(e));

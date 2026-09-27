@@ -1287,6 +1287,17 @@ mod server {
     /// How long writing the git files into one pod may take.
     const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+    /// A new pod's git files: nothing to write when there's no key and no
+    /// identity, so a pod on an image without `/etc/smelt` still starts.
+    pub async fn install_into_new_pod(pool: &PgPool, pod_id: i64) -> Result<(), String> {
+        let keys = db::list_ssh_keys(pool).await.map_err(|e| e.to_string())?;
+        let identity = db::get_git_identity(pool).await.map_err(|e| e.to_string())?;
+        if keys.is_empty() && identity == GitIdentity::default() {
+            return Ok(());
+        }
+        install_into_pod(pool, pod_id).await
+    }
+
     /// After a key or the identity changes: every live pod gets the new
     /// files, so a key added mid-conversation works without a new pod. A
     /// pod that can't be reached is logged and skipped; it may be starting
@@ -1759,6 +1770,14 @@ mod server {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let row = db::get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
             assert_eq!((row.status.as_str(), row.error.as_deref()), ("ready", None));
+        }
+
+        /// No key and no identity: a new pod is left alone (SME-32 code
+        /// review 8, finding 2). Pod 999999 doesn't exist, and this test
+        /// process has no cluster: any attempt to write would fail.
+        #[sqlx::test]
+        async fn test_a_new_pod_gets_nothing_when_there_is_nothing_to_install(pool: PgPool) {
+            install_into_new_pod(&pool, 999_999).await.expect("nothing to do");
         }
 
         #[sqlx::test]
