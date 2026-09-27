@@ -1934,7 +1934,7 @@ mod server {
             close_session(routed).await.expect("close the routed session");
             loaded.expect("a routed session should load localhost from the sandbox");
             assert!(text.contains("in-page fetch 200"), "the page's own request to localhost failed: {text:?}");
-            assert!(dialed.lock().unwrap().iter().all(|&p| p == 4400), "unexpected ports: {dialed:?}");
+            assert!(dialed.lock().unwrap().iter().all(|&(_, p)| p == 4400), "unexpected ports: {dialed:?}");
 
             let unrouted: i64 = 900_102;
             open_session_with_guard(unrouted, fetch_guard::is_safe_fetch_addr)

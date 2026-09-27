@@ -13,21 +13,23 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+#[cfg(test)]
+use futures_util::FutureExt;
 use k8s_openapi::api::core::v1::{
-    Container, PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource,
-    Pod, PodSpec, ResourceRequirements, Volume, VolumeMount, VolumeResourceRequirements,
+    Container, EmptyDirVolumeSource, ExecAction, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    PersistentVolumeClaimVolumeSource, Pod, PodSpec, Probe, ResourceRequirements, SecurityContext,
+    Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-#[cfg(test)]
-use kube::api::ListParams;
-use kube::api::{Api, AttachParams, DeleteParams, PostParams};
+use kube::api::{Api, AttachParams, DeleteParams, ListParams, PostParams};
 use serde::Deserialize;
 use sqlx::PgPool;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::docker_net::{DOCKER_BRIDGE_IP, DOCKER_NETWORK_POOL};
 use crate::{db, events};
 
 // `cfg(test)` rather than an env var deliberately: the whole point is that
@@ -44,6 +46,12 @@ const DEFAULT_RUNNING_WAIT_TIMEOUT_SECS: u64 = 30;
 
 /// Matches `sandbox_agent`'s own `LISTEN_ADDR` port.
 const AGENT_PORT: u16 = 8088;
+/// The agent's relay into the pod's Docker networks (`RELAY_ADDR` in
+/// src/bin/sandbox_agent.rs), SME-33.
+const RELAY_PORT: u16 = 8089;
+/// Longer than the relay's own 5s connect timeout, so its answer, or its
+/// giving up, arrives first.
+const RELAY_CONNECT_WAIT: Duration = Duration::from_secs(7);
 
 #[derive(Debug)]
 pub enum SandboxError {
@@ -297,12 +305,23 @@ impl Sandbox {
     /// terminal protocol, which is what production code actually uses.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn exec(&self, command: &[&str]) -> Result<ExecResult, SandboxError> {
+        self.exec_in("sandbox", command).await
+    }
+
+    /// `exec` in a named container of the pod — `"docker"` for the Docker
+    /// sidecar (SME-33).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn exec_in(
+        &self,
+        container: &str,
+        command: &[&str],
+    ) -> Result<ExecResult, SandboxError> {
         let pods = pods_api(&self.client);
         let mut attached = pods
             .exec(
                 &self.pod_name,
                 command.iter().copied(),
-                &AttachParams::default(),
+                &AttachParams::default().container(container),
             )
             .await?;
 
@@ -376,14 +395,9 @@ impl SandboxManager {
         Self { client, cleanup_tx }
     }
 
-    /// `memory`/`cpu` are already-resolved values (the caller's own
-    /// override, or its default) — only used on the actual-creation
-    /// branch below; the reuse branch has nothing to apply them to, since
-    /// resources are immutable on an already-existing pod. `volumes` is
-    /// every currently-configured `sandbox_volumes` row — every pod gets
-    /// every one of them mounted, unconditionally (see
-    /// SME-17's Phase 4); an
-    /// empty slice is fine for callers (mostly tests) that don't care.
+    /// `create_with_docker` for tests, which have no conversation: a small
+    /// Docker sidecar whose data dies with the pod.
+    #[cfg(test)]
     pub async fn create(
         &self,
         session_id: &str,
@@ -391,8 +405,42 @@ impl SandboxManager {
         cpu: &str,
         volumes: &[db::SandboxVolume],
     ) -> Result<Sandbox, SandboxError> {
-        self.create_with_running_timeout(session_id, memory, cpu, volumes, running_wait_timeout())
-            .await
+        // Limits double as requests, so the deployment's 8Gi default would
+        // reserve 8Gi per test pod.
+        let docker = DockerSidecar {
+            memory: "512Mi".to_string(),
+            cpu: "250m".to_string(),
+            storage: DockerStorage::Ephemeral,
+        };
+        self.create_with_docker(session_id, memory, cpu, &docker, volumes).await
+    }
+
+    /// `memory`/`cpu` are already-resolved values (the caller's own
+    /// override, or its default) — only used on the actual-creation
+    /// branch below; the reuse branch has nothing to apply them to, since
+    /// resources are immutable on an already-existing pod. The same goes
+    /// for `docker`, the Docker sidecar's limits and storage (SME-33).
+    /// `volumes` is every currently-configured `sandbox_volumes` row —
+    /// every pod gets every one of them mounted, unconditionally (see
+    /// SME-17's Phase 4); an empty slice is fine for callers (mostly
+    /// tests) that don't care.
+    pub async fn create_with_docker(
+        &self,
+        session_id: &str,
+        memory: &str,
+        cpu: &str,
+        docker: &DockerSidecar,
+        volumes: &[db::SandboxVolume],
+    ) -> Result<Sandbox, SandboxError> {
+        self.create_with_running_timeout(
+            session_id,
+            memory,
+            cpu,
+            docker,
+            volumes,
+            running_wait_timeout(),
+        )
+        .await
     }
 
     /// Split out of `create` so a test can exercise the "pod never reaches
@@ -407,6 +455,7 @@ impl SandboxManager {
         session_id: &str,
         memory: &str,
         cpu: &str,
+        docker: &DockerSidecar,
         volumes: &[db::SandboxVolume],
         running_timeout: Duration,
     ) -> Result<Sandbox, SandboxError> {
@@ -436,7 +485,7 @@ impl SandboxManager {
                 ensure_volume_claims(&self.client, volumes).await?;
                 pods.create(
                     &PostParams::default(),
-                    &build_pod_spec(&name, memory, cpu, volumes),
+                    &build_pod_spec(&name, memory, cpu, docker, volumes),
                 )
                 .await?;
                 true
@@ -536,26 +585,373 @@ fn running_wait_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Where a pod's Docker sidecar keeps `/var/lib/docker` (SME-33).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DockerStorage {
+    /// The conversation's own PVC (`sandbox-docker-<id>`), so images and
+    /// build cache outlive the pod.
+    Conversation(i64),
+    /// An emptyDir that dies with the pod, for tests, which have no
+    /// conversation.
+    #[cfg(test)]
+    Ephemeral,
+}
+
+/// A pod's Docker sidecar: its own limits, which nested containers count
+/// against, and where its data lives (SME-33).
+#[derive(Debug, Clone)]
+pub struct DockerSidecar {
+    pub memory: String,
+    pub cpu: String,
+    pub storage: DockerStorage,
+}
+
+/// `SANDBOX_DOCKER_MEMORY_LIMIT`, default `"8Gi"` — see
+/// `default_memory_limit`. Nested containers count against it, not the
+/// sandbox container's limit.
+fn default_docker_memory_limit() -> String {
+    std::env::var("SANDBOX_DOCKER_MEMORY_LIMIT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "8Gi".to_string())
+}
+
+/// `SANDBOX_DOCKER_CPU_LIMIT`, default `"1"` — see `default_memory_limit`.
+fn default_docker_cpu_limit() -> String {
+    std::env::var("SANDBOX_DOCKER_CPU_LIMIT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "1".to_string())
+}
+
+/// Shared by the sandbox and Docker sidecar containers: projects that
+/// bind-mount host paths go here, and terminals start here.
+pub const WORKSPACE_DIR: &str = "/workspace";
+const WORKSPACE_VOLUME: &str = "workspace";
+/// Holds only dockerd's socket, never dockerd's own `/run/docker`: that
+/// holds containerd's state and pid file, and a copy shared with the
+/// sandbox survives a sidecar restart and makes the next dockerd fail
+/// (SME-33's spike).
+const DOCKER_SOCK_DIR: &str = "/run/docker-sock";
+const DOCKER_SOCK_VOLUME: &str = "docker-sock";
+const DOCKER_HOST: &str = "unix:///run/docker-sock/docker.sock";
+const DOCKER_DATA_VOLUME: &str = "docker-data";
+/// The `docker` group's GID in the sandbox image
+/// (docker/sandbox/Dockerfile); dockerd gives it the socket.
+const DOCKER_GID: u32 = 2375;
+
+/// The conversation's Docker data PVC, `sandbox-docker-<id>`.
+fn docker_pvc_name(conversation_id: i64) -> String {
+    format!("sandbox-docker-{conversation_id}")
+}
+
+/// Label naming a conversation, on its Docker data PVC and on every pod
+/// that mounts that PVC.
+const CONVERSATION_LABEL: &str = "smelt/conversation";
+
+/// `SANDBOX_DOCKER_STORAGE_SIZE`, default `"20Gi"` — see
+/// `default_memory_limit`. Each conversation's Docker data PVC requests
+/// this much.
+fn default_docker_storage_size() -> String {
+    std::env::var("SANDBOX_DOCKER_STORAGE_SIZE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "20Gi".to_string())
+}
+
+fn build_docker_pvc_spec(conversation_id: i64) -> PersistentVolumeClaim {
+    let mut requests = std::collections::BTreeMap::new();
+    requests.insert("storage".to_string(), Quantity(default_docker_storage_size()));
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert(
+        CONVERSATION_LABEL.to_string(),
+        conversation_id.to_string(),
+    );
+
+    PersistentVolumeClaim {
+        metadata: ObjectMeta {
+            name: Some(docker_pvc_name(conversation_id)),
+            namespace: Some(NAMESPACE.to_string()),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+            resources: Some(VolumeResourceRequirements {
+                requests: Some(requests),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The conversations whose Docker data claims outlived them: claims
+/// labelled with a conversation that isn't in `live`.
+fn orphaned_docker_claims(
+    claims: &[PersistentVolumeClaim],
+    live: &std::collections::HashSet<i64>,
+) -> Vec<i64> {
+    claims
+        .iter()
+        .filter_map(|c| c.metadata.labels.as_ref()?.get(CONVERSATION_LABEL)?.parse().ok())
+        .filter(|id| !live.contains(id))
+        .collect()
+}
+
+/// Deletes Docker data claims whose conversation is gone. Conversation
+/// teardown deletes its claim best-effort, so this catches what that
+/// missed. Run once at startup by `main`, never from tests: tests share
+/// the namespace but each has its own database, so from a test every
+/// other test's claim would look orphaned.
+pub async fn sweep_orphaned_docker_claims(pool: &PgPool) {
+    let client = &get().client;
+    let selector = ListParams::default().labels(CONVERSATION_LABEL);
+    // Claims first, then conversations: a claim only exists for a
+    // conversation that already did, so none can be missed in between.
+    let claims = match pvc_api(client).list(&selector).await {
+        Ok(list) => list.items,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list docker data claims to sweep");
+            return;
+        }
+    };
+    let live = match db::list_conversations(pool).await {
+        Ok(conversations) => conversations.into_iter().map(|c| c.id).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list conversations to sweep docker data claims");
+            return;
+        }
+    };
+    for conversation_id in orphaned_docker_claims(&claims, &live) {
+        tracing::info!(conversation_id, "deleting a deleted conversation's docker data claim");
+        delete_docker_pvc(client, conversation_id).await;
+    }
+}
+
+/// Whether the pod's Docker sidecar restarted since `last_reported`
+/// restarts, and if so its new restart count and the reason Kubernetes
+/// gave for the last exit (e.g. `OOMKilled`).
+fn docker_restart_to_report(pod: &Pod, last_reported: i32) -> Option<(i32, Option<String>)> {
+    let docker = pod
+        .status
+        .as_ref()?
+        .init_container_statuses
+        .as_ref()?
+        .iter()
+        .find(|c| c.name == "docker")?;
+    if docker.restart_count <= last_reported {
+        return None;
+    }
+    let reason = docker
+        .last_state
+        .as_ref()
+        .and_then(|s| s.terminated.as_ref())
+        .and_then(|t| t.reason.clone());
+    Some((docker.restart_count, reason))
+}
+
+/// `watch_pods`' bookkeeping for Docker sidecar restarts: remembers each
+/// pod's restart count in `seen`, and returns the pod id and reason for a
+/// restart to report. A pod's first listing (`initial`, after smelt starts
+/// or the watch reconnects) is only remembered, so a restart from before
+/// isn't reported again.
+fn note_docker_restarts(
+    seen: &mut HashMap<i64, i32>,
+    pod: &Pod,
+    initial: bool,
+) -> Option<(i64, Option<String>)> {
+    let pod_id = watched_pod_id(pod)?;
+    let last = seen.get(&pod_id).copied().unwrap_or(0);
+    let (count, reason) = docker_restart_to_report(pod, last)?;
+    seen.insert(pod_id, count);
+    (!initial).then_some((pod_id, reason))
+}
+
+/// Tells the pod's conversation that its Docker sidecar restarted, then
+/// wakes it, the same way a crashed pod is reported (see
+/// `handle_crash_cleanup`): the containers it ran are gone, which a
+/// command waiting on one of them may need to hear about.
+async fn report_docker_restart(pool: &PgPool, pod_id: i64, reason: Option<String>) {
+    let conversation_id = match db::sandbox_pod_conversation_id(pool, pod_id).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't find the conversation of a pod whose Docker restarted");
+            return;
+        }
+    };
+    let why = reason.map(|r| format!(" ({r})")).unwrap_or_default();
+    let notice = format!(
+        "Docker in sandbox pod {pod_id} was restarted{why}, so the containers it was running \
+         have stopped. Images, terminals and /workspace are unaffected. Every container shares \
+         Docker's memory limit; a pod created with a larger docker_memory_limit gives them more."
+    );
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::api::chat::save_notice_between_turns(&pool, conversation_id, notice).await {
+            tracing::warn!(conversation_id, pod_id, error = %e, "couldn't save the Docker restart notice");
+        }
+        let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
+    });
+}
+
+/// Waits until no pod labelled with `conversation_id` is left in the
+/// cluster, so a new pod never shares the Docker claim with one still
+/// stopping.
+async fn wait_for_conversation_pods_gone(
+    client: &kube::Client,
+    conversation_id: i64,
+    timeout: Duration,
+) -> Result<(), SandboxError> {
+    let pods = pods_api(client);
+    let selector = ListParams::default().labels(&format!("{CONVERSATION_LABEL}={conversation_id}"));
+    let waited = tokio::time::timeout(timeout, async {
+        loop {
+            let remaining = pods.list(&selector).await?;
+            if remaining.items.is_empty() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await;
+    waited.map_err(|_| {
+        SandboxError::Timeout(Some(
+            "the conversation's previous pod is still stopping".to_string(),
+        ))
+    })?
+}
+
+/// Creates the conversation's Docker data PVC unless it already exists,
+/// so a conversation's later pods reuse its images and build cache.
+async fn ensure_docker_pvc(client: &kube::Client, conversation_id: i64) -> Result<(), SandboxError> {
+    let pvcs = pvc_api(client);
+    if pvcs.get_opt(&docker_pvc_name(conversation_id)).await?.is_some() {
+        return Ok(());
+    }
+    match pvcs
+        .create(&PostParams::default(), &build_docker_pvc_spec(conversation_id))
+        .await
+    {
+        // Another create for the same conversation got there first.
+        Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
+        other => other.map(|_| ()).map_err(SandboxError::from),
+    }
+}
+
+/// Best-effort, like the rest of conversation teardown: logged, never
+/// returned. The startup sweep catches whatever this misses.
+async fn delete_docker_pvc(client: &kube::Client, conversation_id: i64) {
+    let name = docker_pvc_name(conversation_id);
+    match pvc_api(client).delete(&name, &DeleteParams::default()).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(e)) if e.code == 404 => {}
+        Err(e) => tracing::warn!(claim = %name, error = %e, "failed to delete docker data claim"),
+    }
+}
+
+/// `SANDBOX_DOCKER_IMAGE`, default `"docker.io/library/docker:29-dind"` —
+/// see `default_sandbox_image`. Delivered into the node like the sandbox
+/// image, and only its `dockerd` is used: never its entrypoint.
+fn default_docker_image() -> String {
+    std::env::var("SANDBOX_DOCKER_IMAGE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "docker.io/library/docker:29-dind".to_string())
+}
+
+/// Starts dockerd inside the sidecar's own cgroup instead of through the
+/// docker:dind image's entrypoint; see the script's own comment.
+const START_DOCKERD_SCRIPT: &str = include_str!("../docker/sandbox/start-dockerd.sh");
+
 /// `memory`/`cpu` are plain Kubernetes `Quantity` strings (`"8Gi"`, `"1"`)
 /// — no app-side parsing or validation of the format; an invalid value is
 /// rejected by the Kubernetes API itself when the pod is actually
 /// created, surfacing back through `SandboxError::Kube` as an ordinary
 /// error. Bounded from above by the `smelt-park` namespace's own
 /// `LimitRange` (`k8s/smelt-park-rbac.yaml`), not by anything here.
-fn build_pod_spec(name: &str, memory: &str, cpu: &str, volumes: &[db::SandboxVolume]) -> Pod {
-    let mut limits = std::collections::BTreeMap::new();
-    limits.insert("memory".to_string(), Quantity(memory.to_string()));
-    limits.insert("cpu".to_string(), Quantity(cpu.to_string()));
+fn build_pod_spec(
+    name: &str,
+    memory: &str,
+    cpu: &str,
+    docker: &DockerSidecar,
+    volumes: &[db::SandboxVolume],
+) -> Pod {
+    let (mut pod_volumes, user_mounts) = volume_mounts_for(volumes);
+    pod_volumes.extend([
+        empty_dir_volume(WORKSPACE_VOLUME),
+        empty_dir_volume(DOCKER_SOCK_VOLUME),
+        docker_data_volume(&docker.storage),
+    ]);
+    // Both containers see the same files at the same paths, so a bind
+    // mount dockerd resolves in the sidecar finds what the model wrote.
+    let mut shared_mounts = user_mounts;
+    shared_mounts.extend([
+        mount(WORKSPACE_VOLUME, WORKSPACE_DIR),
+        mount(DOCKER_SOCK_VOLUME, DOCKER_SOCK_DIR),
+    ]);
+    let mut docker_mounts = shared_mounts.clone();
+    docker_mounts.push(mount(DOCKER_DATA_VOLUME, "/var/lib/docker"));
 
-    let (pod_volumes, volume_mounts) = volume_mounts_for(volumes);
+    // Only a pod on a conversation's claim needs finding by conversation:
+    // see `wait_for_conversation_pods_gone`.
+    let labels = match docker.storage {
+        DockerStorage::Conversation(conversation_id) => Some(
+            [(CONVERSATION_LABEL.to_string(), conversation_id.to_string())].into(),
+        ),
+        #[cfg(test)]
+        DockerStorage::Ephemeral => None,
+    };
 
     Pod {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(NAMESPACE.to_string()),
+            labels,
             ..Default::default()
         },
         spec: Some(PodSpec {
+            // A native sidecar (an init container with `restartPolicy:
+            // Always`): the pod stays `Pending` until its startup probe
+            // passes, so the sandbox never starts before dockerd answers,
+            // and Kubernetes restarts it on its own after an OOM kill
+            // without touching the sandbox container (SME-33's spike).
+            init_containers: Some(vec![Container {
+                name: "docker".to_string(),
+                image: Some(default_docker_image()),
+                // Delivered into the node like the sandbox image, see
+                // scripts/build-sandbox-image.sh.
+                image_pull_policy: Some("Never".to_string()),
+                restart_policy: Some("Always".to_string()),
+                security_context: Some(SecurityContext {
+                    privileged: Some(true),
+                    ..Default::default()
+                }),
+                command: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    START_DOCKERD_SCRIPT.to_string(),
+                    "start-dockerd".to_string(),
+                ]),
+                args: Some(dockerd_args()),
+                startup_probe: Some(Probe {
+                    exec: Some(ExecAction {
+                        command: Some(vec![
+                            "docker".to_string(),
+                            format!("--host={DOCKER_HOST}"),
+                            "info".to_string(),
+                        ]),
+                    }),
+                    period_seconds: Some(1),
+                    failure_threshold: Some(60),
+                    ..Default::default()
+                }),
+                resources: Some(limits(&docker.memory, &docker.cpu)),
+                volume_mounts: Some(docker_mounts),
+                ..Default::default()
+            }]),
             containers: vec![Container {
                 name: "sandbox".to_string(),
                 image: Some(default_sandbox_image()),
@@ -571,19 +967,70 @@ fn build_pod_spec(name: &str, memory: &str, cpu: &str, volumes: &[db::SandboxVol
                 // the sandbox agent, so it's already running (and keeping
                 // the pod alive) the moment the container starts. See
                 // SME-17.
-                resources: Some(ResourceRequirements {
-                    limits: Some(limits),
-                    ..Default::default()
-                }),
-                volume_mounts: (!volume_mounts.is_empty()).then_some(volume_mounts),
+                resources: Some(limits(memory, cpu)),
+                volume_mounts: Some(shared_mounts),
                 ..Default::default()
             }],
-            volumes: (!pod_volumes.is_empty()).then_some(pod_volumes),
+            volumes: Some(pod_volumes),
             restart_policy: Some("Never".to_string()),
             ..Default::default()
         }),
         status: None,
     }
+}
+
+fn limits(memory: &str, cpu: &str) -> ResourceRequirements {
+    let mut limits = std::collections::BTreeMap::new();
+    limits.insert("memory".to_string(), Quantity(memory.to_string()));
+    limits.insert("cpu".to_string(), Quantity(cpu.to_string()));
+    ResourceRequirements {
+        limits: Some(limits),
+        ..Default::default()
+    }
+}
+
+fn mount(volume: &str, path: &str) -> VolumeMount {
+    VolumeMount {
+        name: volume.to_string(),
+        mount_path: path.to_string(),
+        ..Default::default()
+    }
+}
+
+fn empty_dir_volume(name: &str) -> Volume {
+    Volume {
+        name: name.to_string(),
+        empty_dir: Some(EmptyDirVolumeSource::default()),
+        ..Default::default()
+    }
+}
+
+fn docker_data_volume(storage: &DockerStorage) -> Volume {
+    match storage {
+        DockerStorage::Conversation(conversation_id) => Volume {
+            name: DOCKER_DATA_VOLUME.to_string(),
+            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                claim_name: docker_pvc_name(*conversation_id),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        #[cfg(test)]
+        DockerStorage::Ephemeral => empty_dir_volume(DOCKER_DATA_VOLUME),
+    }
+}
+
+/// dockerd's arguments after `START_DOCKERD_SCRIPT` — a unix socket only,
+/// never TCP: the pod shares one network namespace, so a TCP listener
+/// would be reachable through `open_pod_target` and a preview link.
+fn dockerd_args() -> Vec<String> {
+    vec![
+        format!("--host={DOCKER_HOST}"),
+        format!("--group={DOCKER_GID}"),
+        format!("--bip={DOCKER_BRIDGE_IP}"),
+        "--default-address-pool".to_string(),
+        format!("base={DOCKER_NETWORK_POOL},size=24"),
+    ]
 }
 
 // Only called by the "no-agent pod" real-cluster test below — `create`
@@ -689,9 +1136,9 @@ pub enum TerminalError {
     /// (which only ever distinguish success from a generic failure) —
     /// the model needs to see and act on exactly what went wrong.
     FileOperation(String),
-    /// A request to open the sandbox agent's own port (`AGENT_PORT`) from a
-    /// route into the pod — see `check_reachable_port`.
-    AgentPort,
+    /// A request to open one of the sandbox agent's own ports (`AGENT_PORT`,
+    /// `RELAY_PORT`) from a route into the pod — see `check_reachable_port`.
+    AgentPort(u16),
 }
 
 impl std::fmt::Display for TerminalError {
@@ -723,9 +1170,9 @@ impl std::fmt::Display for TerminalError {
                 )
             }
             TerminalError::FileOperation(message) => write!(f, "{message}"),
-            TerminalError::AgentPort => write!(
+            TerminalError::AgentPort(port) => write!(
                 f,
-                "port {AGENT_PORT} is smelt's own sandbox agent, which can't be opened from a \
+                "port {port} is smelt's own sandbox agent, which can't be opened from a \
                  browser or a preview; run your server on another port"
             ),
         }
@@ -1010,22 +1457,19 @@ async fn conversation_pod_id(pool: &PgPool, conversation_id: i64) -> Result<i64,
 /// another. Rolls the DB row back (soft-terminates it) if the underlying
 /// k8s create fails, so a failed create never leaves a pod_id `list_pods`
 /// would show as live but that doesn't actually exist.
-/// `memory_limit`/`cpu_limit` override the deployment's
-/// `SANDBOX_MEMORY_LIMIT`/`SANDBOX_CPU_LIMIT` default for just this one
-/// pod when given — see the plan's "Per-pod limit overrides."
+/// `limits` override the deployment's defaults for just this one pod —
+/// see `PodLimitOverrides`.
 pub async fn create_pod(
     pool: &PgPool,
     conversation_id: i64,
-    memory_limit: Option<String>,
-    cpu_limit: Option<String>,
+    limits: PodLimitOverrides,
 ) -> Result<i64, SandboxError> {
     let existing = db::list_sandbox_pods(pool, conversation_id)
         .await
         .map_err(SandboxError::Db)?;
     check_pod_guard(&existing)?;
 
-    let memory = memory_limit.unwrap_or_else(default_memory_limit);
-    let cpu = cpu_limit.unwrap_or_else(default_cpu_limit);
+    let (memory, cpu, docker) = limits.resolve(conversation_id);
 
     let manager = get();
     let row = db::create_sandbox_pod(pool, conversation_id)
@@ -1040,8 +1484,20 @@ pub async fn create_pod(
     // (this pod persists independently of any in-process value), so it's
     // disarmed immediately, the same `mem::forget` pattern
     // `SandboxManager::delete` itself already uses for the same reason.
+    // A pod terminate_pod just stopped can still hold the Docker claim.
+    if let Err(e) =
+        wait_for_conversation_pods_gone(&manager.client, conversation_id, running_wait_timeout())
+            .await
+    {
+        let _ = db::terminate_sandbox_pod(pool, row.id).await;
+        return Err(e);
+    }
+    if let Err(e) = ensure_docker_pvc(&manager.client, conversation_id).await {
+        let _ = db::terminate_sandbox_pod(pool, row.id).await;
+        return Err(e);
+    }
     match manager
-        .create(&row.id.to_string(), &memory, &cpu, &volumes)
+        .create_with_docker(&row.id.to_string(), &memory, &cpu, &docker, &volumes)
         .await
     {
         Ok(sandbox) => {
@@ -1064,22 +1520,61 @@ pub async fn create_pod(
     }
 }
 
-/// Refuses the one port in a pod no route may reach: the sandbox agent's
-/// (`AGENT_PORT`), whose WebSocket runs commands with no login of its own.
-/// A preview or a page in the model's browser reaching it would let any
-/// website run commands in the sandbox (found in SME-42's code review).
+/// Refuses the ports in a pod no route may reach: the sandbox agent's
+/// (`AGENT_PORT`), whose WebSocket runs commands with no login of its own,
+/// and its relay (`RELAY_PORT`), which reaches every container. A preview
+/// or a page in the model's browser reaching either would let any website
+/// into the sandbox (found in SME-42's code review).
 pub fn check_reachable_port(port: u16) -> Result<(), TerminalError> {
-    if port == AGENT_PORT {
-        return Err(TerminalError::AgentPort);
+    if port == AGENT_PORT || port == RELAY_PORT {
+        return Err(TerminalError::AgentPort(port));
     }
     Ok(())
 }
 
-/// A byte stream to a port inside a sandbox pod, from `open_pod_port`.
+/// `create_pod`'s per-pod overrides of the deployment's limits: the
+/// sandbox container's (`SANDBOX_MEMORY_LIMIT`/`SANDBOX_CPU_LIMIT`, see the
+/// plan's "Per-pod limit overrides") and the Docker sidecar's
+/// (`SANDBOX_DOCKER_*_LIMIT`, SME-33). Plain Kubernetes quantity strings,
+/// validated by Kubernetes itself against the namespace's `LimitRange`.
+#[derive(Debug, Clone, Default)]
+pub struct PodLimitOverrides {
+    pub memory: Option<String>,
+    pub cpu: Option<String>,
+    pub docker_memory: Option<String>,
+    pub docker_cpu: Option<String>,
+}
+
+impl PodLimitOverrides {
+    /// The sandbox container's memory and CPU, and the Docker sidecar on
+    /// the conversation's own claim.
+    fn resolve(self, conversation_id: i64) -> (String, String, DockerSidecar) {
+        let docker = DockerSidecar {
+            memory: self.docker_memory.unwrap_or_else(default_docker_memory_limit),
+            cpu: self.docker_cpu.unwrap_or_else(default_docker_cpu_limit),
+            storage: DockerStorage::Conversation(conversation_id),
+        };
+        (
+            self.memory.unwrap_or_else(default_memory_limit),
+            self.cpu.unwrap_or_else(default_cpu_limit),
+            docker,
+        )
+    }
+}
+
+/// Where in a conversation's pod a connection goes (SME-33): its own
+/// `localhost`, or a Docker container's address in the pod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PodHost {
+    Localhost,
+    Container(std::net::Ipv4Addr),
+}
+
+/// A byte stream to a port inside a sandbox pod, from `open_pod_target`.
 pub trait PodIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> PodIo for T {}
 
-/// Opens a TCP connection to `port` inside `conversation_id`'s own live
+/// Opens a TCP connection to `host:port` inside `conversation_id`'s own live
 /// pod, through a Kubernetes port-forward — the pod is resolved here from
 /// the conversation, never named by the caller, so nothing can reach
 /// another conversation's pod (SME-42). The connection is made inside the
@@ -1090,15 +1585,19 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> PodIo for T
 /// ends without a byte. After the pod side closes, the end of the stream
 /// arrives about a second late (seen on k3s), so a caller must never wait
 /// for it to know a response is complete.
-pub async fn open_pod_port(
+///
+/// `host` is the pod's own `localhost`, or a Docker container's address
+/// there (SME-33), reached through the agent's relay.
+pub async fn open_pod_target(
     pool: &PgPool,
     conversation_id: i64,
+    host: PodHost,
     port: u16,
 ) -> Result<Box<dyn PodIo>, TerminalError> {
-    open_pod_port_with(pool, conversation_id, port, || get().client.clone()).await
+    open_pod_port_with(pool, conversation_id, host, port, || get().client.clone()).await
 }
 
-/// `open_pod_port` with the Kubernetes client supplied — a test's own, so
+/// `open_pod_target` with the Kubernetes client supplied — a test's own, so
 /// it never has to set the process-global manager (see
 /// `test_open_pod_port_reaches_the_conversations_own_pod`). The client is
 /// only asked for once there's a pod, so a conversation without one never
@@ -1106,18 +1605,58 @@ pub async fn open_pod_port(
 async fn open_pod_port_with(
     pool: &PgPool,
     conversation_id: i64,
+    host: PodHost,
     port: u16,
     client: impl FnOnce() -> kube::Client,
 ) -> Result<Box<dyn PodIo>, TerminalError> {
-    check_reachable_port(port)?;
+    if host == PodHost::Localhost {
+        check_reachable_port(port)?;
+    }
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
-    let mut forwarder = pods_api(&client())
-        .portforward(&pod_name(pod_id), &[port])
+    dial_pod(&client(), &pod_name(pod_id), host, port).await
+}
+
+/// Opens a connection to `host:port` in the pod named `pod`: a
+/// port-forward for `localhost`, or one to the agent's relay for a
+/// container address.
+async fn dial_pod(
+    client: &kube::Client,
+    pod: &str,
+    host: PodHost,
+    port: u16,
+) -> Result<Box<dyn PodIo>, TerminalError> {
+    let forward_to = match host {
+        PodHost::Localhost => {
+            check_reachable_port(port)?;
+            port
+        }
+        PodHost::Container(_) => RELAY_PORT,
+    };
+    let mut forwarder = pods_api(client)
+        .portforward(pod, &[forward_to])
         .await
         .map_err(|e| TerminalError::Sandbox(SandboxError::Kube(e)))?;
-    let stream = forwarder
-        .take_stream(port)
+    let mut stream = forwarder
+        .take_stream(forward_to)
         .expect("stream requested for the forwarded port");
+    if let PodHost::Container(ip) = host {
+        // The relay's one line, then its answer once it has connected
+        // (`RELAY_CONNECTED` in src/bin/sandbox_agent.rs). A target it
+        // refuses, or can't reach, gets a stream that's already ended,
+        // which reads the same as a port nothing listens on.
+        use tokio::io::AsyncWriteExt;
+        stream
+            .write_all(format!("{ip}:{port}\n").as_bytes())
+            .await
+            .map_err(|e| TerminalError::Sandbox(SandboxError::Io(e)))?;
+        let mut answer = [0u8; 3];
+        let connected = tokio::time::timeout(RELAY_CONNECT_WAIT, stream.read_exact(&mut answer))
+            .await
+            .is_ok_and(|read| read.is_ok() && &answer == b"ok\n");
+        if !connected {
+            return Ok(Box::new(tokio::io::join(tokio::io::empty(), tokio::io::sink())));
+        }
+    }
     Ok(Box::new(stream))
 }
 
@@ -1128,8 +1667,13 @@ async fn open_pod_port_with(
 /// k3s); a listening server keeps the connection open waiting for a
 /// request. `LISTEN_PROBE` is well past the first and far below a request
 /// timeout.
-pub async fn pod_port_is_listening(pool: &PgPool, conversation_id: i64, port: u16) -> Result<bool, TerminalError> {
-    pod_port_is_listening_with(pool, conversation_id, port, || get().client.clone()).await
+pub async fn pod_port_is_listening(
+    pool: &PgPool,
+    conversation_id: i64,
+    host: PodHost,
+    port: u16,
+) -> Result<bool, TerminalError> {
+    pod_port_is_listening_with(pool, conversation_id, host, port, || get().client.clone()).await
 }
 
 const LISTEN_PROBE: Duration = Duration::from_millis(500);
@@ -1137,18 +1681,24 @@ const LISTEN_PROBE: Duration = Duration::from_millis(500);
 async fn pod_port_is_listening_with(
     pool: &PgPool,
     conversation_id: i64,
+    host: PodHost,
     port: u16,
     client: impl FnOnce() -> kube::Client,
 ) -> Result<bool, TerminalError> {
-    let mut stream = open_pod_port_with(pool, conversation_id, port, client).await?;
+    let stream = open_pod_port_with(pool, conversation_id, host, port, client).await?;
+    Ok(stream_is_listening(stream).await)
+}
+
+/// `pod_port_is_listening`'s judgement of a freshly opened stream.
+async fn stream_is_listening(mut stream: Box<dyn PodIo>) -> bool {
     let mut first = [0u8; 1];
-    Ok(match tokio::time::timeout(LISTEN_PROBE, stream.read(&mut first)).await {
+    match tokio::time::timeout(LISTEN_PROBE, stream.read(&mut first)).await {
         // Still open: something accepted the connection and is waiting.
         Err(_) => true,
         // A server that speaks first (SSH, a database) is listening too.
         Ok(Ok(n)) => n > 0,
         Ok(Err(_)) => false,
-    })
+    }
 }
 
 /// The conversation's live pod's id, for callers outside this module —
@@ -1217,12 +1767,36 @@ async fn force_terminate_pod(
 }
 
 /// What the pods view shows about a pod from Kubernetes itself: its phase
-/// and its container's configured limits (as Kubernetes quantity strings).
+/// and each of its containers' configured limits (as Kubernetes quantity
+/// strings): the sandbox container's and, since SME-33, the Docker
+/// sidecar's. The view adds them up, as it does their usage.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PodDetails {
     pub phase: Option<String>,
-    pub memory_limit: Option<String>,
-    pub cpu_limit: Option<String>,
+    pub memory_limits: Vec<String>,
+    pub cpu_limits: Vec<String>,
+}
+
+/// Every running container's memory and CPU limits in `pod`: its
+/// containers and its native sidecars (init containers that keep running).
+fn pod_container_limits(pod: &Pod) -> (Vec<String>, Vec<String>) {
+    let Some(spec) = pod.spec.as_ref() else {
+        return (Vec::new(), Vec::new());
+    };
+    let sidecars = spec
+        .init_containers
+        .iter()
+        .flatten()
+        .filter(|c| c.restart_policy.as_deref() == Some("Always"));
+    let running: Vec<&Container> = spec.containers.iter().chain(sidecars).collect();
+    let limits = |name: &str| -> Vec<String> {
+        running
+            .iter()
+            .filter_map(|c| c.resources.as_ref()?.limits.as_ref()?.get(name))
+            .map(|q| q.0.clone())
+            .collect()
+    };
+    (limits("memory"), limits("cpu"))
 }
 
 /// `pod_id`'s phase and limits, or `None` if Kubernetes has no such pod.
@@ -1231,17 +1805,11 @@ pub async fn pod_details(pod_id: i64) -> Result<Option<PodDetails>, SandboxError
     let Some(pod) = pods.get_opt(&pod_name(pod_id)).await? else {
         return Ok(None);
     };
-    let limits = pod
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.containers.first())
-        .and_then(|container| container.resources.as_ref())
-        .and_then(|resources| resources.limits.as_ref());
-    let limit = |name: &str| limits.and_then(|l| l.get(name)).map(|q| q.0.clone());
+    let (memory_limits, cpu_limits) = pod_container_limits(&pod);
     Ok(Some(PodDetails {
         phase: pod.status.as_ref().and_then(|s| s.phase.clone()),
-        memory_limit: limit("memory"),
-        cpu_limit: limit("cpu"),
+        memory_limits,
+        cpu_limits,
     }))
 }
 
@@ -1543,6 +2111,8 @@ pub async fn teardown_conversation(pool: &PgPool, conversation_id: i64) {
             }
         }
     }
+    // After the pods: Kubernetes holds a claim until no pod mounts it.
+    delete_docker_pvc(&manager.client, conversation_id).await;
 }
 
 /// Returns the existing registry entry for `pod_id` if there is one;
@@ -2037,10 +2607,13 @@ pub async fn watch_pods(pool: PgPool) {
     futures_util::pin_mut!(events);
     // Pods listed since the last `Init`, until `InitDone` completes the set.
     let mut listed = std::collections::HashSet::new();
+    // Each pod's Docker sidecar restart count, see `note_docker_restarts`.
+    let mut docker_restarts = HashMap::new();
     while let Some(event) = events.next().await {
         match event {
             Ok(watcher::Event::Init) => listed.clear(),
             Ok(watcher::Event::InitApply(pod)) => {
+                note_docker_restarts(&mut docker_restarts, &pod, true);
                 if let Some(pod_id) = watched_pod_id(&pod) {
                     if !pod_has_finished(&pod) {
                         listed.insert(pod_id);
@@ -2062,9 +2635,14 @@ pub async fn watch_pods(pool: PgPool) {
                     close_after_grace(pool.clone(), pod_id);
                 }
             }
-            Ok(watcher::Event::Apply(_)) => {}
+            Ok(watcher::Event::Apply(pod)) => {
+                if let Some((pod_id, reason)) = note_docker_restarts(&mut docker_restarts, &pod, false) {
+                    report_docker_restart(&pool, pod_id, reason).await;
+                }
+            }
             Ok(watcher::Event::Delete(pod)) => {
                 if let Some(pod_id) = watched_pod_id(&pod) {
+                    docker_restarts.remove(&pod_id);
                     close_after_grace(pool.clone(), pod_id);
                 }
             }
@@ -2610,6 +3188,341 @@ mod tests {
         }
     }
 
+    fn docker_for_conversation(conversation_id: i64) -> DockerSidecar {
+        DockerSidecar {
+            memory: "2Gi".to_string(),
+            cpu: "2".to_string(),
+            storage: DockerStorage::Conversation(conversation_id),
+        }
+    }
+
+    fn container<'a>(containers: &'a Option<Vec<Container>>, name: &str) -> &'a Container {
+        containers
+            .as_ref()
+            .and_then(|cs| cs.iter().find(|c| c.name == name))
+            .unwrap_or_else(|| panic!("pod spec should have a `{name}` container"))
+    }
+
+    fn mount_path_of<'a>(c: &'a Container, volume: &str) -> Option<&'a str> {
+        c.volume_mounts
+            .as_ref()?
+            .iter()
+            .find(|m| m.name == volume)
+            .map(|m| m.mount_path.as_str())
+    }
+
+    #[test]
+    fn test_pod_spec_runs_dockerd_in_a_privileged_native_sidecar() {
+        let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker_for_conversation(42), &[]);
+        let spec = pod.spec.expect("pod should have a spec");
+        let docker = container(&spec.init_containers, "docker");
+
+        // A native sidecar: an init container that keeps running, and that
+        // Kubernetes restarts on its own when it dies (an OOM kill).
+        assert_eq!(docker.restart_policy.as_deref(), Some("Always"));
+        assert_eq!(
+            docker.security_context.as_ref().and_then(|s| s.privileged),
+            Some(true)
+        );
+        // Our own start script, never the image's entrypoint, which
+        // rearranges the node's root cgroup (see START_DOCKERD_SCRIPT).
+        let command = docker.command.as_ref().expect("sidecar should override the entrypoint");
+        assert_eq!(command[..2], ["sh".to_string(), "-c".to_string()]);
+        assert_eq!(command[2], START_DOCKERD_SCRIPT);
+        let args = docker.args.as_ref().expect("sidecar should pass dockerd args");
+        assert!(
+            args.contains(&"--host=unix:///run/docker-sock/docker.sock".to_string()),
+            "dockerd should listen on the shared socket: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("tcp://")),
+            "dockerd must never listen on TCP: {args:?}"
+        );
+        let limits = docker
+            .resources
+            .as_ref()
+            .and_then(|r| r.limits.as_ref())
+            .expect("sidecar should have limits");
+        assert_eq!(limits.get("memory"), Some(&Quantity("2Gi".to_string())));
+        assert_eq!(limits.get("cpu"), Some(&Quantity("2".to_string())));
+        assert!(docker.startup_probe.is_some(), "the sandbox should wait until dockerd answers");
+    }
+
+    #[test]
+    fn test_pod_spec_leaves_the_sandbox_container_unprivileged() {
+        let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker_for_conversation(42), &[]);
+        let spec = pod.spec.expect("pod should have a spec");
+        let main = Some(spec.containers);
+        let sandbox = container(&main, "sandbox");
+        assert_ne!(
+            sandbox.security_context.as_ref().and_then(|s| s.privileged),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_pod_spec_shares_workspace_and_socket_but_keeps_docker_data_in_the_sidecar() {
+        let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker_for_conversation(42), &[]);
+        let spec = pod.spec.expect("pod should have a spec");
+        let docker = container(&spec.init_containers, "docker");
+        let main = Some(spec.containers.clone());
+        let sandbox = container(&main, "sandbox");
+
+        for c in [docker, sandbox] {
+            assert_eq!(mount_path_of(c, "workspace"), Some("/workspace"), "{}", c.name);
+            assert_eq!(mount_path_of(c, "docker-sock"), Some("/run/docker-sock"), "{}", c.name);
+        }
+        assert_eq!(mount_path_of(docker, "docker-data"), Some("/var/lib/docker"));
+        assert_eq!(mount_path_of(sandbox, "docker-data"), None);
+
+        let volumes = spec.volumes.expect("pod should have volumes");
+        let data = volumes.iter().find(|v| v.name == "docker-data").expect("docker-data volume");
+        assert_eq!(
+            data.persistent_volume_claim.as_ref().map(|p| p.claim_name.as_str()),
+            Some("sandbox-docker-42")
+        );
+        for shared in ["workspace", "docker-sock"] {
+            let v = volumes.iter().find(|v| v.name == shared).expect(shared);
+            assert!(v.empty_dir.is_some(), "{shared} should be an emptyDir");
+        }
+    }
+
+    #[test]
+    fn test_pod_spec_ephemeral_docker_storage_is_an_empty_dir() {
+        let docker = DockerSidecar {
+            storage: DockerStorage::Ephemeral,
+            ..docker_for_conversation(42)
+        };
+        let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker, &[]);
+        let volumes = pod.spec.and_then(|s| s.volumes).expect("pod should have volumes");
+        let data = volumes.iter().find(|v| v.name == "docker-data").expect("docker-data volume");
+        assert!(data.empty_dir.is_some());
+        assert!(data.persistent_volume_claim.is_none());
+    }
+
+    #[test]
+    fn test_pod_spec_mounts_user_volumes_into_both_containers_at_the_same_path() {
+        let volumes = vec![db::SandboxVolume {
+            id: 7,
+            name: "cache".to_string(),
+            mount_path: "/data/cache".to_string(),
+            created_at: chrono::Utc::now().naive_utc(),
+            updated_at: chrono::Utc::now().naive_utc(),
+        }];
+        let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker_for_conversation(42), &volumes);
+        let spec = pod.spec.expect("pod should have a spec");
+        let docker = container(&spec.init_containers, "docker");
+        let main = Some(spec.containers.clone());
+        let sandbox = container(&main, "sandbox");
+        // So `docker run -v /data/cache:/c` sees the same files the model does.
+        assert_eq!(mount_path_of(docker, "volume-7"), Some("/data/cache"));
+        assert_eq!(mount_path_of(sandbox, "volume-7"), Some("/data/cache"));
+    }
+
+    #[test]
+    fn test_pod_spec_labels_a_pod_with_its_conversation_only_when_it_uses_the_claim() {
+        let labelled = build_pod_spec("sandbox-1", "1Gi", "1", &docker_for_conversation(42), &[]);
+        assert_eq!(
+            labelled.metadata.labels.as_ref().and_then(|l| l.get(CONVERSATION_LABEL)).map(String::as_str),
+            Some("42"),
+            "create_pod finds a conversation's still-stopping pods by this label"
+        );
+        let ephemeral = DockerSidecar {
+            storage: DockerStorage::Ephemeral,
+            ..docker_for_conversation(42)
+        };
+        let unlabelled = build_pod_spec("sandbox-1", "1Gi", "1", &ephemeral, &[]);
+        assert!(unlabelled.metadata.labels.and_then(|l| l.get(CONVERSATION_LABEL).cloned()).is_none());
+    }
+
+    fn claim(name: &str, conversation: Option<&str>) -> PersistentVolumeClaim {
+        PersistentVolumeClaim {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                labels: conversation
+                    .map(|c| [(CONVERSATION_LABEL.to_string(), c.to_string())].into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_orphaned_docker_claims_are_those_whose_conversation_is_gone() {
+        let claims = vec![
+            claim("sandbox-docker-1", Some("1")),
+            claim("sandbox-docker-2", Some("2")),
+            // A sandbox volume's claim has no conversation label.
+            claim("sandbox-volume-3", None),
+            claim("sandbox-docker-x", Some("not-a-number")),
+        ];
+        let live = std::collections::HashSet::from([1]);
+        assert_eq!(orphaned_docker_claims(&claims, &live), vec![2]);
+    }
+
+    #[test]
+    fn test_pod_limit_overrides_replace_only_the_limits_they_name() {
+        let overrides = PodLimitOverrides {
+            memory: Some("3Gi".to_string()),
+            docker_cpu: Some("4".to_string()),
+            ..Default::default()
+        };
+        let (memory, cpu, docker) = overrides.resolve(7);
+        assert_eq!(memory, "3Gi");
+        assert_eq!(cpu, default_cpu_limit());
+        assert_eq!(docker.memory, default_docker_memory_limit());
+        assert_eq!(docker.cpu, "4");
+        assert_eq!(docker.storage, DockerStorage::Conversation(7));
+    }
+
+    fn pod_with_docker_status(restarts: i32, last_reason: Option<&str>) -> Pod {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStatus, PodStatus,
+        };
+        Pod {
+            status: Some(PodStatus {
+                init_container_statuses: Some(vec![ContainerStatus {
+                    name: "docker".to_string(),
+                    restart_count: restarts,
+                    last_state: last_reason.map(|reason| ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            reason: Some(reason.to_string()),
+                            exit_code: 137,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_docker_restart_to_report_ignores_a_pod_whose_docker_never_restarted() {
+        assert_eq!(docker_restart_to_report(&Pod::default(), 0), None);
+        assert_eq!(docker_restart_to_report(&pod_with_docker_status(0, None), 0), None);
+    }
+
+    #[test]
+    fn test_docker_restart_to_report_gives_the_new_count_and_kubernetes_reason() {
+        assert_eq!(
+            docker_restart_to_report(&pod_with_docker_status(1, Some("OOMKilled")), 0),
+            Some((1, Some("OOMKilled".to_string())))
+        );
+        assert_eq!(
+            docker_restart_to_report(&pod_with_docker_status(3, Some("Error")), 2),
+            Some((3, Some("Error".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_docker_restart_to_report_reports_each_restart_once() {
+        assert_eq!(docker_restart_to_report(&pod_with_docker_status(1, Some("OOMKilled")), 1), None);
+    }
+
+    fn named(mut pod: Pod, name: &str) -> Pod {
+        pod.metadata.name = Some(name.to_string());
+        pod
+    }
+
+    #[test]
+    fn test_docker_restarts_are_reported_once_and_never_from_the_first_listing() {
+        let mut seen = HashMap::new();
+        // A restart from before smelt started, seen in the first listing.
+        let old = named(pod_with_docker_status(2, Some("Error")), "sandbox-7");
+        assert_eq!(note_docker_restarts(&mut seen, &old, true), None);
+        assert_eq!(note_docker_restarts(&mut seen, &old, false), None, "already known");
+
+        let again = named(pod_with_docker_status(3, Some("OOMKilled")), "sandbox-7");
+        assert_eq!(
+            note_docker_restarts(&mut seen, &again, false),
+            Some((7, Some("OOMKilled".to_string())))
+        );
+        assert_eq!(note_docker_restarts(&mut seen, &again, false), None, "reported once");
+
+        // Not smelt's pod.
+        let other = named(pod_with_docker_status(1, Some("OOMKilled")), "something-else");
+        assert_eq!(note_docker_restarts(&mut seen, &other, false), None);
+    }
+
+    /// DB-only: the notice lands in the pod's conversation, saying what
+    /// was lost and what wasn't. The wake after it is pointed at a port
+    /// nothing listens on.
+    #[sqlx::test]
+    async fn test_report_docker_restart_tells_the_pods_conversation(pool: PgPool) {
+        let _anthropic_guard = crate::anthropic::test_support::lock_anthropic_base_url();
+        unsafe {
+            std::env::set_var("ANTHROPIC_BASE_URL", "http://127.0.0.1:1");
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        }
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let pod = db::create_sandbox_pod(&pool, conversation.id).await.expect("create pod row");
+
+        report_docker_restart(&pool, pod.id, Some("OOMKilled".to_string())).await;
+
+        let saved = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let messages = db::list_messages(&pool, conversation.id).await.expect("list messages");
+                if let Some(text) = messages.iter().find_map(|m| {
+                    m.blocks().ok()?.into_iter().find_map(|b| match b {
+                        crate::anthropic::ContentBlock::Text { text } if text.contains("Docker") => {
+                            Some(text)
+                        }
+                        _ => None,
+                    })
+                }) {
+                    return text;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("a Docker notice should be saved to the conversation");
+        assert!(saved.contains("OOMKilled"), "{saved}");
+        assert!(saved.contains("/workspace"), "should say what survived: {saved}");
+    }
+
+    #[test]
+    fn test_check_reachable_port_refuses_both_of_the_agents_ports() {
+        assert!(matches!(check_reachable_port(AGENT_PORT), Err(TerminalError::AgentPort(8088))));
+        assert!(matches!(check_reachable_port(RELAY_PORT), Err(TerminalError::AgentPort(8089))));
+        assert!(check_reachable_port(3000).is_ok());
+    }
+
+    #[test]
+    fn test_pod_container_limits_include_the_docker_sidecar() {
+        let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker_for_conversation(42), &[]);
+        assert_eq!(
+            pod_container_limits(&pod),
+            (vec!["1Gi".to_string(), "2Gi".to_string()], vec!["1".to_string(), "2".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_docker_pvc_spec_is_named_labelled_and_sized_for_the_conversation() {
+        let pvc = build_docker_pvc_spec(42);
+        assert_eq!(pvc.metadata.name.as_deref(), Some("sandbox-docker-42"));
+        assert_eq!(
+            pvc.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(CONVERSATION_LABEL))
+                .map(String::as_str),
+            Some("42"),
+            "the startup sweep finds a claim's conversation by this label"
+        );
+        let spec = pvc.spec.expect("claim should have a spec");
+        assert_eq!(spec.access_modes, Some(vec!["ReadWriteOnce".to_string()]));
+        let requested = spec
+            .resources
+            .and_then(|r| r.requests)
+            .and_then(|r| r.get("storage").cloned());
+        assert_eq!(requested, Some(Quantity(default_docker_storage_size())));
+    }
+
     #[test]
     fn test_resolve_mount_path_expands_bare_tilde() {
         assert_eq!(resolve_mount_path("~"), "/home/sandbox");
@@ -2919,7 +3832,7 @@ mod tests {
             .await
             .expect("create sandbox pod");
 
-        let result = create_pod(&pool, conversation.id, None, None).await;
+        let result = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await;
         assert!(
             matches!(result, Err(SandboxError::PodAlreadyExists)),
             "expected PodAlreadyExists, got {result:?}"
@@ -2931,7 +3844,7 @@ mod tests {
     #[sqlx::test]
     async fn test_open_pod_port_without_a_live_pod_is_no_pod(pool: PgPool) {
         let conversation = db::create_conversation(&pool).await.expect("create conversation");
-        let result = open_pod_port(&pool, conversation.id, 3000).await;
+        let result = open_pod_target(&pool, conversation.id, PodHost::Localhost, 3000).await;
         assert!(matches!(result, Err(TerminalError::NoPod)), "expected NoPod");
     }
 
@@ -2940,8 +3853,8 @@ mod tests {
     #[sqlx::test]
     async fn test_open_pod_port_refuses_the_sandbox_agents_own_port(pool: PgPool) {
         let conversation = db::create_conversation(&pool).await.expect("create conversation");
-        let result = open_pod_port(&pool, conversation.id, AGENT_PORT).await;
-        assert!(matches!(result, Err(TerminalError::AgentPort)), "the agent's port must be refused");
+        let result = open_pod_target(&pool, conversation.id, PodHost::Localhost, AGENT_PORT).await;
+        assert!(matches!(result, Err(TerminalError::AgentPort(_))), "the agent's port must be refused");
     }
 
     /// Sends a bare HTTP request down `stream` and returns whatever comes
@@ -2961,7 +3874,7 @@ mod tests {
         }
     }
 
-    /// Real cluster: `open_pod_port` reaches a server inside the
+    /// Real cluster: `open_pod_target` reaches a server inside the
     /// conversation's own pod — one bound to `127.0.0.1` there, as dev
     /// servers are by default — but never the sandbox agent's own port. A
     /// conversation with no pod of its own can't borrow another's, and a
@@ -2994,7 +3907,7 @@ mod tests {
             .expect("create the pod");
         let open = |conversation_id: i64, port: u16| {
             let (client, pool) = (client.clone(), pool.clone());
-            async move { open_pod_port_with(&pool, conversation_id, port, move || client).await }
+            async move { open_pod_port_with(&pool, conversation_id, PodHost::Localhost, port, move || client).await }
         };
         // Python's server speaks HTTP/1.0 and closes after every response,
         // so the preview below also meets an upstream that's gone between
@@ -3020,7 +3933,7 @@ mod tests {
         // The user's preview proxy over the same real port-forward: three
         // requests on one kept-alive connection. Each would take over a
         // second if anything waited for the port-forward's late end of
-        // stream (see `open_pod_port`).
+        // stream (see `open_pod_target`).
         let through_preview = {
             use crate::egress_proxy::{DialFuture, SandboxDial};
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -3033,10 +3946,10 @@ mod tests {
             let (dial_client, dial_pool) = (client.clone(), pool.clone());
             let dial_for: crate::preview::DialFor = Arc::new(move |conversation| {
                 let (client, pool) = (dial_client.clone(), dial_pool.clone());
-                Arc::new(move |port| {
+                Arc::new(move |_host, port| {
                     let (client, pool) = (client.clone(), pool.clone());
                     Box::pin(async move {
-                        open_pod_port_with(&pool, conversation, port, move || client)
+                        open_pod_port_with(&pool, conversation, PodHost::Localhost, port, move || client)
                             .await
                             .map_err(|e| e.to_string())
                     }) as DialFuture
@@ -3050,7 +3963,7 @@ mod tests {
             let started = std::time::Instant::now();
             let mut statuses = Vec::new();
             for _ in 0..3 {
-                match http.get(format!("{}/no-such-path", template.url_for(with_pod.id, 8000))).send().await {
+                match http.get(format!("{}/no-such-path", template.url_for(with_pod.id, PodHost::Localhost, 8000))).send().await {
                     Ok(response) => statuses.push(response.status().as_u16()),
                     Err(_) => statuses.push(0),
                 }
@@ -3060,9 +3973,9 @@ mod tests {
         };
         let (probe_client, probe_pool) = (client.clone(), pool.clone());
         let server_listening =
-            pod_port_is_listening_with(&probe_pool, with_pod.id, 8000, || probe_client.clone()).await;
+            pod_port_is_listening_with(&probe_pool, with_pod.id, PodHost::Localhost, 8000, || probe_client.clone()).await;
         let agent_port_result = open(with_pod.id, AGENT_PORT).await;
-        let unused_listening = pod_port_is_listening_with(&probe_pool, with_pod.id, 9, || probe_client.clone()).await;
+        let unused_listening = pod_port_is_listening_with(&probe_pool, with_pod.id, PodHost::Localhost, 9, || probe_client.clone()).await;
         let without_pod_result = open(without_pod.id, 8000).await;
         let closed_reply = match open(with_pod.id, 9).await {
             Ok(mut stream) => Ok(http_get_over(&mut stream, "/").await),
@@ -3075,7 +3988,7 @@ mod tests {
         let reply = reply.expect("open the server's port");
         assert!(reply.starts_with("HTTP/1.0 404"), "expected the server's 404, got {reply:?}");
         assert!(
-            matches!(agent_port_result, Err(TerminalError::AgentPort)),
+            matches!(agent_port_result, Err(TerminalError::AgentPort(_))),
             "the sandbox agent's port must be refused even with a pod"
         );
         assert!(
@@ -3169,6 +4082,389 @@ mod tests {
         )
     }
 
+    /// Docker in a real sandbox pod behaves like Docker on a Linux machine,
+    /// and stays inside the pod (SME-33). One test so the pods, the claim
+    /// and the base image are made once.
+    #[tokio::test]
+    async fn test_docker_in_a_sandbox_pod_works_and_stays_inside_the_pod() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let pods = pods_api(&client);
+        let conversation_id = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64
+            + 1_000_000_000;
+        let docker = DockerSidecar {
+            memory: "1Gi".to_string(),
+            cpu: "500m".to_string(),
+            storage: DockerStorage::Conversation(conversation_id),
+        };
+        ensure_docker_pvc(&client, conversation_id).await.expect("ensure docker claim");
+        // Every pod this test makes, so cleanup below finds them even after
+        // a failed assertion unwinds out of the checks.
+        let created: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+
+        let checks = tokio::time::timeout(Duration::from_secs(300), async {
+            let first = manager
+                .create_with_docker(&unique_session_id("docker"), "256Mi", "250m", &docker, &[])
+                .await
+                .expect("create pod with docker");
+            created.lock().expect("created").push(first.pod_name.clone());
+
+            // The very first command works: the pod only runs once dockerd answers.
+            let info = first
+                .exec(&["docker", "info", "--format", "{{.ServerVersion}}"])
+                .await
+                .expect("exec docker info");
+            assert_eq!(info.exit_code, 0, "docker info right after create: {}", info.stdout);
+            assert!(info.stdout.starts_with("29."), "server version: {}", info.stdout);
+
+            // A base image from the sandbox's own files: no Docker Hub.
+            let import = first
+                .exec(&[
+                    "bash",
+                    "-c",
+                    "sudo tar -C / -c bin sbin lib lib64 usr etc 2>/dev/null | docker import - local/base",
+                ])
+                .await
+                .expect("exec import");
+            assert_eq!(import.exit_code, 0, "import base image: {}", import.stdout);
+
+            let run = first
+                .exec(&["docker", "run", "--rm", "local/base", "echo", "hello-from-docker"])
+                .await
+                .expect("exec docker run");
+            assert_eq!(run.stdout.trim(), "hello-from-docker");
+
+            // A relative bind mount from /workspace sees the sandbox's files.
+            let compose = first
+                .exec(&[
+                    "bash",
+                    "-c",
+                    "mkdir -p /workspace/proj/src && echo from-workspace > /workspace/proj/src/f \
+                     && cd /workspace/proj \
+                     && printf 'services:\\n  web:\\n    image: local/base\\n    command: [cat, /data/f]\\n    volumes: [./src:/data]\\n' > compose.yml \
+                     && docker compose run --rm -q web 2>&1",
+                ])
+                .await
+                .expect("exec compose");
+            assert!(
+                compose.stdout.contains("from-workspace"),
+                "compose bind mount from /workspace: {}",
+                compose.stdout
+            );
+
+            // Nested containers live under the sidecar's own cgroup, so its
+            // memory limit applies, never at the node's cgroup root.
+            let started = first
+                .exec(&["docker", "run", "-d", "local/base", "sleep", "300"])
+                .await
+                .expect("exec docker run -d");
+            let id = started.stdout.trim().to_string();
+            let where_ = first
+                .exec_in(
+                    "docker",
+                    &[
+                        "sh",
+                        "-c",
+                        &format!(
+                            "own=$(dirname $(sed -n 's/^0:://p' /proc/1/cgroup)); \
+                             pid=$(docker --host={DOCKER_HOST} inspect -f '{{{{.State.Pid}}}}' {id}); \
+                             echo \"$own\"; sed -n 's/^0:://p' /proc/$pid/cgroup"
+                        ),
+                    ],
+                )
+                .await
+                .expect("exec in docker sidecar");
+            let mut lines = where_.stdout.lines();
+            let own = lines.next().unwrap_or_default().to_string();
+            let nested = lines.next().unwrap_or_default().to_string();
+            assert!(
+                !own.is_empty() && nested.starts_with(&format!("{own}/docker/")),
+                "nested container cgroup {nested:?} should be under the sidecar's {own:?}"
+            );
+
+            // Both browsers' routes into the pod (SME-33): a published port
+            // on localhost, any container port at its address through the
+            // agent's relay, and nothing outside the Docker range.
+            let serve = first
+                .exec(&[
+                    "bash",
+                    "-c",
+                    "mkdir -p /workspace/www && echo from-a-container > /workspace/www/index.html \
+                     && docker run -d -p 8000:8000 -v /workspace/www:/w -w /w local/base python3 -m http.server 8000 >/dev/null \
+                     && docker run -d --name unpublished -v /workspace/www:/w -w /w local/base python3 -m http.server 8001 >/dev/null \
+                     && sleep 2 && docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' unpublished",
+                ])
+                .await
+                .expect("exec start servers");
+            let container_ip: std::net::Ipv4Addr =
+                serve.stdout.trim().parse().unwrap_or_else(|_| panic!("container ip: {:?}", serve.stdout));
+            let fetch = |host: PodHost, port: u16| {
+                let client = client.clone();
+                let pod = first.pod_name.clone();
+                async move {
+                    use tokio::io::AsyncWriteExt;
+                    let mut stream = dial_pod(&client, &pod, host, port).await.expect("dial_pod");
+                    stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await.expect("send request");
+                    let mut reply = String::new();
+                    let _ = tokio::time::timeout(Duration::from_secs(10), stream.read_to_string(&mut reply)).await;
+                    reply
+                }
+            };
+            assert!(fetch(PodHost::Localhost, 8000).await.contains("from-a-container"), "published port on localhost");
+            assert!(
+                fetch(PodHost::Container(container_ip), 8001).await.contains("from-a-container"),
+                "unpublished container port through the relay"
+            );
+            assert_eq!(
+                fetch(PodHost::Container(std::net::Ipv4Addr::new(10, 43, 0, 1)), 443).await,
+                "",
+                "the relay must refuse an address outside the Docker range"
+            );
+            // An address no container has yet (one still starting) isn't
+            // listening: the relay mustn't look open while it's connecting.
+            let nobody = dial_pod(&client, &first.pod_name, PodHost::Container(std::net::Ipv4Addr::new(172, 21, 200, 200)), 8001)
+                .await
+                .expect("dial_pod");
+            assert!(!stream_is_listening(nobody).await, "nothing is at 172.21.200.200:8001");
+            assert!(
+                stream_is_listening(dial_pod(&client, &first.pod_name, PodHost::Container(container_ip), 8001).await.expect("dial_pod")).await,
+                "the unpublished container is listening"
+            );
+
+            // A container can't reach the sandbox agent, whose WebSocket
+            // runs commands with no login, at the bridge gateway.
+            let agent = first
+                .exec(&[
+                    "docker",
+                    "run",
+                    "--rm",
+                    "local/base",
+                    "bash",
+                    "-c",
+                    &format!("</dev/tcp/{}/{AGENT_PORT}", DOCKER_BRIDGE_IP.split('/').next().unwrap_or_default()),
+                ])
+                .await
+                .expect("exec agent probe");
+            assert_ne!(agent.exit_code, 0, "a container reached the sandbox agent at the gateway");
+
+            // dockerd never listens on TCP.
+            for port in [2375, 2376] {
+                let tcp = first
+                    .exec(&["bash", "-c", &format!("</dev/tcp/127.0.0.1/{port}")])
+                    .await
+                    .expect("exec tcp probe");
+                assert_ne!(tcp.exit_code, 0, "nothing should listen on {port}");
+            }
+
+            // Images live on the conversation's claim, so a new pod has them.
+            let first_name = first.pod_name.clone();
+            pods.delete(&first_name, &immediate_delete_params()).await.ok();
+            std::mem::forget(first);
+            while pods.get_opt(&first_name).await.ok().flatten().is_some() {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            let second = manager
+                .create_with_docker(&unique_session_id("docker"), "256Mi", "250m", &docker, &[])
+                .await
+                .expect("recreate pod on the same claim");
+            created.lock().expect("created").push(second.pod_name.clone());
+            let images = second
+                .exec(&["docker", "image", "ls", "-q", "local/base"])
+                .await
+                .expect("exec image ls");
+            assert!(!images.stdout.trim().is_empty(), "local/base should survive a new pod");
+            std::mem::forget(second);
+        });
+        let outcome = std::panic::AssertUnwindSafe(checks).catch_unwind().await;
+
+        // Delete what this test made directly, not through the cleanup queue,
+        // whether or not the checks passed.
+        let created = created.into_inner().expect("created");
+        for name in &created {
+            pods.delete(name, &immediate_delete_params()).await.ok();
+        }
+        for name in &created {
+            while pods.get_opt(name).await.ok().flatten().is_some() {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+        pvc_api(&client)
+            .delete(&docker_pvc_name(conversation_id), &DeleteParams::default())
+            .await
+            .ok();
+        match outcome {
+            Ok(finished) => finished.expect("docker test should finish within the timeout"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// An OOM kill inside a nested container restarts only the Docker
+    /// sidecar: the sandbox container, its processes and /workspace carry
+    /// on, and the pod's status says why, as `docker_restart_to_report`
+    /// reads it (SME-33's spike). Written memory, not `bytearray(n)`, whose
+    /// untouched pages never count.
+    #[tokio::test]
+    async fn test_an_oom_in_a_nested_container_restarts_only_the_docker_sidecar() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let pods = pods_api(&client);
+        let docker = DockerSidecar {
+            memory: "512Mi".to_string(),
+            cpu: "500m".to_string(),
+            storage: DockerStorage::Ephemeral,
+        };
+        let sandbox = manager
+            .create_with_docker(&unique_session_id("docker-oom"), "128Mi", "250m", &docker, &[])
+            .await
+            .expect("create pod");
+        let name = sandbox.pod_name.clone();
+
+        let checks = std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(240), async {
+            let setup = sandbox
+                .exec(&[
+                    "bash",
+                    "-c",
+                    "echo kept > /workspace/marker && (setsid sleep 1000 >/dev/null 2>&1 &) \
+                     && sudo tar -C / -c bin sbin lib lib64 usr etc 2>/dev/null \
+                        | docker import - local/base >/dev/null && echo ready",
+                ])
+                .await
+                .expect("exec setup");
+            assert_eq!(setup.stdout.trim(), "ready", "setup: {}", setup.stdout);
+            // Detached: the container's memory outgrows the sidecar's limit.
+            let started = sandbox
+                .exec(&["docker", "run", "-d", "local/base", "sh", "-c", "head -c 900M /dev/zero | tail; sleep 600"])
+                .await
+                .expect("exec docker run");
+            let container = started.stdout.trim().to_string();
+
+            let restarted = loop {
+                let pod = pods.get(&name).await.expect("get pod");
+                if let Some(report) = docker_restart_to_report(&pod, 0) {
+                    break (pod, report);
+                }
+                // A workload that exits on its own never reaches the limit:
+                // say why now rather than at the timeout. Exit code 255 is
+                // not that: it's how a restarted dockerd reports the
+                // containers its OOM-killed predecessor ran, often before
+                // the pod's status shows the restart.
+                let state = sandbox
+                    .exec(&["docker", "inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", &container])
+                    .await
+                    .expect("exec docker inspect");
+                if state.stdout.trim().starts_with("exited") && state.stdout.trim() != "exited 255" {
+                    let why = sandbox
+                        .exec(&["sh", "-c", &format!("docker inspect -f '{{{{json .State}}}}' {container}; docker logs {container} 2>&1 | tail -5")])
+                        .await
+                        .expect("exec docker inspect");
+                    panic!("the workload exited without an OOM kill: {}", why.stdout);
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            };
+            let (pod, report) = restarted;
+            assert_eq!(report, (1, Some("OOMKilled".to_string())));
+            let sandbox_restarts = pod
+                .status
+                .and_then(|s| s.container_statuses)
+                .and_then(|cs| cs.into_iter().find(|c| c.name == "sandbox"))
+                .map(|c| c.restart_count);
+            assert_eq!(sandbox_restarts, Some(0), "the sandbox container must not restart");
+
+            let after = sandbox
+                .exec(&["bash", "-c", "cat /workspace/marker; pgrep -x sleep >/dev/null && echo sleep-alive || \
+                        (for p in /proc/[0-9]*; do [ \"$(cat $p/comm 2>/dev/null)\" = sleep ] && echo sleep-alive && break; done)"])
+                .await
+                .expect("exec after restart");
+            assert!(after.stdout.contains("kept"), "/workspace should survive: {}", after.stdout);
+            assert!(after.stdout.contains("sleep-alive"), "sandbox processes should survive: {}", after.stdout);
+        }))
+        .catch_unwind()
+        .await;
+
+        pods.delete(&name, &immediate_delete_params()).await.ok();
+        std::mem::forget(sandbox);
+        while pods.get_opt(&name).await.ok().flatten().is_some() {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        match checks {
+            Ok(finished) => finished.expect("the sidecar should be OOM-killed within the timeout"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// A new pod must not mount a conversation's Docker claim while the old
+    /// one is still stopping: two dockerds on one /var/lib/docker corrupt
+    /// it. The old pod gets a grace period so it lingers while terminating.
+    #[tokio::test]
+    async fn test_wait_for_conversation_pods_gone_waits_out_a_stopping_pod() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let pods = pods_api(&client);
+        let conversation_id = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64
+            + 1_000_000_000;
+        let docker = DockerSidecar {
+            memory: "256Mi".to_string(),
+            cpu: "250m".to_string(),
+            storage: DockerStorage::Conversation(conversation_id),
+        };
+        ensure_docker_pvc(&client, conversation_id).await.expect("ensure docker claim");
+        let sandbox = manager
+            .create_with_docker(&unique_session_id("stopping"), "128Mi", "250m", &docker, &[])
+            .await
+            .expect("create pod");
+        let name = sandbox.pod_name.clone();
+        std::mem::forget(sandbox);
+
+        pods.delete(&name, &DeleteParams { grace_period_seconds: Some(5), ..Default::default() })
+            .await
+            .expect("start deleting the pod");
+        let waited =
+            wait_for_conversation_pods_gone(&client, conversation_id, Duration::from_secs(60)).await;
+        let still_there = pods.get_opt(&name).await.expect("get pod").is_some();
+
+        pods.delete(&name, &immediate_delete_params()).await.ok();
+        while pods.get_opt(&name).await.ok().flatten().is_some() {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        pvc_api(&client).delete(&docker_pvc_name(conversation_id), &DeleteParams::default()).await.ok();
+
+        assert!(waited.is_ok(), "the wait should finish once the pod is gone: {waited:?}");
+        assert!(!still_there, "the wait returned while {name} was still stopping");
+    }
+
+    /// A conversation's Docker claim is created once and reused, and
+    /// deleting it removes it. No pod: `local-path` binds on first use, so
+    /// an unused claim stays `Pending`, which is fine here.
+    #[tokio::test]
+    async fn test_ensure_docker_pvc_creates_once_and_delete_removes_it() {
+        let client = test_client().await;
+        let pvcs = pvc_api(&client);
+        // Far above any id a fresh test database hands out, and unique per run.
+        let conversation_id = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64
+            + 1_000_000_000;
+        let name = docker_pvc_name(conversation_id);
+
+        ensure_docker_pvc(&client, conversation_id).await.expect("first ensure should create");
+        let first = pvcs.get_opt(&name).await.expect("get claim");
+        let first_uid = first.and_then(|p| p.metadata.uid);
+        assert!(first_uid.is_some(), "ensure_docker_pvc should create {name}");
+
+        ensure_docker_pvc(&client, conversation_id).await.expect("second ensure should reuse");
+        let second_uid = pvcs.get_opt(&name).await.expect("get claim").and_then(|p| p.metadata.uid);
+        assert_eq!(first_uid, second_uid, "a second ensure must reuse the claim, not replace it");
+
+        delete_docker_pvc(&client, conversation_id).await;
+        let gone = tokio::time::timeout(Duration::from_secs(30), async {
+            while pvcs.get_opt(&name).await.expect("get claim").is_some() {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await;
+        // Delete directly too, so a failed assertion never leaves it behind.
+        pvcs.delete(&name, &DeleteParams::default()).await.ok();
+        assert!(gone.is_ok(), "delete_docker_pvc should remove {name}");
+    }
+
     /// A single, comprehensive, real-cluster-and-real-Postgres integration
     /// test covering the terminal *and* file-tool lifecycle end to end,
     /// including the one-pod-per-conversation guard — deliberately one
@@ -3236,6 +4532,10 @@ mod tests {
                 .delete(&sandbox_volume_pvc_name(n), &DeleteParams::default())
                 .await
                 .ok();
+            pvcs_precheck
+                .delete(&docker_pvc_name(n), &DeleteParams::default())
+                .await
+                .ok();
         }
         // Same reasoning again, for the volume-mount pod itself
         // (`unique_session_id(VOLUME_MOUNT_SESSION_LABEL)`) — its name
@@ -3288,8 +4588,8 @@ mod tests {
 
             // --- One pod per conversation: create_pod refuses a second
             // live pod, list reflects reality ---
-            let pod_a = create_pod(&pool, conversation_a.id, None, None).await.expect("create_pod (a) should succeed");
-            let duplicate = create_pod(&pool, conversation_a.id, None, None).await;
+            let pod_a = create_pod(&pool, conversation_a.id, PodLimitOverrides::default()).await.expect("create_pod (a) should succeed");
+            let duplicate = create_pod(&pool, conversation_a.id, PodLimitOverrides::default()).await;
             assert!(
                 matches!(duplicate, Err(SandboxError::PodAlreadyExists)),
                 "create_pod should refuse a second live pod for the same conversation, got {duplicate:?}"
@@ -3400,7 +4700,7 @@ mod tests {
             // --- Pod isolation: a file in conversation_a's pod is
             // invisible from conversation_b's — two separate conversations
             // now, since one conversation can't have two live pods. ---
-            create_pod(&pool, conversation_b.id, None, None).await.expect("create_pod (b) should succeed");
+            create_pod(&pool, conversation_b.id, PodLimitOverrides::default()).await.expect("create_pod (b) should succeed");
             let terminal_b1 = create_terminal(&pool, conversation_b.id).await.expect("create_terminal (b1) should succeed");
             run_and_wait(&pool, conversation_a.id, terminal_a1, "write-marker", "echo marker > /tmp/isolation-marker").await;
             let check = run_and_wait(&pool, conversation_b.id, terminal_b1, "check-marker", "cat /tmp/isolation-marker 2>&1; echo EXIT:$?").await;
@@ -3638,7 +4938,7 @@ mod tests {
             // without ever confirming" crash already did. A separate
             // conversation, since conversation_a's one pod slot is already
             // in use. ---
-            let pod_c = create_pod(&pool, conversation_c.id, None, None).await.expect("create_pod (c) should succeed");
+            let pod_c = create_pod(&pool, conversation_c.id, PodLimitOverrides::default()).await.expect("create_pod (c) should succeed");
             let terminal_c1 = create_terminal(&pool, conversation_c.id).await.expect("create_terminal (c1) should succeed");
 
             let pods = pods_api(&get().client);
@@ -3669,7 +4969,7 @@ mod tests {
             // alone) should flip back to "connected" once try_reconnect
             // runs, not need an unrelated tool call to happen first.
             // Another separate conversation, same reason as pod_c. ---
-            let pod_d = create_pod(&pool, conversation_d.id, None, None).await.expect("create_pod (d) should succeed");
+            let pod_d = create_pod(&pool, conversation_d.id, PodLimitOverrides::default()).await.expect("create_pod (d) should succeed");
             let terminal_d1 = create_terminal(&pool, conversation_d.id).await.expect("create_terminal (d1) should succeed");
             deregister(pod_d);
 
@@ -3722,7 +5022,7 @@ mod tests {
             // live connection is noticed and reported without any further
             // tool call — see SME-12. ---
             let conversation_e = db::create_conversation(&pool).await.expect("create conversation e");
-            let pod_e = create_pod(&pool, conversation_e.id, None, None).await.expect("create_pod (e) should succeed");
+            let pod_e = create_pod(&pool, conversation_e.id, PodLimitOverrides::default()).await.expect("create_pod (e) should succeed");
             let terminal_e = create_terminal(&pool, conversation_e.id).await.expect("create_terminal (e) should succeed");
 
             pods_api(&client).delete(&pod_name(pod_e), &immediate_delete_params()).await.expect("delete pod (e) directly");
@@ -3761,7 +5061,7 @@ mod tests {
             // is what makes this race-safe against the reader task noticing
             // the same connection drop for a different reason. ---
             let conversation_f = db::create_conversation(&pool).await.expect("create conversation f");
-            create_pod(&pool, conversation_f.id, None, None).await.expect("create_pod (f) should succeed");
+            create_pod(&pool, conversation_f.id, PodLimitOverrides::default()).await.expect("create_pod (f) should succeed");
             terminate_pod(&pool, conversation_f.id).await.expect("terminate_pod (f) should succeed");
             tokio::time::sleep(Duration::from_secs(2)).await; // give a wrongly-firing reader task a chance to misfire
             assert!(
@@ -3775,7 +5075,7 @@ mod tests {
             // crash notice. See SME-26. ---
             let conversation_g = db::create_conversation(&pool).await.expect("create conversation g");
             let mut app_events = events::subscribe_app();
-            let pod_g = create_pod(&pool, conversation_g.id, None, None).await.expect("create_pod (g) should succeed");
+            let pod_g = create_pod(&pool, conversation_g.id, PodLimitOverrides::default()).await.expect("create_pod (g) should succeed");
             assert!(
                 received_pods_changed(&mut app_events).await,
                 "creating a pod should tell app-wide listeners"
@@ -3794,8 +5094,15 @@ mod tests {
                 .expect("the pods view should list pod (g)");
             assert_eq!(overview_g.conversation_id, conversation_g.id);
             assert_eq!(overview_g.status.as_deref(), Some("Running"));
-            assert_eq!(overview_g.memory_limit, Some(default_memory_limit()));
-            assert_eq!(overview_g.cpu_limit, Some(default_cpu_limit()));
+            // The sandbox container's and the Docker sidecar's, added up (SME-33).
+            assert_eq!(
+                overview_g.memory_limit,
+                crate::api::pods::sum_memory_limits(&[default_memory_limit(), default_docker_memory_limit()])
+            );
+            assert_eq!(
+                overview_g.cpu_limit,
+                crate::api::pods::sum_cpu_limits(&[default_cpu_limit(), default_docker_cpu_limit()])
+            );
             assert_eq!(overview_g.terminals, 1);
             assert_eq!(overview_g.activity, crate::api::pods::PodActivity::Busy, "a command is running");
             // Live usage, end to end: metrics-server samples a new pod
@@ -3889,7 +5196,7 @@ mod tests {
             // Before the watch starts: pod (h) is gone from Kubernetes, and
             // old enough that its record should have a pod.
             let conversation_h = db::create_conversation(&pool).await.expect("create conversation h");
-            let pod_h = create_pod(&pool, conversation_h.id, None, None).await.expect("create_pod (h) should succeed");
+            let pod_h = create_pod(&pool, conversation_h.id, PodLimitOverrides::default()).await.expect("create_pod (h) should succeed");
             let terminal_h = db::create_sandbox_terminal(&pool, pod_h).await.expect("a terminal record");
             db::create_terminal_command(&pool, conversation_h.id, terminal_h.id, "stale-h", "sleep 300")
                 .await
@@ -3923,7 +5230,7 @@ mod tests {
             // While the watch runs: pod (i) is deleted outside smelt, with no
             // connection open, so crash detection never sees it.
             let conversation_i = db::create_conversation(&pool).await.expect("create conversation i");
-            let pod_i = create_pod(&pool, conversation_i.id, None, None).await.expect("create_pod (i) should succeed");
+            let pod_i = create_pod(&pool, conversation_i.id, PodLimitOverrides::default()).await.expect("create_pod (i) should succeed");
             pods_api(&client).delete(&pod_name(pod_i), &immediate_delete_params()).await.expect("delete pod (i) directly");
             assert!(wait_until_closed(pod_i).await, "a pod deleted while the watch runs should have its record closed");
             assert!(
@@ -3988,7 +5295,7 @@ mod tests {
             );
             let pod_g_gone = pods_api(&client).get_opt(&pod_name(pod_g)).await.expect("get_opt");
             assert!(pod_g_gone.is_none(), "exhausting reconnect attempts should force-terminate the k8s pod");
-            let recreated = create_pod(&pool, conversation_g.id, None, None).await;
+            let recreated = create_pod(&pool, conversation_g.id, PodLimitOverrides::default()).await;
             assert!(
                 recreated.is_ok(),
                 "create_pod should succeed again immediately, not stay blocked behind a stale live-pod row, got {recreated:?}"
@@ -3998,7 +5305,7 @@ mod tests {
             // covered by the pod-level message, even though it has no
             // per-command message of its own. ---
             let conversation_h = db::create_conversation(&pool).await.expect("create conversation h");
-            let pod_h = create_pod(&pool, conversation_h.id, None, None).await.expect("create_pod (h) should succeed");
+            let pod_h = create_pod(&pool, conversation_h.id, PodLimitOverrides::default()).await.expect("create_pod (h) should succeed");
             create_terminal(&pool, conversation_h.id).await.expect("create_terminal (h) should succeed");
             pods_api(&client).delete(&pod_name(pod_h), &immediate_delete_params()).await.expect("delete pod (h) directly");
             let detected_h = tokio::time::timeout(Duration::from_secs(30), async {
@@ -4011,6 +5318,38 @@ mod tests {
             })
             .await;
             assert!(detected_h.is_ok(), "an idle terminal's pod crashing should still produce the pod-level notification");
+
+            // --- Docker data PVC (SME-33): create_pod gives the pod the
+            // conversation's own claim, so its images outlive the pod, and
+            // teardown_conversation removes the claim with the pod. ---
+            let conversation_j = db::create_conversation(&pool).await.expect("create conversation j");
+            let pod_j = create_pod(&pool, conversation_j.id, PodLimitOverrides::default()).await.expect("create_pod (j) should succeed");
+            let docker_pvcs = pvc_api(&client);
+            let docker_claim = docker_pvc_name(conversation_j.id);
+            assert!(
+                docker_pvcs.get_opt(&docker_claim).await.expect("get_opt").is_some(),
+                "create_pod should create the conversation's docker data claim {docker_claim}"
+            );
+            let spec_j = pods_api(&client).get(&pod_name(pod_j)).await.expect("get pod j").spec.expect("spec");
+            let data_claim = spec_j
+                .volumes
+                .unwrap_or_default()
+                .into_iter()
+                .find(|v| v.name == DOCKER_DATA_VOLUME)
+                .and_then(|v| v.persistent_volume_claim)
+                .map(|c| c.claim_name);
+            assert_eq!(data_claim.as_deref(), Some(docker_claim.as_str()), "pod j should mount its conversation's claim");
+
+            teardown_conversation(&pool, conversation_j.id).await;
+            // The claim's `pvc-protection` finalizer holds it until the pod
+            // is really gone.
+            let docker_claim_gone = tokio::time::timeout(Duration::from_secs(60), async {
+                while docker_pvcs.get_opt(&docker_claim).await.ok().flatten().is_some() {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            })
+            .await;
+            assert!(docker_claim_gone.is_ok(), "teardown_conversation should delete the docker data claim");
 
             // --- Generic volumes: create_volume/delete_volume manage a
             // real PVC alongside the sandbox_volumes row, and a volume
@@ -4071,6 +5410,11 @@ mod tests {
             pods.delete(&pod_name(n), &immediate_delete_params())
                 .await
                 .ok();
+        }
+        // Each conversation's docker data claim (SME-33); ids are small here.
+        let pvcs = pvc_api(&get().client);
+        for n in 1..=30i64 {
+            pvcs.delete(&docker_pvc_name(n), &DeleteParams::default()).await.ok();
         }
 
         outcome.expect(
@@ -4208,6 +5552,11 @@ mod tests {
                 &session_id,
                 "128Mi",
                 "250m",
+                &DockerSidecar {
+                    memory: "512Mi".to_string(),
+                    cpu: "250m".to_string(),
+                    storage: DockerStorage::Ephemeral,
+                },
                 &[],
                 Duration::from_millis(1),
             )
@@ -4385,16 +5734,24 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
         })
-        .await
-        .expect("pod should be confirmed dead within 30s of a real OOM trigger");
+        .await;
 
+        // Delete the pod directly before asserting, not through the cleanup
+        // queue: a Failed pod is never removed by Kubernetes, and every run
+        // used to leave one behind.
+        let name = sandbox.pod_name.clone();
+        std::mem::forget(sandbox);
+        pods.delete(&name, &immediate_delete_params()).await.ok();
+        while pods.get_opt(&name).await.ok().flatten().is_some() {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+
+        let reason = reason.expect("pod should be confirmed dead within 30s of a real OOM trigger");
         assert_eq!(
             reason,
             Some("OOMKilled".to_string()),
             "a real OOM kill should surface as OOMKilled via the real Kubernetes API, not a constructed one"
         );
-
-        std::mem::forget(sandbox);
     }
 
     #[tokio::test]
@@ -4614,3 +5971,4 @@ mod tests {
         );
     }
 }
+

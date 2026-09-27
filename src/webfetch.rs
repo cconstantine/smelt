@@ -550,7 +550,7 @@ mod browser_tests {
             "expected the sandbox's page, got: {:?}",
             result.text
         );
-        assert!(dialed.lock().unwrap().contains(&4321), "the route was never used: {dialed:?}");
+        assert!(dialed.lock().unwrap().contains(&(crate::sandbox::PodHost::Localhost, 4321)), "the route was never used: {dialed:?}");
 
         // --- Scenario 7 (SME-42): a routed context is still guarded —
         // a page loaded from the sandbox can't reach a private address by a

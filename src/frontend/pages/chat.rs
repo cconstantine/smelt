@@ -658,7 +658,10 @@ fn tool_summary(name: &str, input: &serde_json::Value) -> String {
         "browser_fill" => "Typed into the browser".to_string(),
         "browser_back" => "Went back in the browser".to_string(),
         "browser_read" => "Read the browser page".to_string(),
-        "sandbox_preview_url" => format!("Shared a preview of port {}", field("port")),
+        "sandbox_preview_url" => match field("host") {
+            host if host.is_empty() => format!("Shared a preview of port {}", field("port")),
+            host => format!("Shared a preview of {host}:{}", field("port")),
+        },
         "todowrite" => "Updated the todo list".to_string(),
         "todoread" => "Checked the todo list".to_string(),
         "add" => format!("Added {} and {}", field("a"), field("b")),
@@ -1914,6 +1917,10 @@ mod tests {
         assert_eq!(tool_summary("todowrite", &serde_json::json!({"todos": []})), "Updated the todo list");
         assert_eq!(tool_summary("sandbox_preview_url", &serde_json::json!({"port": 5173})), "Shared a preview of port 5173");
         assert_eq!(
+            tool_summary("sandbox_preview_url", &serde_json::json!({"port": 3000, "host": "172.21.0.2"})),
+            "Shared a preview of 172.21.0.2:3000"
+        );
+        assert_eq!(
             tool_summary("mcp__exa__web_search_exa", &serde_json::json!({"query": "rust 1.0 release"})),
             "Searched the web for \"rust 1.0 release\""
         );
@@ -2080,6 +2087,7 @@ mod tests {
     fn preview(port: u16) -> SandboxPreview {
         SandboxPreview {
             port,
+            host: None,
             url: format!("http://{port}-1.preview.localhost:8181"),
         }
     }
@@ -3549,13 +3557,13 @@ fn ChatPanel(
                                                 div { class: "sandbox-previews",
                                                     for preview in pod.previews.clone() {
                                                         a {
-                                                            key: "{preview.port}",
+                                                            key: "{preview.url}",
                                                             class: "sandbox-preview",
                                                             href: "{preview.url}",
                                                             target: "_blank",
                                                             rel: "noopener noreferrer",
-                                                            title: "Open what's running on port {preview.port} in the sandbox, in a new tab",
-                                                            "Open preview · port {preview.port}"
+                                                            title: "Open what's running on {preview.label()} in the sandbox, in a new tab",
+                                                            "Open preview · {preview.label()}"
                                                         }
                                                     }
                                                 }

@@ -4,6 +4,8 @@ mod browsing;
 #[cfg(feature = "server")]
 mod db;
 #[cfg(feature = "server")]
+mod docker_net;
+#[cfg(feature = "server")]
 mod egress_proxy;
 mod events;
 #[cfg(feature = "server")]
@@ -85,6 +87,11 @@ async fn main() {
     // and /pods match it. Only here, never in the browser test harness:
     // see `sandbox::watch_pods`.
     tokio::spawn(sandbox::watch_pods(pool.clone()));
+    // Docker data claims whose conversation deletion didn't reach them (SME-33).
+    tokio::spawn({
+        let pool = pool.clone();
+        async move { sandbox::sweep_orphaned_docker_claims(&pool).await }
+    });
 
     // Each sandbox's dev servers, for the user's browser, on a listener of
     // its own (SME-42).

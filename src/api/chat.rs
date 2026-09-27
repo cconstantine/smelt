@@ -1707,7 +1707,7 @@ pub async fn get_sandbox_state(id: i64) -> ServerFnResult<SandboxSnapshot> {
                 let ports = db::list_pod_previews(pool, pod.pod_id)
                     .await
                     .map_err(ServerFnError::new)?;
-                crate::preview::preview_links(template, id, &ports)
+                crate::preview::preview_links(template, id, &crate::preview::stored_previews(&ports))
             }
             None => Vec::new(),
         };
@@ -3045,7 +3045,18 @@ mod tests {
     /// and underscores; the few that aren't tools are listed.
     #[test]
     fn test_system_prompt_only_names_real_tools() {
-        const NOT_TOOLS: &[&str] = &["sandbox", "sudo", "web_search", "localhost"];
+        // Backticked words that aren't tools: a user, commands, tool
+        // parameters and an example container name.
+        const NOT_TOOLS: &[&str] = &[
+            "sandbox",
+            "sudo",
+            "web_search",
+            "localhost",
+            "docker_memory_limit",
+            "docker_cpu_limit",
+            "host",
+            "web",
+        ];
         let tools: Vec<String> = anthropic::tools::native_tool_definitions()
             .into_iter()
             .map(|tool| tool.name)

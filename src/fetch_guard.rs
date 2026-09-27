@@ -105,6 +105,17 @@ pub fn is_sandbox_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
+/// Where in the conversation's pod `host` goes, in a browser context with
+/// a sandbox route: a `localhost` name (`is_sandbox_host`) is the pod's own
+/// localhost, and an address in the pod's Docker range is that container
+/// (SME-33). Anything else isn't the sandbox's.
+pub fn sandbox_host(host: &str) -> Option<crate::sandbox::PodHost> {
+    if is_sandbox_host(host) {
+        return Some(crate::sandbox::PodHost::Localhost);
+    }
+    crate::docker_net::container_address(host).map(crate::sandbox::PodHost::Container)
+}
+
 /// What a request says about the page that sent it — the headers a browser
 /// sets itself, which a page can't forge (SME-42).
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -192,8 +203,10 @@ pub async fn is_request_allowed_with(url: &str, is_addr_allowed: fn(IpAddr) -> b
 /// Whether a page may load `url` — the check both the per-page request
 /// interceptor and the pre-navigation checks make. With `sandbox_routed`
 /// (the page's browser context has a sandbox route, SME-42), a
-/// `localhost`-style host is let through without resolving: the context's
-/// own proxy sends it to the conversation's pod, never to this machine.
+/// `localhost`-style host or a container address in the pod
+/// (`sandbox_host`, SME-33) is let through without resolving: the
+/// context's own proxy sends it to the conversation's pod, never to this
+/// machine or its network.
 /// Every other host must resolve only to addresses `is_addr_allowed`
 /// accepts. The error says why, for the model to read.
 pub async fn check_load(
@@ -202,7 +215,7 @@ pub async fn check_load(
     sandbox_routed: bool,
 ) -> Result<(), String> {
     let (host, port) = parse_fetch_target(url)?;
-    if sandbox_routed && is_sandbox_host(&host) {
+    if sandbox_routed && sandbox_host(&host).is_some() {
         return Ok(());
     }
     resolve_allowed(&host, port, is_addr_allowed).await.map(|_| ())
@@ -380,6 +393,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_sandbox_host_maps_localhost_and_container_addresses_into_the_pod() {
+        use crate::sandbox::PodHost;
+        assert_eq!(sandbox_host("localhost"), Some(PodHost::Localhost));
+        assert_eq!(sandbox_host("[::1]"), Some(PodHost::Localhost));
+        assert_eq!(
+            sandbox_host("172.21.0.2"),
+            Some(PodHost::Container(std::net::Ipv4Addr::new(172, 21, 0, 2)))
+        );
+        for host in ["example.com", "172.24.0.1", "172.16.0.5", "10.43.0.1", "web"] {
+            assert_eq!(sandbox_host(host), None, "{host:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_load_lets_a_routed_context_load_a_container_address() {
+        assert_eq!(check_load("http://172.21.0.2:3000/", is_safe_fetch_addr, true).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn test_check_load_refuses_a_container_address_without_a_sandbox_route() {
+        assert!(check_load("http://172.21.0.2:3000/", is_safe_fetch_addr, false).await.is_err());
+    }
+
     #[tokio::test]
     async fn test_check_load_refuses_localhost_without_a_sandbox_route() {
         let error = check_load("http://localhost:3000/", is_safe_fetch_addr, false)
@@ -390,7 +427,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_load_still_refuses_other_private_hosts_in_a_routed_context() {
-        for url in ["http://10.0.0.5/", "http://169.254.169.254/", "http://127.0.0.2:3000/"] {
+        for url in [
+            "http://10.0.0.5/",
+            "http://169.254.169.254/",
+            "http://127.0.0.2:3000/",
+            // Private, but outside the pod's Docker range.
+            "http://172.16.0.5/",
+            "http://172.24.0.1/",
+        ] {
             assert!(check_load(url, is_safe_fetch_addr, true).await.is_err(), "{url}");
         }
     }
