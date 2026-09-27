@@ -892,7 +892,12 @@ mod server {
         let branch = branch.map(str::trim).filter(|b| !b.is_empty());
         let (key, dir, retry) = match plan_clone(pool, conversation_id, url, branch, None).await? {
             ClonePlan::Existing(repo) => {
-                // Already checked out; the sandbox may still need starting.
+                // Already checked out (the model cloned it, say): the user
+                // naming it trusts it all the same.
+                db::set_repo_trust(pool, &repo.remote_key, true)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // The sandbox may still need starting.
                 ensure_sandbox(pool, conversation_id).await?;
                 return summarise(pool, repo).await;
             }
@@ -1614,6 +1619,21 @@ mod server {
             .expect("trust");
             assert_eq!(decided[0].0, conversation.id);
             assert_eq!(project_instructions(&pool, conversation.id).await.expect("loaded").len(), 1);
+        }
+
+        /// "Work on a repo" on a repo the model already cloned still
+        /// counts as the user picking it (SME-32 code review 7, finding 4).
+        #[sqlx::test]
+        async fn test_work_on_a_repo_trusts_an_existing_checkout(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            cloned_repo(&pool, conversation.id).await;
+            // A live pod row: nothing needs starting.
+            db::create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+            let repo = attach_repo(&pool, conversation.id, "git@github.com:o/r.git", None)
+                .await
+                .expect("the existing checkout");
+            assert_eq!(repo.path, "/workspace/r");
+            assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("get"), Some(true));
         }
 
         #[sqlx::test]
