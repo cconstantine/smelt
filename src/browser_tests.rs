@@ -1633,6 +1633,52 @@ async fn test_end_to_end_browser_scenarios() {
             "the container's preview link should show its server"
         );
         preview_tab.close().await.expect("close the preview tab");
+
+        // --- A repo's AGENTS.md waits for the user's trust (SME-32): the
+        // chat shows the file with Trust / Don't trust, and trusting loads
+        // it (the panel then says so). Seeded as a clone of an unknown
+        // remote; the model the decision wakes is the mock upstream. ---
+        let trusting = new_conversation(pool, &created).await;
+        let remote = format!("example.com/browser-tier/{}", unique_id("trust"));
+        let repo = db::create_conversation_repo(pool, trusting.id, &format!("https://{remote}.git"), &remote, None, "trust-me")
+            .await
+            .expect("seed a repo");
+        db::set_repo_cloned(pool, repo.id, "main", "abc1234def").await.expect("seed the clone");
+        crate::git::record_clone_instructions(
+            pool,
+            repo.id,
+            Some(db::LoadedInstructions {
+                content: "Browser tier rule: always run the linter.\n".to_string(),
+                file_bytes: 42,
+                hash: "browser-tier-hash".to_string(),
+                commit: Some("abc1234def".to_string()),
+                nested: vec![],
+            }),
+        )
+        .await
+        .expect("seed the found AGENTS.md");
+        let trust_page = harness
+            .browser
+            .new_page(&format!("{}conversation/{}", harness.base_url, trusting.id))
+            .await
+            .expect("open the trust conversation");
+        assert!(
+            wait_for_text(&trust_page, "Browser tier rule: always run the linter.", Duration::from_secs(10)).await,
+            "the trust card should show the AGENTS.md it asks about"
+        );
+        click_when_present(&trust_page, ".trust-card-trust", Duration::from_secs(5)).await;
+        assert!(
+            wait_for_count(&trust_page, ".trust-card", 0, Duration::from_secs(10)).await,
+            "trusting should take the card away, live"
+        );
+        let trusted = db::get_repo_trust(pool, &remote).await.expect("read trust");
+        db::delete_repo_trust(pool, &remote).await.expect("clean up the trust decision");
+        assert_eq!(trusted, Some(true), "the decision is remembered for the remote");
+        assert_eq!(
+            crate::git::project_instructions(pool, trusting.id).await.expect("loaded")[0].content,
+            "Browser tier rule: always run the linter.\n"
+        );
+        trust_page.close().await.expect("close the trust tab");
         page.close().await.expect("close the tab");
     })))
     .await;
