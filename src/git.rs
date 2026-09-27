@@ -234,7 +234,7 @@ mod server {
             crate::sandbox::exec_with(client, pod_name, "sandbox", &command, None),
         )
         .await
-        .map_err(|_| format!("git clone {url} took longer than {} minutes", CLONE_TIMEOUT.as_secs() / 60))?
+        .map_err(|_| format!("{CLONE_TIMED_OUT} ({} minutes) cloning {url}.", CLONE_TIMEOUT.as_secs() / 60))?
         .map_err(|e| e.to_string())?;
         if clone.exit_code != 0 {
             let output = format!("{}{}", clone.stdout, clone.stderr);
@@ -624,11 +624,14 @@ mod server {
     enum ClonePlan {
         /// The same repo and branch is already checked out.
         Existing(db::ConversationRepo),
-        /// Clone into `dir`, retrying `retry`'s failed attempt there if set.
+        /// Clone into `dir`, retrying `retry`'s failed attempt there if
+        /// set; `replace_leftover` when that attempt was cut off midway and
+        /// may have left a partial checkout.
         Clone {
             key: String,
             dir: String,
             retry: Option<i64>,
+            replace_leftover: bool,
         },
     }
 
@@ -661,19 +664,26 @@ mod server {
         }) {
             return Ok(ClonePlan::Existing(same.clone()));
         }
-        let retry = match existing.iter().find(|r| r.dir == dir) {
+        let (retry, replace_leftover) = match existing.iter().find(|r| r.dir == dir) {
             // A failed earlier attempt at the same directory is retried in
             // place rather than recorded twice.
-            Some(failed) if failed.remote_key == key && failed.status == "failed" => Some(failed.id),
+            Some(failed) if failed.remote_key == key && failed.status == "failed" => {
+                (Some(failed.id), cut_off(failed.error.as_deref()))
+            }
             Some(other) => {
                 return Err(format!(
                     "/workspace/{dir} is already used by {}. Pick another directory.",
                     other.url
                 ));
             }
-            None => None,
+            None => (None, false),
         };
-        Ok(ClonePlan::Clone { key, dir, retry })
+        Ok(ClonePlan::Clone {
+            key,
+            dir,
+            retry,
+            replace_leftover,
+        })
     }
 
     /// Writes a planned clone down as `cloning`, so a turn waits for it.
@@ -704,10 +714,9 @@ mod server {
         pod_id: i64,
         repo: db::ConversationRepo,
         guard: CloneGuard,
-        retrying: bool,
+        replace_leftover: bool,
     ) -> Result<RepoSummary, String> {
-        // A retry's directory is the failed attempt's, maybe half written.
-        let outcome = clone_repo_row(pool, pod_id, &repo, retrying).await;
+        let outcome = clone_repo_row(pool, pod_id, &repo, replace_leftover).await;
         guard.finish();
         publish_repos(pool, conversation_id).await;
         outcome?;
@@ -727,16 +736,21 @@ mod server {
     ) -> Result<RepoSummary, String> {
         let url = url.trim();
         let branch = branch.map(str::trim).filter(|b| !b.is_empty());
-        let (key, dir, retry) = match plan_clone(pool, conversation_id, url, branch, dir).await? {
+        let (key, dir, retry, replace_leftover) = match plan_clone(pool, conversation_id, url, branch, dir).await? {
             ClonePlan::Existing(repo) => return summarise(pool, repo).await,
-            ClonePlan::Clone { key, dir, retry } => (key, dir, retry),
+            ClonePlan::Clone {
+                key,
+                dir,
+                retry,
+                replace_leftover,
+            } => (key, dir, retry, replace_leftover),
         };
         let pod_id = sandbox::live_pod_id(pool, conversation_id).await.map_err(|_| {
             "This conversation has no sandbox yet: call create_pod first.".to_string()
         })?;
         let repo = record_clone(pool, conversation_id, url, branch, &key, &dir, retry).await?;
         let guard = CloneGuard::new(pool, repo.id, conversation_id);
-        run_clone(pool, conversation_id, pod_id, repo, guard, retry.is_some()).await
+        run_clone(pool, conversation_id, pod_id, repo, guard, replace_leftover).await
     }
 
     /// The user's "Work on a repo": the repo is recorded first, so a
@@ -750,13 +764,18 @@ mod server {
     ) -> Result<RepoSummary, String> {
         let url = url.trim();
         let branch = branch.map(str::trim).filter(|b| !b.is_empty());
-        let (key, dir, retry) = match plan_clone(pool, conversation_id, url, branch, None).await? {
+        let (key, dir, retry, replace_leftover) = match plan_clone(pool, conversation_id, url, branch, None).await? {
             ClonePlan::Existing(repo) => {
                 // Already checked out; the sandbox may still need starting.
                 ensure_sandbox(pool, conversation_id).await?;
                 return summarise(pool, repo).await;
             }
-            ClonePlan::Clone { key, dir, retry } => (key, dir, retry),
+            ClonePlan::Clone {
+                key,
+                dir,
+                retry,
+                replace_leftover,
+            } => (key, dir, retry, replace_leftover),
         };
         // The user named this repo, so its AGENTS.md is trusted without
         // asking (SME-32's plan, open question 1).
@@ -774,7 +793,7 @@ mod server {
                 return Err(e);
             }
         };
-        run_clone(pool, conversation_id, pod_id, repo, guard, retry.is_some()).await
+        run_clone(pool, conversation_id, pod_id, repo, guard, replace_leftover).await
     }
 
     /// The conversation's live pod, started if it has none.
@@ -805,6 +824,17 @@ mod server {
             nested: file.nested,
         });
         record_clone_instructions(pool, repo_id, loaded).await
+    }
+
+    /// How a clone that ran out of time starts its error.
+    pub const CLONE_TIMED_OUT: &str = "The clone took too long and was stopped";
+
+    /// Whether a failed clone was cut off midway, so its directory may hold
+    /// a partial checkout of its own; any other failure (git refusing a
+    /// directory that already holds work, a bad URL) leaves nothing of the
+    /// clone's there.
+    fn cut_off(error: Option<&str>) -> bool {
+        error.is_some_and(|e| e == CLONE_INTERRUPTED || e.starts_with(CLONE_TIMED_OUT))
     }
 
     /// What a clone cut off before it finished is marked with.
@@ -1488,6 +1518,15 @@ mod server {
             a.await.expect("a");
             b.await.expect("b");
             assert_eq!(installed.lock().expect("log").last(), Some(&"new"), "the pod ends with the newest keys");
+        }
+
+        #[test]
+        fn test_only_a_clone_cut_off_midway_may_have_left_a_partial_checkout() {
+            assert!(cut_off(Some(CLONE_INTERRUPTED)));
+            assert!(cut_off(Some(&format!("{CLONE_TIMED_OUT} (10 minutes) cloning u."))));
+            assert!(!cut_off(Some("fatal: destination path '/workspace/r' already exists and is not an empty directory.")));
+            assert!(!cut_off(Some("fatal: Remote branch nope not found in upstream origin")));
+            assert!(!cut_off(None));
         }
 
         #[test]

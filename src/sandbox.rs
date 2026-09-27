@@ -5079,6 +5079,42 @@ mod tests {
             assert_eq!(retried.branch.as_deref(), Some("main"));
             assert_eq!(retried.status, crate::git::RepoStatus::Ready);
 
+            // A clone refused because the directory already holds work
+            // doesn't delete that work when retried; only a clone that was
+            // interrupted gets its directory replaced (SME-32 code review
+            // 2, finding 1).
+            let work = exec_with(
+                &client,
+                &pod_name(pod_a),
+                "sandbox",
+                &["sh", "-c", "mkdir -p /workspace/mywork && echo precious > /workspace/mywork/notes.txt"],
+                None,
+            )
+            .await
+            .expect("exec make work");
+            assert_eq!(work.exit_code, 0, "{}", work.stderr);
+            for attempt in ["first", "retry"] {
+                let refused = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, Some("mywork"))
+                    .await
+                    .expect_err("the directory holds work");
+                assert!(refused.contains("already exists"), "{attempt}: {refused}");
+            }
+            let kept = exec_with(&client, &pod_name(pod_a), "sandbox", &["cat", "/workspace/mywork/notes.txt"], None)
+                .await
+                .expect("exec cat");
+            assert_eq!(kept.stdout, "precious\n", "a retry must not delete the work");
+            let mywork = db::list_conversation_repos(&pool, conversation_a.id)
+                .await
+                .expect("list")
+                .into_iter()
+                .find(|r| r.dir == "mywork")
+                .expect("the mywork repo");
+            db::set_repo_failed(&pool, mywork.id, crate::git::CLONE_INTERRUPTED).await.expect("mark interrupted");
+            let replaced = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, Some("mywork"))
+                .await
+                .expect("an interrupted clone's retry replaces its directory");
+            assert_eq!(replaced.status, crate::git::RepoStatus::Ready);
+
             // Asking again returns the same checkout rather than a second clone.
             let again = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, None)
                 .await
@@ -5549,7 +5585,7 @@ mod tests {
                 kept.stderr
             );
             let repos = crate::git::list_repos(&pool, conversation_a.id).await.expect("list repos");
-            assert_eq!(repos.len(), 2, "origin and its retry: {repos:?}");
+            assert_eq!(repos.len(), 3, "origin, its retry and mywork: {repos:?}");
             assert_eq!(repos[0].status, crate::git::RepoStatus::Ready, "{repos:?}");
             assert_eq!(repos[0].instructions, crate::git::InstructionsState::Changed, "still to reload: {repos:?}");
             assert_eq!(repos[1].status, crate::git::RepoStatus::Ready, "{repos:?}");
