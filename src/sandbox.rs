@@ -1101,6 +1101,42 @@ async fn open_pod_port_with(
     Ok(Box::new(stream))
 }
 
+/// Whether something is listening on `port` in `conversation_id`'s pod —
+/// the sharing a preview's check, so the model hears at once if it gave
+/// the wrong port or the server isn't up yet. A port-forward to a port
+/// nothing listens on ends straight away without a byte (about 50ms on
+/// k3s); a listening server keeps the connection open waiting for a
+/// request. `LISTEN_PROBE` is well past the first and far below a request
+/// timeout.
+pub async fn pod_port_is_listening(pool: &PgPool, conversation_id: i64, port: u16) -> Result<bool, TerminalError> {
+    pod_port_is_listening_with(pool, conversation_id, port, || get().client.clone()).await
+}
+
+const LISTEN_PROBE: Duration = Duration::from_millis(500);
+
+async fn pod_port_is_listening_with(
+    pool: &PgPool,
+    conversation_id: i64,
+    port: u16,
+    client: impl FnOnce() -> kube::Client,
+) -> Result<bool, TerminalError> {
+    let mut stream = open_pod_port_with(pool, conversation_id, port, client).await?;
+    let mut first = [0u8; 1];
+    Ok(match tokio::time::timeout(LISTEN_PROBE, stream.read(&mut first)).await {
+        // Still open: something accepted the connection and is waiting.
+        Err(_) => true,
+        // A server that speaks first (SSH, a database) is listening too.
+        Ok(Ok(n)) => n > 0,
+        Ok(Err(_)) => false,
+    })
+}
+
+/// The conversation's live pod's id, for callers outside this module —
+/// `NoPod` when it has none.
+pub async fn live_pod_id(pool: &PgPool, conversation_id: i64) -> Result<i64, TerminalError> {
+    conversation_pod_id(pool, conversation_id).await
+}
+
 /// Takes `conversation_id`, resolved to "the conversation's pod" via
 /// `conversation_pod_id` — no longer idempotent on repeat the way a
 /// `pod_id`-addressed version was: once the one live pod is terminated,
@@ -2987,6 +3023,10 @@ mod tests {
             server.abort();
             (statuses, started.elapsed())
         };
+        let (probe_client, probe_pool) = (client.clone(), pool.clone());
+        let agent_listening =
+            pod_port_is_listening_with(&probe_pool, with_pod.id, AGENT_PORT, || probe_client.clone()).await;
+        let unused_listening = pod_port_is_listening_with(&probe_pool, with_pod.id, 9, || probe_client.clone()).await;
         let without_pod_result = open(without_pod.id, AGENT_PORT).await;
         let closed_reply = match open(with_pod.id, 9).await {
             Ok(mut stream) => Ok(http_get_over(&mut stream, "/").await),
@@ -3002,6 +3042,8 @@ mod tests {
             "a conversation without a pod must not reach any pod"
         );
         assert_eq!(closed_reply.expect("open an unused port"), "", "nothing listens on port 9");
+        assert!(agent_listening.expect("probe the agent's port"), "the agent listens on its port");
+        assert!(!unused_listening.expect("probe port 9"), "nothing listens on port 9");
         let (statuses, elapsed) = through_preview;
         assert_eq!(statuses, vec![404, 404, 404], "the agent's 404 through the preview each time");
         assert!(elapsed < Duration::from_secs(2), "three preview requests took {elapsed:?}");

@@ -138,6 +138,7 @@ mod server {
             "webfetch" => webfetch_tool(pool, conversation_id, input).await,
             "http_request" => http_request_tool(input).await,
             "open_browser_session" => open_browser_session_tool(pool, conversation_id).await,
+            "sandbox_preview_url" => sandbox_preview_url_tool(pool, conversation_id, input).await,
             "close_browser_session" => close_browser_session_tool(conversation_id).await,
             "browser_navigate" => browser_navigate_tool(conversation_id, input).await,
             "browser_click" => browser_click_tool(conversation_id, input).await,
@@ -662,12 +663,15 @@ mod server {
                 name: "webfetch".to_string(),
                 description: "Fetch a URL in a real browser (JS included — unlike a plain HTTP \
                                request, this handles JS-rendered pages) and return its \
-                               rendered, readable text. Independent of the sandbox pod — works \
-                               even with no pod created. http/https only; the resolved address \
-                               (and every address any redirect or the page's own JS tries to \
-                               reach) must be a real public address, not an internal/private \
-                               one. Slower and heavier than http_request — prefer http_request \
-                               for a JSON API or anything that doesn't need real page rendering."
+                               rendered, readable text. Works with no pod created. http/https \
+                               only; the resolved address (and every address any redirect or \
+                               the page's own JS tries to reach) must be a real public address, \
+                               not an internal/private one — except localhost (or 127.0.0.1), \
+                               which means this conversation's sandbox pod: \
+                               http://localhost:5173/ reaches a server listening on port 5173 \
+                               there. Slower and heavier than http_request — prefer \
+                               http_request for a JSON API or anything that doesn't need real \
+                               page rendering."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -675,6 +679,24 @@ mod server {
                         "url": {"type": "string", "description": "the http:// or https:// URL to fetch"}
                     },
                     "required": ["url"]
+                }),
+            },
+            ToolDefinition {
+                name: "sandbox_preview_url".to_string(),
+                description: "Get a link the user can open in their own browser to see a server \
+                               running in this conversation's sandbox pod on `port` (a dev \
+                               server, a web app, an API's docs page). The sandbox panel shows \
+                               the link too, so share it once the server is up. Says whether \
+                               anything is listening on that port yet. Your own browser tools \
+                               (webfetch, browser_navigate) reach the same server at \
+                               http://localhost:<port>/: use that there, not this link."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "port": {"type": "integer", "description": "the port the server listens on inside the sandbox, e.g. 5173"}
+                    },
+                    "required": ["port"]
                 }),
             },
             ToolDefinition {
@@ -722,7 +744,8 @@ mod server {
                                resulting page's readable text plus a list of interactive \
                                elements (each with an index — pass that index to browser_click/ \
                                browser_fill). Requires open_browser_session first. http/https \
-                               only, same SSRF restriction as webfetch."
+                               only, same address rules as webfetch: localhost (or 127.0.0.1) \
+                               means this conversation's sandbox pod."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -2159,6 +2182,61 @@ mod server {
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
+    /// A link the user can open in their own browser for `port` in this
+    /// conversation's sandbox (SME-42), after checking something listens
+    /// there. Recorded on the pod, so the sandbox panel shows it.
+    async fn sandbox_preview_url_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
+        let port = input
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|&p| p != 0)
+            .ok_or("port must be a number from 1 to 65535")?;
+        let pod_id = crate::sandbox::live_pod_id(pool, conversation_id)
+            .await
+            .map_err(|e| match e {
+                crate::sandbox::TerminalError::NoPod => "This conversation has no running sandbox: \
+                    call create_pod first, then start the server in it."
+                    .to_string(),
+                other => other.to_string(),
+            })?;
+        let template = crate::preview::configured_template()
+            .map_err(|e| format!("Previews are off on this smelt: {e}"))?;
+        let listening = crate::sandbox::pod_port_is_listening(pool, conversation_id, port)
+            .await
+            .map_err(|e| e.to_string())?;
+        let ports = db::add_pod_preview(pool, pod_id, port)
+            .await
+            .map_err(|e| e.to_string())?;
+        crate::events::publish(
+            conversation_id,
+            crate::events::ConversationEvent::SandboxPreviewUpdate {
+                pod_id,
+                previews: crate::preview::preview_links(&template, conversation_id, &ports),
+            },
+        );
+        let note = if listening {
+            format!(
+                "The user can open this link in their own browser; the sandbox panel shows it too. \
+                 Your own browser tools reach the same server at http://localhost:{port}/, so use \
+                 that address with them, not this link."
+            )
+        } else {
+            format!(
+                "Nothing is listening on port {port} in the sandbox yet, so the link won't load \
+                 until something does. Check the server started and which port it uses. The link \
+                 is saved in the sandbox panel either way."
+            )
+        };
+        Ok(serde_json::json!({
+            "url": template.url_for(conversation_id, port),
+            "port": port,
+            "listening": listening,
+            "note": note,
+        })
+        .to_string())
+    }
+
     async fn open_browser_session_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
         let sandbox = crate::egress_proxy::sandbox_dial(pool.clone(), conversation_id);
         crate::browsing::open_session(conversation_id, sandbox).await?;
@@ -2358,6 +2436,32 @@ mod server {
                 message.contains("read_file"),
                 "expected an error telling the model to call read_file first, got: {message}"
             );
+        }
+
+        #[sqlx::test]
+        async fn test_sandbox_preview_url_without_a_pod_says_to_create_one(pool: sqlx::PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("create conversation");
+            let message = sandbox_preview_url_tool(&pool, conversation.id, &serde_json::json!({"port": 3000}))
+                .await
+                .expect_err("no pod, no preview");
+            assert!(message.contains("create_pod"), "should say how to get a sandbox: {message}");
+        }
+
+        #[sqlx::test]
+        async fn test_sandbox_preview_url_refuses_a_port_that_is_not_a_port(pool: sqlx::PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("create conversation");
+            for input in [
+                serde_json::json!({}),
+                serde_json::json!({"port": 0}),
+                serde_json::json!({"port": 70000}),
+                serde_json::json!({"port": "3000"}),
+                serde_json::json!({"port": -1}),
+            ] {
+                let message = sandbox_preview_url_tool(&pool, conversation.id, &input)
+                    .await
+                    .expect_err("not a port");
+                assert!(message.contains("1 to 65535"), "{input}: {message}");
+            }
         }
 
         #[sqlx::test]

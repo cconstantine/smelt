@@ -465,6 +465,29 @@ pub async fn sandbox_pod_conversation_id(
         .await
 }
 
+/// Records `port` as a preview the model shared for `pod_id` (SME-42) and
+/// returns every port shared for that pod so far, lowest first. Sharing a
+/// port twice is fine.
+pub async fn add_pod_preview(pool: &PgPool, pod_id: i64, port: u16) -> Result<Vec<u16>, sqlx::Error> {
+    sqlx::query("INSERT INTO sandbox_pod_previews (pod_id, port) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+        .bind(pod_id)
+        .bind(i32::from(port))
+        .execute(pool)
+        .await?;
+    list_pod_previews(pool, pod_id).await
+}
+
+/// Every port shared as a preview for `pod_id`, lowest first.
+pub async fn list_pod_previews(pool: &PgPool, pod_id: i64) -> Result<Vec<u16>, sqlx::Error> {
+    let ports: Vec<i32> =
+        sqlx::query_scalar("SELECT port FROM sandbox_pod_previews WHERE pod_id = $1 ORDER BY port")
+            .bind(pod_id)
+            .fetch_all(pool)
+            .await?;
+    // The table's CHECK keeps every port in u16's range.
+    Ok(ports.into_iter().filter_map(|p| u16::try_from(p).ok()).collect())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, sqlx::FromRow)]
 pub struct TerminalCommand {
     pub id: i64,
@@ -1444,6 +1467,23 @@ mod tests {
             !for_pod_after.iter().any(|t| t.id == terminal.id),
             "terminated terminal should no longer be listed as live"
         );
+    }
+
+    #[sqlx::test]
+    async fn test_pod_previews_are_listed_per_pod_lowest_first_without_repeats(pool: PgPool) {
+        let conversation = test_conversation(&pool).await;
+        let pod = create_sandbox_pod(&pool, conversation.id).await.expect("create pod");
+        let other = create_sandbox_pod(&pool, conversation.id).await.expect("create another pod");
+
+        add_pod_preview(&pool, pod.id, 5173).await.expect("add 5173");
+        let after = add_pod_preview(&pool, pod.id, 3000).await.expect("add 3000");
+        assert_eq!(after, vec![3000, 5173]);
+        let again = add_pod_preview(&pool, pod.id, 3000).await.expect("add 3000 again");
+        assert_eq!(again, vec![3000, 5173]);
+        add_pod_preview(&pool, other.id, 8080).await.expect("add to the other pod");
+
+        assert_eq!(list_pod_previews(&pool, pod.id).await.expect("list"), vec![3000, 5173]);
+        assert_eq!(list_pod_previews(&pool, other.id).await.expect("list"), vec![8080]);
     }
 
     #[sqlx::test]

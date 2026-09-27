@@ -34,6 +34,22 @@ pub fn configured_template() -> Result<PreviewTemplate, String> {
     PreviewTemplate::parse(&raw).map_err(|e| format!("SMELT_PREVIEW_URL is invalid: {e}"))
 }
 
+/// The links for `ports` in `conversation_id`'s sandbox, as the sandbox
+/// panel shows them.
+pub fn preview_links(
+    template: &PreviewTemplate,
+    conversation_id: i64,
+    ports: &[u16],
+) -> Vec<crate::events::SandboxPreview> {
+    ports
+        .iter()
+        .map(|&port| crate::events::SandboxPreview {
+            port,
+            url: template.url_for(conversation_id, port),
+        })
+        .collect()
+}
+
 /// `SMELT_PREVIEW_URL`, parsed: a scheme and an authority holding one
 /// `{port}` and one `{conversation}`, e.g.
 /// `https://{port}-{conversation}-smelt.example.com`.
@@ -594,6 +610,19 @@ mod tests {
         ] {
             assert_eq!(t.match_host(host), None, "{host:?} is not a preview");
         }
+    }
+
+    #[test]
+    fn test_preview_links_pair_each_port_with_its_address() {
+        let t = template(DEFAULT_PREVIEW_URL);
+        let links = preview_links(&t, 9, &[3000, 5173]);
+        assert_eq!(
+            links,
+            vec![
+                crate::events::SandboxPreview { port: 3000, url: "http://3000-9.preview.localhost:8181".to_string() },
+                crate::events::SandboxPreview { port: 5173, url: "http://5173-9.preview.localhost:8181".to_string() },
+            ]
+        );
     }
 
     #[test]
