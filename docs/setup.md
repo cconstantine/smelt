@@ -100,6 +100,8 @@ silently sends an empty string to the Anthropic API.
 | `SANDBOX_IMAGE` | no | `docker.io/library/smelt-sandbox:latest` | The sandbox pod's image reference — `docker/sandbox/Dockerfile`, built and delivered with no registry involved by `scripts/build-sandbox-image.sh`. Must match whatever `ctr images import` actually registered the image as, not an arbitrary tag — see SME-17. |
 | `SANDBOX_RUNNING_WAIT_TIMEOUT_SECS` | no | `30` | How long `wait_for_running` (`src/sandbox.rs`) waits for a pod to reach `Running` before giving up with `SandboxError::Timeout`, which carries the pod's own reason for still being pending (e.g. `PodScheduled: Unschedulable: persistentvolumeclaim … not found`) when it has one. A container stuck in a state that won't recover (an image pull failure, a crash loop) fails at once with `SandboxError::StartFailed` instead of waiting out the timeout. The default is plenty on the real `homelab` cluster or a resource-rich dev machine; a CPU-constrained CI runner schedules pods measurably slower, so `.github/workflows/ci.yml` raises this for its `cargo test --features server` run. |
 | `SMELT_BASE_URL` | no | derived from the request | Overrides the scheme+host `src/mcp_oauth.rs` builds an MCP OAuth redirect_uri from (`/mcp-servers`' Connect flow). Without it, the base URL is derived from the incoming request's `Host` header (`X-Forwarded-Proto` for scheme) — wrong if smelt sits behind a proxy/tunnel that doesn't forward a `Host` a browser/OAuth provider could actually reach. No trailing slash. Set-but-empty is treated as unset, same as every other env var here. |
+| `SMELT_PREVIEW_URL` | no | `http://{port}-{conversation}.preview.localhost:8181` | The address a sandbox preview gets (see [Sandbox previews](#sandbox-previews)): a scheme and host holding `{port}` and `{conversation}` once each, with something other than digits between them, and no path. In production, e.g. `https://{port}-{conversation}-smelt.constantlee.us`. An invalid value turns previews off, logged as an error at startup; the rest of smelt runs as usual. |
+| `SMELT_PREVIEW_ADDR` | no | `0.0.0.0:8181` | Where the preview proxy listens. It's a listener of its own, not a route on smelt's main port (see below). A port that can't be bound turns previews off, logged as an error. |
 
 ## Built-in MCP servers
 
@@ -109,6 +111,19 @@ At startup, smelt adds any built-in MCP server that isn't configured yet, matche
 - **Edits are kept.** Only the name is matched, so a changed URL, an added header or a switch to OAuth survives restarts.
 - **Deleting doesn't stick.** A deleted entry comes back on the next start. To turn search off, change its URL or tool list instead.
 - **Search queries go to Exa**, unauthenticated in keyless mode.
+
+## Sandbox previews
+
+A server running in a conversation's sandbox pod (a dev server, a web app) can be opened in two browsers, both through a Kubernetes port-forward to the pod, so a server bound to `127.0.0.1` inside the pod works too (SME-42):
+
+- **The model's own browser.** In `webfetch` and browsing sessions, `http://localhost:<port>/` (also `127.0.0.1` and `[::1]`) is that port in the conversation's own pod. Every other loopback or private address is still refused.
+- **The user's browser.** The model calls `sandbox_preview_url` with the port; the sandbox panel then shows an "Open preview · port N" link to `SMELT_PREVIEW_URL` for that port and conversation, e.g. `http://5173-42.preview.localhost:8181`.
+
+Previews are served on a listener of their own (`SMELT_PREVIEW_ADDR`), not on smelt's main port: `dx serve`'s dev proxy replaces the `Host` header before a request reaches the app, and a preview's address is all in its `Host`.
+
+- **Dev:** compose publishes port 8181. After pulling this change, recreate the `smelt` container from the host (`docker compose up -d smelt`) so the port is published; this restarts the container. Browsers resolve `*.localhost` to this machine with no DNS set up.
+- **Production:** point the preview hostnames at `SMELT_PREVIEW_ADDR`'s port in the front end, with the same TLS and access rules as smelt itself. The flat `{port}-{conversation}-smelt.constantlee.us` form fits under an existing `*.constantlee.us` wildcard certificate.
+- **Access:** smelt has no login, so a preview is exactly as protected as smelt is. Other websites open in the same browser can't send requests to a preview (or, in the model's browser, to the sandbox): only the conversation's own previews and opening the link directly get through. A later login can cover previews too; SME-42 records how.
 
 ## Pod metrics
 

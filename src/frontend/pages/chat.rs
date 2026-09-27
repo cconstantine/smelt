@@ -43,6 +43,7 @@ use crate::api::chat::{
 };
 #[cfg(feature = "web")]
 use crate::events::ConversationEvent;
+use crate::events::SandboxPreview;
 use crate::frontend::Route;
 use crate::models::{Conversation, Message};
 
@@ -343,6 +344,8 @@ fn apply_task_update(
 struct SandboxPodPanelEntry {
     pod_id: i64,
     status: String,
+    /// Preview links for the user's own browser (SME-42).
+    previews: Vec<SandboxPreview>,
 }
 
 /// One output line's widget state — same shape as the wire `SandboxOutputLine`,
@@ -396,10 +399,12 @@ fn merge_sandbox_snapshot(
     for pod in snapshot.pods {
         if let Some(entry) = pods.iter_mut().find(|p| p.pod_id == pod.pod_id) {
             entry.status = pod.status.clone();
+            entry.previews = pod.previews.clone();
         } else {
             pods.push(SandboxPodPanelEntry {
                 pod_id: pod.pod_id,
                 status: pod.status.clone(),
+                previews: pod.previews.clone(),
             });
         }
 
@@ -462,7 +467,17 @@ fn apply_sandbox_pod_update(
     if let Some(entry) = pods.iter_mut().find(|p| p.pod_id == pod_id) {
         entry.status = status;
     } else {
-        pods.push(SandboxPodPanelEntry { pod_id, status });
+        pods.push(SandboxPodPanelEntry { pod_id, status, previews: Vec::new() });
+    }
+}
+
+/// Applies one live `SandboxPreviewUpdate`: the pod's preview list becomes
+/// the one carried. A pod the panel doesn't know yet is skipped — the next
+/// snapshot brings it, previews included.
+#[cfg(any(feature = "web", test))]
+fn apply_sandbox_preview_update(pods: &mut [SandboxPodPanelEntry], pod_id: i64, previews: Vec<SandboxPreview>) {
+    if let Some(entry) = pods.iter_mut().find(|p| p.pod_id == pod_id) {
+        entry.previews = previews;
     }
 }
 
@@ -643,6 +658,7 @@ fn tool_summary(name: &str, input: &serde_json::Value) -> String {
         "browser_fill" => "Typed into the browser".to_string(),
         "browser_back" => "Went back in the browser".to_string(),
         "browser_read" => "Read the browser page".to_string(),
+        "sandbox_preview_url" => format!("Shared a preview of port {}", field("port")),
         "todowrite" => "Updated the todo list".to_string(),
         "todoread" => "Checked the todo list".to_string(),
         "add" => format!("Added {} and {}", field("a"), field("b")),
@@ -1896,6 +1912,7 @@ mod tests {
         assert_eq!(tool_summary("http_request", &serde_json::json!({"url": "https://api.x/y"})), "Sent GET https://api.x/y");
         assert_eq!(tool_summary("browser_navigate", &serde_json::json!({"url": "https://example.com"})), "Opened https://example.com in the browser");
         assert_eq!(tool_summary("todowrite", &serde_json::json!({"todos": []})), "Updated the todo list");
+        assert_eq!(tool_summary("sandbox_preview_url", &serde_json::json!({"port": 5173})), "Shared a preview of port 5173");
         assert_eq!(
             tool_summary("mcp__exa__web_search_exa", &serde_json::json!({"query": "rust 1.0 release"})),
             "Searched the web for \"rust 1.0 release\""
@@ -2060,6 +2077,68 @@ mod tests {
         }
     }
 
+    fn preview(port: u16) -> SandboxPreview {
+        SandboxPreview {
+            port,
+            url: format!("http://{port}-1.preview.localhost:8181"),
+        }
+    }
+
+    #[test]
+    fn test_merge_sandbox_snapshot_carries_each_pods_previews() {
+        let mut pods = vec![SandboxPodPanelEntry {
+            pod_id: 1,
+            status: "Running".to_string(),
+            previews: vec![preview(8080)],
+        }];
+        let mut terminals = Vec::new();
+        let snapshot = SandboxSnapshot {
+            pods: vec![
+                SandboxPodSummary {
+                    pod_id: 1,
+                    status: "Running".to_string(),
+                    terminals: Vec::new(),
+                    previews: vec![preview(3000)],
+                },
+                SandboxPodSummary {
+                    pod_id: 2,
+                    status: "Running".to_string(),
+                    terminals: Vec::new(),
+                    previews: vec![preview(5173)],
+                },
+            ],
+        };
+        merge_sandbox_snapshot(&mut pods, &mut terminals, snapshot);
+        assert_eq!(pods[0].previews, vec![preview(3000)], "the snapshot's list replaces the old one");
+        assert_eq!(pods[1].previews, vec![preview(5173)]);
+    }
+
+    #[test]
+    fn test_apply_sandbox_preview_update_replaces_only_its_pods_list() {
+        let mut pods = vec![
+            SandboxPodPanelEntry { pod_id: 1, status: "Running".to_string(), previews: Vec::new() },
+            SandboxPodPanelEntry { pod_id: 2, status: "Running".to_string(), previews: vec![preview(9000)] },
+        ];
+        apply_sandbox_preview_update(&mut pods, 1, vec![preview(3000), preview(5173)]);
+        assert_eq!(pods[0].previews, vec![preview(3000), preview(5173)]);
+        assert_eq!(pods[1].previews, vec![preview(9000)], "another pod's previews are untouched");
+
+        apply_sandbox_preview_update(&mut pods, 99, vec![preview(1)]);
+        assert_eq!(pods.len(), 2, "an unknown pod isn't invented");
+    }
+
+    #[test]
+    fn test_a_pod_status_update_keeps_its_previews() {
+        let mut pods = vec![SandboxPodPanelEntry {
+            pod_id: 1,
+            status: "Pending".to_string(),
+            previews: vec![preview(3000)],
+        }];
+        let mut terminals = Vec::new();
+        apply_sandbox_pod_update(&mut pods, &mut terminals, 1, "Running".to_string(), false);
+        assert_eq!(pods[0].previews, vec![preview(3000)]);
+    }
+
     #[test]
     fn test_merge_sandbox_snapshot_flattens_pods_and_terminals_and_hydrates_command_history() {
         let mut pods = Vec::new();
@@ -2097,6 +2176,7 @@ mod tests {
                         },
                     ],
                 }],
+                previews: Vec::new(),
             }],
         };
 
@@ -2132,6 +2212,7 @@ mod tests {
         let mut pods = vec![SandboxPodPanelEntry {
             pod_id: 1,
             status: "Pending".to_string(),
+            previews: Vec::new(),
         }];
         let mut terminals = Vec::new();
         let snapshot = SandboxSnapshot {
@@ -2139,6 +2220,7 @@ mod tests {
                 pod_id: 1,
                 status: "Running".to_string(),
                 terminals: Vec::new(),
+                previews: Vec::new(),
             }],
         };
 
@@ -2173,6 +2255,7 @@ mod tests {
         let mut pods = vec![SandboxPodPanelEntry {
             pod_id: 1,
             status: "Running".to_string(),
+            previews: Vec::new(),
         }];
         let mut terminals = vec![
             test_sandbox_terminal_entry(10, 1),
@@ -2927,6 +3010,9 @@ fn ChatPanel(
                                         terminated,
                                     );
                                 }
+                                Some(Ok(ConversationEvent::SandboxPreviewUpdate { pod_id, previews })) => {
+                                    apply_sandbox_preview_update(&mut sandbox_pods.write(), pod_id, previews);
+                                }
                                 Some(Ok(ConversationEvent::SandboxTerminalUpdate {
                                     pod_id,
                                     terminal_id,
@@ -3458,6 +3544,21 @@ fn ChatPanel(
                                             }
                                             if let Some(err) = pod_stop_error() {
                                                 p { class: "error", "{err}" }
+                                            }
+                                            if !pod.previews.is_empty() {
+                                                div { class: "sandbox-previews",
+                                                    for preview in pod.previews.clone() {
+                                                        a {
+                                                            key: "{preview.port}",
+                                                            class: "sandbox-preview",
+                                                            href: "{preview.url}",
+                                                            target: "_blank",
+                                                            rel: "noopener noreferrer",
+                                                            title: "Open what's running on port {preview.port} in the sandbox, in a new tab",
+                                                            "Open preview · port {preview.port}"
+                                                        }
+                                                    }
+                                                }
                                             }
                                             div { class: "task-terminal-stack",
                                                 for terminal in sandbox_terminals().into_iter().filter(|t| t.pod_id == pod.pod_id) {

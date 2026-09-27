@@ -4638,6 +4638,8 @@ dependencies = [
  "globset",
  "gloo-timers 0.4.0",
  "http",
+ "hyper",
+ "hyper-util",
  "ignore",
  "k8s-openapi",
  "keyboard-types",

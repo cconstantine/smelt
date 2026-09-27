@@ -81,9 +81,19 @@ async fn request_with_guard(
     let mut current_method = method;
     for _ in 0..=MAX_REDIRECTS {
         if !fetch_guard::is_request_allowed_with(&current_url, is_addr_allowed).await {
-            return Err(format!(
-                "refusing to request {current_url}: not a safe address"
-            ));
+            // localhost means the sandbox only in the browser tools (SME-42):
+            // say so, rather than leave the model guessing.
+            let sandbox_hint = fetch_guard::parse_fetch_target(&current_url)
+                .is_ok_and(|(host, _)| fetch_guard::is_sandbox_host(&host));
+            return Err(if sandbox_hint {
+                format!(
+                    "refusing to request {current_url}: http_request can't reach localhost. For a \
+                     server in your sandbox, use webfetch or a browsing session (there localhost \
+                     is your sandbox), or curl in a terminal."
+                )
+            } else {
+                format!("refusing to request {current_url}: not a safe address")
+            });
         }
         let mut req = client.request(current_method.clone(), &current_url);
         for (name, value) in headers {
@@ -288,6 +298,18 @@ mod tests {
             result.is_err(),
             "the real (non-relaxed) guard should refuse a loopback address"
         );
+    }
+
+    /// A model reaching for its sandbox's dev server with http_request
+    /// (seen on SME-42's hands-on check) should hear where that works.
+    #[tokio::test]
+    async fn test_a_refused_localhost_request_says_where_localhost_reaches_the_sandbox() {
+        for url in ["http://127.0.0.1:5173/", "http://localhost:3000/api"] {
+            let error = request("GET", url, &[], None).await.expect_err("loopback is refused here");
+            assert!(error.contains("webfetch") && error.contains("curl"), "{url}: {error}");
+        }
+        let error = request("GET", "http://10.0.0.5/", &[], None).await.expect_err("private is refused");
+        assert!(!error.contains("webfetch"), "only localhost-style hosts get the pointer: {error}");
     }
 
     #[test]

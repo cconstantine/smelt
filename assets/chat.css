@@ -1065,6 +1065,34 @@ body {
     color: var(--muted);
 }
 
+/* Links to what the sandbox is serving, for the user's own browser
+   (SME-42): one per port the model shared. */
+.sandbox-panel .sandbox-previews {
+    flex-shrink: 0;
+}
+
+.sandbox-previews {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    margin-bottom: 8px;
+    font-size: 13px;
+}
+
+.sandbox-preview {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.sandbox-preview:hover,
+.sandbox-preview:focus-visible {
+    text-decoration: underline;
+}
+
+.sandbox-preview::after {
+    content: " \2197";
+}
+
 /* Each background task gets its own terminal-window-styled widget — the
    same visual language a real shell session will use once async tasks grow
    into one, not just a status list. Stacked vertically since the panel is

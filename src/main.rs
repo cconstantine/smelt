@@ -19,6 +19,8 @@ mod mcp;
 mod mcp_oauth;
 mod models;
 #[cfg(feature = "server")]
+mod preview;
+#[cfg(feature = "server")]
 mod sandbox;
 #[cfg(feature = "server")]
 mod webfetch;
@@ -83,6 +85,10 @@ async fn main() {
     // and /pods match it. Only here, never in the browser test harness:
     // see `sandbox::watch_pods`.
     tokio::spawn(sandbox::watch_pods(pool.clone()));
+
+    // Each sandbox's dev servers, for the user's browser, on a listener of
+    // its own (SME-42).
+    preview::start(pool.clone()).await;
 
     let router = build_router();
 

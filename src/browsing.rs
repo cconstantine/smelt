@@ -60,6 +60,8 @@ pub enum BrowserInputEvent {
 mod server {
     use std::collections::HashMap;
     use std::net::IpAddr;
+
+    use crate::egress_proxy::SandboxDial;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
@@ -173,7 +175,10 @@ mod server {
         /// checks a new address against it before loading anything.
         is_addr_allowed: fn(IpAddr) -> bool,
         /// This session's own browser context — see `open_session_with_guard`.
-        context: chromiumoxide::cdp::browser_protocol::browser::BrowserContextId,
+        context: crate::webfetch::IsolatedContext,
+        /// Whether `localhost` in this session means the conversation's
+        /// sandbox (SME-42) — `navigate` checks a new address with it.
+        sandbox_routed: bool,
         page: Page,
         intercept_task: tokio::task::JoinHandle<()>,
         /// The latest frame, as a template for new viewers' receivers — a
@@ -200,8 +205,8 @@ mod server {
     /// exists" precedent; `close_session` first). Always uses the real,
     /// strict `fetch_guard::is_safe_fetch_addr` — see
     /// `open_session_with_guard` for why a test-only seam exists at all.
-    pub async fn open_session(conversation_id: i64) -> Result<(), String> {
-        open_session_with_guard(conversation_id, fetch_guard::is_safe_fetch_addr).await
+    pub async fn open_session(conversation_id: i64, sandbox: SandboxDial) -> Result<(), String> {
+        open_session_routed(conversation_id, fetch_guard::is_safe_fetch_addr, Some(sandbox)).await
     }
 
     /// The real implementation behind `open_session`, parameterized on the
@@ -211,10 +216,23 @@ mod server {
     /// "does a real navigation actually get through" needs a relaxed
     /// variant in tests, while the real `open_session` above always uses
     /// the strict guard.
+    #[cfg(all(test, feature = "browser-test"))]
     async fn open_session_with_guard(
         conversation_id: i64,
         is_addr_allowed: fn(IpAddr) -> bool,
     ) -> Result<(), String> {
+        open_session_routed(conversation_id, is_addr_allowed, None).await
+    }
+
+    /// `open_session_with_guard` plus an optional sandbox route: with one,
+    /// the session's browser context sends `localhost`-style hosts to the
+    /// conversation's sandbox (SME-42).
+    async fn open_session_routed(
+        conversation_id: i64,
+        is_addr_allowed: fn(IpAddr) -> bool,
+        sandbox: Option<SandboxDial>,
+    ) -> Result<(), String> {
+        let sandbox_routed = sandbox.is_some();
         let _lifecycle = SESSION_LIFECYCLE.lock().await;
         if SESSIONS.lock().unwrap().contains_key(&conversation_id) {
             return Err(
@@ -226,8 +244,8 @@ mod server {
         // Each session gets a browser context of its own, so no two
         // conversations ever share cookies, storage or service workers, and
         // closing the session deletes everything it stored.
-        let (page, context) = crate::webfetch::new_isolated_page().await?;
-        let intercept_task = match configure_session_page(&page, is_addr_allowed).await {
+        let (page, context) = crate::webfetch::new_isolated_page(sandbox).await?;
+        let intercept_task = match configure_session_page(&page, is_addr_allowed, sandbox_routed).await {
             Ok(task) => task,
             Err(e) => {
                 crate::webfetch::dispose_isolated(context).await;
@@ -252,6 +270,7 @@ mod server {
                 id: session_id,
                 is_addr_allowed,
                 context,
+                sandbox_routed,
                 current_url: "about:blank".to_string(),
                 url_task,
                 page,
@@ -276,6 +295,7 @@ mod server {
     async fn configure_session_page(
         page: &Page,
         is_addr_allowed: fn(IpAddr) -> bool,
+        sandbox_routed: bool,
     ) -> Result<tokio::task::JoinHandle<()>, String> {
         // Pins this page's viewport to exactly the screencast's own
         // max dimensions (device_scale_factor 1, no mobile emulation) —
@@ -293,7 +313,7 @@ mod server {
         ))
         .await
         .map_err(|e| format!("failed to set the session's viewport: {e}"))?;
-        fetch_guard::spawn_request_interceptor(page, is_addr_allowed).await
+        fetch_guard::spawn_request_interceptor(page, is_addr_allowed, sandbox_routed).await
     }
 
     /// Closes `conversation_id`'s browsing session — a no-op (not an
@@ -815,20 +835,21 @@ mod server {
     /// Navigates `conversation_id`'s live session to `url` and returns
     /// the resulting page's state.
     pub async fn navigate(conversation_id: i64, url: &str) -> Result<PageState, String> {
-        // The request interceptor only sees loads that touch the network, so
-        // it can't stop a `data:` (or similar) URL — check the scheme here.
-        let (host, port) = fetch_guard::parse_fetch_target(url)?;
         let page = live_page(conversation_id)?;
         // Checked before loading, so a refused address leaves the session
         // on its current page instead of Chrome's blank error page, and
-        // the error says why (SME-40 F11). The interceptor still guards
-        // everything the page loads after this, redirects included.
-        let is_addr_allowed = SESSIONS
+        // the error says why (SME-40 F11). `check_load` also refuses a
+        // `data:` (or similar) URL, which the request interceptor can't see
+        // because it never touches the network. The interceptor still
+        // guards everything the page loads after this, redirects included.
+        let (is_addr_allowed, sandbox_routed) = SESSIONS
             .lock()
             .unwrap()
             .get(&conversation_id)
-            .map_or(fetch_guard::is_safe_fetch_addr as fn(IpAddr) -> bool, |s| s.is_addr_allowed);
-        fetch_guard::resolve_allowed(&host, port, is_addr_allowed)
+            .map_or((fetch_guard::is_safe_fetch_addr as fn(IpAddr) -> bool, false), |s| {
+                (s.is_addr_allowed, s.sandbox_routed)
+            });
+        fetch_guard::check_load(url, is_addr_allowed, sandbox_routed)
             .await
             .map_err(|e| format!("refused {url}: {e}; smelt doesn't load private or local addresses"))?;
         tokio::time::timeout(NAV_TIMEOUT, page.goto(url))
@@ -1876,6 +1897,96 @@ mod server {
             );
             close_session(first).await.expect("close the first session");
             close_session(second).await.expect("close the second session");
+
+            // --- SME-42: a session with a sandbox route loads `localhost`
+            // from the sandbox under the strict guard — the navigation and
+            // the page's own requests alike — while a session without one
+            // still refuses it. ---
+            let (sandbox_url, _sandbox_server) = start_test_server(
+                "<html><body><div id=\"out\">pending</div><script>\
+                 fetch('http://localhost:4400/').then(\
+                   r => { document.getElementById('out').innerText = 'in-page fetch ' + r.status; },\
+                   () => { document.getElementById('out').innerText = 'in-page fetch blocked'; });\
+                 </script></body></html>",
+            )
+            .await;
+            let sandbox_addr: std::net::SocketAddr = sandbox_url
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .parse()
+                .expect("a test server address");
+            let dialed = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let routed: i64 = 900_101;
+            open_session_routed(
+                routed,
+                fetch_guard::is_safe_fetch_addr,
+                Some(crate::egress_proxy::dial_to(sandbox_addr, dialed.clone())),
+            )
+            .await
+            .expect("open a routed session");
+            let loaded = navigate(routed, "http://localhost:4400/").await;
+            let mut text = loaded.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while loaded.is_ok() && text.contains("pending") && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                text = read(routed).await.map(|s| s.text).unwrap_or_default();
+            }
+            close_session(routed).await.expect("close the routed session");
+            loaded.expect("a routed session should load localhost from the sandbox");
+            assert!(text.contains("in-page fetch 200"), "the page's own request to localhost failed: {text:?}");
+            assert!(dialed.lock().unwrap().iter().all(|&p| p == 4400), "unexpected ports: {dialed:?}");
+
+            let unrouted: i64 = 900_102;
+            open_session_with_guard(unrouted, fetch_guard::is_safe_fetch_addr)
+                .await
+                .expect("open an unrouted session");
+            let refused = navigate(unrouted, "http://localhost:4400/").await;
+            close_session(unrouted).await.expect("close the unrouted session");
+            let error = refused.expect_err("a session without a sandbox route must refuse localhost");
+            assert!(error.contains("private or local"), "the refusal should say why: {error}");
+
+            // --- SME-42 review: a page from another site, open in a routed
+            // session, can't reach the sandbox — not by fetch, an image or a
+            // WebSocket. 127.0.0.2 is loopback but not a sandbox address. ---
+            let outside = tokio::net::TcpListener::bind("127.0.0.2:0").await.expect("bind 127.0.0.2");
+            let outside_url = format!("http://{}/", outside.local_addr().expect("local addr"));
+            let outside_page: &'static str = "<html><body><div id=\"out\">pending</div>\
+                 <img src=\"http://localhost:4500/from-outside-img\">\
+                 <script>\
+                 fetch('http://localhost:4500/from-outside-fetch', {mode: 'no-cors', method: 'POST', body: 'x'});\
+                 try { new WebSocket('ws://localhost:4500/from-outside-ws'); } catch (e) {}\
+                 setTimeout(() => { document.getElementById('out').innerText = 'tried'; }, 1500);\
+                 </script></body></html>";
+            let _outside_server = tokio::spawn(async move {
+                let router = axum::Router::new()
+                    .route("/", axum::routing::get(move || async move { axum::response::Html(outside_page) }));
+                axum::serve(outside, router).await.expect("outside server");
+            });
+            let reached = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let guarded: i64 = 900_103;
+            open_session_routed(
+                guarded,
+                allow_loopback_too,
+                Some(crate::egress_proxy::dial_to(sandbox_addr, reached.clone())),
+            )
+            .await
+            .expect("open a routed session");
+            let loaded = navigate(guarded, &outside_url).await;
+            let mut text = loaded.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while loaded.is_ok() && text.contains("pending") && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                text = read(guarded).await.map(|s| s.text).unwrap_or_default();
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            close_session(guarded).await.expect("close the routed session");
+            loaded.expect("the outside page should load");
+            assert!(text.contains("tried"), "the outside page's script never ran: {text:?}");
+            assert!(
+                reached.lock().unwrap().is_empty(),
+                "a page from another site reached the sandbox: {:?}",
+                reached.lock().unwrap()
+            );
         }
 
         /// Shows whatever cookie and localStorage value the page can see.

@@ -109,6 +109,11 @@ http = { version = "1", optional = true }
 # doesn't re-export the macro), same "explicit edge" reasoning as `http`
 # above.
 async-trait = { version = "0.1", optional = true }
+# For src/preview.rs's reverse proxy to a sandbox pod — HTTP/1 over a
+# port-forward stream, upgrades (a dev server's live-reload WebSocket)
+# included. The same versions axum already pulls in.
+hyper = { version = "1", features = ["client", "server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 # For src/mcp_oauth.rs's callback route — percent-encoding an OAuth error
 # message into a `?oauth_error=` redirect query param. Already present
 # transitively (pulled in by `url`, itself pulled in by rmcp's "auth"
@@ -156,6 +161,8 @@ server = [
     "dep:rmcp",
     "dep:http",
     "dep:async-trait",
+    "dep:hyper",
+    "dep:hyper-util",
     "dep:percent-encoding",
     "dep:chromiumoxide",
     "dep:url",

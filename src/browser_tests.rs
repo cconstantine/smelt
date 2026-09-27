@@ -35,6 +35,7 @@ use crate::{anthropic, db, sandbox};
 struct BrowserTestHarness {
     browser: Browser,
     server_task: tokio::task::JoinHandle<()>,
+    preview_task: tokio::task::JoinHandle<()>,
     base_url: String,
 }
 
@@ -62,6 +63,28 @@ impl BrowserTestHarness {
         unsafe {
             std::env::set_var("DIOXUS_PUBLIC_PATH", &public_path);
         }
+
+        // Sandbox previews (SME-42) on a port of this test's own, with
+        // `SMELT_PREVIEW_URL` naming it, so a link the model shares opens
+        // in this browser just as it would for a user. `*.localhost`
+        // resolves to this machine inside Chrome with no DNS set up.
+        let preview_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the preview listener");
+        let preview_url = format!(
+            "http://{{port}}-{{conversation}}.preview.localhost:{}",
+            preview_listener.local_addr().expect("preview address").port()
+        );
+        // SAFETY: as above — still single-threaded.
+        unsafe {
+            std::env::set_var("SMELT_PREVIEW_URL", &preview_url);
+        }
+        let preview_template = crate::preview::configured_template().expect("the test's preview template");
+        let preview_task = tokio::spawn(crate::preview::serve(
+            preview_listener,
+            preview_template,
+            std::sync::Arc::new(|conversation| crate::egress_proxy::sandbox_dial(db::get().clone(), conversation)),
+        ));
 
         // A plain `cargo test` build doesn't bundle assets: `asset!()`
         // resolves to the source file's own path, which nothing serves, so
@@ -102,6 +125,7 @@ impl BrowserTestHarness {
         Self {
             browser,
             server_task,
+            preview_task,
             base_url: format!("http://127.0.0.1:{port}/"),
         }
     }
@@ -113,6 +137,7 @@ impl BrowserTestHarness {
         let _ = self.browser.close().await;
 
         self.server_task.abort();
+        self.preview_task.abort();
     }
 }
 
@@ -417,7 +442,7 @@ async fn test_end_to_end_browser_scenarios() {
 
     // `catch_unwind` so a failing scenario still gets cleaned up after;
     // its panic is re-raised once that's done.
-    let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(180), async {
+    let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(240), async {
         let conversation = new_conversation(pool, &created).await;
 
         // --- Scenario 1: cold-load panel population, one pod, two terminals
@@ -1077,7 +1102,9 @@ async fn test_end_to_end_browser_scenarios() {
         // squeezed the messages and input to 48px and made the page
         // scroll sideways (SME-40 F2). ---
         let browsing = new_conversation(pool, &created).await;
-        crate::browsing::open_session(browsing.id).await.expect("open a browsing session");
+        crate::browsing::open_session(browsing.id, crate::egress_proxy::sandbox_dial(pool.clone(), browsing.id))
+            .await
+            .expect("open a browsing session");
         // With a todo list and a sandbox terminal open too, as in a real
         // session: side by side, the three panels shared ~450px, so the
         // browser was tiny and the terminal pushed out of sight (SME-41 D16).
@@ -1416,6 +1443,98 @@ async fn test_end_to_end_browser_scenarios() {
             0,
             "picking an example shouldn't send it"
         );
+        page.close().await.expect("close the tab");
+
+        // --- Scenario 23 (SME-42): a dev server in the sandbox, end to end.
+        // It's bound to 127.0.0.1 inside the pod, as dev servers are by
+        // default. The model's own browser loads it at localhost; the model
+        // shares a preview; the link shows up in the sandbox panel live,
+        // opens the same server in a tab of its own, and survives a reload. ---
+        let serving = new_conversation(pool, &created).await;
+        sandbox::create_pod(pool, serving.id, None, None).await.expect("create_pod");
+        let terminal = sandbox::create_terminal(pool, serving.id).await.expect("create_terminal");
+        anthropic::tools::execute(
+            pool,
+            serving.id,
+            &unique_id("write"),
+            "write_file",
+            &serde_json::json!({
+                "path": "/home/sandbox/site/index.html",
+                "content": "<html><body><h1>Hello from the sandbox dev server</h1></body></html>",
+            }),
+        )
+        .await
+        .expect("write the page");
+        anthropic::tools::execute(
+            pool,
+            serving.id,
+            &unique_id("serve"),
+            "run_terminal_command",
+            &serde_json::json!({
+                "terminal_id": terminal,
+                "command": "cd /home/sandbox/site && python3 -m http.server 8000 --bind 127.0.0.1",
+            }),
+        )
+        .await
+        .expect("start the server");
+        let mut listening = false;
+        for _ in 0..50 {
+            if sandbox::pod_port_is_listening(pool, serving.id, 8000).await.expect("probe port 8000") {
+                listening = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(listening, "the dev server never started listening");
+
+        // The model's side: localhost in its browsing session is the sandbox.
+        crate::browsing::open_session(serving.id, crate::egress_proxy::sandbox_dial(pool.clone(), serving.id))
+            .await
+            .expect("open a browsing session");
+        let seen = crate::browsing::navigate(serving.id, "http://localhost:8000/").await;
+        crate::browsing::close_session(serving.id).await.expect("close the browsing session");
+        let seen = seen.expect("the model's browser should load the sandbox's dev server");
+        assert!(seen.text.contains("Hello from the sandbox dev server"), "got {:?}", seen.text);
+
+        // The user's side.
+        let page = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, serving.id))
+            .await
+            .expect("open the serving conversation");
+        wait_for_live_client(&page, serving.id).await;
+        let shared = anthropic::tools::execute(
+            pool,
+            serving.id,
+            &unique_id("preview"),
+            "sandbox_preview_url",
+            &serde_json::json!({"port": 8000}),
+        )
+        .await
+        .expect("share a preview");
+        let shared: serde_json::Value = serde_json::from_str(&shared).expect("the tool's JSON");
+        assert_eq!(shared["listening"], true, "got {shared}");
+        let link = shared["url"].as_str().expect("a url").to_string();
+        assert_eq!(link, crate::preview::configured_template().expect("the template").url_for(serving.id, 8000));
+        // Without a reload: it arrives on the conversation's live stream.
+        wait_for_element(&page, ".sandbox-preview", Duration::from_secs(10)).await;
+        let href: String = page
+            .evaluate("document.querySelector('.sandbox-preview').href")
+            .await
+            .expect("read the link")
+            .into_value()
+            .expect("an href");
+        assert_eq!(href.trim_end_matches('/'), link, "the panel links to the shared preview");
+        let preview_tab = harness.browser.new_page(link.clone()).await.expect("open the preview");
+        assert!(
+            wait_for_text(&preview_tab, "Hello from the sandbox dev server", Duration::from_secs(10)).await,
+            "the preview link should show the sandbox's dev server"
+        );
+        preview_tab.close().await.expect("close the preview tab");
+        page.reload().await.expect("reload the conversation");
+        wait_for_live_client(&page, serving.id).await;
+        // Still there after a reload: `get_sandbox_state` brings it back.
+        wait_for_element(&page, ".sandbox-preview", Duration::from_secs(10)).await;
         page.close().await.expect("close the tab");
     })))
     .await;

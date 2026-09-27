@@ -1572,6 +1572,8 @@ pub struct SandboxPodSummary {
     pub pod_id: i64,
     pub status: String,
     pub terminals: Vec<SandboxTerminalSummary>,
+    /// Ports the model has shared as previews, with their links (SME-42).
+    pub previews: Vec<crate::events::SandboxPreview>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1695,14 +1697,28 @@ pub async fn get_sandbox_state(id: i64) -> ServerFnResult<SandboxSnapshot> {
             });
     }
 
-    let pods = pods
-        .into_iter()
-        .map(|pod| SandboxPodSummary {
+    // No links when previews are off (a bad `SMELT_PREVIEW_URL`): the
+    // model's `sandbox_preview_url` says why when it tries to share one.
+    let template = crate::preview::configured_template().ok();
+    let mut summaries = Vec::with_capacity(pods.len());
+    for pod in pods {
+        let previews = match &template {
+            Some(template) => {
+                let ports = db::list_pod_previews(pool, pod.pod_id)
+                    .await
+                    .map_err(ServerFnError::new)?;
+                crate::preview::preview_links(template, id, &ports)
+            }
+            None => Vec::new(),
+        };
+        summaries.push(SandboxPodSummary {
             pod_id: pod.pod_id,
             status: pod.status,
             terminals: by_pod.remove(&pod.pod_id).unwrap_or_default(),
-        })
-        .collect();
+            previews,
+        });
+    }
+    let pods = summaries;
 
     Ok(SandboxSnapshot { pods })
 }
@@ -3029,7 +3045,7 @@ mod tests {
     /// and underscores; the few that aren't tools are listed.
     #[test]
     fn test_system_prompt_only_names_real_tools() {
-        const NOT_TOOLS: &[&str] = &["sandbox", "sudo", "web_search"];
+        const NOT_TOOLS: &[&str] = &["sandbox", "sudo", "web_search", "localhost"];
         let tools: Vec<String> = anthropic::tools::native_tool_definitions()
             .into_iter()
             .map(|tool| tool.name)

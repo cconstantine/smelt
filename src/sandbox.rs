@@ -689,6 +689,9 @@ pub enum TerminalError {
     /// (which only ever distinguish success from a generic failure) —
     /// the model needs to see and act on exactly what went wrong.
     FileOperation(String),
+    /// A request to open the sandbox agent's own port (`AGENT_PORT`) from a
+    /// route into the pod — see `check_reachable_port`.
+    AgentPort,
 }
 
 impl std::fmt::Display for TerminalError {
@@ -720,6 +723,11 @@ impl std::fmt::Display for TerminalError {
                 )
             }
             TerminalError::FileOperation(message) => write!(f, "{message}"),
+            TerminalError::AgentPort => write!(
+                f,
+                "port {AGENT_PORT} is smelt's own sandbox agent, which can't be opened from a \
+                 browser or a preview; run your server on another port"
+            ),
         }
     }
 }
@@ -1054,6 +1062,99 @@ pub async fn create_pod(
             Err(e)
         }
     }
+}
+
+/// Refuses the one port in a pod no route may reach: the sandbox agent's
+/// (`AGENT_PORT`), whose WebSocket runs commands with no login of its own.
+/// A preview or a page in the model's browser reaching it would let any
+/// website run commands in the sandbox (found in SME-42's code review).
+pub fn check_reachable_port(port: u16) -> Result<(), TerminalError> {
+    if port == AGENT_PORT {
+        return Err(TerminalError::AgentPort);
+    }
+    Ok(())
+}
+
+/// A byte stream to a port inside a sandbox pod, from `open_pod_port`.
+pub trait PodIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> PodIo for T {}
+
+/// Opens a TCP connection to `port` inside `conversation_id`'s own live
+/// pod, through a Kubernetes port-forward — the pod is resolved here from
+/// the conversation, never named by the caller, so nothing can reach
+/// another conversation's pod (SME-42). The connection is made inside the
+/// pod's network namespace, so a server bound only to `127.0.0.1` there
+/// is reachable. One port-forward per connection.
+///
+/// Nothing listening on `port` isn't an error here: the stream simply
+/// ends without a byte. After the pod side closes, the end of the stream
+/// arrives about a second late (seen on k3s), so a caller must never wait
+/// for it to know a response is complete.
+pub async fn open_pod_port(
+    pool: &PgPool,
+    conversation_id: i64,
+    port: u16,
+) -> Result<Box<dyn PodIo>, TerminalError> {
+    open_pod_port_with(pool, conversation_id, port, || get().client.clone()).await
+}
+
+/// `open_pod_port` with the Kubernetes client supplied — a test's own, so
+/// it never has to set the process-global manager (see
+/// `test_open_pod_port_reaches_the_conversations_own_pod`). The client is
+/// only asked for once there's a pod, so a conversation without one never
+/// needs a cluster at all.
+async fn open_pod_port_with(
+    pool: &PgPool,
+    conversation_id: i64,
+    port: u16,
+    client: impl FnOnce() -> kube::Client,
+) -> Result<Box<dyn PodIo>, TerminalError> {
+    check_reachable_port(port)?;
+    let pod_id = conversation_pod_id(pool, conversation_id).await?;
+    let mut forwarder = pods_api(&client())
+        .portforward(&pod_name(pod_id), &[port])
+        .await
+        .map_err(|e| TerminalError::Sandbox(SandboxError::Kube(e)))?;
+    let stream = forwarder
+        .take_stream(port)
+        .expect("stream requested for the forwarded port");
+    Ok(Box::new(stream))
+}
+
+/// Whether something is listening on `port` in `conversation_id`'s pod —
+/// the sharing a preview's check, so the model hears at once if it gave
+/// the wrong port or the server isn't up yet. A port-forward to a port
+/// nothing listens on ends straight away without a byte (about 50ms on
+/// k3s); a listening server keeps the connection open waiting for a
+/// request. `LISTEN_PROBE` is well past the first and far below a request
+/// timeout.
+pub async fn pod_port_is_listening(pool: &PgPool, conversation_id: i64, port: u16) -> Result<bool, TerminalError> {
+    pod_port_is_listening_with(pool, conversation_id, port, || get().client.clone()).await
+}
+
+const LISTEN_PROBE: Duration = Duration::from_millis(500);
+
+async fn pod_port_is_listening_with(
+    pool: &PgPool,
+    conversation_id: i64,
+    port: u16,
+    client: impl FnOnce() -> kube::Client,
+) -> Result<bool, TerminalError> {
+    let mut stream = open_pod_port_with(pool, conversation_id, port, client).await?;
+    let mut first = [0u8; 1];
+    Ok(match tokio::time::timeout(LISTEN_PROBE, stream.read(&mut first)).await {
+        // Still open: something accepted the connection and is waiting.
+        Err(_) => true,
+        // A server that speaks first (SSH, a database) is listening too.
+        Ok(Ok(n)) => n > 0,
+        Ok(Err(_)) => false,
+    })
+}
+
+/// The conversation's live pod's id, for callers outside this module —
+/// `NoPod` when it has none.
+pub async fn live_pod_id(pool: &PgPool, conversation_id: i64) -> Result<i64, TerminalError> {
+    conversation_pod_id(pool, conversation_id).await
 }
 
 /// Takes `conversation_id`, resolved to "the conversation's pod" via
@@ -2823,6 +2924,170 @@ mod tests {
             matches!(result, Err(SandboxError::PodAlreadyExists)),
             "expected PodAlreadyExists, got {result:?}"
         );
+    }
+
+    /// DB-only: with no live pod there's nothing to connect to, and the
+    /// manager is never touched.
+    #[sqlx::test]
+    async fn test_open_pod_port_without_a_live_pod_is_no_pod(pool: PgPool) {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let result = open_pod_port(&pool, conversation.id, 3000).await;
+        assert!(matches!(result, Err(TerminalError::NoPod)), "expected NoPod");
+    }
+
+    /// DB-only: the sandbox agent's port is refused before anything is
+    /// looked up, so no route can reach it.
+    #[sqlx::test]
+    async fn test_open_pod_port_refuses_the_sandbox_agents_own_port(pool: PgPool) {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let result = open_pod_port(&pool, conversation.id, AGENT_PORT).await;
+        assert!(matches!(result, Err(TerminalError::AgentPort)), "the agent's port must be refused");
+    }
+
+    /// Sends a bare HTTP request down `stream` and returns whatever comes
+    /// back before the response stops arriving — never waits for the end
+    /// of the stream, which a port-forward reports about a second late.
+    async fn http_get_over(stream: &mut Box<dyn PodIo>, path: &str) -> String {
+        use tokio::io::AsyncWriteExt;
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .expect("write the request");
+        let mut buf = vec![0u8; 4096];
+        match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf)).await {
+            Ok(Ok(n)) => String::from_utf8_lossy(&buf[..n]).to_string(),
+            Ok(Err(e)) => panic!("read failed: {e}"),
+            Err(_) => panic!("no response within 10s"),
+        }
+    }
+
+    /// Real cluster: `open_pod_port` reaches a server inside the
+    /// conversation's own pod — one bound to `127.0.0.1` there, as dev
+    /// servers are by default — but never the sandbox agent's own port. A
+    /// conversation with no pod of its own can't borrow another's, and a
+    /// port nothing listens on ends at once with no bytes.
+    #[sqlx::test]
+    async fn test_open_pod_port_reaches_the_conversations_own_pod(pool: PgPool) {
+        // Pod names are `sandbox-{pod_id}`, and every `#[sqlx::test]`
+        // database restarts ids at 1 — start this one's ids far from the
+        // low range `test_terminal_lifecycle_end_to_end` wipes and uses.
+        let first_id = (uuid_like().parse::<u128>().unwrap() % 1_000_000_000) as i64 + 1_000_000;
+        sqlx::query("SELECT setval(pg_get_serial_sequence('sandbox_pods', 'id'), $1)")
+            .bind(first_id)
+            .execute(&pool)
+            .await
+            .expect("move the pod id sequence");
+        // Its own client and manager, never the process-global one: a
+        // manager set here would die with this test's runtime and break
+        // every later test that uses `get()` (seen as `Kube(Service(Closed))`
+        // in `test_terminal_lifecycle_end_to_end`). The pod is created
+        // under the name the database row gives it, as `create_pod` would.
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+
+        let with_pod = db::create_conversation(&pool).await.expect("create conversation");
+        let without_pod = db::create_conversation(&pool).await.expect("create conversation");
+        let row = db::create_sandbox_pod(&pool, with_pod.id).await.expect("create the pod's row");
+        let sandbox = manager
+            .create(&row.id.to_string(), "128Mi", "250m", &[])
+            .await
+            .expect("create the pod");
+        let open = |conversation_id: i64, port: u16| {
+            let (client, pool) = (client.clone(), pool.clone());
+            async move { open_pod_port_with(&pool, conversation_id, port, move || client).await }
+        };
+        // Python's server speaks HTTP/1.0 and closes after every response,
+        // so the preview below also meets an upstream that's gone between
+        // requests on one kept-alive connection.
+        let started_server = sandbox
+            .exec(&["sh", "-c", "setsid nohup python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 </dev/null &"])
+            .await;
+
+        // The server binds a moment after it starts. Everything is gathered
+        // before asserting, so a failure still deletes the pod below
+        // instead of leaving it in the cluster.
+        let mut reply = Err("never tried".to_string());
+        for _ in 0..50 {
+            reply = match open(with_pod.id, 8000).await {
+                Ok(mut stream) => Ok(http_get_over(&mut stream, "/no-such-path").await),
+                Err(e) => Err(e.to_string()),
+            };
+            if reply.as_ref().is_ok_and(|r| !r.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        // The user's preview proxy over the same real port-forward: three
+        // requests on one kept-alive connection. Each would take over a
+        // second if anything waited for the port-forward's late end of
+        // stream (see `open_pod_port`).
+        let through_preview = {
+            use crate::egress_proxy::{DialFuture, SandboxDial};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let preview_addr = listener.local_addr().expect("local addr");
+            let template = crate::preview::PreviewTemplate::parse(&format!(
+                "http://{{port}}-{{conversation}}.preview.localhost:{}",
+                preview_addr.port()
+            ))
+            .expect("a template");
+            let (dial_client, dial_pool) = (client.clone(), pool.clone());
+            let dial_for: crate::preview::DialFor = Arc::new(move |conversation| {
+                let (client, pool) = (dial_client.clone(), dial_pool.clone());
+                Arc::new(move |port| {
+                    let (client, pool) = (client.clone(), pool.clone());
+                    Box::pin(async move {
+                        open_pod_port_with(&pool, conversation, port, move || client)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }) as DialFuture
+                }) as SandboxDial
+            });
+            let server = tokio::spawn(crate::preview::serve(listener, template.clone(), dial_for));
+            let http = reqwest::Client::builder()
+                .resolve(&format!("8000-{}.preview.localhost", with_pod.id), preview_addr)
+                .build()
+                .expect("a client");
+            let started = std::time::Instant::now();
+            let mut statuses = Vec::new();
+            for _ in 0..3 {
+                match http.get(format!("{}/no-such-path", template.url_for(with_pod.id, 8000))).send().await {
+                    Ok(response) => statuses.push(response.status().as_u16()),
+                    Err(_) => statuses.push(0),
+                }
+            }
+            server.abort();
+            (statuses, started.elapsed())
+        };
+        let (probe_client, probe_pool) = (client.clone(), pool.clone());
+        let server_listening =
+            pod_port_is_listening_with(&probe_pool, with_pod.id, 8000, || probe_client.clone()).await;
+        let agent_port_result = open(with_pod.id, AGENT_PORT).await;
+        let unused_listening = pod_port_is_listening_with(&probe_pool, with_pod.id, 9, || probe_client.clone()).await;
+        let without_pod_result = open(without_pod.id, 8000).await;
+        let closed_reply = match open(with_pod.id, 9).await {
+            Ok(mut stream) => Ok(http_get_over(&mut stream, "/").await),
+            Err(e) => Err(e.to_string()),
+        };
+        pods_api(&client).delete(&pod_name(row.id), &immediate_delete_params()).await.ok();
+        std::mem::forget(sandbox);
+
+        started_server.expect("start a server in the pod");
+        let reply = reply.expect("open the server's port");
+        assert!(reply.starts_with("HTTP/1.0 404"), "expected the server's 404, got {reply:?}");
+        assert!(
+            matches!(agent_port_result, Err(TerminalError::AgentPort)),
+            "the sandbox agent's port must be refused even with a pod"
+        );
+        assert!(
+            matches!(without_pod_result, Err(TerminalError::NoPod)),
+            "a conversation without a pod must not reach any pod"
+        );
+        assert_eq!(closed_reply.expect("open an unused port"), "", "nothing listens on port 9");
+        assert!(server_listening.expect("probe the server's port"), "the server listens on 8000");
+        assert!(!unused_listening.expect("probe port 9"), "nothing listens on port 9");
+        let (statuses, elapsed) = through_preview;
+        assert_eq!(statuses, vec![404, 404, 404], "the server's 404 through the preview each time");
+        assert!(elapsed < Duration::from_secs(2), "three preview requests took {elapsed:?}");
     }
 
     #[test]

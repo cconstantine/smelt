@@ -10,6 +10,14 @@ use serde::{Deserialize, Serialize};
 use crate::anthropic::TokenUsage;
 use crate::models::Message;
 
+/// A port in a sandbox pod the user can open in their own browser, and the
+/// preview address that reaches it (`preview::PreviewTemplate::url_for`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SandboxPreview {
+    pub port: u16,
+    pub url: String,
+}
+
 /// `TaskUpdate` is ephemeral UI telemetry, regenerable at any time from the
 /// task registry (`anthropic::tools::snapshot_tasks`) — never persisted.
 /// `MessagesAppended` carries no new data of its own; it's a live-delivery
@@ -40,6 +48,13 @@ pub enum ConversationEvent {
         pod_id: i64,
         status: String,
         terminated: bool,
+    },
+    /// Published when the model shares a preview (`sandbox_preview_url`),
+    /// carrying every preview that pod has so far — the panel replaces its
+    /// list with this one. See SME-42.
+    SandboxPreviewUpdate {
+        pod_id: i64,
+        previews: Vec<SandboxPreview>,
     },
     /// Published once on `create_terminal`, once on `terminate_terminal`,
     /// and once per terminal a crash-cleanup pass clears.
@@ -500,6 +515,13 @@ mod wire_tests {
                 pod_id: 1,
                 status: "running".to_string(),
                 terminated: false,
+            },
+            ConversationEvent::SandboxPreviewUpdate {
+                pod_id: 1,
+                previews: vec![SandboxPreview {
+                    port: 3000,
+                    url: "http://3000-3.preview.localhost:8181".to_string(),
+                }],
             },
             ConversationEvent::SandboxTerminalUpdate {
                 pod_id: 1,
