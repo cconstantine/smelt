@@ -185,7 +185,8 @@ mod server {
     /// What a finished clone checked out.
     #[derive(Clone, Debug, PartialEq)]
     pub struct ClonedRepo {
-        pub commit: String,
+        /// `None` for an empty repo: nothing committed yet.
+        pub commit: Option<String>,
         pub branch: String,
     }
 
@@ -245,22 +246,30 @@ mod server {
                 output.to_string()
             });
         }
+        // The branch from HEAD itself, and the commit only if there is
+        // one: a brand-new empty repo has a branch but no commit yet.
         let head = crate::sandbox::exec_with(
             client,
             pod_name,
             "sandbox",
-            &["git", "-C", &path, "rev-parse", "HEAD", "--abbrev-ref", "HEAD"],
+            &[
+                "sh",
+                "-c",
+                r#"cd "$1" && git symbolic-ref --short -q HEAD || git rev-parse --abbrev-ref HEAD; git rev-parse --verify -q HEAD || true"#,
+                "sh",
+                &path,
+            ],
             None,
         )
         .await
         .map_err(|e| e.to_string())?;
         let mut lines = head.stdout.lines();
-        match (head.exit_code, lines.next(), lines.next()) {
-            (0, Some(commit), Some(branch)) => Ok(ClonedRepo {
-                commit: commit.to_string(),
+        match (head.exit_code, lines.next()) {
+            (0, Some(branch)) if !branch.is_empty() => Ok(ClonedRepo {
                 branch: branch.to_string(),
+                commit: lines.next().filter(|c| !c.is_empty()).map(str::to_string),
             }),
-            _ => Err(format!("cloned, but couldn't read what was checked out: {}", head.stdout.trim())),
+            _ => Err(format!("cloned, but couldn't read what was checked out: {}{}", head.stdout.trim(), head.stderr.trim())),
         }
     }
 
@@ -671,7 +680,9 @@ mod server {
             // A failed earlier attempt at the same directory is retried in
             // place rather than recorded twice.
             Some(failed) if failed.remote_key == key && failed.status == "failed" => {
-                (Some(failed.id), cut_off(failed.error.as_deref()))
+                // Only a directory that attempt made itself is cleared;
+                // one that held work before is never touched.
+                (Some(failed.id), failed.dir_created)
             }
             Some(other) => {
                 return Err(format!(
@@ -816,13 +827,13 @@ mod server {
         client: &kube::Client,
         pod_name: &str,
         dir: &str,
-        commit: &str,
+        commit: Option<&str>,
     ) -> Result<(), String> {
         let loaded = read_agents_file(client, pod_name, dir).await?.map(|file| db::LoadedInstructions {
             content: truncate_instructions(&file.content).to_string(),
             file_bytes: file.file_bytes as i64,
             hash: file.hash,
-            commit: Some(commit.to_string()),
+            commit: commit.map(str::to_string),
             nested: file.nested,
         });
         record_clone_instructions(pool, repo_id, loaded).await
@@ -830,14 +841,6 @@ mod server {
 
     /// How a clone that ran out of time starts its error.
     pub const CLONE_TIMED_OUT: &str = "The clone took too long and was stopped";
-
-    /// Whether a failed clone was cut off midway, so its directory may hold
-    /// a partial checkout of its own; any other failure (git refusing a
-    /// directory that already holds work, a bad URL) leaves nothing of the
-    /// clone's there.
-    fn cut_off(error: Option<&str>) -> bool {
-        error.is_some_and(|e| e == CLONE_INTERRUPTED || e.starts_with(CLONE_TIMED_OUT))
-    }
 
     /// What a clone cut off before it finished is marked with.
     pub const CLONE_INTERRUPTED: &str =
@@ -883,6 +886,18 @@ mod server {
     }
 
     /// Clones one recorded repo into pod `pod_id` and records how it went.
+    async fn workspace_dir_exists(client: &kube::Client, pod_name: &str, dir: &str) -> Result<bool, String> {
+        let path = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
+        let test = crate::sandbox::exec_with(client, pod_name, "sandbox", &["test", "-e", &path], None)
+            .await
+            .map_err(|e| e.to_string())?;
+        match test.exit_code {
+            0 => Ok(true),
+            1 => Ok(false),
+            code => Err(format!("couldn't check {path} (exit code {code})")),
+        }
+    }
+
     /// Records a finished clone, and disarms its guard: whatever runs
     /// afterwards (reading its AGENTS.md) being cut off doesn't make the
     /// clone "interrupted".
@@ -892,7 +907,7 @@ mod server {
         cloned: &ClonedRepo,
         guard: CloneGuard,
     ) -> Result<(), String> {
-        db::set_repo_cloned(pool, repo_id, &cloned.branch, &cloned.commit)
+        db::set_repo_cloned(pool, repo_id, &cloned.branch, cloned.commit.as_deref())
             .await
             .map_err(|e| e.to_string())?;
         guard.finish();
@@ -908,6 +923,13 @@ mod server {
     ) -> Result<(), String> {
         let client = sandbox::kube_client();
         let pod_name = sandbox::kubernetes_pod_name(pod_id);
+        // Whether this attempt makes the directory, recorded before it
+        // starts: if the attempt is cut off, its retry clears only a
+        // directory the attempt made.
+        let created = replace_leftover || !workspace_dir_exists(&client, &pod_name, &repo.dir).await?;
+        db::set_repo_dir_created(pool, repo.id, created)
+            .await
+            .map_err(|e| e.to_string())?;
         let outcome = clone_into_pod(
             &client,
             &pod_name,
@@ -922,7 +944,7 @@ mod server {
                 record_cloned(pool, repo.id, &cloned, guard).await?;
                 // The clone is good even if its instructions can't be read;
                 // the panel says why they aren't loaded.
-                if let Err(e) = load_instructions(pool, repo.id, &client, &pod_name, &repo.dir, &cloned.commit).await {
+                if let Err(e) = load_instructions(pool, repo.id, &client, &pod_name, &repo.dir, cloned.commit.as_deref()).await {
                     tracing::warn!(repo = %repo.url, error = %e, "couldn't load AGENTS.md");
                     let _ = db::set_repo_error(pool, repo.id, &format!("Couldn't load AGENTS.md: {e}")).await;
                 }
@@ -1375,7 +1397,7 @@ mod server {
                 let pool = pool.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    db::set_repo_cloned(&pool, repo.id, "main", "abc").await.expect("cloned");
+                    db::set_repo_cloned(&pool, repo.id, "main", Some("abc")).await.expect("cloned");
                 })
             };
             let started = std::time::Instant::now();
@@ -1419,7 +1441,7 @@ mod server {
             let repo = db::create_conversation_repo(pool, conversation_id, "git@github.com:o/r.git", "github.com/o/r", None, dir)
                 .await
                 .expect("repo");
-            db::set_repo_cloned(pool, repo.id, "main", "abc123").await.expect("cloned");
+            db::set_repo_cloned(pool, repo.id, "main", Some("abc123")).await.expect("cloned");
             repo
         }
 
@@ -1539,7 +1561,7 @@ mod server {
                 .expect("repo");
             let guard = CloneGuard::new(&pool, repo.id, conversation.id);
             let cloned = ClonedRepo {
-                commit: "abc".to_string(),
+                commit: Some("abc".to_string()),
                 branch: "main".to_string(),
             };
             record_cloned(&pool, repo.id, &cloned, guard).await.expect("record");
@@ -1596,15 +1618,6 @@ mod server {
             a.await.expect("a");
             b.await.expect("b");
             assert_eq!(installed.lock().expect("log").last(), Some(&"new"), "the pod ends with the newest keys");
-        }
-
-        #[test]
-        fn test_only_a_clone_cut_off_midway_may_have_left_a_partial_checkout() {
-            assert!(cut_off(Some(CLONE_INTERRUPTED)));
-            assert!(cut_off(Some(&format!("{CLONE_TIMED_OUT} (10 minutes) cloning u."))));
-            assert!(!cut_off(Some("fatal: destination path '/workspace/r' already exists and is not an empty directory.")));
-            assert!(!cut_off(Some("fatal: Remote branch nope not found in upstream origin")));
-            assert!(!cut_off(None));
         }
 
         #[test]

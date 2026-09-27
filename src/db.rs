@@ -887,6 +887,8 @@ pub struct ConversationRepo {
     pub instructions_hash: Option<String>,
     pub instructions_commit: Option<String>,
     pub nested_instructions: Vec<String>,
+    /// Whether the last clone attempt created `dir` (see the migration).
+    pub dir_created: bool,
     /// The AGENTS.md as last read from the checkout (see the migration).
     pub found_instructions: Option<String>,
     pub found_bytes: Option<i64>,
@@ -1086,7 +1088,7 @@ pub async fn set_repo_cloned(
     pool: &PgPool,
     id: i64,
     checked_out_branch: &str,
-    commit_sha: &str,
+    commit_sha: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE conversation_repos
@@ -1099,6 +1101,16 @@ pub async fn set_repo_cloned(
     .bind(commit_sha)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Records whether the clone about to run creates the repo's directory.
+pub async fn set_repo_dir_created(pool: &PgPool, id: i64, created: bool) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE conversation_repos SET dir_created = $2, updated_at = now() WHERE id = $1")
+        .bind(id)
+        .bind(created)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -2608,7 +2620,7 @@ mod tests {
             .expect("retry");
         assert_eq!((retried.status.as_str(), retried.error.as_deref()), ("cloning", None));
         assert_eq!((retried.url.as_str(), retried.branch.as_deref()), ("ssh://git@github.com/o/r", None));
-        set_repo_cloned(&pool, repo.id, "dev", "abc123").await.expect("cloned");
+        set_repo_cloned(&pool, repo.id, "dev", Some("abc123")).await.expect("cloned");
         let listed = list_conversation_repos(&pool, conversation.id).await.expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].status, "ready");

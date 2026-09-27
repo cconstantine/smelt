@@ -3042,7 +3042,7 @@ mod tests {
         let repo = db::create_conversation_repo(&pool, conversation.id, "git@github.com:o/r.git", "github.com/o/r", None, "r")
             .await
             .expect("repo");
-        db::set_repo_cloned(&pool, repo.id, "main", "abc123").await.expect("cloned");
+        db::set_repo_cloned(&pool, repo.id, "main", Some("abc123")).await.expect("cloned");
         let loaded = db::LoadedInstructions {
             content: "Run make test.\n".to_string(),
             file_bytes: 15,

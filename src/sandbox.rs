@@ -4430,7 +4430,7 @@ mod tests {
             let cloned = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin", false)
                 .await
                 .expect("clone the default branch");
-            assert_eq!(cloned.commit, main_commit);
+            assert_eq!(cloned.commit.as_deref(), Some(main_commit.as_str()));
             assert_eq!(cloned.branch, "main");
             let agents = sandbox
                 .exec(&["cat", "/workspace/origin/AGENTS.md"])
@@ -4458,7 +4458,7 @@ mod tests {
             .await
             .expect("clone a branch");
             assert_eq!(feature.branch, "feature");
-            assert_ne!(feature.commit, main_commit);
+            assert_ne!(feature.commit.as_deref(), Some(main_commit.as_str()));
             let read = crate::git::read_agents_file(&client, &pod_name, "origin-feature")
                 .await
                 .expect("read AGENTS.md")
@@ -4512,7 +4512,7 @@ mod tests {
             let replaced = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "partial", true)
                 .await
                 .expect("a retry replaces the leftover directory");
-            assert_eq!(replaced.commit, main_commit);
+            assert_eq!(replaced.commit.as_deref(), Some(main_commit.as_str()));
             let gone = sandbox
                 .exec(&["test", "-e", "/workspace/partial/half-written"])
                 .await
@@ -5174,11 +5174,50 @@ mod tests {
                 .into_iter()
                 .find(|r| r.dir == "mywork")
                 .expect("the mywork repo");
+            // Even marked interrupted: that directory held work before any
+            // clone, so a retry leaves it (SME-32 code review 3).
             db::set_repo_failed(&pool, mywork.id, crate::git::CLONE_INTERRUPTED).await.expect("mark interrupted");
-            let replaced = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, Some("mywork"))
+            let refused = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, Some("mywork"))
                 .await
-                .expect("an interrupted clone's retry replaces its directory");
+                .expect_err("the directory still holds work");
+            assert!(refused.contains("already exists"), "{refused}");
+            let kept = exec_with(&client, &pod_name(pod_a), "sandbox", &["cat", "/workspace/mywork/notes.txt"], None)
+                .await
+                .expect("exec cat");
+            assert_eq!(kept.stdout, "precious\n");
+
+            // A directory a clone attempt made, cut off halfway, is cleared
+            // by the retry.
+            let half = db::create_conversation_repo(&pool, conversation_a.id, "file:///tmp/origin.git", "file/tmp/origin", None, "half")
+                .await
+                .expect("seed a repo");
+            db::set_repo_dir_created(&pool, half.id, true).await.expect("seed dir_created");
+            db::set_repo_failed(&pool, half.id, crate::git::CLONE_INTERRUPTED).await.expect("seed interrupted");
+            let partial = exec_with(
+                &client,
+                &pod_name(pod_a),
+                "sandbox",
+                &["sh", "-c", "mkdir -p /workspace/half/.git && echo x > /workspace/half/partial"],
+                None,
+            )
+            .await
+            .expect("exec partial");
+            assert_eq!(partial.exit_code, 0);
+            let replaced = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, Some("half"))
+                .await
+                .expect("a retry replaces what its own attempt left");
             assert_eq!(replaced.status, crate::git::RepoStatus::Ready);
+
+            // A brand-new empty repo clones: its branch, no commit yet.
+            let empty = exec_with(&client, &pod_name(pod_a), "sandbox", &["git", "init", "-q", "--bare", "-b", "main", "/tmp/empty.git"], None)
+                .await
+                .expect("exec init empty");
+            assert_eq!(empty.exit_code, 0, "{}", empty.stderr);
+            let cloned_empty = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/empty.git", None, None)
+                .await
+                .expect("an empty repo clones");
+            assert_eq!(cloned_empty.status, crate::git::RepoStatus::Ready);
+            assert_eq!((cloned_empty.branch.as_deref(), cloned_empty.commit.as_deref()), (Some("main"), None));
 
             // Asking again returns the same checkout rather than a second clone.
             let again = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, None)
@@ -5650,7 +5689,7 @@ mod tests {
                 kept.stderr
             );
             let repos = crate::git::list_repos(&pool, conversation_a.id).await.expect("list repos");
-            assert_eq!(repos.len(), 3, "origin, its retry and mywork: {repos:?}");
+            assert_eq!(repos.len(), 5, "origin, retry, mywork, half, empty: {repos:?}");
             assert_eq!(repos[0].status, crate::git::RepoStatus::Ready, "{repos:?}");
             assert_eq!(repos[0].instructions, crate::git::InstructionsState::Changed, "still to reload: {repos:?}");
             assert_eq!(repos[1].status, crate::git::RepoStatus::Ready, "{repos:?}");

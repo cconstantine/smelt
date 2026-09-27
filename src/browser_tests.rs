@@ -1643,7 +1643,7 @@ async fn test_end_to_end_browser_scenarios() {
         let repo = db::create_conversation_repo(pool, trusting.id, &format!("https://{remote}.git"), &remote, None, "trust-me")
             .await
             .expect("seed a repo");
-        db::set_repo_cloned(pool, repo.id, "main", "abc1234def").await.expect("seed the clone");
+        db::set_repo_cloned(pool, repo.id, "main", Some("abc1234def")).await.expect("seed the clone");
         crate::git::record_clone_instructions(
             pool,
             repo.id,
