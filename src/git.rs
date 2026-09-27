@@ -203,6 +203,42 @@ mod server {
         command
     }
 
+    /// What to say about a clone that exited with `exit_code` and printed
+    /// `output`, into `path`.
+    pub fn clone_failure(exit_code: i32, output: &str, url: &str, path: &str) -> String {
+        let output = output.trim();
+        // `timeout`'s own exit code for stopping git. 137 (SIGKILL) isn't
+        // proof of it: the pod's memory limit kills with SIGKILL too.
+        if exit_code == 124 {
+            return format!("{CLONE_TIMED_OUT} ({} minutes) cloning {url}.", CLONE_TIMEOUT.as_secs() / 60);
+        }
+        if exit_code == 137 {
+            return format!(
+                "git clone {url} was killed (exit code 137): most likely it ran out of memory, \
+                 or it hit the {}-minute limit. {output}",
+                CLONE_TIMEOUT.as_secs() / 60
+            )
+            .trim()
+            .to_string();
+        }
+        // Git refuses a directory that already exists and isn't empty, and
+        // removes one it made itself when it fails. Only a clone that was
+        // cut off (Stop, the timeout, a restart) leaves one behind, which
+        // the error says how to deal with.
+        if output.contains("already exists") {
+            return format!(
+                "{output} If it's what's left of an earlier clone that was cut off, delete it \
+                 (rm -rf {path}) and clone again, but after a clone that was just stopped, wait \
+                 a moment first: it may still be running. Otherwise clone into another directory."
+            );
+        }
+        if output.is_empty() {
+            format!("git clone {url} failed (exit code {exit_code})")
+        } else {
+            output.to_string()
+        }
+    }
+
     /// What a finished clone checked out.
     #[derive(Clone, Debug, PartialEq)]
     pub struct ClonedRepo {
@@ -236,30 +272,8 @@ mod server {
         .await
         .map_err(|_| timed_out())?
         .map_err(|e| e.to_string())?;
-        // `timeout`'s own exit codes: 124 when it stopped git, 137 when it
-        // had to kill it.
-        if matches!(clone.exit_code, 124 | 137) {
-            return Err(timed_out());
-        }
-        // Git refuses a directory that already exists and isn't empty, and
-        // removes one it made itself when it fails. Only a clone that was
-        // cut off (Stop, the timeout, a restart) leaves one behind, which
-        // the error says how to deal with.
         if clone.exit_code != 0 {
-            let output = format!("{}{}", clone.stdout, clone.stderr);
-            let output = output.trim();
-            if output.contains("already exists") {
-                return Err(format!(
-                    "{output} If it's what's left of an earlier clone that was cut off, delete it \
-                     (rm -rf {path}) and clone again, but after a clone that was just stopped, wait \
-                     a moment first: it may still be running. Otherwise clone into another directory."
-                ));
-            }
-            return Err(if output.is_empty() {
-                format!("git clone {url} failed (exit code {})", clone.exit_code)
-            } else {
-                output.to_string()
-            });
+            return Err(clone_failure(clone.exit_code, &format!("{}{}", clone.stdout, clone.stderr), url, &path));
         }
         // The branch from HEAD itself, and the commit only if there is
         // one: a brand-new empty repo has a branch but no commit yet.
@@ -1808,6 +1822,23 @@ mod server {
             ] {
                 assert!(resolve_instructions_path(&repos, bad).is_err(), "{bad}");
             }
+        }
+
+        #[test]
+        fn test_a_failed_clone_says_what_happened() {
+            let url = "git@github.com:o/r.git";
+            let path = "/workspace/r";
+            // Only 124 is the pod's `timeout` stopping git.
+            assert!(clone_failure(124, "", url, path).starts_with(CLONE_TIMED_OUT));
+            // 137 is SIGKILL, from `timeout` or not: often the memory limit.
+            let killed = clone_failure(137, "", url, path);
+            assert!(!killed.starts_with(CLONE_TIMED_OUT), "{killed}");
+            assert!(killed.contains("killed") && killed.contains("memory"), "{killed}");
+            // Git's own words otherwise, with a hint for an existing directory.
+            assert_eq!(clone_failure(128, "fatal: Remote branch nope not found\n", url, path), "fatal: Remote branch nope not found");
+            let exists = clone_failure(128, "fatal: destination path '/workspace/r' already exists and is not an empty directory.", url, path);
+            assert!(exists.contains("rm -rf /workspace/r"), "{exists}");
+            assert_eq!(clone_failure(2, "", url, path), "git clone git@github.com:o/r.git failed (exit code 2)");
         }
 
         #[test]
