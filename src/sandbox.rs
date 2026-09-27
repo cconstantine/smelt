@@ -403,14 +403,14 @@ pub async fn install_git_files(
         client,
         pod_name,
         "sandbox",
-        &["sh", "-c", r#"mkdir -p -m 700 "$1" 2>&1"#, "sh", &keys_dir],
+        &["sh", "-c", r#"mkdir -p -m 700 "$1""#, "sh", &keys_dir],
         None,
     )
     .await?;
     if made.exit_code != 0 {
         return Err(SandboxError::GitSetup(format!(
             "couldn't make {keys_dir}: {}",
-            made.stdout.trim()
+            made.stderr.trim()
         )));
     }
     for file in files {
@@ -425,7 +425,7 @@ pub async fn install_git_files(
             &[
                 "sh",
                 "-c",
-                r#"umask 077 && cat > "$1.new" && chmod "$2" "$1.new" && mv "$1.new" "$1" 2>&1"#,
+                r#"umask 077 && cat > "$1.new" && chmod "$2" "$1.new" && mv "$1.new" "$1""#,
                 "sh",
                 &file.path,
                 &mode,
@@ -437,7 +437,7 @@ pub async fn install_git_files(
             return Err(SandboxError::GitSetup(format!(
                 "couldn't write {}: {}",
                 file.path,
-                written.stdout.trim()
+                written.stderr.trim()
             )));
         }
     }
@@ -452,7 +452,7 @@ pub async fn install_git_files(
                [ -e "$f" ] || continue
                keep=; for k in "$@"; do [ "$f" = "$k" ] && keep=1; done
                [ -n "$keep" ] || rm -f -- "$f"
-           done 2>&1"#,
+           done"#,
         "sh",
         &keys_dir,
     ];
@@ -461,7 +461,7 @@ pub async fn install_git_files(
     if pruned.exit_code != 0 {
         return Err(SandboxError::GitSetup(format!(
             "couldn't remove deleted keys from {keys_dir}: {}",
-            pruned.stdout.trim()
+            pruned.stderr.trim()
         )));
     }
     Ok(())
@@ -4369,6 +4369,14 @@ mod tests {
             let (watched, ()) = tokio::join!(watch, reinstall);
             let watched = watched.expect("exec watch");
             assert!(!watched.stdout.contains("missing"), "the key vanished during a reinstall");
+
+            // A write that fails says why (SME-32 code review 7, finding 5).
+            let locked = sandbox.exec(&["chmod", "500", "/etc/smelt/keys"]).await.expect("exec chmod");
+            assert_eq!(locked.exit_code, 0);
+            let failed = install_git_files(&client, &pod_name, &files).await.expect_err("keys dir not writable");
+            assert!(failed.to_string().contains("Permission denied"), "{failed}");
+            let unlocked = sandbox.exec(&["chmod", "700", "/etc/smelt/keys"]).await.expect("exec chmod");
+            assert_eq!(unlocked.exit_code, 0);
 
             // The key is deleted: a reinstall without it removes the file.
             let files = crate::git::pod_git_files(&[], &identity);
