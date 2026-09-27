@@ -1944,6 +1944,49 @@ mod server {
             close_session(unrouted).await.expect("close the unrouted session");
             let error = refused.expect_err("a session without a sandbox route must refuse localhost");
             assert!(error.contains("private or local"), "the refusal should say why: {error}");
+
+            // --- SME-42 review: a page from another site, open in a routed
+            // session, can't reach the sandbox — not by fetch, an image or a
+            // WebSocket. 127.0.0.2 is loopback but not a sandbox address. ---
+            let outside = tokio::net::TcpListener::bind("127.0.0.2:0").await.expect("bind 127.0.0.2");
+            let outside_url = format!("http://{}/", outside.local_addr().expect("local addr"));
+            let outside_page: &'static str = "<html><body><div id=\"out\">pending</div>\
+                 <img src=\"http://localhost:4500/from-outside-img\">\
+                 <script>\
+                 fetch('http://localhost:4500/from-outside-fetch', {mode: 'no-cors', method: 'POST', body: 'x'});\
+                 try { new WebSocket('ws://localhost:4500/from-outside-ws'); } catch (e) {}\
+                 setTimeout(() => { document.getElementById('out').innerText = 'tried'; }, 1500);\
+                 </script></body></html>";
+            let _outside_server = tokio::spawn(async move {
+                let router = axum::Router::new()
+                    .route("/", axum::routing::get(move || async move { axum::response::Html(outside_page) }));
+                axum::serve(outside, router).await.expect("outside server");
+            });
+            let reached = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let guarded: i64 = 900_103;
+            open_session_routed(
+                guarded,
+                allow_loopback_too,
+                Some(crate::egress_proxy::dial_to(sandbox_addr, reached.clone())),
+            )
+            .await
+            .expect("open a routed session");
+            let loaded = navigate(guarded, &outside_url).await;
+            let mut text = loaded.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while loaded.is_ok() && text.contains("pending") && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                text = read(guarded).await.map(|s| s.text).unwrap_or_default();
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            close_session(guarded).await.expect("close the routed session");
+            loaded.expect("the outside page should load");
+            assert!(text.contains("tried"), "the outside page's script never ran: {text:?}");
+            assert!(
+                reached.lock().unwrap().is_empty(),
+                "a page from another site reached the sandbox: {:?}",
+                reached.lock().unwrap()
+            );
         }
 
         /// Shows whatever cookie and localStorage value the page can see.

@@ -123,7 +123,7 @@ Previews are served on a listener of their own (`SMELT_PREVIEW_ADDR`), not on sm
 
 - **Dev:** compose publishes port 8181. After pulling this change, recreate the `smelt` container from the host (`docker compose up -d smelt`) so the port is published; this restarts the container. Browsers resolve `*.localhost` to this machine with no DNS set up.
 - **Production:** point the preview hostnames at `SMELT_PREVIEW_ADDR`'s port in the front end, with the same TLS and access rules as smelt itself. The flat `{port}-{conversation}-smelt.constantlee.us` form fits under an existing `*.constantlee.us` wildcard certificate.
-- **Access:** smelt has no login, so a preview is exactly as protected as smelt is. A later login can cover previews too; SME-42 records how.
+- **Access:** smelt has no login, so a preview is exactly as protected as smelt is. Other websites open in the same browser can't send requests to a preview (or, in the model's browser, to the sandbox): only the conversation's own previews and opening the link directly get through. A later login can cover previews too; SME-42 records how.
 
 ## Pod metrics
 

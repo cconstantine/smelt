@@ -232,6 +232,27 @@ mod server {
         let Some((conversation, port)) = template.match_host(host) else {
             return text_response(StatusCode::NOT_FOUND, "This isn't a sandbox preview address.");
         };
+        // Only this conversation's own previews, and someone opening the link
+        // directly: any other site open in the same browser mustn't be able
+        // to send requests to its sandbox (SME-42's code review).
+        let header = |name: &str| request.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+        let source = crate::fetch_guard::RequestSource {
+            method: request.method().to_string(),
+            origin: header("origin"),
+            sec_fetch_site: header("sec-fetch-site"),
+            sec_fetch_mode: header("sec-fetch-mode"),
+        };
+        let is_home = |host: &str, port: Option<u16>| {
+            let authority = port.map_or_else(|| host.to_string(), |port| format!("{host}:{port}"));
+            template.match_host(&authority).is_some_and(|(origin_conversation, _)| origin_conversation == conversation)
+        };
+        if !crate::fetch_guard::allows_request_from(&source, is_home) {
+            return text_response(
+                StatusCode::FORBIDDEN,
+                "Refused: a page from another site tried to reach this preview. Open the preview's \
+                 link from smelt instead.",
+            );
+        }
         // The dev server sees itself addressed as it would locally, so a
         // host check (Vite's, for one) accepts the request.
         request.headers_mut().insert(
@@ -507,6 +528,50 @@ mod server {
                 .unwrap();
             assert_eq!(response.status(), 404);
             assert!(dials.lock().unwrap().is_empty());
+        }
+
+        /// Another site open in the user's browser mustn't reach a preview;
+        /// a link from smelt, and the same conversation's other previews, can.
+        #[tokio::test]
+        async fn test_a_preview_only_answers_its_own_pages_and_direct_visits() {
+            let upstream = start_upstream().await;
+            let dials = Dials::default();
+            let (preview, template) = start_preview(dial_for_upstream(upstream, dials.clone())).await;
+            let client = client_for(preview, &["3000-42.preview.localhost"]);
+            let url = format!("{}/", template.url_for(42, 3000));
+            let other_port = template.url_for(42, 5173);
+            let other_conversation = template.url_for(7, 3000);
+            let refused: [&[(&str, &str)]; 3] = [
+                &[("origin", "https://evil.example"), ("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "cors")],
+                &[("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "no-cors")],
+                &[("origin", &other_conversation), ("sec-fetch-site", "same-site"), ("sec-fetch-mode", "cors")],
+            ];
+            for headers in refused {
+                let mut request = client.post(&url);
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
+                let response = request.send().await.unwrap();
+                assert_eq!(response.status(), 403, "{headers:?}");
+                let body = response.text().await.unwrap();
+                assert!(body.contains("another site"), "the refusal should say why: {body:?}");
+            }
+            assert!(dials.lock().unwrap().is_empty(), "a refused request must not reach the sandbox");
+
+            let allowed: [&[(&str, &str)]; 2] = [
+                // Opening the link from smelt's sandbox panel.
+                &[("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "navigate")],
+                // The conversation's frontend calling its API on another port.
+                &[("origin", &other_port), ("sec-fetch-site", "same-site"), ("sec-fetch-mode", "cors")],
+            ];
+            for headers in allowed {
+                let mut request = client.get(&url);
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
+                let response = request.send().await.unwrap();
+                assert_eq!(response.status(), 200, "{headers:?}");
+            }
         }
 
         #[tokio::test]

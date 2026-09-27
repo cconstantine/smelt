@@ -105,6 +105,45 @@ pub fn is_sandbox_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
+/// What a request says about the page that sent it — the headers a browser
+/// sets itself, which a page can't forge (SME-42).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RequestSource {
+    pub method: String,
+    pub origin: Option<String>,
+    pub sec_fetch_site: Option<String>,
+    pub sec_fetch_mode: Option<String>,
+}
+
+/// Whether a request to a sandbox server came from somewhere allowed to
+/// send it: that server's own pages ("home", as `is_home` judges an
+/// origin's host and port), the model or user asking directly, or a plain
+/// top-level page load. Without this, any other site open in the same
+/// browser could send requests to the sandbox's servers.
+///
+/// Browsers send `Origin` on every cross-origin request that could change
+/// something and on every WebSocket handshake (which carries no
+/// `Sec-Fetch-*`), so a present `Origin` must be home. Otherwise
+/// `Sec-Fetch-Site` decides: only a cross-site GET/HEAD page load (a link
+/// someone followed) gets through. A request with neither header isn't
+/// from a browser page at all.
+pub fn allows_request_from(source: &RequestSource, is_home: impl Fn(&str, Option<u16>) -> bool) -> bool {
+    if let Some(origin) = &source.origin {
+        // "null" (an opaque origin) and anything unparseable aren't home.
+        return url::Url::parse(origin)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| is_home(host, url.port())))
+            .unwrap_or(false);
+    }
+    match source.sec_fetch_site.as_deref() {
+        Some("cross-site") => {
+            source.sec_fetch_mode.as_deref() == Some("navigate")
+                && matches!(source.method.to_ascii_uppercase().as_str(), "GET" | "HEAD")
+        }
+        _ => true,
+    }
+}
+
 /// Parses `url` and, if it's a well-formed `http`/`https` URL, returns its
 /// `(host, port)` — pure and synchronous; only the DNS resolution that
 /// follows (`is_request_allowed`) needs to be async. Rejects every other
@@ -365,5 +404,49 @@ mod tests {
     #[tokio::test]
     async fn test_check_load_allows_a_public_address() {
         assert_eq!(check_load("http://1.1.1.1/", is_safe_fetch_addr, false).await, Ok(()));
+    }
+
+    fn source(method: &str, origin: Option<&str>, site: Option<&str>, mode: Option<&str>) -> RequestSource {
+        RequestSource {
+            method: method.to_string(),
+            origin: origin.map(str::to_string),
+            sec_fetch_site: site.map(str::to_string),
+            sec_fetch_mode: mode.map(str::to_string),
+        }
+    }
+
+    fn sandbox_home(host: &str, _port: Option<u16>) -> bool {
+        is_sandbox_host(host)
+    }
+
+    /// The header combinations Chrome really sent through the sandbox
+    /// route (SME-42's review spike).
+    #[test]
+    fn test_requests_from_the_sandbox_or_the_model_are_allowed() {
+        for (what, s) in [
+            ("the model's navigation", source("GET", None, Some("none"), Some("navigate"))),
+            ("the page's own POST", source("POST", Some("http://localhost:4400"), Some("same-origin"), Some("cors"))),
+            ("another sandbox port", source("GET", Some("http://localhost:4400"), Some("same-site"), Some("cors"))),
+            ("the page's WebSocket", source("GET", Some("http://localhost:4400"), None, None)),
+            ("a page on 127.0.0.1", source("GET", Some("http://127.0.0.1:5173"), Some("cross-site"), Some("cors"))),
+            ("a link from another site", source("GET", None, Some("cross-site"), Some("navigate"))),
+            ("not a browser", source("POST", None, None, None)),
+        ] {
+            assert!(allows_request_from(&s, sandbox_home), "{what} should be allowed");
+        }
+    }
+
+    #[test]
+    fn test_requests_from_other_sites_are_refused() {
+        for (what, s) in [
+            ("another site's image", source("GET", None, Some("cross-site"), Some("no-cors"))),
+            ("another site's POST", source("POST", Some("http://127.0.0.2:7000"), Some("cross-site"), Some("no-cors"))),
+            ("another site's WebSocket", source("GET", Some("http://127.0.0.2:7000"), None, None)),
+            ("another site's form POST", source("POST", Some("https://evil.example"), Some("cross-site"), Some("navigate"))),
+            ("a cross-site POST page load", source("POST", None, Some("cross-site"), Some("navigate"))),
+            ("an opaque origin", source("POST", Some("null"), Some("cross-site"), Some("cors"))),
+        ] {
+            assert!(!allows_request_from(&s, sandbox_home), "{what} should be refused");
+        }
     }
 }

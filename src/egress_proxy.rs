@@ -210,6 +210,54 @@ async fn handle_sandbox(
     rest: Vec<u8>,
     dial: SandboxDial,
 ) -> Result<(), String> {
+    let io = |e: std::io::Error| e.to_string();
+    // What goes to the pod first, and who's asking. A CONNECT tunnel's real
+    // request (a WebSocket's handshake) is inside it: answer the CONNECT,
+    // then read that request's head for its Origin.
+    let (source, first_bytes) = match &request.forward_head {
+        Some(head) => {
+            let mut first = head.clone();
+            first.extend_from_slice(&rest);
+            (request.source.clone(), first)
+        }
+        None => {
+            client
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .map_err(io)?;
+            let mut peeked = rest;
+            if peeked.is_empty() {
+                let mut chunk = [0u8; 4096];
+                let n = tokio::time::timeout(HANDSHAKE_TIMEOUT, client.read(&mut chunk))
+                    .await
+                    .map_err(|_| "timed out waiting for the tunnel's request".to_string())?
+                    .map_err(io)?;
+                peeked.extend_from_slice(&chunk[..n]);
+            }
+            // TLS hides who's asking, so it isn't let through. It wouldn't
+            // load anyway: a dev server's own certificate isn't trusted.
+            if peeked.first() == Some(&0x16) {
+                return Err("refused a TLS tunnel to the sandbox: its requests can't be checked".to_string());
+            }
+            let (head, after) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_head_from(&mut client, peeked))
+                .await
+                .map_err(|_| "timed out reading the tunnel's request".to_string())??;
+            let source = request_source(&String::from_utf8_lossy(&head));
+            let mut first = head;
+            first.extend_from_slice(&after);
+            (source, first)
+        }
+    };
+    if !fetch_guard::allows_request_from(&source, |host, _| fetch_guard::is_sandbox_host(host)) {
+        let from = source.origin.as_deref().map(|o| format!(" ({o})")).unwrap_or_default();
+        let message = format!(
+            "Refused: a page from another site{from} tried to reach port {} in this conversation's \
+             sandbox. Only the sandbox's own pages, and pages opened directly, can reach it.",
+            request.port
+        );
+        respond_with_body(&mut client, "403 Forbidden", &message).await;
+        return Err(message);
+    }
     // `sandbox_dial` bounds opening the port-forward (`with_timeout`).
     let upstream = match dial(request.port).await {
         Ok(upstream) => upstream,
@@ -218,17 +266,9 @@ async fn handle_sandbox(
             return Err(message);
         }
     };
-    let io = |e: std::io::Error| e.to_string();
     let (mut from_page, mut to_page) = client.into_split();
     let (mut from_pod, mut to_pod) = tokio::io::split(upstream);
-    match &request.forward_head {
-        None => to_page
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await
-            .map_err(io)?,
-        Some(forward_head) => to_pod.write_all(forward_head).await.map_err(io)?,
-    }
-    to_pod.write_all(&rest).await.map_err(io)?;
+    to_pod.write_all(&first_bytes).await.map_err(io)?;
     // Everything else the page sends goes on to the pod from here — a
     // request body can follow its head in writes of its own (Chrome does
     // this for a larger POST), and the pod won't answer until it has it.
@@ -260,7 +300,11 @@ async fn handle_sandbox(
 /// Reads up to and including the blank line ending the request head;
 /// returns the head and whatever bytes arrived after it.
 async fn read_head(client: &mut TcpStream) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let mut buf = Vec::with_capacity(4096);
+    read_head_from(client, Vec::with_capacity(4096)).await
+}
+
+/// `read_head`, starting from bytes already read.
+async fn read_head_from(client: &mut TcpStream, mut buf: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>), String> {
     let mut chunk = [0u8; 4096];
     loop {
         if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -306,6 +350,31 @@ struct ProxyRequest {
     /// The request head to send upstream, rewritten to origin-form; `None`
     /// for `CONNECT`, which tunnels raw bytes instead.
     forward_head: Option<Vec<u8>>,
+    /// Who sent it, for the sandbox route (`fetch_guard::allows_request_from`).
+    /// A `CONNECT`'s real request is inside its tunnel, so this is read there.
+    source: fetch_guard::RequestSource,
+}
+
+/// The method and the browser-set headers of a request head that say which
+/// page sent it.
+fn request_source(head: &str) -> fetch_guard::RequestSource {
+    let mut lines = head.split("\r\n");
+    let method = lines.next().unwrap_or_default().split(' ').next().unwrap_or_default();
+    let mut source = fetch_guard::RequestSource {
+        method: method.to_string(),
+        ..Default::default()
+    };
+    for line in lines.take_while(|line| !line.is_empty()) {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        let value = Some(value.trim().to_string());
+        match name.trim().to_ascii_lowercase().as_str() {
+            "origin" => source.origin = value,
+            "sec-fetch-site" => source.sec_fetch_site = value,
+            "sec-fetch-mode" => source.sec_fetch_mode = value,
+            _ => {}
+        }
+    }
+    source
 }
 
 /// Headers that are about the hop to this proxy, not the request itself.
@@ -328,6 +397,7 @@ fn parse_request_head(head: &[u8]) -> Result<ProxyRequest, String> {
             host,
             port,
             forward_head: None,
+            source: request_source(head),
         });
     }
 
@@ -362,6 +432,7 @@ fn parse_request_head(head: &[u8]) -> Result<ProxyRequest, String> {
         host,
         port,
         forward_head: Some(forward.into_bytes()),
+        source: request_source(head),
     })
 }
 
@@ -412,7 +483,11 @@ mod tests {
             ProxyRequest {
                 host: "example.com".to_string(),
                 port: 443,
-                forward_head: None
+                forward_head: None,
+                source: fetch_guard::RequestSource {
+                    method: "CONNECT".to_string(),
+                    ..Default::default()
+                },
             }
         );
     }
@@ -552,6 +627,99 @@ mod tests {
             assert_eq!(response.text().await.unwrap(), "upstream says hi", "{host}");
         }
         assert_eq!(*dialed.lock().unwrap(), vec![3000, 3000, 3000]);
+    }
+
+    /// Sends `head` through the proxy as a plain HTTP request and returns the
+    /// whole reply.
+    async fn send_raw(proxy: SocketAddr, head: &str) -> String {
+        let mut stream = TcpStream::connect(proxy).await.unwrap();
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut reply))
+            .await
+            .expect("a reply in time")
+            .unwrap();
+        reply
+    }
+
+    #[tokio::test]
+    async fn test_a_sandbox_route_refuses_requests_other_sites_send() {
+        let upstream = start_upstream().await;
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
+            .await
+            .unwrap();
+        for head in [
+            // Another site's <img>: no Origin, cross-site.
+            "GET http://localhost:3000/ HTTP/1.1\r\nHost: localhost:3000\r\n\
+             Sec-Fetch-Site: cross-site\r\nSec-Fetch-Mode: no-cors\r\n\r\n",
+            // Another site's fetch() POST.
+            "POST http://localhost:3000/ HTTP/1.1\r\nHost: localhost:3000\r\nOrigin: https://evil.example\r\n\
+             Sec-Fetch-Site: cross-site\r\nSec-Fetch-Mode: no-cors\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let reply = send_raw(proxy.addr, head).await;
+            assert!(reply.starts_with("HTTP/1.1 403"), "got {reply:?}");
+            assert!(reply.contains("another site"), "the refusal should say why: {reply:?}");
+        }
+        assert!(dialed.lock().unwrap().is_empty(), "a refused request must not reach the sandbox");
+
+        // The sandbox's own page, and the model's own navigation, still get through.
+        for head in [
+            "GET http://localhost:3000/ HTTP/1.1\r\nHost: localhost:3000\r\nOrigin: http://localhost:5173\r\n\
+             Sec-Fetch-Site: same-site\r\nSec-Fetch-Mode: cors\r\n\r\n",
+            "GET http://localhost:3000/ HTTP/1.1\r\nHost: localhost:3000\r\nSec-Fetch-Site: none\r\n\
+             Sec-Fetch-Mode: navigate\r\n\r\n",
+        ] {
+            let reply = send_raw(proxy.addr, head).await;
+            assert!(reply.starts_with("HTTP/1.1 200") && reply.ends_with("upstream says hi"), "got {reply:?}");
+        }
+    }
+
+    /// A WebSocket's handshake carries no Sec-Fetch-* headers, only
+    /// Origin, and it travels inside a CONNECT tunnel.
+    #[tokio::test]
+    async fn test_a_sandbox_route_checks_who_opened_a_tunnel() {
+        let upstream = start_upstream().await;
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
+            .await
+            .unwrap();
+        let target: SocketAddr = "127.0.0.1:5173".parse().unwrap();
+
+        let (mut tunnel, reply) = connect_through(proxy.addr, target).await;
+        assert!(reply.starts_with("HTTP/1.1 200"), "got {reply:?}");
+        tunnel
+            .write_all(b"GET /ws HTTP/1.1\r\nHost: localhost:5173\r\nOrigin: https://evil.example\r\n\
+                         Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            .await
+            .unwrap();
+        let mut refused = String::new();
+        tokio::time::timeout(Duration::from_secs(5), tunnel.read_to_string(&mut refused))
+            .await
+            .expect("a refusal in time")
+            .unwrap();
+        assert!(refused.starts_with("HTTP/1.1 403"), "got {refused:?}");
+        assert!(dialed.lock().unwrap().is_empty(), "another site's tunnel must not reach the sandbox");
+
+        // TLS can't be checked, so it isn't let through either.
+        let (mut tls, _) = connect_through(proxy.addr, target).await;
+        tls.write_all(&[0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5]).await.unwrap();
+        let mut rest = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut rest))
+            .await
+            .expect("the tunnel should be closed");
+        assert!(dialed.lock().unwrap().is_empty(), "a TLS tunnel must not reach the sandbox");
+
+        // The sandbox's own page opening one still gets through.
+        let (mut own, _) = connect_through(proxy.addr, target).await;
+        own.write_all(b"GET / HTTP/1.1\r\nHost: localhost:5173\r\nOrigin: http://localhost:5173\r\n\
+                        Connection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        own.read_to_string(&mut response).await.unwrap();
+        assert!(response.ends_with("upstream says hi"), "got {response:?}");
+        assert_eq!(*dialed.lock().unwrap(), vec![5173]);
     }
 
     /// Chrome sends a larger POST's body after its head, in a write of its
