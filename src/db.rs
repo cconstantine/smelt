@@ -2550,34 +2550,16 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_ssh_keys_round_trip_and_list_by_name(pool: PgPool) {
+    async fn test_ssh_key_round_trips_and_deletes(pool: PgPool) {
         let work = create_ssh_key(&pool, "work", "ssh-ed25519 AAAA work", "PRIVATE-W")
             .await
             .expect("create key");
-        create_ssh_key(&pool, "github", "ssh-ed25519 AAAA gh", "PRIVATE-G")
-            .await
-            .expect("create key");
-
         let listed = list_ssh_keys(&pool).await.expect("list keys");
-        let names: Vec<&str> = listed.iter().map(|k| k.name.as_str()).collect();
-        assert_eq!(names, vec!["github", "work"]);
-        assert_eq!(listed[1], work);
-        assert_eq!(listed[1].private_key, "PRIVATE-W");
+        assert_eq!(listed, vec![work.clone()]);
+        assert_eq!(listed[0].private_key, "PRIVATE-W");
 
         delete_ssh_key(&pool, work.id).await.expect("delete key");
-        let names: Vec<String> = list_ssh_keys(&pool)
-            .await
-            .expect("list keys")
-            .into_iter()
-            .map(|k| k.name)
-            .collect();
-        assert_eq!(names, vec!["github"]);
-    }
-
-    #[sqlx::test]
-    async fn test_ssh_key_names_are_unique(pool: PgPool) {
-        create_ssh_key(&pool, "github", "pub", "priv").await.expect("first");
-        assert!(create_ssh_key(&pool, "github", "pub2", "priv2").await.is_err());
+        assert!(list_ssh_keys(&pool).await.expect("list keys").is_empty());
     }
 
     #[sqlx::test]

@@ -182,24 +182,6 @@ mod server {
         Some((host, path.to_string()))
     }
 
-    /// The `core.sshCommand` of each attempt to clone `url`: over SSH, one
-    /// per key, each offering only that key, since GitHub stops at the
-    /// first key it knows, and a deploy key for another repo then gets
-    /// "Repository not found". `None`: a single attempt with git's default
-    /// (https, a local path, or no keys to choose between).
-    pub fn key_attempts(url: &str, key_names: &[String]) -> Vec<Option<String>> {
-        let url = url.trim();
-        // scp-like (`git@host:path`) or `ssh://`: see `parse_remote`.
-        let over_ssh = url.starts_with("ssh://") || (!url.contains("://") && parse_remote(url).is_some());
-        if !over_ssh || key_names.is_empty() {
-            return vec![None];
-        }
-        key_names
-            .iter()
-            .map(|name| Some(format!("ssh -i {POD_GIT_DIR}/keys/{name} -o IdentitiesOnly=yes")))
-            .collect()
-    }
-
     /// What a finished clone checked out.
     #[derive(Clone, Debug, PartialEq)]
     pub struct ClonedRepo {
@@ -216,7 +198,6 @@ mod server {
         branch: Option<&str>,
         dir: &str,
         replace_leftover: bool,
-        ssh_command: Option<&str>,
     ) -> Result<ClonedRepo, String> {
         if parse_remote(url).is_none() {
             return Err(format!("{url} isn't a git URL smelt can clone."));
@@ -235,13 +216,12 @@ mod server {
         }
         // No prompts: nothing can answer one, and a clone waiting on a
         // password or a host key would hang until the timeout.
-        let ssh_setting = format!("core.sshCommand={} -o BatchMode=yes", ssh_command.unwrap_or("ssh"));
         let mut command = vec![
             "env",
             "GIT_TERMINAL_PROMPT=0",
             "git",
             "-c",
-            &ssh_setting,
+            "core.sshCommand=ssh -o BatchMode=yes",
             "clone",
             "--quiet",
         ];
@@ -264,22 +244,6 @@ mod server {
             } else {
                 output.to_string()
             });
-        }
-        // The key that could clone is the one for this repo from now on,
-        // pushes included.
-        if let Some(ssh_command) = ssh_command {
-            let pinned = crate::sandbox::exec_with(
-                client,
-                pod_name,
-                "sandbox",
-                &["git", "-C", &path, "config", "core.sshCommand", ssh_command],
-                None,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            if pinned.exit_code != 0 {
-                return Err(format!("cloned, but couldn't pin its SSH key: {}", pinned.stderr.trim()));
-            }
         }
         let head = crate::sandbox::exec_with(
             client,
@@ -944,38 +908,15 @@ mod server {
     ) -> Result<(), String> {
         let client = sandbox::kube_client();
         let pod_name = sandbox::kubernetes_pod_name(pod_id);
-        let key_names: Vec<String> = db::list_ssh_keys(pool)
-            .await
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|k| k.name)
-            .collect();
-        let attempts = key_attempts(&repo.url, &key_names);
-        let mut outcome = Err(String::new());
-        for (i, ssh_command) in attempts.iter().enumerate() {
-            outcome = clone_into_pod(
-                &client,
-                &pod_name,
-                &repo.url,
-                repo.branch.as_deref(),
-                &repo.dir,
-                replace_leftover && i == 0,
-                ssh_command.as_deref(),
-            )
-            .await;
-            if outcome.is_ok() {
-                break;
-            }
-        }
-        if attempts.len() > 1 {
-            outcome = outcome.map_err(|e| {
-                format!(
-                    "None of the SSH keys ({}) could clone {}. Add a key with access on smelt's Git page. Git said: {e}",
-                    key_names.join(", "),
-                    repo.url
-                )
-            });
-        }
+        let outcome = clone_into_pod(
+            &client,
+            &pod_name,
+            &repo.url,
+            repo.branch.as_deref(),
+            &repo.dir,
+            replace_leftover,
+        )
+        .await;
         match outcome {
             Ok(cloned) => {
                 record_cloned(pool, repo.id, &cloned, guard).await?;
@@ -1276,6 +1217,7 @@ mod server {
     /// Generates and stores a new key, and installs it into every live pod.
     pub async fn create_key(pool: &PgPool, name: &str) -> Result<SshKeySummary, String> {
         validate_key_name(name)?;
+        refuse_a_second_key(pool).await?;
         store_key(pool, name, generate_key(name)).await
     }
 
@@ -1286,20 +1228,33 @@ mod server {
         private_key: &str,
     ) -> Result<SshKeySummary, String> {
         validate_key_name(name)?;
-        store_key(pool, name, import_key(private_key)?).await
+        let pair = import_key(private_key)?;
+        refuse_a_second_key(pool).await?;
+        store_key(pool, name, pair).await
+    }
+
+    /// The refusal for a second key: one at a time, for now.
+    fn one_key_only(existing: &str) -> String {
+        format!("There's already an SSH key ({existing}). Delete it first to add another.")
     }
 
     async fn store_key(pool: &PgPool, name: &str, pair: KeyPair) -> Result<SshKeySummary, String> {
         let stored = db::create_ssh_key(pool, name, &pair.public_key, &pair.private_key)
             .await
             .map_err(|e| match e.as_database_error() {
-                Some(db_err) if db_err.is_unique_violation() => {
-                    format!("A key named {name} already exists.")
-                }
+                // `ssh_keys_only_one`: another request added one meanwhile.
+                Some(db_err) if db_err.is_unique_violation() => one_key_only("added just now"),
                 _ => e.to_string(),
             })?;
         install_into_live_pods(pool).await;
         Ok(summary(stored))
+    }
+
+    async fn refuse_a_second_key(pool: &PgPool) -> Result<(), String> {
+        match db::list_ssh_keys(pool).await.map_err(|e| e.to_string())?.first() {
+            Some(existing) => Err(one_key_only(&existing.name)),
+            None => Ok(()),
+        }
     }
 
     /// Deletes a key and removes it from every live pod.
@@ -1338,13 +1293,30 @@ mod server {
         }
 
         #[sqlx::test]
-        async fn test_create_key_refuses_a_taken_or_unsafe_name(pool: PgPool) {
-            create_key(&pool, "github").await.expect("first");
-            let taken = create_key(&pool, "github").await.expect_err("taken");
-            assert!(taken.contains("already"), "{taken}");
+        async fn test_create_key_refuses_an_unsafe_name(pool: PgPool) {
             let unsafe_name = create_key(&pool, "../x").await.expect_err("unsafe");
             assert!(unsafe_name.contains("letters"), "{unsafe_name}");
-            assert_eq!(db::list_ssh_keys(&pool).await.expect("list").len(), 1);
+            assert!(db::list_ssh_keys(&pool).await.expect("list").is_empty());
+        }
+
+        /// One key at a time, for now: with several, the host picks the
+        /// first it knows, which breaks per-repo deploy keys (SME-32 code
+        /// review 3).
+        #[sqlx::test]
+        async fn test_only_one_key_at_a_time(pool: PgPool) {
+            let first = create_key(&pool, "github").await.expect("first");
+            let generated = create_key(&pool, "another").await.expect_err("a second key");
+            assert!(generated.contains("Delete it first"), "{generated}");
+            let imported = import_key_named(&pool, "imported", &generate_key("x").private_key)
+                .await
+                .expect_err("a second key, imported");
+            assert!(imported.contains("Delete it first"), "{imported}");
+            // The database refuses one too, whatever the code checks.
+            assert!(db::create_ssh_key(&pool, "sneaky", "pub", "priv").await.is_err());
+            assert_eq!(list_keys(&pool).await.expect("list").len(), 1);
+
+            delete_key(&pool, first.id).await.expect("delete");
+            create_key(&pool, "replacement").await.expect("a key again once there's none");
         }
 
         #[sqlx::test]
@@ -1624,19 +1596,6 @@ mod server {
             a.await.expect("a");
             b.await.expect("b");
             assert_eq!(installed.lock().expect("log").last(), Some(&"new"), "the pod ends with the newest keys");
-        }
-
-        #[test]
-        fn test_an_ssh_clone_tries_each_key_on_its_own() {
-            let keys = vec!["a-repo".to_string(), "b-repo".to_string()];
-            let only = |name: &str| Some(format!("ssh -i /etc/smelt/keys/{name} -o IdentitiesOnly=yes"));
-            for url in ["git@github.com:o/b.git", "ssh://git@github.com/o/b"] {
-                assert_eq!(key_attempts(url, &keys), vec![only("a-repo"), only("b-repo")], "{url}");
-            }
-            // No keys to choose between, or no SSH at all: git's default.
-            assert_eq!(key_attempts("git@github.com:o/b.git", &[]), vec![None]);
-            assert_eq!(key_attempts("https://github.com/o/b", &keys), vec![None]);
-            assert_eq!(key_attempts("file:///tmp/origin.git", &keys), vec![None]);
         }
 
         #[test]

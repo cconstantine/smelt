@@ -194,12 +194,12 @@ pub fn GitSettingsPage() -> Element {
                 }
 
                 section { class: "git-section",
-                    h2 { "SSH keys" }
+                    h2 { "SSH key" }
                     p { class: "muted",
-                        "Add a key's public half to your git host: on GitHub, as a deploy key with write access for one repo, or under your account's SSH keys for all of them."
+                        "One key for now. Add its public half to your git host: on GitHub, under your account's SSH keys, so it reaches all your repos (a deploy key only reaches one repo). To use a different key, delete this one first."
                     }
                     if keys().is_empty() {
-                        p { class: "muted", "No keys yet." }
+                        p { class: "muted", "No key yet." }
                     } else {
                         div { class: "sandbox-volume-list",
                             for key in keys() {
@@ -231,6 +231,7 @@ pub fn GitSettingsPage() -> Element {
                         }
                     }
 
+                    if keys().is_empty() {
                     form { class: "sandbox-volume-add-form git-key-form", onsubmit: add_key,
                         h3 { if importing() { "Import a key" } else { "Add a key" } }
                         label { r#for: "git-key-name", "Name" }
@@ -271,6 +272,7 @@ pub fn GitSettingsPage() -> Element {
                                 if importing() { "Generate a new key instead" } else { "Import an existing key instead" }
                             }
                         }
+                    }
                     }
                 }
             }
