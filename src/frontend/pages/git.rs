@@ -1,10 +1,11 @@
 use dioxus::prelude::*;
 
 use crate::api::git::{
-    delete_ssh_key, generate_ssh_key, get_git_settings, import_ssh_key, save_git_identity,
+    delete_ssh_key, forget_repo_trust, generate_ssh_key, get_git_settings, import_ssh_key,
+    save_git_identity,
 };
 use crate::frontend::Route;
-use crate::git::{GitIdentity, SshKeySummary};
+use crate::git::{GitIdentity, RepoTrustSummary, SshKeySummary};
 
 /// Git settings (SME-32): the commit identity and the SSH keys every
 /// sandbox pod gets. A change reaches running pods straight away.
@@ -14,6 +15,8 @@ pub fn GitSettingsPage() -> Element {
     let mut loaded = use_signal(|| false);
     let mut load_error: Signal<Option<String>> = use_signal(|| None);
     let mut keys: Signal<Vec<SshKeySummary>> = use_signal(Vec::new);
+    let mut trust: Signal<Vec<RepoTrustSummary>> = use_signal(Vec::new);
+    let mut trust_error: Signal<Option<String>> = use_signal(|| None);
     let mut name: Signal<String> = use_signal(String::new);
     let mut email: Signal<String> = use_signal(String::new);
 
@@ -24,6 +27,7 @@ pub fn GitSettingsPage() -> Element {
                     name.set(settings.identity.name);
                     email.set(settings.identity.email);
                     keys.set(settings.keys);
+                    trust.set(settings.trust);
                 }
                 Err(e) => load_error.set(Some(e.to_string())),
             }
@@ -145,6 +149,47 @@ pub fn GitSettingsPage() -> Element {
                             None => rsx! {},
                         }
                         button { r#type: "submit", "Save" }
+                    }
+                }
+
+                section { class: "git-section",
+                    h2 { "Repos you've decided about" }
+                    p { class: "muted",
+                        "A trusted repo's AGENTS.md is loaded into the model's instructions when it's cloned. Forget a decision to be asked again next time the repo is cloned."
+                    }
+                    if let Some(err) = trust_error() {
+                        p { class: "error", "{err}" }
+                    }
+                    if trust().is_empty() {
+                        p { class: "muted", "None yet. You're asked the first time the model clones a repo with an AGENTS.md; repos you open with Work on a repo are trusted." }
+                    } else {
+                        div { class: "sandbox-volume-list",
+                            for decision in trust() {
+                                div { key: "{decision.remote}", class: "sandbox-volume-row",
+                                    div { class: "sandbox-volume-summary",
+                                        span { class: "sandbox-volume-name", "{decision.remote}" }
+                                        span { class: "sandbox-volume-path", if decision.trusted { "Trusted" } else { "Not trusted" } }
+                                    }
+                                    button {
+                                        class: "git-key-copy",
+                                        r#type: "button",
+                                        onclick: {
+                                            let remote = decision.remote.clone();
+                                            move |_| {
+                                                let remote = remote.clone();
+                                                spawn(async move {
+                                                    match forget_repo_trust(remote.clone()).await {
+                                                        Ok(()) => trust.write().retain(|t| t.remote != remote),
+                                                        Err(e) => trust_error.set(Some(e.to_string())),
+                                                    }
+                                                });
+                                            }
+                                        },
+                                        "Forget"
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 

@@ -36,7 +36,7 @@ use crate::api::chat::{
 use crate::api::browsing::{get_browsing_state, subscribe_browser_frames};
 #[cfg(feature = "web")]
 use crate::api::git::list_conversation_repos;
-use crate::api::git::attach_repo;
+use crate::api::git::{attach_repo, decide_repo_trust, reload_repo_instructions};
 use crate::git::{RepoStatus, RepoSummary};
 use crate::browsing::BrowserInputEvent;
 // Only referenced by this module's own tests, which build their own
@@ -697,6 +697,18 @@ fn instructions_source(doc: &crate::git::ProjectInstructions) -> String {
         )
     } else {
         format!("{origin} \u{b7} {} bytes", doc.file_bytes)
+    }
+}
+
+/// What the sandbox panel says about a repo's `AGENTS.md`, if anything.
+fn instructions_label(state: crate::git::InstructionsState) -> Option<&'static str> {
+    use crate::git::InstructionsState as S;
+    match state {
+        S::None => None,
+        S::Loaded => Some("AGENTS.md loaded"),
+        S::Changed => Some("AGENTS.md changed since it was loaded"),
+        S::AwaitingTrust => Some("AGENTS.md waiting for you to trust this repo"),
+        S::NotTrusted => Some("AGENTS.md not loaded: you didn't trust this repo"),
     }
 }
 
@@ -1988,6 +2000,16 @@ mod tests {
     }
 
     #[test]
+    fn test_instructions_label_says_where_agents_md_stands() {
+        use crate::git::InstructionsState as S;
+        assert_eq!(instructions_label(S::None), None);
+        assert_eq!(instructions_label(S::Loaded), Some("AGENTS.md loaded"));
+        assert_eq!(instructions_label(S::Changed), Some("AGENTS.md changed since it was loaded"));
+        assert_eq!(instructions_label(S::AwaitingTrust), Some("AGENTS.md waiting for you to trust this repo"));
+        assert_eq!(instructions_label(S::NotTrusted), Some("AGENTS.md not loaded: you didn't trust this repo"));
+    }
+
+    #[test]
     fn test_repo_detail_says_what_is_checked_out() {
         let mut repo = RepoSummary {
             id: 1,
@@ -1999,6 +2021,7 @@ mod tests {
             status: RepoStatus::Cloning,
             error: None,
             instructions: crate::git::InstructionsState::None,
+            instructions_preview: None,
         };
         assert_eq!(repo_detail(&repo), "Cloning dev\u{2026}");
         repo.requested_branch = None;
@@ -2870,6 +2893,8 @@ fn ChatPanel(
     let mut repo_branch = use_signal(String::new);
     let mut repo_attaching = use_signal(|| false);
     let mut repo_attach_error: Signal<Option<String>> = use_signal(|| None);
+    // The last Trust / Don't trust / Reload failure.
+    let mut repo_action_error: Signal<Option<String>> = use_signal(|| None);
     // The conversation's git repos (SME-32), from `ReposUpdate`.
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut repos: Signal<Vec<RepoSummary>> = use_signal(Vec::new);
@@ -3688,11 +3713,27 @@ fn ChatPanel(
                                                             title: "{repo.url}",
                                                             code { class: "sandbox-repo-path", "{repo.path}" }
                                                             span { class: "sandbox-repo-detail", "{repo_detail(&repo)}" }
-                                                            if repo.instructions == crate::git::InstructionsState::Loaded {
+                                                            if let Some(label) = instructions_label(repo.instructions) {
                                                                 span {
-                                                                    class: "sandbox-repo-instructions",
-                                                                    title: "Its AGENTS.md is in the model's context on every turn. See the context view.",
-                                                                    "AGENTS.md loaded"
+                                                                    class: "sandbox-repo-instructions sandbox-repo-instructions-{repo.instructions:?}",
+                                                                    "{label}"
+                                                                }
+                                                            }
+                                                            if repo.instructions == crate::git::InstructionsState::Changed {
+                                                                button {
+                                                                    class: "sandbox-repo-reload",
+                                                                    r#type: "button",
+                                                                    title: "Load AGENTS.md as the checkout has it now. The model is told.",
+                                                                    onclick: move |_| {
+                                                                        let Some(id) = selected() else { return };
+                                                                        let repo_id = repo.id;
+                                                                        spawn(async move {
+                                                                            if let Err(e) = reload_repo_instructions(id, repo_id).await {
+                                                                                repo_action_error.set(Some(e.to_string()));
+                                                                            }
+                                                                        });
+                                                                    },
+                                                                    "Reload"
                                                                 }
                                                             }
                                                             if let Some(err) = repo.error.clone() {
@@ -3984,6 +4025,57 @@ fn ChatPanel(
                             }
                             if let Some(err) = notification_delivery_error() {
                                 p { class: "error", "A background notification failed to reach the model: {err}" }
+                            }
+                            // A repo's AGENTS.md waits for the user's trust before it
+                            // becomes instructions the model follows (SME-32).
+                            for repo in repos().into_iter().filter(|r| r.instructions == crate::git::InstructionsState::AwaitingTrust) {
+                                div { key: "trust-{repo.id}", class: "trust-card", role: "group", aria_label: "Trust {repo.url}?",
+                                    p { class: "trust-card-question",
+                                        "Trust "
+                                        code { "{repo.url}" }
+                                        "?"
+                                    }
+                                    p { class: "muted",
+                                        "Its AGENTS.md, below, would become instructions the model follows on every turn in any conversation on this repo. Only trust repos whose instructions you're happy for the model to follow. You'll be asked once per repo."
+                                    }
+                                    details { class: "trust-card-preview", open: true,
+                                        summary { "{repo.path}/AGENTS.md" }
+                                        pre { "{repo.instructions_preview.clone().unwrap_or_default()}" }
+                                    }
+                                    div { class: "trust-card-buttons",
+                                        button {
+                                            class: "trust-card-trust",
+                                            r#type: "button",
+                                            onclick: move |_| {
+                                                let Some(id) = selected() else { return };
+                                                let repo_id = repo.id;
+                                                spawn(async move {
+                                                    if let Err(e) = decide_repo_trust(id, repo_id, true).await {
+                                                        repo_action_error.set(Some(e.to_string()));
+                                                    }
+                                                });
+                                            },
+                                            "Trust"
+                                        }
+                                        button {
+                                            class: "trust-card-decline",
+                                            r#type: "button",
+                                            onclick: move |_| {
+                                                let Some(id) = selected() else { return };
+                                                let repo_id = repo.id;
+                                                spawn(async move {
+                                                    if let Err(e) = decide_repo_trust(id, repo_id, false).await {
+                                                        repo_action_error.set(Some(e.to_string()));
+                                                    }
+                                                });
+                                            },
+                                            "Don't trust"
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(err) = repo_action_error() {
+                                p { class: "error", "{err}" }
                             }
                         }
                         if !conversation_missing() {

@@ -5013,7 +5013,13 @@ mod tests {
             assert_eq!(repo.status, crate::git::RepoStatus::Ready);
             assert_eq!(repo.commit.as_deref(), Some(origin.stdout.trim()));
             assert_eq!(repo.branch.as_deref(), Some("main"));
-            // Its AGENTS.md is loaded into the model's context.
+            // Its AGENTS.md waits on the user: the model cloned a remote
+            // they haven't decided about.
+            assert_eq!(repo.instructions, crate::git::InstructionsState::AwaitingTrust);
+            assert_eq!(repo.instructions_preview.as_deref(), Some("Run make test.\n"));
+            assert!(crate::git::project_instructions(&pool, conversation_a.id).await.expect("loaded").is_empty());
+            // Trusted, it's loaded into the model's context.
+            crate::git::decide_trust(&pool, conversation_a.id, repo.id, true).await.expect("trust");
             let loaded = crate::git::project_instructions(&pool, conversation_a.id)
                 .await
                 .expect("project instructions");
@@ -5036,6 +5042,23 @@ mod tests {
             .await
             .expect("exec write");
             assert_eq!(wrote.exit_code, 0, "{}", wrote.stderr);
+
+            // AGENTS.md changes in the checkout: noticed, not reloaded.
+            let edited = exec_with(
+                &client,
+                &pod_name(pod_a),
+                "sandbox",
+                &["sh", "-c", "echo 'Run make lint too.' >> /workspace/origin/AGENTS.md"],
+                None,
+            )
+            .await
+            .expect("exec edit");
+            assert_eq!(edited.exit_code, 0, "{}", edited.stderr);
+            crate::git::refresh_instructions(&pool, conversation_a.id).await;
+            let repos = crate::git::list_repos(&pool, conversation_a.id).await.expect("list repos");
+            assert_eq!(repos[0].instructions, crate::git::InstructionsState::Changed, "{repos:?}");
+            let loaded = crate::git::project_instructions(&pool, conversation_a.id).await.expect("loaded");
+            assert_eq!(loaded[0].content, "Run make test.\n", "still the loaded version");
             let duplicate = create_pod(&pool, conversation_a.id, PodLimitOverrides::default()).await;
             assert!(
                 matches!(duplicate, Err(SandboxError::PodAlreadyExists)),
@@ -5469,13 +5492,14 @@ mod tests {
             .expect("exec check workspace");
             assert_eq!(
                 (kept.exit_code, kept.stdout.as_str()),
-                (0, "not pushed yet\n?? uncommitted.txt\n"),
+                (0, "not pushed yet\n M AGENTS.md\n?? uncommitted.txt\n"),
                 "the checkout and its uncommitted file survive the pod: {}",
                 kept.stderr
             );
             let repos = crate::git::list_repos(&pool, conversation_a.id).await.expect("list repos");
             assert_eq!(repos.len(), 1);
             assert_eq!(repos[0].status, crate::git::RepoStatus::Ready, "{repos:?}");
+            assert_eq!(repos[0].instructions, crate::git::InstructionsState::Changed, "still to reload: {repos:?}");
             terminate_pod(&pool, conversation_a.id).await.expect("terminate the second pod (a)");
 
             let pods_after = list_pods(&pool, conversation_a.id).await.expect("list_pods");
@@ -5486,6 +5510,11 @@ mod tests {
                 .await
                 .expect_err("this origin doesn't exist");
             assert!(attached.contains("does not appear to be a git repository"), "{attached}");
+            // The user named it, so it counts as trusted.
+            assert_eq!(
+                db::get_repo_trust(&pool, "file/tmp/missing").await.expect("trust"),
+                Some(true)
+            );
             assert_eq!(
                 list_pods(&pool, conversation_a.id).await.expect("list_pods").len(),
                 1,

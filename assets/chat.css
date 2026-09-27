@@ -2760,3 +2760,89 @@ div.mcp-status-not-connected::before {
     cursor: pointer;
     font-size: 13px;
 }
+
+.sandbox-repo-instructions-Changed,
+.sandbox-repo-instructions-AwaitingTrust {
+    color: var(--accent);
+}
+
+.sandbox-repo-instructions-NotTrusted {
+    color: var(--text-2);
+}
+
+.sandbox-repo-reload {
+    padding: 2px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--ink);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.sandbox-repo-reload:hover {
+    background: var(--subtle);
+}
+
+/* Asking the user whether to trust a repo's AGENTS.md (SME-32). */
+
+.trust-card {
+    margin: 12px 0;
+    padding: 14px 16px;
+    border: 1px solid var(--border-strong);
+    border-left: 3px solid var(--ink);
+    border-radius: 12px;
+    background: var(--surface);
+}
+
+.trust-card-question {
+    margin: 0 0 6px;
+    font-weight: 600;
+}
+
+.trust-card-question code {
+    word-break: break-all;
+}
+
+.trust-card-preview pre {
+    max-height: 240px;
+    overflow: auto;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: var(--subtle);
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.trust-card-preview summary {
+    cursor: pointer;
+    font-size: 13px;
+}
+
+.trust-card-buttons {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.trust-card-buttons button {
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.trust-card-trust {
+    border: 1px solid var(--ink);
+    background: var(--ink);
+    color: var(--surface);
+}
+
+.trust-card-decline {
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--ink);
+}

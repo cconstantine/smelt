@@ -5,7 +5,7 @@
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::git::{GitIdentity, RepoSummary, SshKeySummary};
+use crate::git::{GitIdentity, RepoSummary, RepoTrustSummary, SshKeySummary};
 #[cfg(feature = "server")]
 use crate::{db, git};
 
@@ -14,6 +14,7 @@ use crate::{db, git};
 pub struct GitSettings {
     pub identity: GitIdentity,
     pub keys: Vec<SshKeySummary>,
+    pub trust: Vec<RepoTrustSummary>,
 }
 
 #[get("/api/git")]
@@ -22,7 +23,46 @@ pub async fn get_git_settings() -> ServerFnResult<GitSettings> {
     Ok(GitSettings {
         identity: db::get_git_identity(pool).await.map_err(ServerFnError::new)?,
         keys: git::list_keys(pool).await.map_err(ServerFnError::new)?,
+        trust: db::list_repo_trust(pool)
+            .await
+            .map_err(ServerFnError::new)?
+            .into_iter()
+            .map(|t| RepoTrustSummary {
+                remote: t.remote_key,
+                trusted: t.trusted,
+            })
+            .collect(),
     })
+}
+
+/// Forgets a trust decision: the user is asked again the next time the
+/// remote is cloned. What's loaded stays until reloaded.
+#[post("/api/git/trust/forget")]
+pub async fn forget_repo_trust(remote: String) -> ServerFnResult<()> {
+    db::delete_repo_trust(db::get(), &remote)
+        .await
+        .map_err(ServerFnError::new)
+}
+
+/// The trust card's answer. The model is told, and woken to carry on.
+#[post("/api/conversations/{id}/repos/{repo_id}/trust")]
+pub async fn decide_repo_trust(id: i64, repo_id: i64, trusted: bool) -> ServerFnResult<()> {
+    let pool = db::get();
+    git::decide_trust(pool, id, repo_id, trusted)
+        .await
+        .map_err(ServerFnError::new)?;
+    tokio::spawn(async move {
+        let _ = crate::api::chat::wake_conversation(pool, id).await;
+    });
+    Ok(())
+}
+
+/// Reload: loads what the checkout's AGENTS.md says now.
+#[post("/api/conversations/{id}/repos/{repo_id}/reload")]
+pub async fn reload_repo_instructions(id: i64, repo_id: i64) -> ServerFnResult<()> {
+    git::reload_instructions(db::get(), id, repo_id)
+        .await
+        .map_err(ServerFnError::new)
 }
 
 /// The conversation's repos, for the sandbox panel.

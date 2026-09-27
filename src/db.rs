@@ -887,6 +887,110 @@ pub struct ConversationRepo {
     pub instructions_hash: Option<String>,
     pub instructions_commit: Option<String>,
     pub nested_instructions: Vec<String>,
+    /// The AGENTS.md as last read from the checkout (see the migration).
+    pub found_instructions: Option<String>,
+    pub found_bytes: Option<i64>,
+    pub found_hash: Option<String>,
+    pub found_commit: Option<String>,
+    pub found_nested: Vec<String>,
+}
+
+impl ConversationRepo {
+    /// What was last read from the checkout, in the shape it's loaded in.
+    pub fn found(&self) -> Option<LoadedInstructions> {
+        Some(LoadedInstructions {
+            content: self.found_instructions.clone()?,
+            file_bytes: self.found_bytes.unwrap_or_default(),
+            hash: self.found_hash.clone().unwrap_or_default(),
+            commit: self.found_commit.clone(),
+            nested: self.found_nested.clone(),
+        })
+    }
+}
+
+/// Records what was read from a repo's checkout (`None`: no AGENTS.md).
+pub async fn set_repo_found(
+    pool: &PgPool,
+    id: i64,
+    found: Option<&LoadedInstructions>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE conversation_repos
+            SET found_instructions = $2, found_bytes = $3, found_hash = $4,
+                found_commit = $5, found_nested = $6, updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(found.map(|l| l.content.as_str()))
+    .bind(found.map(|l| l.file_bytes))
+    .bind(found.map(|l| l.hash.as_str()))
+    .bind(found.and_then(|l| l.commit.as_deref()))
+    .bind(found.map(|l| l.nested.clone()).unwrap_or_default())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Every conversation's repos with this remote, for a trust decision.
+pub async fn list_repos_with_remote(
+    pool: &PgPool,
+    remote_key: &str,
+) -> Result<Vec<ConversationRepo>, sqlx::Error> {
+    sqlx::query_as::<_, ConversationRepo>(
+        "SELECT * FROM conversation_repos WHERE remote_key = $1 ORDER BY id ASC",
+    )
+    .bind(remote_key)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_conversation_repo(pool: &PgPool, id: i64) -> Result<Option<ConversationRepo>, sqlx::Error> {
+    sqlx::query_as::<_, ConversationRepo>("SELECT * FROM conversation_repos WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+pub struct RepoTrust {
+    pub remote_key: String,
+    pub trusted: bool,
+    pub decided_at: NaiveDateTime,
+}
+
+/// `Some(trusted)` once the user has decided about this remote.
+pub async fn get_repo_trust(pool: &PgPool, remote_key: &str) -> Result<Option<bool>, sqlx::Error> {
+    sqlx::query_scalar("SELECT trusted FROM repo_trust WHERE remote_key = $1")
+        .bind(remote_key)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn set_repo_trust(pool: &PgPool, remote_key: &str, trusted: bool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO repo_trust (remote_key, trusted) VALUES ($1, $2)
+         ON CONFLICT (remote_key) DO UPDATE SET trusted = $2, decided_at = now()",
+    )
+    .bind(remote_key)
+    .bind(trusted)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_repo_trust(pool: &PgPool) -> Result<Vec<RepoTrust>, sqlx::Error> {
+    sqlx::query_as::<_, RepoTrust>("SELECT * FROM repo_trust ORDER BY remote_key ASC")
+        .fetch_all(pool)
+        .await
+}
+
+/// Forgets a decision, so the user is asked again next time.
+pub async fn delete_repo_trust(pool: &PgPool, remote_key: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM repo_trust WHERE remote_key = $1")
+        .bind(remote_key)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// What gets loaded for a repo's AGENTS.md; see `ConversationRepo`.
@@ -2524,6 +2628,22 @@ mod tests {
         let row = &list_conversation_repos(&pool, conversation.id).await.expect("list")[0];
         assert_eq!((row.instructions.clone(), row.instructions_hash.clone()), (None, None));
         assert!(row.nested_instructions.is_empty());
+
+        // What was read from the checkout, apart from what's loaded.
+        set_repo_found(&pool, repo.id, Some(&loaded)).await.expect("found");
+        let row = get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
+        assert_eq!(row.found(), Some(loaded.clone()));
+        assert_eq!(row.instructions, None, "finding doesn't load");
+        assert_eq!(list_repos_with_remote(&pool, "github.com/o/r").await.expect("by remote").len(), 1);
+
+        // Trust decisions, remembered per remote either way.
+        assert_eq!(get_repo_trust(&pool, "github.com/o/r").await.expect("get"), None);
+        set_repo_trust(&pool, "github.com/o/r", false).await.expect("decline");
+        set_repo_trust(&pool, "github.com/o/r", true).await.expect("trust");
+        assert_eq!(get_repo_trust(&pool, "github.com/o/r").await.expect("get"), Some(true));
+        assert_eq!(list_repo_trust(&pool).await.expect("list").len(), 1);
+        delete_repo_trust(&pool, "github.com/o/r").await.expect("forget");
+        assert_eq!(get_repo_trust(&pool, "github.com/o/r").await.expect("get"), None);
 
         // One checkout per directory.
         assert!(

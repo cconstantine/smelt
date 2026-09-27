@@ -611,6 +611,7 @@ mod wire_tests {
                     status: crate::git::RepoStatus::Failed,
                     error: Some("fatal: nope".to_string()),
                     instructions: crate::git::InstructionsState::None,
+                    instructions_preview: None,
                 }],
             },
         ]

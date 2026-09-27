@@ -865,13 +865,26 @@ pub(crate) fn run_turn<'a>(
     on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
 {
-    run_turn_bounded(
-        pool,
-        conversation_id,
-        Some(new_message),
-        on_delta,
-        MAX_TURNS,
-    )
+    Box::pin(async move {
+        let result = run_turn_bounded(
+            pool,
+            conversation_id,
+            Some(new_message),
+            on_delta,
+            MAX_TURNS,
+        )
+        .await;
+        spawn_instructions_refresh(pool, conversation_id);
+        result
+    })
+}
+
+/// After a turn, the model may have changed a repo's AGENTS.md (or pulled
+/// a new one): noticed in the background, for the user to reload (SME-32).
+#[cfg(feature = "server")]
+fn spawn_instructions_refresh(pool: &PgPool, conversation_id: i64) {
+    let pool = pool.clone();
+    tokio::spawn(async move { crate::git::refresh_instructions(&pool, conversation_id).await });
 }
 
 /// Wakes `conversation_id`'s turn loop because a terminal command reached a
@@ -903,6 +916,7 @@ pub(crate) async fn wake_conversation(
         return Ok(Vec::new());
     }
     let result = run_turn_bounded(pool, conversation_id, None, None, MAX_TURNS).await;
+    spawn_instructions_refresh(pool, conversation_id);
     // A stop is the user's doing, not a failure to reach the model.
     if let Err(e) = &result
         && chat_error_text(e) != TURN_STOPPED
@@ -2904,6 +2918,7 @@ mod tests {
             status: crate::git::RepoStatus::Ready,
             error: None,
             instructions: crate::git::InstructionsState::None,
+            instructions_preview: None,
         }];
         env.instructions = vec![crate::git::ProjectInstructions {
             repo_url: "git@github.com:o/smelt.git".to_string(),
