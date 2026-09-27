@@ -450,7 +450,7 @@ async fn test_end_to_end_browser_scenarios() {
         // SME-11's "One pod per conversation"),
         // so there's no tab bar to click through — both terminals render
         // straight through as soon as the panel loads. ---
-        sandbox::create_pod(pool, conversation.id, None, None).await.expect("create_pod");
+        sandbox::create_pod(pool, conversation.id, Default::default()).await.expect("create_pod");
         let terminal_a1 = sandbox::create_terminal(pool, conversation.id).await.expect("create_terminal (a1)");
         let terminal_a2 = sandbox::create_terminal(pool, conversation.id).await.expect("create_terminal (a2)");
 
@@ -909,7 +909,7 @@ async fn test_end_to_end_browser_scenarios() {
             wait_for_count(&sidebar_tab, &dot, 0, Duration::from_secs(5)).await,
             "no dot before the conversation has a pod"
         );
-        let pod_id = sandbox::create_pod(pool, with_pod.id, None, None).await.expect("create_pod");
+        let pod_id = sandbox::create_pod(pool, with_pod.id, Default::default()).await.expect("create_pod");
         assert!(
             wait_for_count(&sidebar_tab, &dot, 1, Duration::from_secs(10)).await,
             "the sidebar should mark a conversation whose pod started, without a reload"
@@ -1114,7 +1114,7 @@ async fn test_end_to_end_browser_scenarios() {
         }])
         .await
         .expect("seed a todo list");
-        sandbox::create_pod(pool, browsing.id, None, None).await.expect("create_pod");
+        sandbox::create_pod(pool, browsing.id, Default::default()).await.expect("create_pod");
         sandbox::create_terminal(pool, browsing.id).await.expect("create_terminal");
         let page = harness
             .browser
@@ -1451,7 +1451,7 @@ async fn test_end_to_end_browser_scenarios() {
         // shares a preview; the link shows up in the sandbox panel live,
         // opens the same server in a tab of its own, and survives a reload. ---
         let serving = new_conversation(pool, &created).await;
-        sandbox::create_pod(pool, serving.id, None, None).await.expect("create_pod");
+        sandbox::create_pod(pool, serving.id, Default::default()).await.expect("create_pod");
         let terminal = sandbox::create_terminal(pool, serving.id).await.expect("create_terminal");
         anthropic::tools::execute(
             pool,

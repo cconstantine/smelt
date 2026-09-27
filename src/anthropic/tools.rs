@@ -348,13 +348,18 @@ mod server {
                                memory_limit: \"4Gi\" for a memory-heavy task) — plain Kubernetes \
                                quantity strings, rejected by Kubernetes itself (as an error from \
                                this call) if malformed or over the deployment's configured \
-                               ceiling."
+                               ceiling. docker_memory_limit/docker_cpu_limit do the same for the \
+                               pod's Docker daemon, whose containers share its limit, not the \
+                               sandbox's (e.g. docker_memory_limit: \"12Gi\" for a big compose \
+                               stack)."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "memory_limit": {"type": "string"},
-                        "cpu_limit": {"type": "string"}
+                        "cpu_limit": {"type": "string"},
+                        "docker_memory_limit": {"type": "string"},
+                        "docker_cpu_limit": {"type": "string"}
                     }
                 }),
             },
@@ -1685,18 +1690,22 @@ mod server {
         conversation_id: i64,
         input: &Value,
     ) -> Result<String, String> {
-        let memory_limit = input
-            .get("memory_limit")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let cpu_limit = input
-            .get("cpu_limit")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let pod_id = sandbox::create_pod(pool, conversation_id, memory_limit, cpu_limit)
+        let pod_id = sandbox::create_pod(pool, conversation_id, pod_limit_overrides(input))
             .await
             .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"pod_id": pod_id}).to_string())
+    }
+
+    /// `create_pod`'s optional limit overrides, each a Kubernetes quantity
+    /// string left for Kubernetes itself to validate.
+    fn pod_limit_overrides(input: &Value) -> sandbox::PodLimitOverrides {
+        let field = |name| input.get(name).and_then(Value::as_str).map(str::to_string);
+        sandbox::PodLimitOverrides {
+            memory: field("memory_limit"),
+            cpu: field("cpu_limit"),
+            docker_memory: field("docker_memory_limit"),
+            docker_cpu: field("docker_cpu_limit"),
+        }
     }
 
     async fn terminate_pod_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
@@ -2317,6 +2326,24 @@ mod server {
                 content: content.to_string(),
                 is_error: if is_error { Some(true) } else { None },
             }
+        }
+
+        #[test]
+        fn test_create_pod_reads_all_four_limit_overrides() {
+            let input = serde_json::json!({
+                "memory_limit": "4Gi",
+                "cpu_limit": "2",
+                "docker_memory_limit": "6Gi",
+                "docker_cpu_limit": "3",
+            });
+            let overrides = pod_limit_overrides(&input);
+            assert_eq!(overrides.memory.as_deref(), Some("4Gi"));
+            assert_eq!(overrides.cpu.as_deref(), Some("2"));
+            assert_eq!(overrides.docker_memory.as_deref(), Some("6Gi"));
+            assert_eq!(overrides.docker_cpu.as_deref(), Some("3"));
+
+            let none = pod_limit_overrides(&serde_json::json!({}));
+            assert!(none.memory.is_none() && none.docker_memory.is_none());
         }
 
         #[test]

@@ -22,9 +22,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-#[cfg(test)]
-use kube::api::ListParams;
-use kube::api::{Api, AttachParams, DeleteParams, PostParams};
+use kube::api::{Api, AttachParams, DeleteParams, ListParams, PostParams};
 use serde::Deserialize;
 use sqlx::PgPool;
 use tokio::io::AsyncReadExt;
@@ -586,8 +584,9 @@ pub enum DockerStorage {
     /// The conversation's own PVC (`sandbox-docker-<id>`), so images and
     /// build cache outlive the pod.
     Conversation(i64),
-    /// An emptyDir that dies with the pod, for callers (tests) that have
-    /// no conversation.
+    /// An emptyDir that dies with the pod, for tests, which have no
+    /// conversation.
+    #[cfg(test)]
     Ephemeral,
 }
 
@@ -598,18 +597,6 @@ pub struct DockerSidecar {
     pub memory: String,
     pub cpu: String,
     pub storage: DockerStorage,
-}
-
-impl DockerSidecar {
-    /// The deployment's defaults (`SANDBOX_DOCKER_MEMORY_LIMIT`,
-    /// `SANDBOX_DOCKER_CPU_LIMIT`), with ephemeral storage.
-    pub fn defaults() -> Self {
-        Self {
-            memory: default_docker_memory_limit(),
-            cpu: default_docker_cpu_limit(),
-            storage: DockerStorage::Ephemeral,
-        }
-    }
 }
 
 /// `SANDBOX_DOCKER_MEMORY_LIMIT`, default `"8Gi"` — see
@@ -657,8 +644,9 @@ fn docker_pvc_name(conversation_id: i64) -> String {
     format!("sandbox-docker-{conversation_id}")
 }
 
-/// Label on a Docker data PVC naming its conversation.
-const DOCKER_PVC_CONVERSATION_LABEL: &str = "smelt/conversation";
+/// Label naming a conversation, on its Docker data PVC and on every pod
+/// that mounts that PVC.
+const CONVERSATION_LABEL: &str = "smelt/conversation";
 
 /// `SANDBOX_DOCKER_STORAGE_SIZE`, default `"20Gi"` — see
 /// `default_memory_limit`. Each conversation's Docker data PVC requests
@@ -675,7 +663,7 @@ fn build_docker_pvc_spec(conversation_id: i64) -> PersistentVolumeClaim {
     requests.insert("storage".to_string(), Quantity(default_docker_storage_size()));
     let mut labels = std::collections::BTreeMap::new();
     labels.insert(
-        DOCKER_PVC_CONVERSATION_LABEL.to_string(),
+        CONVERSATION_LABEL.to_string(),
         conversation_id.to_string(),
     );
 
@@ -696,6 +684,76 @@ fn build_docker_pvc_spec(conversation_id: i64) -> PersistentVolumeClaim {
         }),
         ..Default::default()
     }
+}
+
+/// The conversations whose Docker data claims outlived them: claims
+/// labelled with a conversation that isn't in `live`.
+fn orphaned_docker_claims(
+    claims: &[PersistentVolumeClaim],
+    live: &std::collections::HashSet<i64>,
+) -> Vec<i64> {
+    claims
+        .iter()
+        .filter_map(|c| c.metadata.labels.as_ref()?.get(CONVERSATION_LABEL)?.parse().ok())
+        .filter(|id| !live.contains(id))
+        .collect()
+}
+
+/// Deletes Docker data claims whose conversation is gone. Conversation
+/// teardown deletes its claim best-effort, so this catches what that
+/// missed. Run once at startup by `main`, never from tests: tests share
+/// the namespace but each has its own database, so from a test every
+/// other test's claim would look orphaned.
+pub async fn sweep_orphaned_docker_claims(pool: &PgPool) {
+    let client = &get().client;
+    let selector = ListParams::default().labels(CONVERSATION_LABEL);
+    // Claims first, then conversations: a claim only exists for a
+    // conversation that already did, so none can be missed in between.
+    let claims = match pvc_api(client).list(&selector).await {
+        Ok(list) => list.items,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list docker data claims to sweep");
+            return;
+        }
+    };
+    let live = match db::list_conversations(pool).await {
+        Ok(conversations) => conversations.into_iter().map(|c| c.id).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list conversations to sweep docker data claims");
+            return;
+        }
+    };
+    for conversation_id in orphaned_docker_claims(&claims, &live) {
+        tracing::info!(conversation_id, "deleting a deleted conversation's docker data claim");
+        delete_docker_pvc(client, conversation_id).await;
+    }
+}
+
+/// Waits until no pod labelled with `conversation_id` is left in the
+/// cluster, so a new pod never shares the Docker claim with one still
+/// stopping.
+async fn wait_for_conversation_pods_gone(
+    client: &kube::Client,
+    conversation_id: i64,
+    timeout: Duration,
+) -> Result<(), SandboxError> {
+    let pods = pods_api(client);
+    let selector = ListParams::default().labels(&format!("{CONVERSATION_LABEL}={conversation_id}"));
+    let waited = tokio::time::timeout(timeout, async {
+        loop {
+            let remaining = pods.list(&selector).await?;
+            if remaining.items.is_empty() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await;
+    waited.map_err(|_| {
+        SandboxError::Timeout(Some(
+            "the conversation's previous pod is still stopping".to_string(),
+        ))
+    })?
 }
 
 /// Creates the conversation's Docker data PVC unless it already exists,
@@ -769,10 +827,21 @@ fn build_pod_spec(
     let mut docker_mounts = shared_mounts.clone();
     docker_mounts.push(mount(DOCKER_DATA_VOLUME, "/var/lib/docker"));
 
+    // Only a pod on a conversation's claim needs finding by conversation:
+    // see `wait_for_conversation_pods_gone`.
+    let labels = match docker.storage {
+        DockerStorage::Conversation(conversation_id) => Some(
+            [(CONVERSATION_LABEL.to_string(), conversation_id.to_string())].into(),
+        ),
+        #[cfg(test)]
+        DockerStorage::Ephemeral => None,
+    };
+
     Pod {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(NAMESPACE.to_string()),
+            labels,
             ..Default::default()
         },
         spec: Some(PodSpec {
@@ -878,6 +947,7 @@ fn docker_data_volume(storage: &DockerStorage) -> Volume {
             }),
             ..Default::default()
         },
+        #[cfg(test)]
         DockerStorage::Ephemeral => empty_dir_volume(DOCKER_DATA_VOLUME),
     }
 }
@@ -1319,22 +1389,19 @@ async fn conversation_pod_id(pool: &PgPool, conversation_id: i64) -> Result<i64,
 /// another. Rolls the DB row back (soft-terminates it) if the underlying
 /// k8s create fails, so a failed create never leaves a pod_id `list_pods`
 /// would show as live but that doesn't actually exist.
-/// `memory_limit`/`cpu_limit` override the deployment's
-/// `SANDBOX_MEMORY_LIMIT`/`SANDBOX_CPU_LIMIT` default for just this one
-/// pod when given — see the plan's "Per-pod limit overrides."
+/// `limits` override the deployment's defaults for just this one pod —
+/// see `PodLimitOverrides`.
 pub async fn create_pod(
     pool: &PgPool,
     conversation_id: i64,
-    memory_limit: Option<String>,
-    cpu_limit: Option<String>,
+    limits: PodLimitOverrides,
 ) -> Result<i64, SandboxError> {
     let existing = db::list_sandbox_pods(pool, conversation_id)
         .await
         .map_err(SandboxError::Db)?;
     check_pod_guard(&existing)?;
 
-    let memory = memory_limit.unwrap_or_else(default_memory_limit);
-    let cpu = cpu_limit.unwrap_or_else(default_cpu_limit);
+    let (memory, cpu, docker) = limits.resolve(conversation_id);
 
     let manager = get();
     let row = db::create_sandbox_pod(pool, conversation_id)
@@ -1349,10 +1416,14 @@ pub async fn create_pod(
     // (this pod persists independently of any in-process value), so it's
     // disarmed immediately, the same `mem::forget` pattern
     // `SandboxManager::delete` itself already uses for the same reason.
-    let docker = DockerSidecar {
-        storage: DockerStorage::Conversation(conversation_id),
-        ..DockerSidecar::defaults()
-    };
+    // A pod terminate_pod just stopped can still hold the Docker claim.
+    if let Err(e) =
+        wait_for_conversation_pods_gone(&manager.client, conversation_id, running_wait_timeout())
+            .await
+    {
+        let _ = db::terminate_sandbox_pod(pool, row.id).await;
+        return Err(e);
+    }
     if let Err(e) = ensure_docker_pvc(&manager.client, conversation_id).await {
         let _ = db::terminate_sandbox_pod(pool, row.id).await;
         return Err(e);
@@ -1390,6 +1461,36 @@ pub fn check_reachable_port(port: u16) -> Result<(), TerminalError> {
         return Err(TerminalError::AgentPort);
     }
     Ok(())
+}
+
+/// `create_pod`'s per-pod overrides of the deployment's limits: the
+/// sandbox container's (`SANDBOX_MEMORY_LIMIT`/`SANDBOX_CPU_LIMIT`, see the
+/// plan's "Per-pod limit overrides") and the Docker sidecar's
+/// (`SANDBOX_DOCKER_*_LIMIT`, SME-33). Plain Kubernetes quantity strings,
+/// validated by Kubernetes itself against the namespace's `LimitRange`.
+#[derive(Debug, Clone, Default)]
+pub struct PodLimitOverrides {
+    pub memory: Option<String>,
+    pub cpu: Option<String>,
+    pub docker_memory: Option<String>,
+    pub docker_cpu: Option<String>,
+}
+
+impl PodLimitOverrides {
+    /// The sandbox container's memory and CPU, and the Docker sidecar on
+    /// the conversation's own claim.
+    fn resolve(self, conversation_id: i64) -> (String, String, DockerSidecar) {
+        let docker = DockerSidecar {
+            memory: self.docker_memory.unwrap_or_else(default_docker_memory_limit),
+            cpu: self.docker_cpu.unwrap_or_else(default_docker_cpu_limit),
+            storage: DockerStorage::Conversation(conversation_id),
+        };
+        (
+            self.memory.unwrap_or_else(default_memory_limit),
+            self.cpu.unwrap_or_else(default_cpu_limit),
+            docker,
+        )
+    }
 }
 
 /// A byte stream to a port inside a sandbox pod, from `open_pod_port`.
@@ -3061,6 +3162,62 @@ mod tests {
     }
 
     #[test]
+    fn test_pod_spec_labels_a_pod_with_its_conversation_only_when_it_uses_the_claim() {
+        let labelled = build_pod_spec("sandbox-1", "1Gi", "1", &docker_for_conversation(42), &[]);
+        assert_eq!(
+            labelled.metadata.labels.as_ref().and_then(|l| l.get(CONVERSATION_LABEL)).map(String::as_str),
+            Some("42"),
+            "create_pod finds a conversation's still-stopping pods by this label"
+        );
+        let ephemeral = DockerSidecar {
+            storage: DockerStorage::Ephemeral,
+            ..docker_for_conversation(42)
+        };
+        let unlabelled = build_pod_spec("sandbox-1", "1Gi", "1", &ephemeral, &[]);
+        assert!(unlabelled.metadata.labels.and_then(|l| l.get(CONVERSATION_LABEL).cloned()).is_none());
+    }
+
+    fn claim(name: &str, conversation: Option<&str>) -> PersistentVolumeClaim {
+        PersistentVolumeClaim {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                labels: conversation
+                    .map(|c| [(CONVERSATION_LABEL.to_string(), c.to_string())].into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_orphaned_docker_claims_are_those_whose_conversation_is_gone() {
+        let claims = vec![
+            claim("sandbox-docker-1", Some("1")),
+            claim("sandbox-docker-2", Some("2")),
+            // A sandbox volume's claim has no conversation label.
+            claim("sandbox-volume-3", None),
+            claim("sandbox-docker-x", Some("not-a-number")),
+        ];
+        let live = std::collections::HashSet::from([1]);
+        assert_eq!(orphaned_docker_claims(&claims, &live), vec![2]);
+    }
+
+    #[test]
+    fn test_pod_limit_overrides_replace_only_the_limits_they_name() {
+        let overrides = PodLimitOverrides {
+            memory: Some("3Gi".to_string()),
+            docker_cpu: Some("4".to_string()),
+            ..Default::default()
+        };
+        let (memory, cpu, docker) = overrides.resolve(7);
+        assert_eq!(memory, "3Gi");
+        assert_eq!(cpu, default_cpu_limit());
+        assert_eq!(docker.memory, default_docker_memory_limit());
+        assert_eq!(docker.cpu, "4");
+        assert_eq!(docker.storage, DockerStorage::Conversation(7));
+    }
+
+    #[test]
     fn test_docker_pvc_spec_is_named_labelled_and_sized_for_the_conversation() {
         let pvc = build_docker_pvc_spec(42);
         assert_eq!(pvc.metadata.name.as_deref(), Some("sandbox-docker-42"));
@@ -3068,7 +3225,7 @@ mod tests {
             pvc.metadata
                 .labels
                 .as_ref()
-                .and_then(|l| l.get(DOCKER_PVC_CONVERSATION_LABEL))
+                .and_then(|l| l.get(CONVERSATION_LABEL))
                 .map(String::as_str),
             Some("42"),
             "the startup sweep finds a claim's conversation by this label"
@@ -3391,7 +3548,7 @@ mod tests {
             .await
             .expect("create sandbox pod");
 
-        let result = create_pod(&pool, conversation.id, None, None).await;
+        let result = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await;
         assert!(
             matches!(result, Err(SandboxError::PodAlreadyExists)),
             "expected PodAlreadyExists, got {result:?}"
@@ -3792,6 +3949,46 @@ mod tests {
         }
     }
 
+    /// A new pod must not mount a conversation's Docker claim while the old
+    /// one is still stopping: two dockerds on one /var/lib/docker corrupt
+    /// it. The old pod gets a grace period so it lingers while terminating.
+    #[tokio::test]
+    async fn test_wait_for_conversation_pods_gone_waits_out_a_stopping_pod() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let pods = pods_api(&client);
+        let conversation_id = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64
+            + 1_000_000_000;
+        let docker = DockerSidecar {
+            memory: "256Mi".to_string(),
+            cpu: "250m".to_string(),
+            storage: DockerStorage::Conversation(conversation_id),
+        };
+        ensure_docker_pvc(&client, conversation_id).await.expect("ensure docker claim");
+        let sandbox = manager
+            .create_with_docker(&unique_session_id("stopping"), "128Mi", "250m", &docker, &[])
+            .await
+            .expect("create pod");
+        let name = sandbox.pod_name.clone();
+        std::mem::forget(sandbox);
+
+        pods.delete(&name, &DeleteParams { grace_period_seconds: Some(5), ..Default::default() })
+            .await
+            .expect("start deleting the pod");
+        let waited =
+            wait_for_conversation_pods_gone(&client, conversation_id, Duration::from_secs(60)).await;
+        let still_there = pods.get_opt(&name).await.expect("get pod").is_some();
+
+        pods.delete(&name, &immediate_delete_params()).await.ok();
+        while pods.get_opt(&name).await.ok().flatten().is_some() {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        pvc_api(&client).delete(&docker_pvc_name(conversation_id), &DeleteParams::default()).await.ok();
+
+        assert!(waited.is_ok(), "the wait should finish once the pod is gone: {waited:?}");
+        assert!(!still_there, "the wait returned while {name} was still stopping");
+    }
+
     /// A conversation's Docker claim is created once and reused, and
     /// deleting it removes it. No pod: `local-path` binds on first use, so
     /// an unused claim stays `Pending`, which is fine here.
@@ -3948,8 +4145,8 @@ mod tests {
 
             // --- One pod per conversation: create_pod refuses a second
             // live pod, list reflects reality ---
-            let pod_a = create_pod(&pool, conversation_a.id, None, None).await.expect("create_pod (a) should succeed");
-            let duplicate = create_pod(&pool, conversation_a.id, None, None).await;
+            let pod_a = create_pod(&pool, conversation_a.id, PodLimitOverrides::default()).await.expect("create_pod (a) should succeed");
+            let duplicate = create_pod(&pool, conversation_a.id, PodLimitOverrides::default()).await;
             assert!(
                 matches!(duplicate, Err(SandboxError::PodAlreadyExists)),
                 "create_pod should refuse a second live pod for the same conversation, got {duplicate:?}"
@@ -4060,7 +4257,7 @@ mod tests {
             // --- Pod isolation: a file in conversation_a's pod is
             // invisible from conversation_b's — two separate conversations
             // now, since one conversation can't have two live pods. ---
-            create_pod(&pool, conversation_b.id, None, None).await.expect("create_pod (b) should succeed");
+            create_pod(&pool, conversation_b.id, PodLimitOverrides::default()).await.expect("create_pod (b) should succeed");
             let terminal_b1 = create_terminal(&pool, conversation_b.id).await.expect("create_terminal (b1) should succeed");
             run_and_wait(&pool, conversation_a.id, terminal_a1, "write-marker", "echo marker > /tmp/isolation-marker").await;
             let check = run_and_wait(&pool, conversation_b.id, terminal_b1, "check-marker", "cat /tmp/isolation-marker 2>&1; echo EXIT:$?").await;
@@ -4298,7 +4495,7 @@ mod tests {
             // without ever confirming" crash already did. A separate
             // conversation, since conversation_a's one pod slot is already
             // in use. ---
-            let pod_c = create_pod(&pool, conversation_c.id, None, None).await.expect("create_pod (c) should succeed");
+            let pod_c = create_pod(&pool, conversation_c.id, PodLimitOverrides::default()).await.expect("create_pod (c) should succeed");
             let terminal_c1 = create_terminal(&pool, conversation_c.id).await.expect("create_terminal (c1) should succeed");
 
             let pods = pods_api(&get().client);
@@ -4329,7 +4526,7 @@ mod tests {
             // alone) should flip back to "connected" once try_reconnect
             // runs, not need an unrelated tool call to happen first.
             // Another separate conversation, same reason as pod_c. ---
-            let pod_d = create_pod(&pool, conversation_d.id, None, None).await.expect("create_pod (d) should succeed");
+            let pod_d = create_pod(&pool, conversation_d.id, PodLimitOverrides::default()).await.expect("create_pod (d) should succeed");
             let terminal_d1 = create_terminal(&pool, conversation_d.id).await.expect("create_terminal (d1) should succeed");
             deregister(pod_d);
 
@@ -4382,7 +4579,7 @@ mod tests {
             // live connection is noticed and reported without any further
             // tool call — see SME-12. ---
             let conversation_e = db::create_conversation(&pool).await.expect("create conversation e");
-            let pod_e = create_pod(&pool, conversation_e.id, None, None).await.expect("create_pod (e) should succeed");
+            let pod_e = create_pod(&pool, conversation_e.id, PodLimitOverrides::default()).await.expect("create_pod (e) should succeed");
             let terminal_e = create_terminal(&pool, conversation_e.id).await.expect("create_terminal (e) should succeed");
 
             pods_api(&client).delete(&pod_name(pod_e), &immediate_delete_params()).await.expect("delete pod (e) directly");
@@ -4421,7 +4618,7 @@ mod tests {
             // is what makes this race-safe against the reader task noticing
             // the same connection drop for a different reason. ---
             let conversation_f = db::create_conversation(&pool).await.expect("create conversation f");
-            create_pod(&pool, conversation_f.id, None, None).await.expect("create_pod (f) should succeed");
+            create_pod(&pool, conversation_f.id, PodLimitOverrides::default()).await.expect("create_pod (f) should succeed");
             terminate_pod(&pool, conversation_f.id).await.expect("terminate_pod (f) should succeed");
             tokio::time::sleep(Duration::from_secs(2)).await; // give a wrongly-firing reader task a chance to misfire
             assert!(
@@ -4435,7 +4632,7 @@ mod tests {
             // crash notice. See SME-26. ---
             let conversation_g = db::create_conversation(&pool).await.expect("create conversation g");
             let mut app_events = events::subscribe_app();
-            let pod_g = create_pod(&pool, conversation_g.id, None, None).await.expect("create_pod (g) should succeed");
+            let pod_g = create_pod(&pool, conversation_g.id, PodLimitOverrides::default()).await.expect("create_pod (g) should succeed");
             assert!(
                 received_pods_changed(&mut app_events).await,
                 "creating a pod should tell app-wide listeners"
@@ -4549,7 +4746,7 @@ mod tests {
             // Before the watch starts: pod (h) is gone from Kubernetes, and
             // old enough that its record should have a pod.
             let conversation_h = db::create_conversation(&pool).await.expect("create conversation h");
-            let pod_h = create_pod(&pool, conversation_h.id, None, None).await.expect("create_pod (h) should succeed");
+            let pod_h = create_pod(&pool, conversation_h.id, PodLimitOverrides::default()).await.expect("create_pod (h) should succeed");
             let terminal_h = db::create_sandbox_terminal(&pool, pod_h).await.expect("a terminal record");
             db::create_terminal_command(&pool, conversation_h.id, terminal_h.id, "stale-h", "sleep 300")
                 .await
@@ -4583,7 +4780,7 @@ mod tests {
             // While the watch runs: pod (i) is deleted outside smelt, with no
             // connection open, so crash detection never sees it.
             let conversation_i = db::create_conversation(&pool).await.expect("create conversation i");
-            let pod_i = create_pod(&pool, conversation_i.id, None, None).await.expect("create_pod (i) should succeed");
+            let pod_i = create_pod(&pool, conversation_i.id, PodLimitOverrides::default()).await.expect("create_pod (i) should succeed");
             pods_api(&client).delete(&pod_name(pod_i), &immediate_delete_params()).await.expect("delete pod (i) directly");
             assert!(wait_until_closed(pod_i).await, "a pod deleted while the watch runs should have its record closed");
             assert!(
@@ -4648,7 +4845,7 @@ mod tests {
             );
             let pod_g_gone = pods_api(&client).get_opt(&pod_name(pod_g)).await.expect("get_opt");
             assert!(pod_g_gone.is_none(), "exhausting reconnect attempts should force-terminate the k8s pod");
-            let recreated = create_pod(&pool, conversation_g.id, None, None).await;
+            let recreated = create_pod(&pool, conversation_g.id, PodLimitOverrides::default()).await;
             assert!(
                 recreated.is_ok(),
                 "create_pod should succeed again immediately, not stay blocked behind a stale live-pod row, got {recreated:?}"
@@ -4658,7 +4855,7 @@ mod tests {
             // covered by the pod-level message, even though it has no
             // per-command message of its own. ---
             let conversation_h = db::create_conversation(&pool).await.expect("create conversation h");
-            let pod_h = create_pod(&pool, conversation_h.id, None, None).await.expect("create_pod (h) should succeed");
+            let pod_h = create_pod(&pool, conversation_h.id, PodLimitOverrides::default()).await.expect("create_pod (h) should succeed");
             create_terminal(&pool, conversation_h.id).await.expect("create_terminal (h) should succeed");
             pods_api(&client).delete(&pod_name(pod_h), &immediate_delete_params()).await.expect("delete pod (h) directly");
             let detected_h = tokio::time::timeout(Duration::from_secs(30), async {
@@ -4676,7 +4873,7 @@ mod tests {
             // conversation's own claim, so its images outlive the pod, and
             // teardown_conversation removes the claim with the pod. ---
             let conversation_j = db::create_conversation(&pool).await.expect("create conversation j");
-            let pod_j = create_pod(&pool, conversation_j.id, None, None).await.expect("create_pod (j) should succeed");
+            let pod_j = create_pod(&pool, conversation_j.id, PodLimitOverrides::default()).await.expect("create_pod (j) should succeed");
             let docker_pvcs = pvc_api(&client);
             let docker_claim = docker_pvc_name(conversation_j.id);
             assert!(
@@ -4905,7 +5102,11 @@ mod tests {
                 &session_id,
                 "128Mi",
                 "250m",
-                &DockerSidecar::defaults(),
+                &DockerSidecar {
+                    memory: "512Mi".to_string(),
+                    cpu: "250m".to_string(),
+                    storage: DockerStorage::Ephemeral,
+                },
                 &[],
                 Duration::from_millis(1),
             )
