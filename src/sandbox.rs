@@ -729,6 +729,73 @@ pub async fn sweep_orphaned_docker_claims(pool: &PgPool) {
     }
 }
 
+/// Whether the pod's Docker sidecar restarted since `last_reported`
+/// restarts, and if so its new restart count and the reason Kubernetes
+/// gave for the last exit (e.g. `OOMKilled`).
+fn docker_restart_to_report(pod: &Pod, last_reported: i32) -> Option<(i32, Option<String>)> {
+    let docker = pod
+        .status
+        .as_ref()?
+        .init_container_statuses
+        .as_ref()?
+        .iter()
+        .find(|c| c.name == "docker")?;
+    if docker.restart_count <= last_reported {
+        return None;
+    }
+    let reason = docker
+        .last_state
+        .as_ref()
+        .and_then(|s| s.terminated.as_ref())
+        .and_then(|t| t.reason.clone());
+    Some((docker.restart_count, reason))
+}
+
+/// `watch_pods`' bookkeeping for Docker sidecar restarts: remembers each
+/// pod's restart count in `seen`, and returns the pod id and reason for a
+/// restart to report. A pod's first listing (`initial`, after smelt starts
+/// or the watch reconnects) is only remembered, so a restart from before
+/// isn't reported again.
+fn note_docker_restarts(
+    seen: &mut HashMap<i64, i32>,
+    pod: &Pod,
+    initial: bool,
+) -> Option<(i64, Option<String>)> {
+    let pod_id = watched_pod_id(pod)?;
+    let last = seen.get(&pod_id).copied().unwrap_or(0);
+    let (count, reason) = docker_restart_to_report(pod, last)?;
+    seen.insert(pod_id, count);
+    (!initial).then_some((pod_id, reason))
+}
+
+/// Tells the pod's conversation that its Docker sidecar restarted, then
+/// wakes it, the same way a crashed pod is reported (see
+/// `handle_crash_cleanup`): the containers it ran are gone, which a
+/// command waiting on one of them may need to hear about.
+async fn report_docker_restart(pool: &PgPool, pod_id: i64, reason: Option<String>) {
+    let conversation_id = match db::sandbox_pod_conversation_id(pool, pod_id).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't find the conversation of a pod whose Docker restarted");
+            return;
+        }
+    };
+    let why = reason.map(|r| format!(" ({r})")).unwrap_or_default();
+    let notice = format!(
+        "Docker in sandbox pod {pod_id} was restarted{why}, so the containers it was running \
+         have stopped. Images, terminals and /workspace are unaffected. Every container shares \
+         Docker's memory limit; a pod created with a larger docker_memory_limit gives them more."
+    );
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::api::chat::save_notice_between_turns(&pool, conversation_id, notice).await {
+            tracing::warn!(conversation_id, pod_id, error = %e, "couldn't save the Docker restart notice");
+        }
+        let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
+    });
+}
+
 /// Waits until no pod labelled with `conversation_id` is left in the
 /// cluster, so a new pod never shares the Docker claim with one still
 /// stopping.
@@ -2457,10 +2524,13 @@ pub async fn watch_pods(pool: PgPool) {
     futures_util::pin_mut!(events);
     // Pods listed since the last `Init`, until `InitDone` completes the set.
     let mut listed = std::collections::HashSet::new();
+    // Each pod's Docker sidecar restart count, see `note_docker_restarts`.
+    let mut docker_restarts = HashMap::new();
     while let Some(event) = events.next().await {
         match event {
             Ok(watcher::Event::Init) => listed.clear(),
             Ok(watcher::Event::InitApply(pod)) => {
+                note_docker_restarts(&mut docker_restarts, &pod, true);
                 if let Some(pod_id) = watched_pod_id(&pod) {
                     if !pod_has_finished(&pod) {
                         listed.insert(pod_id);
@@ -2482,9 +2552,14 @@ pub async fn watch_pods(pool: PgPool) {
                     close_after_grace(pool.clone(), pod_id);
                 }
             }
-            Ok(watcher::Event::Apply(_)) => {}
+            Ok(watcher::Event::Apply(pod)) => {
+                if let Some((pod_id, reason)) = note_docker_restarts(&mut docker_restarts, &pod, false) {
+                    report_docker_restart(&pool, pod_id, reason).await;
+                }
+            }
             Ok(watcher::Event::Delete(pod)) => {
                 if let Some(pod_id) = watched_pod_id(&pod) {
+                    docker_restarts.remove(&pod_id);
                     close_after_grace(pool.clone(), pod_id);
                 }
             }
@@ -3217,6 +3292,116 @@ mod tests {
         assert_eq!(docker.storage, DockerStorage::Conversation(7));
     }
 
+    fn pod_with_docker_status(restarts: i32, last_reason: Option<&str>) -> Pod {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStatus, PodStatus,
+        };
+        Pod {
+            status: Some(PodStatus {
+                init_container_statuses: Some(vec![ContainerStatus {
+                    name: "docker".to_string(),
+                    restart_count: restarts,
+                    last_state: last_reason.map(|reason| ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            reason: Some(reason.to_string()),
+                            exit_code: 137,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_docker_restart_to_report_ignores_a_pod_whose_docker_never_restarted() {
+        assert_eq!(docker_restart_to_report(&Pod::default(), 0), None);
+        assert_eq!(docker_restart_to_report(&pod_with_docker_status(0, None), 0), None);
+    }
+
+    #[test]
+    fn test_docker_restart_to_report_gives_the_new_count_and_kubernetes_reason() {
+        assert_eq!(
+            docker_restart_to_report(&pod_with_docker_status(1, Some("OOMKilled")), 0),
+            Some((1, Some("OOMKilled".to_string())))
+        );
+        assert_eq!(
+            docker_restart_to_report(&pod_with_docker_status(3, Some("Error")), 2),
+            Some((3, Some("Error".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_docker_restart_to_report_reports_each_restart_once() {
+        assert_eq!(docker_restart_to_report(&pod_with_docker_status(1, Some("OOMKilled")), 1), None);
+    }
+
+    fn named(mut pod: Pod, name: &str) -> Pod {
+        pod.metadata.name = Some(name.to_string());
+        pod
+    }
+
+    #[test]
+    fn test_docker_restarts_are_reported_once_and_never_from_the_first_listing() {
+        let mut seen = HashMap::new();
+        // A restart from before smelt started, seen in the first listing.
+        let old = named(pod_with_docker_status(2, Some("Error")), "sandbox-7");
+        assert_eq!(note_docker_restarts(&mut seen, &old, true), None);
+        assert_eq!(note_docker_restarts(&mut seen, &old, false), None, "already known");
+
+        let again = named(pod_with_docker_status(3, Some("OOMKilled")), "sandbox-7");
+        assert_eq!(
+            note_docker_restarts(&mut seen, &again, false),
+            Some((7, Some("OOMKilled".to_string())))
+        );
+        assert_eq!(note_docker_restarts(&mut seen, &again, false), None, "reported once");
+
+        // Not smelt's pod.
+        let other = named(pod_with_docker_status(1, Some("OOMKilled")), "something-else");
+        assert_eq!(note_docker_restarts(&mut seen, &other, false), None);
+    }
+
+    /// DB-only: the notice lands in the pod's conversation, saying what
+    /// was lost and what wasn't. The wake after it is pointed at a port
+    /// nothing listens on.
+    #[sqlx::test]
+    async fn test_report_docker_restart_tells_the_pods_conversation(pool: PgPool) {
+        let _anthropic_guard = crate::anthropic::test_support::lock_anthropic_base_url();
+        unsafe {
+            std::env::set_var("ANTHROPIC_BASE_URL", "http://127.0.0.1:1");
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        }
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let pod = db::create_sandbox_pod(&pool, conversation.id).await.expect("create pod row");
+
+        report_docker_restart(&pool, pod.id, Some("OOMKilled".to_string())).await;
+
+        let saved = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let messages = db::list_messages(&pool, conversation.id).await.expect("list messages");
+                if let Some(text) = messages.iter().find_map(|m| {
+                    m.blocks().ok()?.into_iter().find_map(|b| match b {
+                        crate::anthropic::ContentBlock::Text { text } if text.contains("Docker") => {
+                            Some(text)
+                        }
+                        _ => None,
+                    })
+                }) {
+                    return text;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("a Docker notice should be saved to the conversation");
+        assert!(saved.contains("OOMKilled"), "{saved}");
+        assert!(saved.contains("/workspace"), "should say what survived: {saved}");
+    }
+
     #[test]
     fn test_docker_pvc_spec_is_named_labelled_and_sized_for_the_conversation() {
         let pvc = build_docker_pvc_spec(42);
@@ -3945,6 +4130,100 @@ mod tests {
             .ok();
         match outcome {
             Ok(finished) => finished.expect("docker test should finish within the timeout"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// An OOM kill inside a nested container restarts only the Docker
+    /// sidecar: the sandbox container, its processes and /workspace carry
+    /// on, and the pod's status says why, as `docker_restart_to_report`
+    /// reads it (SME-33's spike). Written memory, not `bytearray(n)`, whose
+    /// untouched pages never count.
+    #[tokio::test]
+    async fn test_an_oom_in_a_nested_container_restarts_only_the_docker_sidecar() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let pods = pods_api(&client);
+        let docker = DockerSidecar {
+            memory: "512Mi".to_string(),
+            cpu: "500m".to_string(),
+            storage: DockerStorage::Ephemeral,
+        };
+        let sandbox = manager
+            .create_with_docker(&unique_session_id("docker-oom"), "128Mi", "250m", &docker, &[])
+            .await
+            .expect("create pod");
+        let name = sandbox.pod_name.clone();
+
+        let checks = std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(240), async {
+            let setup = sandbox
+                .exec(&[
+                    "bash",
+                    "-c",
+                    "echo kept > /workspace/marker && (setsid sleep 1000 >/dev/null 2>&1 &) \
+                     && sudo tar -C / -c bin sbin lib lib64 usr etc 2>/dev/null \
+                        | docker import - local/base >/dev/null && echo ready",
+                ])
+                .await
+                .expect("exec setup");
+            assert_eq!(setup.stdout.trim(), "ready", "setup: {}", setup.stdout);
+            // Detached: the container's memory outgrows the sidecar's limit.
+            let started = sandbox
+                .exec(&["docker", "run", "-d", "local/base", "sh", "-c", "head -c 900M /dev/zero | tail; sleep 600"])
+                .await
+                .expect("exec docker run");
+            let container = started.stdout.trim().to_string();
+
+            let restarted = loop {
+                let pod = pods.get(&name).await.expect("get pod");
+                if let Some(report) = docker_restart_to_report(&pod, 0) {
+                    break (pod, report);
+                }
+                // A workload that exits on its own never reaches the limit:
+                // say why now rather than at the timeout. Exit code 255 is
+                // not that: it's how a restarted dockerd reports the
+                // containers its OOM-killed predecessor ran, often before
+                // the pod's status shows the restart.
+                let state = sandbox
+                    .exec(&["docker", "inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", &container])
+                    .await
+                    .expect("exec docker inspect");
+                if state.stdout.trim().starts_with("exited") && state.stdout.trim() != "exited 255" {
+                    let why = sandbox
+                        .exec(&["sh", "-c", &format!("docker inspect -f '{{{{json .State}}}}' {container}; docker logs {container} 2>&1 | tail -5")])
+                        .await
+                        .expect("exec docker inspect");
+                    panic!("the workload exited without an OOM kill: {}", why.stdout);
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            };
+            let (pod, report) = restarted;
+            assert_eq!(report, (1, Some("OOMKilled".to_string())));
+            let sandbox_restarts = pod
+                .status
+                .and_then(|s| s.container_statuses)
+                .and_then(|cs| cs.into_iter().find(|c| c.name == "sandbox"))
+                .map(|c| c.restart_count);
+            assert_eq!(sandbox_restarts, Some(0), "the sandbox container must not restart");
+
+            let after = sandbox
+                .exec(&["bash", "-c", "cat /workspace/marker; pgrep -x sleep >/dev/null && echo sleep-alive || \
+                        (for p in /proc/[0-9]*; do [ \"$(cat $p/comm 2>/dev/null)\" = sleep ] && echo sleep-alive && break; done)"])
+                .await
+                .expect("exec after restart");
+            assert!(after.stdout.contains("kept"), "/workspace should survive: {}", after.stdout);
+            assert!(after.stdout.contains("sleep-alive"), "sandbox processes should survive: {}", after.stdout);
+        }))
+        .catch_unwind()
+        .await;
+
+        pods.delete(&name, &immediate_delete_params()).await.ok();
+        std::mem::forget(sandbox);
+        while pods.get_opt(&name).await.ok().flatten().is_some() {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        match checks {
+            Ok(finished) => finished.expect("the sidecar should be OOM-killed within the timeout"),
             Err(panic) => std::panic::resume_unwind(panic),
         }
     }
