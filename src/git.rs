@@ -316,26 +316,26 @@ mod server {
     pub async fn read_instructions_file(
         client: &kube::Client,
         pod_name: &str,
+        checkout: &str,
         path: &str,
     ) -> Result<Option<db::InstructionsFile>, String> {
-        let size = crate::sandbox::exec_with(
-            client,
-            pod_name,
-            "sandbox",
-            &["sh", "-c", r#"if [ -f "$1" ]; then wc -c < "$1"; else echo -; fi"#, "sh", path],
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        let file_bytes: i64 = match size.stdout.trim() {
-            "-" => return Ok(None),
-            n => n.parse().map_err(|_| format!("couldn't read {path}: {}", size.stderr.trim()))?,
-        };
+        // A regular file inside the checkout, by its real path: a symlinked
+        // AGENTS.md (or a symlinked directory above it) could otherwise
+        // load any file in the pod, the user's SSH key included, into the
+        // model's instructions. The first line is the file's size, or
+        // `-` (no such file) or `!` (not a regular file in the checkout);
+        // the content follows, read from the resolved path.
+        let script = r#"f="$1"; root="$2"; max="$3"
+            if [ ! -e "$f" ] && [ ! -L "$f" ]; then echo -; exit 0; fi
+            if [ -L "$f" ] || [ ! -f "$f" ]; then echo !; exit 0; fi
+            real=$(realpath -e -- "$f") && top=$(realpath -e -- "$root") || { echo !; exit 0; }
+            case "$real" in "$top"/*) ;; *) echo !; exit 0;; esac
+            wc -c < "$real" && head -c "$max" -- "$real""#;
         let read = crate::sandbox::exec_with(
             client,
             pod_name,
             "sandbox",
-            &["head", "-c", &INSTRUCTIONS_MAX_BYTES.to_string(), path],
+            &["sh", "-c", script, "sh", path, checkout, &INSTRUCTIONS_MAX_BYTES.to_string()],
             None,
         )
         .await
@@ -343,7 +343,19 @@ mod server {
         if read.exit_code != 0 {
             return Err(format!("couldn't read {path}: {}", read.stderr.trim()));
         }
-        let content = truncate_instructions(&read.stdout).to_string();
+        let (first, rest) = read.stdout.split_once('\n').unwrap_or((read.stdout.as_str(), ""));
+        let file_bytes: i64 = match first.trim() {
+            "-" => return Ok(None),
+            "!" => {
+                return Err(format!(
+                    "{path} isn't a regular file in the repository (a symlink, or it leads \
+                     outside the checkout), so it isn't loaded."
+                ));
+            }
+            n => n.parse().map_err(|_| format!("couldn't read {path}: {}", read.stderr.trim()))?,
+        };
+        let read_content = rest.to_string();
+        let content = truncate_instructions(&read_content).to_string();
         use sha2::Digest;
         let hash = sha2::Sha256::digest(content.as_bytes())
             .iter()
@@ -591,7 +603,8 @@ mod server {
         let client = sandbox::kube_client();
         let pod_name = sandbox::kubernetes_pod_name(pod_id);
         let full = format!("{}/{}/{rel_path}", crate::sandbox::WORKSPACE_DIR, repo.dir);
-        let mut file = read_instructions_file(&client, &pod_name, &full)
+        let checkout = format!("{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir);
+        let mut file = read_instructions_file(&client, &pod_name, &checkout, &full)
             .await?
             .ok_or_else(|| format!("There's no file at {full}."))?;
         file.commit = head_commit(&client, &pod_name, &repo.dir).await;
