@@ -5734,16 +5734,24 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
         })
-        .await
-        .expect("pod should be confirmed dead within 30s of a real OOM trigger");
+        .await;
 
+        // Delete the pod directly before asserting, not through the cleanup
+        // queue: a Failed pod is never removed by Kubernetes, and every run
+        // used to leave one behind.
+        let name = sandbox.pod_name.clone();
+        std::mem::forget(sandbox);
+        pods.delete(&name, &immediate_delete_params()).await.ok();
+        while pods.get_opt(&name).await.ok().flatten().is_some() {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+
+        let reason = reason.expect("pod should be confirmed dead within 30s of a real OOM trigger");
         assert_eq!(
             reason,
             Some("OOMKilled".to_string()),
             "a real OOM kill should surface as OOMKilled via the real Kubernetes API, not a constructed one"
         );
-
-        std::mem::forget(sandbox);
     }
 
     #[tokio::test]
