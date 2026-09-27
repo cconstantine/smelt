@@ -4369,7 +4369,7 @@ mod tests {
         let checks = tokio::time::timeout(Duration::from_secs(120), async {
             let main_commit = make_origin_repo(&sandbox).await;
 
-            let cloned = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin", false)
+            let cloned = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin", false, None)
                 .await
                 .expect("clone the default branch");
             assert_eq!(cloned.commit, main_commit);
@@ -4396,6 +4396,7 @@ mod tests {
                 Some("feature"),
                 "origin-feature",
                 false,
+                None,
             )
             .await
             .expect("clone a branch");
@@ -4432,13 +4433,13 @@ mod tests {
             assert_eq!(read.content, "Use \u{FFFD} tabs.\n");
             assert_eq!(read.file_bytes, 12);
 
-            let missing = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/nope.git", None, "nope", false)
+            let missing = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/nope.git", None, "nope", false, None)
                 .await
                 .expect_err("a missing repo fails");
             assert!(missing.contains("does not appear to be a git repository"), "{missing}");
 
             // The directory is taken: git's own message, not a silent overwrite.
-            let taken = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin", false)
+            let taken = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin", false, None)
                 .await
                 .expect_err("an existing directory fails");
             assert!(taken.contains("already exists"), "{taken}");
@@ -4451,10 +4452,21 @@ mod tests {
                 .await
                 .expect("exec make partial");
             assert_eq!(partial.exit_code, 0);
-            let replaced = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "partial", true)
+            let replaced = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "partial", true, None)
                 .await
                 .expect("a retry replaces the leftover directory");
             assert_eq!(replaced.commit, main_commit);
+            // The key a clone used is pinned in the checkout, so pushes
+            // use it too (SME-32 code review 2, finding 3).
+            let pinned_command = "ssh -i /etc/smelt/keys/b-repo -o IdentitiesOnly=yes";
+            crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "pinned", false, Some(pinned_command))
+                .await
+                .expect("clone with a key");
+            let pinned = sandbox
+                .exec(&["git", "-C", "/workspace/pinned", "config", "--local", "core.sshCommand"])
+                .await
+                .expect("exec git config");
+            assert_eq!(pinned.stdout.trim(), pinned_command);
             let gone = sandbox
                 .exec(&["test", "-e", "/workspace/partial/half-written"])
                 .await

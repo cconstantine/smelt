@@ -182,6 +182,24 @@ mod server {
         Some((host, path.to_string()))
     }
 
+    /// The `core.sshCommand` of each attempt to clone `url`: over SSH, one
+    /// per key, each offering only that key, since GitHub stops at the
+    /// first key it knows, and a deploy key for another repo then gets
+    /// "Repository not found". `None`: a single attempt with git's default
+    /// (https, a local path, or no keys to choose between).
+    pub fn key_attempts(url: &str, key_names: &[String]) -> Vec<Option<String>> {
+        let url = url.trim();
+        // scp-like (`git@host:path`) or `ssh://`: see `parse_remote`.
+        let over_ssh = url.starts_with("ssh://") || (!url.contains("://") && parse_remote(url).is_some());
+        if !over_ssh || key_names.is_empty() {
+            return vec![None];
+        }
+        key_names
+            .iter()
+            .map(|name| Some(format!("ssh -i {POD_GIT_DIR}/keys/{name} -o IdentitiesOnly=yes")))
+            .collect()
+    }
+
     /// What a finished clone checked out.
     #[derive(Clone, Debug, PartialEq)]
     pub struct ClonedRepo {
@@ -198,6 +216,7 @@ mod server {
         branch: Option<&str>,
         dir: &str,
         replace_leftover: bool,
+        ssh_command: Option<&str>,
     ) -> Result<ClonedRepo, String> {
         if parse_remote(url).is_none() {
             return Err(format!("{url} isn't a git URL smelt can clone."));
@@ -216,12 +235,13 @@ mod server {
         }
         // No prompts: nothing can answer one, and a clone waiting on a
         // password or a host key would hang until the timeout.
+        let ssh_setting = format!("core.sshCommand={} -o BatchMode=yes", ssh_command.unwrap_or("ssh"));
         let mut command = vec![
             "env",
             "GIT_TERMINAL_PROMPT=0",
             "git",
             "-c",
-            "core.sshCommand=ssh -o BatchMode=yes",
+            &ssh_setting,
             "clone",
             "--quiet",
         ];
@@ -244,6 +264,22 @@ mod server {
             } else {
                 output.to_string()
             });
+        }
+        // The key that could clone is the one for this repo from now on,
+        // pushes included.
+        if let Some(ssh_command) = ssh_command {
+            let pinned = crate::sandbox::exec_with(
+                client,
+                pod_name,
+                "sandbox",
+                &["git", "-C", &path, "config", "core.sshCommand", ssh_command],
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            if pinned.exit_code != 0 {
+                return Err(format!("cloned, but couldn't pin its SSH key: {}", pinned.stderr.trim()));
+            }
         }
         let head = crate::sandbox::exec_with(
             client,
@@ -905,7 +941,39 @@ mod server {
     ) -> Result<(), String> {
         let client = sandbox::kube_client();
         let pod_name = sandbox::kubernetes_pod_name(pod_id);
-        match clone_into_pod(&client, &pod_name, &repo.url, repo.branch.as_deref(), &repo.dir, replace_leftover).await {
+        let key_names: Vec<String> = db::list_ssh_keys(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|k| k.name)
+            .collect();
+        let attempts = key_attempts(&repo.url, &key_names);
+        let mut outcome = Err(String::new());
+        for (i, ssh_command) in attempts.iter().enumerate() {
+            outcome = clone_into_pod(
+                &client,
+                &pod_name,
+                &repo.url,
+                repo.branch.as_deref(),
+                &repo.dir,
+                replace_leftover && i == 0,
+                ssh_command.as_deref(),
+            )
+            .await;
+            if outcome.is_ok() {
+                break;
+            }
+        }
+        if attempts.len() > 1 {
+            outcome = outcome.map_err(|e| {
+                format!(
+                    "None of the SSH keys ({}) could clone {}. Add a key with access on smelt's Git page. Git said: {e}",
+                    key_names.join(", "),
+                    repo.url
+                )
+            });
+        }
+        match outcome {
             Ok(cloned) => {
                 record_cloned(pool, repo.id, &cloned, guard).await?;
                 // The clone is good even if its instructions can't be read;
@@ -1551,6 +1619,19 @@ mod server {
             a.await.expect("a");
             b.await.expect("b");
             assert_eq!(installed.lock().expect("log").last(), Some(&"new"), "the pod ends with the newest keys");
+        }
+
+        #[test]
+        fn test_an_ssh_clone_tries_each_key_on_its_own() {
+            let keys = vec!["a-repo".to_string(), "b-repo".to_string()];
+            let only = |name: &str| Some(format!("ssh -i /etc/smelt/keys/{name} -o IdentitiesOnly=yes"));
+            for url in ["git@github.com:o/b.git", "ssh://git@github.com/o/b"] {
+                assert_eq!(key_attempts(url, &keys), vec![only("a-repo"), only("b-repo")], "{url}");
+            }
+            // No keys to choose between, or no SSH at all: git's default.
+            assert_eq!(key_attempts("git@github.com:o/b.git", &[]), vec![None]);
+            assert_eq!(key_attempts("https://github.com/o/b", &keys), vec![None]);
+            assert_eq!(key_attempts("file:///tmp/origin.git", &keys), vec![None]);
         }
 
         #[test]
