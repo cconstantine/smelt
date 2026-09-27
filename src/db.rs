@@ -1170,16 +1170,19 @@ pub async fn retry_repo_clone(
     pool: &PgPool,
     id: i64,
     url: &str,
+    remote_key: &str,
     branch: Option<&str>,
 ) -> Result<ConversationRepo, sqlx::Error> {
     sqlx::query_as::<_, ConversationRepo>(
         "UPDATE conversation_repos
-            SET url = $2, branch = $3, status = 'cloning', error = NULL, updated_at = now()
+            SET url = $2, remote_key = $3, branch = $4, status = 'cloning', error = NULL,
+                agents_files = '{}', updated_at = now()
           WHERE id = $1
       RETURNING *",
     )
     .bind(id)
     .bind(url)
+    .bind(remote_key)
     .bind(branch)
     .fetch_one(pool)
     .await
@@ -2706,7 +2709,7 @@ mod tests {
         let listed = list_conversation_repos(&pool, conversation.id).await.expect("list");
         assert_eq!((listed[0].status.as_str(), listed[0].error.as_deref()), ("failed", Some("fatal: nope")));
 
-        let retried = retry_repo_clone(&pool, repo.id, "ssh://git@github.com/o/r", None)
+        let retried = retry_repo_clone(&pool, repo.id, "ssh://git@github.com/o/r", "github.com/o/r", None)
             .await
             .expect("retry");
         assert_eq!((retried.status.as_str(), retried.error.as_deref()), ("cloning", None));

@@ -2901,6 +2901,7 @@ fn ChatPanel(
     // "Work on a repo" in a new conversation.
     let mut repo_url = use_signal(String::new);
     let mut repo_branch = use_signal(String::new);
+    let mut repo_dir = use_signal(String::new);
     let mut repo_attaching = use_signal(|| false);
     let mut repo_attach_error: Signal<Option<String>> = use_signal(|| None);
     // The last Trust / Don't trust / Reload failure.
@@ -3066,6 +3067,7 @@ fn ChatPanel(
             // they were used in (SME-32 code review 8).
             repo_url.set(String::new());
             repo_branch.set(String::new());
+            repo_dir.set(String::new());
             repo_attaching.set(false);
             repo_attach_error.set(None);
             repo_action_error.set(None);
@@ -3955,10 +3957,11 @@ fn ChatPanel(
                                             }
                                             let url = repo_url();
                                             let branch = repo_branch();
+                                            let dir = repo_dir();
                                             repo_attaching.set(true);
                                             repo_attach_error.set(None);
                                             spawn(async move {
-                                                let result = attach_repo(id, url, branch).await;
+                                                let result = attach_repo(id, url, branch, dir).await;
                                                 // The user may have moved on to another conversation.
                                                 if selected() != Some(id) {
                                                     return;
@@ -3967,6 +3970,7 @@ fn ChatPanel(
                                                     Ok(_) => {
                                                         repo_url.set(String::new());
                                                         repo_branch.set(String::new());
+                                                        repo_dir.set(String::new());
                                                     }
                                                     Err(e) => repo_attach_error.set(Some(e.to_string())),
                                                 }
@@ -3990,6 +3994,14 @@ fn ChatPanel(
                                                 aria_label: "Branch",
                                                 value: "{repo_branch}",
                                                 oninput: move |e| repo_branch.set(e.value()),
+                                            }
+                                            input {
+                                                class: "repo-attach-branch",
+                                                r#type: "text",
+                                                placeholder: "directory (optional)",
+                                                aria_label: "Directory under /workspace",
+                                                value: "{repo_dir}",
+                                                oninput: move |e| repo_dir.set(e.value()),
                                             }
                                             button {
                                                 r#type: "submit",

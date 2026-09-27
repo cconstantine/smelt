@@ -71,10 +71,11 @@ pub async fn list_conversation_repos(id: i64) -> ServerFnResult<Vec<RepoSummary>
 /// start and the clone run in the background, so a closed tab can't cut
 /// them off. The panel follows them through `ReposUpdate`.
 #[post("/api/conversations/{id}/repos")]
-pub async fn attach_repo(id: i64, url: String, branch: String) -> ServerFnResult<RepoSummary> {
+pub async fn attach_repo(id: i64, url: String, branch: String, dir: String) -> ServerFnResult<RepoSummary> {
     let pool = db::get();
     let branch = Some(branch.trim()).filter(|b| !b.is_empty());
-    let (shown, pending, notices) = git::start_attach(pool, id, url.trim(), branch)
+    let dir = Some(dir.trim()).filter(|d| !d.is_empty());
+    let (shown, pending, notices) = git::start_attach(pool, id, url.trim(), branch, dir)
         .await
         .map_err(ServerFnError::new)?;
     for (conversation_id, notice) in notices {

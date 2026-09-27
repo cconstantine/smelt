@@ -859,11 +859,10 @@ mod server {
             return Ok(ClonePlan::Existing(same.clone()));
         }
         let retry = match existing.iter().find(|r| r.dir == dir) {
-            // A failed earlier attempt at the same directory is retried in
-            // place rather than recorded twice.
-            Some(failed) if failed.remote_key == key && failed.status == "failed" => {
-                Some(failed.id)
-            }
+            // A failed attempt at this directory is retried in place, with
+            // whatever repo is asked for now (a corrected URL, say): git
+            // removed what it made, so nothing there is the old repo's.
+            Some(failed) if failed.status == "failed" => Some(failed.id),
             Some(other) => {
                 return Err(format!(
                     "/workspace/{dir} is already used by {}. Pick another directory.",
@@ -887,7 +886,7 @@ mod server {
     ) -> Result<db::ConversationRepo, String> {
         let repo = match retry {
             // With what's asked for now, not what failed.
-            Some(id) => db::retry_repo_clone(pool, id, url, branch).await,
+            Some(id) => db::retry_repo_clone(pool, id, url, key, branch).await,
             None => db::create_conversation_repo(pool, conversation_id, url, key, branch, dir).await,
         }
         .map_err(|e| e.to_string())?;
@@ -945,7 +944,7 @@ mod server {
         url: &str,
         branch: Option<&str>,
     ) -> Result<RepoSummary, String> {
-        let (shown, pending, _notices) = start_attach(pool, conversation_id, url, branch).await?;
+        let (shown, pending, _notices) = start_attach(pool, conversation_id, url, branch, None).await?;
         Ok(finish_attach(pool, conversation_id, pending).await?.unwrap_or(shown))
     }
 
@@ -958,10 +957,11 @@ mod server {
         conversation_id: i64,
         url: &str,
         branch: Option<&str>,
+        dir: Option<&str>,
     ) -> Result<(RepoSummary, Option<db::ConversationRepo>, Vec<(i64, String)>), String> {
         let url = url.trim();
         let branch = branch.map(str::trim).filter(|b| !b.is_empty());
-        let (key, dir, retry) = match plan_clone(pool, conversation_id, url, branch, None).await? {
+        let (key, dir, retry) = match plan_clone(pool, conversation_id, url, branch, dir).await? {
             ClonePlan::Existing(repo) => {
                 // Already checked out (the model cloned it, say): the user
                 // naming it trusts it all the same.
@@ -1748,7 +1748,7 @@ mod server {
         #[sqlx::test]
         async fn test_starting_work_on_a_repo_records_it_without_touching_a_pod(pool: PgPool) {
             let conversation = db::create_conversation(&pool).await.expect("conversation");
-            let (shown, pending, _) = start_attach(&pool, conversation.id, "git@github.com:o/r.git", None)
+            let (shown, pending, _) = start_attach(&pool, conversation.id, "git@github.com:o/r.git", None, None)
                 .await
                 .expect("start");
             assert_eq!(shown.status, RepoStatus::Cloning);
@@ -1756,6 +1756,34 @@ mod server {
             assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("get"), Some(true));
             assert!(db::list_sandbox_pods(&pool, conversation.id).await.expect("pods").is_empty(), "no pod yet");
             assert!(!wait_for_clones(&pool, conversation.id, std::time::Duration::ZERO).await, "a turn waits for it");
+        }
+
+        /// "Work on a repo" never reaches a dead end (SME-32 code review
+        /// 10, finding 2): a failed clone's directory can be taken over by
+        /// a corrected URL, and a directory can be named for a second
+        /// checkout.
+        #[sqlx::test]
+        async fn test_work_on_a_repo_can_correct_a_url_or_name_a_directory(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let typo = db::create_conversation_repo(&pool, conversation.id, "git@github.com:me/app.git", "github.com/me/app", None, "app")
+                .await
+                .expect("repo");
+            db::set_repo_failed(&pool, typo.id, "ERROR: Repository not found.").await.expect("failed");
+
+            let (shown, pending, _) = start_attach(&pool, conversation.id, "git@github.com:org/app.git", None, None)
+                .await
+                .expect("the corrected URL takes the failed clone's place");
+            assert_eq!(shown.id, typo.id, "replaced, not added");
+            assert_eq!(shown.url, "git@github.com:org/app.git");
+            assert_eq!(pending.expect("to clone").remote_key, "github.com/org/app");
+
+            // The same repo on another branch, in a directory of its own.
+            db::set_repo_cloned(&pool, typo.id, "main", Some("abc")).await.expect("cloned");
+            let (shown, _, _) = start_attach(&pool, conversation.id, "git@github.com:org/app.git", Some("dev"), Some("app-dev"))
+                .await
+                .expect("a second checkout");
+            assert_eq!(shown.path, "/workspace/app-dev");
+            assert_eq!(list_repos(&pool, conversation.id).await.expect("list").len(), 2);
         }
 
         #[sqlx::test]
@@ -1783,7 +1811,7 @@ mod server {
 
             // "Work on a repo" with the same remote, from another conversation.
             let attaching = db::create_conversation(&pool).await.expect("conversation");
-            let (_, _, notices) = start_attach(&pool, attaching.id, "https://github.com/o/r", None)
+            let (_, _, notices) = start_attach(&pool, attaching.id, "https://github.com/o/r", None, None)
                 .await
                 .expect("start");
             assert!(only_repo(&pool, waiting.id).await.trust_requests.is_empty(), "no card left behind");
