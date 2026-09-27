@@ -1668,6 +1668,13 @@ async fn test_end_to_end_browser_scenarios() {
             wait_for_text(&trust_page, "Browser tier rule: always run the linter.", Duration::from_secs(10)).await,
             "the trust card should show the AGENTS.md it asks about"
         );
+        // The repo shows in the panel with no pod running (SME-32 code
+        // review 10, finding 1).
+        // (By the panel's own element: the card's file path has the same text.)
+        assert!(
+            wait_for_count(&trust_page, ".sandbox-repo", 1, Duration::from_secs(10)).await,
+            "the panel should list the conversation's repos even without a pod"
+        );
         click_when_present(&trust_page, ".trust-card-trust", Duration::from_secs(5)).await;
         assert!(
             wait_for_count(&trust_page, ".trust-card", 0, Duration::from_secs(10)).await,

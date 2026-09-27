@@ -3472,7 +3472,7 @@ fn ChatPanel(
                     let tool_results = tool_results_by_id(&messages());
                     let commands = terminal_commands_by_id(&messages());
                     rsx! {
-                    if !tasks().is_empty() || !sandbox_pods().is_empty() || !todos().is_empty() || browsing_session_open() {
+                    if !tasks().is_empty() || !sandbox_pods().is_empty() || !repos().is_empty() || !todos().is_empty() || browsing_session_open() {
                         div { class: "side-panels-row",
                             if browsing_session_open() {
                                 aside { class: "browsing-panel",
@@ -3684,9 +3684,35 @@ fn ChatPanel(
                                     }
                                 }
                             }
-                            if !sandbox_pods().is_empty() {
+                            if !sandbox_pods().is_empty() || !repos().is_empty() {
                                 aside { class: "sandbox-panel",
                                     h3 { "Sandbox" }
+                                    // The conversation's repos, pod or not: /workspace and
+                                    // its checkouts outlive the pod, and a clone that
+                                    // failed to start a sandbox must still say so.
+                                            if !repos().is_empty() {
+                                                div { class: "sandbox-repos",
+                                                    for repo in repos() {
+                                                        div {
+                                                            key: "{repo.id}",
+                                                            class: "sandbox-repo sandbox-repo-{repo_status_class(repo.status)}",
+                                                            title: "{repo.url}",
+                                                            code { class: "sandbox-repo-path", "{repo.path}" }
+                                                            span { class: "sandbox-repo-detail", "{repo_detail(&repo)}" }
+                                                            if let Some(label) = instructions_label(&repo) {
+                                                                span {
+                                                                    class: "sandbox-repo-instructions",
+                                                                    title: "The model loads a repo's AGENTS.md files with load_instructions. Loaded ones are in its context on every turn; see the context view.",
+                                                                    "{label}"
+                                                                }
+                                                            }
+                                                            if let Some(err) = repo.error.clone() {
+                                                                pre { class: "sandbox-repo-error", "{err}" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                     // A conversation has at most one live pod (see
                                     // SME-11's "One pod
                                     // per conversation") — straight through, no tab
@@ -3717,29 +3743,6 @@ fn ChatPanel(
                                                             rel: "noopener noreferrer",
                                                             title: "Open what's running on {preview.label()} in the sandbox, in a new tab",
                                                             "Open preview · {preview.label()}"
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if !repos().is_empty() {
-                                                div { class: "sandbox-repos",
-                                                    for repo in repos() {
-                                                        div {
-                                                            key: "{repo.id}",
-                                                            class: "sandbox-repo sandbox-repo-{repo_status_class(repo.status)}",
-                                                            title: "{repo.url}",
-                                                            code { class: "sandbox-repo-path", "{repo.path}" }
-                                                            span { class: "sandbox-repo-detail", "{repo_detail(&repo)}" }
-                                                            if let Some(label) = instructions_label(&repo) {
-                                                                span {
-                                                                    class: "sandbox-repo-instructions",
-                                                                    title: "The model loads a repo's AGENTS.md files with load_instructions. Loaded ones are in its context on every turn; see the context view.",
-                                                                    "{label}"
-                                                                }
-                                                            }
-                                                            if let Some(err) = repo.error.clone() {
-                                                                pre { class: "sandbox-repo-error", "{err}" }
-                                                            }
                                                         }
                                                     }
                                                 }
