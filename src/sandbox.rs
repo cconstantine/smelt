@@ -4365,7 +4365,7 @@ mod tests {
         let checks = tokio::time::timeout(Duration::from_secs(120), async {
             let main_commit = make_origin_repo(&sandbox).await;
 
-            let cloned = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin")
+            let cloned = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin", false)
                 .await
                 .expect("clone the default branch");
             assert_eq!(cloned.commit, main_commit);
@@ -4391,6 +4391,7 @@ mod tests {
                 "file:///tmp/origin.git",
                 Some("feature"),
                 "origin-feature",
+                false,
             )
             .await
             .expect("clone a branch");
@@ -4412,16 +4413,34 @@ mod tests {
                 .expect("read a repo without one");
             assert_eq!(none, None);
 
-            let missing = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/nope.git", None, "nope")
+            let missing = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/nope.git", None, "nope", false)
                 .await
                 .expect_err("a missing repo fails");
             assert!(missing.contains("does not appear to be a git repository"), "{missing}");
 
             // The directory is taken: git's own message, not a silent overwrite.
-            let taken = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin")
+            let taken = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin", false)
                 .await
                 .expect_err("an existing directory fails");
             assert!(taken.contains("already exists"), "{taken}");
+
+            // Retrying a failed clone clears what an interrupted one left
+            // behind in the (persistent) directory (SME-32 code review,
+            // finding 4).
+            let partial = sandbox
+                .exec(&["sh", "-c", "mkdir -p /workspace/partial/.git && echo half > /workspace/partial/half-written"])
+                .await
+                .expect("exec make partial");
+            assert_eq!(partial.exit_code, 0);
+            let replaced = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "partial", true)
+                .await
+                .expect("a retry replaces the leftover directory");
+            assert_eq!(replaced.commit, main_commit);
+            let gone = sandbox
+                .exec(&["test", "-e", "/workspace/partial/half-written"])
+                .await
+                .expect("exec test");
+            assert_eq!(gone.exit_code, 1, "the leftover is gone");
         })
         .await;
 

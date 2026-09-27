@@ -197,11 +197,23 @@ mod server {
         url: &str,
         branch: Option<&str>,
         dir: &str,
+        replace_leftover: bool,
     ) -> Result<ClonedRepo, String> {
         if parse_remote(url).is_none() {
             return Err(format!("{url} isn't a git URL smelt can clone."));
         }
         let path = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
+        // A clone cut off midway (Stop, a timeout, a restart) can leave a
+        // partial checkout, and /workspace outlives the pod: a retry of
+        // that clone replaces it rather than failing on it forever.
+        if replace_leftover {
+            let cleared = crate::sandbox::exec_with(client, pod_name, "sandbox", &["rm", "-rf", "--", &path], None)
+                .await
+                .map_err(|e| e.to_string())?;
+            if cleared.exit_code != 0 {
+                return Err(format!("couldn't clear {path} to clone again: {}", cleared.stderr.trim()));
+            }
+        }
         // No prompts: nothing can answer one, and a clone waiting on a
         // password or a host key would hang until the timeout.
         let mut command = vec![
@@ -692,8 +704,10 @@ mod server {
         pod_id: i64,
         repo: db::ConversationRepo,
         guard: CloneGuard,
+        retrying: bool,
     ) -> Result<RepoSummary, String> {
-        let outcome = clone_repo_row(pool, pod_id, &repo).await;
+        // A retry's directory is the failed attempt's, maybe half written.
+        let outcome = clone_repo_row(pool, pod_id, &repo, retrying).await;
         guard.finish();
         publish_repos(pool, conversation_id).await;
         outcome?;
@@ -722,7 +736,7 @@ mod server {
         })?;
         let repo = record_clone(pool, conversation_id, url, branch, &key, &dir, retry).await?;
         let guard = CloneGuard::new(pool, repo.id, conversation_id);
-        run_clone(pool, conversation_id, pod_id, repo, guard).await
+        run_clone(pool, conversation_id, pod_id, repo, guard, retry.is_some()).await
     }
 
     /// The user's "Work on a repo": the repo is recorded first, so a
@@ -760,7 +774,7 @@ mod server {
                 return Err(e);
             }
         };
-        run_clone(pool, conversation_id, pod_id, repo, guard).await
+        run_clone(pool, conversation_id, pod_id, repo, guard, retry.is_some()).await
     }
 
     /// The conversation's live pod, started if it has none.
@@ -837,10 +851,15 @@ mod server {
     }
 
     /// Clones one recorded repo into pod `pod_id` and records how it went.
-    async fn clone_repo_row(pool: &PgPool, pod_id: i64, repo: &db::ConversationRepo) -> Result<(), String> {
+    async fn clone_repo_row(
+        pool: &PgPool,
+        pod_id: i64,
+        repo: &db::ConversationRepo,
+        replace_leftover: bool,
+    ) -> Result<(), String> {
         let client = sandbox::kube_client();
         let pod_name = sandbox::kubernetes_pod_name(pod_id);
-        match clone_into_pod(&client, &pod_name, &repo.url, repo.branch.as_deref(), &repo.dir).await {
+        match clone_into_pod(&client, &pod_name, &repo.url, repo.branch.as_deref(), &repo.dir, replace_leftover).await {
             Ok(cloned) => {
                 db::set_repo_cloned(pool, repo.id, &cloned.branch, &cloned.commit)
                     .await
