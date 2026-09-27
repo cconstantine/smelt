@@ -2746,3 +2746,17 @@ div.mcp-status-not-connected::before {
     color: var(--muted);
     cursor: not-allowed;
 }
+
+.sandbox-repo-instructions {
+    font-size: 12px;
+    color: var(--ok);
+}
+
+.context-detail-instructions {
+    margin: 6px 0;
+}
+
+.context-detail-instructions summary {
+    cursor: pointer;
+    font-size: 13px;
+}

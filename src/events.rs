@@ -610,6 +610,7 @@ mod wire_tests {
                     commit: Some("abc123".to_string()),
                     status: crate::git::RepoStatus::Failed,
                     error: Some("fatal: nope".to_string()),
+                    instructions: crate::git::InstructionsState::None,
                 }],
             },
         ]

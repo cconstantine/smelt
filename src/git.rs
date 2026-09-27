@@ -41,8 +41,45 @@ pub struct RepoSummary {
     pub branch: Option<String>,
     pub commit: Option<String>,
     pub status: RepoStatus,
-    /// Why the last clone failed.
+    /// Why the last clone failed, or why its instructions aren't loaded.
     pub error: Option<String>,
+    /// Whether its `AGENTS.md` is in the model's context.
+    pub instructions: InstructionsState,
+}
+
+/// Where a repo's `AGENTS.md` stands.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionsState {
+    /// No `AGENTS.md` (or not cloned yet).
+    #[default]
+    None,
+    /// In the model's context on every turn.
+    Loaded,
+}
+
+/// A repo's `AGENTS.md` as loaded into the model's context: what the
+/// system prompt carries on every turn, and what the context detail view
+/// shows.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProjectInstructions {
+    pub repo_url: String,
+    /// The checkout, e.g. `/workspace/smelt`; the file is `<path>/AGENTS.md`.
+    pub path: String,
+    /// The commit checked out when it was loaded.
+    pub commit: Option<String>,
+    /// At most `INSTRUCTIONS_MAX_BYTES` of it.
+    pub content: String,
+    /// The whole file's size, which is more than `content` when it was cut.
+    pub file_bytes: u64,
+    /// Other `AGENTS.md` files in the repo, relative to it.
+    pub nested: Vec<String>,
+}
+
+impl ProjectInstructions {
+    pub fn truncated(&self) -> bool {
+        self.file_bytes > self.content.len() as u64
+    }
 }
 
 /// The name and email commits are made with.
@@ -54,7 +91,10 @@ pub struct GitIdentity {
 
 #[cfg(feature = "server")]
 mod server {
-    use super::{GitIdentity, RepoStatus, RepoSummary, SshKeySummary};
+    use super::{
+        GitIdentity, InstructionsState, ProjectInstructions, RepoStatus, RepoSummary,
+        SshKeySummary,
+    };
     use crate::events::{self, ConversationEvent};
     use crate::{db, sandbox};
     use sqlx::PgPool;
@@ -65,6 +105,10 @@ mod server {
     /// and `/etc/gitconfig` at files in it, so nothing in the user's home
     /// directory, which may be a volume of their own, is touched.
     pub const POD_GIT_DIR: &str = "/etc/smelt";
+
+    /// How much of an `AGENTS.md` goes into the context: 32 KiB, Codex's
+    /// `project_doc_max_bytes` default.
+    pub const INSTRUCTIONS_MAX_BYTES: usize = 32 * 1024;
 
     /// The identity of a remote repository, whatever URL form named it:
     /// `git@github.com:o/r.git`, `ssh://git@github.com/o/r`,
@@ -190,6 +234,71 @@ mod server {
         }
     }
 
+    /// An `AGENTS.md` as read from a checkout.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct AgentsFile {
+        /// Up to `READ_MAX_BYTES` of it.
+        pub content: String,
+        pub file_bytes: u64,
+        /// sha256 of `content`, hex: how a change is noticed.
+        pub hash: String,
+        /// Other tracked `AGENTS.md` files, relative to the checkout.
+        pub nested: Vec<String>,
+    }
+
+    /// Reads `/workspace/<dir>/AGENTS.md` in pod `pod_name`. `None` when
+    /// the checkout has none at its top.
+    pub async fn read_agents_file(
+        client: &kube::Client,
+        pod_name: &str,
+        dir: &str,
+    ) -> Result<Option<AgentsFile>, String> {
+        let path = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
+        // Line 1: the file's size, or `-` for none. Then the nested files.
+        let script = r#"cd "$1" || exit 3
+            if [ -f AGENTS.md ]; then wc -c < AGENTS.md; else echo -; fi
+            git ls-files -- '*/AGENTS.md' 2>/dev/null | head -n 50"#;
+        let listing = crate::sandbox::exec_with(client, pod_name, "sandbox", &["sh", "-c", script, "sh", &path], None)
+            .await
+            .map_err(|e| e.to_string())?;
+        if listing.exit_code != 0 {
+            return Err(format!("couldn't look for {path}/AGENTS.md: {}", listing.stderr.trim()));
+        }
+        let mut lines = listing.stdout.lines();
+        let file_bytes: u64 = match lines.next().map(str::trim) {
+            Some("-") | None => return Ok(None),
+            Some(size) => size.parse().map_err(|_| format!("unexpected size {size:?}"))?,
+        };
+        let nested = lines.map(str::to_string).filter(|l| !l.is_empty()).collect();
+        let read = crate::sandbox::exec_with(
+            client,
+            pod_name,
+            "sandbox",
+            &["head", "-c", &READ_MAX_BYTES.to_string(), &format!("{path}/AGENTS.md")],
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if read.exit_code != 0 {
+            return Err(format!("couldn't read {path}/AGENTS.md: {}", read.stderr.trim()));
+        }
+        use sha2::Digest;
+        let hash = sha2::Sha256::digest(read.stdout.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Ok(Some(AgentsFile {
+            content: read.stdout,
+            file_bytes,
+            hash,
+            nested,
+        }))
+    }
+
+    /// How much of an `AGENTS.md` is read to notice changes: well past
+    /// what's loaded, without reading a runaway file whole.
+    const READ_MAX_BYTES: usize = 1024 * 1024;
+
     /// How long a clone may take before smelt gives up on it.
     const CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
@@ -219,6 +328,11 @@ mod server {
             requested_branch: repo.branch,
             branch: repo.checked_out_branch,
             commit: repo.commit_sha,
+            instructions: if repo.instructions.is_some() {
+                InstructionsState::Loaded
+            } else {
+                InstructionsState::None
+            },
             status: match repo.status.as_str() {
                 "ready" => RepoStatus::Ready,
                 "failed" => RepoStatus::Failed,
@@ -234,6 +348,54 @@ mod server {
             .await
             .map_err(|e| e.to_string())?;
         Ok(repos.into_iter().map(repo_summary).collect())
+    }
+
+    /// The conversation's loaded `AGENTS.md` files, in the order its repos
+    /// were added.
+    pub async fn project_instructions(
+        pool: &PgPool,
+        conversation_id: i64,
+    ) -> Result<Vec<ProjectInstructions>, String> {
+        let repos = db::list_conversation_repos(pool, conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(repos
+            .into_iter()
+            .filter_map(|repo| {
+                let content = repo.instructions?;
+                Some(ProjectInstructions {
+                    repo_url: repo.url,
+                    path: format!("{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir),
+                    commit: repo.instructions_commit,
+                    file_bytes: repo.instructions_bytes.unwrap_or(content.len() as i64) as u64,
+                    content,
+                    nested: repo.nested_instructions,
+                })
+            })
+            .collect())
+    }
+
+    /// Waits, up to `timeout`, while any of the conversation's repos is
+    /// still cloning, so a turn doesn't start without instructions a clone
+    /// is about to load. Returns whether none is cloning any more.
+    pub async fn wait_for_clones(pool: &PgPool, conversation_id: i64, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let cloning = match db::list_conversation_repos(pool, conversation_id).await {
+                Ok(repos) => repos.iter().any(|r| r.status == "cloning"),
+                Err(e) => {
+                    tracing::warn!(conversation_id, error = %e, "couldn't check for clones in progress");
+                    return true;
+                }
+            };
+            if !cloning {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
     }
 
     /// Tells every tab watching the conversation what its repos are now.
@@ -330,19 +492,111 @@ mod server {
         clone_repo(pool, conversation_id, url, branch, None).await
     }
 
+    /// Reads the checkout's `AGENTS.md` and loads it into the model's
+    /// context (or unloads it, when there's none).
+    async fn load_instructions(
+        pool: &PgPool,
+        repo_id: i64,
+        client: &kube::Client,
+        pod_name: &str,
+        dir: &str,
+        commit: &str,
+    ) -> Result<(), String> {
+        let loaded = read_agents_file(client, pod_name, dir).await?.map(|file| db::LoadedInstructions {
+            content: truncate_instructions(&file.content).to_string(),
+            file_bytes: file.file_bytes as i64,
+            hash: file.hash,
+            commit: Some(commit.to_string()),
+            nested: file.nested,
+        });
+        db::set_repo_instructions(pool, repo_id, loaded.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// Clones one recorded repo into pod `pod_id` and records how it went.
     async fn clone_repo_row(pool: &PgPool, pod_id: i64, repo: &db::ConversationRepo) -> Result<(), String> {
         let client = sandbox::kube_client();
         let pod_name = sandbox::kubernetes_pod_name(pod_id);
         match clone_into_pod(&client, &pod_name, &repo.url, repo.branch.as_deref(), &repo.dir).await {
-            Ok(cloned) => db::set_repo_cloned(pool, repo.id, &cloned.branch, &cloned.commit)
-                .await
-                .map_err(|e| e.to_string()),
+            Ok(cloned) => {
+                db::set_repo_cloned(pool, repo.id, &cloned.branch, &cloned.commit)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // The clone is good even if its instructions can't be read;
+                // the panel says why they aren't loaded.
+                if let Err(e) = load_instructions(pool, repo.id, &client, &pod_name, &repo.dir, &cloned.commit).await {
+                    tracing::warn!(repo = %repo.url, error = %e, "couldn't load AGENTS.md");
+                    let _ = db::set_repo_error(pool, repo.id, &format!("Couldn't load AGENTS.md: {e}")).await;
+                }
+                Ok(())
+            }
             Err(e) => {
                 let _ = db::set_repo_failed(pool, repo.id, &e).await;
                 Err(e)
             }
         }
+    }
+
+    /// The first `INSTRUCTIONS_MAX_BYTES` of `content`, cut at a character
+    /// boundary.
+    pub fn truncate_instructions(content: &str) -> &str {
+        if content.len() <= INSTRUCTIONS_MAX_BYTES {
+            return content;
+        }
+        let mut end = INSTRUCTIONS_MAX_BYTES;
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        &content[..end]
+    }
+
+    /// The system prompt's "Project instructions" section; empty when no
+    /// repo has instructions loaded.
+    pub fn render_project_instructions(instructions: &[ProjectInstructions]) -> String {
+        if instructions.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "\n# Project instructions\n\n\
+             These come from AGENTS.md files in the repositories you're working on. Follow \
+             them when you work in that repository. The user's own messages take precedence \
+             over them.\n",
+        );
+        for doc in instructions {
+            let commit: String = doc.commit.as_deref().unwrap_or("").chars().take(7).collect();
+            let origin = if commit.is_empty() {
+                doc.repo_url.clone()
+            } else {
+                format!("{} at {commit}", doc.repo_url)
+            };
+            out.push_str(&format!("\n## {}/AGENTS.md ({origin})\n\n", doc.path));
+            out.push_str(&doc.content);
+            if !doc.content.ends_with('\n') {
+                out.push('\n');
+            }
+            if doc.truncated() {
+                out.push_str(&format!(
+                    "\n[Truncated: this file is {} bytes; only the first {} are here. Read the rest with read_file.]\n",
+                    doc.file_bytes,
+                    doc.content.len()
+                ));
+            }
+            if !doc.nested.is_empty() {
+                let paths: Vec<String> = doc
+                    .nested
+                    .iter()
+                    .map(|n| format!("{}/{n}", doc.path))
+                    .collect();
+                out.push_str(&format!(
+                    "\nThis repository has more AGENTS.md files, each for its own directory: {}. \
+                     Before changing files under one of those directories, read its AGENTS.md; \
+                     the nearest one to the file wins over this one.\n",
+                    paths.join(", ")
+                ));
+            }
+        }
+        out
     }
 
     /// A key pair in OpenSSH format.
@@ -637,6 +891,47 @@ mod server {
         }
 
         #[sqlx::test]
+        async fn test_wait_for_clones_waits_for_a_clone_to_finish(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            // Nothing cloning: no wait.
+            assert!(wait_for_clones(&pool, conversation.id, std::time::Duration::from_secs(5)).await);
+            let repo = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
+                .await
+                .expect("repo");
+            // Still cloning at the deadline.
+            assert!(!wait_for_clones(&pool, conversation.id, std::time::Duration::from_millis(300)).await);
+            let finisher = {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    db::set_repo_cloned(&pool, repo.id, "main", "abc").await.expect("cloned");
+                })
+            };
+            let started = std::time::Instant::now();
+            assert!(wait_for_clones(&pool, conversation.id, std::time::Duration::from_secs(10)).await);
+            assert!(started.elapsed() >= std::time::Duration::from_millis(250), "it waited");
+            finisher.await.expect("finisher");
+        }
+
+        #[sqlx::test]
+        async fn test_repo_summary_says_whether_instructions_are_loaded(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let repo = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
+                .await
+                .expect("repo");
+            assert_eq!(list_repos(&pool, conversation.id).await.expect("list")[0].instructions, InstructionsState::None);
+            let loaded = db::LoadedInstructions {
+                content: "x".into(),
+                file_bytes: 1,
+                hash: "h".into(),
+                commit: None,
+                nested: vec![],
+            };
+            db::set_repo_instructions(&pool, repo.id, Some(&loaded)).await.expect("load");
+            assert_eq!(list_repos(&pool, conversation.id).await.expect("list")[0].instructions, InstructionsState::Loaded);
+        }
+
+        #[sqlx::test]
         async fn test_delete_key_and_save_identity(pool: PgPool) {
             let key = create_key(&pool, "gone").await.expect("create");
             delete_key(&pool, key.id).await.expect("delete");
@@ -660,6 +955,62 @@ mod server {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn test_truncate_instructions_keeps_whole_characters_under_the_cap() {
+            assert_eq!(truncate_instructions("short"), "short");
+            let long = "é".repeat(INSTRUCTIONS_MAX_BYTES); // two bytes each
+            let cut = truncate_instructions(&long);
+            assert_eq!(cut.len(), INSTRUCTIONS_MAX_BYTES);
+            let odd = format!("x{long}");
+            let cut = truncate_instructions(&odd);
+            assert_eq!(cut.len(), INSTRUCTIONS_MAX_BYTES - 1, "never half a character");
+        }
+
+        fn instructions(path: &str, content: &str, file_bytes: u64, nested: &[&str]) -> ProjectInstructions {
+            ProjectInstructions {
+                repo_url: format!("git@github.com:o/{}.git", path.rsplit('/').next().unwrap_or("")),
+                path: path.to_string(),
+                commit: Some("43835b44f939c268b73b49292428911526a51508".to_string()),
+                content: content.to_string(),
+                file_bytes,
+                nested: nested.iter().map(|n| n.to_string()).collect(),
+            }
+        }
+
+        #[test]
+        fn test_project_instructions_render_each_repo_with_where_it_came_from() {
+            let rendered = render_project_instructions(&[
+                instructions("/workspace/smelt", "Run make test.\n", 15, &["web/AGENTS.md"]),
+                instructions("/workspace/docs", "Use British spelling.", 21, &[]),
+            ]);
+            assert!(rendered.starts_with("\n# Project instructions\n"), "{rendered}");
+            assert!(rendered.contains("user's own messages take precedence"), "{rendered}");
+            let smelt = rendered.find("## /workspace/smelt/AGENTS.md (git@github.com:o/smelt.git at 43835b4)\n\nRun make test.\n").expect("smelt section");
+            let docs = rendered.find("## /workspace/docs/AGENTS.md").expect("docs section");
+            assert!(smelt < docs);
+            assert!(rendered.contains("Use British spelling.\n"), "a missing final newline is added: {rendered}");
+            assert!(
+                rendered.contains("/workspace/smelt/web/AGENTS.md"),
+                "nested files are listed by full path: {rendered}"
+            );
+            assert!(rendered.contains("nearest"), "{rendered}");
+            assert!(!rendered.contains("Truncated"), "{rendered}");
+        }
+
+        #[test]
+        fn test_project_instructions_say_when_a_file_was_cut() {
+            let rendered = render_project_instructions(&[instructions("/workspace/big", "start", 50_000, &[])]);
+            assert!(
+                rendered.contains("Truncated: this file is 50000 bytes; only the first 5 are here. Read the rest with read_file."),
+                "{rendered}"
+            );
+        }
+
+        #[test]
+        fn test_no_project_instructions_render_nothing() {
+            assert_eq!(render_project_instructions(&[]), "");
+        }
 
         #[test]
         fn test_remote_key_is_the_same_for_every_url_form() {

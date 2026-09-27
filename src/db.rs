@@ -880,6 +880,46 @@ pub struct ConversationRepo {
     pub commit_sha: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
+    /// Its AGENTS.md as loaded into the model's context, `None` when
+    /// nothing is (see the migration).
+    pub instructions: Option<String>,
+    pub instructions_bytes: Option<i64>,
+    pub instructions_hash: Option<String>,
+    pub instructions_commit: Option<String>,
+    pub nested_instructions: Vec<String>,
+}
+
+/// What gets loaded for a repo's AGENTS.md; see `ConversationRepo`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedInstructions {
+    pub content: String,
+    pub file_bytes: i64,
+    pub hash: String,
+    pub commit: Option<String>,
+    pub nested: Vec<String>,
+}
+
+/// Loads (`Some`) or unloads (`None`) a repo's instructions.
+pub async fn set_repo_instructions(
+    pool: &PgPool,
+    id: i64,
+    loaded: Option<&LoadedInstructions>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE conversation_repos
+            SET instructions = $2, instructions_bytes = $3, instructions_hash = $4,
+                instructions_commit = $5, nested_instructions = $6, updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(loaded.map(|l| l.content.as_str()))
+    .bind(loaded.map(|l| l.file_bytes))
+    .bind(loaded.map(|l| l.hash.as_str()))
+    .bind(loaded.and_then(|l| l.commit.as_deref()))
+    .bind(loaded.map(|l| l.nested.clone()).unwrap_or_default())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Records a repo, `cloning`. Fails on a `dir` the conversation already uses.
@@ -947,6 +987,17 @@ pub async fn set_repo_cloned(
     .bind(commit_sha)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// A problem with a repo that doesn't change its status, such as its
+/// AGENTS.md being unreadable after a good clone.
+pub async fn set_repo_error(pool: &PgPool, id: i64, error: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE conversation_repos SET error = $2, updated_at = now() WHERE id = $1")
+        .bind(id)
+        .bind(error)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -2453,6 +2504,26 @@ mod tests {
         assert_eq!(listed[0].error, None);
         assert_eq!(listed[0].checked_out_branch.as_deref(), Some("dev"));
         assert_eq!(listed[0].commit_sha.as_deref(), Some("abc123"));
+
+        // Loading and unloading instructions.
+        let loaded = LoadedInstructions {
+            content: "Run make test.\n".to_string(),
+            file_bytes: 15,
+            hash: "abc".to_string(),
+            commit: Some("abc123".to_string()),
+            nested: vec!["web/AGENTS.md".to_string()],
+        };
+        set_repo_instructions(&pool, repo.id, Some(&loaded)).await.expect("load");
+        let row = &list_conversation_repos(&pool, conversation.id).await.expect("list")[0];
+        assert_eq!(row.instructions.as_deref(), Some("Run make test.\n"));
+        assert_eq!(row.instructions_bytes, Some(15));
+        assert_eq!(row.instructions_hash.as_deref(), Some("abc"));
+        assert_eq!(row.instructions_commit.as_deref(), Some("abc123"));
+        assert_eq!(row.nested_instructions, vec!["web/AGENTS.md".to_string()]);
+        set_repo_instructions(&pool, repo.id, None).await.expect("unload");
+        let row = &list_conversation_repos(&pool, conversation.id).await.expect("list")[0];
+        assert_eq!((row.instructions.clone(), row.instructions_hash.clone()), (None, None));
+        assert!(row.nested_instructions.is_empty());
 
         // One checkout per directory.
         assert!(

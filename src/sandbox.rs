@@ -4342,7 +4342,8 @@ mod tests {
             printf 'Run make test before committing.\n' > AGENTS.md
             git add AGENTS.md && git -c user.name=t -c user.email=t@t commit -qm first
             git branch feature && git checkout -q feature
-            printf 'x\n' > feature.txt && git add feature.txt
+            printf 'x\n' > feature.txt && mkdir web && printf 'Use pnpm.\n' > web/AGENTS.md
+            git add feature.txt web/AGENTS.md
             git -c user.name=t -c user.email=t@t commit -qm feature && git checkout -q main
             git clone -q --bare /tmp/src /tmp/origin.git
             git rev-parse main"#;
@@ -4375,6 +4376,15 @@ mod tests {
                 .expect("exec cat");
             assert_eq!(agents.stdout, "Run make test before committing.\n");
 
+            let read = crate::git::read_agents_file(&client, &pod_name, "origin")
+                .await
+                .expect("read AGENTS.md")
+                .expect("origin has an AGENTS.md");
+            assert_eq!(read.content, "Run make test before committing.\n");
+            assert_eq!(read.file_bytes, 33);
+            assert_eq!(read.hash.len(), 64, "sha256 hex: {}", read.hash);
+            assert!(read.nested.is_empty(), "main has no nested files: {:?}", read.nested);
+
             let feature = crate::git::clone_into_pod(
                 &client,
                 &pod_name,
@@ -4386,6 +4396,21 @@ mod tests {
             .expect("clone a branch");
             assert_eq!(feature.branch, "feature");
             assert_ne!(feature.commit, main_commit);
+            let read = crate::git::read_agents_file(&client, &pod_name, "origin-feature")
+                .await
+                .expect("read AGENTS.md")
+                .expect("feature has an AGENTS.md");
+            assert_eq!(read.nested, vec!["web/AGENTS.md".to_string()]);
+
+            let bare = sandbox
+                .exec(&["git", "init", "-q", "/workspace/no-agents"])
+                .await
+                .expect("exec git init");
+            assert_eq!(bare.exit_code, 0);
+            let none = crate::git::read_agents_file(&client, &pod_name, "no-agents")
+                .await
+                .expect("read a repo without one");
+            assert_eq!(none, None);
 
             let missing = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/nope.git", None, "nope")
                 .await
@@ -4975,7 +5000,7 @@ mod tests {
                 &client,
                 &pod_name(pod_a),
                 "sandbox",
-                &["sh", "-c", "set -e; git init -q -b main /tmp/src; cd /tmp/src; echo hi > README; git add README; git commit -qm one; git clone -q --bare /tmp/src /tmp/origin.git; git rev-parse HEAD"],
+                &["sh", "-c", "set -e; git init -q -b main /tmp/src; cd /tmp/src; echo 'Run make test.' > AGENTS.md; git add AGENTS.md; git commit -qm one; git clone -q --bare /tmp/src /tmp/origin.git; git rev-parse HEAD"],
                 None,
             )
             .await
@@ -4988,6 +5013,14 @@ mod tests {
             assert_eq!(repo.status, crate::git::RepoStatus::Ready);
             assert_eq!(repo.commit.as_deref(), Some(origin.stdout.trim()));
             assert_eq!(repo.branch.as_deref(), Some("main"));
+            // Its AGENTS.md is loaded into the model's context.
+            let loaded = crate::git::project_instructions(&pool, conversation_a.id)
+                .await
+                .expect("project instructions");
+            assert_eq!(loaded.len(), 1, "{loaded:?}");
+            assert_eq!(loaded[0].content, "Run make test.\n");
+            assert_eq!(loaded[0].path, "/workspace/origin");
+            assert_eq!(loaded[0].commit, repo.commit);
             // Asking again returns the same checkout rather than a second clone.
             let again = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, None)
                 .await

@@ -681,6 +681,25 @@ fn tool_summary(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
+/// Where a loaded `AGENTS.md` came from, for the context detail view.
+fn instructions_source(doc: &crate::git::ProjectInstructions) -> String {
+    let commit: String = doc.commit.as_deref().unwrap_or("").chars().take(7).collect();
+    let origin = if commit.is_empty() {
+        doc.repo_url.clone()
+    } else {
+        format!("{} at {commit}", doc.repo_url)
+    };
+    if doc.truncated() {
+        format!(
+            "{origin} \u{b7} {} bytes, only the first {} loaded",
+            doc.file_bytes,
+            doc.content.len()
+        )
+    } else {
+        format!("{origin} \u{b7} {} bytes", doc.file_bytes)
+    }
+}
+
 fn repo_status_class(status: RepoStatus) -> &'static str {
     match status {
         RepoStatus::Cloning => "cloning",
@@ -1951,6 +1970,24 @@ mod tests {
     }
 
     #[test]
+    fn test_instructions_source_names_repo_commit_and_size() {
+        let mut doc = crate::git::ProjectInstructions {
+            repo_url: "git@github.com:o/r.git".to_string(),
+            path: "/workspace/r".to_string(),
+            commit: Some("43835b44f939".to_string()),
+            content: "Run make test.\n".to_string(),
+            file_bytes: 15,
+            nested: vec![],
+        };
+        assert_eq!(instructions_source(&doc), "git@github.com:o/r.git at 43835b4 \u{b7} 15 bytes");
+        doc.file_bytes = 50_000;
+        assert_eq!(
+            instructions_source(&doc),
+            "git@github.com:o/r.git at 43835b4 \u{b7} 50000 bytes, only the first 15 loaded"
+        );
+    }
+
+    #[test]
     fn test_repo_detail_says_what_is_checked_out() {
         let mut repo = RepoSummary {
             id: 1,
@@ -1961,6 +1998,7 @@ mod tests {
             commit: None,
             status: RepoStatus::Cloning,
             error: None,
+            instructions: crate::git::InstructionsState::None,
         };
         assert_eq!(repo_detail(&repo), "Cloning dev\u{2026}");
         repo.requested_branch = None;
@@ -3650,6 +3688,13 @@ fn ChatPanel(
                                                             title: "{repo.url}",
                                                             code { class: "sandbox-repo-path", "{repo.path}" }
                                                             span { class: "sandbox-repo-detail", "{repo_detail(&repo)}" }
+                                                            if repo.instructions == crate::git::InstructionsState::Loaded {
+                                                                span {
+                                                                    class: "sandbox-repo-instructions",
+                                                                    title: "Its AGENTS.md is in the model's context on every turn. See the context view.",
+                                                                    "AGENTS.md loaded"
+                                                                }
+                                                            }
                                                             if let Some(err) = repo.error.clone() {
                                                                 pre { class: "sandbox-repo-error", "{err}" }
                                                             }
@@ -3765,6 +3810,19 @@ fn ChatPanel(
                                         None => rsx! { p { "Loading…" } },
                                         Some(detail) => rsx! {
                                             h3 { "Context" }
+                                            if !detail.instructions.is_empty() {
+                                                h4 { class: "context-detail-heading", "Project instructions ({detail.instructions.len()})" }
+                                                p { class: "muted", "AGENTS.md files from this conversation's repos, sent with every turn as part of the system prompt below." }
+                                                for doc in &detail.instructions {
+                                                    details { class: "context-detail-instructions",
+                                                        summary {
+                                                            code { "{doc.path}/AGENTS.md" }
+                                                            span { class: "muted", " {instructions_source(doc)}" }
+                                                        }
+                                                        pre { class: "context-detail-prompt", "{doc.content}" }
+                                                    }
+                                                }
+                                            }
                                             h4 { class: "context-detail-heading", "System prompt" }
                                             if let Some(system) = &detail.system {
                                                 // Its own line breaks and headings, not one
