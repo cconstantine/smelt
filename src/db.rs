@@ -1044,6 +1044,16 @@ pub async fn list_instruction_requests_for_remote(
     .await
 }
 
+/// Drops a pending request for `path` of repo `repo_id`, if there is one.
+pub async fn delete_instruction_request_for(pool: &PgPool, repo_id: i64, path: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM instruction_requests WHERE repo_id = $1 AND path = $2")
+        .bind(repo_id)
+        .bind(path)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn delete_instruction_request(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM instruction_requests WHERE id = $1")
         .bind(id)

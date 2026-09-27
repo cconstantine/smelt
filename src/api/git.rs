@@ -74,9 +74,14 @@ pub async fn list_conversation_repos(id: i64) -> ServerFnResult<Vec<RepoSummary>
 pub async fn attach_repo(id: i64, url: String, branch: String) -> ServerFnResult<RepoSummary> {
     let pool = db::get();
     let branch = Some(branch.trim()).filter(|b| !b.is_empty());
-    let (shown, pending) = git::start_attach(pool, id, url.trim(), branch)
+    let (shown, pending, notices) = git::start_attach(pool, id, url.trim(), branch)
         .await
         .map_err(ServerFnError::new)?;
+    for (conversation_id, notice) in notices {
+        tokio::spawn(async move {
+            crate::api::chat::deliver_notice(pool, conversation_id, notice).await;
+        });
+    }
     tokio::spawn(async move {
         if let Err(e) = git::finish_attach(pool, id, pending).await {
             tracing::warn!(conversation_id = id, error = %e, "\"Work on a repo\" failed");

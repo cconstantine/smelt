@@ -598,6 +598,11 @@ mod server {
                 db::load_instruction(pool, conversation_id, repo.id, rel_path, file)
                     .await
                     .map_err(|e| e.to_string())?;
+                // A card still asking about this file (the remote was
+                // trusted some other way meanwhile) has nothing left to ask.
+                db::delete_instruction_request_for(pool, repo.id, rel_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(LoadOutcome::Loaded)
             }
             Some(false) => Err(format!(
@@ -901,7 +906,7 @@ mod server {
         url: &str,
         branch: Option<&str>,
     ) -> Result<RepoSummary, String> {
-        let (shown, pending) = start_attach(pool, conversation_id, url, branch).await?;
+        let (shown, pending, _notices) = start_attach(pool, conversation_id, url, branch).await?;
         Ok(finish_attach(pool, conversation_id, pending).await?.unwrap_or(shown))
     }
 
@@ -914,7 +919,7 @@ mod server {
         conversation_id: i64,
         url: &str,
         branch: Option<&str>,
-    ) -> Result<(RepoSummary, Option<db::ConversationRepo>), String> {
+    ) -> Result<(RepoSummary, Option<db::ConversationRepo>, Vec<(i64, String)>), String> {
         let url = url.trim();
         let branch = branch.map(str::trim).filter(|b| !b.is_empty());
         let (key, dir, retry) = match plan_clone(pool, conversation_id, url, branch, None).await? {
@@ -924,7 +929,8 @@ mod server {
                 db::set_repo_trust(pool, &repo.remote_key, true)
                     .await
                     .map_err(|e| e.to_string())?;
-                return Ok((summarise(pool, repo).await?, None));
+                let notices = settle_requests_trusted_elsewhere(pool, &repo.remote_key, url).await?;
+                return Ok((summarise(pool, repo).await?, None, notices));
             }
             ClonePlan::Clone { key, dir, retry } => (key, dir, retry),
         };
@@ -933,8 +939,45 @@ mod server {
         db::set_repo_trust(pool, &key, true)
             .await
             .map_err(|e| e.to_string())?;
+        let notices = settle_requests_trusted_elsewhere(pool, &key, url).await?;
         let repo = record_clone(pool, conversation_id, url, branch, &key, &dir, retry).await?;
-        Ok((summarise(pool, repo.clone()).await?, Some(repo)))
+        Ok((summarise(pool, repo.clone()).await?, Some(repo), notices))
+    }
+
+    /// The remote was trusted without its cards being answered (the user
+    /// opened it with "Work on a repo"): the cards go, since the files
+    /// they showed weren't what was decided on, and each waiting model is
+    /// told to load again, which now works without asking. Returns the
+    /// notices, for the caller to deliver.
+    async fn settle_requests_trusted_elsewhere(
+        pool: &PgPool,
+        remote_key: &str,
+        url: &str,
+    ) -> Result<Vec<(i64, String)>, String> {
+        let requests = db::list_instruction_requests_for_remote(pool, remote_key)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut notices = Vec::new();
+        let mut touched = std::collections::BTreeSet::new();
+        for request in requests {
+            db::delete_instruction_request(pool, request.id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let repo = get_repo(pool, request.repo_id).await?;
+            let file = format!("{}/{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir, request.path);
+            notices.push((
+                request.conversation_id,
+                format!(
+                    "The user now trusts {url}. {file} wasn't loaded; call load_instructions \
+                     again for it if you still want it (it loads without asking now)."
+                ),
+            ));
+            touched.insert(request.conversation_id);
+        }
+        for id in touched {
+            publish_repos(pool, id).await;
+        }
+        Ok(notices)
     }
 
     /// The rest of "Work on a repo", run apart from the button's request:
@@ -1666,7 +1709,7 @@ mod server {
         #[sqlx::test]
         async fn test_starting_work_on_a_repo_records_it_without_touching_a_pod(pool: PgPool) {
             let conversation = db::create_conversation(&pool).await.expect("conversation");
-            let (shown, pending) = start_attach(&pool, conversation.id, "git@github.com:o/r.git", None)
+            let (shown, pending, _) = start_attach(&pool, conversation.id, "git@github.com:o/r.git", None)
                 .await
                 .expect("start");
             assert_eq!(shown.status, RepoStatus::Cloning);
@@ -1687,6 +1730,40 @@ mod server {
                 .expect("the existing checkout");
             assert_eq!(repo.path, "/workspace/r");
             assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("get"), Some(true));
+        }
+
+        /// A remote trusted without its card being answered (the model
+        /// loading again once it's trusted, or "Work on a repo") leaves no
+        /// card behind, and every waiting model hears (SME-32 code review
+        /// 9, finding 1).
+        #[sqlx::test]
+        async fn test_trust_given_elsewhere_settles_waiting_requests(pool: PgPool) {
+            let waiting = db::create_conversation(&pool).await.expect("conversation");
+            let repo = cloned_repo(&pool, waiting.id).await;
+            request_or_load(&pool, waiting.id, &repo, "AGENTS.md", &file("x")).await.expect("ask");
+
+            // "Work on a repo" with the same remote, from another conversation.
+            let attaching = db::create_conversation(&pool).await.expect("conversation");
+            let (_, _, notices) = start_attach(&pool, attaching.id, "https://github.com/o/r", None)
+                .await
+                .expect("start");
+            assert!(only_repo(&pool, waiting.id).await.trust_requests.is_empty(), "no card left behind");
+            assert!(
+                notices.iter().any(|(id, text)| *id == waiting.id && text.contains("load_instructions again")),
+                "the waiting model hears: {notices:?}"
+            );
+
+            // A trusted load of a file with a request pending removes it.
+            let other = db::create_conversation(&pool).await.expect("conversation");
+            let other_repo = cloned_repo(&pool, other.id).await;
+            db::delete_repo_trust(&pool, "github.com/o/r").await.expect("forget");
+            request_or_load(&pool, other.id, &other_repo, "AGENTS.md", &file("y")).await.expect("ask");
+            db::set_repo_trust(&pool, "github.com/o/r", true).await.expect("trusted meanwhile");
+            assert_eq!(
+                request_or_load(&pool, other.id, &other_repo, "AGENTS.md", &file("y")).await.expect("load"),
+                LoadOutcome::Loaded
+            );
+            assert!(only_repo(&pool, other.id).await.trust_requests.is_empty(), "the stale card goes");
         }
 
         #[sqlx::test]
