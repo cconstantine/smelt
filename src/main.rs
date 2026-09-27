@@ -4,6 +4,8 @@ mod browsing;
 #[cfg(feature = "server")]
 mod db;
 #[cfg(feature = "server")]
+mod docker_net;
+#[cfg(feature = "server")]
 mod egress_proxy;
 mod events;
 #[cfg(feature = "server")]

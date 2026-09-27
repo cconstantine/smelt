@@ -3,7 +3,7 @@
 //! `http://3000-42.preview.localhost:8181` for port 3000 in conversation
 //! 42's pod — served by a reverse proxy on a listener of its own
 //! (`SMELT_PREVIEW_ADDR`) that reaches the pod through
-//! `sandbox::open_pod_port`.
+//! `sandbox::open_pod_target`.
 //!
 //! Its own listener rather than a route on smelt's app, because `dx
 //! serve`'s dev proxy replaces `Host` before a request reaches the app, and
@@ -267,7 +267,7 @@ mod server {
         // A request with no body can go again on a fresh connection when a
         // reused one turns out to be gone. `is_closed` can't be trusted for
         // that: a port-forward reports a dev server dropping an idle
-        // connection about a second late (`sandbox::open_pod_port`).
+        // connection about a second late (`sandbox::open_pod_target`).
         let retry = request.body().is_end_stream().then(|| {
             let mut again = Request::new(Body::empty());
             *again.method_mut() = request.method().clone();
@@ -358,7 +358,7 @@ mod server {
         conversation: i64,
         port: u16,
     ) -> Result<SendRequest<Body>, Response<Body>> {
-        let stream = dial_for(conversation)(port)
+        let stream = dial_for(conversation)(crate::sandbox::PodHost::Localhost, port)
             .await
             .map_err(|message| text_response(StatusCode::BAD_GATEWAY, &message))?;
         let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
@@ -453,7 +453,7 @@ mod server {
         fn dial_for_upstream(upstream: SocketAddr, dials: Dials) -> DialFor {
             Arc::new(move |conversation| {
                 let dials = dials.clone();
-                Arc::new(move |port| {
+                Arc::new(move |_host, port| {
                     dials.lock().unwrap().push((conversation, port));
                     Box::pin(async move {
                         let stream = TcpStream::connect(upstream).await.map_err(|e| e.to_string())?;
@@ -577,7 +577,7 @@ mod server {
         #[tokio::test]
         async fn test_a_conversation_without_a_sandbox_says_so() {
             let dial_for: DialFor = Arc::new(|_| {
-                Arc::new(|_| {
+                Arc::new(|_, _| {
                     Box::pin(async { Err("This conversation has no running sandbox.".to_string()) }) as DialFuture
                 }) as SandboxDial
             });
@@ -716,11 +716,11 @@ mod server {
 
         /// Like `dial_for_upstream`, but the upstream's end of stream reaches
         /// the proxy a second late — as it does through a real port-forward
-        /// (see `sandbox::open_pod_port`).
+        /// (see `sandbox::open_pod_target`).
         fn dial_for_upstream_with_late_eof(upstream: SocketAddr, dials: Dials) -> DialFor {
             Arc::new(move |conversation| {
                 let dials = dials.clone();
-                Arc::new(move |port| {
+                Arc::new(move |_host, port| {
                     dials.lock().unwrap().push((conversation, port));
                     Box::pin(async move {
                         let tcp = TcpStream::connect(upstream).await.map_err(|e| e.to_string())?;

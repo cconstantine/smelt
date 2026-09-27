@@ -13,6 +13,11 @@
 //! there; PID/process-group discovery for `send_signal` reads
 //! `/proc/<bash_pid>/task/<bash_pid>/children` reactively, not eagerly.
 
+// Shared with the server; the agent only needs `container_address`.
+#[path = "../docker_net.rs"]
+#[allow(dead_code)]
+mod docker_net;
+
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -28,7 +33,7 @@ use axum::{
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
@@ -37,6 +42,12 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 /// reach this at the bridge gateway (SME-33). smelt reaches it through a
 /// Kubernetes port-forward, which dials localhost in the pod.
 const LISTEN_ADDR: &str = "127.0.0.1:8088";
+/// The relay into the pod's Docker networks (SME-33): a port-forward can
+/// only dial localhost, so smelt reaches a container's IP by connecting
+/// here and naming it. Loopback only, like `LISTEN_ADDR`.
+const RELAY_ADDR: &str = "127.0.0.1:8089";
+/// The one line a relay connection starts with, `ip:port\n`, is at most this long.
+const RELAY_TARGET_MAX: usize = 64;
 const PID_FILE: &str = "/tmp/sandbox_agent.pid";
 const MARKER_PREFIX: &str = "MARKER:";
 /// Bounded retry for the one real race left once PID discovery moved from
@@ -1396,9 +1407,95 @@ fn pgid_of(pid: i32) -> Option<i32> {
     after_comm.split_whitespace().nth(2)?.parse().ok()
 }
 
+/// Where a relay connection asks to go: `ip:port` for a container in the
+/// pod's Docker range, and nothing else, so the relay can't reach the
+/// cluster or the LAN.
+fn relay_target(line: &str) -> Result<std::net::SocketAddrV4, String> {
+    let (host, port) = line
+        .rsplit_once(':')
+        .ok_or_else(|| format!("{line:?} isn't ip:port"))?;
+    let ip = docker_net::container_address(host)
+        .ok_or_else(|| format!("{host:?} isn't a container address in the pod"))?;
+    let port: u16 = port
+        .parse()
+        .ok()
+        .filter(|&p| p != 0)
+        .ok_or_else(|| format!("{port:?} isn't a port"))?;
+    Ok(std::net::SocketAddrV4::new(ip, port))
+}
+
+/// Serves `RELAY_ADDR`: each connection names a container address on its
+/// first line, then carries raw bytes to and from it. A refused or failed
+/// target just closes the connection, the same as a port nothing listens
+/// on, which is how smelt reports it.
+async fn serve_relay(listener: tokio::net::TcpListener) {
+    loop {
+        let Ok((client, _)) = listener.accept().await else {
+            continue;
+        };
+        tokio::spawn(async move {
+            if let Err(e) = relay(client).await {
+                tracing::debug!("relay: {e}");
+            }
+        });
+    }
+}
+
+async fn relay(client: tokio::net::TcpStream) -> Result<(), String> {
+    let mut client = BufReader::new(client);
+    let mut line = String::new();
+    let read = tokio::time::timeout(
+        Duration::from_secs(5),
+        (&mut client).take(RELAY_TARGET_MAX as u64).read_line(&mut line),
+    )
+    .await
+    .map_err(|_| "timed out waiting for the target".to_string())?
+    .map_err(|e| e.to_string())?;
+    if read == 0 || !line.ends_with('\n') {
+        return Err("no target line".to_string());
+    }
+    let target = relay_target(line.trim_end())?;
+    let mut upstream = tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(target))
+        .await
+        .map_err(|_| format!("timed out connecting to {target}"))?
+        .map_err(|e| format!("couldn't connect to {target}: {e}"))?;
+    // Bytes the client sent after its target line are already buffered.
+    let buffered = client.buffer().to_vec();
+    let mut client = client.into_inner();
+    upstream.write_all(&buffered).await.map_err(|e| e.to_string())?;
+    tokio::io::copy_bidirectional(&mut client, &mut upstream)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_relay_target_accepts_a_container_address_and_port() {
+        assert_eq!(
+            relay_target("172.21.0.2:3000"),
+            Ok("172.21.0.2:3000".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_relay_target_refuses_anything_outside_the_docker_range() {
+        for line in [
+            "10.43.0.1:443",
+            "192.168.8.130:6443",
+            "127.0.0.1:8088",
+            "localhost:3000",
+            "172.21.0.2",
+            "172.21.0.2:0",
+            "172.21.0.2:99999",
+            "",
+        ] {
+            assert!(relay_target(line).is_err(), "{line:?} should be refused");
+        }
+    }
 
     #[test]
     fn test_hash_content_returns_sha256_hex_digest() {
@@ -1756,6 +1853,11 @@ async fn main() {
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .with_state(state);
+    let relay_listener = tokio::net::TcpListener::bind(RELAY_ADDR)
+        .await
+        .unwrap_or_else(|e| panic!("failed to bind {RELAY_ADDR}: {e}"));
+    tokio::spawn(serve_relay(relay_listener));
+
     let listener = tokio::net::TcpListener::bind(LISTEN_ADDR)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {LISTEN_ADDR}: {e}"));

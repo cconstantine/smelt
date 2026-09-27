@@ -22,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::fetch_guard;
-use crate::sandbox::PodIo;
+use crate::sandbox::{PodHost, PodIo};
 use sqlx::PgPool;
 
 /// Largest request head accepted — far above anything a browser sends.
@@ -50,29 +50,32 @@ pub async fn start(is_addr_allowed: fn(IpAddr) -> bool) -> std::io::Result<Socke
     Ok(addr)
 }
 
-/// Opens a connection to a port in one conversation's sandbox pod —
-/// `sandbox::open_pod_port` for that conversation, or a stand-in in tests.
-/// An `Err` is a message the proxy shows as the reason it couldn't connect.
-pub type SandboxDial = Arc<dyn Fn(u16) -> DialFuture + Send + Sync>;
+/// Opens a connection to a port in one conversation's sandbox pod, on its
+/// own `localhost` or at a Docker container's address there (SME-33) —
+/// `sandbox::open_pod_target` for that conversation, or a stand-in in
+/// tests. An `Err` is a message the proxy shows as the reason it couldn't
+/// connect.
+pub type SandboxDial = Arc<dyn Fn(PodHost, u16) -> DialFuture + Send + Sync>;
 
 /// What a `SandboxDial` returns.
 pub type DialFuture = Pin<Box<dyn Future<Output = Result<Box<dyn PodIo>, String>> + Send>>;
 
-/// The real `SandboxDial` for `conversation_id`: `sandbox::open_pod_port`,
+/// The real `SandboxDial` for `conversation_id`: `sandbox::open_pod_target`,
 /// with its failures turned into sentences the model (or the user, in the
 /// live panel) can act on.
 pub fn sandbox_dial(pool: PgPool, conversation_id: i64) -> SandboxDial {
-    let dial: SandboxDial = Arc::new(move |port| {
+    let dial: SandboxDial = Arc::new(move |host, port| {
         let pool = pool.clone();
         Box::pin(async move {
-            crate::sandbox::open_pod_port(&pool, conversation_id, port)
+            crate::sandbox::open_pod_target(&pool, conversation_id, host, port)
                 .await
                 .map_err(|e| match e {
                     crate::sandbox::TerminalError::NoPod => format!(
                         "This conversation has no running sandbox, so there's nothing at \
-                         localhost:{port}. Start one with create_pod and run the server there."
+                         {}. Start one with create_pod and run the server there.",
+                        describe(host, port)
                     ),
-                    other => format!("Couldn't reach port {port} in the sandbox: {other}"),
+                    other => format!("Couldn't reach {} in the sandbox: {other}", describe(host, port)),
                 })
         })
     });
@@ -83,14 +86,23 @@ pub fn sandbox_dial(pool: PgPool, conversation_id: i64) -> SandboxDial {
 /// with a message saying so. The one place opening a port-forward is
 /// bounded, so every caller of `sandbox_dial` inherits it.
 pub fn with_timeout(dial: SandboxDial, limit: Duration) -> SandboxDial {
-    Arc::new(move |port| {
-        let opening = dial(port);
+    Arc::new(move |host, port| {
+        let opening = dial(host, port);
         Box::pin(async move {
-            tokio::time::timeout(limit, opening)
-                .await
-                .unwrap_or_else(|_| Err(format!("Timed out connecting to port {port} in the sandbox.")))
+            tokio::time::timeout(limit, opening).await.unwrap_or_else(|_| {
+                Err(format!("Timed out connecting to {} in the sandbox.", describe(host, port)))
+            })
         })
     })
+}
+
+/// `host:port` as the model or user wrote it: `localhost:3000`, or a
+/// container's `172.21.0.2:3000`.
+fn describe(host: PodHost, port: u16) -> String {
+    match host {
+        PodHost::Localhost => format!("localhost:{port}"),
+        PodHost::Container(ip) => format!("{ip}:{port}"),
+    }
 }
 
 /// A proxy from `start_with_sandbox`. It stops accepting connections when
@@ -107,10 +119,11 @@ impl Drop for RoutedProxy {
 }
 
 /// Like `start`, but for one conversation's browser context: requests for
-/// `localhost`, `127.0.0.1` or `::1` (`fetch_guard::is_sandbox_host`) go to
-/// that port in the conversation's sandbox through `dial`, instead of being
-/// refused as loopback. Every other host goes through `is_addr_allowed`
-/// exactly as with `start`. See SME-42.
+/// `localhost`, `127.0.0.1` or `::1`, or a Docker container's address in
+/// the pod (`fetch_guard::sandbox_host`), go to that port in the
+/// conversation's sandbox through `dial`, instead of being refused as
+/// loopback or private. Every other host goes through `is_addr_allowed`
+/// exactly as with `start`. See SME-42 and SME-33.
 pub async fn start_with_sandbox(
     is_addr_allowed: fn(IpAddr) -> bool,
     dial: SandboxDial,
@@ -162,9 +175,9 @@ async fn handle(
         }
     };
     if let Some(dial) = sandbox
-        && fetch_guard::is_sandbox_host(&request.host)
+        && let Some(host) = fetch_guard::sandbox_host(&request.host)
     {
-        return handle_sandbox(client, request, rest, dial).await;
+        return handle_sandbox(client, request, host, rest, dial).await;
     }
     let addrs = match fetch_guard::resolve_allowed(&request.host, request.port, is_addr_allowed).await
     {
@@ -207,6 +220,7 @@ async fn handle(
 async fn handle_sandbox(
     mut client: TcpStream,
     request: ProxyRequest,
+    host: PodHost,
     rest: Vec<u8>,
     dial: SandboxDial,
 ) -> Result<(), String> {
@@ -248,18 +262,18 @@ async fn handle_sandbox(
             (source, first)
         }
     };
-    if !fetch_guard::allows_request_from(&source, |host, _| fetch_guard::is_sandbox_host(host)) {
+    if !fetch_guard::allows_request_from(&source, |host, _| fetch_guard::sandbox_host(host).is_some()) {
         let from = source.origin.as_deref().map(|o| format!(" ({o})")).unwrap_or_default();
         let message = format!(
-            "Refused: a page from another site{from} tried to reach port {} in this conversation's \
+            "Refused: a page from another site{from} tried to reach {} in this conversation's \
              sandbox. Only the sandbox's own pages, and pages opened directly, can reach it.",
-            request.port
+            describe(host, request.port)
         );
         respond_with_body(&mut client, "403 Forbidden", &message).await;
         return Err(message);
     }
     // `sandbox_dial` bounds opening the port-forward (`with_timeout`).
-    let upstream = match dial(request.port).await {
+    let upstream = match dial(host, request.port).await {
         Ok(upstream) => upstream,
         Err(message) => {
             respond_with_body(&mut client, "502 Bad Gateway", &message).await;
@@ -282,8 +296,8 @@ async fn handle_sandbox(
         if n == 0 {
             page_to_pod.abort();
             let message = format!(
-                "Nothing is listening on port {} in this conversation's sandbox.",
-                request.port
+                "Nothing is listening on {} in this conversation's sandbox.",
+                describe(host, request.port)
             );
             respond_with_body(&mut to_page, "502 Bad Gateway", &message).await;
             return Err(message);
@@ -450,15 +464,15 @@ fn host_and_port(url: &str) -> Result<(String, u16), String> {
     Ok((host, port))
 }
 
-/// A stand-in for `sandbox::open_pod_port` in tests: records each port
-/// it's asked for and connects to `upstream` whatever the port.
+/// A stand-in for `sandbox::open_pod_target` in tests: records each host
+/// and port it's asked for and connects to `upstream` whatever they are.
 #[cfg(test)]
 pub(crate) fn dial_to(
     upstream: SocketAddr,
-    dialed: Arc<std::sync::Mutex<Vec<u16>>>,
+    dialed: Arc<std::sync::Mutex<Vec<(PodHost, u16)>>>,
 ) -> SandboxDial {
-    Arc::new(move |port| {
-        dialed.lock().unwrap().push(port);
+    Arc::new(move |host, port| {
+        dialed.lock().unwrap().push((host, port));
         Box::pin(async move {
             let stream = TcpStream::connect(upstream).await.map_err(|e| e.to_string())?;
             Ok(Box::new(stream) as Box<dyn PodIo>)
@@ -626,7 +640,22 @@ mod tests {
             assert_eq!(response.status(), 200, "{host}");
             assert_eq!(response.text().await.unwrap(), "upstream says hi", "{host}");
         }
-        assert_eq!(*dialed.lock().unwrap(), vec![3000, 3000, 3000]);
+        assert_eq!(*dialed.lock().unwrap(), vec![(PodHost::Localhost, 3000); 3]);
+    }
+
+    #[tokio::test]
+    async fn test_a_sandbox_route_sends_a_container_address_to_that_container() {
+        let upstream = start_upstream().await;
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
+            .await
+            .unwrap();
+        let response = client_via(proxy.addr).get("http://172.21.0.2:3000/").send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            *dialed.lock().unwrap(),
+            vec![(PodHost::Container(std::net::Ipv4Addr::new(172, 21, 0, 2)), 3000)]
+        );
     }
 
     /// Sends `head` through the proxy as a plain HTTP request and returns the
@@ -719,7 +748,7 @@ mod tests {
         let mut response = String::new();
         own.read_to_string(&mut response).await.unwrap();
         assert!(response.ends_with("upstream says hi"), "got {response:?}");
-        assert_eq!(*dialed.lock().unwrap(), vec![5173]);
+        assert_eq!(*dialed.lock().unwrap(), vec![(PodHost::Localhost, 5173)]);
     }
 
     /// Chrome sends a larger POST's body after its head, in a write of its
@@ -769,7 +798,7 @@ mod tests {
         let mut response = String::new();
         tunnel.read_to_string(&mut response).await.unwrap();
         assert!(response.ends_with("upstream says hi"), "got {response:?}");
-        assert_eq!(*dialed.lock().unwrap(), vec![5173]);
+        assert_eq!(*dialed.lock().unwrap(), vec![(PodHost::Localhost, 5173)]);
     }
 
     #[tokio::test]
@@ -791,7 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_sandbox_route_that_cannot_connect_says_why() {
-        let dial: SandboxDial = Arc::new(|_| {
+        let dial: SandboxDial = Arc::new(|_, _| {
             Box::pin(async { Err("This conversation has no running sandbox.".to_string()) })
         });
         let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial).await.unwrap();
@@ -818,14 +847,14 @@ mod tests {
         let response = client_via(proxy.addr).get("http://localhost:3000/").send().await.unwrap();
         assert_eq!(response.status(), 502);
         let body = response.text().await.unwrap();
-        assert!(body.contains("Nothing is listening on port 3000"), "got {body:?}");
+        assert!(body.contains("Nothing is listening on localhost:3000"), "got {body:?}");
     }
 
     #[sqlx::test]
     async fn test_sandbox_dial_without_a_pod_says_how_to_get_one(pool: PgPool) {
         let conversation = crate::db::create_conversation(&pool).await.expect("create conversation");
         let dial = sandbox_dial(pool, conversation.id);
-        let error = match dial(3000).await {
+        let error = match dial(PodHost::Localhost, 3000).await {
             Ok(_) => panic!("a conversation without a pod has nothing to connect to"),
             Err(e) => e,
         };
@@ -835,23 +864,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_dial_that_never_opens_times_out_with_a_reason() {
-        let never: SandboxDial = Arc::new(|_| Box::pin(std::future::pending()) as DialFuture);
+        let never: SandboxDial = Arc::new(|_, _| Box::pin(std::future::pending()) as DialFuture);
         let dial = with_timeout(never, Duration::from_millis(100));
-        let result = tokio::time::timeout(Duration::from_secs(5), dial(3000))
+        let result = tokio::time::timeout(Duration::from_secs(5), dial(PodHost::Localhost, 3000))
             .await
             .expect("the bounded dial must give up on its own");
         let error = match result {
             Ok(_) => panic!("a dial that never opens can't succeed"),
             Err(e) => e,
         };
-        assert!(error.contains("port 3000") && error.contains("Timed out"), "got {error:?}");
+        assert!(error.contains("localhost:3000") && error.contains("Timed out"), "got {error:?}");
     }
 
     #[sqlx::test]
     async fn test_sandbox_dial_refuses_the_sandbox_agents_port(pool: PgPool) {
         let conversation = crate::db::create_conversation(&pool).await.expect("create conversation");
         let dial = sandbox_dial(pool, conversation.id);
-        let error = match dial(8088).await {
+        let error = match dial(PodHost::Localhost, 8088).await {
             Ok(_) => panic!("the sandbox agent's port must never be reachable"),
             Err(e) => e,
         };

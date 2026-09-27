@@ -29,6 +29,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::docker_net::{DOCKER_BRIDGE_IP, DOCKER_NETWORK_POOL};
 use crate::{db, events};
 
 // `cfg(test)` rather than an env var deliberately: the whole point is that
@@ -45,6 +46,9 @@ const DEFAULT_RUNNING_WAIT_TIMEOUT_SECS: u64 = 30;
 
 /// Matches `sandbox_agent`'s own `LISTEN_ADDR` port.
 const AGENT_PORT: u16 = 8088;
+/// The agent's relay into the pod's Docker networks (`RELAY_ADDR` in
+/// src/bin/sandbox_agent.rs), SME-33.
+const RELAY_PORT: u16 = 8089;
 
 #[derive(Debug)]
 pub enum SandboxError {
@@ -632,12 +636,6 @@ const DOCKER_DATA_VOLUME: &str = "docker-data";
 /// The `docker` group's GID in the sandbox image
 /// (docker/sandbox/Dockerfile); dockerd gives it the socket.
 const DOCKER_GID: u32 = 2375;
-/// Docker's default bridge, and the pool its other networks come from.
-/// Together they fill `172.20.0.0/14`, clear of k3s's pod and service
-/// ranges (`10.42/16`, `10.43/16`) and the homelab LAN (`192.168.x`),
-/// which Docker's own default pools would overlap.
-const DOCKER_BRIDGE_IP: &str = "172.20.0.1/16";
-const DOCKER_NETWORK_POOL: &str = "172.21.0.0/16";
 
 /// The conversation's Docker data PVC, `sandbox-docker-<id>`.
 fn docker_pvc_name(conversation_id: i64) -> String {
@@ -1021,7 +1019,7 @@ fn docker_data_volume(storage: &DockerStorage) -> Volume {
 
 /// dockerd's arguments after `START_DOCKERD_SCRIPT` — a unix socket only,
 /// never TCP: the pod shares one network namespace, so a TCP listener
-/// would be reachable through `open_pod_port` and a preview link.
+/// would be reachable through `open_pod_target` and a preview link.
 fn dockerd_args() -> Vec<String> {
     vec![
         format!("--host={DOCKER_HOST}"),
@@ -1135,9 +1133,9 @@ pub enum TerminalError {
     /// (which only ever distinguish success from a generic failure) —
     /// the model needs to see and act on exactly what went wrong.
     FileOperation(String),
-    /// A request to open the sandbox agent's own port (`AGENT_PORT`) from a
-    /// route into the pod — see `check_reachable_port`.
-    AgentPort,
+    /// A request to open one of the sandbox agent's own ports (`AGENT_PORT`,
+    /// `RELAY_PORT`) from a route into the pod — see `check_reachable_port`.
+    AgentPort(u16),
 }
 
 impl std::fmt::Display for TerminalError {
@@ -1169,9 +1167,9 @@ impl std::fmt::Display for TerminalError {
                 )
             }
             TerminalError::FileOperation(message) => write!(f, "{message}"),
-            TerminalError::AgentPort => write!(
+            TerminalError::AgentPort(port) => write!(
                 f,
-                "port {AGENT_PORT} is smelt's own sandbox agent, which can't be opened from a \
+                "port {port} is smelt's own sandbox agent, which can't be opened from a \
                  browser or a preview; run your server on another port"
             ),
         }
@@ -1519,13 +1517,14 @@ pub async fn create_pod(
     }
 }
 
-/// Refuses the one port in a pod no route may reach: the sandbox agent's
-/// (`AGENT_PORT`), whose WebSocket runs commands with no login of its own.
-/// A preview or a page in the model's browser reaching it would let any
-/// website run commands in the sandbox (found in SME-42's code review).
+/// Refuses the ports in a pod no route may reach: the sandbox agent's
+/// (`AGENT_PORT`), whose WebSocket runs commands with no login of its own,
+/// and its relay (`RELAY_PORT`), which reaches every container. A preview
+/// or a page in the model's browser reaching either would let any website
+/// into the sandbox (found in SME-42's code review).
 pub fn check_reachable_port(port: u16) -> Result<(), TerminalError> {
-    if port == AGENT_PORT {
-        return Err(TerminalError::AgentPort);
+    if port == AGENT_PORT || port == RELAY_PORT {
+        return Err(TerminalError::AgentPort(port));
     }
     Ok(())
 }
@@ -1560,11 +1559,19 @@ impl PodLimitOverrides {
     }
 }
 
-/// A byte stream to a port inside a sandbox pod, from `open_pod_port`.
+/// Where in a conversation's pod a connection goes (SME-33): its own
+/// `localhost`, or a Docker container's address in the pod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PodHost {
+    Localhost,
+    Container(std::net::Ipv4Addr),
+}
+
+/// A byte stream to a port inside a sandbox pod, from `open_pod_target`.
 pub trait PodIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> PodIo for T {}
 
-/// Opens a TCP connection to `port` inside `conversation_id`'s own live
+/// Opens a TCP connection to `host:port` inside `conversation_id`'s own live
 /// pod, through a Kubernetes port-forward — the pod is resolved here from
 /// the conversation, never named by the caller, so nothing can reach
 /// another conversation's pod (SME-42). The connection is made inside the
@@ -1575,15 +1582,19 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> PodIo for T
 /// ends without a byte. After the pod side closes, the end of the stream
 /// arrives about a second late (seen on k3s), so a caller must never wait
 /// for it to know a response is complete.
-pub async fn open_pod_port(
+///
+/// `host` is the pod's own `localhost`, or a Docker container's address
+/// there (SME-33), reached through the agent's relay.
+pub async fn open_pod_target(
     pool: &PgPool,
     conversation_id: i64,
+    host: PodHost,
     port: u16,
 ) -> Result<Box<dyn PodIo>, TerminalError> {
-    open_pod_port_with(pool, conversation_id, port, || get().client.clone()).await
+    open_pod_port_with(pool, conversation_id, host, port, || get().client.clone()).await
 }
 
-/// `open_pod_port` with the Kubernetes client supplied — a test's own, so
+/// `open_pod_target` with the Kubernetes client supplied — a test's own, so
 /// it never has to set the process-global manager (see
 /// `test_open_pod_port_reaches_the_conversations_own_pod`). The client is
 /// only asked for once there's a pod, so a conversation without one never
@@ -1591,18 +1602,49 @@ pub async fn open_pod_port(
 async fn open_pod_port_with(
     pool: &PgPool,
     conversation_id: i64,
+    host: PodHost,
     port: u16,
     client: impl FnOnce() -> kube::Client,
 ) -> Result<Box<dyn PodIo>, TerminalError> {
-    check_reachable_port(port)?;
+    if host == PodHost::Localhost {
+        check_reachable_port(port)?;
+    }
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
-    let mut forwarder = pods_api(&client())
-        .portforward(&pod_name(pod_id), &[port])
+    dial_pod(&client(), &pod_name(pod_id), host, port).await
+}
+
+/// Opens a connection to `host:port` in the pod named `pod`: a
+/// port-forward for `localhost`, or one to the agent's relay for a
+/// container address.
+async fn dial_pod(
+    client: &kube::Client,
+    pod: &str,
+    host: PodHost,
+    port: u16,
+) -> Result<Box<dyn PodIo>, TerminalError> {
+    let forward_to = match host {
+        PodHost::Localhost => {
+            check_reachable_port(port)?;
+            port
+        }
+        PodHost::Container(_) => RELAY_PORT,
+    };
+    let mut forwarder = pods_api(client)
+        .portforward(pod, &[forward_to])
         .await
         .map_err(|e| TerminalError::Sandbox(SandboxError::Kube(e)))?;
-    let stream = forwarder
-        .take_stream(port)
+    let mut stream = forwarder
+        .take_stream(forward_to)
         .expect("stream requested for the forwarded port");
+    if let PodHost::Container(ip) = host {
+        // The relay's one line; a target it refuses closes the stream,
+        // which reads the same as a port nothing listens on.
+        use tokio::io::AsyncWriteExt;
+        stream
+            .write_all(format!("{ip}:{port}\n").as_bytes())
+            .await
+            .map_err(|e| TerminalError::Sandbox(SandboxError::Io(e)))?;
+    }
     Ok(Box::new(stream))
 }
 
@@ -1625,7 +1667,7 @@ async fn pod_port_is_listening_with(
     port: u16,
     client: impl FnOnce() -> kube::Client,
 ) -> Result<bool, TerminalError> {
-    let mut stream = open_pod_port_with(pool, conversation_id, port, client).await?;
+    let mut stream = open_pod_port_with(pool, conversation_id, PodHost::Localhost, port, client).await?;
     let mut first = [0u8; 1];
     Ok(match tokio::time::timeout(LISTEN_PROBE, stream.read(&mut first)).await {
         // Still open: something accepted the connection and is waiting.
@@ -3403,6 +3445,13 @@ mod tests {
     }
 
     #[test]
+    fn test_check_reachable_port_refuses_both_of_the_agents_ports() {
+        assert!(matches!(check_reachable_port(AGENT_PORT), Err(TerminalError::AgentPort(8088))));
+        assert!(matches!(check_reachable_port(RELAY_PORT), Err(TerminalError::AgentPort(8089))));
+        assert!(check_reachable_port(3000).is_ok());
+    }
+
+    #[test]
     fn test_docker_pvc_spec_is_named_labelled_and_sized_for_the_conversation() {
         let pvc = build_docker_pvc_spec(42);
         assert_eq!(pvc.metadata.name.as_deref(), Some("sandbox-docker-42"));
@@ -3745,7 +3794,7 @@ mod tests {
     #[sqlx::test]
     async fn test_open_pod_port_without_a_live_pod_is_no_pod(pool: PgPool) {
         let conversation = db::create_conversation(&pool).await.expect("create conversation");
-        let result = open_pod_port(&pool, conversation.id, 3000).await;
+        let result = open_pod_target(&pool, conversation.id, PodHost::Localhost, 3000).await;
         assert!(matches!(result, Err(TerminalError::NoPod)), "expected NoPod");
     }
 
@@ -3754,8 +3803,8 @@ mod tests {
     #[sqlx::test]
     async fn test_open_pod_port_refuses_the_sandbox_agents_own_port(pool: PgPool) {
         let conversation = db::create_conversation(&pool).await.expect("create conversation");
-        let result = open_pod_port(&pool, conversation.id, AGENT_PORT).await;
-        assert!(matches!(result, Err(TerminalError::AgentPort)), "the agent's port must be refused");
+        let result = open_pod_target(&pool, conversation.id, PodHost::Localhost, AGENT_PORT).await;
+        assert!(matches!(result, Err(TerminalError::AgentPort(_))), "the agent's port must be refused");
     }
 
     /// Sends a bare HTTP request down `stream` and returns whatever comes
@@ -3775,7 +3824,7 @@ mod tests {
         }
     }
 
-    /// Real cluster: `open_pod_port` reaches a server inside the
+    /// Real cluster: `open_pod_target` reaches a server inside the
     /// conversation's own pod — one bound to `127.0.0.1` there, as dev
     /// servers are by default — but never the sandbox agent's own port. A
     /// conversation with no pod of its own can't borrow another's, and a
@@ -3808,7 +3857,7 @@ mod tests {
             .expect("create the pod");
         let open = |conversation_id: i64, port: u16| {
             let (client, pool) = (client.clone(), pool.clone());
-            async move { open_pod_port_with(&pool, conversation_id, port, move || client).await }
+            async move { open_pod_port_with(&pool, conversation_id, PodHost::Localhost, port, move || client).await }
         };
         // Python's server speaks HTTP/1.0 and closes after every response,
         // so the preview below also meets an upstream that's gone between
@@ -3834,7 +3883,7 @@ mod tests {
         // The user's preview proxy over the same real port-forward: three
         // requests on one kept-alive connection. Each would take over a
         // second if anything waited for the port-forward's late end of
-        // stream (see `open_pod_port`).
+        // stream (see `open_pod_target`).
         let through_preview = {
             use crate::egress_proxy::{DialFuture, SandboxDial};
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -3847,10 +3896,10 @@ mod tests {
             let (dial_client, dial_pool) = (client.clone(), pool.clone());
             let dial_for: crate::preview::DialFor = Arc::new(move |conversation| {
                 let (client, pool) = (dial_client.clone(), dial_pool.clone());
-                Arc::new(move |port| {
+                Arc::new(move |_host, port| {
                     let (client, pool) = (client.clone(), pool.clone());
                     Box::pin(async move {
-                        open_pod_port_with(&pool, conversation, port, move || client)
+                        open_pod_port_with(&pool, conversation, PodHost::Localhost, port, move || client)
                             .await
                             .map_err(|e| e.to_string())
                     }) as DialFuture
@@ -3889,7 +3938,7 @@ mod tests {
         let reply = reply.expect("open the server's port");
         assert!(reply.starts_with("HTTP/1.0 404"), "expected the server's 404, got {reply:?}");
         assert!(
-            matches!(agent_port_result, Err(TerminalError::AgentPort)),
+            matches!(agent_port_result, Err(TerminalError::AgentPort(_))),
             "the sandbox agent's port must be refused even with a pod"
         );
         assert!(
@@ -4081,6 +4130,45 @@ mod tests {
             assert!(
                 !own.is_empty() && nested.starts_with(&format!("{own}/docker/")),
                 "nested container cgroup {nested:?} should be under the sidecar's {own:?}"
+            );
+
+            // Both browsers' routes into the pod (SME-33): a published port
+            // on localhost, any container port at its address through the
+            // agent's relay, and nothing outside the Docker range.
+            let serve = first
+                .exec(&[
+                    "bash",
+                    "-c",
+                    "mkdir -p /workspace/www && echo from-a-container > /workspace/www/index.html \
+                     && docker run -d -p 8000:8000 -v /workspace/www:/w -w /w local/base python3 -m http.server 8000 >/dev/null \
+                     && docker run -d --name unpublished -v /workspace/www:/w -w /w local/base python3 -m http.server 8001 >/dev/null \
+                     && sleep 2 && docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' unpublished",
+                ])
+                .await
+                .expect("exec start servers");
+            let container_ip: std::net::Ipv4Addr =
+                serve.stdout.trim().parse().unwrap_or_else(|_| panic!("container ip: {:?}", serve.stdout));
+            let fetch = |host: PodHost, port: u16| {
+                let client = client.clone();
+                let pod = first.pod_name.clone();
+                async move {
+                    use tokio::io::AsyncWriteExt;
+                    let mut stream = dial_pod(&client, &pod, host, port).await.expect("dial_pod");
+                    stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await.expect("send request");
+                    let mut reply = String::new();
+                    let _ = tokio::time::timeout(Duration::from_secs(10), stream.read_to_string(&mut reply)).await;
+                    reply
+                }
+            };
+            assert!(fetch(PodHost::Localhost, 8000).await.contains("from-a-container"), "published port on localhost");
+            assert!(
+                fetch(PodHost::Container(container_ip), 8001).await.contains("from-a-container"),
+                "unpublished container port through the relay"
+            );
+            assert_eq!(
+                fetch(PodHost::Container(std::net::Ipv4Addr::new(10, 43, 0, 1)), 443).await,
+                "",
+                "the relay must refuse an address outside the Docker range"
             );
 
             // A container can't reach the sandbox agent, whose WebSocket
