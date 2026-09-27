@@ -138,7 +138,7 @@ mod server {
     use std::sync::Arc;
 
     use axum::body::Body;
-    use hyper::body::Incoming;
+    use hyper::body::{Body as _, Incoming};
     use hyper::client::conn::http1::SendRequest;
     use hyper::header::{HOST, HeaderValue, LOCATION, UPGRADE};
     use hyper::{Request, Response, StatusCode};
@@ -217,7 +217,7 @@ mod server {
     struct Upstream {
         conversation: i64,
         port: u16,
-        sender: SendRequest<Incoming>,
+        sender: SendRequest<Body>,
     }
 
     type CachedUpstream = Arc<tokio::sync::Mutex<Option<Upstream>>>;
@@ -243,20 +243,54 @@ mod server {
             .contains_key(UPGRADE)
             .then(|| hyper::upgrade::on(&mut request));
 
+        // A request with no body can go again on a fresh connection when a
+        // reused one turns out to be gone. `is_closed` can't be trusted for
+        // that: a port-forward reports a dev server dropping an idle
+        // connection about a second late (`sandbox::open_pod_port`).
+        let retry = request.body().is_end_stream().then(|| {
+            let mut again = Request::new(Body::empty());
+            *again.method_mut() = request.method().clone();
+            *again.uri_mut() = request.uri().clone();
+            *again.version_mut() = request.version();
+            *again.headers_mut() = request.headers().clone();
+            again
+        });
+        let request = request.map(Body::new);
+
         // Held until the response head is back: HTTP/1 is one request at a
         // time per connection anyway.
         let mut cached = cached.lock().await;
         let reusable = cached
             .take()
             .filter(|up| up.conversation == conversation && up.port == port && !up.sender.is_closed());
-        let (mut sender, reused) = match reusable {
+        let (mut sender, mut reused) = match reusable {
             Some(up) => (up.sender, true),
             None => match connect(dial_for, conversation, port).await {
                 Ok(sender) => (sender, false),
                 Err(response) => return response,
             },
         };
-        let mut response = match sender.send_request(request).await {
+        if reused && sender.ready().await.is_err() {
+            sender = match connect(dial_for, conversation, port).await {
+                Ok(sender) => sender,
+                Err(response) => return response,
+            };
+            reused = false;
+        }
+        let first_try = sender.send_request(request).await;
+        let first_try = match (first_try, retry) {
+            (Err(e), Some(retry)) if reused => {
+                tracing::debug!(conversation, port, "preview: reused connection gone, retrying: {e}");
+                sender = match connect(dial_for, conversation, port).await {
+                    Ok(sender) => sender,
+                    Err(response) => return response,
+                };
+                reused = false;
+                sender.send_request(retry).await
+            }
+            (result, _) => result,
+        };
+        let mut response = match first_try {
             Ok(response) => response,
             Err(e) => {
                 tracing::debug!(conversation, port, reused, "preview: no response: {e}");
@@ -302,7 +336,7 @@ mod server {
         dial_for: &DialFor,
         conversation: i64,
         port: u16,
-    ) -> Result<SendRequest<Incoming>, Response<Body>> {
+    ) -> Result<SendRequest<Body>, Response<Body>> {
         let stream = dial_for(conversation)(port)
             .await
             .map_err(|message| text_response(StatusCode::BAD_GATEWAY, &message))?;
@@ -613,6 +647,81 @@ mod server {
                 assert!(reply.starts_with("HTTP/1.1 200") && reply.ends_with("ok"), "got {replies:?}");
             }
             assert_eq!(dials.lock().unwrap().len(), 2, "the closed upstream was replaced");
+        }
+
+        /// Like `dial_for_upstream`, but the upstream's end of stream reaches
+        /// the proxy a second late — as it does through a real port-forward
+        /// (see `sandbox::open_pod_port`).
+        fn dial_for_upstream_with_late_eof(upstream: SocketAddr, dials: Dials) -> DialFor {
+            Arc::new(move |conversation| {
+                let dials = dials.clone();
+                Arc::new(move |port| {
+                    dials.lock().unwrap().push((conversation, port));
+                    Box::pin(async move {
+                        let tcp = TcpStream::connect(upstream).await.map_err(|e| e.to_string())?;
+                        let (proxy_side, pump_side) = tokio::io::duplex(64 * 1024);
+                        let (mut from_server, mut to_server) = tcp.into_split();
+                        let (mut from_proxy, mut to_proxy) = tokio::io::split(pump_side);
+                        tokio::spawn(async move {
+                            let _ = tokio::io::copy(&mut from_server, &mut to_proxy).await;
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            let _ = tokio::io::AsyncWriteExt::shutdown(&mut to_proxy).await;
+                        });
+                        tokio::spawn(async move {
+                            let _ = tokio::io::copy(&mut from_proxy, &mut to_server).await;
+                        });
+                        Ok(Box::new(proxy_side) as Box<dyn PodIo>)
+                    }) as DialFuture
+                }) as SandboxDial
+            })
+        }
+
+        #[tokio::test]
+        async fn test_an_idle_upstream_dropped_just_before_a_request_is_redialled() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // HTTP/1.1 and kept alive, until the connection has been idle
+            // for 100ms — like Node's keep-alive timeout, only shorter.
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_addr = upstream.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = upstream.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        while let Ok(Ok(n)) =
+                            tokio::time::timeout(std::time::Duration::from_millis(100), socket.read(&mut buf)).await
+                        {
+                            if n == 0 {
+                                return;
+                            }
+                            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+                        }
+                    });
+                }
+            });
+            let dials = Dials::default();
+            let (preview, _) = start_preview(dial_for_upstream_with_late_eof(upstream_addr, dials.clone())).await;
+            let host = format!("3000-42.preview.localhost:{}", preview.port());
+            let mut stream = TcpStream::connect(preview).await.unwrap();
+            let mut replies = Vec::new();
+            for pause in [300, 0] {
+                stream
+                    .write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                let mut buf = vec![0u8; 4096];
+                let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+                    .await
+                    .expect("a reply in time")
+                    .unwrap();
+                replies.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                // The upstream drops the idle connection at 100ms; the proxy
+                // won't hear of it for another second.
+                tokio::time::sleep(std::time::Duration::from_millis(pause)).await;
+            }
+            for reply in &replies {
+                assert!(reply.starts_with("HTTP/1.1 200") && reply.ends_with("ok"), "got {replies:?}");
+            }
+            assert_eq!(dials.lock().unwrap().len(), 2, "the dropped upstream was replaced");
         }
 
         #[tokio::test]
