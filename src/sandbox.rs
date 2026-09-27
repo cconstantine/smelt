@@ -360,14 +360,18 @@ pub(crate) async fn exec_with(
     let mut stderr_reader = attached
         .stderr()
         .expect("stderr requested by AttachParams::default()");
-    let mut stdout = String::new();
-    let mut stderr = String::new();
+    // Bytes, decoded leniently: a file's contents need not be UTF-8, and
+    // a `head -c` cut can split a character (SME-32).
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
     let (stdout_res, stderr_res) = tokio::join!(
-        stdout_reader.read_to_string(&mut stdout),
-        stderr_reader.read_to_string(&mut stderr),
+        stdout_reader.read_to_end(&mut stdout),
+        stderr_reader.read_to_end(&mut stderr),
     );
     stdout_res.map_err(SandboxError::Io)?;
     stderr_res.map_err(SandboxError::Io)?;
+    let stdout = String::from_utf8_lossy(&stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
 
     let status = attached.take_status();
     attached.join().await.ok();
@@ -4412,6 +4416,21 @@ mod tests {
                 .await
                 .expect("read a repo without one");
             assert_eq!(none, None);
+
+            // Bytes that aren't UTF-8 (or a 1 MiB cut through a character)
+            // still load, with the bad bytes replaced (SME-32 code review,
+            // finding 6).
+            let bad = sandbox
+                .exec(&["sh", "-c", "git init -q /workspace/bad-bytes && printf 'Use \\377 tabs.\\n' > /workspace/bad-bytes/AGENTS.md"])
+                .await
+                .expect("exec make bad bytes");
+            assert_eq!(bad.exit_code, 0, "{}", bad.stderr);
+            let read = crate::git::read_agents_file(&client, &pod_name, "bad-bytes")
+                .await
+                .expect("a file with invalid UTF-8 reads")
+                .expect("it exists");
+            assert_eq!(read.content, "Use \u{FFFD} tabs.\n");
+            assert_eq!(read.file_bytes, 12);
 
             let missing = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/nope.git", None, "nope", false)
                 .await
