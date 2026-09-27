@@ -310,7 +310,9 @@ mod server {
             client,
             pod_name,
             "sandbox",
-            &["git", "-C", &path, "ls-files", "--", "AGENTS.md", "*/AGENTS.md"],
+            // -z: paths as they are, NUL-separated; otherwise git quotes
+            // non-ASCII ones ("\303\251/AGENTS.md"), which can't be loaded.
+            &["git", "-C", &path, "ls-files", "-z", "--", "AGENTS.md", "*/AGENTS.md"],
             None,
         )
         .await
@@ -318,7 +320,7 @@ mod server {
         if listed.exit_code != 0 {
             return Err(format!("couldn't list {path}'s AGENTS.md files: {}", listed.stderr.trim()));
         }
-        let mut files: Vec<String> = listed.stdout.lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+        let mut files: Vec<String> = listed.stdout.split('\0').filter(|l| !l.is_empty()).map(str::to_string).collect();
         files.sort_by_key(|f| (f.matches('/').count(), f.clone()));
         files.truncate(50);
         Ok(files)

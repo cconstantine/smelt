@@ -4485,6 +4485,16 @@ mod tests {
             assert_eq!(read.content, "Use \u{FFFD} tabs.\n");
             assert_eq!(read.file_bytes, 12);
 
+            // A non-ASCII path is listed as it is, not in git's quoting,
+            // so it can be loaded (SME-32 code review 7, finding 3).
+            let unicode = sandbox
+                .exec(&["sh", "-c", "git init -q /workspace/unicode && cd /workspace/unicode && mkdir é && echo x > é/AGENTS.md && git add é/AGENTS.md"])
+                .await
+                .expect("exec make unicode");
+            assert_eq!(unicode.exit_code, 0, "{}", unicode.stderr);
+            let listed = crate::git::list_agents_files(&client, &pod_name, "unicode").await.expect("list");
+            assert_eq!(listed, vec!["é/AGENTS.md".to_string()]);
+
             // An AGENTS.md that's a symlink out of the checkout (to a key,
             // say) is refused, not read (SME-32 code review 7, finding 1).
             let linked = sandbox
