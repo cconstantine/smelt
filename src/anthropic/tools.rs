@@ -135,6 +135,7 @@ mod server {
             "grep" => grep_tool(pool, conversation_id, input).await,
             "todowrite" => todowrite_tool(pool, conversation_id, input).await,
             "todoread" => todoread_tool(pool, conversation_id).await,
+            "clone_repo" => clone_repo_tool(pool, conversation_id, input).await,
             "webfetch" => webfetch_tool(pool, conversation_id, input).await,
             "http_request" => http_request_tool(input).await,
             "open_browser_session" => open_browser_session_tool(pool, conversation_id).await,
@@ -663,6 +664,26 @@ mod server {
                                todowrite."
                     .to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            ToolDefinition {
+                name: "clone_repo".to_string(),
+                description: "Clone a git repository into this conversation's sandbox pod, \
+                               at /workspace/<dir> (the repo's name by default), and remember \
+                               it: a new pod for this conversation clones it again. Use this \
+                               rather than `git clone` in a terminal. Needs a pod (create_pod \
+                               first). Takes an SSH URL (git@github.com:owner/repo.git) or an \
+                               https one; https only works for public repos, and pushing \
+                               needs SSH. Returns where it is and what was checked out."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "the repository's URL"},
+                        "branch": {"type": "string", "description": "branch or tag to check out; the remote's default if omitted"},
+                        "dir": {"type": "string", "description": "directory name under /workspace; the repo's name if omitted"}
+                    },
+                    "required": ["url"]
+                }),
             },
             ToolDefinition {
                 name: "webfetch".to_string(),
@@ -2167,6 +2188,15 @@ mod server {
         serde_json::to_string(&todos).map_err(|e| e.to_string())
     }
 
+    async fn clone_repo_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
+        let url = required_str(input, "url")?;
+        let optional = |field: &str| input.get(field).and_then(Value::as_str).map(str::to_string);
+        let branch = optional("branch");
+        let dir = optional("dir");
+        let repo = crate::git::clone_repo(pool, conversation_id, &url, branch.as_deref(), dir.as_deref()).await?;
+        serde_json::to_string(&repo).map_err(|e| e.to_string())
+    }
+
     async fn webfetch_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
         let url = required_str(input, "url")?;
         let sandbox = crate::egress_proxy::sandbox_dial(pool.clone(), conversation_id);
@@ -2526,6 +2556,26 @@ mod server {
                 .expect_err("not a container address");
                 assert!(message.contains("docker inspect"), "{host:?}: {message}");
             }
+        }
+
+        #[sqlx::test]
+        async fn test_clone_repo_tool_needs_a_url_and_a_pod(pool: sqlx::PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("create conversation");
+            let missing = execute(&pool, conversation.id, "toolu_1", "clone_repo", &serde_json::json!({}))
+                .await
+                .expect_err("url is required");
+            assert!(missing.contains("url"), "{missing}");
+            let no_pod = execute(
+                &pool,
+                conversation.id,
+                "toolu_2",
+                "clone_repo",
+                &serde_json::json!({"url": "git@github.com:o/r.git", "branch": "dev"}),
+            )
+            .await
+            .expect_err("no pod yet");
+            assert!(no_pod.contains("create_pod"), "{no_pod}");
+            assert!(native_tool_definitions().iter().any(|d| d.name == "clone_repo"));
         }
 
         #[sqlx::test]

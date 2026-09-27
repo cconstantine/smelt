@@ -19,6 +19,32 @@ pub struct SshKeySummary {
     pub fingerprint: String,
 }
 
+/// Where a conversation's repo is: being cloned, checked out, or failed.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoStatus {
+    Cloning,
+    Ready,
+    Failed,
+}
+
+/// A repo a conversation works on, as the sandbox panel and the model see it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RepoSummary {
+    pub id: i64,
+    pub url: String,
+    /// Where it's checked out in the pod: `/workspace/<dir>`.
+    pub path: String,
+    /// The branch asked for; `None` means the remote's default.
+    pub requested_branch: Option<String>,
+    /// What the last clone checked out.
+    pub branch: Option<String>,
+    pub commit: Option<String>,
+    pub status: RepoStatus,
+    /// Why the last clone failed.
+    pub error: Option<String>,
+}
+
 /// The name and email commits are made with.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct GitIdentity {
@@ -28,7 +54,8 @@ pub struct GitIdentity {
 
 #[cfg(feature = "server")]
 mod server {
-    use super::{GitIdentity, SshKeySummary};
+    use super::{GitIdentity, RepoStatus, RepoSummary, SshKeySummary};
+    use crate::events::{self, ConversationEvent};
     use crate::{db, sandbox};
     use sqlx::PgPool;
     use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey, rand_core::OsRng};
@@ -38,6 +65,308 @@ mod server {
     /// and `/etc/gitconfig` at files in it, so nothing in the user's home
     /// directory, which may be a volume of their own, is touched.
     pub const POD_GIT_DIR: &str = "/etc/smelt";
+
+    /// The identity of a remote repository, whatever URL form named it:
+    /// `git@github.com:o/r.git`, `ssh://git@github.com/o/r`,
+    /// `https://github.com/o/r.git` and `https://github.com/O/R/` are all
+    /// `github.com/o/r`. What trust decisions are remembered by. Lowercased,
+    /// since the common hosts treat owner and repo names that way. `None`
+    /// for anything that isn't a clonable URL.
+    pub fn remote_key(url: &str) -> Option<String> {
+        let (host, path) = parse_remote(url)?;
+        Some(format!("{host}/{path}").to_lowercase())
+    }
+
+    /// The directory a clone of `url` goes in, under `/workspace`: the
+    /// repo's own name, like `git clone` picks.
+    pub fn default_checkout_dir(url: &str) -> Option<String> {
+        let (_, path) = parse_remote(url)?;
+        path.rsplit('/').next().map(str::to_string)
+    }
+
+    /// `(host, path)` of a clonable URL, the path without slashes at
+    /// either end or a `.git` suffix; `file` as the host for a local path.
+    /// Anything git would read as an option or a transport helper
+    /// (`ext::…`) is refused, since the URL ends up on a command line.
+    fn parse_remote(url: &str) -> Option<(String, String)> {
+        let url = url.trim();
+        if url.is_empty() || url.starts_with('-') || url.contains("::") || url.contains(char::is_whitespace) {
+            return None;
+        }
+        let (host, path) = if url.contains("://") {
+            let parsed = url::Url::parse(url).ok()?;
+            match parsed.scheme() {
+                "file" => ("file".to_string(), parsed.path().to_string()),
+                "https" | "http" | "ssh" | "git" => {
+                    (parsed.host_str()?.to_string(), parsed.path().to_string())
+                }
+                _ => return None,
+            }
+        } else {
+            // scp-like: [user@]host:path, where a `/` before the `:` would
+            // make it a local path instead.
+            let (before, path) = url.split_once(':')?;
+            if before.contains('/') {
+                return None;
+            }
+            let host = before.rsplit_once('@').map_or(before, |(_, host)| host);
+            (host.to_string(), path.to_string())
+        };
+        let path = path.trim_matches('/');
+        let path = path.strip_suffix(".git").unwrap_or(path).trim_end_matches('/');
+        if host.is_empty() || path.is_empty() {
+            return None;
+        }
+        Some((host, path.to_string()))
+    }
+
+    /// What a finished clone checked out.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct ClonedRepo {
+        pub commit: String,
+        pub branch: String,
+    }
+
+    /// Clones `url` into `/workspace/<dir>` in pod `pod_name`, at `branch`
+    /// or the remote's default. The error is git's own output.
+    pub async fn clone_into_pod(
+        client: &kube::Client,
+        pod_name: &str,
+        url: &str,
+        branch: Option<&str>,
+        dir: &str,
+    ) -> Result<ClonedRepo, String> {
+        if parse_remote(url).is_none() {
+            return Err(format!("{url} isn't a git URL smelt can clone."));
+        }
+        let path = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
+        // No prompts: nothing can answer one, and a clone waiting on a
+        // password or a host key would hang until the timeout.
+        let mut command = vec![
+            "env",
+            "GIT_TERMINAL_PROMPT=0",
+            "git",
+            "-c",
+            "core.sshCommand=ssh -o BatchMode=yes",
+            "clone",
+            "--quiet",
+        ];
+        if let Some(branch) = branch {
+            command.extend(["--branch", branch]);
+        }
+        command.extend(["--", url, &path]);
+        let clone = tokio::time::timeout(
+            CLONE_TIMEOUT,
+            crate::sandbox::exec_with(client, pod_name, "sandbox", &command, None),
+        )
+        .await
+        .map_err(|_| format!("git clone {url} took longer than {} minutes", CLONE_TIMEOUT.as_secs() / 60))?
+        .map_err(|e| e.to_string())?;
+        if clone.exit_code != 0 {
+            let output = format!("{}{}", clone.stdout, clone.stderr);
+            let output = output.trim();
+            return Err(if output.is_empty() {
+                format!("git clone {url} failed (exit code {})", clone.exit_code)
+            } else {
+                output.to_string()
+            });
+        }
+        let head = crate::sandbox::exec_with(
+            client,
+            pod_name,
+            "sandbox",
+            &["git", "-C", &path, "rev-parse", "HEAD", "--abbrev-ref", "HEAD"],
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let mut lines = head.stdout.lines();
+        match (head.exit_code, lines.next(), lines.next()) {
+            (0, Some(commit), Some(branch)) => Ok(ClonedRepo {
+                commit: commit.to_string(),
+                branch: branch.to_string(),
+            }),
+            _ => Err(format!("cloned, but couldn't read what was checked out: {}", head.stdout.trim())),
+        }
+    }
+
+    /// How long a clone may take before smelt gives up on it.
+    const CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+    /// A checkout directory is one name under `/workspace`.
+    pub fn validate_checkout_dir(dir: &str) -> Result<(), String> {
+        let valid = !dir.is_empty()
+            && dir.len() <= 100
+            && !dir.starts_with(['.', '-'])
+            && dir
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if valid {
+            Ok(())
+        } else {
+            Err(format!(
+                "{dir:?} can't be a checkout directory: use one name of letters, digits, \
+                 -, _ or ., not starting with . or -."
+            ))
+        }
+    }
+
+    fn repo_summary(repo: db::ConversationRepo) -> RepoSummary {
+        RepoSummary {
+            id: repo.id,
+            url: repo.url,
+            path: format!("{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir),
+            requested_branch: repo.branch,
+            branch: repo.checked_out_branch,
+            commit: repo.commit_sha,
+            status: match repo.status.as_str() {
+                "ready" => RepoStatus::Ready,
+                "failed" => RepoStatus::Failed,
+                _ => RepoStatus::Cloning,
+            },
+            error: repo.error,
+        }
+    }
+
+    /// A conversation's repos.
+    pub async fn list_repos(pool: &PgPool, conversation_id: i64) -> Result<Vec<RepoSummary>, String> {
+        let repos = db::list_conversation_repos(pool, conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(repos.into_iter().map(repo_summary).collect())
+    }
+
+    /// Tells every tab watching the conversation what its repos are now.
+    async fn publish_repos(pool: &PgPool, conversation_id: i64) {
+        match list_repos(pool, conversation_id).await {
+            Ok(repos) => events::publish(conversation_id, ConversationEvent::ReposUpdate { repos }),
+            Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't list repos to publish"),
+        }
+    }
+
+    /// Records `url` as one of the conversation's repos and clones it into
+    /// the conversation's pod, at `/workspace/<dir>` (the repo's name when
+    /// `dir` is `None`). The same repo and branch already checked out is
+    /// returned as it is rather than cloned twice.
+    pub async fn clone_repo(
+        pool: &PgPool,
+        conversation_id: i64,
+        url: &str,
+        branch: Option<&str>,
+        dir: Option<&str>,
+    ) -> Result<RepoSummary, String> {
+        let url = url.trim();
+        let branch = branch.map(str::trim).filter(|b| !b.is_empty());
+        let key = remote_key(url).ok_or_else(|| format!("{url} isn't a git URL smelt can clone."))?;
+        let dir = match dir.map(str::trim).filter(|d| !d.is_empty()) {
+            Some(dir) => dir.to_string(),
+            None => default_checkout_dir(url).expect("remote_key parsed it"),
+        };
+        validate_checkout_dir(&dir)?;
+
+        let existing = db::list_conversation_repos(pool, conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(same) = existing
+            .iter()
+            .find(|r| r.remote_key == key && r.branch.as_deref() == branch && r.status != "failed")
+        {
+            return Ok(repo_summary(same.clone()));
+        }
+        if let Some(other) = existing.iter().find(|r| r.dir == dir) {
+            if other.remote_key != key || other.status != "failed" {
+                return Err(format!(
+                    "/workspace/{dir} is already used by {}. Pick another directory.",
+                    other.url
+                ));
+            }
+        }
+
+        let pod_id = sandbox::live_pod_id(pool, conversation_id).await.map_err(|_| {
+            "This conversation has no sandbox yet: call create_pod first.".to_string()
+        })?;
+
+        // A failed earlier attempt at the same directory is retried in
+        // place rather than recorded twice.
+        let repo = match existing.into_iter().find(|r| r.dir == dir) {
+            Some(failed) => {
+                db::set_repo_cloning(pool, failed.id).await.map_err(|e| e.to_string())?;
+                failed
+            }
+            None => db::create_conversation_repo(pool, conversation_id, url, &key, branch, &dir)
+                .await
+                .map_err(|e| e.to_string())?,
+        };
+        publish_repos(pool, conversation_id).await;
+        let outcome = clone_repo_row(pool, pod_id, &repo).await;
+        publish_repos(pool, conversation_id).await;
+        outcome?;
+        let repos = db::list_conversation_repos(pool, conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        repos
+            .into_iter()
+            .find(|r| r.id == repo.id)
+            .map(repo_summary)
+            .ok_or_else(|| "the repo vanished while it was cloned".to_string())
+    }
+
+    /// The user's "Work on a repo": starts the conversation's sandbox if it
+    /// has none, then clones.
+    pub async fn attach_repo(
+        pool: &PgPool,
+        conversation_id: i64,
+        url: &str,
+        branch: Option<&str>,
+    ) -> Result<RepoSummary, String> {
+        if remote_key(url).is_none() {
+            return Err(format!("{} isn't a git URL smelt can clone.", url.trim()));
+        }
+        if sandbox::live_pod_id(pool, conversation_id).await.is_err() {
+            sandbox::create_pod(pool, conversation_id, sandbox::PodLimitOverrides::default())
+                .await
+                .map_err(|e| format!("Couldn't start the sandbox: {e}"))?;
+        }
+        clone_repo(pool, conversation_id, url, branch, None).await
+    }
+
+    /// A new pod for a conversation gets its repos back: each is cloned
+    /// again, at the branch it was asked for. A repo that fails is marked
+    /// failed, with git's reason, and doesn't fail the pod.
+    pub async fn reclone_repos(pool: &PgPool, conversation_id: i64, pod_id: i64) {
+        let repos = match db::list_conversation_repos(pool, conversation_id).await {
+            Ok(repos) => repos,
+            Err(e) => {
+                tracing::warn!(conversation_id, error = %e, "couldn't list repos to clone again");
+                return;
+            }
+        };
+        for repo in repos {
+            if db::set_repo_cloning(pool, repo.id).await.is_err() {
+                continue;
+            }
+            publish_repos(pool, conversation_id).await;
+            if let Err(e) = clone_repo_row(pool, pod_id, &repo).await {
+                tracing::warn!(conversation_id, repo = %repo.url, error = %e, "couldn't clone a repo again");
+            }
+            publish_repos(pool, conversation_id).await;
+        }
+    }
+
+    /// Clones one recorded repo into pod `pod_id` and records how it went.
+    async fn clone_repo_row(pool: &PgPool, pod_id: i64, repo: &db::ConversationRepo) -> Result<(), String> {
+        let client = sandbox::kube_client();
+        let pod_name = sandbox::kubernetes_pod_name(pod_id);
+        match clone_into_pod(&client, &pod_name, &repo.url, repo.branch.as_deref(), &repo.dir).await {
+            Ok(cloned) => db::set_repo_cloned(pool, repo.id, &cloned.branch, &cloned.commit)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => {
+                let _ = db::set_repo_failed(pool, repo.id, &e).await;
+                Err(e)
+            }
+        }
+    }
 
     /// A key pair in OpenSSH format.
     #[derive(Clone, Debug, PartialEq)]
@@ -303,6 +632,34 @@ mod server {
         }
 
         #[sqlx::test]
+        async fn test_clone_repo_refuses_before_recording_anything(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let bad_url = clone_repo(&pool, conversation.id, "not a url", None, None)
+                .await
+                .expect_err("bad url");
+            assert!(bad_url.contains("isn't a git URL"), "{bad_url}");
+            let bad_dir = clone_repo(&pool, conversation.id, "git@github.com:o/r.git", None, Some("../etc"))
+                .await
+                .expect_err("bad dir");
+            assert!(bad_dir.contains("directory"), "{bad_dir}");
+            let no_pod = clone_repo(&pool, conversation.id, "git@github.com:o/r.git", None, None)
+                .await
+                .expect_err("no pod");
+            assert!(no_pod.contains("create_pod"), "{no_pod}");
+            assert!(list_repos(&pool, conversation.id).await.expect("list").is_empty());
+        }
+
+        #[test]
+        fn test_checkout_dirs_are_one_plain_name() {
+            for ok in ["smelt", "my.repo", "repo-2", "a_b"] {
+                assert!(validate_checkout_dir(ok).is_ok(), "{ok}");
+            }
+            for bad in ["", ".", "..", "../x", "a/b", ".hidden", "-rf", "has space", &"x".repeat(101)] {
+                assert!(validate_checkout_dir(bad).is_err(), "{bad:?}");
+            }
+        }
+
+        #[sqlx::test]
         async fn test_delete_key_and_save_identity(pool: PgPool) {
             let key = create_key(&pool, "gone").await.expect("create");
             delete_key(&pool, key.id).await.expect("delete");
@@ -326,6 +683,43 @@ mod server {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn test_remote_key_is_the_same_for_every_url_form() {
+            for url in [
+                "git@github.com:Owner/Repo.git",
+                "ssh://git@github.com/owner/repo",
+                "ssh://git@github.com:22/owner/repo.git",
+                "https://github.com/owner/repo.git",
+                "https://github.com/OWNER/repo/",
+                "https://user@github.com/owner/repo",
+                "http://github.com/owner/repo",
+                "git://github.com/owner/repo.git",
+            ] {
+                assert_eq!(remote_key(url).as_deref(), Some("github.com/owner/repo"), "{url}");
+            }
+            assert_eq!(
+                remote_key("https://gitlab.com/group/sub/project.git").as_deref(),
+                Some("gitlab.com/group/sub/project")
+            );
+            // A local path in the pod (tests use bare repos this way).
+            assert_eq!(remote_key("file:///tmp/origin.git").as_deref(), Some("file/tmp/origin"));
+        }
+
+        #[test]
+        fn test_remote_key_refuses_what_isnt_a_url() {
+            for bad in ["", "   ", "github.com", "owner/repo", "https://", "https://github.com", "-u evil", "ext::sh -c touch% /tmp/x"] {
+                assert_eq!(remote_key(bad), None, "{bad:?}");
+            }
+        }
+
+        #[test]
+        fn test_default_checkout_dir_is_the_repo_name() {
+            assert_eq!(default_checkout_dir("git@github.com:o/smelt.git").as_deref(), Some("smelt"));
+            assert_eq!(default_checkout_dir("https://github.com/o/Smelt/").as_deref(), Some("Smelt"));
+            assert_eq!(default_checkout_dir("file:///tmp/origin.git").as_deref(), Some("origin"));
+            assert_eq!(default_checkout_dir("owner/repo"), None);
+        }
 
         #[test]
         fn test_generated_key_is_ed25519_and_its_halves_match() {

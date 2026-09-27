@@ -863,6 +863,105 @@ pub async fn set_git_identity(
     Ok(())
 }
 
+// --- A conversation's git repos (SME-32) ---
+
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+pub struct ConversationRepo {
+    pub id: i64,
+    pub conversation_id: i64,
+    pub url: String,
+    pub remote_key: String,
+    pub branch: Option<String>,
+    pub dir: String,
+    /// `cloning`, `ready` or `failed`.
+    pub status: String,
+    pub error: Option<String>,
+    pub checked_out_branch: Option<String>,
+    pub commit_sha: Option<String>,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+/// Records a repo, `cloning`. Fails on a `dir` the conversation already uses.
+pub async fn create_conversation_repo(
+    pool: &PgPool,
+    conversation_id: i64,
+    url: &str,
+    remote_key: &str,
+    branch: Option<&str>,
+    dir: &str,
+) -> Result<ConversationRepo, sqlx::Error> {
+    sqlx::query_as::<_, ConversationRepo>(
+        "INSERT INTO conversation_repos (conversation_id, url, remote_key, branch, dir, status)
+         VALUES ($1, $2, $3, $4, $5, 'cloning') RETURNING *",
+    )
+    .bind(conversation_id)
+    .bind(url)
+    .bind(remote_key)
+    .bind(branch)
+    .bind(dir)
+    .fetch_one(pool)
+    .await
+}
+
+/// A conversation's repos, in the order they were added.
+pub async fn list_conversation_repos(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Vec<ConversationRepo>, sqlx::Error> {
+    sqlx::query_as::<_, ConversationRepo>(
+        "SELECT * FROM conversation_repos WHERE conversation_id = $1 ORDER BY id ASC",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// A clone is starting (again): the last one's outcome is cleared.
+pub async fn set_repo_cloning(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE conversation_repos
+            SET status = 'cloning', error = NULL, updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_repo_cloned(
+    pool: &PgPool,
+    id: i64,
+    checked_out_branch: &str,
+    commit_sha: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE conversation_repos
+            SET status = 'ready', error = NULL, checked_out_branch = $2, commit_sha = $3,
+                updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(checked_out_branch)
+    .bind(commit_sha)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_repo_failed(pool: &PgPool, id: i64, error: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE conversation_repos SET status = 'failed', error = $2, updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // --- MCP servers (externally-hosted, configured via the /mcp-servers UI) ---
 // Plain CRUD, no soft delete — this is configuration a person edits, not a
 // live external resource like a sandbox pod. See
@@ -2324,6 +2423,46 @@ mod tests {
         };
         set_git_identity(&pool, &second).await.expect("set again");
         assert_eq!(get_git_identity(&pool).await.expect("get"), second);
+    }
+
+    #[sqlx::test]
+    async fn test_conversation_repos_round_trip_through_a_clone(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("create conversation");
+        let repo = create_conversation_repo(
+            &pool,
+            conversation.id,
+            "git@github.com:o/r.git",
+            "github.com/o/r",
+            Some("dev"),
+            "r",
+        )
+        .await
+        .expect("create repo");
+        assert_eq!(repo.status, "cloning");
+        assert_eq!(repo.branch.as_deref(), Some("dev"));
+
+        set_repo_failed(&pool, repo.id, "fatal: nope").await.expect("fail");
+        let listed = list_conversation_repos(&pool, conversation.id).await.expect("list");
+        assert_eq!((listed[0].status.as_str(), listed[0].error.as_deref()), ("failed", Some("fatal: nope")));
+
+        set_repo_cloning(&pool, repo.id).await.expect("retry");
+        set_repo_cloned(&pool, repo.id, "dev", "abc123").await.expect("cloned");
+        let listed = list_conversation_repos(&pool, conversation.id).await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "ready");
+        assert_eq!(listed[0].error, None);
+        assert_eq!(listed[0].checked_out_branch.as_deref(), Some("dev"));
+        assert_eq!(listed[0].commit_sha.as_deref(), Some("abc123"));
+
+        // One checkout per directory.
+        assert!(
+            create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
+                .await
+                .is_err()
+        );
+        // Deleting the conversation deletes its repos.
+        delete_conversation(&pool, conversation.id).await.expect("delete conversation");
+        assert!(list_conversation_repos(&pool, conversation.id).await.expect("list").is_empty());
     }
 
     #[sqlx::test]

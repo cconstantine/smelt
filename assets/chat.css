@@ -2638,3 +2638,111 @@ div.mcp-status-not-connected::before {
         flex-direction: row;
     }
 }
+
+/* A conversation's repos in the sandbox panel (SME-32). */
+
+.sandbox-repos {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 8px 0;
+}
+
+.sandbox-repo {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 10px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-left-width: 3px;
+    border-radius: 8px;
+    background: var(--surface);
+    font-size: 13px;
+    min-width: 0;
+}
+
+.sandbox-repo-ready {
+    border-left-color: var(--ok);
+}
+
+.sandbox-repo-cloning {
+    border-left-color: var(--muted);
+}
+
+.sandbox-repo-failed {
+    border-left-color: var(--danger);
+}
+
+.sandbox-repo-path {
+    font-weight: 600;
+    word-break: break-all;
+}
+
+.sandbox-repo-detail {
+    color: var(--text-2);
+}
+
+.sandbox-repo-error,
+.repo-attach-error {
+    flex-basis: 100%;
+    margin: 4px 0 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 12px;
+    color: var(--danger);
+}
+
+/* "Work on a repo" in a new conversation. */
+
+.repo-attach {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 16px 0;
+    text-align: left;
+}
+
+.repo-attach label {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.repo-attach-fields {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.repo-attach-fields input {
+    flex: 3 1 240px;
+    min-width: 0;
+    padding: 8px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 14px;
+}
+
+.repo-attach-fields input.repo-attach-branch {
+    flex: 1 1 120px;
+}
+
+.repo-attach-fields button {
+    padding: 8px 16px;
+    border: 1px solid var(--ink);
+    border-radius: 8px;
+    background: var(--ink);
+    color: var(--surface);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.repo-attach-fields button:disabled {
+    background: var(--border);
+    border-color: var(--border);
+    color: var(--muted);
+    cursor: not-allowed;
+}

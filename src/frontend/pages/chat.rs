@@ -34,6 +34,10 @@ use crate::api::chat::{
 };
 #[cfg(feature = "web")]
 use crate::api::browsing::{get_browsing_state, subscribe_browser_frames};
+#[cfg(feature = "web")]
+use crate::api::git::list_conversation_repos;
+use crate::api::git::attach_repo;
+use crate::git::{RepoStatus, RepoSummary};
 use crate::browsing::BrowserInputEvent;
 // Only referenced by this module's own tests, which build their own
 // `SandboxSnapshot`s by hand rather than through `get_sandbox_state`.
@@ -664,6 +668,7 @@ fn tool_summary(name: &str, input: &serde_json::Value) -> String {
         },
         "todowrite" => "Updated the todo list".to_string(),
         "todoread" => "Checked the todo list".to_string(),
+        "clone_repo" => format!("Cloned {}", field("url")),
         "add" => format!("Added {} and {}", field("a"), field("b")),
         "count" => format!("Counted to {}", field("target")),
         "list_tasks" => "Listed background tasks".to_string(),
@@ -673,6 +678,30 @@ fn tool_summary(name: &str, input: &serde_json::Value) -> String {
         "cancel_task" => "Cancelled a background task".to_string(),
         "write_task_stdin" => "Sent input to a background task".to_string(),
         other => format!("Used {other}"),
+    }
+}
+
+fn repo_status_class(status: RepoStatus) -> &'static str {
+    match status {
+        RepoStatus::Cloning => "cloning",
+        RepoStatus::Ready => "ready",
+        RepoStatus::Failed => "failed",
+    }
+}
+
+/// A repo's state under its path in the sandbox panel.
+fn repo_detail(repo: &RepoSummary) -> String {
+    match repo.status {
+        RepoStatus::Cloning => match &repo.requested_branch {
+            Some(branch) => format!("Cloning {branch}\u{2026}"),
+            None => "Cloning\u{2026}".to_string(),
+        },
+        RepoStatus::Failed => "Clone failed".to_string(),
+        RepoStatus::Ready => {
+            let branch = repo.branch.clone().unwrap_or_default();
+            let commit: String = repo.commit.clone().unwrap_or_default().chars().take(7).collect();
+            format!("{branch} \u{b7} {commit}")
+        }
     }
 }
 
@@ -1915,6 +1944,33 @@ mod tests {
         assert_eq!(tool_summary("http_request", &serde_json::json!({"url": "https://api.x/y"})), "Sent GET https://api.x/y");
         assert_eq!(tool_summary("browser_navigate", &serde_json::json!({"url": "https://example.com"})), "Opened https://example.com in the browser");
         assert_eq!(tool_summary("todowrite", &serde_json::json!({"todos": []})), "Updated the todo list");
+        assert_eq!(
+            tool_summary("clone_repo", &serde_json::json!({"url": "git@github.com:o/r.git"})),
+            "Cloned git@github.com:o/r.git"
+        );
+    }
+
+    #[test]
+    fn test_repo_detail_says_what_is_checked_out() {
+        let mut repo = RepoSummary {
+            id: 1,
+            url: "git@github.com:o/r.git".to_string(),
+            path: "/workspace/r".to_string(),
+            requested_branch: Some("dev".to_string()),
+            branch: None,
+            commit: None,
+            status: RepoStatus::Cloning,
+            error: None,
+        };
+        assert_eq!(repo_detail(&repo), "Cloning dev\u{2026}");
+        repo.requested_branch = None;
+        assert_eq!(repo_detail(&repo), "Cloning\u{2026}");
+        repo.status = RepoStatus::Ready;
+        repo.branch = Some("main".to_string());
+        repo.commit = Some("43835b44f939c268b73b49292428911526a51508".to_string());
+        assert_eq!(repo_detail(&repo), "main \u{b7} 43835b4");
+        repo.status = RepoStatus::Failed;
+        assert_eq!(repo_detail(&repo), "Clone failed");
         assert_eq!(tool_summary("sandbox_preview_url", &serde_json::json!({"port": 5173})), "Shared a preview of port 5173");
         assert_eq!(
             tool_summary("sandbox_preview_url", &serde_json::json!({"port": 3000, "host": "172.21.0.2"})),
@@ -2771,6 +2827,14 @@ fn ChatPanel(
     let mut tasks: Signal<Vec<TaskPanelEntry>> = use_signal(Vec::new);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut todos: Signal<Vec<TodoItem>> = use_signal(Vec::new);
+    // "Work on a repo" in a new conversation.
+    let mut repo_url = use_signal(String::new);
+    let mut repo_branch = use_signal(String::new);
+    let mut repo_attaching = use_signal(|| false);
+    let mut repo_attach_error: Signal<Option<String>> = use_signal(|| None);
+    // The conversation's git repos (SME-32), from `ReposUpdate`.
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut repos: Signal<Vec<RepoSummary>> = use_signal(Vec::new);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut sandbox_pods: Signal<Vec<SandboxPodPanelEntry>> = use_signal(Vec::new);
     // The panel's Stop button: the pod armed for stopping (click once to
@@ -2924,6 +2988,7 @@ fn ChatPanel(
             let Some(id) = selected() else { return };
             tasks.set(Vec::new());
             todos.set(Vec::new());
+            repos.set(Vec::new());
             task_body_els.write().clear();
             task_body_stuck.write().clear();
             sandbox_pods.set(Vec::new());
@@ -2967,6 +3032,9 @@ fn ChatPanel(
                         }
                         if let Ok(snapshot) = get_todos(id).await {
                             todos.set(snapshot);
+                        }
+                        if let Ok(snapshot) = list_conversation_repos(id).await {
+                            repos.set(snapshot);
                         }
                         if let Ok(running) = get_turn_state(id).await {
                             turn_running.set(running);
@@ -3107,6 +3175,9 @@ fn ChatPanel(
                                 }
                                 Some(Ok(ConversationEvent::TurnError { message })) => {
                                     stream_errors.write().insert(id, message);
+                                }
+                                Some(Ok(ConversationEvent::ReposUpdate { repos: list })) => {
+                                    repos.set(list);
                                 }
                                 Some(Err(_)) | None => break,
                             }
@@ -3570,6 +3641,22 @@ fn ChatPanel(
                                                     }
                                                 }
                                             }
+                                            if !repos().is_empty() {
+                                                div { class: "sandbox-repos",
+                                                    for repo in repos() {
+                                                        div {
+                                                            key: "{repo.id}",
+                                                            class: "sandbox-repo sandbox-repo-{repo_status_class(repo.status)}",
+                                                            title: "{repo.url}",
+                                                            code { class: "sandbox-repo-path", "{repo.path}" }
+                                                            span { class: "sandbox-repo-detail", "{repo_detail(&repo)}" }
+                                                            if let Some(err) = repo.error.clone() {
+                                                                pre { class: "sandbox-repo-error", "{err}" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             div { class: "task-terminal-stack",
                                                 for terminal in sandbox_terminals().into_iter().filter(|t| t.pod_id == pod.pod_id) {
                                                     div {
@@ -3755,6 +3842,60 @@ fn ChatPanel(
                                 div { class: "conversation-empty",
                                     h2 { "What should smelt work on?" }
                                     p { "It works in a sandbox of its own: it writes and runs code, uses a terminal, reads the web, and shows you each step." }
+                                    form {
+                                        class: "repo-attach",
+                                        onsubmit: move |event| {
+                                            event.prevent_default();
+                                            let Some(id) = selected() else { return };
+                                            if repo_attaching() {
+                                                return;
+                                            }
+                                            let url = repo_url();
+                                            let branch = repo_branch();
+                                            repo_attaching.set(true);
+                                            repo_attach_error.set(None);
+                                            spawn(async move {
+                                                match attach_repo(id, url, branch).await {
+                                                    Ok(_) => {
+                                                        repo_url.set(String::new());
+                                                        repo_branch.set(String::new());
+                                                    }
+                                                    Err(e) => repo_attach_error.set(Some(e.to_string())),
+                                                }
+                                                repo_attaching.set(false);
+                                            });
+                                        },
+                                        label { r#for: "repo-attach-url", "Work on a repo" }
+                                        div { class: "repo-attach-fields",
+                                            input {
+                                                id: "repo-attach-url",
+                                                r#type: "text",
+                                                required: true,
+                                                placeholder: "git@github.com:owner/repo.git",
+                                                value: "{repo_url}",
+                                                oninput: move |e| repo_url.set(e.value()),
+                                            }
+                                            input {
+                                                class: "repo-attach-branch",
+                                                r#type: "text",
+                                                placeholder: "branch (optional)",
+                                                aria_label: "Branch",
+                                                value: "{repo_branch}",
+                                                oninput: move |e| repo_branch.set(e.value()),
+                                            }
+                                            button {
+                                                r#type: "submit",
+                                                disabled: repo_attaching(),
+                                                if repo_attaching() { "Cloning\u{2026}" } else { "Clone" }
+                                            }
+                                        }
+                                        if repo_attaching() {
+                                            p { class: "muted", "Starting the sandbox and cloning. You can write your first message meanwhile." }
+                                        }
+                                        if let Some(err) = repo_attach_error() {
+                                            pre { class: "error repo-attach-error", "{err}" }
+                                        }
+                                    }
                                     div { class: "example-asks",
                                         for example in EXAMPLE_ASKS {
                                             button {

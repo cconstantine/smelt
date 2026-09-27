@@ -5,7 +5,7 @@
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::git::{GitIdentity, SshKeySummary};
+use crate::git::{GitIdentity, RepoSummary, SshKeySummary};
 #[cfg(feature = "server")]
 use crate::{db, git};
 
@@ -23,6 +23,21 @@ pub async fn get_git_settings() -> ServerFnResult<GitSettings> {
         identity: db::get_git_identity(pool).await.map_err(ServerFnError::new)?,
         keys: git::list_keys(pool).await.map_err(ServerFnError::new)?,
     })
+}
+
+/// The conversation's repos, for the sandbox panel.
+#[get("/api/conversations/{id}/repos")]
+pub async fn list_conversation_repos(id: i64) -> ServerFnResult<Vec<RepoSummary>> {
+    git::list_repos(db::get(), id).await.map_err(ServerFnError::new)
+}
+
+/// "Work on a repo": starts the sandbox if needed and clones `url`.
+#[post("/api/conversations/{id}/repos")]
+pub async fn attach_repo(id: i64, url: String, branch: String) -> ServerFnResult<RepoSummary> {
+    let branch = Some(branch.trim()).filter(|b| !b.is_empty());
+    git::attach_repo(db::get(), id, url.trim(), branch)
+        .await
+        .map_err(ServerFnError::new)
 }
 
 #[post("/api/git/identity")]

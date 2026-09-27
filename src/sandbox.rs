@@ -298,6 +298,7 @@ pub struct Sandbox {
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct ExecResult {
     pub stdout: String,
+    pub stderr: String,
     pub exit_code: i32,
 }
 
@@ -328,7 +329,7 @@ impl Sandbox {
 /// closes just the stdin stream on a v5 connection (k3s has it); an older
 /// server closes the whole connection and the exit code comes back
 /// missing, which callers treat as a failure.
-async fn exec_with(
+pub(crate) async fn exec_with(
     client: &kube::Client,
     pod_name: &str,
     container: &str,
@@ -356,9 +357,6 @@ async fn exec_with(
     let mut stdout_reader = attached
         .stdout()
         .expect("stdout requested by AttachParams::default()");
-    // Requested (so the exec session doesn't wait on a caller that will
-    // never read it) but discarded — no caller has needed stderr
-    // separately from stdout yet.
     let mut stderr_reader = attached
         .stderr()
         .expect("stderr requested by AttachParams::default()");
@@ -380,6 +378,7 @@ async fn exec_with(
 
     Ok(ExecResult {
         stdout,
+        stderr,
         exit_code: extract_exit_code(status),
     })
 }
@@ -436,6 +435,11 @@ pub async fn install_git_files(
         }
     }
     Ok(())
+}
+
+/// The Kubernetes client every sandbox operation uses.
+pub(crate) fn kube_client() -> kube::Client {
+    get().client.clone()
 }
 
 /// `install_git_files` for a live pod of smelt's own, by id.
@@ -1604,6 +1608,7 @@ pub async fn create_pod(
                 let _ = db::terminate_sandbox_pod(pool, row.id).await;
                 return Err(SandboxError::GitSetup(e));
             }
+            crate::git::reclone_repos(pool, conversation_id, row.id).await;
             std::mem::forget(sandbox);
             events::publish(
                 conversation_id,
@@ -4255,6 +4260,77 @@ mod tests {
         checks.expect("checks finished within the timeout");
     }
 
+    /// Sets up a bare repo at /tmp/origin.git inside `sandbox`'s pod, with
+    /// `main` holding an AGENTS.md and a `feature` branch on top. Returns
+    /// main's commit.
+    async fn make_origin_repo(sandbox: &Sandbox) -> String {
+        let script = r#"set -e
+            git init -q -b main /tmp/src && cd /tmp/src
+            printf 'Run make test before committing.\n' > AGENTS.md
+            git add AGENTS.md && git -c user.name=t -c user.email=t@t commit -qm first
+            git branch feature && git checkout -q feature
+            printf 'x\n' > feature.txt && git add feature.txt
+            git -c user.name=t -c user.email=t@t commit -qm feature && git checkout -q main
+            git clone -q --bare /tmp/src /tmp/origin.git
+            git rev-parse main"#;
+        let made = sandbox.exec(&["sh", "-c", script]).await.expect("exec make origin");
+        assert_eq!(made.exit_code, 0, "make origin repo: {}", made.stdout);
+        made.stdout.trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_clone_into_pod_checks_out_a_branch_and_reports_failures() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let sandbox = manager
+            .create(&unique_session_id("git-clone"), "256Mi", "250m", &[])
+            .await
+            .expect("create pod");
+        let pod_name = sandbox.pod_name.clone();
+
+        let checks = tokio::time::timeout(Duration::from_secs(120), async {
+            let main_commit = make_origin_repo(&sandbox).await;
+
+            let cloned = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin")
+                .await
+                .expect("clone the default branch");
+            assert_eq!(cloned.commit, main_commit);
+            assert_eq!(cloned.branch, "main");
+            let agents = sandbox
+                .exec(&["cat", "/workspace/origin/AGENTS.md"])
+                .await
+                .expect("exec cat");
+            assert_eq!(agents.stdout, "Run make test before committing.\n");
+
+            let feature = crate::git::clone_into_pod(
+                &client,
+                &pod_name,
+                "file:///tmp/origin.git",
+                Some("feature"),
+                "origin-feature",
+            )
+            .await
+            .expect("clone a branch");
+            assert_eq!(feature.branch, "feature");
+            assert_ne!(feature.commit, main_commit);
+
+            let missing = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/nope.git", None, "nope")
+                .await
+                .expect_err("a missing repo fails");
+            assert!(missing.contains("does not appear to be a git repository"), "{missing}");
+
+            // The directory is taken: git's own message, not a silent overwrite.
+            let taken = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin")
+                .await
+                .expect_err("an existing directory fails");
+            assert!(taken.contains("already exists"), "{taken}");
+        })
+        .await;
+
+        manager.delete(sandbox).await.expect("delete pod");
+        checks.expect("checks finished within the timeout");
+    }
+
     #[test]
     fn test_exec_with_no_status_is_a_failure_not_a_success() {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
@@ -4816,6 +4892,30 @@ mod tests {
                 (0, "lifecycle@example.com"),
                 "a new pod has the stored key and identity"
             );
+
+            // clone_repo records the repo and checks it out in the pod.
+            let origin = exec_with(
+                &client,
+                &pod_name(pod_a),
+                "sandbox",
+                &["sh", "-c", "set -e; git init -q -b main /tmp/src; cd /tmp/src; echo hi > README; git add README; git commit -qm one; git clone -q --bare /tmp/src /tmp/origin.git; git rev-parse HEAD"],
+                None,
+            )
+            .await
+            .expect("exec make origin");
+            assert_eq!(origin.exit_code, 0, "make origin: {}{}", origin.stdout, origin.stderr);
+            let repo = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, None)
+                .await
+                .expect("clone_repo");
+            assert_eq!(repo.path, "/workspace/origin");
+            assert_eq!(repo.status, crate::git::RepoStatus::Ready);
+            assert_eq!(repo.commit.as_deref(), Some(origin.stdout.trim()));
+            assert_eq!(repo.branch.as_deref(), Some("main"));
+            // Asking again returns the same checkout rather than a second clone.
+            let again = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, None)
+                .await
+                .expect("clone_repo again");
+            assert_eq!(again.id, repo.id);
             let duplicate = create_pod(&pool, conversation_a.id, PodLimitOverrides::default()).await;
             assert!(
                 matches!(duplicate, Err(SandboxError::PodAlreadyExists)),
@@ -5233,8 +5333,35 @@ mod tests {
                 "terminate_pod should no longer be idempotent — a second call resolves to NoPod, got {repeat:?}"
             );
 
+            // A new pod clones the conversation's repos again. This origin
+            // lived in the old pod's /tmp, so the retry fails, with git's
+            // own reason recorded.
+            create_pod(&pool, conversation_a.id, PodLimitOverrides::default())
+                .await
+                .expect("a second pod for conversation a");
+            let repos = crate::git::list_repos(&pool, conversation_a.id).await.expect("list repos");
+            assert_eq!(repos.len(), 1);
+            assert_eq!(repos[0].status, crate::git::RepoStatus::Failed, "{repos:?}");
+            assert!(
+                repos[0].error.as_deref().unwrap_or("").contains("does not appear to be a git repository"),
+                "{repos:?}"
+            );
+            terminate_pod(&pool, conversation_a.id).await.expect("terminate the second pod (a)");
+
             let pods_after = list_pods(&pool, conversation_a.id).await.expect("list_pods");
             assert!(pods_after.is_empty(), "no pods should be listed after terminating it, got {pods_after:?}");
+
+            // "Work on a repo" on a conversation with no sandbox starts one.
+            let attached = crate::git::attach_repo(&pool, conversation_a.id, "file:///tmp/missing.git", None)
+                .await
+                .expect_err("this origin doesn't exist");
+            assert!(attached.contains("does not appear to be a git repository"), "{attached}");
+            assert_eq!(
+                list_pods(&pool, conversation_a.id).await.expect("list_pods").len(),
+                1,
+                "attach_repo started a sandbox"
+            );
+            terminate_pod(&pool, conversation_a.id).await.expect("terminate the attach pod (a)");
             let terminals_after = list_terminals(&pool, conversation_a.id).await.expect("list_terminals");
             assert!(terminals_after.is_empty(), "no terminals should be listed after terminating all of them");
 
