@@ -593,16 +593,17 @@ mod server {
     /// The user's answer on the trust card for request `request_id`, from
     /// conversation `conversation_id`. Remembered for the repo's remote;
     /// on Trust, exactly the file the card showed is loaded. Other
-    /// requests about the same remote (their files unseen) are dropped,
-    /// and their conversations told to ask again. Returns the notice saved
-    /// for the deciding conversation's model.
+    /// requests about the same remote (their files unseen) are dropped.
+    /// Returns what to tell each affected conversation's model, the
+    /// deciding one first, for the caller to deliver: delivering waits for
+    /// a running turn, which mustn't hold up the user's click.
     pub async fn decide_trust(
         pool: &PgPool,
         conversation_id: i64,
         request_id: i64,
         shown_hash: &str,
         trusted: bool,
-    ) -> Result<String, String> {
+    ) -> Result<Vec<(i64, String)>, String> {
         let request = db::get_instruction_request(pool, request_id)
             .await
             .map_err(|e| e.to_string())?
@@ -635,6 +636,7 @@ mod server {
             .map_err(|e| e.to_string())?;
         let mut touched = std::collections::BTreeSet::from([conversation_id]);
         let mut also_mine = Vec::new();
+        let mut others_told = Vec::new();
         for other in others {
             let _ = db::delete_instruction_request(pool, other.id).await;
             let other_repo = get_repo(pool, other.repo_id).await?;
@@ -654,7 +656,7 @@ mod server {
             if other.conversation_id == conversation_id {
                 also_mine.push(other_file);
             } else {
-                let _ = crate::api::chat::save_notice_between_turns(pool, other.conversation_id, notice).await;
+                others_told.push((other.conversation_id, notice));
             }
             touched.insert(other.conversation_id);
         }
@@ -685,10 +687,9 @@ mod server {
                 format!(" {files} won't be loaded either.")
             });
         }
-        crate::api::chat::save_notice_between_turns(pool, conversation_id, notice.clone())
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(notice)
+        let mut notices = vec![(conversation_id, notice)];
+        notices.extend(others_told);
+        Ok(notices)
     }
 
     /// The checkout's current commit, for labelling a loaded AGENTS.md.
@@ -1473,21 +1474,23 @@ mod server {
             request_or_load(&pool, second.id, &other, "AGENTS.md", &file("injected")).await.expect("ask");
             let shown = only_repo(&pool, first.id).await.trust_requests.remove(0);
 
-            let notice = decide_trust(&pool, first.id, shown.id, &shown.hash, true).await.expect("trust");
+            let notices = decide_trust(&pool, first.id, shown.id, &shown.hash, true).await.expect("trust");
+            assert_eq!(notices[0].0, first.id, "the deciding conversation's notice comes first");
+            let notice = notices[0].1.clone();
             assert!(notice.contains("/workspace/r/AGENTS.md"), "{notice}");
             assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("get"), Some(true));
             let loaded = project_instructions(&pool, first.id).await.expect("loaded");
             assert_eq!(loaded.len(), 1);
             assert_eq!(loaded[0].content, "what the user read");
             assert!(only_repo(&pool, first.id).await.trust_requests.is_empty());
-            let told = db::list_messages(&pool, first.id).await.expect("messages");
-            assert!(told.iter().any(|m| m.content.contains("/workspace/r/AGENTS.md")), "the model is told");
 
             // The unseen copy isn't loaded; that conversation is told to ask again.
             assert!(project_instructions(&pool, second.id).await.expect("loaded").is_empty());
             assert!(only_repo(&pool, second.id).await.trust_requests.is_empty());
-            let told = db::list_messages(&pool, second.id).await.expect("messages");
-            assert!(told.iter().any(|m| m.content.contains("load_instructions again")), "told to ask again");
+            assert!(
+                notices.iter().any(|(id, text)| *id == second.id && text.contains("load_instructions again")),
+                "that conversation is told to ask again: {notices:?}"
+            );
         }
 
         /// The file changed (the model asked again) while the card was
@@ -1527,7 +1530,7 @@ mod server {
                 let requests = only_repo(&pool, conversation.id).await.trust_requests;
                 assert_eq!(requests.len(), 2);
                 let top = requests.iter().find(|r| r.path.ends_with("/r/AGENTS.md")).expect("top-level request");
-                let notice = decide_trust(&pool, conversation.id, top.id, &top.hash, trusted).await.expect("decide");
+                let notice = decide_trust(&pool, conversation.id, top.id, &top.hash, trusted).await.expect("decide").remove(0).1;
                 assert!(notice.contains("/workspace/r/web/AGENTS.md"), "{trusted}: {notice}");
                 if trusted {
                     assert!(notice.contains("load_instructions again"), "{notice}");
@@ -1539,13 +1542,35 @@ mod server {
             }
         }
 
+        /// The decision is recorded at once, and the notices are the
+        /// caller's to deliver: a turn running in the conversation doesn't
+        /// hold up the user's click (SME-32 code review 6, finding 3).
+        #[sqlx::test]
+        async fn test_deciding_doesnt_wait_for_a_running_turn(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let repo = cloned_repo(&pool, conversation.id).await;
+            request_or_load(&pool, conversation.id, &repo, "AGENTS.md", &file("x")).await.expect("ask");
+            let shown = only_repo(&pool, conversation.id).await.trust_requests.remove(0);
+            let lock = crate::api::chat::conversation_lock(conversation.id);
+            let _running_turn = lock.lock().await;
+            let decided = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                decide_trust(&pool, conversation.id, shown.id, &shown.hash, true),
+            )
+            .await
+            .expect("the decision returns while a turn runs")
+            .expect("trust");
+            assert_eq!(decided[0].0, conversation.id);
+            assert_eq!(project_instructions(&pool, conversation.id).await.expect("loaded").len(), 1);
+        }
+
         #[sqlx::test]
         async fn test_declining_loads_nothing_and_later_loads_are_refused(pool: PgPool) {
             let conversation = db::create_conversation(&pool).await.expect("conversation");
             let repo = cloned_repo(&pool, conversation.id).await;
             request_or_load(&pool, conversation.id, &repo, "AGENTS.md", &file("x")).await.expect("ask");
             let shown = only_repo(&pool, conversation.id).await.trust_requests.remove(0);
-            let notice = decide_trust(&pool, conversation.id, shown.id, &shown.hash, false).await.expect("decline");
+            let notice = decide_trust(&pool, conversation.id, shown.id, &shown.hash, false).await.expect("decline").remove(0).1;
             assert!(notice.contains("not to trust"), "{notice}");
             assert!(project_instructions(&pool, conversation.id).await.expect("loaded").is_empty());
             assert!(only_repo(&pool, conversation.id).await.trust_requests.is_empty());

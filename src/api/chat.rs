@@ -839,7 +839,7 @@ static CONVERSATION_LOCKS: LazyLock<Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(feature = "server")]
-fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<()>> {
     let mut locks = CONVERSATION_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
     locks
         .entry(conversation_id)

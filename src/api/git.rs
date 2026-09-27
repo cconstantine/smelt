@@ -49,12 +49,15 @@ pub async fn forget_repo_trust(remote: String) -> ServerFnResult<()> {
 #[post("/api/conversations/{id}/instruction-requests/{request_id}")]
 pub async fn decide_repo_trust(id: i64, request_id: i64, shown_hash: String, trusted: bool) -> ServerFnResult<()> {
     let pool = db::get();
-    git::decide_trust(pool, id, request_id, &shown_hash, trusted)
+    let notices = git::decide_trust(pool, id, request_id, &shown_hash, trusted)
         .await
         .map_err(ServerFnError::new)?;
-    tokio::spawn(async move {
-        let _ = crate::api::chat::wake_conversation(pool, id).await;
-    });
+    // In the background: each waits for its conversation's turn to end.
+    for (conversation_id, notice) in notices {
+        tokio::spawn(async move {
+            crate::api::chat::deliver_notice(pool, conversation_id, notice).await;
+        });
+    }
     Ok(())
 }
 
