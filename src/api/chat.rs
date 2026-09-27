@@ -2960,6 +2960,7 @@ mod tests {
             commit: Some("43835b44f939".to_string()),
             content: "Run make test.\n".to_string(),
             file_bytes: 15,
+            truncated: false,
         }];
         let prompt = system_prompt(&env);
         assert!(
@@ -3098,6 +3099,7 @@ mod tests {
                 commit: Some("abc123".to_string()),
                 content: "Run make test.\n".to_string(),
                 file_bytes: 15,
+                truncated: false,
             }]
         );
         assert_eq!(env.date, chrono::Utc::now().date_naive());

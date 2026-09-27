@@ -4493,6 +4493,21 @@ mod tests {
             assert_eq!(read.content, "Use \u{FFFD} tabs.\n");
             assert_eq!(read.file_bytes, 12);
 
+            // Invalid bytes decode to 3-byte replacement characters: a file
+            // well under 32 KiB can decode to more, and must load whole, not
+            // be cut again (SME-32 code review 8, finding 3).
+            let swollen = sandbox
+                .exec(&["sh", "-c", "git init -q /workspace/swollen && head -c 16000 /dev/zero | tr '\\0' '\\377' > /workspace/swollen/AGENTS.md && echo END >> /workspace/swollen/AGENTS.md"])
+                .await
+                .expect("exec make swollen");
+            assert_eq!(swollen.exit_code, 0, "{}", swollen.stderr);
+            let read = crate::git::read_instructions_file(&client, &pod_name, "/workspace/swollen", "/workspace/swollen/AGENTS.md")
+                .await
+                .expect("read")
+                .expect("it exists");
+            assert_eq!(read.file_bytes, 16004);
+            assert!(read.content.ends_with("END\n"), "the whole file loads: ...{:?}", read.content.chars().rev().take(5).collect::<String>());
+
             // A non-ASCII path is listed as it is, not in git's quoting,
             // so it can be loaded (SME-32 code review 7, finding 3).
             let unicode = sandbox

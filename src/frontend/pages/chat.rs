@@ -689,12 +689,8 @@ fn instructions_source(doc: &crate::git::ProjectInstructions) -> String {
     } else {
         format!("{} at {commit}", doc.repo_url)
     };
-    if doc.truncated() {
-        format!(
-            "{origin} \u{b7} {} bytes, only the first {} loaded",
-            doc.file_bytes,
-            doc.content.len()
-        )
+    if doc.truncated {
+        format!("{origin} \u{b7} {} bytes, only the first 32 KiB loaded", doc.file_bytes)
     } else {
         format!("{origin} \u{b7} {} bytes", doc.file_bytes)
     }
@@ -1989,12 +1985,14 @@ mod tests {
             commit: Some("43835b44f939".to_string()),
             content: "Run make test.\n".to_string(),
             file_bytes: 15,
+            truncated: false,
         };
         assert_eq!(instructions_source(&doc), "git@github.com:o/r.git at 43835b4 \u{b7} 15 bytes");
         doc.file_bytes = 50_000;
+        doc.truncated = true;
         assert_eq!(
             instructions_source(&doc),
-            "git@github.com:o/r.git at 43835b4 \u{b7} 50000 bytes, only the first 15 loaded"
+            "git@github.com:o/r.git at 43835b4 \u{b7} 50000 bytes, only the first 32 KiB loaded"
         );
     }
 

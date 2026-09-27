@@ -76,14 +76,11 @@ pub struct ProjectInstructions {
     pub commit: Option<String>,
     /// At most `INSTRUCTIONS_MAX_BYTES` of it.
     pub content: String,
-    /// The whole file's size, which is more than `content` when it was cut.
+    /// The whole file's size.
     pub file_bytes: u64,
-}
-
-impl ProjectInstructions {
-    pub fn truncated(&self) -> bool {
-        self.file_bytes > self.content.len() as u64
-    }
+    /// Only the first 32 KiB of the file were loaded. Set from the file's
+    /// size, not `content`'s: invalid bytes decode to longer text.
+    pub truncated: bool,
 }
 
 /// A remembered trust decision, for the settings page.
@@ -382,7 +379,10 @@ mod server {
             n => n.parse().map_err(|_| format!("couldn't read {path}: {}", read.stderr.trim()))?,
         };
         let read_content = rest.to_string();
-        let content = truncate_instructions(&read_content).to_string();
+        // Already at most INSTRUCTIONS_MAX_BYTES of the file (head -c). Not
+        // cut again by its decoded length, which invalid bytes (each a
+        // 3-byte replacement character) can push past the cap.
+        let content = read_content;
         use sha2::Digest;
         let hash = sha2::Sha256::digest(content.as_bytes())
             .iter()
@@ -505,6 +505,7 @@ mod server {
                     path: format!("{}/{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir, l.path),
                     commit: l.commit_sha,
                     file_bytes: l.file_bytes as u64,
+                    truncated: l.file_bytes > INSTRUCTIONS_MAX_BYTES as i64,
                     content: l.content,
                 })
             })
@@ -1074,19 +1075,6 @@ mod server {
         }
     }
 
-    /// The first `INSTRUCTIONS_MAX_BYTES` of `content`, cut at a character
-    /// boundary.
-    pub fn truncate_instructions(content: &str) -> &str {
-        if content.len() <= INSTRUCTIONS_MAX_BYTES {
-            return content;
-        }
-        let mut end = INSTRUCTIONS_MAX_BYTES;
-        while !content.is_char_boundary(end) {
-            end -= 1;
-        }
-        &content[..end]
-    }
-
     /// The system prompt's "Project instructions" section; empty when no
     /// repo has instructions loaded.
     pub fn render_project_instructions(instructions: &[ProjectInstructions]) -> String {
@@ -1112,11 +1100,10 @@ mod server {
             if !doc.content.ends_with('\n') {
                 out.push('\n');
             }
-            if doc.truncated() {
+            if doc.truncated {
                 out.push_str(&format!(
-                    "\n[Truncated: this file is {} bytes; only the first {} are here. Read the rest with read_file.]\n",
+                    "\n[Truncated: this file is {} bytes; only the first {INSTRUCTIONS_MAX_BYTES} are here. Read the rest with read_file.]\n",
                     doc.file_bytes,
-                    doc.content.len()
                 ));
             }
         }
@@ -1829,17 +1816,6 @@ mod server {
             assert_eq!(installed.lock().expect("log").last(), Some(&"new"), "the pod ends with the newest keys");
         }
 
-        #[test]
-        fn test_truncate_instructions_keeps_whole_characters_under_the_cap() {
-            assert_eq!(truncate_instructions("short"), "short");
-            let long = "é".repeat(INSTRUCTIONS_MAX_BYTES); // two bytes each
-            let cut = truncate_instructions(&long);
-            assert_eq!(cut.len(), INSTRUCTIONS_MAX_BYTES);
-            let odd = format!("x{long}");
-            let cut = truncate_instructions(&odd);
-            assert_eq!(cut.len(), INSTRUCTIONS_MAX_BYTES - 1, "never half a character");
-        }
-
         fn instructions(path: &str, content: &str, file_bytes: u64) -> ProjectInstructions {
             ProjectInstructions {
                 repo_url: "git@github.com:o/smelt.git".to_string(),
@@ -1847,6 +1823,7 @@ mod server {
                 commit: Some("43835b44f939c268b73b49292428911526a51508".to_string()),
                 content: content.to_string(),
                 file_bytes,
+                truncated: file_bytes > INSTRUCTIONS_MAX_BYTES as u64,
             }
         }
 
@@ -1872,7 +1849,7 @@ mod server {
         fn test_project_instructions_say_when_a_file_was_cut() {
             let rendered = render_project_instructions(&[instructions("/workspace/big/AGENTS.md", "start", 50_000)]);
             assert!(
-                rendered.contains("Truncated: this file is 50000 bytes; only the first 5 are here. Read the rest with read_file."),
+                rendered.contains("Truncated: this file is 50000 bytes; only the first 32768 are here. Read the rest with read_file."),
                 "{rendered}"
             );
         }
