@@ -957,10 +957,7 @@ async fn report_docker_restart(pool: &PgPool, pod_id: i64, reason: Option<String
     );
     let pool = pool.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::api::chat::save_notice_between_turns(&pool, conversation_id, notice).await {
-            tracing::warn!(conversation_id, pod_id, error = %e, "couldn't save the Docker restart notice");
-        }
-        let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
+        crate::api::chat::deliver_notice(&pool, conversation_id, notice).await;
     });
 }
 

@@ -796,6 +796,38 @@ pub(crate) async fn save_notice_between_turns(
     Ok(saved)
 }
 
+/// Tells the model about something that happened outside a turn (Docker
+/// restarting, the user's trust decision) and lets it answer: the notice
+/// is the next message, and a turn runs for it once no turn is running.
+/// After the user stopped the conversation, it's only saved, for their
+/// next message. Call it from a spawned task: it waits for a running turn.
+#[cfg(feature = "server")]
+pub(crate) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: String) {
+    if is_paused(conversation_id) {
+        if let Err(e) = save_notice_between_turns(pool, conversation_id, text).await {
+            tracing::warn!(conversation_id, error = %e, "couldn't save a notice");
+        }
+        return;
+    }
+    // The notice as the turn's own message: `run_turn` saves it before the
+    // model call, so it survives the call failing.
+    let message = anthropic::AnthropicMessage {
+        role: "user".to_string(),
+        content: vec![anthropic::ContentBlock::Text { text }],
+    };
+    if let Err(e) = run_turn(pool, conversation_id, message, None).await
+        && chat_error_text(&e) != TURN_STOPPED
+    {
+        tracing::warn!(conversation_id, error = %e, "a notice didn't reach the model");
+        crate::events::publish(
+            conversation_id,
+            crate::events::ConversationEvent::NotificationDeliveryFailed {
+                detail: chat_error_text(&e),
+            },
+        );
+    }
+}
+
 /// A live `send_message` call and a background task's push-triggered
 /// `run_turn` call (or two different tasks' pushes) can race for the same
 /// conversation — Anthropic's strict user/assistant alternation breaks if
@@ -3362,6 +3394,31 @@ mod tests {
             requests[0]["messages"].to_string().contains("cmd-after-stop"),
             "the next turn should include the command's notice"
         );
+    }
+
+    /// A notice delivered while nothing runs gets an answer from the model;
+    /// after the user stopped the conversation, it's only saved (SME-32
+    /// code review 6: the old save-then-wake never ran a turn).
+    #[sqlx::test]
+    async fn test_a_delivered_notice_is_answered_unless_stopped(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let requests = start_recording_mock_upstream(vec![text_reply_body("Noted.")]).await;
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+
+        deliver_notice(&pool, conversation.id, "Docker in your sandbox was restarted.".to_string()).await;
+        {
+            let requests = requests.lock().expect("the request log");
+            assert_eq!(requests.len(), 1, "the model is asked about the notice");
+            let last = requests[0]["messages"].as_array().expect("messages").last().expect("a message").to_string();
+            assert!(last.contains("Docker in your sandbox was restarted."), "{last}");
+        }
+
+        let stopped = db::create_conversation(&pool).await.expect("create conversation");
+        stop_turn_now(stopped.id);
+        deliver_notice(&pool, stopped.id, "The user trusts it.".to_string()).await;
+        assert_eq!(requests.lock().expect("the request log").len(), 1, "no model call after a stop");
+        let saved = db::list_messages(&pool, stopped.id).await.expect("messages");
+        assert!(saved.iter().any(|m| m.content.contains("The user trusts it.")), "saved for later");
     }
 
     #[sqlx::test]
