@@ -14,7 +14,8 @@
 //! - **Unknown `Host` names** (DNS rebinding: a page whose name later resolves
 //!   to smelt's address reads it as same-origin). Enforced when the names
 //!   smelt is reached by are known, from `SMELT_BASE_URL` and
-//!   `SMELT_ALLOWED_HOSTS`; an IP address or `localhost` is always allowed,
+//!   `SMELT_ALLOWED_HOSTS` (plus `SMELT_BASE_URL` once that's set); an IP
+//!   address or `localhost` is always allowed,
 //!   since rebinding needs a name.
 //!
 //! A request with neither header (curl, a script) is let through: no browser
@@ -29,19 +30,32 @@ use axum::response::{IntoResponse, Response};
 /// `SMELT_BASE_URL`'s host plus the comma-separated `SMELT_ALLOWED_HOSTS`.
 /// Empty means unknown, and the `Host` check is skipped.
 pub fn allowed_hosts_from_env() -> Vec<String> {
-    let mut hosts = Vec::new();
-    if let Some(base) = std::env::var("SMELT_BASE_URL").ok().filter(|v| !v.trim().is_empty())
+    allowed_hosts(
+        std::env::var("SMELT_BASE_URL").ok().as_deref(),
+        std::env::var("SMELT_ALLOWED_HOSTS").ok().as_deref(),
+    )
+}
+
+/// `allowed_hosts_from_env` on given values. Only `SMELT_ALLOWED_HOSTS`
+/// turns the check on: `SMELT_BASE_URL` is often set because smelt is
+/// behind a proxy, and a proxy usually sends its own name for smelt as
+/// `Host`, which would then be refused (SME-51 code review 1). Once on,
+/// `SMELT_BASE_URL`'s host is allowed too.
+fn allowed_hosts(base_url: Option<&str>, list: Option<&str>) -> Vec<String> {
+    let mut hosts: Vec<String> = list
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect();
+    if hosts.is_empty() {
+        return hosts;
+    }
+    if let Some(base) = base_url.filter(|v| !v.trim().is_empty())
         && let Ok(url) = url::Url::parse(base.trim())
         && let Some(host) = url.host_str()
     {
         hosts.push(host.to_ascii_lowercase());
-    }
-    if let Ok(list) = std::env::var("SMELT_ALLOWED_HOSTS") {
-        hosts.extend(
-            list.split(',')
-                .map(|h| h.trim().to_ascii_lowercase())
-                .filter(|h| !h.is_empty()),
-        );
     }
     hosts
 }
@@ -158,6 +172,19 @@ mod tests {
         assert!(refusal(&post, &headers(&[("origin", "null")]), &[]).is_some());
         // No browser headers at all: curl or a script, not another site's page.
         assert_eq!(refusal(&post, &headers(&[("host", "localhost:8080")]), &[]), None);
+    }
+
+    /// SME-51 code review 1: `SMELT_BASE_URL` alone mustn't turn the host
+    /// check on. It's set behind a proxy, whose own name for smelt (the
+    /// `Host` it sends) would then be refused for every request.
+    #[test]
+    fn test_only_smelt_allowed_hosts_turns_the_host_check_on() {
+        assert!(allowed_hosts(Some("https://smelt.example.com"), None).is_empty());
+        assert!(allowed_hosts(Some("https://smelt.example.com"), Some(" ")).is_empty());
+        assert_eq!(
+            allowed_hosts(Some("https://smelt.example.com/"), Some("Smelt.Lan, other.example")),
+            vec!["smelt.lan", "other.example", "smelt.example.com"]
+        );
     }
 
     #[test]

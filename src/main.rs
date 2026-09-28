@@ -79,8 +79,8 @@ async fn main() {
 
     if request_guard::allowed_hosts_from_env().is_empty() {
         tracing::warn!(
-            "SMELT_BASE_URL and SMELT_ALLOWED_HOSTS are unset, so requests for any host name \
-             are served; set one to refuse DNS-rebinding requests"
+            "SMELT_ALLOWED_HOSTS is unset, so requests for any host name are served; set it to \
+             the names smelt is reached by to refuse DNS-rebinding requests"
         );
     }
 
