@@ -6,59 +6,90 @@ Dioxus components under `src/frontend/`, rendered via **fullstack SSR**: the ser
 
 ```
 frontend/
-  mod.rs               # App (router root), Route enum, Home/ConversationRoute
+  mod.rs               # App (router root), Route enum, a small wrapper component per route, NotFound
   pages/
-    mod.rs
+    mod.rs             # TwoStepLabel
     chat.rs            # Chat, ConversationSidebar, ChatPanel
-    mcp_servers.rs      # McpServersIndex, McpServerNew, McpServerEdit
-    sandbox_volumes.rs  # SandboxVolumesIndex, SandboxVolumeNew
+    git.rs             # GitSettingsPage
+    language_servers.rs # LanguageServersIndex, LanguageServerNew, LanguageServerEdit
+    mcp_servers.rs     # McpServersIndex, McpServerNew, McpServerEdit
+    pods.rs            # PodsIndex, use_pods_changed
+    sandbox_volumes.rs # SandboxVolumesIndex, SandboxVolumeNew
 ```
 
-`App` mounts a single stylesheet asset and the router:
+`App` mounts a viewport meta tag, a single stylesheet asset and the router:
 
 ```rust
 #[component]
 pub fn App() -> Element {
     rsx! {
+        document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
         document::Stylesheet { href: asset!("/assets/chat.css") }
         Router::<Route> {}
     }
 }
 ```
 
-The chat routes: `Home {}` at `/` (nothing selected) and `ConversationRoute { id: i64 }` at `/conversation/{id}`. Both just render `Chat {}` with no props — `Chat` derives which conversation is selected straight from the router (every other route — `/mcp-servers`, `/sandbox-volumes`, and their `new`/`:id` children — maps `None`, since `Chat` never renders there at all):
+Without the viewport tag a phone lays the page out at desktop width and shrinks it (SME-40 F8; browser scenario 17 checks it).
+
+The routes (`Route` in `frontend/mod.rs`):
+
+| Path | Page |
+|---|---|
+| `/` | `Chat`, nothing selected (`Home`) |
+| `/conversation/:id` | `Chat` (`ConversationRoute`) |
+| `/mcp-servers`, `/mcp-servers/new`, `/mcp-servers/:id` | `McpServersIndex`, `McpServerNew`, `McpServerEdit` |
+| `/sandbox-volumes`, `/sandbox-volumes/new` | `SandboxVolumesIndex`, `SandboxVolumeNew` |
+| `/pods` | `PodsIndex` |
+| `/git` | `GitSettingsPage` |
+| `/language-servers`, `/language-servers/new`, `/language-servers/:id` | `LanguageServersIndex`, `LanguageServerNew`, `LanguageServerEdit` |
+| `/:..segments` (anything else, including a non-numeric conversation id) | `NotFound`: "Page not found", with a link back |
+
+`Home {}` and `ConversationRoute { id: i64 }` both just render `Chat {}` with no props. `Chat` derives which conversation is selected straight from the router. The match needs an arm for every variant; every route other than those two maps to `None`, since `Chat` never renders there:
 
 ```rust
-let router = use_router();
+let router = router();
 let selected: Memo<Option<i64>> = use_memo(move || match router.current::<Route>() {
     Route::Home {} => None,
     Route::ConversationRoute { id } => Some(id),
+    Route::McpServersRoute {} => None,
+    // ... one `None` arm per remaining variant
+    Route::NotFound { .. } => None,
 });
 ```
 
 This isn't just style — a plain prop threaded down from `Home`/`ConversationRoute` looked reasonable but silently breaks: switching from one conversation straight to another (still the same route *variant*, just a different `id`) re-renders the component with a new prop value without tearing down its hooks, and a `use_effect` that only reads that plain prop never re-fires (effects only re-run on a *tracked* — i.e. signal — read), so `use_resource`-driven state downstream quietly stops updating. `router.current()` is a genuine tracked read, so wrapping it in `use_memo` gives every descendant (including `use_resource`, which only restarts on a tracked read inside its own closure) a value that actually updates on navigation. Sidebar clicks and "New conversation" navigate via `use_navigator()`/`Route::ConversationRoute { id }` rather than writing to a local signal directly, so the URL stays the single source of truth — a refresh, bookmark, or direct link lands back on the same conversation because the server renders straight from the route.
 
-`Chat` also owns a `conversations_changed: Signal<u64>` counter, passed to both `ConversationSidebar` and `ChatPanel`. The sidebar's `use_resource` reads it before calling `get_conversations()`, so bumping it refetches the list. `ChatPanel` bumps it when a `MessagesAppended` event arrives and when a send finishes, which is how a new conversation's title (set by its first message) replaces "New Conversation" without a reload.
+`Chat` also owns three `Signal<u64>` counters, passed to both `ConversationSidebar` and `ChatPanel`. Each is read inside one of the sidebar's `use_resource`s, so bumping it refetches:
+- `conversations_changed` refetches `get_conversations()`. `ChatPanel` bumps it when a `MessagesAppended` event arrives and when a send finishes, which is how a new conversation's title (set by its first message) replaces "New conversation" without a reload.
+- `pods_changed` refetches `get_live_pod_conversations()`, the green dot on each conversation with a live sandbox pod. `ChatPanel` bumps it on `ConversationEvent::PodsChanged`.
+- `turns_changed` refetches `get_busy_conversations()`, the "Working" mark on each conversation with a turn running. `ChatPanel` bumps it on `ConversationEvent::TurnsChanged`.
 
-On a switch, `ChatPanel` resets every per-conversation signal before subscribing to the new conversation's events: tasks, todos, sandbox state, browsing state, the background-notification error and the context-usage meter. Anything missed here shows the previous conversation's state until something replaces it. The sidebar shows a green dot on each conversation with a live sandbox pod (`get_live_pod_conversations`), refetched when `Chat`'s `pods_changed` counter moves. `ChatPanel` bumps that counter on `ConversationEvent::PodsChanged`, which arrives on the open conversation's own stream rather than a second connection (see [api.md](api.md#live-conversation-events)). So on `/`, with no conversation open, the dots only refresh on navigation. A "Pods" link sits under "MCP servers", leading to `/pods` (`pages/pods.rs`). That page:
-- lists every live pod with its conversation, status, uptime, activity (busy, or idle for how long), memory and CPU use against their limits, and terminal count;
+`PodsChanged` and `TurnsChanged` arrive on the open conversation's own stream rather than a second connection (see [api.md](api.md#live-conversation-events)). So on `/`, with no conversation open, the dots and busy marks only refresh on navigation.
+
+On a switch, `ChatPanel` resets every per-conversation signal before subscribing to the new conversation's events: messages and load error, tasks, todos, repos and the repo form, sandbox state, browsing state and the address bar, the background-notification error, the turn state and streaming reply, the context-usage meter and its detail view. Anything missed here shows the previous conversation's state until something replaces it (SME-51 B11 was the context detail view staying open over the next conversation).
+
+The sidebar links to the other pages: "MCP servers", "Sandboxes" (`/pods`), "Sandbox volumes", "Git" and "Language servers". The route and code say pods; the link and the page's heading say "Sandboxes". The Sandboxes page (`pages/pods.rs`):
+- lists every live sandbox with its conversation, status, uptime, activity (busy, or idle for how long), memory and CPU use against their limits, and terminal count, plus a line under the row for its language servers, if any;
 - has a Stop button per row, clicked once to arm and again to confirm;
 - refetches on `AppEvent::PodsChanged` (its own `subscribe_app_events` stream, through `use_pods_changed`) and every 30 seconds;
 - measures ages against the `observed_at` the server sends, not the browser's clock.
 
-The conversation's sandbox panel has the same two-click "Stop pod" button.
+The conversation's sandbox panel has the same two-click "Stop sandbox" button.
 
-**Two-step buttons** (click once to arm, again to confirm) use `TwoStepLabel` (`pages/mod.rs`) for their label. Both labels share one grid cell and the inactive one is hidden, so arming doesn't resize the button or move what's around it, and the confirming click lands where the first did. Browser scenario 12 checks this on `/pods`. Use it for any new two-step button.
+**Two-step buttons** (click once to arm, again to confirm) use `TwoStepLabel` (`pages/mod.rs`) for their label. Both labels share one grid cell and the inactive one is hidden, so arming doesn't resize the button or move what's around it, and the confirming click lands where the first did. Browser scenario 12 checks this on `/pods`, and scenario 16 on the sidebar's Delete. Use it for any new two-step button.
 
-While a turn runs, the composer shows **Stop** next to Send. That's when this tab's reply is streaming, or the server says a turn is running (`TurnState`, with `get_turn_state` in the reconnect pull, kept just before `get_browsing_state` because the browser tests use that request as the "client is live" signal). Stop calls `stop_turn` and shows "Stopped." in place of the reply; the next send clears it.
+While a turn runs in the conversation (`TurnState`, whoever started it), the composer shows **Stop** next to Send. Stop calls `stop_turn`. The stop saves a notice message (`api::chat::STOP_NOTICE`), which the transcript shows as "Stopped.", so it shows in every tab and survives a reload (SME-51 B10). The turn's `TurnError` carrying `TURN_STOPPED` is ignored. If `stop_turn` itself fails, the chat shows "Couldn't stop the turn: …".
 
-**Connections are scarce.** Over plain HTTP/1.1, a browser allows 6 connections per host, shared by every tab. Each chat tab holds one always-open event stream, plus one more while a reply streams, and any other request (a Stop click, a snapshot) needs a free one. With about four smelt tabs open while a reply streams, a click can queue until something finishes. Don't add another always-open stream per tab; relay on the conversation stream instead, as `PodsChanged` does.
+The reconnect pull (run once per stream connection, see [Streaming into the UI](#streaming-into-the-ui)) fetches messages, tasks, sandbox state, context usage, todos, repos, `get_turn_state`, `get_reply_in_progress` and `get_turn_error`, then `get_browsing_state`. Keep `get_browsing_state` last: the browser tests take that request completing as the sign the client is live.
+
+**Connections are scarce.** Over plain HTTP/1.1, a browser allows 6 connections per host, shared by every tab. Each chat tab holds one always-open conversation stream, plus the frame stream while a browsing session is open; a `/pods` tab holds its own app-events stream. Replies stream on the conversation stream, not on the send request. Any other request (a send, a Stop click, a snapshot) needs a free connection. Don't add another always-open stream per tab; relay on the conversation stream instead, as `PodsChanged` and `TurnsChanged` do.
 
 If `get_messages` fails with `conversation not found`, the page says "This conversation doesn't exist. It may have been deleted." and hides the message box.
 
 ## Calling server functions
 
-No fetch layer to write — call the functions from `src/api/chat.rs` directly, same as any other async function. See [api.md](api.md) for how the isomorphic call works. A typical load-on-select pattern:
+No fetch layer to write — call the functions from `src/api/` (`chat.rs`, `browsing.rs`, `git.rs`, `language_servers.rs`, `mcp.rs`, `pods.rs`, `sandbox_volumes.rs`) directly, same as any other async function. See [api.md](api.md) for how the isomorphic call works. A typical load-on-select pattern:
 
 ```rust
 let initial_messages = use_resource(move || {
@@ -79,14 +110,14 @@ use_effect(move || {
 });
 ```
 
-The `use_resource` + `use_effect`-into-a-plain-signal pairing (rather than reading the resource directly in the render body) is used deliberately: it gives a stable, independently-updatable `Signal<Vec<Message>>` that the streaming send handler can also push into, without fighting the resource's own lifecycle.
+The `use_resource` + `use_effect`-into-a-plain-signal pairing (rather than reading the resource directly in the render body) is used deliberately: it gives a stable, independently-updatable `Signal<Vec<Message>>` that `send()`'s optimistic copy and the event stream can also push into, without fighting the resource's own lifecycle.
 
 ## Streaming into the UI
 
 Sending is an ordinary request: `send()` adds an optimistic copy of the message (a negative id), calls `send_message`, and shows an error only if the request itself fails. Everything else arrives on the conversation's event stream, the same way in every tab watching the conversation:
 - `ReplyReset` starts the streaming bubble (`streaming_reply`), `ReplyDelta` adds to it, and a saved assistant message (`MessagesAppended`) or the turn ending (`TurnState { running: false }`) clears it. It's reset on a conversation switch and restored from `get_reply_in_progress` in the reconnect pull.
 - `MessagesAppended` goes through `accept_saved_messages`: each saved user message replaces one optimistic copy of itself (same text), then anything new is added. Without that the sender saw its own message twice.
-- `TurnError` sets the conversation's error, or "Stopped." for a stop.
+- `TurnError` sets the conversation's error, except for a stop (`TURN_STOPPED`), which shows as its saved notice instead (see above).
 - The message box is disabled while a turn runs in the conversation (`TurnState`), whoever started it, and Stop is offered instead.
 
 Loading a conversation's messages on open goes through `apply_loaded_messages`, not a plain replace. The live subscription's reconciliation merge can land first with a message saved after the load's snapshot, and a replace would wipe it.
@@ -95,18 +126,18 @@ Loading a conversation's messages on open goes through `apply_loaded_messages`, 
 
 `.browsing-panel` (in `ChatPanel`) is a second, independent live stream from `subscribe_conversation_events`'s — it exists only while the model has a browsing session open (`ConversationEvent::BrowsingSessionUpdate`) and subscribes separately, via `api::browsing::subscribe_browser_frames`, to a per-conversation frame channel that isn't part of `ConversationEvent` at all (frames are frequent, ephemeral, UI-only data that shouldn't crowd out task/message updates in that shared bounded broadcast channel — see `events::ConversationEvent`'s own doc comment). A dedicated `use_effect` (separate from the main event-subscription one) starts/stops that subscription as `browsing_session_open()`/`selected()` change, mirroring the main loop's own `Task`-cancel-on-change shape. If the frame stream drops (a network blip, a server restart), it reconnects after 1.5s, the same delay the main loop uses — unless `get_browsing_state` says the session is gone, in which case the panel closes.
 
-Each frame is a base64 JPEG rendered directly as `img { src: "data:image/jpeg;base64,{data}" }` — no decoding needed (`browsing::BrowserFrame`'s own doc comment explains why: CDP's wire format is already base64, and `chromiumoxide`'s `Binary` type doesn't re-decode it). The frame element renders at a **fixed** 1280x800 CSS size matching the session's own pinned viewport exactly (`browsing::server`'s `SCREENCAST_MAX_WIDTH`/`SCREENCAST_MAX_HEIGHT`) — deliberately not responsive/scaled, so `element_coordinates()` (a mouse/wheel event's position relative to the target element) already equals real frame-pixel coordinates with no scale-factor lookup needed. `onmousemove`/`onmousedown`/`onmouseup`/`onwheel`/`onkeydown` on the frame's wrapper each build a `browsing::BrowserInputEvent` and hand it to one input queue (a `use_coroutine`), which calls `send_browser_input` one request at a time, in order. Spawning a request per event let them overtake each other: a mouse-up could reach the page before its mouse-down. Mouse moves that queue up while a request is in flight collapse to the latest one (`coalesce_mouse_moves`), so a fast-moving pointer can't build a backlog. A move carries whether the left button is actually held (`held_buttons()`, read off the real DOM event), so a plain hover reaches the page as a hover and not a drag. Only the primary button's down/up is forwarded. `onkeydown` maps a `keyboard_types::Key` to either `TypeText` (a printable character, via `Input.insertText`) or `PressKey` (a small named-key set — Enter/Backspace/Tab/Escape/Delete/arrows — via a real `Input.dispatchKeyEvent` carrying the held modifiers, so Shift+Tab and Ctrl+Backspace work, with Enter carrying its `\r` text so it submits forms) through `browser_input_event_for_key`. Wheel deltas are converted to pixels first (`wheel_delta_pixels`), since Firefox reports them in lines. Anything else (a bare modifier, an unrecognized named key, or a Ctrl/Cmd shortcut, which must not type its letter) isn't forwarded, and its default isn't prevented, so the viewer's own browser handles it as usual. Pasting into the page isn't supported.
+Each frame is a base64 JPEG rendered directly as `img { src: "data:image/jpeg;base64,{data}" }` — no decoding needed (`browsing::BrowserFrame`'s own doc comment explains why: CDP's wire format is already base64, and `chromiumoxide`'s `Binary` type doesn't re-decode it). The session's viewport is pinned at 1280x800 (`browsing::server`'s `SCREENCAST_MAX_WIDTH`/`SCREENCAST_MAX_HEIGHT`), but the frame is scaled to fit the panel (`width: 100%`). A fixed 1280px frame that couldn't shrink squeezed the chat to 48px wide at laptop widths (SME-40 F2, browser scenario 15). So the wrapper tracks its shown width (`onresize`), and `frame_point(x, y, shown_width)` rescales each mouse/wheel event's `element_coordinates()` back to the page's own pixels. `onmousemove`/`onmousedown`/`onmouseup`/`onwheel`/`onkeydown` on the frame's wrapper each build a `browsing::BrowserInputEvent` and hand it to one input queue (a `use_coroutine`), which calls `send_browser_input` one request at a time, in order. Spawning a request per event let them overtake each other: a mouse-up could reach the page before its mouse-down. Mouse moves that queue up while a request is in flight collapse to the latest one (`coalesce_mouse_moves`), so a fast-moving pointer can't build a backlog. A move carries whether the left button is actually held (`held_buttons()`, read off the real DOM event), so a plain hover reaches the page as a hover and not a drag. Only the primary button's down/up is forwarded. `onkeydown` maps a `keyboard_types::Key` to either `TypeText` (a printable character, via `Input.insertText`) or `PressKey` (a small named-key set — Enter/Backspace/Tab/Escape/Delete/arrows — via a real `Input.dispatchKeyEvent` carrying the held modifiers, so Shift+Tab and Ctrl+Backspace work, with Enter carrying its `\r` text so it submits forms) through `browser_input_event_for_key`. Wheel deltas are converted to pixels first (`wheel_delta_pixels`), since Firefox reports them in lines. Anything else (a bare modifier, an unrecognized named key, or a Ctrl/Cmd shortcut, which must not type its letter) isn't forwarded, and its default isn't prevented, so the viewer's own browser handles it as usual. Pasting into the page isn't supported.
 
 Above the frame sits an address bar showing the session's current URL, kept current by `ConversationEvent::BrowsingUrlUpdate` (seeded from `get_browsing_state`). It follows every navigation, whoever made it. While the viewer is typing in it (from focus, or the first keystroke), incoming URL changes don't overwrite their text (`address_bar_value`); Escape reverts. Enter calls `navigate_browser`, and a failure shows under the bar (`server_error_message` strips `ServerFnError`'s wrapper text; the chat view uses it for load and send errors too).
 
 There's no locking between the model's own tool-driven actions and the user's live input — both dispatch CDP commands against the same real page, which just serializes whichever arrives, the same as two people sharing one mouse. See [SME-22](https://linear.app/smelt-agent/issue/SME-22) for the full design, including why this needed its own streaming channel and viewport-pinning approach.
 
-**Coverage gap, stated plainly:** the panel's actual DOM/RSX wiring is verified manually only (a real `dx serve` + Playwright pass driving a real model through a real conversation, confirmed the panel renders live frames and that input events reach the backend correctly) — `src/browser_tests.rs`'s automated tier doesn't cover it, since automating "one headless browser watching another headless browser's live video feed" is a meaningfully bigger lift than that tier's existing scenarios. `browser_input_event_for_key`, `cdp_modifiers`, `wheel_delta_pixels`, `coalesce_mouse_moves`, `address_bar_value` and `server_error_message` — the pieces of this panel's frontend logic that are pure functions rather than DOM-dependent — do have direct unit tests (`frontend::pages::chat::tests`), and the CDP mechanisms it drives (screencast frame delivery, `send_input` dispatch) are covered end-to-end at the backend level by `browsing.rs`'s own real-browser scenarios (see [testing.md](testing.md)). What's still unautomated is narrower than "the whole panel": just the RSX event handlers and the reactive frame stream themselves. Worth a real automated scenario later, not assumed away.
+**Coverage gap, stated plainly:** the panel's input and frame wiring is verified manually only (a real app + Playwright pass driving a real model through a real conversation, confirmed the panel renders live frames and that input events reach the backend correctly). `src/browser_tests.rs`'s scenario 15 opens a browsing session and checks the panel's layout, but no scenario watches frames arrive or clicks on one, since automating "one headless browser watching another headless browser's live video feed" is a meaningfully bigger lift than that tier's existing scenarios. `browser_input_event_for_key`, `cdp_modifiers`, `frame_point`, `wheel_delta_pixels`, `coalesce_mouse_moves`, `address_bar_value` and `server_error_message` — the pieces of this panel's frontend logic that are pure functions rather than DOM-dependent — do have direct unit tests (`frontend::pages::chat::tests`), and the CDP mechanisms it drives (screencast frame delivery, `send_input` dispatch) are covered end-to-end at the backend level by `browsing.rs`'s real-browser scenarios, which run inside `webfetch::browser_tests::test_fetch_scenarios` (see [testing.md](testing.md)). What's still unautomated is narrower than "the whole panel": just the RSX event handlers and the reactive frame stream themselves. Worth a real automated scenario later, not assumed away.
 
 ## Forms and events
 
-Standard Dioxus idioms: `oninput: move |e| signal.set(e.value())`, `onsubmit: move |event| { event.prevent_default(); ... }`, `r#type: "submit"` (raw-identifier since `type` is a Rust keyword). Optimistic UI (showing the user's own message immediately, before the server confirms it) uses a locally-generated negative placeholder id, since real ids are always positive (`AUTOINCREMENT` starting at 1) — good enough for React/Dioxus-style list `key` uniqueness without needing the server round trip first.
+Standard Dioxus idioms: `oninput: move |e| signal.set(e.value())`, `onsubmit: move |event| { event.prevent_default(); ... }`, `r#type: "submit"` (raw-identifier since `type` is a Rust keyword). Optimistic UI (showing the user's own message immediately, before the server confirms it) uses a locally-generated negative placeholder id, since real ids are always positive (Postgres identity columns, starting at 1) — good enough for React/Dioxus-style list `key` uniqueness without needing the server round trip first.
 
 ## Verifying UI changes
 
-`src/browser_tests.rs` is a small, `#[ignore]`d automated tier (real Postgres, real k3s, real headless Chrome via CDP) covering the sandbox panel, the context-usage indicator/detail view/compaction divider, and the todo panel — not a general framework everything else is expected to plug into yet. For anything else that touches rendering or interaction, drive the running app manually with `dx serve --fullstack` and a browser, or a scripted headless Chrome session over the DevTools Protocol — `cargo check`/`cargo test` alone don't exercise hydration, click handlers, or the live SSE loop. See [testing.md](testing.md).
+`src/browser_tests.rs` is an `#[ignore]`d automated tier (real Postgres, real k3s, real headless Chrome via CDP): one test running numbered scenarios in sequence, covering the side panels, live streaming across tabs, stopping a turn, the Sandboxes page, layout at laptop and phone widths, dark mode and more (list in [testing.md](testing.md#srcbrowser_testsrs-automated)). Add a scenario there when a change needs real-DOM verification that should keep running. For a hands-on check, start `scripts/check-server start` (a separate worktree on port 8081, so your edits don't restart it) and drive it with a browser, usually through `scripts/ui-check/smelt_ui.py` — `cargo check`/`cargo test` alone don't exercise hydration, click handlers, or the live SSE loop. See [testing.md](testing.md#browser-verification).

@@ -34,7 +34,7 @@ mod tests {
 }
 ```
 
-`#[sqlx::test]` connects to the Postgres server at `DATABASE_URL`, creates a new database per test, runs all migrations against it, and tears it down afterward — no shared fixture, no manual setup/teardown, and no cross-test interference since each test is fully isolated. This requires a reachable Postgres server while running tests (`docker compose up -d postgres`) — a real workflow change from the old in-memory-SQLite setup, where `cargo test` was fully self-contained.
+`#[sqlx::test]` connects to the Postgres server at `DATABASE_URL`, creates a new database per test, runs all migrations against it, and tears it down afterward — no shared fixture, no manual setup/teardown, and no cross-test interference since each test is fully isolated. This requires a reachable Postgres server while running tests (`docker compose up -d postgres`).
 
 ## Sandbox tests
 
@@ -64,15 +64,15 @@ uses — `src/sandbox.rs`'s `NAMESPACE` constant resolves per `#[cfg(test)]`,
 not an env var, specifically so a test run can't accidentally collide with
 (or leave litter for) a real dev instance, or vice versa.
 
-A real, non-obvious gotcha proven the hard way: deleting a sandbox pod
-with Kubernetes' default `DeleteParams` leaves it `Terminating` for its
-full grace period (commonly 30s) before it actually disappears, because
-the sandbox container doesn't trap `SIGTERM`. Every delete in
-`sandbox.rs` — including test cleanup — goes through
-`immediate_delete_params()` (`grace_period_seconds: Some(0)`) specifically
-to avoid tests timing out on this.
+A real, non-obvious gotcha proven the hard way: a deleted pod stays
+`Terminating` for its full grace period before it actually disappears.
+smelt's own deletes use `pod_delete_params()` (20s, so the pod's dockerd
+can stop its containers; SME-51 B6), and `create_pod` waits for a
+previous pod to go. Test cleanup that needs nothing to stop cleanly uses
+`immediate_delete_params()` (`grace_period_seconds: Some(0)`) instead, so
+tests don't time out waiting.
 
-Two more, both proven the hard way on `sandbox-oom` (hit once during that
+Three about `pods.exec`, the first two proven the hard way on `sandbox-oom` (hit once during that
 project's design spikes, then hit *again*, independently, while writing
 its final integration test — worth internalizing rather than
 rediscovering a third time):
@@ -94,18 +94,6 @@ rediscovering a third time):
   long as the remote command needs to run — e.g. move it (not just its
   stream handles) into the task that drains it, so the exec session stays
   open until that task itself finishes.
-
-A related one from `sandbox-native-environment`'s generic-volumes work:
-**a PVC still mounted by a pod carries Kubernetes' own
-`kubernetes.io/pvc-protection` finalizer**, so deleting the PVC right after
-deleting the pod that mounts it can leave `get_opt` still returning
-`Some` (a `Terminating` object, not gone) — the finalizer only releases
-once the pod is genuinely gone, not just marked for deletion. A test (or
-any caller) that deletes both needs to poll for the *pod* to actually
-disappear before deleting the PVC, and/or poll for the PVC itself to
-disappear rather than checking once immediately after the delete call
-returns — the delete API call succeeding doesn't mean the object is
-already gone.
 - **Writing a large payload to an `AttachedProcess`'s stdin while the
   executed command produces *zero* stdout output reliably breaks the
   connection (`BrokenPipe`) partway through the write.** Found on
@@ -121,6 +109,18 @@ already gone.
   payload is more than a few hundred KB — `src/bin/sandbox_image_import.rs`
   does both.
 
+A related one from `sandbox-native-environment`'s generic-volumes work:
+**a PVC still mounted by a pod carries Kubernetes' own
+`kubernetes.io/pvc-protection` finalizer**, so deleting the PVC right after
+deleting the pod that mounts it can leave `get_opt` still returning
+`Some` (a `Terminating` object, not gone) — the finalizer only releases
+once the pod is genuinely gone, not just marked for deletion. A test (or
+any caller) that deletes both needs to poll for the *pod* to actually
+disappear before deleting the PVC, and/or poll for the PVC itself to
+disappear rather than checking once immediately after the delete call
+returns — the delete API call succeeding doesn't mean the object is
+already gone.
+
 ### Docker in the sandbox (SME-33)
 
 - `test_docker_in_a_sandbox_pod_works_and_stays_inside_the_pod` and `test_an_oom_in_a_nested_container_restarts_only_the_docker_sidecar` run real containers. Their base image is the sandbox's own files (`sudo tar -C / -c bin sbin lib lib64 usr etc | docker import - local/base`), so no test pulls from Docker Hub. Leave out `usr/lib64` or `etc` and a container fails with `exec /usr/bin/sh: no such file or directory`.
@@ -130,32 +130,45 @@ already gone.
 
 ### Language servers (SME-35)
 
-- `src/lsp/pods.rs`'s cluster tests use a stand-in sandbox (the sandbox image, idle, with the conversation's workspace claim, `with_sandbox`, torn down even after a panic) and `cat` as the "server". `src/lsp/manager.rs`'s run the real rust-analyzer and pyright, configured from the catalog's own suggestion for the mason fixtures, so they pull `rust:1` and `node:22-slim` and download the servers: they need the network.
+- `src/lsp/pods.rs`'s cluster tests use a stand-in sandbox (the sandbox image, idle, with the conversation's workspace claim, `with_sandbox`, torn down even after a panic) and `cat` as the "server". `src/lsp/manager.rs`'s run the real rust-analyzer, pyright and gopls (`go install`), configured from the catalog's own suggestion for the mason fixtures, so they pull `rust:1`, `node:22-slim` and `golang:1` and download the servers: they need the network.
 - A fresh server answers before it has indexed: rust-analyzer returns partial references and `-32801 content modified` for a while. Ask until the answer has what you expect (`until_contains`) rather than asserting on the first one.
 - A server's out-of-memory kill takes its whole container (cgroup v2 kills the group), so the pod stops as `OOMKilled`; it isn't just the one process.
 
 ## Testing the Anthropic streaming client without the network
 
-`anthropic::stream::stream_anthropic_message` is tested against a mock upstream — a throwaway Axum server bound to an ephemeral port, with `ANTHROPIC_BASE_URL` pointed at it for the duration of the test:
+`anthropic::stream::stream_anthropic_message(api_key, auth_token, request, on_delta) -> Result<StreamedTurn, String>` is tested against a mock upstream — a throwaway Axum server bound to an ephemeral port, with `ANTHROPIC_BASE_URL` pointed at it for the duration of the test. The helper `run_against_mock_upstream` does the setup:
 
 ```rust
-#[tokio::test]
-async fn test_stream_anthropic_message_assembles_deltas_from_mock_upstream() {
-    // spawn a tiny axum::Router that responds to POST /v1/messages with a
-    // hand-written text/event-stream body
+async fn run_against_mock_upstream(
+    mock_body: &'static str,
+    on_delta: impl FnMut(&str),
+) -> Result<StreamedTurn, String> {
+    let _guard = crate::anthropic::test_support::lock_anthropic_base_url();
+    // bind 127.0.0.1:0, serve POST /v1/messages with `mock_body` as text/event-stream
     unsafe { std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}")) };
-    let assembled = stream_anthropic_message("test-key", &request, |delta| { /* collect */ }).await?;
-    assert_eq!(assembled, "Hello!");
+    stream_anthropic_message(Some("test-key"), None, &request, on_delta).await
+}
+
+#[tokio::test]
+async fn test_stream_anthropic_message_assembles_turns_from_mock_upstream() {
+    let mut deltas = Vec::new();
+    let turn = run_against_mock_upstream(text_mock_body, |delta| deltas.push(delta.to_string()))
+        .await
+        .expect("stream should succeed");
+    assert_eq!(deltas, vec!["Hel".to_string(), "lo!".to_string()]);
+    assert_eq!(turn.content, vec![ContentBlock::Text { text: "Hello!".to_string() }]);
+    assert_eq!(turn.stop_reason, "end_turn");
+    // ... then a tool-use body and a thinking body, in the same test
 }
 ```
 
-`ANTHROPIC_BASE_URL` is process-global, so **every** test across the whole binary that points it at a mock upstream must hold `anthropic::test_support::lock_anthropic_base_url()` (a `#[cfg(test)]`-only `std::sync::Mutex<()>` in `anthropic/mod.rs`) for the duration — `anthropic::stream`'s and `api::chat`'s mock-upstream tests both do. Without it, two such tests on different OS threads can each set the var to their own mock server's address and race, with one test's HTTP client ending up pointed at the other's server; when one file's tests need more than one mock-upstream scenario, prefer folding them into a single `#[tokio::test]` function (see `anthropic::stream`'s tests) over adding another test that also touches the lock, to keep contention low. The pure parsing logic (`interpret_stream_event`, deciding what a single decoded SSE payload means) is tested separately and synchronously, with no network or async runtime involved at all.
+`ANTHROPIC_BASE_URL` is process-global, so **every** test across the whole binary that sets it must hold `anthropic::test_support::lock_anthropic_base_url()` (a `#[cfg(test)]`-only `std::sync::Mutex<()>` in `anthropic/mod.rs`, recovering from poisoning) for the duration. `anthropic::stream`'s and `api::chat`'s mock-upstream tests do, and so do the tests in `anthropic::tools`, `sandbox.rs` and `browser_tests.rs` that point it somewhere (some at a dead address, `127.0.0.1:1`, so an accidental turn fails loudly). Without it, two such tests on different OS threads can each set the var to their own mock server's address and race, with one test's HTTP client ending up pointed at the other's server. The lock serializes those tests, so separate tests are fine: `anthropic::stream` has several, each going through a helper that takes the lock (`run_against_mock_upstream`, `run_against_responses` for the retry tests). Tests of `send_and_await_response` (auth headers, a timeout, an unreachable endpoint) pass the base URL in directly and don't touch the variable or the lock. The pure parsing logic (`interpret_stream_event`, deciding what a single decoded SSE payload means) is tested separately and synchronously, with no network or async runtime involved at all.
 
-A mock upstream that needs to return a *different* response per call (e.g. a tool-use turn, then a follow-up turn once the tool result comes back) tracks a request count with a shared `AtomicUsize` in the route closure and indexes into a `Vec<String>` of bodies, clamped to the last one once exhausted — see `api::chat`'s `start_mock_upstream` test helper.
+A mock upstream that needs to return a *different* response per call (e.g. a tool-use turn, then a follow-up turn once the tool result comes back) tracks a request count with a shared `AtomicUsize` in the route closure and indexes into a `Vec<String>` of bodies, clamped to the last one once exhausted — see `api::chat`'s `start_mock_upstream` test helper, which also sets `ANTHROPIC_API_KEY`. `start_mock_upstream_failing_n_times` answers the first N requests with an HTTP 500 (Ollama's "error parsing tool call" body) and then a normal stream, for the retry path.
 
 ## Testing code that touches a process-global resource across `#[tokio::test]` runtimes
 
-**General hazard, not just `PgPool`:** each `#[tokio::test]` fn gets its own independent tokio runtime. Any process-global resource (a `OnceLock`/`OnceCell`-held value) whose correctness depends on a background task that outlives a single call — a connection driven by a spawned task, a handler loop, anything with a "keep this running or the resource stops working" shape — breaks the same way once more than one `#[tokio::test]` fn touches it: whichever test's runtime first initialized it also owns that background task, and once *that* runtime tears down (at the end of *that* test fn), the resource silently stops working for every other test still trying to reuse it, from a different runtime. Seen twice now — `PgPool` below, and `chromiumoxide::Browser` (`src/webfetch.rs`'s own real-browser test, which hit "send failed because receiver is gone" the first time it split its scenarios into three separate `#[tokio::test]` fns instead of one) — check for this before adding a third. The fix is the same shape both times: either thread the resource through explicitly so each test gets its own runtime-local instance (`PgPool`'s fix), or consolidate every scenario that needs to share one instance into a single `#[tokio::test]` fn (`chromiumoxide::Browser`'s fix, matching `src/browser_tests.rs`'s own already-established "deliberately one test, not several" pattern). A third shape, and the one the shared browser now uses: run the resource's background tasks on a runtime of its own that lives as long as the process (`webfetch::BROWSER_RUNTIME`). One test per file stopped being enough once the app's browser tier (`browser_tests.rs`) also opened a browsing session: the first of the two tests to touch the shared browser took it down for the other (SME-40). A third instance, on SME-42: a real-cluster test that set `sandbox`'s process-global `MANAGER` made `test_terminal_lifecycle_end_to_end` fail with `Kube(Service(Closed))` whenever it ran after that test finished. The kube client's worker lived on the first test's runtime. Only one test sets `MANAGER`; any other real-cluster test uses its own client and `SandboxManager` (`open_pod_port_with` takes the client for this reason).
+**General hazard, not just `PgPool`:** each `#[tokio::test]` fn gets its own independent tokio runtime. Any process-global resource (a `OnceLock`/`OnceCell`-held value) whose correctness depends on a background task that outlives a single call — a connection driven by a spawned task, a handler loop, anything with a "keep this running or the resource stops working" shape — breaks the same way once more than one `#[tokio::test]` fn touches it: whichever test's runtime first initialized it also owns that background task, and once *that* runtime tears down (at the end of *that* test fn), the resource silently stops working for every other test still trying to reuse it, from a different runtime. Seen twice now — `PgPool` below, and `chromiumoxide::Browser` (`src/webfetch.rs`'s own real-browser test, which hit "send failed because receiver is gone" the first time it split its scenarios into three separate `#[tokio::test]` fns instead of one) — check for this before adding a third. The fix is the same shape both times: either thread the resource through explicitly so each test gets its own runtime-local instance (`PgPool`'s fix), or consolidate every scenario that needs to share one instance into a single `#[tokio::test]` fn (`chromiumoxide::Browser`'s fix, matching `src/browser_tests.rs`'s own already-established "deliberately one test, not several" pattern). A third shape, and the one the shared browser now uses: run the resource's background tasks on a runtime of its own that lives as long as the process (`webfetch::BROWSER_RUNTIME`). One test per file stopped being enough once the app's browser tier (`browser_tests.rs`) also opened a browsing session: the first of the two tests to touch the shared browser took it down for the other (SME-40). A third instance, on SME-42: a real-cluster test that set `sandbox`'s process-global `MANAGER` made `test_terminal_lifecycle_end_to_end` fail with `Kube(Service(Closed))` whenever it ran after that test finished. The kube client's worker lived on the first test's runtime. Now only `test_terminal_lifecycle_end_to_end` sets `MANAGER` directly, and the browser tier's one test sets it through `sandbox::init()`; any other real-cluster test uses its own client and `SandboxManager`. That's why the public `sandbox::open_pod_target(pool, conversation_id, host, port)` is a thin wrapper over a private `open_pod_port_with` that takes the client: `test_open_pod_port_reaches_the_conversations_own_pod` passes its own.
 
 Most server logic takes `pool: &PgPool` explicitly and uses `#[sqlx::test]`, per "Database tests" above. `api::chat::run_turn` is the one exception worth calling out: it was *changed* to take `pool: &PgPool` (rather than reaching for `db::get()` internally, which is what `send_message` itself still does) specifically so its own tests could use `#[sqlx::test]`. The first version reached for `db::get()` directly and initialized it once via a shared `tokio::sync::OnceCell` across tests — it worked in isolation but reliably deadlocked/timed out (`PoolTimedOut`) when multiple such tests ran concurrently, because each `#[tokio::test]` gets its *own* tokio runtime, and a `sqlx::PgPool`'s connections become unusable once the runtime that created them is torn down (which happens as soon as the test that happened to initialize the pool finishes) — a later test reusing the same process-global pool object from a *different* runtime hangs waiting for a connection that will never come back. Threading `pool: &PgPool` through instead sidesteps this: every test gets its own runtime-local, `#[sqlx::test]`-isolated pool, same as everywhere else. Any new server-side function that a background task might call (as `run_async`'s spawned task calls `run_turn`) should take its pool the same way, for the same reason.
 
@@ -178,6 +191,7 @@ Some state is process-wide and keyed by conversation id: the turn lock, a stop, 
 ## Running tests
 
 ```bash
+scripts/check.sh                              # the per-commit gate (see below)
 cargo test --features server                 # the real (server-gated) tests
 cargo test --features server -- --nocapture   # show println! output
 cargo test --features server test_name        # a single test by name
@@ -185,20 +199,24 @@ cargo test --features server test_name        # a single test by name
 
 Most logic lives behind the `server` feature; plain `cargo test` compiles but skips it.
 
+`scripts/check.sh` is what every commit is gated on (`scripts/check.sh && git commit ...`, see [development-process.md](development-process.md#rules)): the web build (`cargo check` for `wasm32-unknown-unknown`), the server binary build, and the server tests. It fails on any failure, including a warning in either build. It doesn't run the browser tier.
+
 `mcp::tests::test_live_exa_search_through_smelt_mcp_client` checks the built-in Exa MCP server against the real service: smelt's own MCP client connects keylessly, sees only `web_search_exa`, and gets results back. It needs the internet and depends on Exa's unpublished free limits, so it's `#[ignore]`d **and** skips unless `SMELT_LIVE_EXA=1` is set. CI's browser job runs every ignored test, and this one shouldn't depend on Exa there. Run it with `SMELT_LIVE_EXA=1 cargo test --features server live_exa -- --ignored`. See [Definition of done](development-process.md#definition-of-done) for the full two-target check.
 
 ## Browser verification
 
-A small automated browser test tier exists (`src/browser_tests.rs`, see below) for behavior that genuinely needs a real DOM to verify — everything else is still a manual/scripted pass, driving a real headless Chrome instance against `dx serve --fullstack`.
+A small automated browser test tier exists (`src/browser_tests.rs`, see below) for behavior that genuinely needs a real DOM to verify — everything else is a hands-on pass, driving a real headless Chrome against a check server.
 
-**A CSS/asset edit made while `dx serve` is already running doesn't reliably reach a *fresh* page load.** `App`'s `asset!("/assets/chat.css")` resolves to a content-hashed bundle path (`/assets/chat-<hash>.css`) baked into the served HTML at build time; `dx`'s hot-reload pushes a live patch over its dev websocket to tabs that were already open when the edit happened, but a brand-new browser instance (exactly what a screenshot script launches each run) requests the hashed URL fresh and can get a stale pre-edit bundle if the server hasn't actually rebuilt yet. Found on `sandbox-native-environment`: a CSS addition looked hot-reloaded (the log even said so) but a fresh `browser_check.py` run kept rendering unstyled markup until `dx serve` was killed (both the wrapper *and* its child `target/dx/.../web/server-*` process — killing just the wrapper leaves the child running, same gotcha the `scripts/browser-check/` section below already documents for a different reason) and restarted for a real full rebuild. If a browser-verification screenshot doesn't reflect a CSS change that should be there, restart `dx serve` before assuming the change itself is wrong.
+**Run hands-on checks against `scripts/check-server`, not a `dx serve` in the working tree.** `scripts/check-server start [REF]` builds and serves a commit (default `HEAD`) from a separate worktree (`../smelt-check`) on port 8081; `scripts/check-server stop` stops it and everything it started; `scripts/check-server status` says what's running. It serves the commit, not your uncommitted edits, and saving a file never restarts it. To check a newer commit, `stop` and `start` again. `CHECK_SCRATCH_DB=1` serves from an empty database of its own (dropped on `stop`), for when the dev database has migrations from another branch. See [development-process.md](development-process.md#rules) for why: a `dx serve` in the working tree rebuilds and restarts on every save, and stopping only the `dx` process leaves its server child running.
+
+A related gotcha with a `dx serve` that is watching files: **a CSS/asset edit doesn't reliably reach a *fresh* page load.** `App`'s `asset!("/assets/chat.css")` resolves to a content-hashed bundle path baked into the served HTML at build time; `dx`'s hot-reload patches tabs that were already open, but a brand-new browser (exactly what a screenshot script launches each run) can get a stale pre-edit bundle. On `sandbox-native-environment` a fresh `browser_check.py` run kept rendering unstyled markup after a CSS edit that the log said was hot-reloaded. With the check server, commit and restart it (`scripts/check-server stop`, then `start`) before assuming the change itself is wrong.
 
 ### Playwright (preferred)
 
 The dev container image bakes in a Python Playwright install specifically so this doesn't have to be rebuilt or asked for per session — see the `Dockerfile`'s `/opt/playwright-venv` stage:
 
 ```bash
-dx serve --fullstack &                             # start the app (see setup.md)
+scripts/check-server start                         # the app, on http://localhost:8081
 
 /opt/playwright-venv/bin/playwright install chromium   # once per container instance —
                                                          # the venv exists in the image,
@@ -209,15 +227,17 @@ dx serve --fullstack &                             # start the app (see setup.md
 /opt/playwright-venv/bin/python your_script.py      # a short sync_playwright() script:
                                                      # launch chromium(args=["--no-sandbox"]),
                                                      # goto/click/fill, .screenshot(path=...)
+
+scripts/check-server stop                          # when done
 ```
 
-For checks with a real model, start from `scripts/ui-check/smelt_ui.py`: a `Tab` wrapper that starts and deletes conversations, sends a message and waits for the turn to finish, reads the transcript and notices, and handles several things that each cost a rerun on SME-51. For example, a conversation page never reaches "network idle" (its event stream stays open), and the message box is an `<input>`. Its docstring has a complete example. Run it against `scripts/check-server`, not a `dx serve` in the working tree.
+Start from `scripts/ui-check/smelt_ui.py`: a `Tab` wrapper that starts and deletes conversations, sends a message and waits for the turn to finish, reads the transcript and notices, and handles several things that each cost a rerun on SME-51. For example, a conversation page never reaches "network idle" (its event stream stays open), and the message box is an `<input>`. Its docstring has a complete example. It talks to `SMELT_UI_BASE` (default `http://localhost:8081`, the check server) and writes screenshots to `SMELT_UI_OUT` (default `./ui-check-out`).
 
-Then view the screenshot (the `Read` tool renders images directly). This is a plain Python script per check, not a fixed CLI — see any recent UI-change conversation in this project for concrete examples (navigating to a conversation, clicking a sidebar entry, reading back `scrollTop`/`scrollHeight` via `page.eval_on_selector`, etc.).
+Then view the screenshot (the `Read` tool renders images directly). This is a plain Python script per check, not a fixed CLI (navigating to a conversation, clicking a sidebar entry, reading back `scrollTop`/`scrollHeight` via `page.eval_on_selector`, etc.).
 
 ### `scripts/browser-check/` (fallback)
 
-Before Playwright was added to the image, UI verification in this sandbox had no browser, no Node, and no Python `pip` available at all (see the `delete-conversations` and `tool-use-round-trip` retrospectives) — `scripts/browser-check/` is a from-scratch, pure-stdlib driver built to cover that gap, and is kept as the fallback for an environment that still lacks Docker-rebuild/root access:
+Before Playwright was added to the image, UI verification in this sandbox had no browser, no Node, and no Python `pip` available at all (see SME-5's and SME-8's retrospectives) — `scripts/browser-check/` is a from-scratch, pure-stdlib driver built to cover that gap, and is kept as the fallback for an environment that still lacks Docker-rebuild/root access:
 
 ```bash
 scripts/browser-check/setup.sh                     # once — downloads a headless
@@ -228,14 +248,14 @@ scripts/browser-check/setup.sh                     # once — downloads a headle
                                                      # safe to re-run, no root needed
 
 python3 scripts/browser-check/browser_check.py \
-    http://127.0.0.1:8080/ \
+    http://127.0.0.1:8081/ \
     --screenshot /tmp/out.png \
     --action "click:.conversation-item" \
     --action "sleep:1000" \
     --action "scroll:.messages"
 ```
 
-`scripts/browser-check/cdp.py` hand-rolls just enough raw WebSocket framing (RFC6455) to speak the Chrome DevTools Protocol directly, and `setup.sh` fetches Chrome for Testing plus its missing shared libraries (nss, atk, dbus, X11, mesa, ...) via non-root `apt-get --print-uris` + `dpkg-deb -x` into a local prefix — no root, no system package state touched. `--action` runs steps in order: `click:SELECTOR`, `type:SELECTOR=TEXT`, `wait:SELECTOR` (poll up to 10s), `scroll:SELECTOR` (scrolls to bottom), `sleep:MS`, `eval:JS` (escape hatch — also handy for injecting synthetic markup to preview CSS for a state you don't have live data for, e.g. an error variant when nothing's currently failing). Each run launches its own Chrome and kills it on exit unless `--keep-open` is passed, specifically so repeated runs don't leak orphaned processes the way plain `kill $pid` on `dx serve` itself can (`dx serve`'s actual Axum server runs as a *child* process under a different PID — killing only the `dx` wrapper leaves it running; `pkill -f 'target/dx/.*/server-'` or checking `ps aux` after is worth doing regardless of which tool started it).
+`scripts/browser-check/cdp.py` hand-rolls just enough raw WebSocket framing (RFC6455) to speak the Chrome DevTools Protocol directly, and `setup.sh` fetches Chrome for Testing plus its missing shared libraries (nss, atk, dbus, X11, mesa, ...) via non-root `apt-get --print-uris` + `dpkg-deb -x` into a local prefix — no root, no system package state touched. `--action` runs steps in order: `click:SELECTOR`, `type:SELECTOR=TEXT`, `wait:SELECTOR` (poll up to 10s), `scroll:SELECTOR` (scrolls to bottom), `sleep:MS`, `eval:JS` (escape hatch — also handy for injecting synthetic markup to preview CSS for a state you don't have live data for, e.g. an error variant when nothing's currently failing). Each run launches its own Chrome and kills it on exit unless `--keep-open` is passed, so repeated runs don't leak orphaned Chrome processes.
 
 ### `src/browser_tests.rs` (automated)
 
@@ -260,16 +280,48 @@ dx build --platform web                  # once per frontend change — dioxus-s
 cargo test --features "server browser-test" -- --ignored --test-threads=1
 ```
 
-`#[ignore]`d by default (needs the two setup steps above, plus a real Postgres and k3s cluster reachable the same way every other real-cluster test already assumes) and deliberately just the one test for this file's own scope — see SME-10 for the design and reasoning (in-process server via a factored-out `build_router()`, `chromiumoxide` talking directly to `chrome-headless-shell` over CDP rather than a `chromedriver`/WebDriver setup this environment doesn't have). Reaches into `db`/`sandbox`/`anthropic::tools` directly to set up scenarios (bypassing the model entirely — this tier verifies the browser/live-event pipeline, not tool-selection behavior) and asserts against the rendered DOM via `page.evaluate("document.body.innerText...")`, not screenshots.
+`#[ignore]`d by default (needs the two setup steps above, plus a real Postgres and k3s cluster reachable the same way every other real-cluster test already assumes) and deliberately just the one test for this file's own scope — see SME-10 for the design and reasoning (in-process server via a factored-out `build_router()`, `chromiumoxide` talking directly to `chrome-headless-shell` over CDP rather than a `chromedriver`/WebDriver setup this environment doesn't have). Reaches into `db`/`sandbox`/`anthropic::tools` directly to set up most scenarios (this tier verifies the browser/live-event pipeline, not tool-selection behavior) and asserts against the rendered DOM via `page.evaluate(...)`, not screenshots. Neither this environment nor CI has real Anthropic credentials, so where a scenario needs the model — a send typed into the page (scenarios 8, 13, 14) or a turn the AGENTS.md trust decision wakes — the model is a slow local mock upstream on `ANTHROPIC_BASE_URL` (`start_slow_mock_upstream`, under the lock above). It runs in CI (`.github/workflows/ci.yml`, see [development-process.md](development-process.md#definition-of-done)).
+
+It runs these scenarios, in order, in one `#[tokio::test]` (`test_end_to_end_browser_scenarios`):
+1. The sandbox panel on a cold load: one pod, two terminals. Also checks the stylesheet loads.
+2. A terminal command's output streaming live, with no reload.
+3. `terminate_terminal` removing exactly the right card.
+4. A reload mid-command rebuilding the panel, with live updates resuming.
+5. The context-usage indicator and its detail view (SME-18).
+6. A compaction divider, collapsed by default, expanding to the summary.
+7. The todo panel: cold load, then a live full replace through the real `todowrite` tool (SME-20).
+8. A reply streaming into one conversation stays there when the viewer switches mid-stream; the sidebar picks up the new title.
+9. A reply the tab didn't send (a background notification, another tab's send) arriving live.
+10. A missing conversation saying so.
+11. A background-notification error clearing on a switch.
+12. A pod's sidebar dot appearing live in another tab, the Sandboxes page listing it, and Stop there (a two-step button that mustn't move when armed) removing the row and the dot.
+13. Stopping a turn, with Stop shown in a second tab that didn't send, and "Stopped." afterwards.
+14. Replies streaming to every tab, a reload mid-reply keeping the text so far, the sender seeing its message once, and five tabs leaving room for a Stop.
+15. With a browsing session, a todo list and a terminal open, the chat staying usable at laptop width (SME-40 F2, SME-41 D16).
+16. Every settings page reachable from the sidebar, and the sidebar's Delete keeping its size when armed.
+17. A phone-width window, including the viewport meta tag (SME-40 F8).
+18. A URL that isn't a page saying so (SME-40 F10).
+19. A tool call as one compact line with its result folded in; a failed one open (SME-41 D2).
+20. Dark mode following the system setting (SME-41 D5).
+21. One primary action per form, and intro text lined up with its heading (SME-41 D6).
+22. A new conversation's intro and example asks (SME-41 D12).
+23. A sandbox dev server end to end (SME-42): a server bound to `127.0.0.1` in a real pod loads in the model's browsing session at `localhost`, the model's `sandbox_preview_url` link appears live in the sandbox panel, opens the same page in a tab through the harness's own preview listener (`SMELT_PREVIEW_URL` set to a free port), and survives a reload. Since SME-33 it goes on to a Docker container with an unpublished port, on a network with a fixed address: `webfetch` and a browsing session load it at its address, a private address outside the Docker range stays refused, and its preview link names the container in the panel and opens in a tab.
+
+Then, unnumbered: a repo's AGENTS.md waiting for the user's trust, and trusting it loading exactly that file (SME-32); and switching conversations closing the context detail view (SME-51 B11).
+
+Lessons from writing these:
+- **Keep the number of open smelt tabs low: close tabs a scenario is done with.** Over HTTP/1.1 the browser allows 6 connections per host across all tabs. Each chat tab holds one always-open stream, and a tab's own loading needs a free connection besides its stream (for its snapshot requests). So about five smelt tabs is the most the harness can have open at once: past that, a new tab never finishes loading. Both this and a Stop click queuing behind a reply's own stream (fixed on `connection-limits`, when replies moved onto the conversation stream) were hit while writing scenarios 12–14.
+- **Before typing into or clicking the page, wait for the WASM client to be live** (`wait_for_live_client`, or `wait_for_resource` on a page without a conversation). The server-rendered page accepts typing before hydration with no handlers attached, so input is silently lost; the harness page also permanently shows `dx`'s "Your app is being rebuilt" overlay, which is a red herring. The signal is the client's last post-subscription snapshot request (`get_browsing_state`) completing. The event stream itself never completes, so it never shows up in resource timings.
+- **The harness cleans up after itself, even when a scenario fails.** It runs against the real dev database and cluster, so every conversation a scenario creates is recorded (`new_conversation`) and removed at the end, pods first, the same way deleting a conversation in the app does. The test then checks nothing was left. That cleanup has to run *before* `harness.shutdown()`: once the harness has shut down, the cluster client's connection is gone ("runtime dropped the dispatch task") and pod deletes silently fail. Leftover pods matter: enough of them and new pods stop starting (`create_pod: Timeout`, then `ProtocolSwitch(500)` on terminals). Other tests can still leave some behind (a crashed run, `sandbox.rs`'s OOM tests); `scripts/clean-test-namespace.sh` clears the namespace.
 
 **The page is styled only because the harness serves the stylesheet itself.** A plain `cargo test` build doesn't bundle assets: `asset!("/assets/chat.css")` resolves to the source file's own path (`/app/assets/chat.css`), which neither the bundle nor dioxus-server serves, so until SME-40 every page in this tier ran unstyled and any layout measurement there was meaningless. The harness now routes that exact URL to `assets/chat.css`, and scenario 1 asserts the stylesheet loads. A new asset referenced with `asset!()` needs the same treatment before a scenario can rely on it.
 
-`src/webfetch.rs` has its own separate `#[ignore]`d, `browser-test`-gated real-browser test (`webfetch::browser_tests::test_fetch_scenarios`) — same `chrome-headless-shell` binary/setup, same `cargo test --features "server browser-test" -- --ignored --test-threads=1` invocation runs both, but a different module/concern (a feature's own browser-driving + SSRF-guard logic, not DOM/panel rendering), so it isn't a scenario folded into `browser_tests.rs`'s one test. Also different in one real way: it launches its *own* browser instance via `webfetch`'s real (production) `shared_browser`, not `browser_tests.rs`'s own harness — and, having hit the cross-runtime hazard above first-hand, is deliberately still just the one `#[tokio::test]` function covering all its scenarios sequentially, not several.
+`src/webfetch.rs` has its own separate `#[ignore]`d, `browser-test`-gated real-browser test (`webfetch::browser_tests::test_fetch_scenarios`) — same `chrome-headless-shell` binary/setup, same `cargo test --features "server browser-test" -- --ignored --test-threads=1` invocation runs both, but a different module/concern (a feature's own browser-driving + SSRF-guard logic, not DOM/panel rendering), so it isn't a scenario folded into `browser_tests.rs`'s one test. `src/browsing.rs`'s real-browser scenarios run inside it too, as a plain async fn it calls (`browsing::browser_tests::run_session_scenarios`), since they share the same browser. Also different in one real way: it uses `webfetch`'s real (production) `shared_browser`, not `browser_tests.rs`'s own harness — and, having hit the cross-runtime hazard above first-hand, keeps all its scenarios in that one `#[tokio::test]` function. `webfetch.rs` has two more ignored tests, for Chrome not outliving its owner: `test_chrome_exits_with_its_owning_process` and the `chrome_owner_helper` it re-runs as a child (see below).
 
 **A piped `cargo test` invocation can look hung when it's actually finished.** If a test spawns a long-lived child process (a shared browser, kept running by design rather than torn down per-test), that child inherits and can hold open any stdio the parent process didn't explicitly close or redirect — `chromiumoxide` only pipes `chrome-headless-shell`'s stderr, not its stdout, so the browser keeps the test binary's own stdout fd alive for as long as it runs. Piping `cargo test`'s output through another command that waits for real EOF (`| tail`, `| grep`, ...) then blocks forever, even after `cargo test` itself (and the Rust test process) have already cleanly exited — not a code bug, a shell-pipeline artifact. Redirect to a real file (`> output.log 2>&1`) instead when a test launches anything long-lived; a file read doesn't block waiting for every writer to close.
 
 ## What's not covered yet
 
-- **The automated browser tier is minimal, not comprehensive.** `browser_tests.rs`'s one test covers the `sandbox-visibility` panel, (since `auto-compaction`) the context-usage indicator/detail view/compaction divider, (since `todo-list-tool`) the todo panel, a reply streaming into one conversation staying there when the viewer switches mid-stream (the model is a slow mock upstream on `ANTHROPIC_BASE_URL`, the one scenario that does call `send_message`), including the sidebar picking up the new title; and (since the bug bash) a reply the tab didn't send reaching it live, a missing conversation saying so, and a background-notification error clearing on a switch; `webfetch.rs`'s own separate test covers real navigation, SSRF-guard behavior, and (since `web-browsing`) the underlying browsing-session tools (navigate/click/fill/go_back/screencast frames/input dispatch) — not a general framework other features are expected to plug into yet. It does run in CI now (`.github/workflows/ci.yml`, see [development-process.md](development-process.md#definition-of-done)), with every `browser_tests.rs` scenario bypassing the model (seeding state directly, never a real `send_message`) since neither this environment nor CI has real Anthropic credentials (the cross-conversation scenario points the model at a local mock instead). Since `pod-management`, it also covers the sidebar's live pod dot and stopping a pod from `/pods` (scenario 12), and stopping a turn, including Stop appearing in a tab that didn't send (scenario 13). **Keep the number of open smelt tabs low: close tabs a scenario is done with.** Over HTTP/1.1 the browser allows 6 connections per host across all tabs. Each chat tab holds one always-open stream, and a tab's own loading needs a free connection besides its stream (for its snapshot requests). So about five smelt tabs is the most the harness can have open at once: past that, a new tab never finishes loading. Both this and a Stop click queuing behind a reply's own stream (fixed on `connection-limits`, when replies moved onto the conversation stream) were hit while writing scenarios 12–14. Scenario 14 covers replies streaming to every tab, a reload mid-reply, the sender seeing its message once, and five tabs leaving room for Stop. Scenario 23 (SME-42) covers a sandbox dev server end to end: a server bound to `127.0.0.1` in a real pod loads in the model's browsing session at `localhost`, the model's `sandbox_preview_url` link appears live in the sandbox panel, opens the same page in a tab through the harness's own preview listener (`SMELT_PREVIEW_URL` set to a free port), and survives a reload. Since SME-33 it goes on to a Docker container with an unpublished port, on a network with a fixed address: `webfetch` and a browsing session load it at its address, a private address outside the Docker range stays refused, and its preview link names the container in the panel and opens in a tab. **Before typing into or clicking the page, wait for the WASM client to be live** (`wait_for_live_client`, or `wait_for_resource` on a page without a conversation). The server-rendered page accepts typing before hydration with no handlers attached, so input is silently lost; the harness page also permanently shows `dx`'s "Your app is being rebuilt" overlay, which is a red herring. The signal is the client's last post-subscription snapshot request completing. The event stream itself never completes, so it never shows up in resource timings. **The harness cleans up after itself, even when a scenario fails.** It runs against the real dev database and cluster, so every conversation a scenario creates is recorded (`new_conversation`) and removed at the end, pods first, the same way deleting a conversation in the app does. The test then checks nothing was left. That cleanup has to run *before* `harness.shutdown()`: once the harness has shut down, the cluster client's connection is gone ("runtime dropped the dispatch task") and pod deletes silently fail. Leftover pods matter: enough of them and new pods stop starting (`create_pod: Timeout`, then `ProtocolSwitch(500)` on terminals). Other tests can still leave some behind (a crashed run, `sandbox.rs`'s OOM tests); `scripts/clean-test-namespace.sh` clears the namespace. Worth extending further once another feature has a similar need for real-DOM verification.
-- **The live browsing panel's DOM/RSX wiring itself has no automated coverage** — only a manual `dx serve` + Playwright pass, driving a real model through a real conversation, confirmed it renders live frames and forwards input correctly. The *tools* underneath it (`browsing.rs`'s own session/navigate/click/fill/screencast/input-dispatch logic) are automated-tested via `webfetch.rs`'s real-browser test, and the panel's pure frontend logic (`chat.rs`'s `browser_input_event_for_key` keydown mapping and `coalesce_mouse_moves`) has direct unit tests. The real-browser scenarios include regressions for what the branch's review found: a plain hover reaching the page with `buttons == 0`, Enter submitting a form, a viewer leaving and another arriving with no gap in frames, a subscription from a closed session not affecting the next one, the frame stream releasing its viewer when dropped, two racing `open_session` calls where exactly one wins, a `data:` URL being refused, a typed password never appearing in the element list, `fill` replacing (and clearing) a field instead of appending, Shift+Tab and Ctrl+Backspace keeping their modifiers, a second viewer getting a frame from a static page, and a close issued mid-open winning. Also: a click waiting for a delayed update and for a slow page it navigates to; `fill` with accented, CJK, emoji and multi-line text; and nothing a page does — a popup, a `target=_blank` link, a WebSocket, a service worker — reaching a refused address, in both `browsing` and `webfetch`. That last check needs an address the guard refuses but that is still reachable, and the tests' guard allows loopback. So it listens on this machine's own private address instead (found by opening a UDP socket toward a private range, which sends nothing) and fails loudly if the machine has none. The address bar's URL tracking is covered too: a URL update for the model navigating, a link click, a `pushState` change, and a refused load (which must report the address asked for, not `chrome-error://`). Browser-data isolation is covered from both sides: a cookie and a localStorage value set in one conversation's session must be visible to that session (so the check can't pass vacuously), invisible to another conversation's, and gone after a close and reopen. A second `webfetch` call must not see what a first one set. `webfetch::browser_tests::test_chrome_exits_with_its_owning_process` checks that Chrome can't be orphaned. It re-runs the test binary as a child process, which then owns a shared browser (via the `chrome_owner_helper` test, a no-op unless `SMELT_CHROME_OWNER_HELPER` is set). The test finds that child's Chrome through `/proc`, SIGKILLs the child and asserts Chrome exits too. The static-page scenario navigates somewhere with no focused input on purpose: a blinking caret keeps Chrome sending frames, which hid this bug from the first version of the test. What's still manual-only is the actual RSX event wiring (mouse/wheel handlers reading `element_coordinates()`, the frame `<img>` reactively updating off the live stream), since automating "one headless browser watching another headless browser's live video feed and clicking on it" is a meaningfully bigger lift than `browser_tests.rs`'s existing scenarios. Worth a real automated scenario later, not assumed away.
+- **The automated browser tier covers what its scenarios list, not every page.** It's not a general framework other features are expected to plug into; add a scenario when a change needs real-DOM verification that should keep running. `webfetch.rs`'s separate test covers real navigation, SSRF-guard behavior, and the browsing-session tools (below).
+- **The live browsing panel's input and frame wiring has no automated coverage** — only a manual pass with a real app and Playwright, driving a real model through a real conversation, confirmed it renders live frames and forwards input correctly. Browser scenario 15 checks the panel's layout, nothing more. The *tools* underneath it (`browsing.rs`'s own session/navigate/click/fill/screencast/input-dispatch logic) are automated-tested inside `webfetch.rs`'s real-browser test, and the panel's pure frontend logic (`chat.rs`'s `browser_input_event_for_key`, `cdp_modifiers`, `frame_point`, `wheel_delta_pixels`, `coalesce_mouse_moves`, `address_bar_value`) has direct unit tests. The real-browser scenarios include regressions for what the branch's review found: a plain hover reaching the page with `buttons == 0`, Enter submitting a form, a viewer leaving and another arriving with no gap in frames, a subscription from a closed session not affecting the next one, the frame stream releasing its viewer when dropped, two racing `open_session` calls where exactly one wins, a `data:` URL being refused, a typed password never appearing in the element list, `fill` replacing (and clearing) a field instead of appending, Shift+Tab and Ctrl+Backspace keeping their modifiers, a second viewer getting a frame from a static page, and a close issued mid-open winning. Also: a click waiting for a delayed update and for a slow page it navigates to; `fill` with accented, CJK, emoji and multi-line text; and nothing a page does — a popup, a `target=_blank` link, a WebSocket, a service worker — reaching a refused address, in both `browsing` and `webfetch`. That last check needs an address the guard refuses but that is still reachable, and the tests' guard allows loopback. So it listens on this machine's own private address instead (found by opening a UDP socket toward a private range, which sends nothing) and fails loudly if the machine has none. The address bar's URL tracking is covered too: a URL update for the model navigating, a link click, a `pushState` change, and a refused load (which must report the address asked for, not `chrome-error://`). Browser-data isolation is covered from both sides: a cookie and a localStorage value set in one conversation's session must be visible to that session (so the check can't pass vacuously), invisible to another conversation's, and gone after a close and reopen. A second `webfetch` call must not see what a first one set. `webfetch::browser_tests::test_chrome_exits_with_its_owning_process` checks that Chrome can't be orphaned. It re-runs the test binary as a child process, which then owns a shared browser (via the `chrome_owner_helper` test, a no-op unless `SMELT_CHROME_OWNER_HELPER` is set). The test finds that child's Chrome through `/proc`, SIGKILLs the child and asserts Chrome exits too. The static-page scenario navigates somewhere with no focused input on purpose: a blinking caret keeps Chrome sending frames, which hid this bug from the first version of the test. What's still manual-only is the actual RSX event wiring (mouse/wheel handlers reading `element_coordinates()` and scaling through `frame_point`, the frame `<img>` reactively updating off the live stream), since automating "one headless browser watching another headless browser's live video feed and clicking on it" is a meaningfully bigger lift than `browser_tests.rs`'s existing scenarios. Worth a real automated scenario later, not assumed away.
 - **No native SSR component-test harness.** Components aren't unit-tested by rendering them to a string outside a real page load. Worth adding if/when component logic grows complex enough that manual browser verification alone becomes slow to iterate on.
