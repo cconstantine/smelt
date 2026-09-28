@@ -111,7 +111,8 @@ pub struct Session {
     client: LspClient,
     pub config: LanguageServerConfig,
     capabilities: Value,
-    roots: Mutex<Vec<String>>,
+    /// Shared with the handler, which lists them when the server asks.
+    roots: Arc<Mutex<Vec<String>>>,
     documents: Mutex<HashMap<String, Document>>,
     heard: Arc<Heard>,
 }
@@ -126,8 +127,9 @@ impl Session {
         W: AsyncWrite + Send + Unpin + 'static,
     {
         let heard = Arc::new(Heard::default());
-        let client = LspClient::start(reader, writer, handler(heard.clone(), config.settings.clone(), root));
-        let folder = json!({"uri": file_uri(root), "name": root.rsplit('/').next().unwrap_or("workspace")});
+        let roots = Arc::new(Mutex::new(vec![root.to_string()]));
+        let client = LspClient::start(reader, writer, handler(heard.clone(), config.settings.clone(), roots.clone()));
+        let folder = workspace_folder(root);
         let result = match client
             .request(
                 "initialize",
@@ -160,7 +162,7 @@ impl Session {
             client,
             config,
             capabilities: result.get("capabilities").cloned().unwrap_or(Value::Null),
-            roots: Mutex::new(vec![root.to_string()]),
+            roots,
             documents: Mutex::new(HashMap::new()),
             heard,
         })
@@ -191,7 +193,7 @@ impl Session {
             }
             roots.push(root.to_string());
         }
-        let folder = json!({"uri": file_uri(root), "name": root.rsplit('/').next().unwrap_or("workspace")});
+        let folder = workspace_folder(root);
         self.client
             .notify("workspace/didChangeWorkspaceFolders", json!({"event": {"added": [folder], "removed": []}}))
             .await
@@ -325,8 +327,12 @@ fn client_capabilities() -> Value {
 
 /// Answers what the server sends: diagnostics and progress are kept, and
 /// its requests get the config's settings or `null`.
-fn handler(heard: Arc<Heard>, settings: Option<Value>, root: &str) -> Handler {
-    let root = root.to_string();
+/// A root as LSP's `WorkspaceFolder`.
+fn workspace_folder(root: &str) -> Value {
+    json!({"uri": file_uri(root), "name": root.rsplit('/').next().unwrap_or("workspace")})
+}
+
+fn handler(heard: Arc<Heard>, settings: Option<Value>, roots: Arc<Mutex<Vec<String>>>) -> Handler {
     Arc::new(move |incoming| match incoming {
         Incoming::Notification { method, params } => {
             match method.as_str() {
@@ -367,7 +373,8 @@ fn handler(heard: Arc<Heard>, settings: Option<Value>, root: &str) -> Handler {
                 Value::Array(items.iter().map(|item| configuration_for(settings.as_ref(), item)).collect())
             }
             "workspace/workspaceFolders" => {
-                json!([{"uri": file_uri(&root), "name": root.rsplit('/').next().unwrap_or("workspace")}])
+                let roots = roots.lock().unwrap_or_else(|e| e.into_inner());
+                Value::Array(roots.iter().map(|root| workspace_folder(root)).collect())
             }
             _ => Value::Null,
         },
@@ -595,6 +602,12 @@ mod tests {
         assert_eq!(added["params"]["event"]["added"][0]["uri"], "file:///workspace/b");
         // Nothing else was sent.
         assert!(tokio::time::timeout(Duration::from_millis(200), server.next()).await.is_err());
+
+        // Asked for its folders, the server hears about both.
+        server.send(json!({"jsonrpc": "2.0", "id": 7, "method": "workspace/workspaceFolders"})).await;
+        let answer = server.next().await;
+        let uris: Vec<&str> = answer["result"].as_array().expect("folders").iter().filter_map(|f| f["uri"].as_str()).collect();
+        assert_eq!(uris, vec!["file:///workspace/a", "file:///workspace/b"]);
     }
 
     #[test]
