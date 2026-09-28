@@ -1108,9 +1108,16 @@ mod server {
         pool: &PgPool,
         repo_id: i64,
         cloned: &ClonedRepo,
+        agents_files: Result<Vec<String>, String>,
         guard: CloneGuard,
     ) -> Result<(), String> {
-        db::set_repo_cloned(pool, repo_id, &cloned.branch, cloned.commit.as_deref())
+        // The clone is good even if its AGENTS.md files can't be listed;
+        // the panel says why.
+        let (files, error) = match agents_files {
+            Ok(files) => (files, None),
+            Err(e) => (Vec::new(), Some(format!("Couldn't list its AGENTS.md files: {e}"))),
+        };
+        db::set_repo_ready(pool, repo_id, &cloned.branch, cloned.commit.as_deref(), &files, error.as_deref())
             .await
             .map_err(|e| e.to_string())?;
         guard.finish();
@@ -1135,19 +1142,12 @@ mod server {
         .await;
         match outcome {
             Ok(cloned) => {
-                record_cloned(pool, repo.id, &cloned, guard).await?;
-                // What the model can load with load_instructions. The clone
-                // is good even if they can't be listed; the panel says why.
-                match list_agents_files(&client, &pod_name, &repo.dir).await {
-                    Ok(files) => {
-                        let _ = db::set_repo_agents_files(pool, repo.id, &files).await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(repo = %repo.url, error = %e, "couldn't list AGENTS.md files");
-                        let _ = db::set_repo_error(pool, repo.id, &format!("Couldn't list its AGENTS.md files: {e}")).await;
-                    }
-                }
-                Ok(())
+                // What the model can load with load_instructions.
+                let files = list_agents_files(&client, &pod_name, &repo.dir).await.map_err(|e| {
+                    tracing::warn!(repo = %repo.url, error = %e, "couldn't list AGENTS.md files");
+                    e.to_string()
+                });
+                record_cloned(pool, repo.id, &cloned, files, guard).await
             }
             Err(e) => {
                 let _ = db::set_repo_failed(pool, repo.id, &e).await;
@@ -1920,11 +1920,34 @@ mod server {
                 commit: Some("abc".to_string()),
                 branch: "main".to_string(),
             };
-            record_cloned(&pool, repo.id, &cloned, guard).await.expect("record");
-            // What follows (reading AGENTS.md) is cut off here.
+            record_cloned(&pool, repo.id, &cloned, Ok(vec![]), guard).await.expect("record");
+            // What follows is cut off here.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let row = db::get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
             assert_eq!((row.status.as_str(), row.error.as_deref()), ("ready", None));
+        }
+
+        /// A repo is ready only once its AGENTS.md files are listed, so a
+        /// turn that waited for the clone sees them (SME-32 code review 10,
+        /// finding 3).
+        #[sqlx::test]
+        async fn test_a_repo_is_ready_with_its_agents_files_already_listed(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let cloned = ClonedRepo { commit: Some("abc".to_string()), branch: "main".to_string() };
+
+            let listed = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "listed").await.expect("repo");
+            let guard = CloneGuard::new(&pool, listed.id, conversation.id);
+            let files = vec!["AGENTS.md".to_string(), "api/AGENTS.md".to_string()];
+            record_cloned(&pool, listed.id, &cloned, Ok(files.clone()), guard).await.expect("record");
+            let row = db::get_conversation_repo(&pool, listed.id).await.expect("get").expect("exists");
+            assert_eq!((row.status.as_str(), row.error.as_deref(), row.agents_files), ("ready", None, files));
+
+            let unlisted = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "unlisted").await.expect("repo");
+            let guard = CloneGuard::new(&pool, unlisted.id, conversation.id);
+            record_cloned(&pool, unlisted.id, &cloned, Err("exec failed".to_string()), guard).await.expect("record");
+            let row = db::get_conversation_repo(&pool, unlisted.id).await.expect("get").expect("exists");
+            assert_eq!(row.status, "ready", "the clone itself is good");
+            assert_eq!(row.error.as_deref(), Some("Couldn't list its AGENTS.md files: exec failed"));
         }
 
         /// No key and no identity: a new pod is left alone (SME-32 code

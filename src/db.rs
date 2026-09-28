@@ -884,7 +884,9 @@ pub struct ConversationRepo {
     pub agents_files: Vec<String>,
 }
 
-/// Records the checkout's AGENTS.md files, after a clone.
+/// Sets a checkout's AGENTS.md files, for tests; a clone records them
+/// with `set_repo_ready`.
+#[cfg(test)]
 pub async fn set_repo_agents_files(pool: &PgPool, id: i64, files: &[String]) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE conversation_repos SET agents_files = $2, updated_at = now() WHERE id = $1")
         .bind(id)
@@ -1188,6 +1190,7 @@ pub async fn retry_repo_clone(
     .await
 }
 
+#[cfg(test)]
 pub async fn set_repo_cloned(
     pool: &PgPool,
     id: i64,
@@ -1208,14 +1211,30 @@ pub async fn set_repo_cloned(
     Ok(())
 }
 
-/// A problem with a repo that doesn't change its status, such as its
-/// AGENTS.md being unreadable after a good clone.
-pub async fn set_repo_error(pool: &PgPool, id: i64, error: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE conversation_repos SET error = $2, updated_at = now() WHERE id = $1")
-        .bind(id)
-        .bind(error)
-        .execute(pool)
-        .await?;
+/// A clone that finished, with the AGENTS.md files it has (or why they
+/// couldn't be listed) recorded in the same update, so nothing sees it
+/// ready without them.
+pub async fn set_repo_ready(
+    pool: &PgPool,
+    id: i64,
+    checked_out_branch: &str,
+    commit_sha: Option<&str>,
+    agents_files: &[String],
+    error: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE conversation_repos
+            SET status = 'ready', error = $4, checked_out_branch = $2, commit_sha = $3,
+                agents_files = $5, updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(checked_out_branch)
+    .bind(commit_sha)
+    .bind(error)
+    .bind(agents_files)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
