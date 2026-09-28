@@ -299,6 +299,18 @@ fn request_error(config: &LanguageServerConfig, error: LspError) -> String {
     }
 }
 
+/// The `lsp` tool's input, checked before anything is asked: a position
+/// needs a path and a line, and lines and characters count from 1.
+fn check_input(operation: Operation, input: &OperationInput) -> Result<(), String> {
+    if operation.needs_position() && (input.path.is_none() || input.line.is_none()) {
+        return Err(format!("{} needs a path and a line (1-based).", operation.name()));
+    }
+    if input.line == Some(0) || input.character == Some(0) {
+        return Err("Lines and characters are 1-based, as read_file shows them: the first is 1.".to_string());
+    }
+    Ok(())
+}
+
 /// A request, asked again (a few times) when the server says the content
 /// changed under it or it cancelled it: it's still loading, and the LSP
 /// spec has the client retry.
@@ -329,9 +341,7 @@ pub async fn operate(
     let config_list: Vec<LanguageServerConfig> = all.iter().map(|(c, _)| c.clone()).collect();
     let running = ready_servers(client, sandbox).await?;
     let path = input.path.clone();
-    if operation.needs_position() && (path.is_none() || input.line.is_none()) {
-        return Err(format!("{} needs a path and a line (1-based).", operation.name()));
-    }
+    check_input(operation, input)?;
     let config = match &path {
         Some(path) => ops::choose_server(path, &config_list, &running)?.clone(),
         None if operation == Operation::WorkspaceSymbols => {
@@ -370,7 +380,7 @@ pub async fn operate(
         let line_text = text.lines().nth(line.saturating_sub(1) as usize).ok_or_else(|| format!("{path} has no line {line}."))?;
         Ok(json!({
             "textDocument": {"uri": session::file_uri(path)},
-            "position": {"line": line - 1, "character": ops::to_utf16(line_text, character)},
+            "position": {"line": line.saturating_sub(1), "character": ops::to_utf16(line_text, character)},
         }))
     };
 
@@ -569,6 +579,19 @@ mod tests {
         );
         assert_eq!(note_indexing("No results.".to_string(), false, "rust-analyzer"), "No results.");
         assert_eq!(note_indexing("/workspace/a.rs:1:1  fn a()".to_string(), true, "rust-analyzer"), "/workspace/a.rs:1:1  fn a()");
+    }
+
+    #[test]
+    fn lines_and_characters_count_from_one() {
+        let at = |line, character| OperationInput { path: Some("/workspace/a.rs".to_string()), line, character, ..Default::default() };
+        assert_eq!(check_input(Operation::Definition, &at(Some(1), Some(1))), Ok(()));
+        assert_eq!(check_input(Operation::Definition, &at(Some(1), None)), Ok(()));
+        let zero_line = check_input(Operation::Definition, &at(Some(0), Some(1))).expect_err("line 0");
+        assert!(zero_line.contains("1-based"), "{zero_line}");
+        assert!(check_input(Operation::Hover, &at(Some(3), Some(0))).is_err(), "character 0");
+        assert!(check_input(Operation::References, &at(None, None)).is_err(), "no line");
+        // Operations without a position don't look at them.
+        assert_eq!(check_input(Operation::WorkspaceSymbols, &OperationInput::default()), Ok(()));
     }
 
     #[test]
