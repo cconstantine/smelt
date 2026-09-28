@@ -1702,6 +1702,14 @@ pub async fn create_pod(
                 return Err(SandboxError::GitSetup(e));
             }
             std::mem::forget(sandbox);
+            // The conversation may have been deleted while this pod was
+            // starting; its teardown had nothing to find yet (SME-51 B5).
+            if !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
+                teardown_conversation_with(&manager.client, conversation_id).await;
+                return Err(SandboxError::StartFailed(
+                    "the conversation was deleted while its sandbox was starting".to_string(),
+                ));
+            }
             events::publish(
                 conversation_id,
                 events::ConversationEvent::SandboxPodUpdate {
@@ -2296,23 +2304,33 @@ pub(crate) async fn pod_exists(pod_id: i64) -> bool {
     )
 }
 
-pub async fn teardown_conversation(pool: &PgPool, conversation_id: i64) {
-    let manager = get();
-    let pods = pods_api(&manager.client);
-    let rows = db::list_sandbox_pods(pool, conversation_id)
-        .await
-        .unwrap_or_default();
-    for row in rows {
-        deregister(row.id);
-        let name = pod_name(row.id);
-        if let Ok(Some(_)) = pods.get_opt(&name).await {
-            if let Err(e) = pods.delete(&name, &immediate_delete_params()).await {
-                tracing::warn!(pod = %name, error = %e, "failed to delete pod during conversation teardown");
+pub async fn teardown_conversation(conversation_id: i64) {
+    teardown_conversation_with(&get().client, conversation_id).await;
+}
+
+/// `teardown_conversation` on `client`. Pods are found by their
+/// conversation label, not by their records: a `create_pod` racing the
+/// conversation's deletion makes a pod whose record the delete then
+/// cascades away (SME-51 B5).
+async fn teardown_conversation_with(client: &kube::Client, conversation_id: i64) {
+    let pods = pods_api(client);
+    let selector = ListParams::default().labels(&format!("{CONVERSATION_LABEL}={conversation_id}"));
+    match pods.list(&selector).await {
+        Ok(list) => {
+            for pod in list {
+                if let Some(pod_id) = watched_pod_id(&pod) {
+                    deregister(pod_id);
+                }
+                let Some(name) = pod.metadata.name else { continue };
+                if let Err(e) = pods.delete(&name, &immediate_delete_params()).await {
+                    tracing::warn!(pod = %name, error = %e, "failed to delete pod during conversation teardown");
+                }
             }
         }
+        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't list a deleted conversation's pods"),
     }
     // After the pods: Kubernetes holds a claim until no pod mounts it.
-    delete_conversation_pvcs(&manager.client, conversation_id).await;
+    delete_conversation_pvcs(client, conversation_id).await;
 }
 
 /// Returns the existing registry entry for `pod_id` if there is one;
@@ -4934,6 +4952,39 @@ mod tests {
         assert!(!still_there, "the wait returned while {name} was still stopping");
     }
 
+    /// SME-51 B5: deleting a conversation removes every pod labelled with
+    /// it, including one whose record is already gone. That's what a
+    /// `create_pod` racing the delete leaves: its row cascades away with
+    /// the conversation, and a teardown that listed rows missed the pod.
+    #[tokio::test]
+    async fn test_teardown_deletes_a_conversations_pod_that_has_no_record() {
+        let client = test_client().await;
+        let pods = pods_api(&client);
+        let conversation_id = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64
+            + 1_000_000_000;
+        // Only the label matters, so the pod never needs to start: an image
+        // that doesn't exist keeps it Pending and costs the cluster nothing.
+        let name = format!("sandbox-{conversation_id}");
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": name, "labels": {CONVERSATION_LABEL: conversation_id.to_string()}},
+            "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
+        }))
+        .expect("pod");
+        pods.create(&PostParams::default(), &pod).await.expect("create pod");
+
+        teardown_conversation_with(&client, conversation_id).await;
+        let gone = tokio::time::timeout(Duration::from_secs(60), async {
+            while pods.get_opt(&name).await.ok().flatten().is_some() {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .is_ok();
+
+        pods.delete(&name, &immediate_delete_params()).await.ok();
+        assert!(gone, "{name} survived its conversation's teardown");
+    }
+
     /// A conversation's Docker claim is created once and reused, and
     /// deleting it removes it. No pod: `local-path` binds on first use, so
     /// an unused claim stays `Pending`, which is fine here.
@@ -6101,7 +6152,7 @@ mod tests {
                 .map(|c| c.claim_name);
             assert_eq!(mounted_workspace.as_deref(), Some(workspace_claim.as_str()), "pod j's /workspace is its conversation's claim");
 
-            teardown_conversation(&pool, conversation_j.id).await;
+            teardown_conversation(conversation_j.id).await;
             // The claim's `pvc-protection` finalizer holds it until the pod
             // is really gone.
             let docker_claim_gone = tokio::time::timeout(Duration::from_secs(60), async {

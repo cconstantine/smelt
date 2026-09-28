@@ -1735,7 +1735,7 @@ async fn sandbox_pod_ids(pool: &sqlx::PgPool, conversations: &[i64]) -> Vec<i64>
 /// terminals and so on go with it).
 async fn remove_conversations(pool: &sqlx::PgPool, conversations: &[i64]) {
     for &conversation in conversations {
-        sandbox::teardown_conversation(pool, conversation).await;
+        sandbox::teardown_conversation(conversation).await;
         if let Err(e) = db::delete_conversation(pool, conversation).await {
             eprintln!("failed to delete test conversation {conversation}: {e}");
         }

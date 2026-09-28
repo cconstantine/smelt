@@ -47,15 +47,18 @@ pub async fn get_messages(id: i64) -> ServerFnResult<Vec<Message>> {
 
 #[delete("/api/conversations/{id}")]
 pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
-    // Best-effort, unconditional (unlike terminate_pod, which the model
-    // calls and which is guarded) — the conversation is going away
-    // regardless, so nothing about the pod matters anymore either way.
-    crate::sandbox::teardown_conversation(db::get(), id).await;
+    // Its turns first, so nothing is still making a pod (SME-51 B5).
+    stop_turn_now(id);
     let _ = crate::browsing::close_session(id).await;
     anthropic::tools::forget_conversation_tasks(id);
     db::delete_conversation(db::get(), id)
         .await
         .map_err(ServerFnError::new)?;
+    // After the delete: a pod started meanwhile is found by its label, and
+    // one still starting sees the conversation gone (`create_pod`).
+    // Best-effort, unconditional (unlike terminate_pod, which the model
+    // calls and which is guarded).
+    crate::sandbox::teardown_conversation(id).await;
     crate::events::forget(id);
     forget_conversation_lock(id);
     // After the delete, so a listener refetching sees the pod rows gone.
