@@ -162,10 +162,8 @@ fn file_types_summary(config: &LanguageServerConfig) -> String {
 pub fn LanguageServerNew() -> Element {
     let navigator = use_navigator();
     let mut error: Signal<Option<String>> = use_signal(|| None);
-    // The catalog lookup refills the form: a new `key` remounts it with the
-    // suggestion as its starting values.
+    // The catalog lookup refills the form (see `LanguageServerForm`).
     let mut initial = use_signal(blank);
-    let mut form_key = use_signal(|| 0u32);
     let mut notes: Signal<Vec<String>> = use_signal(Vec::new);
     let mut package = use_signal(String::new);
     let mut looking_up = use_signal(|| false);
@@ -183,7 +181,6 @@ pub fn LanguageServerNew() -> Element {
                 Ok(suggestion) => {
                     initial.set(suggestion.config);
                     notes.set(suggestion.notes);
-                    *form_key.write() += 1;
                 }
                 Err(e) => lookup_error.set(Some(super::chat::server_error_message(&e))),
             }
@@ -225,7 +222,7 @@ pub fn LanguageServerNew() -> Element {
                     p { class: "language-server-note", "{note}" }
                 }
             }
-            LanguageServerForm { key: "{form_key}", initial: initial(), save_label: "Add language server", error: error(), on_save: save }
+            LanguageServerForm { initial: initial(), save_label: "Add language server", error: error(), on_save: save }
         }
     }
 }
@@ -297,6 +294,9 @@ fn LanguageServerForm(
     on_save: EventHandler<LanguageServerConfig>,
 ) -> Element {
     let mut form = use_signal(|| FormText::from_config(&initial));
+    // New starting values (a catalog lookup) replace what's in the form. A
+    // `key` doesn't remount a component that isn't in a list.
+    use_effect(use_reactive!(|initial| form.set(FormText::from_config(&initial))));
     let mut form_error: Signal<Option<String>> = use_signal(|| None);
     let submit = move |event: Event<FormData>| {
         event.prevent_default();
