@@ -195,6 +195,20 @@ async fn session_for(client: &kube::Client, pod_name: &str, config: &LanguageSer
     Ok(session)
 }
 
+/// Opens the session with `pod_name` without waiting for it, unless one
+/// is already being opened (each failed open spends the reconnect budget).
+fn connect_in_background(client: &kube::Client, pod_name: &str, config: &LanguageServerConfig, root: &str) {
+    if connect_lock(pod_name).try_lock().is_err() {
+        return;
+    }
+    let (client, pod_name, config, root) = (client.clone(), pod_name.to_string(), config.clone(), root.to_string());
+    tokio::spawn(async move {
+        if let Err(e) = session_for(&client, &pod_name, &config, &root).await {
+            tracing::info!(pod_name, error = %e, "couldn't connect to a language server after an edit");
+        }
+    });
+}
+
 /// `path`'s contents, read in the server's pod.
 async fn read_in_pod(client: &kube::Client, pod_name: &str, path: &str) -> Result<String, String> {
     let limit = MAX_FILE_BYTES.to_string();
@@ -513,7 +527,9 @@ fn note_indexing(answer: String, indexing: bool, server: &str) -> String {
 
 /// After `edit_file`/`write_file`: `path`'s errors and warnings from a
 /// running server that takes it, or `None` (no server, or it couldn't say).
-/// Never starts a server, and never fails the edit.
+/// Never starts a server, never waits for one to connect (the first edit
+/// after a server starts, or after smelt restarts, connects in the
+/// background and says so), and never fails the edit.
 pub async fn diagnostics_after_edit(pool: &PgPool, conversation_id: i64, path: &str) -> Option<String> {
     let all = configs(pool).await.ok()?;
     let config_list: Vec<LanguageServerConfig> = all.into_iter().map(|(c, _)| c).collect();
@@ -532,6 +548,13 @@ async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::C
     let config = ops::choose_server(path, config_list, &running).ok()?.clone();
     let pod_name = pods::server_pod_name(sandbox.pod_id, &config.name);
     let root = root_in_pod(client, &pod_name, path, &config.root_markers).await;
+    // Only a session that's already open: opening one waits for the
+    // server's `initialize`, which can take minutes.
+    let open = SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).get(&pod_name).is_some_and(|s| !s.is_closed());
+    if !open {
+        connect_in_background(client, &pod_name, &config, &root);
+        return Some(format!("{} is connecting; edits after this one will include its diagnostics.", config.name));
+    }
     let session = session_for(client, &pod_name, &config, &root).await.ok()?;
     let text = read_in_pod(client, &pod_name, path).await.ok()?;
     let since = Instant::now();
@@ -754,6 +777,35 @@ impl Shape for Square {
             }
             assert!(session.is_closed(), "the session sees its server die");
             until_contains(&pool, &client, &sandbox, Operation::Definition, &at(MAIN, 9, 18), "shapes.rs").await;
+        })
+        .await;
+    }
+
+    /// An edit never waits for a server to start talking: with no session
+    /// open, it comes back at once saying the server is connecting, even
+    /// with a server that never answers `initialize`.
+    #[tokio::test]
+    async fn test_an_edit_does_not_wait_for_a_server_to_connect() {
+        with_sandbox(|client, sandbox| async move {
+            let config = LanguageServerConfig {
+                name: "silent".to_string(),
+                image: "debian:trixie-slim".to_string(),
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "cat > /dev/null".to_string()],
+                file_types: [("txt".to_string(), "plaintext".to_string())].into(),
+                memory_limit: "128Mi".to_string(),
+                cpu_limit: "1".to_string(),
+                enabled: true,
+                ..Default::default()
+            };
+            pods::start_with(&client, &sandbox, &config, "v1").await.expect("start");
+            let path = "/workspace/notes/a.txt";
+            write_files(&client, &sandbox, &[(path, "hello\n")]).await;
+            let started = Instant::now();
+            let found = edit_diagnostics(&[config], &client, &sandbox, path).await;
+            assert!(started.elapsed() < Duration::from_secs(10), "the edit waited {:?}", started.elapsed());
+            let found = found.expect("a note");
+            assert!(found.contains("silent is connecting"), "{found}");
         })
         .await;
     }
