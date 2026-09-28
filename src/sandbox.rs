@@ -1718,7 +1718,33 @@ where
     .unwrap_or_else(|e| Err(SandboxError::StartFailed(format!("starting the sandbox failed: {e}"))))
 }
 
+/// After a failed pod start: if the conversation was deleted meanwhile,
+/// removes what the start may have re-created after the delete's teardown
+/// ran, its claims (SME-51 code review 1). `label_id` is the conversation
+/// id its pods and claims are labelled with (the same, outside tests).
+async fn clean_up_after_failed_start(pool: &PgPool, client: &kube::Client, conversation_id: i64, label_id: i64) {
+    if !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
+        teardown_conversation_with(client, label_id).await;
+    }
+}
+
+/// `create_pod_attempt`, cleaning up after a failure for a conversation
+/// deleted while it ran.
 async fn create_pod_now(
+    pool: &PgPool,
+    conversation_id: i64,
+    limits: PodLimitOverrides,
+) -> Result<i64, SandboxError> {
+    let result = create_pod_attempt(pool, conversation_id, limits).await;
+    // Only a deleted conversation needs the cluster touched; a refused
+    // start for a live one (a pod already exists, say) doesn't.
+    if result.is_err() && !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
+        clean_up_after_failed_start(pool, &get().client, conversation_id, conversation_id).await;
+    }
+    result
+}
+
+async fn create_pod_attempt(
     pool: &PgPool,
     conversation_id: i64,
     limits: PodLimitOverrides,
@@ -5104,6 +5130,34 @@ mod tests {
         )
         .await;
         assert!(matches!(probed, Ok(Ok(false))), "the probe should give up and say nothing's listening: {probed:?}");
+    }
+
+    /// SME-51 code review 1: a pod start that fails after its conversation
+    /// was deleted may have re-created the conversation's claims after the
+    /// delete's teardown ran; they're removed. A live conversation's stay.
+    #[sqlx::test]
+    async fn test_a_failed_start_for_a_deleted_conversation_leaves_no_claims(pool: PgPool) {
+        let client = test_client().await;
+        let pvcs = pvc_api(&client);
+        let deleted = db::create_conversation(&pool).await.expect("conversation");
+        let live = db::create_conversation(&pool).await.expect("conversation");
+        // Ids from a fresh test database are tiny; offset them away from
+        // other runs' claims in the shared test namespace.
+        let offset = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64 + 2_000_000_000;
+        db::delete_conversation(&pool, deleted.id).await.expect("delete");
+        for id in [deleted.id, live.id] {
+            ensure_conversation_pvcs(&client, id + offset).await.expect("claims");
+        }
+
+        clean_up_after_failed_start(&pool, &client, deleted.id, deleted.id + offset).await;
+        clean_up_after_failed_start(&pool, &client, live.id, live.id + offset).await;
+
+        let gone = pvcs.get_opt(&docker_pvc_name(deleted.id + offset)).await.expect("get").is_none_or(|p| p.metadata.deletion_timestamp.is_some());
+        let kept = pvcs.get_opt(&docker_pvc_name(live.id + offset)).await.expect("get").is_some();
+        delete_conversation_pvcs(&client, live.id + offset).await;
+        delete_conversation_pvcs(&client, deleted.id + offset).await;
+        assert!(gone, "the deleted conversation's re-created claim was left behind");
+        assert!(kept, "a live conversation's claims must stay");
     }
 
     /// SME-51 B7: "Work on a repo" while the sandbox is still starting
