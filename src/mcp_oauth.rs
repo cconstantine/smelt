@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use rmcp::transport::auth::{
-    AuthError, AuthorizationManager, AuthorizationRequest, CredentialStore, OAuthState,
-    StoredCredentials,
+    AuthError, AuthorizationManager, AuthorizationRequest, CredentialStore, InMemoryStateStore,
+    OAuthState, StateStore, StoredAuthorizationState, StoredCredentials,
 };
 use sqlx::PgPool;
 use tokio::sync::Mutex as AsyncMutex;
@@ -78,13 +78,23 @@ impl CredentialStore for PgCredentialStore {
 }
 
 /// One in-flight authorization attempt per server id — holds the whole
-/// `OAuthState::Session` (which owns the PKCE verifier/CSRF token for this
-/// attempt) between `start` and `handle_callback`. In-memory only: a
+/// `OAuthState::Session` and its state store (the PKCE verifier, CSRF token
+/// and expected issuer for this attempt) between `start` and the callback,
+/// which ends it whatever the outcome. In-memory only: a
 /// restart mid-login just means starting over, the same class of accepted
 /// limitation as `mcp.rs`'s connection registry and `run_async`'s task
 /// registry — see the plan's "Key discovery."
-static PENDING: LazyLock<AsyncMutex<HashMap<i64, OAuthState>>> =
+static PENDING: LazyLock<AsyncMutex<HashMap<i64, PendingAttempt>>> =
     LazyLock::new(|| AsyncMutex::new(HashMap::new()));
+
+struct PendingAttempt {
+    state: OAuthState,
+    /// The attempt's `rmcp` state store, shared with `state`'s manager
+    /// (clones share one map). It holds the issuer the attempt expects,
+    /// which `rmcp` checks on a code callback but which an error callback
+    /// has to be checked against here (`verify_error_callback`).
+    stored: InMemoryStateStore,
+}
 
 /// Starts an OAuth authorization attempt for `config` and returns the
 /// authorization URL the browser must be navigated to. Only one attempt
@@ -104,6 +114,8 @@ pub async fn start(
             )
         })?;
     manager.set_credential_store(PgCredentialStore::new(pool.clone(), config.id));
+    let stored = InMemoryStateStore::new();
+    manager.set_state_store(stored.clone());
 
     let mut state = OAuthState::Unauthorized(manager);
     let mut request = AuthorizationRequest::new(redirect_uri).with_client_name("smelt");
@@ -132,7 +144,10 @@ pub async fn start(
         )
     })?;
 
-    PENDING.lock().await.insert(config.id, state);
+    PENDING
+        .lock()
+        .await
+        .insert(config.id, PendingAttempt { state, stored });
     Ok(url)
 }
 
@@ -155,10 +170,11 @@ pub async fn handle_callback(
     csrf_token: &str,
     issuer: Option<&str>,
 ) -> Result<(), String> {
-    let mut state = PENDING.lock().await.remove(&server_id).ok_or_else(|| {
+    let mut attempt = PENDING.lock().await.remove(&server_id).ok_or_else(|| {
         "no OAuth authorization attempt in progress for this server — it may have expired, or this callback link was already used".to_string()
     })?;
-    state
+    attempt
+        .state
         .handle_callback_with_issuer(code, csrf_token, issuer)
         .await
         .map_err(|e| format!("OAuth callback failed: {e}"))
@@ -217,8 +233,9 @@ pub struct CallbackParams {
     /// sets `authorization_response_iss_parameter_supported`.
     iss: Option<String>,
     /// Set instead of `code`/`state` when the user denies consent or the
-    /// provider itself fails (RFC 6749 §4.1.2.1) — surfaced the same way as
-    /// any other failure below rather than treated as a missing-param bug.
+    /// provider itself fails (RFC 6749 §4.1.2.1) — surfaced like any other
+    /// failure rather than treated as a missing-param bug, once
+    /// `verify_error_callback` has tied it to the pending attempt.
     error: Option<String>,
     error_description: Option<String>,
 }
@@ -249,8 +266,15 @@ pub async fn callback_handler(
     }
 }
 
+/// Shown in place of the provider's own text when an error callback can't
+/// be tied to this server's pending attempt and to the issuer that attempt
+/// expects (RFC 9207 §2.4): anyone can send an error callback, so its text
+/// is only worth showing once it's checked.
+const UNVERIFIED_ERROR: &str = "smelt couldn't verify the authorization provider's response, so it was ignored. Click Connect to try again.";
+
 async fn complete_callback(id: i64, params: CallbackParams) -> Result<(), String> {
     if let Some(error) = params.error {
+        verify_error_callback(id, params.state.as_deref(), params.iss.as_deref()).await?;
         return Err(params.error_description.unwrap_or(error));
     }
     let code = params
@@ -262,6 +286,47 @@ async fn complete_callback(id: i64, params: CallbackParams) -> Result<(), String
     handle_callback(id, &code, &state, params.iss.as_deref()).await?;
     crate::mcp::evict(id).await;
     Ok(())
+}
+
+/// Ends `server_id`'s pending attempt (a provider doesn't send a code
+/// after an error), and checks the error callback belongs to it: its
+/// `state` must be the attempt's, and its `iss` must pass the check `rmcp`
+/// gives a code callback (RFC 9207 §2.4). `Err(UNVERIFIED_ERROR)` if not.
+async fn verify_error_callback(
+    server_id: i64,
+    csrf_token: Option<&str>,
+    issuer: Option<&str>,
+) -> Result<(), String> {
+    let unverified = || UNVERIFIED_ERROR.to_string();
+    let attempt = PENDING
+        .lock()
+        .await
+        .remove(&server_id)
+        .ok_or_else(unverified)?;
+    let stored = attempt
+        .stored
+        .load(csrf_token.ok_or_else(unverified)?)
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(unverified)?;
+    if issuer_accepted(&stored, issuer) {
+        Ok(())
+    } else {
+        Err(unverified())
+    }
+}
+
+/// `rmcp`'s own rule for a code callback's `iss`
+/// (`AuthorizationManager::validate_authorization_response_issuer`, private
+/// in rmcp 3.1.2): equal to the recorded issuer if one was sent, present if
+/// the provider advertised sending it, and absent if no issuer was recorded.
+fn issuer_accepted(stored: &StoredAuthorizationState, received: Option<&str>) -> bool {
+    match (stored.expected_issuer.as_deref(), received) {
+        (Some(expected), Some(received)) => received == expected,
+        (Some(_), None) => !stored.require_issuer,
+        (None, received) => received.is_none() && !stored.require_issuer,
+    }
 }
 
 #[cfg(test)]
@@ -414,7 +479,7 @@ mod tests {
         .expect("set the next mcp_servers id");
         db::create_mcp_server_config(
             pool,
-            "oauth-test-server",
+            &format!("oauth-test-server-{id}"),
             base_url,
             &HashMap::new(),
             "oauth",
@@ -575,6 +640,110 @@ mod tests {
             .expect("iss is optional from a provider that doesn't advertise it");
 
         assert!(stored_credentials(&pool, config.id).await.is_some());
+    }
+
+    /// What a provider sends back instead of a code when the user denies
+    /// consent (RFC 6749 §4.1.2.1).
+    fn error_callback(state: Option<&str>, iss: Option<&str>) -> CallbackParams {
+        CallbackParams {
+            code: None,
+            state: state.map(str::to_string),
+            iss: iss.map(str::to_string),
+            error: Some("access_denied".to_string()),
+            error_description: Some("The user denied access".to_string()),
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_an_error_callback_from_the_advertised_issuer_shows_its_error_and_ends_the_attempt(
+        pool: PgPool,
+    ) {
+        let base_url = spawn_mock_oauth_server(MockMetadata::Issuer {
+            iss_supported: true,
+        })
+        .await;
+        let config = create_oauth_server(&pool, &base_url).await;
+        let state = start_attempt(&pool, &config).await;
+
+        let error = complete_callback(
+            config.id,
+            error_callback(Some(&state), Some(&mock_issuer(&base_url))),
+        )
+        .await
+        .expect_err("an error callback is a failed attempt");
+
+        assert_eq!(error, "The user denied access");
+        assert_attempt_cleared(config.id, &state, &base_url).await;
+    }
+
+    /// An error callback smelt can't tie to the attempt and its issuer shows
+    /// `UNVERIFIED_ERROR`, not the provider's text, and still ends the
+    /// attempt.
+    #[sqlx::test]
+    async fn test_an_error_callback_that_cannot_be_verified_hides_its_text(pool: PgPool) {
+        let base_url = spawn_mock_oauth_server(MockMetadata::Issuer {
+            iss_supported: true,
+        })
+        .await;
+        let config = create_oauth_server(&pool, &base_url).await;
+        let issuer = mock_issuer(&base_url);
+        let cases: [(&str, Option<&str>, Option<&str>); 4] = [
+            ("no iss", Some("STATE"), None),
+            (
+                "a different iss",
+                Some("STATE"),
+                Some("https://attacker.example"),
+            ),
+            ("an unknown state", Some("not-the-state"), Some(&issuer)),
+            ("no state", None, Some(&issuer)),
+        ];
+        for (case, state_param, iss) in cases {
+            let state = start_attempt(&pool, &config).await;
+            let state_param = state_param.map(|s| if s == "STATE" { state.as_str() } else { s });
+
+            let error = complete_callback(config.id, error_callback(state_param, iss))
+                .await
+                .expect_err("an error callback is a failed attempt");
+
+            assert_eq!(error, UNVERIFIED_ERROR, "case: {case}");
+            assert_attempt_cleared(config.id, &state, &base_url).await;
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_an_error_callback_with_no_pending_attempt_hides_its_text(pool: PgPool) {
+        let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
+        let config = create_oauth_server(&pool, &base_url).await;
+
+        let error = complete_callback(config.id, error_callback(Some("some-state"), None))
+            .await
+            .expect_err("an error callback is a failed attempt");
+
+        assert_eq!(error, UNVERIFIED_ERROR);
+    }
+
+    /// SEP-2468 only requires `iss` from a provider that advertises it, on
+    /// error callbacks as on code callbacks.
+    #[sqlx::test]
+    async fn test_an_error_callback_without_iss_shows_its_error_when_the_provider_does_not_advertise_it(
+        pool: PgPool,
+    ) {
+        for metadata in [
+            MockMetadata::Issuer {
+                iss_supported: false,
+            },
+            MockMetadata::None,
+        ] {
+            let base_url = spawn_mock_oauth_server(metadata).await;
+            let config = create_oauth_server(&pool, &base_url).await;
+            let state = start_attempt(&pool, &config).await;
+
+            let error = complete_callback(config.id, error_callback(Some(&state), None))
+                .await
+                .expect_err("an error callback is a failed attempt");
+
+            assert_eq!(error, "The user denied access");
+        }
     }
 
     /// RFC 8414 §3.3: metadata must name the server it was fetched from.
