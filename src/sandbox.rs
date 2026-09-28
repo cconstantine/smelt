@@ -42,7 +42,14 @@ use crate::{db, events};
 const NAMESPACE: &str = "smelt-park";
 #[cfg(test)]
 const NAMESPACE: &str = "smelt-park-test";
-const DEFAULT_RUNNING_WAIT_TIMEOUT_SECS: u64 = 30;
+/// At least the Docker sidecar's startup probe, plus time for a first
+/// pod's claims to be provisioned (SME-62 B15): 30 s gave up on pods that
+/// would have started under load.
+const DEFAULT_RUNNING_WAIT_TIMEOUT_SECS: u64 = 90;
+
+/// The Docker sidecar's startup probe: how many checks, how far apart.
+const DOCKER_STARTUP_PROBE_CHECKS: i32 = 60;
+const DOCKER_STARTUP_PROBE_PERIOD_SECS: i32 = 1;
 
 /// Matches `sandbox_agent`'s own `LISTEN_ADDR` port.
 const AGENT_PORT: u16 = 8088;
@@ -119,7 +126,7 @@ impl From<kube::Error> for SandboxError {
     }
 }
 
-fn pods_api(client: &kube::Client) -> Api<Pod> {
+pub(crate) fn pods_api(client: &kube::Client) -> Api<Pod> {
     Api::namespaced(client.clone(), NAMESPACE)
 }
 
@@ -286,7 +293,7 @@ fn volume_mounts_for(volumes: &[db::SandboxVolume]) -> (Vec<Volume>, Vec<VolumeM
 const POD_DELETE_GRACE_SECS: u32 = 20;
 
 /// Every delete of a sandbox pod smelt makes.
-fn pod_delete_params() -> DeleteParams {
+pub(crate) fn pod_delete_params() -> DeleteParams {
     DeleteParams {
         grace_period_seconds: Some(POD_DELETE_GRACE_SECS),
         ..Default::default()
@@ -796,7 +803,7 @@ fn docker_pvc_name(conversation_id: i64) -> String {
 }
 
 /// The conversation's /workspace PVC, `sandbox-workspace-<id>` (SME-32).
-fn workspace_pvc_name(conversation_id: i64) -> String {
+pub(crate) fn workspace_pvc_name(conversation_id: i64) -> String {
     format!("sandbox-workspace-{conversation_id}")
 }
 
@@ -1135,8 +1142,8 @@ fn build_pod_spec(
                             "info".to_string(),
                         ]),
                     }),
-                    period_seconds: Some(1),
-                    failure_threshold: Some(60),
+                    period_seconds: Some(DOCKER_STARTUP_PROBE_PERIOD_SECS),
+                    failure_threshold: Some(DOCKER_STARTUP_PROBE_CHECKS),
                     ..Default::default()
                 }),
                 resources: Some(limits(&docker.memory, &docker.cpu)),
@@ -2434,8 +2441,17 @@ pub async fn teardown_conversation(conversation_id: i64) {
 /// cascades away (SME-51 B5).
 async fn teardown_conversation_with(client: &kube::Client, conversation_id: i64) {
     let pods = pods_api(client);
-    let selector = ListParams::default().labels(&format!("{CONVERSATION_LABEL}={conversation_id}"));
-    match pods.list(&selector).await {
+    // Its sandbox pods, and its language server pods (SME-35).
+    for label in [CONVERSATION_LABEL, crate::lsp::pods::LSP_OF_LABEL] {
+        let selector = ListParams::default().labels(&format!("{label}={conversation_id}"));
+        delete_listed(&pods, &selector, conversation_id).await;
+    }
+    // After the pods: Kubernetes holds a claim until no pod mounts it.
+    delete_conversation_pvcs(client, conversation_id).await;
+}
+
+async fn delete_listed(pods: &Api<Pod>, selector: &ListParams, conversation_id: i64) {
+    match pods.list(selector).await {
         Ok(list) => {
             for pod in list {
                 if let Some(pod_id) = watched_pod_id(&pod) {
@@ -2449,8 +2465,6 @@ async fn teardown_conversation_with(client: &kube::Client, conversation_id: i64)
         }
         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't list a deleted conversation's pods"),
     }
-    // After the pods: Kubernetes holds a claim until no pod mounts it.
-    delete_conversation_pvcs(client, conversation_id).await;
 }
 
 /// Returns the existing registry entry for `pod_id` if there is one;
@@ -5132,6 +5146,15 @@ mod tests {
         assert!(matches!(probed, Ok(Ok(false))), "the probe should give up and say nothing's listening: {probed:?}");
     }
 
+    /// SME-62 B15: a pod start mustn't give up before the Docker sidecar's
+    /// own startup probe would (60 checks a second apart), with time left
+    /// for a first pod's claims to be provisioned.
+    #[test]
+    fn test_a_pod_start_waits_longer_than_the_docker_probe() {
+        let probe = DOCKER_STARTUP_PROBE_CHECKS * DOCKER_STARTUP_PROBE_PERIOD_SECS;
+        assert!(DEFAULT_RUNNING_WAIT_TIMEOUT_SECS >= probe as u64 + 30, "{DEFAULT_RUNNING_WAIT_TIMEOUT_SECS}s vs a {probe}s probe");
+    }
+
     /// SME-51 code review 1: a pod start that fails after its conversation
     /// was deleted may have re-created the conversation's claims after the
     /// delete's teardown ran; they're removed. A live conversation's stay.
@@ -5197,9 +5220,21 @@ mod tests {
         .expect("pod");
         pods.create(&PostParams::default(), &pod).await.expect("create pod");
 
+        // A language server pod of the same conversation (SME-35), under
+        // its own label.
+        let server = format!("lsp-{conversation_id}-x");
+        let server_pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": server, "labels": {crate::lsp::pods::LSP_OF_LABEL: conversation_id.to_string()}},
+            "spec": {"containers": [{"name": "server", "image": "smelt.invalid/none:0"}]},
+        }))
+        .expect("pod");
+        pods.create(&PostParams::default(), &server_pod).await.expect("create server pod");
+
         teardown_conversation_with(&client, conversation_id).await;
         let gone = tokio::time::timeout(Duration::from_secs(60), async {
-            while pods.get_opt(&name).await.ok().flatten().is_some() {
+            while pods.get_opt(&name).await.ok().flatten().is_some()
+                || pods.get_opt(&server).await.ok().flatten().is_some()
+            {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         })
@@ -5207,7 +5242,8 @@ mod tests {
         .is_ok();
 
         pods.delete(&name, &immediate_delete_params()).await.ok();
-        assert!(gone, "{name} survived its conversation's teardown");
+        pods.delete(&server, &immediate_delete_params()).await.ok();
+        assert!(gone, "{name} or {server} survived its conversation's teardown");
     }
 
     /// A conversation's Docker claim is created once and reused, and

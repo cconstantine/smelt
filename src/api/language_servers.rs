@@ -27,9 +27,14 @@ pub async fn create_language_server(config: LanguageServerConfig) -> ServerFnRes
     crate::lsp::config::save(db::get(), None, &config).await.map_err(ServerFnError::new)
 }
 
+/// Saves `id`'s settings. Disabling or renaming it stops its running pods;
+/// other edits reach a running server when it's restarted.
 #[post("/api/language-servers/{id}")]
 pub async fn update_language_server(id: i64, config: LanguageServerConfig) -> ServerFnResult<LanguageServer> {
-    crate::lsp::config::save(db::get(), Some(id), &config).await.map_err(ServerFnError::new)
+    let before = db::get_language_server(db::get(), id).await.map_err(ServerFnError::new)?;
+    let saved = crate::lsp::config::save(db::get(), Some(id), &config).await.map_err(ServerFnError::new)?;
+    crate::lsp::config::stop_servers(crate::lsp::config::servers_to_stop(before.as_ref().map(|s| &s.config), Some(&saved.config))).await;
+    Ok(saved)
 }
 
 /// Suggests a new server's settings from mason's registry and Helix's
@@ -42,6 +47,7 @@ pub async fn lookup_language_server(package: String) -> ServerFnResult<LanguageS
 
 #[delete("/api/language-servers/{id}")]
 pub async fn delete_language_server(id: i64) -> ServerFnResult<()> {
-    db::delete_language_server(db::get(), id).await.map_err(ServerFnError::new)?;
+    let deleted = db::delete_language_server(db::get(), id).await.map_err(ServerFnError::new)?;
+    crate::lsp::config::stop_servers(crate::lsp::config::servers_to_stop(deleted.as_ref().map(|s| &s.config), None)).await;
     Ok(())
 }

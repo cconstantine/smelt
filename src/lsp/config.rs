@@ -23,9 +23,44 @@ pub async fn save(pool: &PgPool, id: Option<i64>, config: &LanguageServerConfig)
     }
 }
 
+/// The servers whose running pods a change to a config stops: all of a
+/// deleted or disabled server's, and a renamed server's under its old name
+/// (SME-35's state model). Other edits reach a running server when it's
+/// restarted.
+pub fn servers_to_stop(before: Option<&LanguageServerConfig>, after: Option<&LanguageServerConfig>) -> Vec<String> {
+    match (before, after) {
+        (Some(before), None) => vec![before.name.clone()],
+        (Some(before), Some(after)) if !after.enabled || after.name != before.name => vec![before.name.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Stops the pods `servers_to_stop` names, logging (not failing on) a
+/// cluster that can't be reached: the config change itself is saved.
+pub async fn stop_servers(names: Vec<String>) {
+    for name in names {
+        if let Err(e) = crate::lsp::pods::stop_everywhere_with(&crate::sandbox::kube_client(), &name).await {
+            tracing::warn!(server = %name, error = %e, "couldn't stop a language server's pods");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_deleting_disabling_or_renaming_stops_a_servers_pods() {
+        let on = pyright();
+        let off = LanguageServerConfig { enabled: false, ..pyright() };
+        let renamed = LanguageServerConfig { name: "pyright2".to_string(), ..pyright() };
+        let edited = LanguageServerConfig { memory_limit: "4Gi".to_string(), ..pyright() };
+        assert_eq!(servers_to_stop(Some(&on), None), vec!["pyright"]);
+        assert_eq!(servers_to_stop(Some(&on), Some(&off)), vec!["pyright"]);
+        assert_eq!(servers_to_stop(Some(&on), Some(&renamed)), vec!["pyright"]);
+        assert!(servers_to_stop(Some(&on), Some(&edited)).is_empty(), "an edit waits for a restart");
+        assert!(servers_to_stop(None, Some(&on)).is_empty());
+    }
 
     fn pyright() -> LanguageServerConfig {
         LanguageServerConfig {
