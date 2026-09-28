@@ -147,6 +147,7 @@ pub async fn start(pool: &PgPool, client: &kube::Client, sandbox: &SandboxRef, n
             // how the model asks for fresh tries.
             let pod_name = pods::server_pod_name(sandbox.pod_id, name);
             OPENED.lock().unwrap_or_else(|e| e.into_inner()).remove(&pod_name);
+            CONNECT_FAILED.lock().unwrap_or_else(|e| e.into_inner()).remove(&pod_name);
             SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).retain(|pod, session| pod != &pod_name || !session.is_closed());
             Ok(format!("{name} is already running."))
         }
@@ -156,12 +157,16 @@ pub async fn start(pool: &PgPool, client: &kube::Client, sandbox: &SandboxRef, n
 /// Sessions by server pod name, and when each was (re)opened.
 static SESSIONS: std::sync::LazyLock<Mutex<HashMap<String, Arc<Session>>>> = std::sync::LazyLock::new(Default::default);
 static OPENED: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> = std::sync::LazyLock::new(Default::default);
+/// Why the last background connect (after an edit) failed, by server pod
+/// name, until a connect succeeds or the server is started again.
+static CONNECT_FAILED: std::sync::LazyLock<Mutex<HashMap<String, String>>> = std::sync::LazyLock::new(Default::default);
 
 /// A new pod under `pod_name`: its old session (if any) is gone, and it
 /// gets a fresh reconnect budget.
 fn forget_session(pod_name: &str) {
     SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).remove(pod_name);
     OPENED.lock().unwrap_or_else(|e| e.into_inner()).remove(pod_name);
+    CONNECT_FAILED.lock().unwrap_or_else(|e| e.into_inner()).remove(pod_name);
 }
 
 fn connect_lock(pod_name: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -199,6 +204,7 @@ async fn session_for(client: &kube::Client, pod_name: &str, config: &LanguageSer
         .map_err(|e| format!("{} didn't start talking: {e}", config.name))?;
     let session = Arc::new(session);
     SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(pod_name.to_string(), session.clone());
+    CONNECT_FAILED.lock().unwrap_or_else(|e| e.into_inner()).remove(pod_name);
     Ok(session)
 }
 
@@ -212,6 +218,7 @@ fn connect_in_background(client: &kube::Client, pod_name: &str, config: &Languag
     tokio::spawn(async move {
         if let Err(e) = session_for(&client, &pod_name, &config, &root).await {
             tracing::info!(pod_name, error = %e, "couldn't connect to a language server after an edit");
+            CONNECT_FAILED.lock().unwrap_or_else(|e| e.into_inner()).insert(pod_name, e);
         }
     });
 }
@@ -593,8 +600,12 @@ async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::C
     // server's `initialize`, which can take minutes.
     let open = SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).get(&pod_name).is_some_and(|s| !s.is_closed());
     if !open {
+        let failed = CONNECT_FAILED.lock().unwrap_or_else(|e| e.into_inner()).get(&pod_name).cloned();
         connect_in_background(client, &pod_name, &config, &root);
-        return Some(format!("{} is connecting; edits after this one will include its diagnostics.", config.name));
+        return Some(match failed {
+            Some(error) => format!("{} couldn't connect, so there are no diagnostics ({error}).", config.name),
+            None => format!("{} is connecting; edits after this one will include its diagnostics.", config.name),
+        });
     }
     let session = session_for(client, &pod_name, &config, &root).await.ok()?;
     let text = read_in_pod(client, &pod_name, path).await.ok()?;
@@ -849,6 +860,33 @@ impl Shape for Square {
             }
             assert!(session.is_closed(), "the session sees its server die");
             until_contains(&pool, &client, &sandbox, Operation::Definition, &at(MAIN, 9, 18), "shapes.rs").await;
+        })
+        .await;
+    }
+
+    /// A server that can't be connected to isn't promised: after a failed
+    /// attempt, an edit says why rather than "connecting" again.
+    #[tokio::test]
+    async fn test_an_edit_says_when_a_server_cannot_connect() {
+        with_sandbox(|client, sandbox| async move {
+            let config = LanguageServerConfig {
+                name: "gone".to_string(),
+                image: "debian:trixie-slim".to_string(),
+                command: "false".to_string(),
+                file_types: [("txt".to_string(), "plaintext".to_string())].into(),
+                memory_limit: "128Mi".to_string(),
+                cpu_limit: "1".to_string(),
+                enabled: true,
+                ..Default::default()
+            };
+            pods::start_with(&client, &sandbox, &config, "v1").await.expect("start");
+            let path = "/workspace/notes/a.txt";
+            write_files(&client, &sandbox, &[(path, "hello\n")]).await;
+            let first = edit_diagnostics(&[config.clone()], &client, &sandbox, path).await.expect("a note");
+            assert!(first.contains("gone is connecting"), "{first}");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let second = edit_diagnostics(&[config], &client, &sandbox, path).await.expect("a note");
+            assert!(second.contains("gone couldn't connect"), "{second}");
         })
         .await;
     }
