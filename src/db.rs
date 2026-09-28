@@ -1429,10 +1429,6 @@ pub async fn update_mcp_server_config(
     .await
 }
 
-/// A conversation with a chosen id, for tests that touch process-wide,
-/// per-conversation state (the turn lock, a stop, a pause): every
-/// `#[sqlx::test]` database numbers conversations from 1, so tests running
-/// in parallel would otherwise share that state through a common id.
 /// A `language_servers` row (SME-35); its list and map columns are JSON.
 #[derive(Debug, sqlx::FromRow)]
 struct LanguageServerRow {
@@ -1564,6 +1560,10 @@ pub async fn delete_language_server(
         .map(|row| row.map(Into::into))
 }
 
+/// A conversation with a chosen id, for tests that touch process-wide,
+/// per-conversation state (the turn lock, a stop, a pause): every
+/// `#[sqlx::test]` database numbers conversations from 1, so tests running
+/// in parallel would otherwise share that state through a common id.
 #[cfg(test)]
 pub async fn create_conversation_with_id(pool: &PgPool, id: i64) -> Result<Conversation, sqlx::Error> {
     sqlx::query_as::<_, Conversation>(
