@@ -27,6 +27,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install the docker compose plugin if missing
+        # The self-hosted ARC runner image has the Docker CLI but not the
+        # compose plugin (GitHub's ubuntu-latest has both). A no-op once the
+        # runner image includes it.
+        run: |
+          if ! docker compose version > /dev/null 2>&1; then
+            mkdir -p ~/.docker/cli-plugins
+            curl -fsSL -o ~/.docker/cli-plugins/docker-compose \
+              https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-x86_64
+            chmod +x ~/.docker/cli-plugins/docker-compose
+          fi
+          docker compose version
+
       - name: Compute UID/GID for docker compose build
         # docker-compose.yml's `smelt` service builds its dev-user with
         # these, defaulting to 1000/1000 — match them to the runner's real
