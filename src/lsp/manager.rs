@@ -142,7 +142,14 @@ pub async fn start(pool: &PgPool, client: &kube::Client, sandbox: &SandboxRef, n
             config.file_types.keys().map(|e| format!(".{e}")).collect::<Vec<_>>().join(" ")
             ))
         }
-        pods::Started::AlreadyRunning => Ok(format!("{name} is already running.")),
+        pods::Started::AlreadyRunning => {
+            // The pod is fine; its connection may not be. Starting again is
+            // how the model asks for fresh tries.
+            let pod_name = pods::server_pod_name(sandbox.pod_id, name);
+            OPENED.lock().unwrap_or_else(|e| e.into_inner()).remove(&pod_name);
+            SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).retain(|pod, session| pod != &pod_name || !session.is_closed());
+            Ok(format!("{name} is already running."))
+        }
     }
 }
 
@@ -840,6 +847,34 @@ impl Shape for Square {
             }
             assert!(session.is_closed(), "the session sees its server die");
             until_contains(&pool, &client, &sandbox, Operation::Definition, &at(MAIN, 9, 18), "shapes.rs").await;
+        })
+        .await;
+    }
+
+    /// Starting a server that's already running gives it a fresh reconnect
+    /// budget: that's what the error for a spent budget tells the model
+    /// to do, and the pod itself is still ready.
+    #[sqlx::test]
+    async fn test_starting_a_running_server_resets_its_reconnects(pool: PgPool) {
+        let config = LanguageServerConfig {
+            name: "budget".to_string(),
+            image: "debian:trixie-slim".to_string(),
+            command: "cat".to_string(),
+            file_types: [("txt".to_string(), "plaintext".to_string())].into(),
+            memory_limit: "128Mi".to_string(),
+            cpu_limit: "1".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        crate::lsp::config::save(&pool, None, &config).await.expect("saved");
+        with_sandbox(|client, sandbox| async move {
+            start(&pool, &client, &sandbox, "budget").await.expect("started");
+            let pod_name = pods::server_pod_name(sandbox.pod_id, "budget");
+            OPENED.lock().unwrap().insert(pod_name.clone(), vec![Instant::now(); RECONNECTS]);
+            let again = start(&pool, &client, &sandbox, "budget").await.expect("started again");
+            assert!(again.contains("already running"), "{again}");
+            let spent = OPENED.lock().unwrap().get(&pod_name).map_or(0, Vec::len);
+            assert_eq!(spent, 0, "the reconnect budget should be fresh");
         })
         .await;
     }
