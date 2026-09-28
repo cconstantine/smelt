@@ -204,12 +204,13 @@ Process changes follow the same confirm-before-change rule — propose first, up
 ## Keeping Linear current
 
 After each project completes:
-- Replace the ticket's `## Plan` section with `## What shipped` (including anything changed from the plan, and what's not done) and `## Retrospective` (see below)
+- Replace the ticket's `## Plan` section with `## What shipped` (including anything changed from the plan, and what's not done)
 - Update the **Current state** document if features or architecture changed
 - Add or update the project's rows in the **Feature checklist**: what a user can do, and how to check it in the browser
 - File anything left undone that's worth doing as its own Backlog ticket, linked as related
 - Put the ticket id in the PR's title or body
 - Review the PR once it's open (see [Code review](#code-review-after-opening-the-pr))
+- Once the reviews are done, add `## Retrospective` to the ticket (see below), before the PR merges
 - Move the ticket to **Done** once the PR merges
 
 When the user mentions a new idea, create a **Backlog** ticket for it before it is forgotten.
@@ -219,7 +220,12 @@ When the user mentions a new idea, create a **Backlog** ticket for it before it 
 ## Retrospective (end of each project)
 
 **Close-out (this section plus "Keeping Linear current" above) is a
-gate on opening the project's PR, not a follow-up to do after it merges.**
+gate on merging the project's PR, not a follow-up to do after it merges.**
+What shipped, the Current state document and the Feature checklist come
+before the PR opens. The retrospective comes after the code review
+finishes, since the reviews are often where the most is learned (SME-32's
+ten review rounds were, and a retrospective written before them missed
+it all).
 Do it on the same branch as the implementation, so the close-out commit
 rides along in the same PR — not as a separate direct-to-main commit
 afterward, which is easy to forget entirely once the PR is merged and
@@ -229,7 +235,8 @@ noticed the stale plan file still sitting in the repo — checking
 "did the last thing get closed out" at the *start* of the next project
 relies on remembering to look backward, which is exactly what failed;
 gating it at the point the current project's own PR is created doesn't
-have that failure mode.
+have that failure mode. The same holds for merging: the retrospective is
+the last step before it.
 
 Before considering a project closed, do a short retrospective covering:
 
@@ -251,6 +258,7 @@ Every PR gets a code review once it's open, while CI runs: `/code-review <PR num
 3. **Fix on the PR's branch, test-first, one commit per finding.** A failing test first, as in Phase 2; for a finding about a browser's behaviour, a browser-tier scenario shown failing with the fix switched off. A finding in already-merged code gets its own PR (see Rules).
 4. **Review again after fixing.** Fixes change the code, and a second pass looks with fresh eyes. Repeat until a review comes back with nothing the user wants fixed.
 5. **Record it in the ticket**: a short code-review part in What shipped listing each finding and its fix.
+6. **Then write the retrospective** (see [Retrospective](#retrospective-end-of-each-project)), covering the reviews too, and only then merge.
 
 On SME-42, the first review found that both new routes could reach the sandbox agent's command WebSocket (any website could have run commands in the sandbox). The project's own real-cluster tests had used that very port as their test server. The second review, after the fixes, found a stalled POST and cross-site requests to the sandbox. None of the four were caught by the tests, the browser tier or the hands-on check.
 
