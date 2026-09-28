@@ -83,7 +83,7 @@ impl CredentialStore for PgCredentialStore {
 /// which ends it whatever the outcome. In-memory only: a
 /// restart mid-login just means starting over, the same class of accepted
 /// limitation as `mcp.rs`'s connection registry and `run_async`'s task
-/// registry — see the plan's "Key discovery."
+/// registry — see SME-16's "Key discovery."
 static PENDING: LazyLock<AsyncMutex<HashMap<i64, PendingAttempt>>> =
     LazyLock::new(|| AsyncMutex::new(HashMap::new()));
 
@@ -120,7 +120,7 @@ pub async fn start(
     let mut state = OAuthState::Unauthorized(manager);
     let mut request = AuthorizationRequest::new(redirect_uri).with_client_name("smelt");
     // A provider with no discovery metadata and no Dynamic Client
-    // Registration support (GitHub, confirmed live — see the plan's "Live
+    // Registration support (GitHub, confirmed live — see SME-16's "Live
     // verification") needs a client pre-registered by hand instead —
     // `AuthorizationRequest`'s own priority order (see
     // `OAuthState::start_authorization`'s doc comment) already prefers
@@ -202,7 +202,7 @@ fn oauth_base_url_override() -> Option<String> {
 }
 
 /// The scheme+host to build a redirect_uri from. `SMELT_BASE_URL` wins if
-/// set; otherwise derived from the current request — see the plan's
+/// set; otherwise derived from the current request — see SME-16's
 /// "Answered by the user." A bare `Host` header never carries scheme, so
 /// `X-Forwarded-Proto` (set by the reverse proxy in front of smelt in every
 /// deployment this matters for) decides `https` vs. `http`, defaulting to

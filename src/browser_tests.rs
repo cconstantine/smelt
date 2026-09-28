@@ -48,7 +48,7 @@ impl BrowserTestHarness {
         // produces this next to the built executable, which plain `cargo
         // test` never runs. `DIOXUS_PUBLIC_PATH` is dioxus-server's own
         // escape hatch for pointing at one built out-of-band — discovered
-        // while first running this test, not anticipated in the plan.
+        // while first running this test, not anticipated in SME-10's plan.
         let public_path = repo_root.join("target/dx/smelt/debug/web/public");
         if !public_path.is_dir() {
             panic!(

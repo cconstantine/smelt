@@ -229,7 +229,7 @@ pub async fn get_conversation_todos(
 }
 
 /// Overwrites `conversation_id`'s todo list with `items` — a full replace,
-/// never a partial update (see the plan's "no per-item ids" decision).
+/// never a partial update (see SME-20's "no per-item ids" decision).
 pub async fn set_conversation_todos(
     pool: &PgPool,
     conversation_id: i64,
@@ -377,7 +377,7 @@ pub async fn conversations_with_live_pods(pool: &PgPool) -> Result<Vec<i64>, sql
 }
 
 /// Live pods only (`terminated_at IS NULL`) — a terminated pod's row
-/// sticks around (see the plan's "How") but shouldn't be listed as if it
+/// sticks around (see SME-9's "How") but shouldn't be listed as if it
 /// still existed.
 pub async fn list_sandbox_pods(
     pool: &PgPool,
@@ -585,7 +585,7 @@ pub async fn create_terminal_command(
 /// Backs the single-command-in-flight check `run_terminal_command` and
 /// `terminate_terminal` both need — at most one row per terminal can
 /// ever be `running` at a time (one in-flight command per terminal, not
-/// per conversation — see the plan's "What"), enforced at the tool layer,
+/// per conversation — see SME-9's "What"), enforced at the tool layer,
 /// not by a database constraint.
 pub async fn terminal_command_is_running(
     pool: &PgPool,
@@ -636,7 +636,7 @@ pub async fn mark_terminal_command_finished(
 
 /// Used only by the crash-recovery path: a command that was `running` when
 /// its agent was found unreachable has no real exit code to report, so
-/// `exit_code` stays `NULL` — see the plan's "Agent crash recovery."
+/// `exit_code` stays `NULL` — see SME-9's "Agent crash recovery."
 /// Restricted to rows still `running` so this is safe to call defensively
 /// without first checking status.
 pub async fn mark_terminal_command_lost(
@@ -689,7 +689,7 @@ pub async fn terminal_command_status(
 }
 
 /// `LIMIT`/`OFFSET` over the requested stream(s), ordered by the agent-
-/// assigned `seq` — *not* `id` (see the plan's "Ordering" section on why
+/// assigned `seq` — *not* `id` (see SME-9's "Ordering" section on why
 /// insertion order isn't trusted as the real order). `streams` is typically
 /// `&["stdout"]`, `&["stderr"]`, or `&["stdout", "stderr"]` — line numbers
 /// are relative to whichever set is requested, by design.
@@ -745,7 +745,7 @@ pub async fn mark_terminal_command_notified(
 /// Backs `list_commands` — most-recent-first, bounded the same way
 /// `read_terminal_output` is, scoped to one terminal (its history
 /// outlives that terminal being torn down, since `terminal_commands`
-/// isn't cascade-deleted by `terminate_terminal` — see the plan's "How").
+/// isn't cascade-deleted by `terminate_terminal` — see SME-9's "How").
 pub async fn list_terminal_commands(
     pool: &PgPool,
     terminal_id: i64,
@@ -2229,8 +2229,8 @@ mod tests {
             .expect("terminate")
             .expect("pod exists");
 
-        // Hard DB cascade only fires on conversation deletion (see the
-        // plan's "How") — terminating the pod itself is a soft delete and
+        // Hard DB cascade only fires on conversation deletion (see
+        // SME-9's "How") — terminating the pod itself is a soft delete and
         // does *not* cascade to its terminals; the model is expected to
         // terminate_terminal each one first (enforced at the tool layer,
         // not here). Confirm the terminal row is untouched by the pod's
@@ -2611,7 +2611,7 @@ mod tests {
     #[sqlx::test]
     async fn test_terminating_a_terminal_preserves_its_command_history(pool: PgPool) {
         // The whole reason terminate_terminal soft-deletes instead of
-        // DELETEing (see the plan's "How"): list_commands should still be
+        // DELETEing (see SME-9's "How"): list_commands should still be
         // able to show what ran in a terminal that's since been torn down.
         let conversation = test_conversation(&pool).await;
         let pod = create_sandbox_pod(&pool, conversation.id)

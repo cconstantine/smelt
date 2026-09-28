@@ -226,7 +226,7 @@ const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// TCP connect through receiving the response headers — before giving up.
 /// Distinct from `CHUNK_TIMEOUT`, which only bounds the gap between chunks
 /// once a response is already streaming; this call had no bound at all
-/// before (see the tool-use-round-trip retrospective: a stalled connect
+/// before (see SME-8's retrospective: a stalled connect
 /// here is indistinguishable from the caller just hanging forever — and
 /// since a `run_async` task with `stream_output: true` awaits exactly this
 /// call once per line before it can continue, that manifested as the
@@ -964,7 +964,7 @@ mod tests {
         );
     }
 
-    /// Regression test for the tool-use-round-trip retrospective's hung
+    /// Regression test for SME-8's retrospective's hung
     /// live model call: before `RESPONSE_TIMEOUT` existed, a connection
     /// that never got a response at all (accepted, then silence) hung
     /// `stream_anthropic_message` forever. Accepts the connection but never

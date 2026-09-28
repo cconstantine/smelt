@@ -1,5 +1,6 @@
-//! The sandbox agent: injected into and launched inside a sandbox pod by
-//! `src/sandbox.rs`, hosting N persistent named inner `bash` shells behind
+//! The sandbox agent: the sandbox image's ENTRYPOINT
+//! (`docker/sandbox/Dockerfile`), so it starts with every sandbox pod
+//! `src/sandbox.rs` creates, hosting N persistent named inner `bash` shells behind
 //! one WebSocket server the main smelt process talks to. See
 //! SME-9 for the full design — this
 //! file implements the "Protocol" and the `sandbox_agent.rs` bullet in
@@ -8,7 +9,7 @@
 //! own process group (`.process_group(0)`) so terminating one never
 //! touches the agent or any sibling terminal. Per-shell: the command
 //! framing is unchanged, foreground `eval` (backgrounding it broke
-//! `cd`/`export` persistence — see the plan's "How"); `set -m` + `trap ':'
+//! `cd`/`export` persistence — see SME-9's "How"); `set -m` + `trap ':'
 //! INT` at startup are both required, for different reasons, also covered
 //! there; PID/process-group discovery for `send_signal` reads
 //! `/proc/<bash_pid>/task/<bash_pid>/children` reactively, not eagerly.
@@ -56,7 +57,7 @@ const MARKER_PREFIX: &str = "MARKER:";
 /// eager (right after spawn) to reactive (only when `send_signal` is
 /// called): a `send_signal` arriving essentially back-to-back with the
 /// command that started it, before bash has necessarily finished forking.
-/// Not measured — see the plan's Open Questions.
+/// Not measured — see SME-9's Open Questions.
 const SIGNAL_DISCOVERY_RETRIES: u32 = 10;
 const SIGNAL_DISCOVERY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -256,14 +257,14 @@ struct DirEntryInfo {
 
 /// Alphabetical by name, case-sensitive (Rust's default `str` ordering —
 /// uppercase sorts before lowercase) — `list_directory` doesn't group
-/// directories first, just a plain sort, see the plan's "What."
+/// directories first, just a plain sort, see SME-11's "What."
 fn sort_entries(mut entries: Vec<DirEntryInfo>) -> Vec<DirEntryInfo> {
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
 }
 
 /// What `edit_file` reports back to the model for each `EditError` variant
-/// — the structured error the plan's "Which files" bullet calls for (hash
+/// — the structured error SME-11's "Which files" bullet calls for (hash
 /// mismatch / not found / ambiguous with match count / no match at the
 /// given line).
 fn edit_error_message(err: EditError) -> String {
@@ -374,14 +375,14 @@ struct Shell {
     stdin: AsyncMutex<ChildStdin>,
     /// Also this shell's own process group id: spawned with
     /// `.process_group(0)`, so `bash_pid` and the shell's pgid are the same
-    /// number — see `terminate_terminal` and the plan's "Per-terminal
+    /// number — see `terminate_terminal` and SME-9's "Per-terminal
     /// process groups."
     bash_pid: u32,
     /// The one in-flight command's id in *this* terminal, if any — the
     /// single source of truth the single-command-in-flight-per-terminal
     /// design relies on. The *primary* enforcement of "only one at a time"
-    /// is server-side (before a command is ever sent here at all — see the
-    /// plan's `sandbox.rs` bullet); this is the agent's own defensive
+    /// is server-side (before a command is ever sent here at all — see
+    /// SME-9's `sandbox.rs` bullet); this is the agent's own defensive
     /// backstop.
     current: AsyncMutex<Option<String>>,
     /// Held only so the child isn't dropped early; never otherwise read.
@@ -475,7 +476,7 @@ struct GrepMatchInfo {
 }
 
 /// One file `grep` excluded (too large, or not valid UTF-8) — reported
-/// explicitly rather than silently dropped, per the plan's "Decisions from
+/// explicitly rather than silently dropped, per SME-19's "Decisions from
 /// review."
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct SkippedFileInfo {
@@ -707,7 +708,7 @@ async fn handle_client_message(text: &str, state: &Arc<AppState>, socket: &mut W
 /// SME-11's "Size bound."
 const MAX_FILE_SIZE_BYTES: u64 = 256 * 1024;
 /// `list_directory`'s analogous bound, as an entry count rather than bytes
-/// — same reasoning, see the plan's "Size bound."
+/// — same reasoning, see SME-11's "Size bound."
 const MAX_DIR_ENTRIES: usize = 1000;
 /// `grep` skips (never errors out entirely on, see `SkippedFileInfo`) a
 /// file bigger than this — bounds worst-case per-file scan time. Distinct
@@ -1110,7 +1111,7 @@ async fn handle_grep(
 
 /// Synchronous, same `spawn_blocking`-only rule as `walk_glob`. Every file
 /// it excludes (oversized, or not valid UTF-8) lands in the returned
-/// `skipped` list — never silently dropped, per the plan's "Decisions
+/// `skipped` list — never silently dropped, per SME-19's "Decisions
 /// from review." `scan_capped` combines the walk's own cap with
 /// `grep_content`'s per-file budget exhaustion — either one means there
 /// may be more matches than `total` reports.
@@ -1186,8 +1187,8 @@ fn walk_grep(
 }
 
 /// Spawns a new named shell — `.process_group(0)` gives it a process group
-/// distinct from the agent's and from every sibling terminal's (see the
-/// plan's "Per-terminal process groups"), so `terminate_terminal` can
+/// distinct from the agent's and from every sibling terminal's (see
+/// SME-9's "Per-terminal process groups"), so `terminate_terminal` can
 /// `killpg` it in isolation later. `set -m`/`trap ':' INT` are the same
 /// per-shell startup this design has always used, just no longer only at
 /// agent-launch time.
@@ -1234,7 +1235,7 @@ async fn create_terminal(state: &Arc<AppState>, socket: &mut WebSocket, terminal
     // one) gets its own process group send_signal can target.
     // trap ':' INT: without this, a non-interactive bash re-raises SIGINT
     // against itself once a foreground job dies from it, taking the whole
-    // shell down with it — see the plan's "Signaling a running command."
+    // shell down with it — see SME-9's "Signaling a running command."
     if let Err(e) = stdin.write_all(b"set -m\ntrap ':' INT\n").await {
         send_terminal_error(
             socket,
@@ -1277,7 +1278,7 @@ async fn create_terminal(state: &Arc<AppState>, socket: &mut WebSocket, terminal
 
 /// `killpg` targeting just this terminal's own process group — safe in
 /// isolation because `.process_group(0)` gave it one distinct from the
-/// agent's and every sibling terminal's. See the plan's "Terminating a
+/// agent's and every sibling terminal's. See SME-9's "Terminating a
 /// terminal without touching the pod, or its siblings."
 async fn terminate_terminal(state: &Arc<AppState>, socket: &mut WebSocket, terminal_id: String) {
     let shell = state.terminals.lock().await.remove(&terminal_id);
@@ -1320,7 +1321,7 @@ async fn start_command(state: &Arc<AppState>, terminal_id: &str, id: String, com
 
     let mut current = shell.current.lock().await;
     if current.is_some() {
-        // Should already be prevented server-side (see the plan) — this is
+        // Should already be prevented server-side (see SME-9's plan) — this is
         // a defensive backstop, not the primary enforcement, so a quiet
         // log rather than inventing a new protocol error message.
         tracing::warn!(%id, "rejecting command: another is already in flight in this terminal");
@@ -1383,7 +1384,7 @@ fn parse_signal(name: &str) -> Option<Signal> {
 /// Reactive, not eager — read only when `send_signal` is actually called,
 /// with a short bounded retry for the one real race (a `send_signal`
 /// arriving essentially back-to-back with the command that started it).
-/// See the plan's "Discovering a running command's process group."
+/// See SME-9's "Discovering a running command's process group."
 async fn discover_current_job_pgid(bash_pid: u32) -> Option<i32> {
     let children_path = format!("/proc/{bash_pid}/task/{bash_pid}/children");
     for _ in 0..SIGNAL_DISCOVERY_RETRIES {

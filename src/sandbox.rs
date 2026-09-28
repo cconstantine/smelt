@@ -68,7 +68,7 @@ pub enum SandboxError {
     Timeout(Option<String>),
     /// A pod already existed for this session but wasn't `Running` (e.g.
     /// `Terminating`, `Failed`). What to do here is an open question in
-    /// the plan — not resolved, just surfaced rather than guessed at.
+    /// SME-7's plan — not resolved, just surfaced rather than guessed at.
     ExistingPodNotRunning(String),
     // Only ever constructed by `Sandbox::exec`, which is itself only called
     // by the real-cluster tests below (see its own cfg) — production code
@@ -77,7 +77,7 @@ pub enum SandboxError {
     #[cfg_attr(not(test), allow(dead_code))]
     Io(std::io::Error),
     WebSocket(tokio_tungstenite::tungstenite::Error),
-    /// A `sandbox_pods`/`sandbox_terminals` query failed — see the plan's
+    /// A `sandbox_pods`/`sandbox_terminals` query failed — see SME-9's
     /// "How" on why pod/terminal identity is DB-backed this round.
     Db(sqlx::Error),
     /// `create_pod` refuses: this conversation already has a live pod. See
@@ -507,7 +507,7 @@ pub async fn install_git_files_in_pod(
 /// On success the exec protocol's terminal `Status` carries no exit code at
 /// all (implying 0); on a non-zero exit it's a `StatusCause` with
 /// `reason == "ExitCode"` and the code itself, as a string, in `message`.
-/// Verified against a real cluster, not assumed — see the plan.
+/// Verified against a real cluster, not assumed — see SME-7's plan.
 ///
 /// No status at all means the connection ended before the API server said
 /// how the command did, so it counts as a failure (-1), not a success.
@@ -624,12 +624,12 @@ impl SandboxManager {
                 let phase = pod.status.and_then(|s| s.phase).unwrap_or_default();
                 if phase != "Running" {
                     // Non-Running existing pod (Terminating, Failed, ...)
-                    // is still an open question per the plan — not
+                    // is still an open question per SME-7's plan — not
                     // handled yet.
                     return Err(SandboxError::ExistingPodNotRunning(phase));
                 }
                 // Reuse: what makes an active conversation's sandbox
-                // survive a smelt server restart, see the plan's "Restart
+                // survive a smelt server restart, see SME-7's "Restart
                 // behavior" section.
                 false
             }
@@ -678,7 +678,7 @@ impl SandboxManager {
         // Disarms Drop: safe to skip since none of Sandbox's fields have
         // meaningful Drop side effects of their own (a String, a
         // cheaply-Clone/Arc-backed kube::Client, an UnboundedSender whose
-        // Drop is just a refcount decrement) — see the plan.
+        // Drop is just a refcount decrement) — see SME-7's plan.
         std::mem::forget(sandbox);
         Ok(())
     }
@@ -687,7 +687,7 @@ impl SandboxManager {
 /// `SANDBOX_MEMORY_LIMIT`, default `"8Gi"` if unset or empty — same
 /// pattern `api::chat::anthropic_model()` uses for `ANTHROPIC_MODEL`. The
 /// *default* a pod gets when `create_pod`'s caller doesn't specify its own
-/// `memory_limit` — see the plan's "Per-pod limit overrides."
+/// `memory_limit` — see SME-12's "Per-pod limit overrides."
 fn default_memory_limit() -> String {
     std::env::var("SANDBOX_MEMORY_LIMIT")
         .ok()
@@ -719,14 +719,14 @@ fn default_sandbox_image() -> String {
         .unwrap_or_else(|| "docker.io/library/smelt-sandbox:latest".to_string())
 }
 
-/// `SANDBOX_RUNNING_WAIT_TIMEOUT_SECS`, default `30` — same pattern as
+/// `SANDBOX_RUNNING_WAIT_TIMEOUT_SECS`, default `90` — same pattern as
 /// `default_memory_limit`. How long `wait_for_running` waits for a pod to
 /// reach `Running` before giving up with `SandboxError::Timeout`. The
 /// homelab cluster's real scheduling latency is why this exists as a
 /// tunable rather than a bare constant: a CPU-constrained CI runner
 /// schedules pods measurably slower than a real cluster or a
-/// resource-rich dev machine, and 30s — plenty in both of the latter —
-/// isn't a reliable bound under CI's actual constraints. See
+/// resource-rich dev machine, so CI raises it further. See
+/// `DEFAULT_RUNNING_WAIT_TIMEOUT_SECS` for why the default is 90, and
 /// docs/setup.md.
 fn running_wait_timeout() -> Duration {
     let secs = std::env::var("SANDBOX_RUNNING_WAIT_TIMEOUT_SECS")
@@ -1327,7 +1327,7 @@ pub fn get() -> &'static SandboxManager {
 
 // --- Terminal: pod, terminal, and command are three separate, explicitly
 // guarded lifecycles, and a conversation may have N pods each with N
-// terminals. See the plan's "What" and "How". ---
+// terminals. See SME-9's "What" and "How". ---
 
 #[derive(Debug)]
 pub enum TerminalError {
@@ -1456,7 +1456,7 @@ pub struct GrepMatch {
 }
 
 /// One file `grep` excluded (too large, or not valid UTF-8) — reported
-/// explicitly rather than silently dropped, per the plan's "Decisions from
+/// explicitly rather than silently dropped, per SME-19's "Decisions from
 /// review."
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkippedFile {
@@ -1503,7 +1503,8 @@ enum FileResponse {
 
 /// How long `create_terminal`/`terminate_terminal` wait for the agent's ack
 /// before giving up — see `request_terminal_action`. Not measured, same
-/// spirit as the plan's other not-yet-sized timeouts (see Open Questions).
+/// spirit as SME-9's plan's other not-yet-sized timeouts (see its Open
+/// Questions).
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct TerminalConnection {
@@ -1533,9 +1534,9 @@ struct TerminalConnection {
 }
 
 /// The per-pod registry — one WebSocket connection per pod, shared by
-/// every terminal that pod hosts (one agent *process* per pod — see the
-/// plan's "Why N pods and N terminals"). Holds only the connection handle,
-/// nothing else (no scrollback, no exit-code slot; see the plan's
+/// every terminal that pod hosts (one agent *process* per pod — see
+/// SME-9's "Why N pods and N terminals"). Holds only the connection handle,
+/// nothing else (no scrollback, no exit-code slot; see SME-9's
 /// "sandbox.rs" bullet on why that in-memory state was removed entirely
 /// once nothing needed a hot path fast enough to justify caching it).
 static TERMINAL_CONNECTIONS: LazyLock<StdMutex<HashMap<i64, Arc<TerminalConnection>>>> =
@@ -1574,7 +1575,7 @@ fn deregister(pod_id: i64) {
 /// having done so — if it's still exactly this same connection (`Arc::ptr_eq`,
 /// not just an equal `pod_id`). Returns `false` when someone else (a
 /// deliberate `terminate_pod`/`teardown_conversation`, or a newer
-/// reconnect) already replaced or removed it first. See the plan's "How":
+/// reconnect) already replaced or removed it first. See SME-12's "How":
 /// this is what lets `connect()`'s reader task tell "this pod was
 /// deliberately torn down" apart from "this connection just crashed"
 /// without any new state.
@@ -1616,7 +1617,7 @@ fn resolve_pod_id(existing: &[db::SandboxPod]) -> Result<i64, TerminalError> {
 /// Decides whether a pod is confirmed dead from its already-fetched
 /// status, and what reason (if any) Kubernetes gave — pulled out as a
 /// pure function over an `Option<Pod>` for the same testability reason as
-/// `check_pod_guard`/`resolve_pod_id`. See the plan's "Testing": the outer
+/// `check_pod_guard`/`resolve_pod_id`. See SME-12's "Testing": the outer
 /// `Option` is "confirmed dead or not" (`None` means genuinely
 /// inconclusive — `Running`/`Pending` — not "no reason"); the inner one is
 /// "did Kubernetes give a specific reason for it."
@@ -1659,7 +1660,7 @@ fn decide_pod_death_reason(pod: Option<Pod>) -> Option<Option<String>> {
 /// `decide_pod_death_reason`'s real-world entry point — just the
 /// `pods.get_opt` fetch, handed straight to the pure decision function.
 /// An API call that itself fails is treated the same as "inconclusive"
-/// (`None`), never as confirmation either way — see the plan's "How."
+/// (`None`), never as confirmation either way — see SME-12's "How."
 async fn pod_death_reason(pods: &Api<Pod>, name: &str) -> Option<Option<String>> {
     match pods.get_opt(name).await {
         Ok(pod) => decide_pod_death_reason(pod),
@@ -1671,7 +1672,7 @@ async fn pod_death_reason(pods: &Api<Pod>, name: &str) -> Option<Option<String>>
 /// a conversation has at most one live pod, so every pod-scoped call
 /// (`terminate_pod`, `create_terminal`, the file tools) can go straight
 /// from a `conversation_id` to a `pod_id` without the model ever naming one
-/// itself. See the plan's "One pod per conversation."
+/// itself. See SME-11's "One pod per conversation."
 async fn conversation_pod_id(pool: &PgPool, conversation_id: i64) -> Result<i64, TerminalError> {
     let existing = db::list_sandbox_pods(pool, conversation_id).await?;
     resolve_pod_id(&existing)
@@ -1859,8 +1860,8 @@ pub fn check_reachable_port(port: u16) -> Result<(), TerminalError> {
 }
 
 /// `create_pod`'s per-pod overrides of the deployment's limits: the
-/// sandbox container's (`SANDBOX_MEMORY_LIMIT`/`SANDBOX_CPU_LIMIT`, see the
-/// plan's "Per-pod limit overrides") and the Docker sidecar's
+/// sandbox container's (`SANDBOX_MEMORY_LIMIT`/`SANDBOX_CPU_LIMIT`, see
+/// SME-12's "Per-pod limit overrides") and the Docker sidecar's
 /// (`SANDBOX_DOCKER_*_LIMIT`, SME-33). Plain Kubernetes quantity strings,
 /// validated by Kubernetes itself against the namespace's `LimitRange`.
 #[derive(Debug, Clone, Default)]
@@ -2047,7 +2048,7 @@ pub async fn live_pod_id(pool: &PgPool, conversation_id: i64) -> Result<i64, Ter
 /// `pod_id`-addressed version was: once the one live pod is terminated,
 /// there's no longer a live pod for this conversation to resolve, so a
 /// second call fails clearly with `NoPod` ("call create_pod first") rather
-/// than silently succeeding again. See the plan's "How." Refuses if the
+/// than silently succeeding again. See SME-11's "How." Refuses if the
 /// pod still has a live terminal.
 pub async fn terminate_pod(pool: &PgPool, conversation_id: i64) -> Result<(), TerminalError> {
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
@@ -2068,7 +2069,7 @@ pub async fn terminate_pod(pool: &PgPool, conversation_id: i64) -> Result<(), Te
 /// above already ensures no live terminals before this runs) and
 /// `reconnect_or_confirm_crash`'s exhausted-retries fallback (unguarded —
 /// nothing to check, it's already given up reaching this pod). Deregisters
-/// *before* touching the k8s API, not after — see the plan's "How" on why
+/// *before* touching the k8s API, not after — see SME-12's "How" on why
 /// that ordering is what lets a deliberate teardown always win the race
 /// against the connection's own reader task noticing the drop.
 async fn force_terminate_pod(
@@ -2308,10 +2309,10 @@ pub async fn create_terminal(pool: &PgPool, conversation_id: i64) -> Result<i64,
     Ok(terminal_id)
 }
 
-/// Idempotent on repeat (see the plan's "How"). Refuses if a command is
+/// Idempotent on repeat (see SME-9's "How"). Refuses if a command is
 /// still `running` in this terminal — the model must `send_signal`/wait
 /// it out first. Otherwise asks the agent to `killpg` just this
-/// terminal's shell — see the plan's "Terminating a terminal without
+/// terminal's shell — see SME-9's "Terminating a terminal without
 /// touching the pod, or its siblings."
 pub async fn terminate_terminal(pool: &PgPool, terminal_id: i64) -> Result<(), TerminalError> {
     let Some(pod_id) = db::sandbox_terminal_pod_id(pool, terminal_id).await? else {
@@ -2416,7 +2417,7 @@ pub async fn send_signal(
 
 /// Deletes every pod that exists for this conversation, unconditionally
 /// (unlike `terminate_pod`, this is a hard teardown on conversation
-/// deletion, not a guarded API the model calls) — see the plan's
+/// deletion, not a guarded API the model calls) — see SME-9's
 /// `chat.rs`/`main.rs` bullet. The DB rows themselves don't need clearing
 /// here: `db::delete_conversation`'s `ON DELETE CASCADE` chain removes
 /// `sandbox_pods`/`sandbox_terminals`/`terminal_commands` for real right
@@ -2471,7 +2472,7 @@ async fn delete_listed(pods: &Api<Pod>, selector: &ListParams, conversation_id: 
 /// otherwise tries to (re)connect to that pod's agent. This is what makes
 /// a smelt restart transparently reconnect to a still-healthy agent, *and*
 /// what detects a crashed agent (pod exists, `Running`, but nothing
-/// answers) — see the plan's "Agent crash recovery": cleanup only, never
+/// answers) — see SME-9's "Agent crash recovery": cleanup only, never
 /// touches the pod, and does not attempt to launch a fresh agent itself
 /// (that's `ensure_pod_connection`'s job, used only by `create_terminal`).
 async fn reconnect_if_needed(
@@ -2484,7 +2485,7 @@ async fn reconnect_if_needed(
     reconnect_or_confirm_crash(pool, pod_id).await
 }
 
-/// Bounded retry, not measured against anything real yet — see the plan's
+/// Bounded retry, not measured against anything real yet — see SME-12's
 /// Open Questions.
 const RECONNECT_ATTEMPTS: u32 = 3;
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
@@ -2494,7 +2495,7 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 /// single failed `connect()` doesn't mean the pod is dead (a transient
 /// portforward/API hiccup looks identical to one that does), so
 /// `pod_death_reason` is the authoritative signal, not the connection
-/// attempt itself. See the plan's "Detection design."
+/// attempt itself. See SME-12's "Detection design."
 ///
 /// Written as a plain `fn` returning a boxed future, not `async fn` —
 /// `connect()`'s reader task calls this, and this itself calls `connect()`
@@ -2624,7 +2625,7 @@ async fn ensure_pod_connection(
 }
 
 /// Sends a `create_terminal`/`terminate_terminal` protocol action and
-/// blocks (up to `ACK_TIMEOUT`) for its ack — see the plan's "Request/ack
+/// blocks (up to `ACK_TIMEOUT`) for its ack — see SME-9's "Request/ack
 /// correlation, new this round." `send_command`/`send_signal` don't go
 /// through this; they stay fire-and-forget.
 async fn request_terminal_action(
@@ -2784,7 +2785,7 @@ pub async fn write_file(
 /// `write_file`) — `edit_file` always needs a prior read to have produced
 /// the `old_string` it's matching against. `expected_line`, if set, targets
 /// one specific occurrence instead of requiring a file-wide unique match —
-/// see the plan's "What" on `edit_file`. Returns the new content's hash.
+/// see SME-11's "What" on `edit_file`. Returns the new content's hash.
 pub async fn edit_file(
     pool: &PgPool,
     conversation_id: i64,
@@ -3085,7 +3086,7 @@ async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64, reason: Option<String>
         // live terminal" condition that already makes a redundant second call
         // (e.g. the pre-existing reactive path still firing after this one
         // already ran) a harmless no-op — no separate dedup state needed. See
-        // the plan's "Detection design": the reason string, when Kubernetes
+        // SME-12's "Detection design": the reason string, when Kubernetes
         // gave one, is passed straight through rather than guessed at.
         let notice = found_live_terminal.then(|| match reason {
             Some(reason) => format!(
@@ -3165,7 +3166,7 @@ async fn close_pod_terminals(pool: &PgPool, pod_id: i64) -> (Option<i64>, bool) 
 /// on the way out, whatever the reason (clean close, error, agent crash)
 /// — the next call that needs a connection detects that and reconnects or
 /// reports `NoTerminal`. One connection per **pod**, shared by every
-/// terminal it hosts — see the plan's "Why N pods and N terminals."
+/// terminal it hosts — see SME-9's "Why N pods and N terminals."
 async fn connect(
     client: &kube::Client,
     pool: PgPool,
@@ -3217,7 +3218,7 @@ async fn connect(
         // Only treat this as worth reacting to if nobody already tore this
         // *specific* connection down deliberately (`terminate_pod`/
         // `teardown_conversation` already deregister before they delete —
-        // see the plan's "How" on why that ordering makes this race-safe).
+        // see SME-12's "How" on why that ordering makes this race-safe).
         // A newer reconnect already having replaced this entry counts the
         // same way: not this task's job to react to.
         if deregister_if_current(pod_id, &conn_for_pump) {
@@ -5325,7 +5326,7 @@ mod tests {
         let client = test_client().await;
         MANAGER.set(SandboxManager::new(client.clone())).ok();
 
-        // pod_id/terminal_id are now DB-generated (see the plan's "How") —
+        // pod_id/terminal_id are now DB-generated (see SME-9's "How") —
         // each `#[sqlx::test]` run gets a *fresh* isolated Postgres database
         // whose identity sequences restart at 1, but this test still talks
         // to the one *real, shared* k3s cluster, so a from-scratch pod_id
@@ -6777,7 +6778,7 @@ mod tests {
     /// itself — no app-side comparison logic to test, just that the
     /// rejection actually happens and surfaces as an ordinary error.
     /// Requires the `LimitRange` to actually be applied to the cluster
-    /// (`k3s-bootstrap`, or the equivalent on `homelab`) — see the plan's
+    /// (`k3s-bootstrap`, or the equivalent on `homelab`) — see SME-12's
     /// "Per-pod limit overrides".
     #[tokio::test]
     async fn test_create_rejects_a_memory_limit_over_the_limitrange_max() {
@@ -6793,7 +6794,7 @@ mod tests {
         );
     }
 
-    /// The one real, permanent OOM trigger in this suite (see the plan's
+    /// The one real, permanent OOM trigger in this suite (see SME-12's
     /// "Testing" on why this isn't a full `cargo build` like the design
     /// spike used — a bash builtin growing memory directly in its own
     /// process, no fork, needs no `rust:*` image). Proves the whole real
@@ -6806,8 +6807,8 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("real-oom");
-        // Small on purpose — fast and reliable to trigger, using this same
-        // plan's own per-pod override rather than the real 8Gi default.
+        // Small on purpose — fast and reliable to trigger, using SME-12's
+        // own per-pod override rather than the real 8Gi default.
         let sandbox = manager
             .create(&session_id, "64Mi", "250m", &[])
             .await

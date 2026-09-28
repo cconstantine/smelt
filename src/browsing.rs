@@ -115,7 +115,7 @@ mod server {
     const ACTION_SETTLE_TIMEOUT: Duration = Duration::from_millis(600);
     /// Screencast frame bounds — deliberately conservative (bandwidth over
     /// smoothness), tunable once the panel is actually running against a
-    /// real page; see the plan's "Exact frame quality/size/rate defaults."
+    /// real page; see SME-22's "Exact frame quality/size/rate defaults."
     const SCREENCAST_MAX_WIDTH: i64 = 1280;
     const SCREENCAST_MAX_HEIGHT: i64 = 800;
     const SCREENCAST_QUALITY: i64 = 60;

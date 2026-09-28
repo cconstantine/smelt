@@ -716,7 +716,7 @@ fn compaction_transcript_budget() -> usize {
 /// `is_safe_compaction_boundary` — but checked defensively rather than
 /// assumed). If the summarization call itself fails, this propagates the
 /// error and the whole turn fails loudly, rather than proceeding with the
-/// oversized request compaction exists to prevent — see the plan's
+/// oversized request compaction exists to prevent — see SME-18's
 /// "Resolved" decision on this.
 #[cfg(feature = "server")]
 async fn compact_conversation(
@@ -860,7 +860,7 @@ pub(crate) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: St
 /// conversation — Anthropic's strict user/assistant alternation breaks if
 /// two writers persist a turn at once. Keyed by conversation id; which
 /// caller acquires a given conversation's lock first when several are ready
-/// is unspecified (see the plan's Open questions).
+/// is unspecified (see SME-8's Open questions).
 #[cfg(feature = "server")]
 static CONVERSATION_LOCKS: LazyLock<Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1480,7 +1480,7 @@ fn run_turn_body<'a>(
             // `run_turn` call — this is what gives same-turn visibility: if
             // a command finishes partway through a turn's tool-calling
             // loop, the very next iteration already sees the notification,
-            // without waiting for a fresh user message. See the plan's
+            // without waiting for a fresh user message. See SME-9's
             // "What" and "How" (the completion-notification design).
             drain_unnotified_terminal_commands(
                 pool,
