@@ -15,6 +15,10 @@ mod git;
 #[cfg(feature = "server")]
 mod headless_chrome;
 #[cfg(feature = "server")]
+// Until the tools use it, later on this branch (SME-35).
+#[allow(dead_code)]
+mod lsp;
+#[cfg(feature = "server")]
 mod http_request;
 #[cfg(feature = "server")]
 mod mcp;
