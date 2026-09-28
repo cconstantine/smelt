@@ -9,7 +9,11 @@ dx serve --fullstack
 # rebuilds/hydrates the WASM client on change, all through one process that
 # dx manages — unlike a CSR-only app, there's no separate hand-rolled server
 # process or web-mode proxy to wire up.
-# dx binds an address itself (check its startup log); open that in a browser.
+# dx serves its own dev address (check its startup log; open that in a
+# browser), sets PORT for the server binary it launches, and proxies to it.
+# In the dev container, use the address compose publishes instead:
+#   dx serve --fullstack --addr 0.0.0.0 --port 8080
+# (the container's :8080 is the host's :8180; see docker-compose.yml).
 
 # ── Simplest one-shot run (no hot reload) ───────────────────────────────────
 dx build --platform web
@@ -48,6 +52,11 @@ scripts/build-sandbox-image.sh
 # `src/browser_tests.rs`'s own test tier anymore. `scripts/browser-check/setup.sh`
 # downloads the binary plus its missing shared libraries into
 # `.browser-check-cache/` (gitignored) — no root needed, safe to re-run.
+# smelt looks for Chrome at `<checkout it was built from>/.browser-check-cache/`
+# (the compile-time `CARGO_MANIFEST_DIR`, `src/headless_chrome.rs`), wherever
+# the binary runs from. `BROWSER_CHECK_CACHE` only moves where setup.sh
+# downloads, not where smelt looks; `scripts/check-server` symlinks the
+# checkout's cache into its own worktree.
 # Without this, any real `webfetch`/`open_browser_session` call fails with a
 # clear "chrome-headless-shell not found" error rather than hanging or
 # crashing. See SME-21 and
@@ -64,9 +73,16 @@ cargo check --no-default-features --features web --target wasm32-unknown-unknown
 cargo test --features server
 ```
 
+Helper scripts: `scripts/check.sh` (the checks every commit must pass: both
+builds with no warnings, plus the server tests), `scripts/check-server`
+(`dx serve` from a separate worktree, for hands-on checks), and
+`scripts/clean-test-namespace.sh` (deletes pods and Docker data claims left behind
+in the `smelt-park-test` namespace).
+
 ## CI
 
-`.github/workflows/ci.yml` runs on every pull request: the full `cargo test
+`.github/workflows/ci.yml` runs on every pull request, every push to `main`,
+and on manual dispatch: the full `cargo test
 --features server` suite (Postgres + real-cluster k3s sandbox tests), the
 WASM `cargo check`, and the automated browser tier — the same tests and the
 same `docker-compose.yml` stack described above and in
@@ -78,10 +94,13 @@ machine. See [development-process.md](development-process.md#definition-of-done)
 Copy `.env.example` to `.env` and fill in `ANTHROPIC_API_KEY` (or
 `ANTHROPIC_AUTH_TOKEN` — see below). Loaded automatically at server startup
 (`dotenvy::dotenv()` in `main.rs`); a value already set in the real
-environment takes precedence over `.env`. A var that's set-but-empty is
-treated the same as unset (see `anthropic_model()` and
-`require_at_least_one_credential()` in `src/api/chat.rs`) — no code path
-silently sends an empty string to the Anthropic API.
+environment takes precedence over `.env`. Most vars treat set-but-empty the
+same as unset (see `anthropic_model()` and the credential checks in
+`src/api/chat.rs`), so no empty API key or auth token is ever sent. The
+exceptions: `ANTHROPIC_BASE_URL`, `SMELT_MASON_REGISTRY_URL` and
+`SMELT_HELIX_LANGUAGES_URL` use an empty value as given (so leave them unset
+rather than empty), and an empty `DATABASE_URL` fails to parse and panics at
+startup just like an unset one.
 
 
 | Variable | Required | Default | Notes |
@@ -92,20 +111,21 @@ silently sends an empty string to the Anthropic API.
 | `ANTHROPIC_BASE_URL` | no | `https://api.anthropic.com` | Override for pointing at a mock upstream in tests, or an API-compatible gateway — e.g. a local Ollama server (v0.14.0+ serves an Anthropic-compatible `/v1/messages`; see the commented-out example in `.env.example`). Pick a model with a large-enough context window for tool-calling to work — some models default to a much smaller one than they support. |
 | `ANTHROPIC_THINKING` | no | on | Set to `0`/`false`/`off` to stop sending `thinking: {"type": "adaptive"}`. On by default — `run_turn` retries a request without thinking if the upstream fails with Ollama's specific "error parsing tool call" shape (seen with `gpt-oss` models, whose Anthropic-compat shim doesn't cleanly separate reasoning from a tool call's arguments), so this only needs turning off if some other backend hits a *different* thinking-related failure that retry doesn't cover. See [docs/api.md](api.md). |
 | `ANTHROPIC_CONTEXT_WINDOW` | no | `200000` | Real token count for the configured model's context window — used to decide when auto-compaction should trigger and to compute the context-usage indicator's percentage. `context_window_for` already recognizes every current `claude-*` model id (all sharing the same standard 200K window) without needing this set; only a fallback for a gateway or local model (`ANTHROPIC_BASE_URL` pointed elsewhere) with no real Anthropic model id to look up. See [SME-18](https://linear.app/smelt-agent/issue/SME-18). |
-| `DATABASE_URL` | yes | — | Postgres connection string; `db::init()` panics on startup if unset. Set in `docker-compose.yml`'s `smelt` service, pointing at the `postgres` compose service (only reachable from other compose services, not the host) — only needed in `.env` if running outside docker compose. |
-| `PORT` | no | `8080` | Port the Axum server binds when run via plain `cargo run --features server` (not used by `dx serve`, which picks its own address). |
-| `RUST_LOG` | no | (silent) | Standard `tracing-subscriber` env filter, e.g. `RUST_LOG=info,tower_http=debug`. |
+| `DATABASE_URL` | yes | — | Postgres connection string; `db::init()` panics on startup if unset or empty. Set in `docker-compose.yml`'s `smelt` service, pointing at the `postgres` compose service (only reachable from other compose services, not the host) — only needed in `.env` if running outside docker compose. |
+| `PORT` | no | `8080` | Port the server binary binds, on `0.0.0.0` (`src/main.rs`). Under `dx serve`, dx sets it for the server it launches and proxies to that. |
+| `RUST_LOG` | no | errors only | Standard `tracing-subscriber` env filter, e.g. `RUST_LOG=info,tower_http=debug`. The `chromiumoxide::conn` and `chromiumoxide::handler` targets are always off, even with `RUST_LOG` set: they log a harmless deserialize error on every real page (`log_filter_directives` in `src/main.rs`). |
 | `KUBECONFIG` | yes, for sandbox code/tests | — | Read by `kube::Client::try_default()` (`src/sandbox.rs`). In `docker-compose.yml`, `smelt`'s `KUBECONFIG` points at the kubeconfig `k3s-bootstrap` generates for the `park` service account against the compose-provided `k3s` service — a hermetic test cluster, not a real deployment target. Point it at `.kubeconfig.yaml` (gitignored) instead to deliberately target the real `homelab` cluster. See [SME-7](https://linear.app/smelt-agent/issue/SME-7). |
 | `SANDBOX_MEMORY_LIMIT` | no | `8Gi` | Default memory limit for a sandbox pod's container — a plain Kubernetes quantity string. Just the *default*: `create_pod`'s `memory_limit` parameter overrides it per pod, up to the `smelt-park`/`smelt-park-test` namespace's `LimitRange` ceiling (`k8s/smelt-park-rbac.yaml`). Hitting the limit kills the whole pod at once (`memory.oom.group=1` on this cluster), not just the offending process — see [SME-12](https://linear.app/smelt-agent/issue/SME-12). |
 | `SANDBOX_CPU_LIMIT` | no | `1` | Default CPU limit for a sandbox pod's container, same shape as `SANDBOX_MEMORY_LIMIT` (a Kubernetes quantity string, e.g. `"2"` for two cores) — overridable per pod via `create_pod`'s `cpu_limit`. |
 | `SANDBOX_IMAGE` | no | `docker.io/library/smelt-sandbox:latest` | The sandbox pod's image reference — `docker/sandbox/Dockerfile`, built and delivered with no registry involved by `scripts/build-sandbox-image.sh`. Must match whatever `ctr images import` actually registered the image as, not an arbitrary tag — see SME-17. |
 | `SANDBOX_RUNNING_WAIT_TIMEOUT_SECS` | no | `90` | How long `wait_for_running` (`src/sandbox.rs`) waits for a pod to reach `Running` before giving up with `SandboxError::Timeout`, which carries the pod's own reason for still being pending (e.g. `PodScheduled: Unschedulable: persistentvolumeclaim … not found`) when it has one. A container stuck in a state that won't recover (an image pull failure, a crash loop) fails at once with `SandboxError::StartFailed` instead of waiting out the timeout. The default covers the Docker sidecar's 60 s startup probe plus claim provisioning (SME-62 B15); a CPU-constrained CI runner schedules pods measurably slower, so `.github/workflows/ci.yml` raises this for its `cargo test --features server` run. |
-| `SMELT_BASE_URL` | no | derived from the request | Overrides the scheme+host `src/mcp_oauth.rs` builds an MCP OAuth redirect_uri from (`/mcp-servers`' Connect flow). Without it, the base URL is derived from the incoming request's `Host` header (`X-Forwarded-Proto` for scheme) — wrong if smelt sits behind a proxy/tunnel that doesn't forward a `Host` a browser/OAuth provider could actually reach. No trailing slash. Set-but-empty is treated as unset, same as every other env var here. Once `SMELT_ALLOWED_HOSTS` is set, its host is accepted too. |
+| `SMELT_BASE_URL` | no | derived from the request | Overrides the scheme+host `src/mcp_oauth.rs` builds an MCP OAuth redirect_uri from (`/mcp-servers`' Connect flow). Without it, the base URL is derived from the incoming request's `Host` header (`X-Forwarded-Proto` for scheme) — wrong if smelt sits behind a proxy/tunnel that doesn't forward a `Host` a browser/OAuth provider could actually reach. No trailing slash. Set-but-empty is treated as unset (see above for the vars that differ). Once `SMELT_ALLOWED_HOSTS` is set, its host is accepted too. |
 | `SMELT_ALLOWED_HOSTS` | no | (unset) | Comma-separated host names smelt is reached by (e.g. `smelt.example.com`); `SMELT_BASE_URL`'s host is added. Once set, a request whose `Host` is any other name is refused, which stops DNS rebinding (a page whose name later resolves to smelt's address). Behind a proxy, list the name the proxy sends as `Host`, not only the public one. IP addresses and `localhost` names always work. Unset, any name is served and startup logs a warning. Separately, a write (anything but GET/HEAD/OPTIONS) that a browser says came from another site, a sandbox preview included, is always refused (`src/request_guard.rs`, SME-51). |
 | `SANDBOX_DOCKER_MEMORY_LIMIT` | no | `8Gi` | Memory limit for each sandbox pod's Docker sidecar (SME-33). Every container Docker runs counts against it, not against `SANDBOX_MEMORY_LIMIT`; an OOM kill restarts only the sidecar. `create_pod`'s `docker_memory_limit` overrides it per pod, up to the same `LimitRange` ceiling. See [Docker in the sandbox](#docker-in-the-sandbox). |
 | `SANDBOX_DOCKER_CPU_LIMIT` | no | `1` | CPU limit for the Docker sidecar, overridable per pod with `create_pod`'s `docker_cpu_limit`. |
 | `SANDBOX_DOCKER_STORAGE_SIZE` | no | `20Gi` | Size each conversation's Docker data claim (`sandbox-docker-<conversation id>`, its images, build cache and named volumes) requests. |
 | `SANDBOX_WORKSPACE_STORAGE_SIZE` | no | `20Gi` | Size each conversation's `/workspace` claim (`sandbox-workspace-<conversation id>`, its files and checkouts) requests. |
+| `SANDBOX_VOLUME_STORAGE_SIZE` | no | `10Gi` | Size each generic volume's claim (`sandbox-volume-<id>`, the volumes configured on the `/sandbox-volumes` page) requests (`src/sandbox.rs`). Not configurable per volume. |
 | `SANDBOX_DOCKER_IMAGE` | no | `docker.io/library/docker:29-dind` | The Docker sidecar's image, delivered into the node by `scripts/build-sandbox-image.sh`. Only its `dockerd` is used, never its entrypoint. |
 | `SMELT_MASON_REGISTRY_URL` | no | `https://raw.githubusercontent.com/mason-org/mason-registry/main` | Where the Language servers page's lookup reads mason's `packages/<name>/package.yaml` (see [Language servers](#language-servers)). |
 | `SMELT_HELIX_LANGUAGES_URL` | no | `https://raw.githubusercontent.com/helix-editor/helix/master/languages.toml` | Helix's `languages.toml`, for the lookup's arguments, file types, root markers and settings. |
@@ -167,7 +187,7 @@ SME-35. The user configures language servers on the Language servers page (`/lan
 
 ## Pod metrics
 
-The pods page (`/pods`) shows each sandbox pod's live memory and CPU use from the cluster's metrics API (metrics-server). smelt's service account needs `get`/`list` on `pods` in the `metrics.k8s.io` group for that; `k8s/smelt-park-rbac.yaml` grants it in both namespaces.
+The Sandboxes page (`/pods`) shows each sandbox pod's live memory and CPU use from the cluster's metrics API (metrics-server). smelt's service account needs `get`/`list` on `pods` in the `metrics.k8s.io` group for that; `k8s/smelt-park-rbac.yaml` grants it in both namespaces.
 - **The local k3s** picks it up when the `k3s-bootstrap` compose service runs, so run `docker compose up` (or `docker compose run --rm k3s-bootstrap`) from the host after pulling the change.
 - **Another cluster** needs the manifest applied there.
 
