@@ -451,6 +451,22 @@ pub async fn sandbox_terminal_pod_id(
         .await
 }
 
+/// The conversation whose pod `terminal_id` is in, if it exists: the tools
+/// only act on the calling conversation's terminals (SME-51 B2).
+pub async fn terminal_conversation_id(
+    pool: &PgPool,
+    terminal_id: i64,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT p.conversation_id FROM sandbox_terminals t
+           JOIN sandbox_pods p ON p.id = t.pod_id
+          WHERE t.id = $1",
+    )
+    .bind(terminal_id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// Resolves which conversation's `events::publish` bus a pod-scoped call
 /// (`terminate_pod`, `create_terminal`, `terminate_terminal`, crash
 /// cleanup) should target — see
