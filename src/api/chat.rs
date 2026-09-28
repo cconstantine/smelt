@@ -879,6 +879,7 @@ pub(crate) fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<
 /// fresh lock and then fails, since the conversation no longer exists.
 #[cfg(feature = "server")]
 fn forget_conversation_lock(conversation_id: i64) {
+    remember_turn_error(conversation_id, None);
     CONVERSATION_LOCKS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1348,21 +1349,47 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     }
     // The user writing again ends any pause from an earlier stop.
     resume_turns(id);
+    remember_turn_error(id, None);
     let new_message = anthropic::AnthropicMessage {
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text: content }],
     };
     tokio::spawn(async move {
         if let Err(e) = run_turn(&pool, id, new_message, None).await {
-            crate::events::publish(
-                id,
-                crate::events::ConversationEvent::TurnError {
-                    message: chat_error_text(&e),
-                },
-            );
+            let message = chat_error_text(&e);
+            if message != TURN_STOPPED {
+                remember_turn_error(id, Some(message.clone()));
+            }
+            crate::events::publish(id, crate::events::ConversationEvent::TurnError { message });
         }
     });
     Ok(())
+}
+
+/// Each conversation's last failed turn's error, until the user writes
+/// again, for a tab that connects after the `TurnError` event (SME-51 B11).
+#[cfg(feature = "server")]
+static TURN_ERRORS: LazyLock<Mutex<HashMap<i64, String>>> = LazyLock::new(Default::default);
+
+#[cfg(feature = "server")]
+fn remember_turn_error(conversation_id: i64, error: Option<String>) {
+    let mut errors = TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+    match error {
+        Some(error) => errors.insert(conversation_id, error),
+        None => errors.remove(&conversation_id),
+    };
+}
+
+#[cfg(feature = "server")]
+fn last_turn_error(conversation_id: i64) -> Option<String> {
+    TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).get(&conversation_id).cloned()
+}
+
+/// The conversation's last failed turn's error, if the user hasn't written
+/// since: the reconnect pull's copy of `ConversationEvent::TurnError`.
+#[get("/api/conversations/{id}/turn-error")]
+pub async fn get_turn_error(id: i64) -> ServerFnResult<Option<String>> {
+    Ok(last_turn_error(id))
 }
 
 /// The user's Stop button: ends this conversation's running turn, and
@@ -4085,6 +4112,29 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         stop_turn_now(stopped.id);
         assert_eq!(next_turn_error(&mut rx).await.as_deref(), Some(TURN_STOPPED));
+    }
+
+    /// SME-51 B11: a failed turn's error was only an event, so a tab that
+    /// reloaded (or connected) afterwards showed a message with no reply
+    /// and no reason. The last error is kept for the reconnect pull, and
+    /// the user's next message clears it.
+    #[sqlx::test]
+    async fn test_a_turn_error_is_still_there_after_a_reload(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation_with_id(&pool, 9_100_000_014)
+            .await
+            .expect("create conversation");
+        start_mock_upstream_failing_n_times(0, None).await;
+        let mut rx = events::subscribe(conversation.id);
+        start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
+        next_turn_error(&mut rx).await.expect("a TurnError");
+        let kept = last_turn_error(conversation.id).expect("the error is kept");
+        assert!(kept.contains("error parsing tool call"), "got: {kept}");
+
+        start_hanging_mock_upstream().await;
+        start_turn(pool.clone(), conversation.id, "again".to_string()).await.expect("send");
+        assert_eq!(last_turn_error(conversation.id), None, "the next message clears it");
+        stop_turn_now(conversation.id);
     }
 
     async fn next_turn_error(

@@ -30,7 +30,7 @@ use crate::api::chat::{
 #[cfg(feature = "web")]
 use crate::api::chat::{
     get_context_usage, get_reply_in_progress, get_sandbox_state, get_tasks, get_todos,
-    get_turn_state, subscribe_conversation_events,
+    get_turn_error, get_turn_state, subscribe_conversation_events,
 };
 #[cfg(feature = "web")]
 use crate::api::browsing::{get_browsing_state, subscribe_browser_frames};
@@ -2980,9 +2980,15 @@ fn ChatPanel(
     let stop = move |_| {
         let Some(id) = selected() else { return };
         // "Stopped." comes from the notice the stop saves, in every tab and
-        // after a reload (SME-51 B10).
+        // after a reload (SME-51 B10); a stop that fails says so (B11).
         spawn(async move {
-            let _ = crate::api::chat::stop_turn(id).await;
+            if let Err(e) = crate::api::chat::stop_turn(id).await
+                && selected() == Some(id)
+            {
+                stream_errors
+                    .write()
+                    .insert(id, format!("Couldn't stop the turn: {}", server_error_message(&e)));
+            }
         });
     };
     // Set when a background wake-up (a terminal command finishing with no
@@ -3023,8 +3029,14 @@ fn ChatPanel(
     let mut request_pod_stop = move |pod_id: i64| {
         if pending_pod_stop() == Some(pod_id) {
             pending_pod_stop.set(None);
+            let conversation = selected();
             spawn(async move {
-                match crate::api::pods::stop_pod(pod_id).await {
+                let result = crate::api::pods::stop_pod(pod_id).await;
+                // Not onto another conversation's panel (SME-51 B11).
+                if selected() != conversation {
+                    return;
+                }
+                match result {
                     Ok(()) => pod_stop_error.set(None),
                     Err(e) => pod_stop_error.set(Some(server_error_message(&e))),
                 }
@@ -3190,6 +3202,16 @@ fn ChatPanel(
             turn_running.set(false);
             streaming_reply.set(None);
             context_usage.set(None);
+            // The rest of what belonged to the conversation left (SME-51 B11).
+            messages.set(Vec::new());
+            load_error.set(None);
+            turn_elapsed.set(0);
+            pending_pod_stop.set(None);
+            pod_stop_error.set(None);
+            context_detail.set(None);
+            context_detail_open.set(false);
+            address_pending.set(false);
+            address_draft.set(String::new());
 
             let handle = spawn(async move {
                 loop {
@@ -3227,6 +3249,11 @@ fn ChatPanel(
                         }
                         if let Ok(reply) = get_reply_in_progress(id).await {
                             streaming_reply.set(reply);
+                        }
+                        // A turn that failed before this tab connected
+                        // (SME-51 B11).
+                        if let Ok(Some(error)) = get_turn_error(id).await {
+                            stream_errors.write().insert(id, error);
                         }
                         // Kept last: the browser tests take this request
                         // completing as the sign the client is live.
@@ -3436,8 +3463,12 @@ fn ChatPanel(
     let mut open_context_detail = move || {
         let Some(id) = selected() else { return };
         context_detail_open.set(true);
+        // Not the last snapshot, possibly another conversation's (SME-51 B11).
+        context_detail.set(None);
         spawn(async move {
-            if let Ok(detail) = get_context_detail(id).await {
+            if let Ok(detail) = get_context_detail(id).await
+                && selected() == Some(id)
+            {
                 context_detail.set(Some(detail));
             }
         });
@@ -3600,7 +3631,12 @@ fn ChatPanel(
                                             address_pending.set(true);
                                             address_error.set(None);
                                             spawn(async move {
-                                                match navigate_browser(id, address).await {
+                                                let result = navigate_browser(id, address).await;
+                                                // Not onto another conversation's bar (SME-51 B11).
+                                                if selected() != Some(id) {
+                                                    return;
+                                                }
+                                                match result {
                                                     Ok(()) => address_editing.set(false),
                                                     Err(e) => address_error.set(Some(server_error_message(&e))),
                                                 }
