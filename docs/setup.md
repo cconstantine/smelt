@@ -137,7 +137,7 @@ startup just like an unset one.
 At startup, smelt adds any built-in MCP server that isn't configured yet, matched by name (`mcp::ensure_default_servers`). Today that's one: **`exa`**, Exa's hosted MCP server at `https://mcp.exa.ai/mcp?tools=web_search_exa`, which gives the model web search (`mcp__exa__web_search_exa`) with no account or key. The `tools=` parameter limits it to search, so reading a page stays with `webfetch`/`http_request`.
 
 - **Keyless by default.** Exa's free, rate-limited mode. Its limits aren't published; going over them comes back as a tool error. To lift them, add an `x-api-key` header with an Exa key to the entry on `/mcp-servers`.
-- **Edits are kept.** Only the name is matched, so a changed URL, an added header or a switch to OAuth survives restarts.
+- **Edits are kept.** Only the name is matched, so a changed URL or an added header survives restarts.
 - **Deleting doesn't stick.** A deleted entry comes back on the next start. To turn search off, change its URL or tool list instead.
 - **Search queries go to Exa**, unauthenticated in keyless mode.
 
