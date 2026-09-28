@@ -11,6 +11,12 @@
 //! - When the stream ends, every pending request fails with `Closed`, and
 //!   so does every later one: the client is broken, and its owner
 //!   reconnects.
+//!
+//! It's smelt's own rather than async-lsp, which pins an older lsp-types,
+//! uses the futures I/O traits rather than tokio's, and can't send
+//! `$/cancelRequest` for a request that times out. Messages stay JSON
+//! values: the operations read a few fields of each answer, and servers
+//! differ in which optional shapes they send.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -30,8 +36,6 @@ pub enum LspError {
     Closed,
     /// The server answered with an error.
     Server { code: i64, message: String },
-    /// The answer wasn't the shape the request expects.
-    Decode(String),
 }
 
 impl std::fmt::Display for LspError {
@@ -40,7 +44,6 @@ impl std::fmt::Display for LspError {
             LspError::Timeout(after) => write!(f, "the language server didn't answer within {}s", after.as_secs()),
             LspError::Closed => write!(f, "the language server's connection closed (it stopped or crashed)"),
             LspError::Server { code, message } => write!(f, "the language server refused ({code}): {message}"),
-            LspError::Decode(e) => write!(f, "the language server's answer couldn't be read: {e}"),
         }
     }
 }
@@ -160,17 +163,6 @@ impl LspClient {
         }
     }
 
-    /// A typed `request`.
-    pub async fn request_typed<R: lsp_types::request::Request>(
-        &self,
-        params: R::Params,
-        timeout: Duration,
-    ) -> Result<R::Result, LspError> {
-        let params = serde_json::to_value(params).map_err(|e| LspError::Decode(e.to_string()))?;
-        let result = self.request(R::METHOD, params, timeout).await?;
-        serde_json::from_value(result).map_err(|e| LspError::Decode(e.to_string()))
-    }
-
     /// Sends a notification.
     pub async fn notify(&self, method: &str, params: Value) -> Result<(), LspError> {
         if self.is_closed() {
@@ -186,11 +178,6 @@ impl LspClient {
         })
     }
 
-    /// A typed `notify`.
-    pub async fn notify_typed<N: lsp_types::notification::Notification>(&self, params: N::Params) -> Result<(), LspError> {
-        let params = serde_json::to_value(params).map_err(|e| LspError::Decode(e.to_string()))?;
-        self.notify(N::METHOD, params).await
-    }
 }
 
 /// Removes a request from the pending list when its caller stops waiting,

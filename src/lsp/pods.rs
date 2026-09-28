@@ -329,6 +329,21 @@ pub async fn stop_everywhere_with(client: &kube::Client, name: &str) -> Result<(
     Ok(())
 }
 
+/// Deletes server `name`'s pod for `conversation_id` (to restart it with
+/// newer settings).
+pub async fn stop_everywhere_in(client: &kube::Client, conversation_id: i64, name: &str) -> Result<(), String> {
+    let pods = crate::sandbox::pods_api(client);
+    let selector = kube::api::ListParams::default()
+        .labels(&format!("{LSP_SERVER_LABEL}={name},{LSP_OF_LABEL}={conversation_id}"));
+    for pod in pods.list(&selector).await.map_err(|e| e.to_string())? {
+        if let Some(pod_name) = pod.metadata.name {
+            pods.delete(&pod_name, &crate::sandbox::pod_delete_params()).await.map_err(|e| e.to_string())?;
+            wait_gone(&pods, &pod_name).await?;
+        }
+    }
+    Ok(())
+}
+
 /// A running server's stdin and stdout, over `pods/exec` into its pod.
 pub struct ServerIo {
     pub stdin: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,

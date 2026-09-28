@@ -131,11 +131,6 @@ url = { version = "2", optional = true }
 # registration, PKCE, refresh) — see SME-16. Pulls
 # in the `oauth2` crate transitively; no separate direct dependency needed
 # since smelt only touches rmcp's re-exports of it.
-# The Language Server Protocol's types, for src/lsp/ (SME-35). The client
-# itself is smelt's own (src/lsp/client.rs), not async-lsp: that pins an
-# older lsp-types, uses the futures I/O traits rather than tokio's, and
-# can't send `$/cancelRequest` for a request that times out.
-lsp-types = { version = "0.97", optional = true }
 # The language server catalog lookup (src/lsp/catalog.rs, SME-35): mason's
 # package.yaml files and Helix's languages.toml. serde_yaml is deprecated;
 # serde_norway is its maintained fork.
@@ -181,7 +176,6 @@ server = [
     "dep:chromiumoxide",
     "dep:url",
     "dep:ssh-key",
-    "dep:lsp-types",
     "dep:serde_norway",
     "dep:toml",
 ]
