@@ -383,108 +383,121 @@ pub async fn operate(
         ops::format_locations(&result, &mut |p, l| files.get(p).and_then(|lines| lines.get(l as usize).cloned()))
     };
 
-    match operation {
-        Operation::Definition | Operation::Implementation | Operation::References => {
-            let mut params = position()?;
-            let method = match operation {
-                Operation::Definition => "textDocument/definition",
-                Operation::Implementation => "textDocument/implementation",
-                _ => {
-                    params["context"] = json!({"includeDeclaration": true});
-                    "textDocument/references"
+    let answer = 'answer: {
+        match operation {
+            Operation::Definition | Operation::Implementation | Operation::References => {
+                let mut params = position()?;
+                let method = match operation {
+                    Operation::Definition => "textDocument/definition",
+                    Operation::Implementation => "textDocument/implementation",
+                    _ => {
+                        params["context"] = json!({"includeDeclaration": true});
+                        "textDocument/references"
+                    }
+                };
+                let result = request(method, params).await?;
+                let files = source_lines(client, &pod_name, &result).await;
+                format_locations(result, files)
+            }
+            Operation::Hover => ops::format_hover(&request("textDocument/hover", position()?).await?),
+            Operation::DocumentSymbols => {
+                let (path, _, _) = file.as_ref().expect("a path");
+                let result = request("textDocument/documentSymbol", json!({"textDocument": {"uri": session::file_uri(path)}})).await?;
+                ops::format_symbols(&result, &mut |_, _| None)
+            }
+            Operation::WorkspaceSymbols => {
+                let query = input.query.clone().unwrap_or_default();
+                let result = request("workspace/symbol", json!({"query": query})).await?;
+                ops::format_symbols(&result, &mut |_, _| None)
+            }
+            Operation::Diagnostics => {
+                let (path, text, version) = file.as_ref().expect("a path");
+                let long_ago = Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
+                let found = session.diagnostics(path, *version, long_ago, Duration::from_secs(5)).await;
+                let lines: Vec<&str> = text.lines().collect();
+                let mut listed = ops::format_diagnostics(&found.items, &mut |l| lines.get(l as usize).map(|s| s.to_string()), false);
+                if found.items.is_empty() {
+                    listed = "No problems.".to_string();
                 }
-            };
-            let result = request(method, params).await?;
-            let files = source_lines(client, &pod_name, &result).await;
-            Ok(format_locations(result, files))
-        }
-        Operation::Hover => Ok(ops::format_hover(&request("textDocument/hover", position()?).await?)),
-        Operation::DocumentSymbols => {
-            let (path, _, _) = file.as_ref().expect("a path");
-            let result = request("textDocument/documentSymbol", json!({"textDocument": {"uri": session::file_uri(path)}})).await?;
-            Ok(ops::format_symbols(&result, &mut |_, _| None))
-        }
-        Operation::WorkspaceSymbols => {
-            let query = input.query.clone().unwrap_or_default();
-            let result = request("workspace/symbol", json!({"query": query})).await?;
-            Ok(ops::format_symbols(&result, &mut |_, _| None))
-        }
-        Operation::Diagnostics => {
-            let (path, text, version) = file.as_ref().expect("a path");
-            let long_ago = Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
-            let found = session.diagnostics(path, *version, long_ago, Duration::from_secs(5)).await;
-            let lines: Vec<&str> = text.lines().collect();
-            let mut listed = ops::format_diagnostics(&found.items, &mut |l| lines.get(l as usize).map(|s| s.to_string()), false);
-            if found.items.is_empty() {
-                listed = "No problems.".to_string();
-            }
-            if !found.complete {
-                listed.push_str("\n(The server may still be indexing; the list may be incomplete.)");
-            }
-            Ok(listed)
-        }
-        Operation::IncomingCalls | Operation::OutgoingCalls => {
-            let items = request("textDocument/prepareCallHierarchy", position()?).await?;
-            let Some(item) = items.as_array().and_then(|i| i.first()).cloned() else {
-                return Ok("Nothing callable there.".to_string());
-            };
-            let (method, key) = if operation == Operation::IncomingCalls {
-                ("callHierarchy/incomingCalls", "from")
-            } else {
-                ("callHierarchy/outgoingCalls", "to")
-            };
-            let calls = request(method, json!({"item": item})).await?;
-            let targets: Vec<Value> = calls
-                .as_array()
-                .map(|calls| {
-                    calls
-                        .iter()
-                        .filter_map(|call| call.get(key))
-                        .map(|target| json!({"uri": target["uri"], "range": target["selectionRange"], "name": target["name"]}))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if targets.is_empty() {
-                return Ok(format!("No {} calls.", if key == "from" { "incoming" } else { "outgoing" }));
-            }
-            let targets = Value::Array(targets);
-            let files = source_lines(client, &pod_name, &targets).await;
-            Ok(format_locations(targets, files))
-        }
-        Operation::Rename => {
-            let new_name = input.new_name.clone().ok_or("rename needs a new_name.")?;
-            let mut params = position()?;
-            params["newName"] = json!(new_name);
-            let edit = request("textDocument/rename", params).await?;
-            let files = ops::workspace_edit_files(&edit)?;
-            if files.is_empty() {
-                return Ok("Nothing to rename there.".to_string());
-            }
-            // Every file first, so none is written if one can't be.
-            let mut planned = Vec::new();
-            for (path, edits) in &files {
-                let current = read_in_pod(client, &pod_name, path).await?;
-                if let Some(seen) = session.synced_text(path)
-                    && seen != current
-                {
-                    return Err(format!("{path} changed since the server last saw it; nothing was renamed. Try again."));
+                if !found.complete {
+                    listed.push_str(&format!("\n({} is still working, indexing or checking; the list may be incomplete.)", config.name));
                 }
-                let updated = ops::apply_text_edits(&current, edits)?;
-                planned.push((path.clone(), current, updated, edits.len()));
+                listed
             }
-            let mut report = Vec::new();
-            for (path, current, updated, count) in planned {
-                write_in_pod(client, &pod_name, &path, &updated, &sha256(&current)).await?;
-                let _ = session.sync(&path, &updated).await;
-                report.push(format!("{path} ({count} edit{})", if count == 1 { "" } else { "s" }));
+            Operation::IncomingCalls | Operation::OutgoingCalls => {
+                let items = request("textDocument/prepareCallHierarchy", position()?).await?;
+                let Some(item) = items.as_array().and_then(|i| i.first()).cloned() else {
+                    break 'answer "Nothing callable there.".to_string();
+                };
+                let (method, key) = if operation == Operation::IncomingCalls {
+                    ("callHierarchy/incomingCalls", "from")
+                } else {
+                    ("callHierarchy/outgoingCalls", "to")
+                };
+                let calls = request(method, json!({"item": item})).await?;
+                let targets: Vec<Value> = calls
+                    .as_array()
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .filter_map(|call| call.get(key))
+                            .map(|target| json!({"uri": target["uri"], "range": target["selectionRange"], "name": target["name"]}))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if targets.is_empty() {
+                    break 'answer format!("No {} calls.", if key == "from" { "incoming" } else { "outgoing" });
+                }
+                let targets = Value::Array(targets);
+                let files = source_lines(client, &pod_name, &targets).await;
+                format_locations(targets, files)
             }
-            Ok(format!(
-                "Renamed to {new_name} in {} file{}:\n{}\nRead a file again before editing it.",
-                report.len(),
-                if report.len() == 1 { "" } else { "s" },
-                report.join("\n")
-            ))
+            Operation::Rename => {
+                let new_name = input.new_name.clone().ok_or("rename needs a new_name.")?;
+                let mut params = position()?;
+                params["newName"] = json!(new_name);
+                let edit = request("textDocument/rename", params).await?;
+                let files = ops::workspace_edit_files(&edit)?;
+                if files.is_empty() {
+                    break 'answer "Nothing to rename there.".to_string();
+                }
+                // Every file first, so none is written if one can't be.
+                let mut planned = Vec::new();
+                for (path, edits) in &files {
+                    let current = read_in_pod(client, &pod_name, path).await?;
+                    if let Some(seen) = session.synced_text(path)
+                        && seen != current
+                    {
+                        return Err(format!("{path} changed since the server last saw it; nothing was renamed. Try again."));
+                    }
+                    let updated = ops::apply_text_edits(&current, edits)?;
+                    planned.push((path.clone(), current, updated, edits.len()));
+                }
+                let mut report = Vec::new();
+                for (path, current, updated, count) in planned {
+                    write_in_pod(client, &pod_name, &path, &updated, &sha256(&current)).await?;
+                    let _ = session.sync(&path, &updated).await;
+                    report.push(format!("{path} ({count} edit{})", if count == 1 { "" } else { "s" }));
+                }
+                format!(
+                    "Renamed to {new_name} in {} file{}:\n{}\nRead a file again before editing it.",
+                    report.len(),
+                    if report.len() == 1 { "" } else { "s" },
+                    report.join("\n")
+                )
+            }
         }
+    };
+    Ok(note_indexing(answer, session.is_indexing(), &config.name))
+}
+
+/// An empty answer from a server that's still indexing may just be early:
+/// it says so.
+fn note_indexing(answer: String, indexing: bool, server: &str) -> String {
+    if indexing && answer.starts_with("No") {
+        format!("{answer}\n({server} is still indexing; try again shortly.)")
+    } else {
+        answer
     }
 }
 
@@ -522,7 +535,7 @@ async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::C
         format!("{} reports:\n{listed}", config.name)
     };
     if !found.complete {
-        out.push_str("\n(It may still be indexing; the list may be incomplete.)");
+        out.push_str("\n(It's still working, indexing or checking; the list may be incomplete. The lsp tool's diagnostics operation shows the latest.)");
     }
     Some(out)
 }
@@ -546,6 +559,16 @@ mod tests {
             ]
         );
         assert!(marker_candidates("/etc/passwd", &markers).is_empty());
+    }
+
+    #[test]
+    fn an_empty_answer_while_indexing_says_so() {
+        assert_eq!(
+            note_indexing("No results.".to_string(), true, "rust-analyzer"),
+            "No results.\n(rust-analyzer is still indexing; try again shortly.)"
+        );
+        assert_eq!(note_indexing("No results.".to_string(), false, "rust-analyzer"), "No results.");
+        assert_eq!(note_indexing("/workspace/a.rs:1:1  fn a()".to_string(), true, "rust-analyzer"), "/workspace/a.rs:1:1  fn a()");
     }
 
     #[test]

@@ -721,6 +721,15 @@ fn tool_summary(name: &str, input: &serde_json::Value) -> String {
         }
         "cancel_task" => "Cancelled a background task".to_string(),
         "write_task_stdin" => "Sent input to a background task".to_string(),
+        "lsp_servers" => "Listed the language servers".to_string(),
+        "start_language_server" => format!("Started {}", field("name")),
+        "lsp" => match field("operation").as_str() {
+            "workspace_symbols" => format!("Searched symbols for `{}`", field("query")),
+            "document_symbols" => format!("Listed the symbols in {}", field("path")),
+            "diagnostics" => format!("Checked {} for problems", field("path")),
+            "rename" => format!("Renamed a symbol to {}", field("new_name")),
+            operation => format!("Looked up {} at {}:{}", operation.replace('_', " "), field("path"), field("line")),
+        },
         other => format!("Used {other}"),
     }
 }
@@ -2157,6 +2166,20 @@ mod tests {
         assert_eq!(tool_summary("mcp__github__create_issue", &serde_json::json!({})), "Used create_issue (github)");
         assert_eq!(tool_summary("add", &serde_json::json!({"a": 2, "b": 3})), "Added 2 and 3");
         assert_eq!(tool_summary("something_new", &serde_json::json!({})), "Used something_new");
+        assert_eq!(tool_summary("lsp_servers", &serde_json::json!({})), "Listed the language servers");
+        assert_eq!(tool_summary("start_language_server", &serde_json::json!({"name": "pyright"})), "Started pyright");
+        let lsp = |input| tool_summary("lsp", &input);
+        assert_eq!(
+            lsp(serde_json::json!({"operation": "incoming_calls", "path": "/workspace/a.rs", "line": 9, "character": 4})),
+            "Looked up incoming calls at /workspace/a.rs:9"
+        );
+        assert_eq!(lsp(serde_json::json!({"operation": "workspace_symbols", "query": "Square"})), "Searched symbols for `Square`");
+        assert_eq!(lsp(serde_json::json!({"operation": "document_symbols", "path": "/workspace/a.rs"})), "Listed the symbols in /workspace/a.rs");
+        assert_eq!(lsp(serde_json::json!({"operation": "diagnostics", "path": "/workspace/a.rs"})), "Checked /workspace/a.rs for problems");
+        assert_eq!(
+            lsp(serde_json::json!({"operation": "rename", "path": "/workspace/a.rs", "line": 4, "new_name": "sum_areas"})),
+            "Renamed a symbol to sum_areas"
+        );
     }
 
     /// SME-40 F2: the frame now scales to fit the panel, so a click on
