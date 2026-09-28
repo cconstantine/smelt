@@ -1617,21 +1617,31 @@ fn decide_pod_death_reason(pod: Option<Pod>) -> Option<Option<String>> {
     let Some(pod) = pod else {
         return Some(None); // pod object gone entirely — confirmed dead, nothing left to inspect
     };
-    let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
-    if phase != Some("Failed") {
-        return None; // Running, Pending, or no status yet — inconclusive, not confirmed either way
+    let status = pod.status.as_ref();
+    // The sandbox container's status: by name, or the only one (tests'
+    // pods, and pods from before the Docker sidecar, have just it).
+    let sandbox = status.and_then(|s| s.container_statuses.as_ref()).and_then(|statuses| {
+        statuses
+            .iter()
+            .find(|cs| cs.name == "sandbox")
+            .or_else(|| statuses.first())
+    });
+    let current_end = sandbox
+        .and_then(|cs| cs.state.as_ref())
+        .and_then(|s| s.terminated.as_ref());
+    let phase = status.and_then(|s| s.phase.as_deref());
+    // Dead when the pod has failed, or when the sandbox container has
+    // ended while the Docker sidecar keeps the pod Running as dockerd
+    // shuts down (SME-51 B9). Anything else is inconclusive.
+    if phase != Some("Failed") && current_end.is_none() {
+        return None;
     }
 
-    let container_terminated_reason = pod
-        .status
-        .as_ref()
-        .and_then(|s| s.container_statuses.as_ref())
-        .and_then(|statuses| statuses.first())
-        .and_then(|cs| {
-            cs.state
-                .as_ref()
+    let container_terminated_reason = current_end
+        .or_else(|| {
+            sandbox
+                .and_then(|cs| cs.last_state.as_ref())
                 .and_then(|s| s.terminated.as_ref())
-                .or_else(|| cs.last_state.as_ref().and_then(|s| s.terminated.as_ref()))
         })
         .and_then(|t| t.reason.clone());
 
@@ -4061,6 +4071,34 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    /// SME-51 B9: since the Docker sidecar (SME-33) the pod stays Running
+    /// after the sandbox container is killed, while dockerd shuts down. The
+    /// sandbox container's own end is the death, with its reason.
+    #[test]
+    fn test_decide_pod_death_reason_sandbox_container_ended_while_the_sidecar_runs() {
+        let pod = Pod {
+            status: Some(PodStatus {
+                phase: Some("Running".to_string()),
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "sandbox".to_string(),
+                    state: Some(terminated(Some("OOMKilled"))),
+                    ..Default::default()
+                }]),
+                init_container_statuses: Some(vec![ContainerStatus {
+                    name: "docker".to_string(),
+                    state: Some(ContainerState {
+                        running: Some(Default::default()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(decide_pod_death_reason(Some(pod)), Some(Some("OOMKilled".to_string())));
     }
 
     #[test]
