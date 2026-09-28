@@ -209,16 +209,25 @@ fn connect_in_background(client: &kube::Client, pod_name: &str, config: &Languag
     });
 }
 
+/// `text`, read from `path` with one byte past `MAX_FILE_BYTES` asked
+/// for, if it fits: a larger file isn't sent cut short.
+fn within_limit(path: &str, text: String) -> Result<String, String> {
+    if text.len() > MAX_FILE_BYTES {
+        return Err(format!("{path} is over 1 MiB; language servers aren't sent files that large."));
+    }
+    Ok(text)
+}
+
 /// `path`'s contents, read in the server's pod.
 async fn read_in_pod(client: &kube::Client, pod_name: &str, path: &str) -> Result<String, String> {
-    let limit = MAX_FILE_BYTES.to_string();
+    let limit = (MAX_FILE_BYTES + 1).to_string();
     let result = crate::sandbox::exec_with(client, pod_name, "server", &["head", "-c", &limit, "--", path], None)
         .await
         .map_err(|e| e.to_string())?;
     if result.exit_code != 0 {
         return Err(format!("Couldn't read {path}: {}", result.stderr.trim()));
     }
-    Ok(result.stdout)
+    within_limit(path, result.stdout)
 }
 
 /// Replaces `path` with `content` in the server's pod, if it still has the
@@ -660,6 +669,15 @@ mod tests {
             partial_rename_error("x", &[], "/workspace/a.rs", "/workspace/a.rs changed while it was being renamed", &[]),
             "The rename to x was refused: /workspace/a.rs changed while it was being renamed. Nothing was changed."
         );
+    }
+
+    #[test]
+    fn a_file_over_the_limit_is_refused_rather_than_cut_short() {
+        assert!(within_limit("/workspace/a.rs", "a".repeat(MAX_FILE_BYTES)).is_ok());
+        let Err(error) = within_limit("/workspace/big.rs", "a".repeat(MAX_FILE_BYTES + 1)) else {
+            panic!("a file over the limit should be refused");
+        };
+        assert!(error.contains("/workspace/big.rs") && error.contains("1 MiB"), "{error}");
     }
 
     #[test]
