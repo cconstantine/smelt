@@ -131,6 +131,11 @@ url = { version = "2", optional = true }
 # registration, PKCE, refresh) — see SME-16. Pulls
 # in the `oauth2` crate transitively; no separate direct dependency needed
 # since smelt only touches rmcp's re-exports of it.
+# The language server catalog lookup (src/lsp/catalog.rs, SME-35): mason's
+# package.yaml files and Helix's languages.toml. serde_yaml is deprecated;
+# serde_norway is its maintained fork.
+serde_norway = { version = "0.9", optional = true }
+toml = { version = "1", optional = true }
 rmcp = { version = "3.1.2", default-features = false, features = ["client", "server", "reqwest", "transport-streamable-http-client-reqwest", "transport-streamable-http-server", "auth"], optional = true }
 
 # For src/git.rs: generating ed25519 SSH keys and parsing imported ones
@@ -171,6 +176,8 @@ server = [
     "dep:chromiumoxide",
     "dep:url",
     "dep:ssh-key",
+    "dep:serde_norway",
+    "dep:toml",
 ]
 # Separate from `server` so the default `cargo test --features server` loop
 # stays exactly as fast as it is today — src/browser_tests.rs's one
@@ -198,3 +205,8 @@ required-features = ["server"]
 name = "sandbox_image_import"
 path = "src/bin/sandbox_image_import.rs"
 required-features = ["server"]
+
+[dev-dependencies]
+# Paused time in tests (`#[tokio::test(start_paused = true)]`), for timeouts
+# too long to wait out (SME-35's 120 s `initialize`).
+tokio = { version = "1", features = ["test-util"] }

@@ -29,9 +29,21 @@ pub struct PodOverview {
     /// installed) or has no numbers for this pod yet.
     pub usage: Option<PodUsage>,
     pub terminals: i64,
+    /// The language servers running next to it (SME-35).
+    pub language_servers: Vec<ServerPodOverview>,
     /// The database's clock when this was read; ages are measured against
     /// it, not the browser's clock.
     pub observed_at: NaiveDateTime,
+}
+
+/// A language server's pod, next to a sandbox pod.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ServerPodOverview {
+    pub name: String,
+    /// `installing`, `ready`, or `stopped (OOMKilled)`.
+    pub state: String,
+    pub memory_limit: Option<String>,
+    pub usage: Option<PodUsage>,
 }
 
 /// A pod's current resource use, from the cluster's metrics API. Lags
@@ -199,10 +211,44 @@ pub(crate) async fn pod_overviews(pool: &sqlx::PgPool) -> Result<Vec<PodOverview
             cpu_limit: sum_cpu_limits(&details.cpu_limits),
             usage: usage.get(&crate::sandbox::kubernetes_pod_name(row.pod_id)).cloned(),
             terminals: row.live_terminals,
+            language_servers: server_overviews(row.conversation_id, row.pod_id, &usage).await,
             observed_at: row.observed_at,
         });
     }
     Ok(overviews)
+}
+
+/// The language servers next to sandbox pod `pod_id`; none when the
+/// cluster can't be asked.
+#[cfg(feature = "server")]
+async fn server_overviews(
+    conversation_id: i64,
+    pod_id: i64,
+    usage: &std::collections::HashMap<String, PodUsage>,
+) -> Vec<ServerPodOverview> {
+    use crate::lsp::pods::{self, ServerState};
+    let servers = match pods::list_with(&crate::sandbox::kube_client(), conversation_id).await {
+        Ok(servers) => servers,
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't list language server pods");
+            return Vec::new();
+        }
+    };
+    servers
+        .into_iter()
+        .filter(|server| server.pod_name == pods::server_pod_name(pod_id, &server.name))
+        .map(|server| ServerPodOverview {
+            state: match &server.state {
+                ServerState::Installing => "installing".to_string(),
+                ServerState::Ready => "ready".to_string(),
+                ServerState::Stopped(Some(reason)) => format!("stopped ({reason})"),
+                ServerState::Stopped(None) => "stopped".to_string(),
+            },
+            usage: usage.get(&server.pod_name).cloned(),
+            memory_limit: server.memory_limit,
+            name: server.name,
+        })
+        .collect()
 }
 
 #[get("/api/pods")]

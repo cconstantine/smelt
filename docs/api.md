@@ -152,6 +152,7 @@ pub enum ConversationEvent {
 - **From Kubernetes:** the pod object's phase and limits (`sandbox::pod_details`), and live use from one metrics list (`sandbox::pod_metrics_list`, `metrics.k8s.io/v1beta1`).
   - Reading metrics needs `get`/`list` on `pods` in the `metrics.k8s.io` group (`k8s/smelt-park-rbac.yaml`). Without it, or if the metrics call fails for any other reason, every pod's `usage` is `None` and the rest of the view still works.
   - Quantities are parsed by `parse_cpu_nanocores`/`parse_memory_bytes`, and CPU is summed across containers in nanocores.
+- **Language servers** (`language_servers`): the server pods next to it, each with its state, memory limit and use (SME-35).
 - **`observed_at`:** the database's `now()`, so the page measures ages on the database's clock rather than the browser's.
 
 **Records are kept in step with the cluster.** A pod can vanish while smelt isn't connected to it: a cluster rebuild, a pod deleted outside smelt, one that died while smelt was down. Crash detection only notices a pod with a live connection. So `main()` starts `sandbox::watch_pods`, a Kubernetes watch on smelt's namespace (`kube::runtime::watcher`), which works in this order:
@@ -159,6 +160,7 @@ pub enum ConversationEvent {
 - **Then react to changes.** When a pod is deleted, or reaches `Failed`/`Succeeded`, its record is closed after a grace period (`CLOSE_GRACE`, 30 seconds).
 - **Leave connected pods to crash detection.** `close_if_gone` skips a record that's no longer live, one with a registered connection (crash detection closes the same records but also tells the model), and one whose pod is still running in Kubernetes.
 - **Close quietly.** Commands are marked lost and terminals and the pod closed, publishing the usual events, with no notice to the model: that would move each conversation to the top of the sidebar.
+- **Tell the model when a language server stops.** A server pod that stops on its own (out of memory, crashed) is reported to its conversation once (`lsp::pods::note_server_stop`); one smelt deleted, or already stopped when listed, isn't.
 - **Real servers only.** The browser harness never runs it, since it shares the dev database but uses the test namespace. The 5-minute cut-off also keeps one instance from closing another's brand-new rows.
 
 `stop_pod(pod_id)` (`sandbox::stop_pod_for_user`) tears a pod down whether or not it has terminals, the way a crash does: running commands are marked lost and terminals closed. The model is then told in one notice ("The user stopped sandbox pod N…"), saved between turns. It doesn't wake the model. `get_live_pod_conversations` lists the conversations with a live pod, for the sidebar's dots.
@@ -215,6 +217,10 @@ pub async fn navigate_browser(id: i64, address: String) -> ServerFnResult<()>;
 | `generate_ssh_key` / `import_ssh_key` | `POST /api/git/keys`, `POST /api/git/keys/import` | a new ed25519 key, or a pasted unencrypted OpenSSH private key; installed in running pods at once |
 | `delete_ssh_key` | `DELETE /api/git/keys/{id}` | removed from running pods at once |
 | `forget_repo_trust` | `POST /api/git/trust/forget` | the user is asked again next time the remote is cloned |
+| `list_language_servers` / `get_language_server` | `GET /api/language-servers`, `GET /api/language-servers/{id}` | the Language servers page (SME-35) |
+| `create_language_server` / `update_language_server` | `POST /api/language-servers`, `POST /api/language-servers/{id}` | validated; a rename or disable stops the server's pods |
+| `delete_language_server` | `DELETE /api/language-servers/{id}` | stops its pods everywhere |
+| `lookup_language_server` | `GET /api/language-servers/lookup/{package}` | a suggested config from mason's registry and Helix |
 | `delete_conversation` | `DELETE /api/conversations/{id}` | hard delete; cascades to the conversation's messages (`ON DELETE CASCADE`); also tears down its sandboxes and browsing session, stops its `run_async` tasks, and drops its event channel and turn lock; deleting a nonexistent id is not an error |
 
 Not yet implemented (straightforward mechanical additions when needed): rename a conversation, concurrent-send guarding.

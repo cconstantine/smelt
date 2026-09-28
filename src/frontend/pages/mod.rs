@@ -1,11 +1,13 @@
 mod chat;
 mod git;
+mod language_servers;
 mod mcp_servers;
 mod pods;
 mod sandbox_volumes;
 
 pub use chat::Chat;
 pub use git::GitSettingsPage;
+pub use language_servers::{LanguageServerEdit, LanguageServerNew, LanguageServersIndex};
 pub use mcp_servers::{McpServerEdit, McpServerNew, McpServersIndex};
 pub use pods::PodsIndex;
 pub use sandbox_volumes::{SandboxVolumeNew, SandboxVolumesIndex};

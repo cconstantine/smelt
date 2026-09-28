@@ -1,0 +1,53 @@
+//! The `/language-servers` page's server functions (SME-35).
+
+use dioxus::prelude::*;
+
+use crate::models::{LanguageServer, LanguageServerConfig, LanguageServerSuggestion};
+
+#[cfg(feature = "server")]
+use crate::db;
+
+#[get("/api/language-servers")]
+pub async fn list_language_servers() -> ServerFnResult<Vec<LanguageServer>> {
+    db::list_language_servers(db::get()).await.map_err(ServerFnError::new)
+}
+
+#[get("/api/language-servers/{id}")]
+pub async fn get_language_server(id: i64) -> ServerFnResult<LanguageServer> {
+    db::get_language_server(db::get(), id)
+        .await
+        .map_err(ServerFnError::new)?
+        .ok_or_else(|| ServerFnError::new("That language server no longer exists."))
+}
+
+/// Creates a language server. A server already running for a conversation
+/// isn't affected by later edits until it's restarted.
+#[post("/api/language-servers")]
+pub async fn create_language_server(config: LanguageServerConfig) -> ServerFnResult<LanguageServer> {
+    crate::lsp::config::save(db::get(), None, &config).await.map_err(ServerFnError::new)
+}
+
+/// Saves `id`'s settings. Disabling or renaming it stops its running pods;
+/// other edits reach a running server when it's restarted.
+#[post("/api/language-servers/{id}")]
+pub async fn update_language_server(id: i64, config: LanguageServerConfig) -> ServerFnResult<LanguageServer> {
+    let before = db::get_language_server(db::get(), id).await.map_err(ServerFnError::new)?;
+    let saved = crate::lsp::config::save(db::get(), Some(id), &config).await.map_err(ServerFnError::new)?;
+    crate::lsp::config::stop_servers(crate::lsp::config::servers_to_stop(before.as_ref().map(|s| &s.config), Some(&saved.config))).await;
+    Ok(saved)
+}
+
+/// Suggests a new server's settings from mason's registry and Helix's
+/// languages.toml, fetched now.
+#[get("/api/language-servers/lookup/{package}")]
+pub async fn lookup_language_server(package: String) -> ServerFnResult<LanguageServerSuggestion> {
+    let (registry, helix) = crate::lsp::catalog::sources_from_env();
+    crate::lsp::catalog::lookup(&package, &registry, &helix).await.map_err(ServerFnError::new)
+}
+
+#[delete("/api/language-servers/{id}")]
+pub async fn delete_language_server(id: i64) -> ServerFnResult<()> {
+    let deleted = db::delete_language_server(db::get(), id).await.map_err(ServerFnError::new)?;
+    crate::lsp::config::stop_servers(crate::lsp::config::servers_to_stop(deleted.as_ref().map(|s| &s.config), None)).await;
+    Ok(())
+}
