@@ -1259,6 +1259,8 @@ fn run_turn_bounded<'a>(
     Box::pin(async move {
         let mut stop = stop_receiver(conversation_id);
         let _in_flight = TurnInFlight::start(conversation_id);
+        // Any new turn replaces the last failure (SME-51 code review 1).
+        remember_turn_error(conversation_id, None);
         let unsaved = new_message.clone();
         let saved = Arc::new(std::sync::atomic::AtomicBool::new(false));
         tokio::select! {
@@ -1349,6 +1351,7 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     }
     // The user writing again ends any pause from an earlier stop.
     resume_turns(id);
+    // At once, not only when the turn starts: it may queue behind another.
     remember_turn_error(id, None);
     let new_message = anthropic::AnthropicMessage {
         role: "user".to_string(),
@@ -4135,6 +4138,21 @@ mod tests {
         start_turn(pool.clone(), conversation.id, "again".to_string()).await.expect("send");
         assert_eq!(last_turn_error(conversation.id), None, "the next message clears it");
         stop_turn_now(conversation.id);
+    }
+
+    /// SME-51 code review 1: a turn the user didn't send (a finished
+    /// task's, say) that goes fine replaces an earlier failure; a reload
+    /// mustn't show that error under the newer reply.
+    #[sqlx::test]
+    async fn test_any_new_turn_clears_the_kept_error(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation_with_id(&pool, 9_100_000_015)
+            .await
+            .expect("create conversation");
+        remember_turn_error(conversation.id, Some("an earlier failure".to_string()));
+        start_recording_mock_upstream(vec![text_reply_body("Done.")]).await;
+        run_turn(&pool, conversation.id, hello(), None).await.expect("a background turn");
+        assert_eq!(last_turn_error(conversation.id), None);
     }
 
     async fn next_turn_error(
