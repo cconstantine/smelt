@@ -69,28 +69,63 @@ pub async fn spawn_request_interceptor(
 }
 
 /// The core SSRF check: is `addr` safe to let a request actually connect
-/// to? `false` for loopback/link-local/private (RFC 1918)/unspecified/
-/// multicast — every category of "not really an arbitrary public host."
-/// IPv6 has no stable `is_private()`-equivalent for unique-local
-/// (`fc00::/7`) addresses, so that range is checked manually.
+/// to? Only the public internet is: `false` for loopback, private (RFC
+/// 1918), link-local, CGNAT (`100.64.0.0/10`, which Tailscale uses, so a
+/// homelab tailnet), benchmarking, documentation, reserved and multicast
+/// ranges, in IPv4 and IPv6 (SME-51 B4). An IPv6 address that carries an
+/// IPv4 one (mapped, IPv4-compatible, NAT64, 6to4) is judged by that IPv4
+/// address. `std`'s `is_global` would do this but isn't stable yet.
 pub fn is_safe_fetch_addr(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
             !(v4.is_loopback()
                 || v4.is_link_local()
                 || v4.is_private()
                 || v4.is_unspecified()
-                || v4.is_multicast())
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || a == 0 // "this network"
+                || (a == 100 && (64..128).contains(&b)) // CGNAT
+                || (a == 192 && b == 0 && c == 0) // IETF protocol assignments
+                || (a == 198 && (b == 18 || b == 19)) // benchmarking
+                || a >= 240) // reserved
         }
         IpAddr::V6(v6) => {
-            let is_unique_local = (v6.segments()[0] & 0xfe00) == 0xfc00;
+            if let Some(v4) = embedded_ipv4(v6) {
+                return is_safe_fetch_addr(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || is_unique_local
-                || v6.to_ipv4_mapped().is_some_and(|v4| !is_safe_fetch_addr(IpAddr::V4(v4))))
+                || (first & 0xfe00) == 0xfc00 // unique local
+                || (first & 0xffc0) == 0xfe80 // link-local
+                || (first & 0xffc0) == 0xfec0 // site-local (deprecated)
+                || (first == 0x2001 && v6.segments()[1] == 0x0db8)) // documentation
         }
     }
+}
+
+/// The IPv4 address an IPv6 address stands for, if it's one of the forms
+/// that reach an IPv4 host: mapped (`::ffff:a.b.c.d`), IPv4-compatible
+/// (`::a.b.c.d`), NAT64 (`64:ff9b::/96`) or 6to4 (`2002:aabb:ccdd::/48`).
+fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let s = v6.segments();
+    let tail = std::net::Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
+    let v4_compatible = s[..6].iter().all(|&x| x == 0) && !v6.is_loopback() && !v6.is_unspecified();
+    let nat64 = s[0] == 0x64 && s[1] == 0xff9b && s[2..6].iter().all(|&x| x == 0);
+    if v4_compatible || nat64 {
+        return Some(tail);
+    }
+    if s[0] == 0x2002 {
+        return Some(std::net::Ipv4Addr::new((s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8));
+    }
+    None
 }
 
 /// Whether `host` names "this machine" the way a model writes it —
@@ -176,9 +211,8 @@ pub fn parse_fetch_target(url: &str) -> Result<(String, u16), String> {
 
 /// Test-only convenience: `is_request_allowed_with` against the real
 /// default guard, so a test doesn't have to spell out `is_safe_fetch_addr`
-/// every time. The real caller (`http_request`'s redirect loop) calls
-/// `is_request_allowed_with` directly with whichever predicate that call
-/// was given; browser pages use `check_load` instead.
+/// every time. `http_request` calls `resolve_allowed` itself, to connect
+/// to the addresses it checked; browser pages use `check_load`.
 #[cfg(test)]
 pub async fn is_request_allowed(url: &str) -> bool {
     is_request_allowed_with(url, is_safe_fetch_addr).await
@@ -193,6 +227,7 @@ pub async fn is_request_allowed(url: &str) -> bool {
 /// "does a legitimate request actually get through" needs a relaxed
 /// variant (allowing loopback) while the real default (`is_safe_fetch_addr`)
 /// stays strict.
+#[cfg(test)]
 pub async fn is_request_allowed_with(url: &str, is_addr_allowed: fn(IpAddr) -> bool) -> bool {
     let Ok((host, port)) = parse_fetch_target(url) else {
         return false;
@@ -232,10 +267,13 @@ pub async fn resolve_allowed(
     port: u16,
     is_addr_allowed: fn(IpAddr) -> bool,
 ) -> Result<Vec<std::net::SocketAddr>, String> {
-    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| format!("could not resolve {host}: {e}"))?
-        .collect();
+    let addrs: Vec<std::net::SocketAddr> = match test_dns::lookup(host, port) {
+        Some(addrs) => addrs,
+        None => tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| format!("could not resolve {host}: {e}"))?
+            .collect(),
+    };
     if addrs.is_empty() {
         return Err(format!("{host} resolved to no addresses"));
     }
@@ -243,6 +281,35 @@ pub async fn resolve_allowed(
         return Err(format!("{host} resolves to a refused address ({})", refused.ip()));
     }
     Ok(addrs)
+}
+
+/// Names only `resolve_allowed` knows, for tests that need the guard's
+/// answer to differ from the system resolver's (as a DNS-rebinding name's
+/// would). Always empty outside tests.
+pub mod test_dns {
+    #[cfg(test)]
+    static ENTRIES: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, Vec<std::net::IpAddr>>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    #[cfg(test)]
+    pub fn set(host: &str, addrs: Vec<std::net::IpAddr>) {
+        ENTRIES.lock().unwrap().insert(host.to_string(), addrs);
+    }
+
+    #[cfg(test)]
+    pub(super) fn lookup(host: &str, port: u16) -> Option<Vec<std::net::SocketAddr>> {
+        ENTRIES
+            .lock()
+            .unwrap()
+            .get(host)
+            .map(|ips| ips.iter().map(|ip| std::net::SocketAddr::new(*ip, port)).collect())
+    }
+
+    #[cfg(not(test))]
+    pub(super) fn lookup(_host: &str, _port: u16) -> Option<Vec<std::net::SocketAddr>> {
+        None
+    }
 }
 
 /// Caps `text` to `max_chars`, same shape `fetch_command_summary`'s tail
@@ -323,6 +390,33 @@ mod tests {
     #[test]
     fn test_is_safe_fetch_addr_rejects_ipv4_mapped_private() {
         assert!(!is_safe_fetch_addr("::ffff:127.0.0.1".parse().unwrap()));
+    }
+
+    /// SME-51 B4: every range that isn't the public internet is refused,
+    /// not just the private and local ones: CGNAT (Tailscale's range, so a
+    /// homelab tailnet), IPv6 link-local, benchmarking, reserved and
+    /// documentation ranges, and IPv6 forms that embed a refused IPv4
+    /// address (NAT64, 6to4, IPv4-compatible).
+    #[test]
+    fn test_is_safe_fetch_addr_refuses_every_non_public_range() {
+        for addr in [
+            "100.64.0.1", "100.101.102.103", "100.127.255.254", // CGNAT
+            "192.0.0.8", "192.0.2.1", "198.51.100.7", "203.0.113.9", // IETF, documentation
+            "198.18.0.1", "198.19.255.255", // benchmarking
+            "240.0.0.1", "255.255.255.255", "0.1.2.3", // reserved, broadcast, "this network"
+            "fe80::1", "febf::1", "fec0::1", // link-local, site-local
+            "64:ff9b::a00:1", "64:ff9b::7f00:1", // NAT64 of 10.0.0.1, 127.0.0.1
+            "2002:a00:1::1", "2002:c0a8:101::1", // 6to4 of 10.0.0.1, 192.168.1.1
+            "::a00:1", // IPv4-compatible 10.0.0.1
+            "2001:db8::1", // documentation
+            "::ffff:100.64.0.1", // mapped CGNAT
+        ] {
+            assert!(!is_safe_fetch_addr(addr.parse().unwrap()), "{addr} should be refused");
+        }
+        // Embedding a public IPv4 address is fine.
+        assert!(is_safe_fetch_addr("64:ff9b::101:101".parse().unwrap()), "NAT64 of 1.1.1.1");
+        assert!(is_safe_fetch_addr("2002:101:101::1".parse().unwrap()), "6to4 of 1.1.1.1");
+        assert!(is_safe_fetch_addr("100.63.255.255".parse().unwrap()), "just below CGNAT");
     }
 
     #[test]
