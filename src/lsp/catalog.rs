@@ -210,7 +210,9 @@ fn install(purl: &Purl, source: &Source, bin: &str, notes: &mut Vec<String>) -> 
             with_extras(format!("python -m venv {home}/venv && {home}/venv/bin/pip install {}=={}", purl.path, purl.version)),
             format!("{home}/venv/bin/{bin}"),
         ),
-        "golang" => (format!("go install {}@{}", purl.path, purl.version), format!("{home}/go/bin/{bin}")),
+        // GOBIN: Go's image sets GOPATH to /go, so without it the binary
+        // lands in /go/bin.
+        "golang" => (format!("GOBIN={home}/go/bin go install {}@{}", purl.path, purl.version), format!("{home}/go/bin/{bin}")),
         "cargo" => (
             format!("cargo install {} --version {} --root {home}/cargo", purl.name(), purl.version),
             format!("{home}/cargo/bin/{bin}"),
@@ -453,7 +455,7 @@ mod tests {
     fn test_gopls_is_a_go_install() {
         let c = suggest_for("gopls").config;
         assert_eq!(c.image, "golang:1");
-        assert_eq!(c.install_command, "go install golang.org/x/tools/gopls@v0.23.0");
+        assert_eq!(c.install_command, "GOBIN=/tmp/home/go/bin go install golang.org/x/tools/gopls@v0.23.0");
         assert_eq!(c.command, "/tmp/home/go/bin/gopls");
         assert_eq!(c.file_types.get("go").map(String::as_str), Some("go"));
     }

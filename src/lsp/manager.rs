@@ -972,4 +972,24 @@ impl Shape for Square {
         })
         .await;
     }
+
+    /// gopls, installed with `go install` as the catalog suggests: a
+    /// definition in another file of the package.
+    #[sqlx::test]
+    async fn test_gopls_from_the_catalog_answers(pool: PgPool) {
+        let config = configure(&pool, include_str!("fixtures/mason-gopls.yaml")).await;
+        with_sandbox(|client, sandbox| async move {
+            let main = "/workspace/hello/main.go";
+            write_files(&client, &sandbox, &[
+                ("/workspace/hello/go.mod", "module hello\n\ngo 1.21\n"),
+                ("/workspace/hello/area.go", "package main\n\nfunc area(side float64) float64 {\n\treturn side * side\n}\n"),
+                (main, "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(area(2))\n}\n"),
+            ])
+            .await;
+            start(&pool, &client, &sandbox, &config.name).await.expect("started");
+            let found = until_contains(&pool, &client, &sandbox, Operation::Definition, &at(main, 6, 14), "area.go").await;
+            assert!(found.contains("func area"), "{found}");
+        })
+        .await;
+    }
 }
