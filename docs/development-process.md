@@ -38,6 +38,7 @@ Linear's markdown differs from GitHub's in ways that bite: don't hard-wrap lines
    - **What** is being built and why
    - **Which files** will be created or modified (be specific)
    - **How** it will be implemented: data model, API shape, UI flow
+   - **State model**, for a feature that keeps state (database rows with a status, files in the sandbox, decisions the user makes): each record's states, what moves it between them (the user, the model, a Stop, a restart, a retry, a timeout, another conversation), and who else sees each change (other conversations, other tabs, the pod). For state in the sandbox, say what survives a pod restart and what's lost. The tests then cover each transition, not just the happy path. On SME-32 none of this was written down: a re-clone step was built and then thrown away when the user asked why `/workspace` didn't outlive the pod, and ten code-review rounds found about 45 bugs, most of them transitions nobody had listed (retry, interrupt, trust given from another conversation), several made by the previous round's local fixes.
    - **Open questions or tradeoffs** you are not sure about
 7. Show the plan to the user (link the ticket) and **stop**
 8. **Wait for explicit approval** — a response like "looks good", "yes", or "go ahead". The user may also leave feedback as comments on the ticket.
@@ -121,7 +122,7 @@ Move to the next behavior in the plan. Write the next failing test. Do not skip 
   ```bash
   scripts/check.sh && git commit ...
   ```
-  On SME-41 a commit went in over a failing test because the command ran the tests and then committed regardless; the script is the fix. On SME-33 a commit passed every test and still didn't build: `ListParams` was imported only under `#[cfg(test)]`, so the test build compiled and the server binary didn't. The script now builds the server binary on its own too.
+  On SME-41 a commit went in over a failing test because the command ran the tests and then committed regardless; the script is the fix. The same goes for any command whose result you act on: never end it with something that replaces its exit status (`| tail`, `| grep`, `; echo exit=$?`). Save the output to a file and check the command's own status (`scripts/check.sh > log 2>&1; rc=$?`). On SME-32 a failed image build reported success through a trailing `echo`, and `scripts/check.sh | tail` let a commit through with a build warning. On SME-33 a commit passed every test and still didn't build: `ListParams` was imported only under `#[cfg(test)]`, so the test build compiled and the server binary didn't. The script now builds the server binary on its own too.
   A change to a type the page matches on (a new `ConversationEvent` variant, say) can pass every server test and still break the web build. A commit that doesn't build breaks bisecting, and breaks checking a new test against older code in a separate worktree. On `connection-limits`, one commit added events without the page handling them; only server tests ran between commits, so it went unnoticed until a worktree run of the old code failed to compile.
 - **Flag when a request substantially exceeds the current plan's scope**, rather than silently folding it into the branch already in progress. `sandbox-visibility`'s plan covered a live pod/terminal panel; the branch it shipped on ended up also covering conversation URL routing and extended thinking, neither mentioned in that plan — convenient in the moment, but it left one close-out doc and retrospective covering several unrelated pieces of work instead of one each. Consider whether a substantially-different ask deserves its own idea/plan doc before starting it.
 - **Fix bugs found in already-merged code in their own PR**, even when a review of the current branch is what found them. On `web-browsing`, the SSRF proxy and the Chrome launcher fixed gaps in already-merged `webfetch` but shipped inside the browsing PR, which grew it to 28 files and one close-out doc covering several unrelated changes. A separate PR keeps each fix reviewable on its own and lets it merge without waiting on the feature.
@@ -204,22 +205,30 @@ Process changes follow the same confirm-before-change rule — propose first, up
 ## Keeping Linear current
 
 After each project completes:
-- Replace the ticket's `## Plan` section with `## What shipped` (including anything changed from the plan, and what's not done) and `## Retrospective` (see below)
+- Replace the ticket's `## Plan` section with `## What shipped` (including anything changed from the plan, and what's not done)
 - Update the **Current state** document if features or architecture changed
 - Add or update the project's rows in the **Feature checklist**: what a user can do, and how to check it in the browser
 - File anything left undone that's worth doing as its own Backlog ticket, linked as related
 - Put the ticket id in the PR's title or body
 - Review the PR once it's open (see [Code review](#code-review-after-opening-the-pr))
+- Once the reviews are done, add `## Retrospective` to the ticket (see below), before the PR merges
 - Move the ticket to **Done** once the PR merges
 
 When the user mentions a new idea, create a **Backlog** ticket for it before it is forgotten.
+
+**After a range edit to a Linear ticket or document** (`replace_range`, or replacing a whole section), read it back and compare it against the version from before the edit; sections outside the range should be unchanged. A save's reply can show stale content, so read it again rather than trusting the reply. On SME-32 a `replace_range` on the Current state document silently deleted 11 architecture bullets, restored only because an earlier copy was still in the session.
 
 ---
 
 ## Retrospective (end of each project)
 
 **Close-out (this section plus "Keeping Linear current" above) is a
-gate on opening the project's PR, not a follow-up to do after it merges.**
+gate on merging the project's PR, not a follow-up to do after it merges.**
+What shipped, the Current state document and the Feature checklist come
+before the PR opens. The retrospective comes after the code review
+finishes, since the reviews are often where the most is learned (SME-32's
+ten review rounds were, and a retrospective written before them missed
+it all).
 Do it on the same branch as the implementation, so the close-out commit
 rides along in the same PR — not as a separate direct-to-main commit
 afterward, which is easy to forget entirely once the PR is merged and
@@ -229,7 +238,8 @@ noticed the stale plan file still sitting in the repo — checking
 "did the last thing get closed out" at the *start* of the next project
 relies on remembering to look backward, which is exactly what failed;
 gating it at the point the current project's own PR is created doesn't
-have that failure mode.
+have that failure mode. The same holds for merging: the retrospective is
+the last step before it.
 
 Before considering a project closed, do a short retrospective covering:
 
@@ -249,8 +259,9 @@ Every PR gets a code review once it's open, while CI runs: `/code-review <PR num
 1. **Check each finding before reporting it.** Confirm it against the code (and, where it's cheap, reproduce it) so the report says which findings are real.
 2. **Report the findings and stop.** Give each one a severity, what goes wrong and a suggested fix, and let the user choose what gets fixed. Fixing changes the PR under review, so it waits for their go-ahead.
 3. **Fix on the PR's branch, test-first, one commit per finding.** A failing test first, as in Phase 2; for a finding about a browser's behaviour, a browser-tier scenario shown failing with the fix switched off. A finding in already-merged code gets its own PR (see Rules).
-4. **Review again after fixing.** Fixes change the code, and a second pass looks with fresh eyes. Repeat until a review comes back with nothing the user wants fixed.
+4. **Review again after fixing, at most twice in all.** Fixes change the code, and a second pass looks with fresh eyes. After the second round, only high-severity findings block the merge; report the rest and file each one the user wants as a Backlog ticket, linked as related. SME-32 ran ten rounds, each mostly fixing edges made by the last; a round that keeps finding new edges points to a missing state model (see Phase 1), which another round won't supply.
 5. **Record it in the ticket**: a short code-review part in What shipped listing each finding and its fix.
+6. **Then write the retrospective** (see [Retrospective](#retrospective-end-of-each-project)), covering the reviews too, and only then merge.
 
 On SME-42, the first review found that both new routes could reach the sandbox agent's command WebSocket (any website could have run commands in the sandbox). The project's own real-cluster tests had used that very port as their test server. The second review, after the fixes, found a stalled POST and cross-site requests to the sandbox. None of the four were caught by the tests, the browser tier or the hands-on check.
 

@@ -34,6 +34,10 @@ use crate::api::chat::{
 };
 #[cfg(feature = "web")]
 use crate::api::browsing::{get_browsing_state, subscribe_browser_frames};
+#[cfg(feature = "web")]
+use crate::api::git::list_conversation_repos;
+use crate::api::git::{attach_repo, decide_repo_trust};
+use crate::git::{RepoStatus, RepoSummary};
 use crate::browsing::BrowserInputEvent;
 // Only referenced by this module's own tests, which build their own
 // `SandboxSnapshot`s by hand rather than through `get_sandbox_state`.
@@ -664,6 +668,7 @@ fn tool_summary(name: &str, input: &serde_json::Value) -> String {
         },
         "todowrite" => "Updated the todo list".to_string(),
         "todoread" => "Checked the todo list".to_string(),
+        "clone_repo" => format!("Cloned {}", field("url")),
         "add" => format!("Added {} and {}", field("a"), field("b")),
         "count" => format!("Counted to {}", field("target")),
         "list_tasks" => "Listed background tasks".to_string(),
@@ -673,6 +678,57 @@ fn tool_summary(name: &str, input: &serde_json::Value) -> String {
         "cancel_task" => "Cancelled a background task".to_string(),
         "write_task_stdin" => "Sent input to a background task".to_string(),
         other => format!("Used {other}"),
+    }
+}
+
+/// Where a loaded `AGENTS.md` came from, for the context detail view.
+fn instructions_source(doc: &crate::git::ProjectInstructions) -> String {
+    let commit: String = doc.commit.as_deref().unwrap_or("").chars().take(7).collect();
+    let origin = if commit.is_empty() {
+        doc.repo_url.clone()
+    } else {
+        format!("{} at {commit}", doc.repo_url)
+    };
+    if doc.truncated {
+        format!("{origin} \u{b7} {} bytes, only the first 32 KiB loaded", doc.file_bytes)
+    } else {
+        format!("{origin} \u{b7} {} bytes", doc.file_bytes)
+    }
+}
+
+/// What the sandbox panel says about a repo's `AGENTS.md` files, if it
+/// has any: which the model has loaded.
+fn instructions_label(repo: &RepoSummary) -> Option<String> {
+    if !repo.loaded_instructions.is_empty() {
+        Some(format!("Loaded {}", repo.loaded_instructions.join(", ")))
+    } else if !repo.agents_files.is_empty() {
+        Some("AGENTS.md not loaded".to_string())
+    } else {
+        None
+    }
+}
+
+fn repo_status_class(status: RepoStatus) -> &'static str {
+    match status {
+        RepoStatus::Cloning => "cloning",
+        RepoStatus::Ready => "ready",
+        RepoStatus::Failed => "failed",
+    }
+}
+
+/// A repo's state under its path in the sandbox panel.
+fn repo_detail(repo: &RepoSummary) -> String {
+    match repo.status {
+        RepoStatus::Cloning => match &repo.requested_branch {
+            Some(branch) => format!("Cloning {branch}\u{2026}"),
+            None => "Cloning\u{2026}".to_string(),
+        },
+        RepoStatus::Failed => "Clone failed".to_string(),
+        RepoStatus::Ready => {
+            let branch = repo.branch.clone().unwrap_or_default();
+            let commit: String = repo.commit.clone().unwrap_or_default().chars().take(7).collect();
+            format!("{branch} \u{b7} {commit}")
+        }
     }
 }
 
@@ -1064,7 +1120,7 @@ fn system_notice(text: &str, commands: &HashMap<String, String>) -> Option<Strin
     }
     if text.starts_with("The user stopped sandbox pod ") {
         return Some(
-            "You stopped the sandbox; its terminals, and any files outside volumes, are gone".to_string(),
+            "You stopped the sandbox; its terminals are gone, and /workspace is kept".to_string(),
         );
     }
     task_notice_sentence(text)
@@ -1868,8 +1924,8 @@ mod tests {
             Some("The sandbox stopped unexpectedly; its terminals are gone")
         );
         assert_eq!(
-            notice("The user stopped sandbox pod 157. Its terminals, and any files outside mounted volumes, are gone. Create a new pod if you need one.").as_deref(),
-            Some("You stopped the sandbox; its terminals, and any files outside volumes, are gone")
+            notice("The user stopped sandbox pod 157. Its terminals, and any files outside /workspace and mounted volumes, are gone. Create a new pod if you need one.").as_deref(),
+            Some("You stopped the sandbox; its terminals are gone, and /workspace is kept")
         );
         assert_eq!(
             notice(r#"<task-notification task_id="t1" tool="count">finished: Counted to 3</task-notification>"#).as_deref(),
@@ -1915,6 +1971,77 @@ mod tests {
         assert_eq!(tool_summary("http_request", &serde_json::json!({"url": "https://api.x/y"})), "Sent GET https://api.x/y");
         assert_eq!(tool_summary("browser_navigate", &serde_json::json!({"url": "https://example.com"})), "Opened https://example.com in the browser");
         assert_eq!(tool_summary("todowrite", &serde_json::json!({"todos": []})), "Updated the todo list");
+        assert_eq!(
+            tool_summary("clone_repo", &serde_json::json!({"url": "git@github.com:o/r.git"})),
+            "Cloned git@github.com:o/r.git"
+        );
+    }
+
+    #[test]
+    fn test_instructions_source_names_repo_commit_and_size() {
+        let mut doc = crate::git::ProjectInstructions {
+            repo_url: "git@github.com:o/r.git".to_string(),
+            path: "/workspace/r".to_string(),
+            commit: Some("43835b44f939".to_string()),
+            content: "Run make test.\n".to_string(),
+            file_bytes: 15,
+            truncated: false,
+        };
+        assert_eq!(instructions_source(&doc), "git@github.com:o/r.git at 43835b4 \u{b7} 15 bytes");
+        doc.file_bytes = 50_000;
+        doc.truncated = true;
+        assert_eq!(
+            instructions_source(&doc),
+            "git@github.com:o/r.git at 43835b4 \u{b7} 50000 bytes, only the first 32 KiB loaded"
+        );
+    }
+
+    #[test]
+    fn test_instructions_label_says_which_agents_md_files_are_loaded() {
+        let mut repo = RepoSummary {
+            id: 1,
+            url: "u".to_string(),
+            path: "/workspace/r".to_string(),
+            requested_branch: None,
+            branch: None,
+            commit: None,
+            status: RepoStatus::Ready,
+            error: None,
+            agents_files: vec![],
+            loaded_instructions: vec![],
+            trust_requests: vec![],
+        };
+        assert_eq!(instructions_label(&repo), None, "no AGENTS.md files");
+        repo.agents_files = vec!["AGENTS.md".to_string(), "web/AGENTS.md".to_string()];
+        assert_eq!(instructions_label(&repo).as_deref(), Some("AGENTS.md not loaded"));
+        repo.loaded_instructions = vec!["AGENTS.md".to_string(), "web/AGENTS.md".to_string()];
+        assert_eq!(instructions_label(&repo).as_deref(), Some("Loaded AGENTS.md, web/AGENTS.md"));
+    }
+
+    #[test]
+    fn test_repo_detail_says_what_is_checked_out() {
+        let mut repo = RepoSummary {
+            id: 1,
+            url: "git@github.com:o/r.git".to_string(),
+            path: "/workspace/r".to_string(),
+            requested_branch: Some("dev".to_string()),
+            branch: None,
+            commit: None,
+            status: RepoStatus::Cloning,
+            error: None,
+            agents_files: vec![],
+            loaded_instructions: vec![],
+            trust_requests: vec![],
+        };
+        assert_eq!(repo_detail(&repo), "Cloning dev\u{2026}");
+        repo.requested_branch = None;
+        assert_eq!(repo_detail(&repo), "Cloning\u{2026}");
+        repo.status = RepoStatus::Ready;
+        repo.branch = Some("main".to_string());
+        repo.commit = Some("43835b44f939c268b73b49292428911526a51508".to_string());
+        assert_eq!(repo_detail(&repo), "main \u{b7} 43835b4");
+        repo.status = RepoStatus::Failed;
+        assert_eq!(repo_detail(&repo), "Clone failed");
         assert_eq!(tool_summary("sandbox_preview_url", &serde_json::json!({"port": 5173})), "Shared a preview of port 5173");
         assert_eq!(
             tool_summary("sandbox_preview_url", &serde_json::json!({"port": 3000, "host": "172.21.0.2"})),
@@ -2495,6 +2622,7 @@ pub fn Chat() -> Element {
         Route::McpServerEditRoute { .. } => None,
         Route::SandboxVolumesRoute {} => None,
         Route::PodsRoute {} => None,
+        Route::GitRoute {} => None,
         Route::SandboxVolumeNewRoute {} => None,
         Route::NotFound { .. } => None,
     });
@@ -2635,6 +2763,7 @@ fn ConversationSidebar(
             Link { to: Route::McpServersRoute {}, class: "mcp-servers-link", "MCP servers" }
             Link { to: Route::PodsRoute {}, class: "pods-link", "Sandboxes" }
             Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
+            Link { to: Route::GitRoute {}, class: "sandbox-volumes-link git-link", "Git" }
             if let Some(err) = error() {
                 p { class: "error", "{err}" }
             }
@@ -2769,6 +2898,17 @@ fn ChatPanel(
     let mut tasks: Signal<Vec<TaskPanelEntry>> = use_signal(Vec::new);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut todos: Signal<Vec<TodoItem>> = use_signal(Vec::new);
+    // "Work on a repo" in a new conversation.
+    let mut repo_url = use_signal(String::new);
+    let mut repo_branch = use_signal(String::new);
+    let mut repo_dir = use_signal(String::new);
+    let mut repo_attaching = use_signal(|| false);
+    let mut repo_attach_error: Signal<Option<String>> = use_signal(|| None);
+    // The last Trust / Don't trust / Reload failure.
+    let mut repo_action_error: Signal<Option<String>> = use_signal(|| None);
+    // The conversation's git repos (SME-32), from `ReposUpdate`.
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut repos: Signal<Vec<RepoSummary>> = use_signal(Vec::new);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut sandbox_pods: Signal<Vec<SandboxPodPanelEntry>> = use_signal(Vec::new);
     // The panel's Stop button: the pod armed for stopping (click once to
@@ -2922,6 +3062,15 @@ fn ChatPanel(
             let Some(id) = selected() else { return };
             tasks.set(Vec::new());
             todos.set(Vec::new());
+            repos.set(Vec::new());
+            // "Work on a repo" and the trust cards belong to the conversation
+            // they were used in (SME-32 code review 8).
+            repo_url.set(String::new());
+            repo_branch.set(String::new());
+            repo_dir.set(String::new());
+            repo_attaching.set(false);
+            repo_attach_error.set(None);
+            repo_action_error.set(None);
             task_body_els.write().clear();
             task_body_stuck.write().clear();
             sandbox_pods.set(Vec::new());
@@ -2965,6 +3114,9 @@ fn ChatPanel(
                         }
                         if let Ok(snapshot) = get_todos(id).await {
                             todos.set(snapshot);
+                        }
+                        if let Ok(snapshot) = list_conversation_repos(id).await {
+                            repos.set(snapshot);
                         }
                         if let Ok(running) = get_turn_state(id).await {
                             turn_running.set(running);
@@ -3105,6 +3257,9 @@ fn ChatPanel(
                                 }
                                 Some(Ok(ConversationEvent::TurnError { message })) => {
                                     stream_errors.write().insert(id, message);
+                                }
+                                Some(Ok(ConversationEvent::ReposUpdate { repos: list })) => {
+                                    repos.set(list);
                                 }
                                 Some(Err(_)) | None => break,
                             }
@@ -3319,7 +3474,7 @@ fn ChatPanel(
                     let tool_results = tool_results_by_id(&messages());
                     let commands = terminal_commands_by_id(&messages());
                     rsx! {
-                    if !tasks().is_empty() || !sandbox_pods().is_empty() || !todos().is_empty() || browsing_session_open() {
+                    if !tasks().is_empty() || !sandbox_pods().is_empty() || !repos().is_empty() || !todos().is_empty() || browsing_session_open() {
                         div { class: "side-panels-row",
                             if browsing_session_open() {
                                 aside { class: "browsing-panel",
@@ -3531,9 +3686,35 @@ fn ChatPanel(
                                     }
                                 }
                             }
-                            if !sandbox_pods().is_empty() {
+                            if !sandbox_pods().is_empty() || !repos().is_empty() {
                                 aside { class: "sandbox-panel",
                                     h3 { "Sandbox" }
+                                    // The conversation's repos, pod or not: /workspace and
+                                    // its checkouts outlive the pod, and a clone that
+                                    // failed to start a sandbox must still say so.
+                                            if !repos().is_empty() {
+                                                div { class: "sandbox-repos",
+                                                    for repo in repos() {
+                                                        div {
+                                                            key: "{repo.id}",
+                                                            class: "sandbox-repo sandbox-repo-{repo_status_class(repo.status)}",
+                                                            title: "{repo.url}",
+                                                            code { class: "sandbox-repo-path", "{repo.path}" }
+                                                            span { class: "sandbox-repo-detail", "{repo_detail(&repo)}" }
+                                                            if let Some(label) = instructions_label(&repo) {
+                                                                span {
+                                                                    class: "sandbox-repo-instructions",
+                                                                    title: "The model loads a repo's AGENTS.md files with load_instructions. Loaded ones are in its context on every turn; see the context view.",
+                                                                    "{label}"
+                                                                }
+                                                            }
+                                                            if let Some(err) = repo.error.clone() {
+                                                                pre { class: "sandbox-repo-error", "{err}" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                     // A conversation has at most one live pod (see
                                     // SME-11's "One pod
                                     // per conversation") — straight through, no tab
@@ -3545,7 +3726,7 @@ fn ChatPanel(
                                                 button {
                                                     class: if pending_pod_stop() == Some(pod.pod_id) { "pod-stop confirm" } else { "pod-stop" },
                                                     r#type: "button",
-                                                    title: "Stop this pod. Its terminals and any files outside mounted volumes are lost.",
+                                                    title: "Stop this pod. Its terminals and any files outside /workspace and mounted volumes are lost.",
                                                     onclick: move |_| request_pod_stop(pod.pod_id),
                                                     super::TwoStepLabel { armed: pending_pod_stop() == Some(pod.pod_id), idle: "Stop sandbox", confirm: "Confirm stop?" }
                                                 }
@@ -3676,6 +3857,19 @@ fn ChatPanel(
                                         None => rsx! { p { "Loading…" } },
                                         Some(detail) => rsx! {
                                             h3 { "Context" }
+                                            if !detail.instructions.is_empty() {
+                                                h4 { class: "context-detail-heading", "Project instructions ({detail.instructions.len()})" }
+                                                p { class: "muted", "AGENTS.md files from this conversation's repos, sent with every turn as part of the system prompt below." }
+                                                for doc in &detail.instructions {
+                                                    details { class: "context-detail-instructions",
+                                                        summary {
+                                                            code { "{doc.path}" }
+                                                            span { class: "muted", " {instructions_source(doc)}" }
+                                                        }
+                                                        pre { class: "context-detail-prompt", "{doc.content}" }
+                                                    }
+                                                }
+                                            }
                                             h4 { class: "context-detail-heading", "System prompt" }
                                             if let Some(system) = &detail.system {
                                                 // Its own line breaks and headings, not one
@@ -3753,6 +3947,75 @@ fn ChatPanel(
                                 div { class: "conversation-empty",
                                     h2 { "What should smelt work on?" }
                                     p { "It works in a sandbox of its own: it writes and runs code, uses a terminal, reads the web, and shows you each step." }
+                                    form {
+                                        class: "repo-attach",
+                                        onsubmit: move |event| {
+                                            event.prevent_default();
+                                            let Some(id) = selected() else { return };
+                                            if repo_attaching() {
+                                                return;
+                                            }
+                                            let url = repo_url();
+                                            let branch = repo_branch();
+                                            let dir = repo_dir();
+                                            repo_attaching.set(true);
+                                            repo_attach_error.set(None);
+                                            spawn(async move {
+                                                let result = attach_repo(id, url, branch, dir).await;
+                                                // The user may have moved on to another conversation.
+                                                if selected() != Some(id) {
+                                                    return;
+                                                }
+                                                match result {
+                                                    Ok(_) => {
+                                                        repo_url.set(String::new());
+                                                        repo_branch.set(String::new());
+                                                        repo_dir.set(String::new());
+                                                    }
+                                                    Err(e) => repo_attach_error.set(Some(e.to_string())),
+                                                }
+                                                repo_attaching.set(false);
+                                            });
+                                        },
+                                        label { r#for: "repo-attach-url", "Work on a repo" }
+                                        div { class: "repo-attach-fields",
+                                            input {
+                                                id: "repo-attach-url",
+                                                r#type: "text",
+                                                required: true,
+                                                placeholder: "git@github.com:owner/repo.git",
+                                                value: "{repo_url}",
+                                                oninput: move |e| repo_url.set(e.value()),
+                                            }
+                                            input {
+                                                class: "repo-attach-branch",
+                                                r#type: "text",
+                                                placeholder: "branch (optional)",
+                                                aria_label: "Branch",
+                                                value: "{repo_branch}",
+                                                oninput: move |e| repo_branch.set(e.value()),
+                                            }
+                                            input {
+                                                class: "repo-attach-branch",
+                                                r#type: "text",
+                                                placeholder: "directory (optional)",
+                                                aria_label: "Directory under /workspace",
+                                                value: "{repo_dir}",
+                                                oninput: move |e| repo_dir.set(e.value()),
+                                            }
+                                            button {
+                                                r#type: "submit",
+                                                disabled: repo_attaching(),
+                                                if repo_attaching() { "Cloning\u{2026}" } else { "Clone" }
+                                            }
+                                        }
+                                        if repo_attaching() {
+                                            p { class: "muted", "Starting the sandbox and cloning. You can write your first message meanwhile." }
+                                        }
+                                        if let Some(err) = repo_attach_error() {
+                                            pre { class: "error repo-attach-error", "{err}" }
+                                        }
+                                    }
                                     div { class: "example-asks",
                                         for example in EXAMPLE_ASKS {
                                             button {
@@ -3783,6 +4046,73 @@ fn ChatPanel(
                             }
                             if let Some(err) = notification_delivery_error() {
                                 p { class: "error", "A background notification failed to reach the model: {err}" }
+                            }
+                            // A repo's AGENTS.md waits for the user's trust before it
+                            // becomes instructions the model follows (SME-32).
+                            for (repo, request) in repos().into_iter().flat_map(|r| r.trust_requests.clone().into_iter().map(move |q| (r.clone(), q))) {
+                                div { key: "trust-{request.id}", class: "trust-card", role: "group", aria_label: "Trust {repo.url}?",
+                                    p { class: "trust-card-question",
+                                        "Trust "
+                                        code { "{repo.url}" }
+                                        "?"
+                                    }
+                                    p { class: "muted",
+                                        "The model wants to load this AGENTS.md as instructions it follows on every turn. Trust loads exactly the file below, and later ones from this repo load without asking. Only trust repos whose instructions you're happy for the model to follow."
+                                    }
+                                    details { class: "trust-card-preview", open: true,
+                                        summary { "{request.path}" }
+                                        pre { "{request.content}" }
+                                    }
+                                    div { class: "trust-card-buttons",
+                                        button {
+                                            class: "trust-card-trust",
+                                            r#type: "button",
+                                            onclick: {
+                                                let request_id = request.id;
+                                                let shown_hash = request.hash.clone();
+                                                move |_| {
+                                                    let Some(id) = selected() else { return };
+                                                    let shown_hash = shown_hash.clone();
+                                                    repo_action_error.set(None);
+                                                    spawn(async move {
+                                                        if let Err(e) = decide_repo_trust(id, request_id, shown_hash, true).await
+                                                            // Not if the user has moved on to another conversation.
+                                                            && selected() == Some(id)
+                                                        {
+                                                            repo_action_error.set(Some(e.to_string()));
+                                                        }
+                                                    });
+                                                }
+                                            },
+                                            "Trust"
+                                        }
+                                        button {
+                                            class: "trust-card-decline",
+                                            r#type: "button",
+                                            onclick: {
+                                                let request_id = request.id;
+                                                let shown_hash = request.hash.clone();
+                                                move |_| {
+                                                    let Some(id) = selected() else { return };
+                                                    let shown_hash = shown_hash.clone();
+                                                    repo_action_error.set(None);
+                                                    spawn(async move {
+                                                        if let Err(e) = decide_repo_trust(id, request_id, shown_hash, false).await
+                                                            // Not if the user has moved on to another conversation.
+                                                            && selected() == Some(id)
+                                                        {
+                                                            repo_action_error.set(Some(e.to_string()));
+                                                        }
+                                                    });
+                                                }
+                                            },
+                                            "Don't trust"
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(err) = repo_action_error() {
+                                p { class: "error", "{err}" }
                             }
                         }
                         if !conversation_missing() {

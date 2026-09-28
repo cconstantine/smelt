@@ -16,7 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 #[cfg(test)]
 use futures_util::FutureExt;
 use k8s_openapi::api::core::v1::{
-    Container, EmptyDirVolumeSource, ExecAction, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    Container, EmptyDirVolumeSource, EnvVar, ExecAction, PersistentVolumeClaim, PersistentVolumeClaimSpec,
     PersistentVolumeClaimVolumeSource, Pod, PodSpec, Probe, ResourceRequirements, SecurityContext,
     Volume, VolumeMount, VolumeResourceRequirements,
 };
@@ -78,6 +78,8 @@ pub enum SandboxError {
     PodAlreadyExists,
     InvalidMountPath(String),
     StartFailed(String),
+    /// Writing the SSH keys and git config into a pod failed (SME-32).
+    GitSetup(String),
 }
 
 impl std::fmt::Display for SandboxError {
@@ -104,6 +106,7 @@ impl std::fmt::Display for SandboxError {
             }
             SandboxError::InvalidMountPath(reason) => write!(f, "invalid mount path: {reason}"),
             SandboxError::StartFailed(reason) => write!(f, "sandbox pod failed to start: {reason}"),
+            SandboxError::GitSetup(reason) => write!(f, "couldn't set up git in the pod: {reason}"),
         }
     }
 }
@@ -295,6 +298,7 @@ pub struct Sandbox {
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct ExecResult {
     pub stdout: String,
+    pub stderr: String,
     pub exit_code: i32,
 }
 
@@ -316,57 +320,181 @@ impl Sandbox {
         container: &str,
         command: &[&str],
     ) -> Result<ExecResult, SandboxError> {
-        let pods = pods_api(&self.client);
-        let mut attached = pods
-            .exec(
-                &self.pod_name,
-                command.iter().copied(),
-                &AttachParams::default().container(container),
-            )
-            .await?;
-
-        let mut stdout_reader = attached
-            .stdout()
-            .expect("stdout requested by AttachParams::default()");
-        // Requested (so the exec session doesn't wait on a caller that will
-        // never read it) but discarded — no caller has needed stderr
-        // separately from stdout yet.
-        let mut stderr_reader = attached
-            .stderr()
-            .expect("stderr requested by AttachParams::default()");
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        let (stdout_res, stderr_res) = tokio::join!(
-            stdout_reader.read_to_string(&mut stdout),
-            stderr_reader.read_to_string(&mut stderr),
-        );
-        stdout_res.map_err(SandboxError::Io)?;
-        stderr_res.map_err(SandboxError::Io)?;
-
-        let status = attached.take_status();
-        attached.join().await.ok();
-        let status = match status {
-            Some(fut) => fut.await,
-            None => None,
-        };
-
-        Ok(ExecResult {
-            stdout,
-            exit_code: extract_exit_code(status),
-        })
+        exec_with(&self.client, &self.pod_name, container, command, None).await
     }
+}
+
+/// kube exec in `pod_name`'s `container`. `stdin`, when given, is written
+/// and then closed, so a command like `cat > file` sees its end. kube
+/// closes just the stdin stream on a v5 connection (k3s has it); an older
+/// server closes the whole connection and the exit code comes back
+/// missing, which callers treat as a failure.
+pub(crate) async fn exec_with(
+    client: &kube::Client,
+    pod_name: &str,
+    container: &str,
+    command: &[&str],
+    stdin: Option<&[u8]>,
+) -> Result<ExecResult, SandboxError> {
+    let pods = pods_api(client);
+    let mut attached = pods
+        .exec(
+            pod_name,
+            command.iter().copied(),
+            &AttachParams::default()
+                .container(container)
+                .stdin(stdin.is_some()),
+        )
+        .await?;
+    if let Some(input) = stdin {
+        use tokio::io::AsyncWriteExt;
+        let mut writer = attached.stdin().expect("stdin requested above");
+        writer.write_all(input).await.map_err(SandboxError::Io)?;
+        writer.shutdown().await.map_err(SandboxError::Io)?;
+        drop(writer);
+    }
+
+    let mut stdout_reader = attached
+        .stdout()
+        .expect("stdout requested by AttachParams::default()");
+    let mut stderr_reader = attached
+        .stderr()
+        .expect("stderr requested by AttachParams::default()");
+    // Bytes, decoded leniently: a file's contents need not be UTF-8, and
+    // a `head -c` cut can split a character (SME-32).
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let (stdout_res, stderr_res) = tokio::join!(
+        stdout_reader.read_to_end(&mut stdout),
+        stderr_reader.read_to_end(&mut stderr),
+    );
+    stdout_res.map_err(SandboxError::Io)?;
+    stderr_res.map_err(SandboxError::Io)?;
+    let stdout = String::from_utf8_lossy(&stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+
+    let status = attached.take_status();
+    attached.join().await.ok();
+    let status = match status {
+        Some(fut) => fut.await,
+        None => None,
+    };
+
+    Ok(ExecResult {
+        stdout,
+        stderr,
+        exit_code: extract_exit_code(status),
+    })
+}
+
+/// Writes git's files (`git::pod_git_files`) into a pod's sandbox
+/// container. The keys directory is replaced wholesale, so a key deleted
+/// since the last install goes too.
+pub async fn install_git_files(
+    client: &kube::Client,
+    pod_name: &str,
+    files: &[crate::git::PodFile],
+) -> Result<(), SandboxError> {
+    // Never emptied: a clone or push running during a reinstall must
+    // still find its key. Keys are written over in place, and only the
+    // ones no longer in `files` removed afterwards.
+    let keys_dir = format!("{}/keys", crate::git::POD_GIT_DIR);
+    let made = exec_with(
+        client,
+        pod_name,
+        "sandbox",
+        &["sh", "-c", r#"mkdir -p -m 700 "$1""#, "sh", &keys_dir],
+        None,
+    )
+    .await?;
+    if made.exit_code != 0 {
+        return Err(SandboxError::GitSetup(format!(
+            "couldn't make {keys_dir}: {}",
+            made.stderr.trim()
+        )));
+    }
+    for file in files {
+        // Written beside the target and renamed over it, so ssh or git
+        // never reads half a file; umask keeps a key private from its
+        // first byte.
+        let mode = format!("{:o}", file.mode);
+        let written = exec_with(
+            client,
+            pod_name,
+            "sandbox",
+            &[
+                "sh",
+                "-c",
+                r#"umask 077 && cat > "$1.new" && chmod "$2" "$1.new" && mv "$1.new" "$1""#,
+                "sh",
+                &file.path,
+                &mode,
+            ],
+            Some(file.content.as_bytes()),
+        )
+        .await?;
+        if written.exit_code != 0 {
+            return Err(SandboxError::GitSetup(format!(
+                "couldn't write {}: {}",
+                file.path,
+                written.stderr.trim()
+            )));
+        }
+    }
+    let keep: Vec<&str> = files
+        .iter()
+        .filter_map(|f| f.path.strip_prefix(&format!("{keys_dir}/")))
+        .collect();
+    let mut prune = vec![
+        "sh",
+        "-c",
+        r#"cd "$1" && shift && for f in * .[!.]*; do
+               [ -e "$f" ] || continue
+               keep=; for k in "$@"; do [ "$f" = "$k" ] && keep=1; done
+               [ -n "$keep" ] || rm -f -- "$f"
+           done"#,
+        "sh",
+        &keys_dir,
+    ];
+    prune.extend(keep);
+    let pruned = exec_with(client, pod_name, "sandbox", &prune, None).await?;
+    if pruned.exit_code != 0 {
+        return Err(SandboxError::GitSetup(format!(
+            "couldn't remove deleted keys from {keys_dir}: {}",
+            pruned.stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
+/// The Kubernetes client every sandbox operation uses.
+pub(crate) fn kube_client() -> kube::Client {
+    get().client.clone()
+}
+
+/// `install_git_files` for a live pod of smelt's own, by id.
+pub async fn install_git_files_in_pod(
+    pod_id: i64,
+    files: &[crate::git::PodFile],
+) -> Result<(), SandboxError> {
+    install_git_files(&get().client, &pod_name(pod_id), files).await
 }
 
 /// On success the exec protocol's terminal `Status` carries no exit code at
 /// all (implying 0); on a non-zero exit it's a `StatusCause` with
 /// `reason == "ExitCode"` and the code itself, as a string, in `message`.
 /// Verified against a real cluster, not assumed — see the plan.
-#[cfg_attr(not(test), allow(dead_code))]
+///
+/// No status at all means the connection ended before the API server said
+/// how the command did, so it counts as a failure (-1), not a success.
 fn extract_exit_code(
     status: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Status>,
 ) -> i32 {
+    let Some(status) = status else {
+        return -1;
+    };
     status
-        .and_then(|s| s.details)
+        .details
         .and_then(|d| d.causes)
         .into_iter()
         .flatten()
@@ -410,7 +538,7 @@ impl SandboxManager {
         let docker = DockerSidecar {
             memory: "512Mi".to_string(),
             cpu: "250m".to_string(),
-            storage: DockerStorage::Ephemeral,
+            storage: PodStorage::Ephemeral,
         };
         self.create_with_docker(session_id, memory, cpu, &docker, volumes).await
     }
@@ -585,13 +713,15 @@ fn running_wait_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Where a pod's Docker sidecar keeps `/var/lib/docker` (SME-33).
+/// Where a pod keeps what should outlive it: the Docker sidecar's
+/// `/var/lib/docker` (SME-33) and `/workspace` (SME-32).
 #[derive(Debug, Clone, PartialEq)]
-pub enum DockerStorage {
-    /// The conversation's own PVC (`sandbox-docker-<id>`), so images and
-    /// build cache outlive the pod.
+pub enum PodStorage {
+    /// The conversation's own PVCs (`sandbox-docker-<id>` and
+    /// `sandbox-workspace-<id>`), so images, build cache and the
+    /// conversation's files outlive the pod.
     Conversation(i64),
-    /// An emptyDir that dies with the pod, for tests, which have no
+    /// emptyDirs that die with the pod, for tests, which have no
     /// conversation.
     #[cfg(test)]
     Ephemeral,
@@ -603,7 +733,7 @@ pub enum DockerStorage {
 pub struct DockerSidecar {
     pub memory: String,
     pub cpu: String,
-    pub storage: DockerStorage,
+    pub storage: PodStorage,
 }
 
 /// `SANDBOX_DOCKER_MEMORY_LIMIT`, default `"8Gi"` — see
@@ -639,10 +769,18 @@ const DOCKER_DATA_VOLUME: &str = "docker-data";
 /// The `docker` group's GID in the sandbox image
 /// (docker/sandbox/Dockerfile); dockerd gives it the socket.
 const DOCKER_GID: u32 = 2375;
+/// The sandbox user's uid:gid, pinned in the image
+/// (docker/sandbox/Dockerfile); the Docker sidecar gives it /workspace.
+const SANDBOX_OWNER: &str = "1000:1000";
 
 /// The conversation's Docker data PVC, `sandbox-docker-<id>`.
 fn docker_pvc_name(conversation_id: i64) -> String {
     format!("sandbox-docker-{conversation_id}")
+}
+
+/// The conversation's /workspace PVC, `sandbox-workspace-<id>` (SME-32).
+fn workspace_pvc_name(conversation_id: i64) -> String {
+    format!("sandbox-workspace-{conversation_id}")
 }
 
 /// Label naming a conversation, on its Docker data PVC and on every pod
@@ -659,9 +797,36 @@ fn default_docker_storage_size() -> String {
         .unwrap_or_else(|| "20Gi".to_string())
 }
 
-fn build_docker_pvc_spec(conversation_id: i64) -> PersistentVolumeClaim {
+/// `SANDBOX_WORKSPACE_STORAGE_SIZE`, default `"20Gi"` — see
+/// `default_memory_limit`. Each conversation's /workspace PVC requests
+/// this much.
+fn default_workspace_storage_size() -> String {
+    std::env::var("SANDBOX_WORKSPACE_STORAGE_SIZE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "20Gi".to_string())
+}
+
+/// A conversation's claims: its Docker data and its /workspace (SME-32),
+/// both kept across its pods and deleted with it.
+fn conversation_pvc_specs(conversation_id: i64) -> [PersistentVolumeClaim; 2] {
+    [
+        build_conversation_pvc_spec(
+            docker_pvc_name(conversation_id),
+            conversation_id,
+            default_docker_storage_size(),
+        ),
+        build_conversation_pvc_spec(
+            workspace_pvc_name(conversation_id),
+            conversation_id,
+            default_workspace_storage_size(),
+        ),
+    ]
+}
+
+fn build_conversation_pvc_spec(name: String, conversation_id: i64, size: String) -> PersistentVolumeClaim {
     let mut requests = std::collections::BTreeMap::new();
-    requests.insert("storage".to_string(), Quantity(default_docker_storage_size()));
+    requests.insert("storage".to_string(), Quantity(size));
     let mut labels = std::collections::BTreeMap::new();
     labels.insert(
         CONVERSATION_LABEL.to_string(),
@@ -670,7 +835,7 @@ fn build_docker_pvc_spec(conversation_id: i64) -> PersistentVolumeClaim {
 
     PersistentVolumeClaim {
         metadata: ObjectMeta {
-            name: Some(docker_pvc_name(conversation_id)),
+            name: Some(name),
             namespace: Some(NAMESPACE.to_string()),
             labels: Some(labels),
             ..Default::default()
@@ -697,6 +862,8 @@ fn orphaned_docker_claims(
         .iter()
         .filter_map(|c| c.metadata.labels.as_ref()?.get(CONVERSATION_LABEL)?.parse().ok())
         .filter(|id| !live.contains(id))
+        .collect::<std::collections::BTreeSet<i64>>()
+        .into_iter()
         .collect()
 }
 
@@ -705,7 +872,7 @@ fn orphaned_docker_claims(
 /// missed. Run once at startup by `main`, never from tests: tests share
 /// the namespace but each has its own database, so from a test every
 /// other test's claim would look orphaned.
-pub async fn sweep_orphaned_docker_claims(pool: &PgPool) {
+pub async fn sweep_orphaned_conversation_claims(pool: &PgPool) {
     let client = &get().client;
     let selector = ListParams::default().labels(CONVERSATION_LABEL);
     // Claims first, then conversations: a claim only exists for a
@@ -726,7 +893,7 @@ pub async fn sweep_orphaned_docker_claims(pool: &PgPool) {
     };
     for conversation_id in orphaned_docker_claims(&claims, &live) {
         tracing::info!(conversation_id, "deleting a deleted conversation's docker data claim");
-        delete_docker_pvc(client, conversation_id).await;
+        delete_conversation_pvcs(client, conversation_id).await;
     }
 }
 
@@ -790,10 +957,7 @@ async fn report_docker_restart(pool: &PgPool, pod_id: i64, reason: Option<String
     );
     let pool = pool.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::api::chat::save_notice_between_turns(&pool, conversation_id, notice).await {
-            tracing::warn!(conversation_id, pod_id, error = %e, "couldn't save the Docker restart notice");
-        }
-        let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
+        crate::api::chat::deliver_notice(&pool, conversation_id, notice).await;
     });
 }
 
@@ -824,31 +988,36 @@ async fn wait_for_conversation_pods_gone(
     })?
 }
 
-/// Creates the conversation's Docker data PVC unless it already exists,
-/// so a conversation's later pods reuse its images and build cache.
-async fn ensure_docker_pvc(client: &kube::Client, conversation_id: i64) -> Result<(), SandboxError> {
+/// Creates the conversation's claims unless they already exist, so its
+/// later pods reuse its images and build cache and find /workspace as the
+/// last pod left it.
+async fn ensure_conversation_pvcs(client: &kube::Client, conversation_id: i64) -> Result<(), SandboxError> {
     let pvcs = pvc_api(client);
-    if pvcs.get_opt(&docker_pvc_name(conversation_id)).await?.is_some() {
-        return Ok(());
+    for spec in conversation_pvc_specs(conversation_id) {
+        let name = spec.metadata.name.clone().expect("named above");
+        if pvcs.get_opt(&name).await?.is_some() {
+            continue;
+        }
+        match pvcs.create(&PostParams::default(), &spec).await {
+            // Another create for the same conversation got there first.
+            Err(kube::Error::Api(e)) if e.code == 409 => {}
+            other => {
+                other?;
+            }
+        }
     }
-    match pvcs
-        .create(&PostParams::default(), &build_docker_pvc_spec(conversation_id))
-        .await
-    {
-        // Another create for the same conversation got there first.
-        Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
-        other => other.map(|_| ()).map_err(SandboxError::from),
-    }
+    Ok(())
 }
 
 /// Best-effort, like the rest of conversation teardown: logged, never
 /// returned. The startup sweep catches whatever this misses.
-async fn delete_docker_pvc(client: &kube::Client, conversation_id: i64) {
-    let name = docker_pvc_name(conversation_id);
-    match pvc_api(client).delete(&name, &DeleteParams::default()).await {
-        Ok(_) => {}
-        Err(kube::Error::Api(e)) if e.code == 404 => {}
-        Err(e) => tracing::warn!(claim = %name, error = %e, "failed to delete docker data claim"),
+async fn delete_conversation_pvcs(client: &kube::Client, conversation_id: i64) {
+    for name in [docker_pvc_name(conversation_id), workspace_pvc_name(conversation_id)] {
+        match pvc_api(client).delete(&name, &DeleteParams::default()).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => tracing::warn!(claim = %name, error = %e, "failed to delete a conversation's claim"),
+        }
     }
 }
 
@@ -881,7 +1050,7 @@ fn build_pod_spec(
 ) -> Pod {
     let (mut pod_volumes, user_mounts) = volume_mounts_for(volumes);
     pod_volumes.extend([
-        empty_dir_volume(WORKSPACE_VOLUME),
+        workspace_volume(&docker.storage),
         empty_dir_volume(DOCKER_SOCK_VOLUME),
         docker_data_volume(&docker.storage),
     ]);
@@ -898,11 +1067,11 @@ fn build_pod_spec(
     // Only a pod on a conversation's claim needs finding by conversation:
     // see `wait_for_conversation_pods_gone`.
     let labels = match docker.storage {
-        DockerStorage::Conversation(conversation_id) => Some(
+        PodStorage::Conversation(conversation_id) => Some(
             [(CONVERSATION_LABEL.to_string(), conversation_id.to_string())].into(),
         ),
         #[cfg(test)]
-        DockerStorage::Ephemeral => None,
+        PodStorage::Ephemeral => None,
     };
 
     Pod {
@@ -936,6 +1105,11 @@ fn build_pod_spec(
                     "start-dockerd".to_string(),
                 ]),
                 args: Some(dockerd_args()),
+                env: Some(vec![EnvVar {
+                    name: "WORKSPACE_OWNER".to_string(),
+                    value: Some(SANDBOX_OWNER.to_string()),
+                    ..Default::default()
+                }]),
                 startup_probe: Some(Probe {
                     exec: Some(ExecAction {
                         command: Some(vec![
@@ -1005,9 +1179,26 @@ fn empty_dir_volume(name: &str) -> Volume {
     }
 }
 
-fn docker_data_volume(storage: &DockerStorage) -> Volume {
+/// /workspace: the conversation's own claim, so a new pod finds it as the
+/// last one left it (SME-32).
+fn workspace_volume(storage: &PodStorage) -> Volume {
     match storage {
-        DockerStorage::Conversation(conversation_id) => Volume {
+        PodStorage::Conversation(conversation_id) => Volume {
+            name: WORKSPACE_VOLUME.to_string(),
+            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                claim_name: workspace_pvc_name(*conversation_id),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        #[cfg(test)]
+        PodStorage::Ephemeral => empty_dir_volume(WORKSPACE_VOLUME),
+    }
+}
+
+fn docker_data_volume(storage: &PodStorage) -> Volume {
+    match storage {
+        PodStorage::Conversation(conversation_id) => Volume {
             name: DOCKER_DATA_VOLUME.to_string(),
             persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
                 claim_name: docker_pvc_name(*conversation_id),
@@ -1016,7 +1207,7 @@ fn docker_data_volume(storage: &DockerStorage) -> Volume {
             ..Default::default()
         },
         #[cfg(test)]
-        DockerStorage::Ephemeral => empty_dir_volume(DOCKER_DATA_VOLUME),
+        PodStorage::Ephemeral => empty_dir_volume(DOCKER_DATA_VOLUME),
     }
 }
 
@@ -1492,7 +1683,7 @@ pub async fn create_pod(
         let _ = db::terminate_sandbox_pod(pool, row.id).await;
         return Err(e);
     }
-    if let Err(e) = ensure_docker_pvc(&manager.client, conversation_id).await {
+    if let Err(e) = ensure_conversation_pvcs(&manager.client, conversation_id).await {
         let _ = db::terminate_sandbox_pod(pool, row.id).await;
         return Err(e);
     }
@@ -1501,6 +1692,15 @@ pub async fn create_pod(
         .await
     {
         Ok(sandbox) => {
+            // Keys and the commit identity, before anything can run a git
+            // command (SME-32). A pod without them would fail its first
+            // push with a confusing ssh error, so a failure here is the
+            // pod's failure.
+            if let Err(e) = crate::git::install_into_new_pod(pool, row.id).await {
+                let _ = manager.delete(sandbox).await;
+                let _ = db::terminate_sandbox_pod(pool, row.id).await;
+                return Err(SandboxError::GitSetup(e));
+            }
             std::mem::forget(sandbox);
             events::publish(
                 conversation_id,
@@ -1552,7 +1752,7 @@ impl PodLimitOverrides {
         let docker = DockerSidecar {
             memory: self.docker_memory.unwrap_or_else(default_docker_memory_limit),
             cpu: self.docker_cpu.unwrap_or_else(default_docker_cpu_limit),
-            storage: DockerStorage::Conversation(conversation_id),
+            storage: PodStorage::Conversation(conversation_id),
         };
         (
             self.memory.unwrap_or_else(default_memory_limit),
@@ -2112,7 +2312,7 @@ pub async fn teardown_conversation(pool: &PgPool, conversation_id: i64) {
         }
     }
     // After the pods: Kubernetes holds a claim until no pod mounts it.
-    delete_docker_pvc(&manager.client, conversation_id).await;
+    delete_conversation_pvcs(&manager.client, conversation_id).await;
 }
 
 /// Returns the existing registry entry for `pod_id` if there is one;
@@ -2561,7 +2761,7 @@ pub async fn stop_pod_for_user(pool: &PgPool, pod_id: i64) -> Result<(), Termina
     force_terminate_pod(pool, pod_id).await?;
     if let Some(conversation_id) = conversation_id {
         let notice = format!(
-            "The user stopped sandbox pod {pod_id}. Its terminals, and any files outside mounted volumes, are gone. Create a new pod if you need one."
+            "The user stopped sandbox pod {pod_id}. Its terminals, and any files outside /workspace and mounted volumes, are gone. Create a new pod if you need one."
         );
         let pool = pool.clone();
         tokio::spawn(async move {
@@ -3192,7 +3392,7 @@ mod tests {
         DockerSidecar {
             memory: "2Gi".to_string(),
             cpu: "2".to_string(),
-            storage: DockerStorage::Conversation(conversation_id),
+            storage: PodStorage::Conversation(conversation_id),
         }
     }
 
@@ -3274,6 +3474,13 @@ mod tests {
         }
         assert_eq!(mount_path_of(docker, "docker-data"), Some("/var/lib/docker"));
         assert_eq!(mount_path_of(sandbox, "docker-data"), None);
+        // The sidecar (root, started first) hands /workspace to the sandbox user.
+        let owner = docker
+            .env
+            .as_ref()
+            .and_then(|env| env.iter().find(|e| e.name == "WORKSPACE_OWNER"))
+            .and_then(|e| e.value.as_deref());
+        assert_eq!(owner, Some(SANDBOX_OWNER));
 
         let volumes = spec.volumes.expect("pod should have volumes");
         let data = volumes.iter().find(|v| v.name == "docker-data").expect("docker-data volume");
@@ -3281,23 +3488,30 @@ mod tests {
             data.persistent_volume_claim.as_ref().map(|p| p.claim_name.as_str()),
             Some("sandbox-docker-42")
         );
-        for shared in ["workspace", "docker-sock"] {
-            let v = volumes.iter().find(|v| v.name == shared).expect(shared);
-            assert!(v.empty_dir.is_some(), "{shared} should be an emptyDir");
-        }
+        // /workspace outlives the pod on a claim of its own (SME-32); the
+        // socket dies with it.
+        let workspace = volumes.iter().find(|v| v.name == "workspace").expect("workspace volume");
+        assert_eq!(
+            workspace.persistent_volume_claim.as_ref().map(|p| p.claim_name.as_str()),
+            Some("sandbox-workspace-42")
+        );
+        let sock = volumes.iter().find(|v| v.name == "docker-sock").expect("docker-sock volume");
+        assert!(sock.empty_dir.is_some(), "docker-sock should be an emptyDir");
     }
 
     #[test]
-    fn test_pod_spec_ephemeral_docker_storage_is_an_empty_dir() {
+    fn test_pod_spec_ephemeral_storage_is_empty_dirs() {
         let docker = DockerSidecar {
-            storage: DockerStorage::Ephemeral,
+            storage: PodStorage::Ephemeral,
             ..docker_for_conversation(42)
         };
         let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker, &[]);
         let volumes = pod.spec.and_then(|s| s.volumes).expect("pod should have volumes");
-        let data = volumes.iter().find(|v| v.name == "docker-data").expect("docker-data volume");
-        assert!(data.empty_dir.is_some());
-        assert!(data.persistent_volume_claim.is_none());
+        for name in ["docker-data", "workspace"] {
+            let v = volumes.iter().find(|v| v.name == name).expect(name);
+            assert!(v.empty_dir.is_some(), "{name}");
+            assert!(v.persistent_volume_claim.is_none(), "{name}");
+        }
     }
 
     #[test]
@@ -3328,7 +3542,7 @@ mod tests {
             "create_pod finds a conversation's still-stopping pods by this label"
         );
         let ephemeral = DockerSidecar {
-            storage: DockerStorage::Ephemeral,
+            storage: PodStorage::Ephemeral,
             ..docker_for_conversation(42)
         };
         let unlabelled = build_pod_spec("sandbox-1", "1Gi", "1", &ephemeral, &[]);
@@ -3358,6 +3572,13 @@ mod tests {
         ];
         let live = std::collections::HashSet::from([1]);
         assert_eq!(orphaned_docker_claims(&claims, &live), vec![2]);
+        // A conversation has two claims (Docker data and /workspace): it's
+        // named once.
+        let both = vec![
+            claim("sandbox-docker-4", Some("4")),
+            claim("sandbox-workspace-4", Some("4")),
+        ];
+        assert_eq!(orphaned_docker_claims(&both, &live), vec![4]);
     }
 
     #[test]
@@ -3372,7 +3593,7 @@ mod tests {
         assert_eq!(cpu, default_cpu_limit());
         assert_eq!(docker.memory, default_docker_memory_limit());
         assert_eq!(docker.cpu, "4");
-        assert_eq!(docker.storage, DockerStorage::Conversation(7));
+        assert_eq!(docker.storage, PodStorage::Conversation(7));
     }
 
     fn pod_with_docker_status(restarts: i32, last_reason: Option<&str>) -> Pod {
@@ -3503,7 +3724,9 @@ mod tests {
 
     #[test]
     fn test_docker_pvc_spec_is_named_labelled_and_sized_for_the_conversation() {
-        let pvc = build_docker_pvc_spec(42);
+        let [pvc, workspace] = conversation_pvc_specs(42);
+        assert_eq!(workspace.metadata.name.as_deref(), Some("sandbox-workspace-42"));
+        assert_eq!(workspace.metadata.labels, pvc.metadata.labels);
         assert_eq!(pvc.metadata.name.as_deref(), Some("sandbox-docker-42"));
         assert_eq!(
             pvc.metadata
@@ -4069,6 +4292,283 @@ mod tests {
     /// actual pod-creation call site.
     const VOLUME_MOUNT_SESSION_LABEL: &str = "volume-mount";
 
+    /// A pod gets the user's SSH keys and commit identity where ssh and git
+    /// read them, and a reinstall after a key is deleted removes it
+    /// (SME-32).
+    #[tokio::test]
+    async fn test_git_files_reach_ssh_and_git_in_a_real_pod() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let sandbox = manager
+            .create(&unique_session_id("git-files"), "256Mi", "250m", &[])
+            .await
+            .expect("create pod");
+        let pod_name = sandbox.pod_name.clone();
+
+        let checks = tokio::time::timeout(Duration::from_secs(120), async {
+            let key = crate::git::generate_key("test-key");
+            let identity = crate::git::GitIdentity {
+                name: "Ada \"Countess\" Lovelace".to_string(),
+                email: "ada@example.com".to_string(),
+            };
+            let files =
+                crate::git::pod_git_files(&[("test-key".to_string(), key.private_key.clone())], &identity);
+            install_git_files(&client, &pod_name, &files)
+                .await
+                .expect("install git files");
+
+            let mode = sandbox
+                .exec(&["stat", "-c", "%a %U", "/etc/smelt/keys/test-key"])
+                .await
+                .expect("exec stat");
+            assert_eq!(mode.stdout.trim(), "600 sandbox", "key file mode and owner");
+
+            // The file is the key, byte for byte: ssh derives the same public half.
+            let derived = sandbox
+                .exec(&["ssh-keygen", "-y", "-f", "/etc/smelt/keys/test-key"])
+                .await
+                .expect("exec ssh-keygen");
+            let expected: Vec<&str> = key.public_key.split(' ').take(2).collect();
+            let got: Vec<&str> = derived.stdout.trim().split(' ').take(2).collect();
+            assert_eq!(got, expected, "derived public key");
+
+            let ssh = sandbox
+                .exec(&["ssh", "-G", "github.com"])
+                .await
+                .expect("exec ssh -G");
+            assert!(
+                ssh.stdout.contains("identityfile /etc/smelt/keys/test-key"),
+                "ssh -G github.com: {}",
+                ssh.stdout
+            );
+            let known = sandbox
+                .exec(&["ssh-keygen", "-F", "github.com", "-f", "/etc/ssh/ssh_known_hosts"])
+                .await
+                .expect("exec ssh-keygen -F");
+            assert_eq!(known.exit_code, 0, "github.com is a known host: {}", known.stdout);
+
+            let name = sandbox
+                .exec(&["git", "config", "user.name"])
+                .await
+                .expect("exec git config");
+            assert_eq!(name.stdout.trim(), "Ada \"Countess\" Lovelace");
+
+            // Reinstalling (a key added elsewhere, the identity saved)
+            // never leaves the key missing, even for a moment: a push
+            // running then would fail (SME-32 code review 2, finding 5).
+            let watch = sandbox.exec(&[
+                "sh",
+                "-c",
+                "for i in $(seq 1 300); do [ -e /etc/smelt/keys/test-key ] || echo missing; sleep 0.01; done",
+            ]);
+            let reinstall = async {
+                for _ in 0..3 {
+                    install_git_files(&client, &pod_name, &files).await.expect("reinstall");
+                }
+            };
+            let (watched, ()) = tokio::join!(watch, reinstall);
+            let watched = watched.expect("exec watch");
+            assert!(!watched.stdout.contains("missing"), "the key vanished during a reinstall");
+
+            // A write that fails says why (SME-32 code review 7, finding 5).
+            let locked = sandbox.exec(&["chmod", "500", "/etc/smelt/keys"]).await.expect("exec chmod");
+            assert_eq!(locked.exit_code, 0);
+            let failed = install_git_files(&client, &pod_name, &files).await.expect_err("keys dir not writable");
+            assert!(failed.to_string().contains("Permission denied"), "{failed}");
+            let unlocked = sandbox.exec(&["chmod", "700", "/etc/smelt/keys"]).await.expect("exec chmod");
+            assert_eq!(unlocked.exit_code, 0);
+
+            // The key is deleted: a reinstall without it removes the file.
+            let files = crate::git::pod_git_files(&[], &identity);
+            install_git_files(&client, &pod_name, &files)
+                .await
+                .expect("reinstall git files");
+            let gone = sandbox
+                .exec(&["test", "-e", "/etc/smelt/keys/test-key"])
+                .await
+                .expect("exec test");
+            assert_eq!(gone.exit_code, 1, "a deleted key's file is removed");
+            let ssh = sandbox
+                .exec(&["ssh", "-G", "github.com"])
+                .await
+                .expect("exec ssh -G");
+            assert!(!ssh.stdout.contains("/etc/smelt/keys/"), "{}", ssh.stdout);
+        })
+        .await;
+
+        manager.delete(sandbox).await.expect("delete pod");
+        checks.expect("checks finished within the timeout");
+    }
+
+    /// Sets up a bare repo at /tmp/origin.git inside `sandbox`'s pod, with
+    /// `main` holding an AGENTS.md and a `feature` branch on top. Returns
+    /// main's commit.
+    async fn make_origin_repo(sandbox: &Sandbox) -> String {
+        let script = r#"set -e
+            git init -q -b main /tmp/src && cd /tmp/src
+            printf 'Run make test before committing.\n' > AGENTS.md
+            git add AGENTS.md && git -c user.name=t -c user.email=t@t commit -qm first
+            git branch feature && git checkout -q feature
+            printf 'x\n' > feature.txt && mkdir web && printf 'Use pnpm.\n' > web/AGENTS.md
+            git add feature.txt web/AGENTS.md
+            git -c user.name=t -c user.email=t@t commit -qm feature && git checkout -q main
+            git clone -q --bare /tmp/src /tmp/origin.git
+            git rev-parse main"#;
+        let made = sandbox.exec(&["sh", "-c", script]).await.expect("exec make origin");
+        assert_eq!(made.exit_code, 0, "make origin repo: {}", made.stdout);
+        made.stdout.trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_clone_into_pod_checks_out_a_branch_and_reports_failures() {
+        let client = test_client().await;
+        let manager = SandboxManager::new(client.clone());
+        let sandbox = manager
+            .create(&unique_session_id("git-clone"), "256Mi", "250m", &[])
+            .await
+            .expect("create pod");
+        let pod_name = sandbox.pod_name.clone();
+
+        let checks = tokio::time::timeout(Duration::from_secs(120), async {
+            let main_commit = make_origin_repo(&sandbox).await;
+
+            let cloned = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin")
+                .await
+                .expect("clone the default branch");
+            assert_eq!(cloned.commit.as_deref(), Some(main_commit.as_str()));
+            assert_eq!(cloned.branch, "main");
+            let agents = sandbox
+                .exec(&["cat", "/workspace/origin/AGENTS.md"])
+                .await
+                .expect("exec cat");
+            assert_eq!(agents.stdout, "Run make test before committing.\n");
+
+            let read = crate::git::read_instructions_file(&client, &pod_name, "/workspace/origin", "/workspace/origin/AGENTS.md")
+                .await
+                .expect("read AGENTS.md")
+                .expect("origin has an AGENTS.md");
+            assert_eq!(read.content, "Run make test before committing.\n");
+            assert_eq!(read.file_bytes, 33);
+            assert_eq!(read.hash.len(), 64, "sha256 hex: {}", read.hash);
+            let listed = crate::git::list_agents_files(&client, &pod_name, "origin").await.expect("list");
+            assert_eq!(listed, vec!["AGENTS.md".to_string()], "main has no nested files");
+
+            let feature = crate::git::clone_into_pod(
+                &client,
+                &pod_name,
+                "file:///tmp/origin.git",
+                Some("feature"),
+                "origin-feature",
+            )
+            .await
+            .expect("clone a branch");
+            assert_eq!(feature.branch, "feature");
+            assert_ne!(feature.commit.as_deref(), Some(main_commit.as_str()));
+            let listed = crate::git::list_agents_files(&client, &pod_name, "origin-feature").await.expect("list");
+            assert_eq!(listed, vec!["AGENTS.md".to_string(), "web/AGENTS.md".to_string()], "top-level first");
+
+            let bare = sandbox
+                .exec(&["git", "init", "-q", "/workspace/no-agents"])
+                .await
+                .expect("exec git init");
+            assert_eq!(bare.exit_code, 0);
+            let none = crate::git::read_instructions_file(&client, &pod_name, "/workspace/no-agents", "/workspace/no-agents/AGENTS.md")
+                .await
+                .expect("read a missing file");
+            assert_eq!(none, None);
+            assert!(crate::git::list_agents_files(&client, &pod_name, "no-agents").await.expect("list").is_empty());
+
+            // Bytes that aren't UTF-8 (or a 1 MiB cut through a character)
+            // still load, with the bad bytes replaced (SME-32 code review,
+            // finding 6).
+            let bad = sandbox
+                .exec(&["sh", "-c", "git init -q /workspace/bad-bytes && printf 'Use \\377 tabs.\\n' > /workspace/bad-bytes/AGENTS.md"])
+                .await
+                .expect("exec make bad bytes");
+            assert_eq!(bad.exit_code, 0, "{}", bad.stderr);
+            let read = crate::git::read_instructions_file(&client, &pod_name, "/workspace/bad-bytes", "/workspace/bad-bytes/AGENTS.md")
+                .await
+                .expect("a file with invalid UTF-8 reads")
+                .expect("it exists");
+            assert_eq!(read.content, "Use \u{FFFD} tabs.\n");
+            assert_eq!(read.file_bytes, 12);
+
+            // Invalid bytes decode to 3-byte replacement characters: a file
+            // well under 32 KiB can decode to more, and must load whole, not
+            // be cut again (SME-32 code review 8, finding 3).
+            let swollen = sandbox
+                .exec(&["sh", "-c", "git init -q /workspace/swollen && head -c 16000 /dev/zero | tr '\\0' '\\377' > /workspace/swollen/AGENTS.md && echo END >> /workspace/swollen/AGENTS.md"])
+                .await
+                .expect("exec make swollen");
+            assert_eq!(swollen.exit_code, 0, "{}", swollen.stderr);
+            let read = crate::git::read_instructions_file(&client, &pod_name, "/workspace/swollen", "/workspace/swollen/AGENTS.md")
+                .await
+                .expect("read")
+                .expect("it exists");
+            assert_eq!(read.file_bytes, 16004);
+            assert!(read.content.ends_with("END\n"), "the whole file loads: ...{:?}", read.content.chars().rev().take(5).collect::<String>());
+
+            // A non-ASCII path is listed as it is, not in git's quoting,
+            // so it can be loaded (SME-32 code review 7, finding 3).
+            let unicode = sandbox
+                .exec(&["sh", "-c", "git init -q /workspace/unicode && cd /workspace/unicode && mkdir é && echo x > é/AGENTS.md && git add é/AGENTS.md"])
+                .await
+                .expect("exec make unicode");
+            assert_eq!(unicode.exit_code, 0, "{}", unicode.stderr);
+            let listed = crate::git::list_agents_files(&client, &pod_name, "unicode").await.expect("list");
+            assert_eq!(listed, vec!["é/AGENTS.md".to_string()]);
+
+            // An AGENTS.md that's a symlink out of the checkout (to a key,
+            // say) is refused, not read (SME-32 code review 7, finding 1).
+            let linked = sandbox
+                .exec(&["sh", "-c", "git init -q /workspace/linked && ln -s /etc/passwd /workspace/linked/AGENTS.md"])
+                .await
+                .expect("exec make symlink");
+            assert_eq!(linked.exit_code, 0, "{}", linked.stderr);
+            let refused = crate::git::read_instructions_file(&client, &pod_name, "/workspace/linked", "/workspace/linked/AGENTS.md")
+                .await
+                .expect_err("a symlink isn't read");
+            assert!(refused.contains("isn't a regular file"), "{refused}");
+            assert!(!refused.contains("root:"), "nothing of the target leaks: {refused}");
+
+            let missing = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/nope.git", None, "nope")
+                .await
+                .expect_err("a missing repo fails");
+            assert!(missing.contains("does not appear to be a git repository"), "{missing}");
+
+            // The directory is taken: git's own message, not a silent overwrite.
+            let taken = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin")
+                .await
+                .expect_err("an existing directory fails");
+            assert!(taken.contains("already exists"), "{taken}");
+            // Git refuses an existing directory; the error says what to do
+            // when it's what a cut-off clone left (SME-32 code review 5).
+            assert!(taken.contains("delete it"), "{taken}");
+            let untouched = sandbox
+                .exec(&["cat", "/workspace/origin/AGENTS.md"])
+                .await
+                .expect("exec cat");
+            assert_eq!(untouched.stdout, "Run make test before committing.\n", "the existing checkout is left alone");
+        })
+        .await;
+
+        manager.delete(sandbox).await.expect("delete pod");
+        checks.expect("checks finished within the timeout");
+    }
+
+    #[test]
+    fn test_exec_with_no_status_is_a_failure_not_a_success() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
+        // The connection closed before the API server said how it ended.
+        assert_eq!(extract_exit_code(None), -1);
+        // What a successful exec actually ends with: no causes at all.
+        let success = Status {
+            status: Some("Success".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(extract_exit_code(Some(success)), 0);
+    }
+
     // Not a real UUID — just enough entropy to avoid pod-name collisions
     // between concurrent test runs, without adding a `uuid` dependency.
     fn uuid_like() -> String {
@@ -4095,9 +4595,9 @@ mod tests {
         let docker = DockerSidecar {
             memory: "1Gi".to_string(),
             cpu: "500m".to_string(),
-            storage: DockerStorage::Conversation(conversation_id),
+            storage: PodStorage::Conversation(conversation_id),
         };
-        ensure_docker_pvc(&client, conversation_id).await.expect("ensure docker claim");
+        ensure_conversation_pvcs(&client, conversation_id).await.expect("ensure docker claim");
         // Every pod this test makes, so cleanup below finds them even after
         // a failed assertion unwinds out of the checks.
         let created: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
@@ -4311,7 +4811,7 @@ mod tests {
         let docker = DockerSidecar {
             memory: "512Mi".to_string(),
             cpu: "500m".to_string(),
-            storage: DockerStorage::Ephemeral,
+            storage: PodStorage::Ephemeral,
         };
         let sandbox = manager
             .create_with_docker(&unique_session_id("docker-oom"), "128Mi", "250m", &docker, &[])
@@ -4405,9 +4905,9 @@ mod tests {
         let docker = DockerSidecar {
             memory: "256Mi".to_string(),
             cpu: "250m".to_string(),
-            storage: DockerStorage::Conversation(conversation_id),
+            storage: PodStorage::Conversation(conversation_id),
         };
-        ensure_docker_pvc(&client, conversation_id).await.expect("ensure docker claim");
+        ensure_conversation_pvcs(&client, conversation_id).await.expect("ensure docker claim");
         let sandbox = manager
             .create_with_docker(&unique_session_id("stopping"), "128Mi", "250m", &docker, &[])
             .await
@@ -4444,16 +4944,16 @@ mod tests {
             + 1_000_000_000;
         let name = docker_pvc_name(conversation_id);
 
-        ensure_docker_pvc(&client, conversation_id).await.expect("first ensure should create");
+        ensure_conversation_pvcs(&client, conversation_id).await.expect("first ensure should create");
         let first = pvcs.get_opt(&name).await.expect("get claim");
         let first_uid = first.and_then(|p| p.metadata.uid);
         assert!(first_uid.is_some(), "ensure_docker_pvc should create {name}");
 
-        ensure_docker_pvc(&client, conversation_id).await.expect("second ensure should reuse");
+        ensure_conversation_pvcs(&client, conversation_id).await.expect("second ensure should reuse");
         let second_uid = pvcs.get_opt(&name).await.expect("get claim").and_then(|p| p.metadata.uid);
         assert_eq!(first_uid, second_uid, "a second ensure must reuse the claim, not replace it");
 
-        delete_docker_pvc(&client, conversation_id).await;
+        delete_conversation_pvcs(&client, conversation_id).await;
         let gone = tokio::time::timeout(Duration::from_secs(30), async {
             while pvcs.get_opt(&name).await.expect("get claim").is_some() {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -4536,6 +5036,10 @@ mod tests {
                 .delete(&docker_pvc_name(n), &DeleteParams::default())
                 .await
                 .ok();
+            pvcs_precheck
+                .delete(&workspace_pvc_name(n), &DeleteParams::default())
+                .await
+                .ok();
         }
         // Same reasoning again, for the volume-mount pod itself
         // (`unique_session_id(VOLUME_MOUNT_SESSION_LABEL)`) — its name
@@ -4588,7 +5092,189 @@ mod tests {
 
             // --- One pod per conversation: create_pod refuses a second
             // live pod, list reflects reality ---
+            // A stored key and commit identity reach every new pod (SME-32).
+            let key = crate::git::generate_key("lifecycle");
+            db::create_ssh_key(&pool, "lifecycle", &key.public_key, &key.private_key)
+                .await
+                .expect("store key");
+            db::set_git_identity(
+                &pool,
+                &crate::git::GitIdentity {
+                    name: "Lifecycle Test".to_string(),
+                    email: "lifecycle@example.com".to_string(),
+                },
+            )
+            .await
+            .expect("store identity");
             let pod_a = create_pod(&pool, conversation_a.id, PodLimitOverrides::default()).await.expect("create_pod (a) should succeed");
+            let git_check = exec_with(
+                &client,
+                &pod_name(pod_a),
+                "sandbox",
+                &["sh", "-c", "test -s /etc/smelt/keys/lifecycle && git config user.email"],
+                None,
+            )
+            .await
+            .expect("exec git check");
+            assert_eq!(
+                (git_check.exit_code, git_check.stdout.trim()),
+                (0, "lifecycle@example.com"),
+                "a new pod has the stored key and identity"
+            );
+            // /workspace is the conversation's claim, whose root the
+            // provisioner owns; the sandbox user gets it (SME-32 code
+            // review 2, finding 6).
+            let owner = exec_with(&client, &pod_name(pod_a), "sandbox", &["stat", "-c", "%U:%G", "/workspace"], None)
+                .await
+                .expect("exec stat");
+            assert_eq!(owner.stdout.trim(), "sandbox:sandbox", "/workspace belongs to the sandbox user");
+
+            // clone_repo records the repo and checks it out in the pod.
+            let origin = exec_with(
+                &client,
+                &pod_name(pod_a),
+                "sandbox",
+                &["sh", "-c", "set -e; git init -q -b main /tmp/src; cd /tmp/src; echo 'Run make test.' > AGENTS.md; git add AGENTS.md; git commit -qm one; git clone -q --bare /tmp/src /tmp/origin.git; git rev-parse HEAD"],
+                None,
+            )
+            .await
+            .expect("exec make origin");
+            assert_eq!(origin.exit_code, 0, "make origin: {}{}", origin.stdout, origin.stderr);
+            let repo = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, None)
+                .await
+                .expect("clone_repo");
+            assert_eq!(repo.path, "/workspace/origin");
+            assert_eq!(repo.status, crate::git::RepoStatus::Ready);
+            assert_eq!(repo.commit.as_deref(), Some(origin.stdout.trim()));
+            assert_eq!(repo.branch.as_deref(), Some("main"));
+            // The clone lists its AGENTS.md; nothing loads by itself.
+            assert_eq!(repo.agents_files, vec!["AGENTS.md".to_string()]);
+            assert!(crate::git::project_instructions(&pool, conversation_a.id).await.expect("loaded").is_empty());
+            // The model asks to load it: a remote the user hasn't decided
+            // about, so they're asked, with exactly that file.
+            let asked = crate::git::load_instructions(&pool, conversation_a.id, "/workspace/origin/AGENTS.md")
+                .await
+                .expect("load_instructions");
+            assert!(asked.contains("being asked"), "{asked}");
+            let repos = crate::git::list_repos(&pool, conversation_a.id).await.expect("list repos");
+            assert_eq!(repos[0].trust_requests.len(), 1);
+            assert_eq!(repos[0].trust_requests[0].content, "Run make test.\n");
+            // Trusted, that file is in the model's context.
+            let shown = &repos[0].trust_requests[0];
+            crate::git::decide_trust(&pool, conversation_a.id, shown.id, &shown.hash, true)
+                .await
+                .expect("trust");
+            let loaded = crate::git::project_instructions(&pool, conversation_a.id)
+                .await
+                .expect("project instructions");
+            assert_eq!(loaded.len(), 1, "{loaded:?}");
+            assert_eq!(loaded[0].content, "Run make test.\n");
+            assert_eq!(loaded[0].path, "/workspace/origin/AGENTS.md");
+            assert_eq!(loaded[0].commit, repo.commit);
+            // A failed clone retried with another branch (or URL) clones
+            // what's asked for now, not what failed (SME-32 code review,
+            // finding 1).
+            let failed = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", Some("nope"), Some("retry"))
+                .await
+                .expect_err("there's no branch nope");
+            assert!(failed.contains("nope"), "{failed}");
+            let retried = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, Some("retry"))
+                .await
+                .expect("the retry clones the default branch");
+            assert_eq!(retried.requested_branch, None);
+            assert_eq!(retried.branch.as_deref(), Some("main"));
+            assert_eq!(retried.status, crate::git::RepoStatus::Ready);
+
+            // A clone refused because the directory already holds work
+            // doesn't delete that work when retried; only a clone that was
+            // interrupted gets its directory replaced (SME-32 code review
+            // 2, finding 1).
+            let work = exec_with(
+                &client,
+                &pod_name(pod_a),
+                "sandbox",
+                &["sh", "-c", "mkdir -p /workspace/mywork && echo precious > /workspace/mywork/notes.txt"],
+                None,
+            )
+            .await
+            .expect("exec make work");
+            assert_eq!(work.exit_code, 0, "{}", work.stderr);
+            for attempt in ["first", "retry"] {
+                let refused = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, Some("mywork"))
+                    .await
+                    .expect_err("the directory holds work");
+                assert!(refused.contains("already exists"), "{attempt}: {refused}");
+            }
+            let kept = exec_with(&client, &pod_name(pod_a), "sandbox", &["cat", "/workspace/mywork/notes.txt"], None)
+                .await
+                .expect("exec cat");
+            assert_eq!(kept.stdout, "precious\n", "a retry must not delete the work");
+            let mywork = db::list_conversation_repos(&pool, conversation_a.id)
+                .await
+                .expect("list")
+                .into_iter()
+                .find(|r| r.dir == "mywork")
+                .expect("the mywork repo");
+            // Even marked interrupted: that directory held work before any
+            // clone, so a retry leaves it (SME-32 code review 3).
+            db::set_repo_failed(&pool, mywork.id, crate::git::CLONE_INTERRUPTED).await.expect("mark interrupted");
+            let refused = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, Some("mywork"))
+                .await
+                .expect_err("the directory still holds work");
+            assert!(refused.contains("already exists"), "{refused}");
+            let kept = exec_with(&client, &pod_name(pod_a), "sandbox", &["cat", "/workspace/mywork/notes.txt"], None)
+                .await
+                .expect("exec cat");
+            assert_eq!(kept.stdout, "precious\n");
+
+            // A brand-new empty repo clones: its branch, no commit yet.
+            let empty = exec_with(&client, &pod_name(pod_a), "sandbox", &["git", "init", "-q", "--bare", "-b", "main", "/tmp/empty.git"], None)
+                .await
+                .expect("exec init empty");
+            assert_eq!(empty.exit_code, 0, "{}", empty.stderr);
+            let cloned_empty = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/empty.git", None, None)
+                .await
+                .expect("an empty repo clones");
+            assert_eq!(cloned_empty.status, crate::git::RepoStatus::Ready);
+            assert_eq!((cloned_empty.branch.as_deref(), cloned_empty.commit.as_deref()), (Some("main"), None));
+
+            // Asking again returns the same checkout rather than a second clone.
+            let again = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, None)
+                .await
+                .expect("clone_repo again");
+            assert_eq!(again.id, repo.id);
+            let wrote = exec_with(
+                &client,
+                &pod_name(pod_a),
+                "sandbox",
+                &["sh", "-c", "echo 'not pushed yet' > /workspace/origin/uncommitted.txt"],
+                None,
+            )
+            .await
+            .expect("exec write");
+            assert_eq!(wrote.exit_code, 0, "{}", wrote.stderr);
+
+            // AGENTS.md changes in the checkout: what's loaded stays until
+            // the model loads it again, which a trusted repo allows at once.
+            let edited = exec_with(
+                &client,
+                &pod_name(pod_a),
+                "sandbox",
+                &["sh", "-c", "echo 'Run make lint too.' >> /workspace/origin/AGENTS.md"],
+                None,
+            )
+            .await
+            .expect("exec edit");
+            assert_eq!(edited.exit_code, 0, "{}", edited.stderr);
+            let loaded = crate::git::project_instructions(&pool, conversation_a.id).await.expect("loaded");
+            assert_eq!(loaded[0].content, "Run make test.\n", "still the loaded version");
+            let reloaded = crate::git::load_instructions(&pool, conversation_a.id, "/workspace/origin/AGENTS.md")
+                .await
+                .expect("load again");
+            assert!(reloaded.starts_with("Loaded"), "{reloaded}");
+            let loaded = crate::git::project_instructions(&pool, conversation_a.id).await.expect("loaded");
+            assert_eq!(loaded.len(), 1, "replaced, not added: {loaded:?}");
+            assert_eq!(loaded[0].content, "Run make test.\nRun make lint too.\n");
             let duplicate = create_pod(&pool, conversation_a.id, PodLimitOverrides::default()).await;
             assert!(
                 matches!(duplicate, Err(SandboxError::PodAlreadyExists)),
@@ -5006,8 +5692,66 @@ mod tests {
                 "terminate_pod should no longer be idempotent — a second call resolves to NoPod, got {repeat:?}"
             );
 
+            // /workspace is the conversation's own: the next pod has the
+            // checkout, uncommitted work included.
+            let pod_a2 = create_pod(&pool, conversation_a.id, PodLimitOverrides::default())
+                .await
+                .expect("a second pod for conversation a");
+            let kept = exec_with(
+                &client,
+                &pod_name(pod_a2),
+                "sandbox",
+                &["sh", "-c", "cat /workspace/origin/uncommitted.txt && git -C /workspace/origin status --porcelain"],
+                None,
+            )
+            .await
+            .expect("exec check workspace");
+            assert_eq!(
+                (kept.exit_code, kept.stdout.as_str()),
+                (0, "not pushed yet\n M AGENTS.md\n?? uncommitted.txt\n"),
+                "the checkout and its uncommitted file survive the pod: {}",
+                kept.stderr
+            );
+            let repos = crate::git::list_repos(&pool, conversation_a.id).await.expect("list repos");
+            assert_eq!(repos.len(), 4, "origin, retry, mywork, empty: {repos:?}");
+            assert_eq!(repos[0].status, crate::git::RepoStatus::Ready, "{repos:?}");
+            assert_eq!(repos[0].loaded_instructions, vec!["AGENTS.md".to_string()], "{repos:?}");
+            assert_eq!(repos[1].status, crate::git::RepoStatus::Ready, "{repos:?}");
+            terminate_pod(&pool, conversation_a.id).await.expect("terminate the second pod (a)");
+
             let pods_after = list_pods(&pool, conversation_a.id).await.expect("list_pods");
             assert!(pods_after.is_empty(), "no pods should be listed after terminating it, got {pods_after:?}");
+
+            // "Work on a repo" on a conversation with no sandbox starts one.
+            // The repo is recorded first, so a message sent while the
+            // sandbox starts waits for the clone (SME-32 code review,
+            // finding 3).
+            let attaching = tokio::spawn({
+                let pool = pool.clone();
+                let id = conversation_a.id;
+                async move { crate::git::attach_repo(&pool, id, "file:///tmp/missing.git", None).await }
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !crate::git::wait_for_clones(&pool, conversation_a.id, Duration::ZERO).await,
+                "a turn started while the sandbox starts should see the clone coming"
+            );
+            let attached = attaching
+                .await
+                .expect("attach task")
+                .expect_err("this origin doesn't exist");
+            assert!(attached.contains("does not appear to be a git repository"), "{attached}");
+            // The user named it, so it counts as trusted.
+            assert_eq!(
+                db::get_repo_trust(&pool, "file/tmp/missing").await.expect("trust"),
+                Some(true)
+            );
+            assert_eq!(
+                list_pods(&pool, conversation_a.id).await.expect("list_pods").len(),
+                1,
+                "attach_repo started a sandbox"
+            );
+            terminate_pod(&pool, conversation_a.id).await.expect("terminate the attach pod (a)");
             let terminals_after = list_terminals(&pool, conversation_a.id).await.expect("list_terminals");
             assert!(terminals_after.is_empty(), "no terminals should be listed after terminating all of them");
 
@@ -5339,6 +6083,21 @@ mod tests {
                 .and_then(|v| v.persistent_volume_claim)
                 .map(|c| c.claim_name);
             assert_eq!(data_claim.as_deref(), Some(docker_claim.as_str()), "pod j should mount its conversation's claim");
+            // And /workspace is on a claim of its own (SME-32).
+            let workspace_claim = workspace_pvc_name(conversation_j.id);
+            assert!(
+                docker_pvcs.get_opt(&workspace_claim).await.expect("get_opt").is_some(),
+                "create_pod should create the conversation's workspace claim {workspace_claim}"
+            );
+            let spec_j = pods_api(&client).get(&pod_name(pod_j)).await.expect("get pod j").spec.expect("spec");
+            let mounted_workspace = spec_j
+                .volumes
+                .unwrap_or_default()
+                .into_iter()
+                .find(|v| v.name == WORKSPACE_VOLUME)
+                .and_then(|v| v.persistent_volume_claim)
+                .map(|c| c.claim_name);
+            assert_eq!(mounted_workspace.as_deref(), Some(workspace_claim.as_str()), "pod j's /workspace is its conversation's claim");
 
             teardown_conversation(&pool, conversation_j.id).await;
             // The claim's `pvc-protection` finalizer holds it until the pod
@@ -5350,6 +6109,13 @@ mod tests {
             })
             .await;
             assert!(docker_claim_gone.is_ok(), "teardown_conversation should delete the docker data claim");
+            let workspace_claim_gone = tokio::time::timeout(Duration::from_secs(60), async {
+                while docker_pvcs.get_opt(&workspace_claim).await.ok().flatten().is_some() {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            })
+            .await;
+            assert!(workspace_claim_gone.is_ok(), "teardown_conversation should delete the workspace claim");
 
             // --- Generic volumes: create_volume/delete_volume manage a
             // real PVC alongside the sandbox_volumes row, and a volume
@@ -5555,7 +6321,7 @@ mod tests {
                 &DockerSidecar {
                     memory: "512Mi".to_string(),
                     cpu: "250m".to_string(),
-                    storage: DockerStorage::Ephemeral,
+                    storage: PodStorage::Ephemeral,
                 },
                 &[],
                 Duration::from_millis(1),

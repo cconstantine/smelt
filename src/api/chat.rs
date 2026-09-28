@@ -122,6 +122,10 @@ const TOOL_CALL_PARSE_RETRIES: usize = 2;
 #[cfg(feature = "server")]
 const MAX_TURNS: usize = 10_000;
 
+/// How long a turn waits for a repo that's still cloning; see `run_turn_bounded`.
+#[cfg(feature = "server")]
+const CLONE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Every real turn's requested reply budget — shared with the
 /// auto-compaction trigger below, which reserves at least this much
 /// headroom off the context window before deciding a request is too big.
@@ -450,6 +454,10 @@ pub(crate) struct PromptEnvironment {
     /// `(name, mount path)`, the path already resolved.
     pub volumes: Vec<(String, String)>,
     pub mcp_servers: Vec<String>,
+    /// The conversation's repos (SME-32).
+    pub repos: Vec<crate::git::RepoSummary>,
+    /// Their loaded `AGENTS.md` files.
+    pub instructions: Vec<crate::git::ProjectInstructions>,
 }
 
 /// The system prompt sent with every turn: the base prompt, then an
@@ -473,6 +481,33 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
             env.mcp_servers.join(", ")
         ));
     }
+    if !env.repos.is_empty() {
+        prompt.push_str("- Repositories:\n");
+        for repo in &env.repos {
+            let state = match repo.status {
+                crate::git::RepoStatus::Ready => repo.branch.clone().unwrap_or_default(),
+                crate::git::RepoStatus::Cloning => "still cloning".to_string(),
+                crate::git::RepoStatus::Failed => "clone failed".to_string(),
+            };
+            prompt.push_str(&format!("  - {}: {} ({state})", repo.path, repo.url));
+            if !repo.agents_files.is_empty() {
+                let files: Vec<String> = repo
+                    .agents_files
+                    .iter()
+                    .map(|f| {
+                        if repo.loaded_instructions.contains(f) {
+                            format!("{f} (loaded)")
+                        } else {
+                            f.clone()
+                        }
+                    })
+                    .collect();
+                prompt.push_str(&format!("; AGENTS.md files: {}", files.join(", ")));
+            }
+            prompt.push('\n');
+        }
+    }
+    prompt.push_str(&crate::git::render_project_instructions(&env.instructions));
     prompt
 }
 
@@ -480,7 +515,17 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
 /// leaves its list empty (and is logged) rather than failing the turn: the
 /// prompt without it is still useful.
 #[cfg(feature = "server")]
-pub(crate) async fn prompt_environment(pool: &PgPool) -> PromptEnvironment {
+pub(crate) async fn prompt_environment(pool: &PgPool, conversation_id: i64) -> PromptEnvironment {
+    let repos = crate::git::list_repos(pool, conversation_id).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "couldn't list repos for the system prompt");
+        Vec::new()
+    });
+    let instructions = crate::git::project_instructions(pool, conversation_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "couldn't read project instructions for the system prompt");
+            Vec::new()
+        });
     let volumes = match db::list_sandbox_volumes(pool).await {
         Ok(volumes) => volumes.into_iter().map(|v| (v.name, v.mount_path)).collect(),
         Err(e) => {
@@ -500,6 +545,8 @@ pub(crate) async fn prompt_environment(pool: &PgPool) -> PromptEnvironment {
         model: anthropic_model(),
         volumes,
         mcp_servers,
+        repos,
+        instructions,
     }
 }
 
@@ -749,6 +796,38 @@ pub(crate) async fn save_notice_between_turns(
     Ok(saved)
 }
 
+/// Tells the model about something that happened outside a turn (Docker
+/// restarting, the user's trust decision) and lets it answer: the notice
+/// is the next message, and a turn runs for it once no turn is running.
+/// After the user stopped the conversation, it's only saved, for their
+/// next message. Call it from a spawned task: it waits for a running turn.
+#[cfg(feature = "server")]
+pub(crate) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: String) {
+    if is_paused(conversation_id) {
+        if let Err(e) = save_notice_between_turns(pool, conversation_id, text).await {
+            tracing::warn!(conversation_id, error = %e, "couldn't save a notice");
+        }
+        return;
+    }
+    // The notice as the turn's own message: `run_turn` saves it before the
+    // model call, so it survives the call failing.
+    let message = anthropic::AnthropicMessage {
+        role: "user".to_string(),
+        content: vec![anthropic::ContentBlock::Text { text }],
+    };
+    if let Err(e) = run_turn(pool, conversation_id, message, None).await
+        && chat_error_text(&e) != TURN_STOPPED
+    {
+        tracing::warn!(conversation_id, error = %e, "a notice didn't reach the model");
+        crate::events::publish(
+            conversation_id,
+            crate::events::ConversationEvent::NotificationDeliveryFailed {
+                detail: chat_error_text(&e),
+            },
+        );
+    }
+}
+
 /// A live `send_message` call and a background task's push-triggered
 /// `run_turn` call (or two different tasks' pushes) can race for the same
 /// conversation — Anthropic's strict user/assistant alternation breaks if
@@ -760,7 +839,7 @@ static CONVERSATION_LOCKS: LazyLock<Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(feature = "server")]
-fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<()>> {
     let mut locks = CONVERSATION_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
     locks
         .entry(conversation_id)
@@ -1287,6 +1366,13 @@ fn run_turn_body<'a>(
             .filter(|s| !s.is_empty());
         require_at_least_one_credential(&api_key, &auth_token).map_err(ServerFnError::new)?;
 
+        // A repo the user just attached may still be cloning; its AGENTS.md
+        // belongs in this turn's system prompt (SME-32). Bounded: past it,
+        // the turn goes ahead and the prompt says the repo is still cloning.
+        if !crate::git::wait_for_clones(pool, conversation_id, CLONE_WAIT).await {
+            tracing::info!(conversation_id, "starting a turn while a repo is still cloning");
+        }
+
         for _ in 0..max_turns {
             // Checked at the top of every loop iteration, not just once per
             // `run_turn` call — this is what gives same-turn visibility: if
@@ -1348,7 +1434,7 @@ fn run_turn_body<'a>(
                 // this budget with the actual reply, and 4096 left no
                 // headroom for both once thinking turned on.
                 max_tokens: MAX_TOKENS,
-                system: Some(system_prompt(&prompt_environment(pool).await)),
+                system: Some(system_prompt(&prompt_environment(pool, conversation_id).await)),
                 messages: history,
                 stream: true,
                 tools: anthropic::tools::tool_definitions(pool).await,
@@ -1772,6 +1858,9 @@ pub async fn get_context_usage(id: i64) -> ServerFnResult<ContextUsageSnapshot> 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ContextDetailSnapshot {
     pub system: Option<String>,
+    /// The `AGENTS.md` files in `system`, with where each came from
+    /// (SME-32).
+    pub instructions: Vec<crate::git::ProjectInstructions>,
     pub tools: Vec<anthropic::ToolDefinition>,
     pub message_count: usize,
     pub usage: Option<anthropic::TokenUsage>,
@@ -1795,7 +1884,10 @@ async fn context_detail(pool: &PgPool, id: i64) -> ServerFnResult<ContextDetailS
         .await
         .map_err(ServerFnError::new)?;
     Ok(ContextDetailSnapshot {
-        system: Some(system_prompt(&prompt_environment(pool).await)),
+        system: Some(system_prompt(&prompt_environment(pool, id).await)),
+        instructions: crate::git::project_instructions(pool, id)
+            .await
+            .map_err(ServerFnError::new)?,
         tools,
         message_count,
         usage,
@@ -2841,7 +2933,44 @@ mod tests {
             model: "claude-test-model".to_string(),
             volumes: vec![("cargo-cache".to_string(), "/home/sandbox/.cargo".to_string())],
             mcp_servers: vec!["exa".to_string(), "github".to_string()],
+            repos: Vec::new(),
+            instructions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn test_system_prompt_lists_repos_and_ends_with_their_instructions() {
+        let mut env = prompt_env();
+        env.repos = vec![crate::git::RepoSummary {
+            id: 1,
+            url: "git@github.com:o/smelt.git".to_string(),
+            path: "/workspace/smelt".to_string(),
+            requested_branch: None,
+            branch: Some("main".to_string()),
+            commit: Some("43835b44f939".to_string()),
+            status: crate::git::RepoStatus::Ready,
+            error: None,
+            agents_files: vec!["AGENTS.md".to_string(), "web/AGENTS.md".to_string()],
+            loaded_instructions: vec!["AGENTS.md".to_string()],
+            trust_requests: vec![],
+        }];
+        env.instructions = vec![crate::git::ProjectInstructions {
+            repo_url: "git@github.com:o/smelt.git".to_string(),
+            path: "/workspace/smelt/AGENTS.md".to_string(),
+            commit: Some("43835b44f939".to_string()),
+            content: "Run make test.\n".to_string(),
+            file_bytes: 15,
+            truncated: false,
+        }];
+        let prompt = system_prompt(&env);
+        assert!(
+            prompt.contains("- Repositories:\n  - /workspace/smelt: git@github.com:o/smelt.git (main); AGENTS.md files: AGENTS.md (loaded), web/AGENTS.md\n"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.ends_with(&crate::git::render_project_instructions(&env.instructions)),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -2943,7 +3072,36 @@ mod tests {
         db::ensure_mcp_server(&pool, "exa", "https://mcp.example.com/mcp")
             .await
             .expect("add mcp server");
-        let env = prompt_environment(&pool).await;
+        let conversation = db::create_conversation(&pool).await.expect("conversation");
+        let repo = db::create_conversation_repo(&pool, conversation.id, "git@github.com:o/r.git", "github.com/o/r", None, "r")
+            .await
+            .expect("repo");
+        db::set_repo_cloned(&pool, repo.id, "main", Some("abc123")).await.expect("cloned");
+        db::set_repo_agents_files(&pool, repo.id, &["AGENTS.md".to_string(), "web/AGENTS.md".to_string()])
+            .await
+            .expect("agents files");
+        let loaded = db::InstructionsFile {
+            content: "Run make test.\n".to_string(),
+            file_bytes: 15,
+            hash: "h".to_string(),
+            commit: Some("abc123".to_string()),
+        };
+        db::load_instruction(&pool, conversation.id, repo.id, "AGENTS.md", &loaded).await.expect("load");
+        let env = prompt_environment(&pool, conversation.id).await;
+        assert_eq!(env.repos[0].loaded_instructions, vec!["AGENTS.md".to_string()]);
+        assert_eq!(env.repos.len(), 1);
+        assert_eq!(env.repos[0].path, "/workspace/r");
+        assert_eq!(
+            env.instructions,
+            vec![crate::git::ProjectInstructions {
+                repo_url: "git@github.com:o/r.git".to_string(),
+                path: "/workspace/r/AGENTS.md".to_string(),
+                commit: Some("abc123".to_string()),
+                content: "Run make test.\n".to_string(),
+                file_bytes: 15,
+                truncated: false,
+            }]
+        );
         assert_eq!(env.date, chrono::Utc::now().date_naive());
         assert_eq!(env.model, anthropic_model());
         assert_eq!(
@@ -2972,7 +3130,7 @@ mod tests {
 
         let requests = requests.lock().expect("the request log");
         assert_eq!(requests.len(), 1);
-        let expected = system_prompt(&prompt_environment(&pool).await);
+        let expected = system_prompt(&prompt_environment(&pool, conversation.id).await);
         assert_eq!(requests[0]["system"].as_str(), Some(expected.as_str()));
         assert!(expected.contains("cargo-cache mounted at /home/sandbox/.cargo"));
     }
@@ -3022,7 +3180,7 @@ mod tests {
         let requests = requests.lock().expect("the request log");
         assert_eq!(requests.len(), 2, "a compaction call, then the real turn");
         assert_eq!(requests[0]["system"].as_str(), Some(COMPACTION_SYSTEM_PROMPT));
-        let expected = system_prompt(&prompt_environment(&pool).await);
+        let expected = system_prompt(&prompt_environment(&pool, conversation.id).await);
         assert_eq!(requests[1]["system"].as_str(), Some(expected.as_str()));
     }
 
@@ -3035,8 +3193,28 @@ mod tests {
         let detail = context_detail(&pool, conversation.id)
             .await
             .expect("context detail");
-        let expected = system_prompt(&prompt_environment(&pool).await);
+        let expected = system_prompt(&prompt_environment(&pool, conversation.id).await);
         assert_eq!(detail.system.as_deref(), Some(expected.as_str()));
+    }
+
+    /// The detail view lists the loaded AGENTS.md files on their own.
+    #[sqlx::test]
+    async fn test_context_detail_lists_loaded_instructions(pool: PgPool) {
+        let conversation = db::create_conversation(&pool).await.expect("conversation");
+        let repo = db::create_conversation_repo(&pool, conversation.id, "git@github.com:o/r.git", "github.com/o/r", None, "r")
+            .await
+            .expect("repo");
+        let loaded = db::InstructionsFile {
+            content: "Run make test.\n".to_string(),
+            file_bytes: 15,
+            hash: "h".to_string(),
+            commit: Some("abc123".to_string()),
+        };
+        db::load_instruction(&pool, conversation.id, repo.id, "AGENTS.md", &loaded).await.expect("load");
+        let detail = context_detail(&pool, conversation.id).await.expect("context detail");
+        assert_eq!(detail.instructions.len(), 1);
+        assert_eq!(detail.instructions[0].path, "/workspace/r/AGENTS.md");
+        assert_eq!(detail.instructions[0].content, "Run make test.\n");
     }
 
     /// Every tool the base prompt names in backticks must exist, so
@@ -3218,6 +3396,31 @@ mod tests {
             requests[0]["messages"].to_string().contains("cmd-after-stop"),
             "the next turn should include the command's notice"
         );
+    }
+
+    /// A notice delivered while nothing runs gets an answer from the model;
+    /// after the user stopped the conversation, it's only saved (SME-32
+    /// code review 6: the old save-then-wake never ran a turn).
+    #[sqlx::test]
+    async fn test_a_delivered_notice_is_answered_unless_stopped(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let requests = start_recording_mock_upstream(vec![text_reply_body("Noted.")]).await;
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+
+        deliver_notice(&pool, conversation.id, "Docker in your sandbox was restarted.".to_string()).await;
+        {
+            let requests = requests.lock().expect("the request log");
+            assert_eq!(requests.len(), 1, "the model is asked about the notice");
+            let last = requests[0]["messages"].as_array().expect("messages").last().expect("a message").to_string();
+            assert!(last.contains("Docker in your sandbox was restarted."), "{last}");
+        }
+
+        let stopped = db::create_conversation(&pool).await.expect("create conversation");
+        stop_turn_now(stopped.id);
+        deliver_notice(&pool, stopped.id, "The user trusts it.".to_string()).await;
+        assert_eq!(requests.lock().expect("the request log").len(), 1, "no model call after a stop");
+        let saved = db::list_messages(&pool, stopped.id).await.expect("messages");
+        assert!(saved.iter().any(|m| m.content.contains("The user trusts it.")), "saved for later");
     }
 
     #[sqlx::test]

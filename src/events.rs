@@ -145,6 +145,12 @@ pub enum ConversationEvent {
     BrowsingUrlUpdate {
         url: String,
     },
+    /// The conversation's repos (SME-32), all of them, published whenever
+    /// one is added, starts cloning, or finishes. Regenerable from
+    /// `api::git::list_conversation_repos`.
+    ReposUpdate {
+        repos: Vec<crate::git::RepoSummary>,
+    },
     /// An app-wide `AppEvent::PodsChanged` (a pod was created or went
     /// away, in any conversation), relayed on every conversation's stream
     /// so a chat tab doesn't need a second always-open connection for the
@@ -593,6 +599,21 @@ mod wire_tests {
             ConversationEvent::BrowsingSessionUpdate { open: true },
             ConversationEvent::BrowsingUrlUpdate {
                 url: "https://example.com/".to_string(),
+            },
+            ConversationEvent::ReposUpdate {
+                repos: vec![crate::git::RepoSummary {
+                    id: 1,
+                    url: "git@github.com:o/r.git".to_string(),
+                    path: "/workspace/r".to_string(),
+                    requested_branch: Some("dev".to_string()),
+                    branch: Some("dev".to_string()),
+                    commit: Some("abc123".to_string()),
+                    status: crate::git::RepoStatus::Failed,
+                    error: Some("fatal: nope".to_string()),
+                    agents_files: vec![],
+                    loaded_instructions: vec![],
+                    trust_requests: vec![],
+                }],
             },
         ]
     }

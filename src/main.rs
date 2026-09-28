@@ -11,6 +11,7 @@ mod events;
 #[cfg(feature = "server")]
 mod fetch_guard;
 mod frontend;
+mod git;
 #[cfg(feature = "server")]
 mod headless_chrome;
 #[cfg(feature = "server")]
@@ -87,10 +88,16 @@ async fn main() {
     // and /pods match it. Only here, never in the browser test harness:
     // see `sandbox::watch_pods`.
     tokio::spawn(sandbox::watch_pods(pool.clone()));
+    // Clones the last run was in the middle of never finished (SME-32).
+    match db::fail_unfinished_clones(pool, git::CLONE_INTERRUPTED).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(clones = n, "marked clones a restart cut off as failed"),
+        Err(e) => tracing::warn!(error = %e, "couldn't mark interrupted clones failed"),
+    }
     // Docker data claims whose conversation deletion didn't reach them (SME-33).
     tokio::spawn({
         let pool = pool.clone();
-        async move { sandbox::sweep_orphaned_docker_claims(&pool).await }
+        async move { sandbox::sweep_orphaned_conversation_claims(&pool).await }
     });
 
     // Each sandbox's dev servers, for the user's browser, on a listener of

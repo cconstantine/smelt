@@ -794,6 +794,475 @@ pub async fn delete_sandbox_volume(pool: &PgPool, id: i64) -> Result<(), sqlx::E
     Ok(())
 }
 
+// --- Git: SSH keys and the commit identity (SME-32) ---
+
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+pub struct SshKey {
+    pub id: i64,
+    pub name: String,
+    pub public_key: String,
+    /// Plain text for now: see SME-48.
+    pub private_key: String,
+    pub created_at: NaiveDateTime,
+}
+
+pub async fn create_ssh_key(
+    pool: &PgPool,
+    name: &str,
+    public_key: &str,
+    private_key: &str,
+) -> Result<SshKey, sqlx::Error> {
+    sqlx::query_as::<_, SshKey>(
+        "INSERT INTO ssh_keys (name, public_key, private_key) VALUES ($1, $2, $3) RETURNING *",
+    )
+    .bind(name)
+    .bind(public_key)
+    .bind(private_key)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_ssh_keys(pool: &PgPool) -> Result<Vec<SshKey>, sqlx::Error> {
+    sqlx::query_as::<_, SshKey>("SELECT * FROM ssh_keys ORDER BY name ASC")
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn delete_ssh_key(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM ssh_keys WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The commit identity; empty strings when it has never been set.
+pub async fn get_git_identity(pool: &PgPool) -> Result<crate::git::GitIdentity, sqlx::Error> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT author_name, author_email FROM git_settings")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row
+        .map(|(name, email)| crate::git::GitIdentity { name, email })
+        .unwrap_or_default())
+}
+
+pub async fn set_git_identity(
+    pool: &PgPool,
+    identity: &crate::git::GitIdentity,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO git_settings (author_name, author_email) VALUES ($1, $2)
+         ON CONFLICT (id) DO UPDATE
+         SET author_name = $1, author_email = $2, updated_at = now()",
+    )
+    .bind(&identity.name)
+    .bind(&identity.email)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// --- A conversation's git repos (SME-32) ---
+
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+pub struct ConversationRepo {
+    pub id: i64,
+    pub conversation_id: i64,
+    pub url: String,
+    pub remote_key: String,
+    pub branch: Option<String>,
+    pub dir: String,
+    /// `cloning`, `ready` or `failed`.
+    pub status: String,
+    pub error: Option<String>,
+    pub checked_out_branch: Option<String>,
+    pub commit_sha: Option<String>,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    /// The checkout's AGENTS.md files, relative to it, top-level first.
+    pub agents_files: Vec<String>,
+}
+
+/// Sets a checkout's AGENTS.md files, for tests; a clone records them
+/// with `set_repo_ready`.
+#[cfg(test)]
+pub async fn set_repo_agents_files(pool: &PgPool, id: i64, files: &[String]) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE conversation_repos SET agents_files = $2, updated_at = now() WHERE id = $1")
+        .bind(id)
+        .bind(files)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// An AGENTS.md as read from a checkout, to load or to ask about.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstructionsFile {
+    /// At most 32 KiB of it.
+    pub content: String,
+    pub file_bytes: i64,
+    pub hash: String,
+    pub commit: Option<String>,
+}
+
+/// An AGENTS.md in the model's context (see the migration).
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+pub struct LoadedInstruction {
+    pub id: i64,
+    pub conversation_id: i64,
+    pub repo_id: i64,
+    pub path: String,
+    pub content: String,
+    pub file_bytes: i64,
+    pub hash: String,
+    pub commit_sha: Option<String>,
+    pub loaded_at: NaiveDateTime,
+}
+
+/// Loads `path` of repo `repo_id` into the conversation's context, or
+/// replaces what was loaded from it.
+pub async fn load_instruction(
+    pool: &PgPool,
+    conversation_id: i64,
+    repo_id: i64,
+    path: &str,
+    file: &InstructionsFile,
+) -> Result<LoadedInstruction, sqlx::Error> {
+    sqlx::query_as::<_, LoadedInstruction>(
+        "INSERT INTO loaded_instructions (conversation_id, repo_id, path, content, file_bytes, hash, commit_sha)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (repo_id, path) DO UPDATE
+            SET content = $4, file_bytes = $5, hash = $6, commit_sha = $7, loaded_at = now()
+         RETURNING *",
+    )
+    .bind(conversation_id)
+    .bind(repo_id)
+    .bind(path)
+    .bind(&file.content)
+    .bind(file.file_bytes)
+    .bind(&file.hash)
+    .bind(file.commit.as_deref())
+    .fetch_one(pool)
+    .await
+}
+
+/// The conversation's loaded AGENTS.md files, oldest first.
+pub async fn list_loaded_instructions(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Vec<LoadedInstruction>, sqlx::Error> {
+    sqlx::query_as::<_, LoadedInstruction>(
+        "SELECT * FROM loaded_instructions WHERE conversation_id = $1 ORDER BY id ASC",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// A load waiting on the user's trust decision (see the migration).
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+pub struct InstructionRequest {
+    pub id: i64,
+    pub conversation_id: i64,
+    pub repo_id: i64,
+    pub path: String,
+    pub content: String,
+    pub file_bytes: i64,
+    pub hash: String,
+    pub commit_sha: Option<String>,
+    pub created_at: NaiveDateTime,
+}
+
+impl InstructionRequest {
+    pub fn file(&self) -> InstructionsFile {
+        InstructionsFile {
+            content: self.content.clone(),
+            file_bytes: self.file_bytes,
+            hash: self.hash.clone(),
+            commit: self.commit_sha.clone(),
+        }
+    }
+}
+
+/// Asks about `path` of repo `repo_id`, replacing an earlier request for
+/// the same file (the card then shows the newest copy).
+pub async fn request_instruction(
+    pool: &PgPool,
+    conversation_id: i64,
+    repo_id: i64,
+    path: &str,
+    file: &InstructionsFile,
+) -> Result<InstructionRequest, sqlx::Error> {
+    sqlx::query_as::<_, InstructionRequest>(
+        "INSERT INTO instruction_requests (conversation_id, repo_id, path, content, file_bytes, hash, commit_sha)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (repo_id, path) DO UPDATE
+            SET content = $4, file_bytes = $5, hash = $6, commit_sha = $7, created_at = now()
+         RETURNING *",
+    )
+    .bind(conversation_id)
+    .bind(repo_id)
+    .bind(path)
+    .bind(&file.content)
+    .bind(file.file_bytes)
+    .bind(&file.hash)
+    .bind(file.commit.as_deref())
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn get_instruction_request(pool: &PgPool, id: i64) -> Result<Option<InstructionRequest>, sqlx::Error> {
+    sqlx::query_as::<_, InstructionRequest>("SELECT * FROM instruction_requests WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn list_instruction_requests(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Vec<InstructionRequest>, sqlx::Error> {
+    sqlx::query_as::<_, InstructionRequest>(
+        "SELECT * FROM instruction_requests WHERE conversation_id = $1 ORDER BY id ASC",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Every conversation's requests about repos with this remote.
+pub async fn list_instruction_requests_for_remote(
+    pool: &PgPool,
+    remote_key: &str,
+) -> Result<Vec<InstructionRequest>, sqlx::Error> {
+    sqlx::query_as::<_, InstructionRequest>(
+        "SELECT r.* FROM instruction_requests r
+           JOIN conversation_repos c ON c.id = r.repo_id
+          WHERE c.remote_key = $1 ORDER BY r.id ASC",
+    )
+    .bind(remote_key)
+    .fetch_all(pool)
+    .await
+}
+
+/// Unloads every conversation's instructions from repos with this remote
+/// (the user declined it). Returns `(conversation, checkout dir, path)` of
+/// each file unloaded.
+pub async fn unload_instructions_for_remote(
+    pool: &PgPool,
+    remote_key: &str,
+) -> Result<Vec<(i64, String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "DELETE FROM loaded_instructions l
+          USING conversation_repos c
+          WHERE c.id = l.repo_id AND c.remote_key = $1
+      RETURNING l.conversation_id, c.dir, l.path",
+    )
+    .bind(remote_key)
+    .fetch_all(pool)
+    .await
+}
+
+/// Drops a pending request for `path` of repo `repo_id`, if there is one.
+pub async fn delete_instruction_request_for(pool: &PgPool, repo_id: i64, path: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM instruction_requests WHERE repo_id = $1 AND path = $2")
+        .bind(repo_id)
+        .bind(path)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_instruction_request(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM instruction_requests WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_conversation_repo(pool: &PgPool, id: i64) -> Result<Option<ConversationRepo>, sqlx::Error> {
+    sqlx::query_as::<_, ConversationRepo>("SELECT * FROM conversation_repos WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+pub struct RepoTrust {
+    pub remote_key: String,
+    pub trusted: bool,
+    pub decided_at: NaiveDateTime,
+}
+
+/// `Some(trusted)` once the user has decided about this remote.
+pub async fn get_repo_trust(pool: &PgPool, remote_key: &str) -> Result<Option<bool>, sqlx::Error> {
+    sqlx::query_scalar("SELECT trusted FROM repo_trust WHERE remote_key = $1")
+        .bind(remote_key)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn set_repo_trust(pool: &PgPool, remote_key: &str, trusted: bool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO repo_trust (remote_key, trusted) VALUES ($1, $2)
+         ON CONFLICT (remote_key) DO UPDATE SET trusted = $2, decided_at = now()",
+    )
+    .bind(remote_key)
+    .bind(trusted)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_repo_trust(pool: &PgPool) -> Result<Vec<RepoTrust>, sqlx::Error> {
+    sqlx::query_as::<_, RepoTrust>("SELECT * FROM repo_trust ORDER BY remote_key ASC")
+        .fetch_all(pool)
+        .await
+}
+
+/// Forgets a decision, so the user is asked again next time.
+pub async fn delete_repo_trust(pool: &PgPool, remote_key: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM repo_trust WHERE remote_key = $1")
+        .bind(remote_key)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Records a repo, `cloning`. Fails on a `dir` the conversation already uses.
+pub async fn create_conversation_repo(
+    pool: &PgPool,
+    conversation_id: i64,
+    url: &str,
+    remote_key: &str,
+    branch: Option<&str>,
+    dir: &str,
+) -> Result<ConversationRepo, sqlx::Error> {
+    sqlx::query_as::<_, ConversationRepo>(
+        "INSERT INTO conversation_repos (conversation_id, url, remote_key, branch, dir, status)
+         VALUES ($1, $2, $3, $4, $5, 'cloning') RETURNING *",
+    )
+    .bind(conversation_id)
+    .bind(url)
+    .bind(remote_key)
+    .bind(branch)
+    .bind(dir)
+    .fetch_one(pool)
+    .await
+}
+
+/// A conversation's repos, in the order they were added.
+pub async fn list_conversation_repos(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Vec<ConversationRepo>, sqlx::Error> {
+    sqlx::query_as::<_, ConversationRepo>(
+        "SELECT * FROM conversation_repos WHERE conversation_id = $1 ORDER BY id ASC",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// A failed clone is being retried, with the URL and branch asked for
+/// this time (the same remote, maybe written another way).
+pub async fn retry_repo_clone(
+    pool: &PgPool,
+    id: i64,
+    url: &str,
+    remote_key: &str,
+    branch: Option<&str>,
+) -> Result<ConversationRepo, sqlx::Error> {
+    sqlx::query_as::<_, ConversationRepo>(
+        "UPDATE conversation_repos
+            SET url = $2, remote_key = $3, branch = $4, status = 'cloning', error = NULL,
+                agents_files = '{}', updated_at = now()
+          WHERE id = $1
+      RETURNING *",
+    )
+    .bind(id)
+    .bind(url)
+    .bind(remote_key)
+    .bind(branch)
+    .fetch_one(pool)
+    .await
+}
+
+#[cfg(test)]
+pub async fn set_repo_cloned(
+    pool: &PgPool,
+    id: i64,
+    checked_out_branch: &str,
+    commit_sha: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE conversation_repos
+            SET status = 'ready', error = NULL, checked_out_branch = $2, commit_sha = $3,
+                updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(checked_out_branch)
+    .bind(commit_sha)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A clone that finished, with the AGENTS.md files it has (or why they
+/// couldn't be listed) recorded in the same update, so nothing sees it
+/// ready without them.
+pub async fn set_repo_ready(
+    pool: &PgPool,
+    id: i64,
+    checked_out_branch: &str,
+    commit_sha: Option<&str>,
+    agents_files: &[String],
+    error: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE conversation_repos
+            SET status = 'ready', error = $4, checked_out_branch = $2, commit_sha = $3,
+                agents_files = $5, updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(checked_out_branch)
+    .bind(commit_sha)
+    .bind(error)
+    .bind(agents_files)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// At startup: a clone still marked cloning was cut off by the restart.
+/// Returns how many there were.
+pub async fn fail_unfinished_clones(pool: &PgPool, error: &str) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE conversation_repos SET status = 'failed', error = $1, updated_at = now()
+          WHERE status = 'cloning'",
+    )
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn set_repo_failed(pool: &PgPool, id: i64, error: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE conversation_repos SET status = 'failed', error = $2, updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // --- MCP servers (externally-hosted, configured via the /mcp-servers UI) ---
 // Plain CRUD, no soft delete — this is configuration a person edits, not a
 // live external resource like a sandbox pod. See
@@ -2203,6 +2672,142 @@ mod tests {
         .await
         .expect("query should succeed");
         assert!(result.is_none());
+    }
+
+    #[sqlx::test]
+    async fn test_ssh_key_round_trips_and_deletes(pool: PgPool) {
+        let work = create_ssh_key(&pool, "work", "ssh-ed25519 AAAA work", "PRIVATE-W")
+            .await
+            .expect("create key");
+        let listed = list_ssh_keys(&pool).await.expect("list keys");
+        assert_eq!(listed, vec![work.clone()]);
+        assert_eq!(listed[0].private_key, "PRIVATE-W");
+
+        delete_ssh_key(&pool, work.id).await.expect("delete key");
+        assert!(list_ssh_keys(&pool).await.expect("list keys").is_empty());
+    }
+
+    #[sqlx::test]
+    async fn test_git_identity_is_empty_until_set_then_updates_in_place(pool: PgPool) {
+        assert_eq!(
+            get_git_identity(&pool).await.expect("get"),
+            crate::git::GitIdentity::default()
+        );
+        let first = crate::git::GitIdentity {
+            name: "Ada".into(),
+            email: "ada@example.com".into(),
+        };
+        set_git_identity(&pool, &first).await.expect("set");
+        assert_eq!(get_git_identity(&pool).await.expect("get"), first);
+
+        let second = crate::git::GitIdentity {
+            name: "Ada Lovelace".into(),
+            email: "ada@lovelace.dev".into(),
+        };
+        set_git_identity(&pool, &second).await.expect("set again");
+        assert_eq!(get_git_identity(&pool).await.expect("get"), second);
+    }
+
+    #[sqlx::test]
+    async fn test_conversation_repos_round_trip_through_a_clone(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("create conversation");
+        let repo = create_conversation_repo(
+            &pool,
+            conversation.id,
+            "git@github.com:o/r.git",
+            "github.com/o/r",
+            Some("dev"),
+            "r",
+        )
+        .await
+        .expect("create repo");
+        assert_eq!(repo.status, "cloning");
+        assert_eq!(repo.branch.as_deref(), Some("dev"));
+
+        set_repo_failed(&pool, repo.id, "fatal: nope").await.expect("fail");
+        let listed = list_conversation_repos(&pool, conversation.id).await.expect("list");
+        assert_eq!((listed[0].status.as_str(), listed[0].error.as_deref()), ("failed", Some("fatal: nope")));
+
+        let retried = retry_repo_clone(&pool, repo.id, "ssh://git@github.com/o/r", "github.com/o/r", None)
+            .await
+            .expect("retry");
+        assert_eq!((retried.status.as_str(), retried.error.as_deref()), ("cloning", None));
+        assert_eq!((retried.url.as_str(), retried.branch.as_deref()), ("ssh://git@github.com/o/r", None));
+        set_repo_cloned(&pool, repo.id, "dev", Some("abc123")).await.expect("cloned");
+        let listed = list_conversation_repos(&pool, conversation.id).await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "ready");
+        assert_eq!(listed[0].error, None);
+        assert_eq!(listed[0].checked_out_branch.as_deref(), Some("dev"));
+        assert_eq!(listed[0].commit_sha.as_deref(), Some("abc123"));
+
+        // After a restart, a clone still marked cloning was cut off.
+        let other = create_conversation(&pool).await.expect("conversation");
+        let unfinished = create_conversation_repo(&pool, other.id, "u", "k", None, "x")
+            .await
+            .expect("repo");
+        assert_eq!(fail_unfinished_clones(&pool, "interrupted").await.expect("sweep"), 1);
+        let row = get_conversation_repo(&pool, unfinished.id).await.expect("get").expect("exists");
+        assert_eq!((row.status.as_str(), row.error.as_deref()), ("failed", Some("interrupted")));
+        let untouched = get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
+        assert_eq!(untouched.status, "ready", "a finished clone is left alone");
+
+        // The checkout's AGENTS.md files.
+        set_repo_agents_files(&pool, repo.id, &["AGENTS.md".to_string(), "web/AGENTS.md".to_string()])
+            .await
+            .expect("agents files");
+        let row = get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
+        assert_eq!(row.agents_files, vec!["AGENTS.md".to_string(), "web/AGENTS.md".to_string()]);
+
+        // Loading an AGENTS.md, and loading it again replaces it.
+        let file = |content: &str| InstructionsFile {
+            content: content.to_string(),
+            file_bytes: content.len() as i64,
+            hash: format!("hash-{content}"),
+            commit: Some("abc123".to_string()),
+        };
+        load_instruction(&pool, conversation.id, repo.id, "AGENTS.md", &file("v1")).await.expect("load");
+        load_instruction(&pool, conversation.id, repo.id, "AGENTS.md", &file("v2")).await.expect("reload");
+        load_instruction(&pool, conversation.id, repo.id, "web/AGENTS.md", &file("web")).await.expect("load nested");
+        let loaded = list_loaded_instructions(&pool, conversation.id).await.expect("list loaded");
+        let paths: Vec<(&str, &str)> = loaded.iter().map(|l| (l.path.as_str(), l.content.as_str())).collect();
+        assert_eq!(paths, vec![("AGENTS.md", "v2"), ("web/AGENTS.md", "web")]);
+        assert_eq!(loaded[0].commit_sha.as_deref(), Some("abc123"));
+
+        // A request waiting on trust; asking again replaces it.
+        request_instruction(&pool, conversation.id, repo.id, "AGENTS.md", &file("seen")).await.expect("request");
+        let request = request_instruction(&pool, conversation.id, repo.id, "AGENTS.md", &file("newer"))
+            .await
+            .expect("request again");
+        let requests = list_instruction_requests(&pool, conversation.id).await.expect("list requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].file(), file("newer"));
+        assert_eq!(
+            list_instruction_requests_for_remote(&pool, "github.com/o/r").await.expect("by remote"),
+            requests
+        );
+        assert_eq!(get_instruction_request(&pool, request.id).await.expect("get"), Some(request.clone()));
+        delete_instruction_request(&pool, request.id).await.expect("delete request");
+        assert!(list_instruction_requests(&pool, conversation.id).await.expect("list").is_empty());
+
+        // Trust decisions, remembered per remote either way.
+        assert_eq!(get_repo_trust(&pool, "github.com/o/r").await.expect("get"), None);
+        set_repo_trust(&pool, "github.com/o/r", false).await.expect("decline");
+        set_repo_trust(&pool, "github.com/o/r", true).await.expect("trust");
+        assert_eq!(get_repo_trust(&pool, "github.com/o/r").await.expect("get"), Some(true));
+        assert_eq!(list_repo_trust(&pool).await.expect("list").len(), 1);
+        delete_repo_trust(&pool, "github.com/o/r").await.expect("forget");
+        assert_eq!(get_repo_trust(&pool, "github.com/o/r").await.expect("get"), None);
+
+        // One checkout per directory.
+        assert!(
+            create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
+                .await
+                .is_err()
+        );
+        // Deleting the conversation deletes its repos.
+        delete_conversation(&pool, conversation.id).await.expect("delete conversation");
+        assert!(list_conversation_repos(&pool, conversation.id).await.expect("list").is_empty());
     }
 
     #[sqlx::test]

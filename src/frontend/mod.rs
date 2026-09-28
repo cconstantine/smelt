@@ -2,7 +2,7 @@ mod pages;
 
 use dioxus::prelude::*;
 use pages::{
-    Chat, McpServerEdit, McpServerNew, McpServersIndex, PodsIndex, SandboxVolumeNew,
+    Chat, GitSettingsPage, McpServerEdit, McpServerNew, McpServersIndex, PodsIndex, SandboxVolumeNew,
     SandboxVolumesIndex,
 };
 
@@ -24,6 +24,8 @@ pub(crate) enum Route {
     SandboxVolumeNewRoute {},
     #[route("/pods")]
     PodsRoute {},
+    #[route("/git")]
+    GitRoute {},
     // Anything else, including a conversation id that isn't a number.
     #[route("/:..segments")]
     NotFound { segments: Vec<String> },
@@ -62,6 +64,11 @@ fn SandboxVolumeNewRoute() -> Element {
 #[component]
 fn PodsRoute() -> Element {
     rsx! { PodsIndex {} }
+}
+
+#[component]
+fn GitRoute() -> Element {
+    rsx! { GitSettingsPage {} }
 }
 
 /// A URL that isn't one of smelt's pages. Without this the router showed

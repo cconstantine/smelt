@@ -17,6 +17,14 @@
 # that cgroup.
 set -eu
 
+# /workspace is the conversation's own claim (SME-32), whose top directory
+# belongs to whatever the storage provisioner made it; this container runs
+# as root and starts first, so it hands it to the unprivileged sandbox
+# user. Only the top: what's inside is already theirs.
+if [ -n "${WORKSPACE_OWNER:-}" ]; then
+    chown "$WORKSPACE_OWNER" /workspace
+fi
+
 self=$(sed -n 's/^0:://p' /proc/self/cgroup)
 base=/sys/fs/cgroup$self
 mkdir -p "$base/dockerd"

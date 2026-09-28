@@ -1633,6 +1633,61 @@ async fn test_end_to_end_browser_scenarios() {
             "the container's preview link should show its server"
         );
         preview_tab.close().await.expect("close the preview tab");
+
+        // --- A repo's AGENTS.md waits for the user's trust (SME-32): when
+        // the model asks to load one from an unknown remote, the chat shows
+        // the file with Trust / Don't trust, and trusting loads exactly
+        // that file. The model the decision wakes is the mock upstream. ---
+        let trusting = new_conversation(pool, &created).await;
+        let remote = format!("example.com/browser-tier/{}", unique_id("trust"));
+        let repo = db::create_conversation_repo(pool, trusting.id, &format!("https://{remote}.git"), &remote, None, "trust-me")
+            .await
+            .expect("seed a repo");
+        db::set_repo_cloned(pool, repo.id, "main", Some("abc1234def")).await.expect("seed the clone");
+        // The model asked to load its AGENTS.md (load_instructions).
+        db::request_instruction(
+            pool,
+            trusting.id,
+            repo.id,
+            "AGENTS.md",
+            &db::InstructionsFile {
+                content: "Browser tier rule: always run the linter.\n".to_string(),
+                file_bytes: 42,
+                hash: "browser-tier-hash".to_string(),
+                commit: Some("abc1234def".to_string()),
+            },
+        )
+        .await
+        .expect("seed the request");
+        let trust_page = harness
+            .browser
+            .new_page(&format!("{}conversation/{}", harness.base_url, trusting.id))
+            .await
+            .expect("open the trust conversation");
+        assert!(
+            wait_for_text(&trust_page, "Browser tier rule: always run the linter.", Duration::from_secs(10)).await,
+            "the trust card should show the AGENTS.md it asks about"
+        );
+        // The repo shows in the panel with no pod running (SME-32 code
+        // review 10, finding 1).
+        // (By the panel's own element: the card's file path has the same text.)
+        assert!(
+            wait_for_count(&trust_page, ".sandbox-repo", 1, Duration::from_secs(10)).await,
+            "the panel should list the conversation's repos even without a pod"
+        );
+        click_when_present(&trust_page, ".trust-card-trust", Duration::from_secs(5)).await;
+        assert!(
+            wait_for_count(&trust_page, ".trust-card", 0, Duration::from_secs(10)).await,
+            "trusting should take the card away, live"
+        );
+        let trusted = db::get_repo_trust(pool, &remote).await.expect("read trust");
+        db::delete_repo_trust(pool, &remote).await.expect("clean up the trust decision");
+        assert_eq!(trusted, Some(true), "the decision is remembered for the remote");
+        assert_eq!(
+            crate::git::project_instructions(pool, trusting.id).await.expect("loaded")[0].content,
+            "Browser tier rule: always run the linter.\n"
+        );
+        trust_page.close().await.expect("close the trust tab");
         page.close().await.expect("close the tab");
     })))
     .await;

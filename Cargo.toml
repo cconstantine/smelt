@@ -133,6 +133,10 @@ url = { version = "2", optional = true }
 # since smelt only touches rmcp's re-exports of it.
 rmcp = { version = "3.1.2", default-features = false, features = ["client", "server", "reqwest", "transport-streamable-http-client-reqwest", "transport-streamable-http-server", "auth"], optional = true }
 
+# For src/git.rs: generating ed25519 SSH keys and parsing imported ones
+# (OpenSSH format) for the git settings page — see SME-32.
+ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519", "ecdsa", "rand_core", "getrandom"], optional = true }
+
 # Web-only: a wasm-compatible timer (tokio::time has no driver in a browser
 # tab — there's no tokio runtime on the WASM client at all).
 gloo-timers = { version = "0.4.0", features = ["futures"], optional = true }
@@ -166,6 +170,7 @@ server = [
     "dep:percent-encoding",
     "dep:chromiumoxide",
     "dep:url",
+    "dep:ssh-key",
 ]
 # Separate from `server` so the default `cargo test --features server` loop
 # stays exactly as fast as it is today — src/browser_tests.rs's one
