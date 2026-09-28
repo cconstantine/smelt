@@ -333,8 +333,10 @@ pub fn apply_text_edits(text: &str, edits: &[Value]) -> Result<String, String> {
         let line = position.get("line").and_then(Value::as_u64).ok_or("an edit without a line")? as usize;
         let column = position.get("character").and_then(Value::as_u64).ok_or("an edit without a character")? as u32;
         let start = *line_starts.get(line).ok_or_else(|| format!("an edit at line {} is past the end of the file", line + 1))?;
-        let end = line_starts.get(line + 1).copied().unwrap_or(text.len());
-        let line_text = &text[start..end];
+        let next = line_starts.get(line + 1).copied().unwrap_or(text.len());
+        // The line without its break: a character past its end means its end.
+        let line_text = text[start..next].trim_end_matches('\n').trim_end_matches('\r');
+        let end = start + line_text.len();
         // UTF-16 units to a byte offset in the line.
         let mut units = 0u32;
         for (index, c) in line_text.char_indices() {
@@ -371,6 +373,16 @@ mod tests {
 
     fn edit(start: (u32, u32), end: (u32, u32), text: &str) -> Value {
         json!({"range": {"start": {"line": start.0, "character": start.1}, "end": {"line": end.0, "character": end.1}}, "newText": text})
+    }
+
+    /// A character past the end of a line means the end of that line (the
+    /// LSP spec), not the start of the next: the line break stays.
+    #[test]
+    fn test_a_character_past_the_end_of_a_line_means_its_end() {
+        let text = "let a = 1;\nlet b = 2;\r\nlast";
+        assert_eq!(apply_text_edits(text, &[edit((0, 8), (0, 999), "5;")]), Ok("let a = 5;\nlet b = 2;\r\nlast".to_string()));
+        assert_eq!(apply_text_edits(text, &[edit((1, 8), (1, 999), "7;")]), Ok("let a = 1;\nlet b = 7;\r\nlast".to_string()));
+        assert_eq!(apply_text_edits(text, &[edit((2, 999), (2, 999), "!")]), Ok("let a = 1;\nlet b = 2;\r\nlast!".to_string()));
     }
 
     #[test]
