@@ -94,6 +94,8 @@ struct Heard {
 struct Document {
     version: i64,
     text: String,
+    /// When the server was told this text.
+    changed_at: Instant,
 }
 
 /// Diagnostics for a file, and whether the list can be trusted as whole.
@@ -199,6 +201,7 @@ impl Session {
     /// `didChange` after, then `didSave`. Returns the new version.
     pub async fn sync(&self, path: &str, text: &str) -> Result<i64, LspError> {
         let uri = file_uri(path);
+        let changed_at = Instant::now();
         let previous = self.documents.lock().unwrap_or_else(|e| e.into_inner()).get(&uri).cloned();
         let version = match previous {
             None => {
@@ -227,8 +230,14 @@ impl Session {
         self.documents
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(uri, Document { version, text: text.to_string() });
+            .insert(uri, Document { version, text: text.to_string(), changed_at });
         Ok(version)
+    }
+
+    /// When the server was last told `path` changed: diagnostics published
+    /// without a version before then are for older text.
+    pub fn changed_at(&self, path: &str) -> Option<Instant> {
+        self.documents.lock().unwrap_or_else(|e| e.into_inner()).get(&file_uri(path)).map(|d| d.changed_at)
     }
 
     /// The text the server was last told `path` holds.
@@ -494,6 +503,27 @@ mod tests {
         // The same text again tells the server nothing new.
         assert_eq!(session.sync("/workspace/a.rs", "fn a() { 1 }").await, Ok(2));
         assert_eq!(session.synced_text("/workspace/a.rs").as_deref(), Some("fn a() { 1 }"));
+    }
+
+    /// Diagnostics a server published without a version, before the file
+    /// last changed, aren't passed off as the current ones.
+    #[tokio::test]
+    async fn test_unversioned_diagnostics_from_before_a_change_are_stale() {
+        let (reader, writer, mut server) = connect();
+        let opening = tokio::spawn(Session::open(reader, writer, config(None), "/workspace"));
+        server.handshake(json!({})).await;
+        let session = opening.await.unwrap().expect("open");
+        session.sync("/workspace/a.rs", "fn a() {}").await.expect("sync");
+        assert_eq!(server.next().await["method"], "textDocument/didOpen");
+        server
+            .send(json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+                "params": {"uri": "file:///workspace/a.rs", "diagnostics": [{"message": "old"}]}}))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let version = session.sync("/workspace/a.rs", "fn b() {}").await.expect("sync");
+        let since = session.changed_at("/workspace/a.rs").expect("synced");
+        let found = session.diagnostics("/workspace/a.rs", version, since, Duration::from_millis(200)).await;
+        assert_eq!(found, FileDiagnostics { items: vec![], complete: false });
     }
 
     #[tokio::test]

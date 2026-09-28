@@ -467,8 +467,10 @@ pub async fn operate(
             }
             Operation::Diagnostics => {
                 let (path, text, version) = file.as_ref().expect("a path");
-                let long_ago = Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
-                let found = session.diagnostics(path, *version, long_ago, Duration::from_secs(5)).await;
+                // Anything published since the server was last told this
+                // text: without a version, older ones may be for other text.
+                let since = session.changed_at(path).unwrap_or_else(Instant::now);
+                let found = session.diagnostics(path, *version, since, Duration::from_secs(5)).await;
                 let lines: Vec<&str> = text.lines().collect();
                 let mut listed = ops::format_diagnostics(&found.items, &mut |l| lines.get(l as usize).map(|s| s.to_string()), false);
                 if found.items.is_empty() {
