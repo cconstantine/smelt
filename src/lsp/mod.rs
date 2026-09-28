@@ -5,5 +5,6 @@
 pub mod catalog;
 pub mod client;
 pub mod config;
+pub mod ops;
 pub mod pods;
 pub mod session;
