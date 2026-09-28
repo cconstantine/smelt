@@ -2,7 +2,7 @@
 
 use dioxus::prelude::*;
 
-use crate::models::{LanguageServer, LanguageServerConfig};
+use crate::models::{LanguageServer, LanguageServerConfig, LanguageServerSuggestion};
 
 #[cfg(feature = "server")]
 use crate::db;
@@ -30,6 +30,14 @@ pub async fn create_language_server(config: LanguageServerConfig) -> ServerFnRes
 #[post("/api/language-servers/{id}")]
 pub async fn update_language_server(id: i64, config: LanguageServerConfig) -> ServerFnResult<LanguageServer> {
     crate::lsp::config::save(db::get(), Some(id), &config).await.map_err(ServerFnError::new)
+}
+
+/// Suggests a new server's settings from mason's registry and Helix's
+/// languages.toml, fetched now.
+#[get("/api/language-servers/lookup/{package}")]
+pub async fn lookup_language_server(package: String) -> ServerFnResult<LanguageServerSuggestion> {
+    let (registry, helix) = crate::lsp::catalog::sources_from_env();
+    crate::lsp::catalog::lookup(&package, &registry, &helix).await.map_err(ServerFnError::new)
 }
 
 #[delete("/api/language-servers/{id}")]

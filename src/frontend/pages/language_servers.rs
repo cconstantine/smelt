@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 
 use crate::api::language_servers::{
     create_language_server, delete_language_server, get_language_server, list_language_servers,
-    update_language_server,
+    lookup_language_server, update_language_server,
 };
 use crate::frontend::Route;
 use crate::models::{LanguageServer, LanguageServerConfig};
@@ -162,6 +162,34 @@ fn file_types_summary(config: &LanguageServerConfig) -> String {
 pub fn LanguageServerNew() -> Element {
     let navigator = use_navigator();
     let mut error: Signal<Option<String>> = use_signal(|| None);
+    // The catalog lookup refills the form: a new `key` remounts it with the
+    // suggestion as its starting values.
+    let mut initial = use_signal(blank);
+    let mut form_key = use_signal(|| 0u32);
+    let mut notes: Signal<Vec<String>> = use_signal(Vec::new);
+    let mut package = use_signal(String::new);
+    let mut looking_up = use_signal(|| false);
+    let mut lookup_error: Signal<Option<String>> = use_signal(|| None);
+    let look_up = move |event: Event<FormData>| {
+        event.prevent_default();
+        let name = package().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        looking_up.set(true);
+        lookup_error.set(None);
+        spawn(async move {
+            match lookup_language_server(name).await {
+                Ok(suggestion) => {
+                    initial.set(suggestion.config);
+                    notes.set(suggestion.notes);
+                    *form_key.write() += 1;
+                }
+                Err(e) => lookup_error.set(Some(super::chat::server_error_message(&e))),
+            }
+            looking_up.set(false);
+        });
+    };
     let save = move |config: LanguageServerConfig| {
         spawn(async move {
             match create_language_server(config).await {
@@ -178,7 +206,26 @@ pub fn LanguageServerNew() -> Element {
                 Link { to: Route::LanguageServersRoute {}, class: "mcp-back-link", "\u{2190} Back to language servers" }
                 h1 { "Add a language server" }
             }
-            LanguageServerForm { initial: blank(), save_label: "Add language server", error: error(), on_save: save }
+            form { class: "mcp-add-form language-server-lookup", onsubmit: look_up,
+                label { r#for: "ls-lookup", "Find in the catalog" }
+                div { class: "language-server-lookup-row",
+                    input { id: "ls-lookup", r#type: "text", placeholder: "rust-analyzer, pyright, gopls...",
+                        value: "{package}", oninput: move |e| package.set(e.value()) }
+                    button { r#type: "submit", disabled: looking_up(), if looking_up() { "Looking up\u{2026}" } else { "Look up" } }
+                }
+                p { class: "muted",
+                    "A package name from "
+                    a { href: "https://mason-registry.dev/registry/list", target: "_blank", rel: "noopener", "mason's registry" }
+                    ". smelt fills in the form from it and Helix's language list; check it before adding."
+                }
+                if let Some(err) = lookup_error() {
+                    p { class: "error", "{err}" }
+                }
+                for note in notes() {
+                    p { class: "language-server-note", "{note}" }
+                }
+            }
+            LanguageServerForm { key: "{form_key}", initial: initial(), save_label: "Add language server", error: error(), on_save: save }
         }
     }
 }

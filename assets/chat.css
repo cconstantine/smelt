@@ -2822,3 +2822,25 @@ div.mcp-status-not-connected::before {
     background: var(--surface);
     color: var(--ink);
 }
+
+/* SME-35: the language server page's catalog lookup. */
+.language-server-lookup-row {
+  display: flex;
+  gap: 8px;
+}
+.language-server-lookup-row input {
+  flex: 1;
+  min-width: 0;
+}
+.language-server-note {
+  margin: 6px 0 0;
+  padding: 6px 10px;
+  border-left: 3px solid #c8a200;
+  background: rgba(200, 162, 0, 0.08);
+  font-size: 0.9em;
+}
+.language-server-enabled {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}

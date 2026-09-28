@@ -2,5 +2,6 @@
 //! next to the conversation's sandbox, and smelt talks LSP to it over a
 //! `pods/exec` stream.
 
+pub mod catalog;
 pub mod client;
 pub mod config;

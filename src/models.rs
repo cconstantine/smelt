@@ -142,6 +142,14 @@ impl LanguageServerConfig {
     }
 }
 
+/// A catalog lookup's suggested config (SME-35), and what the user should
+/// check before saving it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LanguageServerSuggestion {
+    pub config: LanguageServerConfig,
+    pub notes: Vec<String>,
+}
+
 #[cfg(test)]
 mod language_server_tests {
     use super::*;
