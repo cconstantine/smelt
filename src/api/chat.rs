@@ -1926,15 +1926,19 @@ fn conversation_event_stream(
     // Both subscribed now, not on first poll, so nothing published in
     // between is missed.
     let receivers = (events::subscribe(id), events::subscribe_app());
-    futures_util::stream::unfold(receivers, |(mut conversation, mut app)| async move {
+    futures_util::stream::unfold(receivers, move |(mut conversation, mut app)| async move {
         loop {
             tokio::select! {
                 received = conversation.recv() => match received {
                     Ok(event) => return Some((Ok::<_, axum::BoxError>(event), (conversation, app))),
-                    // A subscriber that fell behind just misses some
-                    // ephemeral updates — the frontend's reconciliation
-                    // pull on connect covers the durable state regardless.
-                    Err(RecvError::Lagged(_)) => continue,
+                    // A subscriber that fell behind has missed events it
+                    // can't get back, a saved message or the turn ending
+                    // among them. Ending the stream makes the tab reconnect
+                    // and pull the current state (SME-51 B3).
+                    Err(RecvError::Lagged(skipped)) => {
+                        tracing::info!(conversation_id = id, skipped, "a tab fell behind; ending its stream so it resyncs");
+                        return None;
+                    }
                     Err(RecvError::Closed) => return None,
                 },
                 received = app.recv() => match received {
@@ -2367,6 +2371,38 @@ mod tests {
             matches!(event, Some(Ok(events::ConversationEvent::PodsChanged {}))),
             "got {event:?}"
         );
+    }
+
+    /// SME-51 B3: a tab that falls behind loses events it can't get back
+    /// (a saved message, the turn ending). Its stream ends instead, so the
+    /// tab reconnects and pulls the current state again.
+    #[tokio::test]
+    async fn test_a_stream_that_falls_behind_ends_instead_of_skipping() {
+        use futures_util::StreamExt;
+        let conversation_id = 9_000_000_051;
+        let stream = conversation_event_stream(conversation_id);
+        futures_util::pin_mut!(stream);
+        for i in 0..2_000 {
+            events::publish(
+                conversation_id,
+                events::ConversationEvent::ReplyDelta { text: format!("{i} ") },
+            );
+        }
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match stream.next().await {
+                    None => return true,
+                    // App-wide events from tests running alongside.
+                    Some(Ok(events::ConversationEvent::PodsChanged {}))
+                    | Some(Ok(events::ConversationEvent::TurnsChanged {})) => continue,
+                    Some(_) => return false,
+                }
+            }
+        })
+        .await
+        .expect("the stream should answer");
+        assert!(ended, "a lagging stream kept going with events missing");
+        events::forget(conversation_id);
     }
 
     /// SME-41 D9: a turn starting or ending is announced app-wide, and
