@@ -1220,7 +1220,7 @@ body {
 }
 
 /* One command's worth of history within a sandbox terminal's body — see
-   the plan discussion in the sandbox-visibility follow-up: the panel now
+   the plan discussion in the sandbox-visibility follow-up (SME-10): the panel now
    shows a terminal's whole (bounded) command history, not just its
    current command, so each command needs its own visual block rather
    than one flat, unlabeled output stream. */

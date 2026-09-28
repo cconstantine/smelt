@@ -125,7 +125,7 @@ fn build_header_map(
 /// rather than waiting for someone to edit the server's config. Everything
 /// else `ClientHandler` can report (progress, resource/prompt list
 /// changes, logging messages, ...) uses the trait's own no-op defaults —
-/// accepted, not acted on; see the plan's "Server-initiated notifications."
+/// accepted, not acted on; see SME-15's "Server-initiated notifications."
 #[derive(Clone)]
 struct SmeltClientHandler {
     stale: Arc<AtomicBool>,

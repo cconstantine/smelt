@@ -4,7 +4,7 @@ name: CI
 # real-cluster k3s sandbox tests), the WASM compile check, and the automated
 # browser tier — reusing the same docker-compose.yml stack local dev already
 # depends on, so there's one environment definition to keep working, not two.
-# See docs/projects/plans/ci-tests-in-pr.md for the design.
+# See SME-14 for the design.
 
 on:
   pull_request:
@@ -76,7 +76,7 @@ jobs:
       #
       # The sandbox image is delivered with no registry involved (`ctr
       # images import` straight into this runner's own k3s node — see
-      # docs/projects/plans/sandbox-native-environment.md) rather than
+      # SME-17) rather than
       # pulled, so every sandbox test that creates a pod fails outright
       # (`ImagePullBackOff`) unless this has run first — a fresh runner's
       # k3s always starts with nothing imported. Needs `docker`/`k3s`/

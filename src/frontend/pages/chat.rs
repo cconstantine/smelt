@@ -485,8 +485,8 @@ fn merge_sandbox_snapshot(
 /// Applies one live `SandboxPodUpdate` — upserts on `terminated: false`,
 /// *removes* the pod (and, defensively, any of its terminals still present
 /// locally) on `terminated: true`. Deliberately diverges from the task
-/// panel here: a terminated pod is gone, not just relabeled — see the
-/// plan's "How."
+/// panel here: a terminated pod is gone, not just relabeled — see
+/// SME-10's "How."
 #[cfg(any(feature = "web", test))]
 fn apply_sandbox_pod_update(
     pods: &mut Vec<SandboxPodPanelEntry>,
@@ -1099,7 +1099,7 @@ mod context_usage_tests {
 /// always (including synthetic pushed `<task-output>`/`<task-notification>`
 /// -tagged messages a background task writes — still indistinguishable from
 /// something a human typed at this stage, flagged as a known gap in the
-/// tool-use-round-trip plan's retrospective, not solved here). `ToolUse`/
+/// SME-8's retrospective, not solved here). `ToolUse`/
 /// `ToolResult` render as their own centered cards, distinct from both the
 /// Whether an assistant message is thinking and nothing else: no text,
 /// no tool call. A model sometimes puts its whole answer in its thinking;

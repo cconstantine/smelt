@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 
 cargo build --bin sandbox_agent --features server "$@"
 
-# Same toolchain/target as the main build (see the plan) — always the
+# Same toolchain/target as the main build (see SME-9's plan) — always the
 # debug or release dir matching whatever profile flag was passed through.
 PROFILE_DIR=debug
 for arg in "$@"; do

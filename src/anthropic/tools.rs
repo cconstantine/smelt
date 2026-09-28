@@ -1,9 +1,10 @@
 //! In-process tool implementations dispatched by name. See
-//! SME-8 for the full design — `add`
-//! and `count` are deliberately throwaway stand-ins proving the Anthropic
+//! SME-8 for the full design — `add`,
+//! `count` and `echo` are deliberately throwaway stand-ins proving the Anthropic
 //! tool-use protocol round-trips through this codebase, not real tools.
 //! `run_async` and the task-management suite (`list_tasks`, `task_status`,
-//! `task_output`, `task_result`, `wait_task`, `cancel_task`) are the
+//! `task_stdout`, `task_stderr`, `task_result`, `wait_task`, `cancel_task`,
+//! `write_task_stdin`) are the
 //! reusable pieces: a generic mechanism for running any tool call
 //! asynchronously, modeled on OS process management (`ps`/`wait`/`kill`).
 
@@ -160,7 +161,7 @@ mod server {
     /// spawning (see `validate_against_schema`) — one definition, used
     /// both ways, so there's a single source of truth for what a tool
     /// accepts rather than the schema and a hand-written check drifting
-    /// apart. `add` and `count` are deliberately throwaway stand-ins
+    /// apart. `add`, `count` and `echo` are deliberately throwaway stand-ins
     /// proving the tool-use protocol round trips through this codebase,
     /// not real tools. Deliberately synchronous and pool-free: every
     /// caller that only needs smelt's own static tools (`run_async`'s
@@ -1071,8 +1072,8 @@ mod server {
     /// past the original "clearly a toy" 1..=5 so `count` can run a
     /// genuinely long, real demo (e.g. counting to a few hundred) if asked,
     /// while still bounded so a call can't pin a task open indefinitely.
-    /// Still guessed defaults, not confirmed-settled values — see the
-    /// plan's "Open questions."
+    /// Still guessed defaults, not confirmed-settled values — see
+    /// SME-8's "Open questions."
     const COUNT_TARGET_RANGE: std::ops::RangeInclusive<u64> = 1..=1000;
     /// `interval_seconds` is a `number` in the schema (not `integer`), so
     /// fractional pauses are genuinely supported now, not just accepted and
@@ -1082,7 +1083,7 @@ mod server {
     tokio::task_local! {
         /// Set only while running inside a `run_async`-spawned task; absent
         /// for a direct call. The *one* concession `count` makes to being
-        /// wrappable — see the plan's "How" section.
+        /// wrappable — see SME-8's "How" section.
         static CURRENT_TASK: String;
     }
 
@@ -1248,7 +1249,7 @@ mod server {
 
     /// Deliberately in-memory and lost on restart — consistent with this
     /// file's already-provisional, deleted-once-real-tools-land status (see
-    /// the plan's Open questions).
+    /// SME-8's Open questions).
     static TASKS: LazyLock<Mutex<HashMap<String, Task>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -1736,7 +1737,7 @@ mod server {
     // their own: `execute` is only ever called from `run_turn`'s tool-
     // dispatch loop, which already holds `conversation_id`'s lock for the
     // whole turn (including every tool_use block in it, processed one at a
-    // time, never concurrently) — see the plan's "Which files" bullet on
+    // time, never concurrently) — see SME-9's "Which files" bullet on
     // `anthropic/tools.rs` and `api::chat::run_turn`'s own `conversation_lock`.
 
     /// The hash from the *most recent* successful `read_file`/`write_file`/
@@ -1914,7 +1915,7 @@ mod server {
 
         // Published immediately, before the agent has produced any output —
         // same "started" convention `run_async`'s own `TaskUpdate` already
-        // uses, see the plan's "Which files."
+        // uses, see SME-10's "Which files."
         events::publish(
             conversation_id,
             events::ConversationEvent::SandboxCommandUpdate {
@@ -2078,7 +2079,7 @@ mod server {
     /// path (no prior operation exists to have found) or a path this
     /// conversation genuinely hasn't touched yet; either way `write_file`
     /// treats it as a new file and skips the check (nothing to compare
-    /// against), matching the plan's "creating a brand-new file... doesn't
+    /// against), matching SME-11's "creating a brand-new file... doesn't
     /// need this." `edit_file`, below, is stricter — it always needs
     /// `old_string` to have come from somewhere, so a missing prior hash
     /// there is a hard refusal instead.
@@ -2291,7 +2292,7 @@ mod server {
     }
 
     /// Parses and validates `todowrite`'s `todos` field — a plain list of
-    /// `{content, status}` objects, no per-item ids (see the plan's
+    /// `{content, status}` objects, no per-item ids (see SME-20's
     /// "whole-list replace" decision). Rejects a blank `content` (never a
     /// useful todo) before anything is persisted, rather than storing it
     /// and letting a later reader be confused by it.

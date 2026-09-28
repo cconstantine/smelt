@@ -179,7 +179,7 @@ async fn launch_browser() -> Result<Browser, String> {
 /// Every request the page makes (this navigation, any redirect,
 /// subresources, JS-initiated fetches) is checked via
 /// `fetch_guard::is_request_allowed_with` through the CDP Fetch domain
-/// before being let through — see the plan's "SSRF guard via CDP request
+/// before being let through — see SME-21's "SSRF guard via CDP request
 /// interception" for why this has to cover more than just the top-level
 /// URL once the fetch is a real, JS-executing browser rather than a plain
 /// HTTP GET.
@@ -440,7 +440,7 @@ mod browser_tests {
 
         // --- Scenario 3: a page-initiated (JS `fetch()`) request to a
         // private address is blocked too — the case a plain top-level-URL
-        // check (the original, reqwest-based plan) couldn't cover. Proves
+        // check (SME-21's original, reqwest-based plan) couldn't cover. Proves
         // the CDP Fetch-domain interception covers subresource/JS-initiated
         // requests, not just the top-level navigation. ---
         let (url, _server) = start_test_server(

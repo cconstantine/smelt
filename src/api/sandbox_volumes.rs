@@ -7,7 +7,7 @@ use crate::{db, sandbox};
 /// Read-only summary of a configured generic volume for the browser — see
 /// SME-17's Phase 4. Deliberately
 /// minimal: this pass has nothing to edit or view beyond name/mount path
-/// (no upload, no browsing — see the plan's "What").
+/// (no upload, no browsing — see SME-17's "What").
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SandboxVolumeSummary {
     pub id: i64,
