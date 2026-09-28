@@ -1,6 +1,6 @@
 # smelt
 
-A single-user, 100%-Rust AI chat agent talking to Claude. Dioxus fullstack (SSR + hydration) on Axum, SQLite via sqlx, streamed replies via Dioxus's native `ServerEvents` SSE payload type — no hand-rolled REST layer, no hand-written browser fetch client.
+A single-user, 100%-Rust AI chat agent talking to Claude. Dioxus fullstack (SSR + hydration) on Axum, Postgres via sqlx, streamed replies via Dioxus's native `ServerEvents` SSE payload type — no hand-rolled REST layer, no hand-written browser fetch client. The few exceptions (the `/oauth/mcp-callback/{id}` route, the `request_guard` middleware, the sandbox preview proxy's own listener) are in [docs/architecture.md](docs/architecture.md#stack).
 
 ## Docs
 
@@ -8,9 +8,10 @@ A single-user, 100%-Rust AI chat agent talking to Claude. Dioxus fullstack (SSR 
 |---|---|
 | Build, run, env vars | [docs/setup.md](docs/setup.md) |
 | Module map, request flow, feature flags | [docs/architecture.md](docs/architecture.md) |
-| sqlx pool, query pattern, `db::get()` | [docs/database.md](docs/database.md) |
+| sqlx pool, query pattern, `db::get()`, schema (every table) | [docs/database.md](docs/database.md) |
 | Server functions (`#[get]`/`#[post]`), `send_message`/`ServerEvents` streaming | [docs/api.md](docs/api.md) |
-| `Conversation`/`Message` structs | [docs/models.md](docs/models.md) |
+| `Conversation`/`Message` and `LanguageServer*` structs | [docs/models.md](docs/models.md) |
+| MCP servers (client, tools, OAuth) | [docs/mcp.md](docs/mcp.md) |
 | Dioxus components, routing, calling server functions from the UI | [docs/frontend.md](docs/frontend.md) |
 | Inline tests, mock-upstream SSE testing | [docs/testing.md](docs/testing.md) |
 | New feature flow, plan phase, TDD workflow | [docs/development-process.md](docs/development-process.md) |
