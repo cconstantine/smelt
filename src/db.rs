@@ -1479,6 +1479,21 @@ mod tests {
 
     /// SME-41 D11: the default title is now sentence case; a conversation
     /// still carrying the old "New Conversation" gets auto-titled too.
+    /// SME-51 B7: one live pod per conversation is the database's rule,
+    /// not only a check `create_pod` makes before inserting.
+    #[sqlx::test]
+    async fn test_a_conversation_cant_have_two_live_pods(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let first = create_sandbox_pod(&pool, conversation.id).await.expect("first pod");
+        let second = create_sandbox_pod(&pool, conversation.id).await;
+        assert!(
+            second.as_ref().is_err_and(|e| e.as_database_error().is_some_and(|d| d.is_unique_violation())),
+            "a second live pod was recorded: {second:?}"
+        );
+        terminate_sandbox_pod(&pool, first.id).await.expect("terminate");
+        create_sandbox_pod(&pool, conversation.id).await.expect("a pod after the first ended");
+    }
+
     #[sqlx::test]
     async fn test_an_old_style_default_title_is_still_replaced(pool: PgPool) {
         assert_eq!(DEFAULT_TITLE, "New conversation");
@@ -1875,9 +1890,16 @@ mod tests {
     /// `terminal_commands`/`terminal_events` and just need a valid
     /// `terminal_id` to hang them off — most of this module.
     async fn test_terminal(pool: &PgPool, conversation_id: i64) -> i64 {
-        let pod = create_sandbox_pod(pool, conversation_id)
+        // One live pod per conversation (SME-51 B7): reuse it if there is one.
+        let live = list_sandbox_pods(pool, conversation_id)
             .await
-            .expect("create sandbox pod");
+            .expect("list pods")
+            .into_iter()
+            .find(|p| p.terminated_at.is_none());
+        let pod = match live {
+            Some(pod) => pod,
+            None => create_sandbox_pod(pool, conversation_id).await.expect("create sandbox pod"),
+        };
         let terminal = create_sandbox_terminal(pool, pod.id)
             .await
             .expect("create sandbox terminal");
@@ -1971,7 +1993,8 @@ mod tests {
     async fn test_pod_previews_are_listed_per_pod_lowest_first_without_repeats(pool: PgPool) {
         let conversation = test_conversation(&pool).await;
         let pod = create_sandbox_pod(&pool, conversation.id).await.expect("create pod");
-        let other = create_sandbox_pod(&pool, conversation.id).await.expect("create another pod");
+        let elsewhere = test_conversation(&pool).await;
+        let other = create_sandbox_pod(&pool, elsewhere.id).await.expect("create another pod");
 
         let local = |port: u16| (String::new(), port);
         add_pod_preview(&pool, pod.id, "", 5173).await.expect("add 5173");

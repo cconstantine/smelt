@@ -1046,10 +1046,7 @@ mod server {
 
     /// The conversation's live pod, started if it has none.
     async fn ensure_sandbox(pool: &PgPool, conversation_id: i64) -> Result<i64, String> {
-        if let Ok(pod_id) = sandbox::live_pod_id(pool, conversation_id).await {
-            return Ok(pod_id);
-        }
-        sandbox::create_pod(pool, conversation_id, sandbox::PodLimitOverrides::default())
+        sandbox::start_or_get_pod(pool, conversation_id)
             .await
             .map_err(|e| format!("Couldn't start the sandbox: {e}"))
     }

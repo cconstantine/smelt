@@ -1672,6 +1672,47 @@ pub async fn create_pod(
     conversation_id: i64,
     limits: PodLimitOverrides,
 ) -> Result<i64, SandboxError> {
+    let pool = pool.clone();
+    run_pod_start(conversation_id, async move { create_pod_now(&pool, conversation_id, limits).await }).await
+}
+
+/// The conversation's running pod, starting one if it has none. Waits for
+/// a pod that's still starting rather than taking its record early
+/// (SME-51 B7).
+pub async fn start_or_get_pod(pool: &PgPool, conversation_id: i64) -> Result<i64, SandboxError> {
+    let pool = pool.clone();
+    run_pod_start(conversation_id, async move {
+        if let Ok(pod_id) = live_pod_id(&pool, conversation_id).await {
+            return Ok(pod_id);
+        }
+        create_pod_now(&pool, conversation_id, PodLimitOverrides::default()).await
+    })
+    .await
+}
+
+/// Runs `start` in a task of its own, holding the conversation's pod-start
+/// lock (SME-51 B7). Its own task: a Stop drops the turn that asked for the
+/// pod, and a start cut off partway would leave a record with no pod, or a
+/// pod never given its git setup. The lock makes a second start wait for
+/// the first.
+async fn run_pod_start<F>(conversation_id: i64, start: F) -> Result<i64, SandboxError>
+where
+    F: std::future::Future<Output = Result<i64, SandboxError>> + Send + 'static,
+{
+    let lock = pod_start_lock(conversation_id);
+    tokio::spawn(async move {
+        let _starting = lock.lock().await;
+        start.await
+    })
+    .await
+    .unwrap_or_else(|e| Err(SandboxError::StartFailed(format!("starting the sandbox failed: {e}"))))
+}
+
+async fn create_pod_now(
+    pool: &PgPool,
+    conversation_id: i64,
+    limits: PodLimitOverrides,
+) -> Result<i64, SandboxError> {
     let existing = db::list_sandbox_pods(pool, conversation_id)
         .await
         .map_err(SandboxError::Db)?;
@@ -1680,9 +1721,14 @@ pub async fn create_pod(
     let (memory, cpu, docker) = limits.resolve(conversation_id);
 
     let manager = get();
-    let row = db::create_sandbox_pod(pool, conversation_id)
-        .await
-        .map_err(SandboxError::Db)?;
+    // The database's own one-live-pod rule backs up the check above.
+    let row = db::create_sandbox_pod(pool, conversation_id).await.map_err(|e| {
+        if e.as_database_error().is_some_and(|d| d.is_unique_violation()) {
+            SandboxError::PodAlreadyExists
+        } else {
+            SandboxError::Db(e)
+        }
+    })?;
     let volumes = db::list_sandbox_volumes(pool)
         .await
         .map_err(SandboxError::Db)?;
@@ -1743,6 +1789,18 @@ pub async fn create_pod(
             Err(e)
         }
     }
+}
+
+/// Each conversation's "a pod is being started" lock (SME-51 B7).
+fn pod_start_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: LazyLock<StdMutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> =
+        LazyLock::new(Default::default);
+    LOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(conversation_id)
+        .or_default()
+        .clone()
 }
 
 /// Refuses the ports in a pod no route may reach: the sandbox agent's
@@ -4974,6 +5032,23 @@ mod tests {
         assert!(!still_there, "the wait returned while {name} was still stopping");
     }
 
+    /// SME-51 B7: "Work on a repo" while the sandbox is still starting
+    /// waits for it, rather than taking the half-made pod's record and
+    /// cloning into a pod that isn't running.
+    #[sqlx::test]
+    async fn test_start_or_get_pod_waits_for_a_pod_still_starting(pool: PgPool) {
+        let conversation = db::create_conversation(&pool).await.expect("conversation");
+        // A pod being made: its record exists, and its start holds the lock.
+        let row = db::create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+        let starting = pod_start_lock(conversation.id);
+        let guard = starting.lock().await;
+        let early = tokio::time::timeout(Duration::from_millis(300), start_or_get_pod(&pool, conversation.id)).await;
+        assert!(early.is_err(), "it took the pod before it had started");
+        drop(guard);
+        let pod = start_or_get_pod(&pool, conversation.id).await.expect("the started pod");
+        assert_eq!(pod, row.id);
+    }
+
     /// SME-51 B5: deleting a conversation removes every pod labelled with
     /// it, including one whose record is already gone. That's what a
     /// `create_pod` racing the delete leaves: its row cascades away with
@@ -6196,6 +6271,31 @@ mod tests {
             })
             .await;
             assert!(workspace_claim_gone.is_ok(), "teardown_conversation should delete the workspace claim");
+
+            // --- SME-51 B7: a create_pod whose caller goes away (a Stop
+            // drops the turn mid-call) still finishes: the pod gets its git
+            // setup and is announced Running, rather than being left with
+            // whatever step it had reached. ---
+            let conversation_k = db::create_conversation(&pool).await.expect("create conversation k");
+            let mut events_k = events::subscribe(conversation_k.id);
+            let dropped = tokio::time::timeout(
+                Duration::from_secs(2),
+                create_pod(&pool, conversation_k.id, PodLimitOverrides::default()),
+            )
+            .await;
+            assert!(dropped.is_err(), "the create should still be under way after 2s");
+            let announced = tokio::time::timeout(Duration::from_secs(90), async {
+                loop {
+                    if let Ok(events::ConversationEvent::SandboxPodUpdate { status, .. }) = events_k.recv().await
+                        && status == "Running"
+                    {
+                        return;
+                    }
+                }
+            })
+            .await;
+            teardown_conversation(conversation_k.id).await;
+            assert!(announced.is_ok(), "a create_pod whose caller went away never finished");
 
             // --- Generic volumes: create_volume/delete_volume manage a
             // real PVC alongside the sandbox_volumes row, and a volume
