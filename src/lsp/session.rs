@@ -83,6 +83,7 @@ struct Published {
 /// State the client's handler updates as the server's messages arrive.
 #[derive(Default)]
 struct Heard {
+    /// By file path (not URI, which servers spell their own way).
     diagnostics: Mutex<HashMap<String, Published>>,
     /// Work-done progress under way (indexing, loading the project).
     progress: Mutex<HashSet<String>>,
@@ -254,7 +255,7 @@ impl Session {
         let deadline = Instant::now() + wait;
         loop {
             let notified = self.heard.changed.notified();
-            let current = self.heard.diagnostics.lock().unwrap_or_else(|e| e.into_inner()).get(&uri).cloned();
+            let current = self.heard.diagnostics.lock().unwrap_or_else(|e| e.into_inner()).get(path).cloned();
             if let Some(published) = current {
                 let fresh = match published.version {
                     Some(v) => v >= version,
@@ -343,7 +344,9 @@ fn handler(heard: Arc<Heard>, settings: Option<Value>, roots: Arc<Mutex<Vec<Stri
                             at: Some(Instant::now()),
                             items: params.get("diagnostics").and_then(Value::as_array).cloned().unwrap_or_default(),
                         };
-                        heard.diagnostics.lock().unwrap_or_else(|e| e.into_inner()).insert(uri.to_string(), published);
+                        // By path: servers spell URIs their own way.
+                        let path = uri_path(uri).unwrap_or_else(|| uri.to_string());
+                        heard.diagnostics.lock().unwrap_or_else(|e| e.into_inner()).insert(path, published);
                         heard.changed.notify_waiters();
                     }
                 }
@@ -531,6 +534,22 @@ mod tests {
         let since = session.changed_at("/workspace/a.rs").expect("synced");
         let found = session.diagnostics("/workspace/a.rs", version, since, Duration::from_millis(200)).await;
         assert_eq!(found, FileDiagnostics { items: vec![], complete: false });
+    }
+
+    /// Servers encode file URIs their own way (rust-analyzer leaves `+`
+    /// as is); diagnostics are found by the path, not the spelling.
+    #[tokio::test]
+    async fn test_diagnostics_are_found_however_the_uri_is_encoded() {
+        let (reader, writer, mut server) = connect();
+        let opening = tokio::spawn(Session::open(reader, writer, config(None), "/workspace"));
+        server.handshake(json!({})).await;
+        let session = opening.await.unwrap().expect("open");
+        server
+            .send(json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+                "params": {"uri": "file:///workspace/c++/a.rs", "version": 1, "diagnostics": [{"message": "here"}]}}))
+            .await;
+        let found = session.diagnostics("/workspace/c++/a.rs", 1, Instant::now(), Duration::from_secs(2)).await;
+        assert_eq!(found.items, vec![json!({"message": "here"})]);
     }
 
     #[tokio::test]
