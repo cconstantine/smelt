@@ -155,19 +155,19 @@ pub fn GitSettingsPage() -> Element {
                 section { class: "git-section",
                     h2 { "Repos you've decided about" }
                     p { class: "muted",
-                        "A trusted repo's AGENTS.md is loaded into the model's instructions when it's cloned. Forget a decision to be asked again next time the repo is cloned."
+                        "The model loads a repo's AGENTS.md into its instructions when it asks to; you're asked the first time for each repo. Forget a decision to be asked again."
                     }
                     if let Some(err) = trust_error() {
                         p { class: "error", "{err}" }
                     }
                     if trust().is_empty() {
-                        p { class: "muted", "None yet. You're asked the first time the model clones a repo with an AGENTS.md; repos you open with Work on a repo are trusted." }
+                        p { class: "muted", "None yet. You're asked the first time the model wants to load a repo's AGENTS.md; repos you open with Work on a repo are trusted." }
                     } else {
                         div { class: "sandbox-volume-list",
                             for decision in trust() {
                                 div { key: "{decision.remote}", class: "sandbox-volume-row",
                                     div { class: "sandbox-volume-summary",
-                                        span { class: "sandbox-volume-name", "{decision.remote}" }
+                                        span { class: "sandbox-volume-name", {crate::git::remote_label(&decision.remote)} }
                                         span { class: "sandbox-volume-path", if decision.trusted { "Trusted" } else { "Not trusted" } }
                                     }
                                     button {

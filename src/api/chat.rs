@@ -47,15 +47,18 @@ pub async fn get_messages(id: i64) -> ServerFnResult<Vec<Message>> {
 
 #[delete("/api/conversations/{id}")]
 pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
-    // Best-effort, unconditional (unlike terminate_pod, which the model
-    // calls and which is guarded) — the conversation is going away
-    // regardless, so nothing about the pod matters anymore either way.
-    crate::sandbox::teardown_conversation(db::get(), id).await;
+    // Its turns first, so nothing is still making a pod (SME-51 B5).
+    stop_turn_now(id);
     let _ = crate::browsing::close_session(id).await;
     anthropic::tools::forget_conversation_tasks(id);
     db::delete_conversation(db::get(), id)
         .await
         .map_err(ServerFnError::new)?;
+    // After the delete: a pod started meanwhile is found by its label, and
+    // one still starting sees the conversation gone (`create_pod`).
+    // Best-effort, unconditional (unlike terminate_pod, which the model
+    // calls and which is guarded).
+    crate::sandbox::teardown_conversation(id).await;
     crate::events::forget(id);
     forget_conversation_lock(id);
     // After the delete, so a listener refetching sees the pod rows gone.
@@ -284,12 +287,26 @@ fn continuation_prompt(unanswered: &[String]) -> String {
     if unanswered.is_empty() {
         return COMPACTION_CONTINUATION_PROMPT.to_string();
     }
+    // Each quoted in part at most: a huge paste quoted whole would leave
+    // the compacted request as big as the one compaction was for, and the
+    // summary already covers it (SME-51 B10).
+    let quoted: Vec<String> = unanswered
+        .iter()
+        .map(|text| match crate::fetch_guard::truncate(text.clone(), CONTINUATION_QUOTE_MAX_CHARS) {
+            (kept, true) => format!("{kept}\n[cut to its first {CONTINUATION_QUOTE_MAX_CHARS} characters; the summary covers the rest]"),
+            (whole, false) => whole,
+        })
+        .collect();
     format!(
         "{COMPACTION_CONTINUATION_PROMPT} The summary includes these latest messages, which you \
          haven't answered yet; respond to them now:\n\n{}",
-        unanswered.join("\n\n")
+        quoted.join("\n\n")
     )
 }
+
+/// How much of each unanswered message a continuation quotes.
+#[cfg(feature = "server")]
+const CONTINUATION_QUOTE_MAX_CHARS: usize = 4_000;
 
 /// The text of the user messages at the end of `messages`, after the
 /// model's last reply: what a compaction happening now would summarize
@@ -308,6 +325,10 @@ fn unanswered_user_text(messages: &[Message]) -> Vec<String> {
         })
         .collect();
     texts.reverse();
+    // What came before the user's last stop was called off (SME-51 B10).
+    if let Some(stop) = texts.iter().rposition(|text| text == STOP_NOTICE) {
+        texts.drain(..=stop);
+    }
     texts
 }
 
@@ -763,6 +784,12 @@ async fn compact_conversation(
         // Watching tabs show the divider as it happens (SME-40 F5).
         record_saved(conversation_id, &mut Vec::new(), saved);
     }
+    // The usage that triggered this described the old, long history. Kept,
+    // a failed or stopped next call would have the following turn compact
+    // again at once; the next real reply records the new size (SME-51 B10).
+    db::clear_conversation_usage(pool, conversation_id)
+        .await
+        .map_err(ServerFnError::new)?;
     Ok(())
 }
 
@@ -852,6 +879,7 @@ pub(crate) fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<
 /// fresh lock and then fails, since the conversation no longer exists.
 #[cfg(feature = "server")]
 fn forget_conversation_lock(conversation_id: i64) {
+    remember_turn_error(conversation_id, None);
     CONVERSATION_LOCKS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1231,6 +1259,8 @@ fn run_turn_bounded<'a>(
     Box::pin(async move {
         let mut stop = stop_receiver(conversation_id);
         let _in_flight = TurnInFlight::start(conversation_id);
+        // Any new turn replaces the last failure (SME-51 code review 1).
+        remember_turn_error(conversation_id, None);
         let unsaved = new_message.clone();
         let saved = Arc::new(std::sync::atomic::AtomicBool::new(false));
         tokio::select! {
@@ -1242,23 +1272,68 @@ fn run_turn_bounded<'a>(
         // background task's notice, say), without running a turn for it;
         // the conversation is paused, so the model sees it next time the
         // user writes (SME-40 F4).
+        let lock = conversation_lock(conversation_id);
+        let _turn = lock.lock().await;
         if let Some(message) = unsaved
             && !saved.load(std::sync::atomic::Ordering::SeqCst)
         {
-            let lock = conversation_lock(conversation_id);
-            let _turn = lock.lock().await;
             match db::create_message(pool, conversation_id, &message.role, &message.content).await {
                 Ok(saved) => record_saved(conversation_id, &mut Vec::new(), saved),
                 Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't keep a stopped turn's message"),
             }
         }
+        record_stop(pool, conversation_id).await;
         Err(ServerFnError::new(TURN_STOPPED))
     })
+}
+
+/// Adds `delta` to `conversation_id`'s reply so far and publishes it with
+/// its offset. Both happen under the lock `get_reply_in_progress` reads
+/// through, so a tab's fetched text and the offsets it then receives
+/// agree (SME-51 B3).
+#[cfg(feature = "server")]
+fn relay_reply_delta(conversation_id: i64, delta: &str) {
+    let mut replies = REPLIES_IN_PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+    let reply = replies.entry(conversation_id).or_default();
+    let offset = reply.len();
+    reply.push_str(delta);
+    crate::events::publish(
+        conversation_id,
+        crate::events::ConversationEvent::ReplyDelta {
+            text: delta.to_string(),
+            offset,
+        },
+    );
+}
+
+/// Notes in the conversation that the user stopped it (`STOP_NOTICE`),
+/// once however many turns the stop ended. Call holding the turn lock.
+#[cfg(feature = "server")]
+async fn record_stop(pool: &PgPool, conversation_id: i64) {
+    let already = db::list_messages(pool, conversation_id)
+        .await
+        .ok()
+        .and_then(|messages| messages.last().map(|m| m.content.contains(STOP_NOTICE)))
+        .unwrap_or(false);
+    if already {
+        return;
+    }
+    let notice = [anthropic::ContentBlock::Text { text: STOP_NOTICE.to_string() }];
+    match db::create_message(pool, conversation_id, "user", &notice).await {
+        Ok(saved) => record_saved(conversation_id, &mut Vec::new(), saved),
+        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't note a stop"),
+    }
 }
 
 /// The error a stopped turn ends with. Not server-only: the chat page
 /// recognizes it to show "Stopped." instead of an error.
 pub const TURN_STOPPED: &str = "stopped by the user";
+
+/// Saved in the conversation when the user stops a turn, so the model (and
+/// a compaction's continuation) knows the request before it was called
+/// off, rather than taking it as still waiting for an answer (SME-51 B10).
+/// Not server-only: the chat page shows it as "Stopped.".
+pub const STOP_NOTICE: &str = "The user stopped this turn before it finished. Don't carry on with what it asked unless they ask again.";
 
 /// What `send_message` does: checks the conversation exists, then runs
 /// the user's turn in the background and returns without waiting for it.
@@ -1276,21 +1351,48 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     }
     // The user writing again ends any pause from an earlier stop.
     resume_turns(id);
+    // At once, not only when the turn starts: it may queue behind another.
+    remember_turn_error(id, None);
     let new_message = anthropic::AnthropicMessage {
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text: content }],
     };
     tokio::spawn(async move {
         if let Err(e) = run_turn(&pool, id, new_message, None).await {
-            crate::events::publish(
-                id,
-                crate::events::ConversationEvent::TurnError {
-                    message: chat_error_text(&e),
-                },
-            );
+            let message = chat_error_text(&e);
+            if message != TURN_STOPPED {
+                remember_turn_error(id, Some(message.clone()));
+            }
+            crate::events::publish(id, crate::events::ConversationEvent::TurnError { message });
         }
     });
     Ok(())
+}
+
+/// Each conversation's last failed turn's error, until the user writes
+/// again, for a tab that connects after the `TurnError` event (SME-51 B11).
+#[cfg(feature = "server")]
+static TURN_ERRORS: LazyLock<Mutex<HashMap<i64, String>>> = LazyLock::new(Default::default);
+
+#[cfg(feature = "server")]
+fn remember_turn_error(conversation_id: i64, error: Option<String>) {
+    let mut errors = TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+    match error {
+        Some(error) => errors.insert(conversation_id, error),
+        None => errors.remove(&conversation_id),
+    };
+}
+
+#[cfg(feature = "server")]
+fn last_turn_error(conversation_id: i64) -> Option<String> {
+    TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).get(&conversation_id).cloned()
+}
+
+/// The conversation's last failed turn's error, if the user hasn't written
+/// since: the reconnect pull's copy of `ConversationEvent::TurnError`.
+#[get("/api/conversations/{id}/turn-error")]
+pub async fn get_turn_error(id: i64) -> ServerFnResult<Option<String>> {
+    Ok(last_turn_error(id))
 }
 
 /// The user's Stop button: ends this conversation's running turn, and
@@ -1444,18 +1546,7 @@ fn run_turn_body<'a>(
             // Every tab watching streams the reply: the text so far is kept
             // for a tab that connects mid-reply, and each delta published.
             let mut relay = |delta: &str| {
-                REPLIES_IN_PROGRESS
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .entry(conversation_id)
-                    .or_default()
-                    .push_str(delta);
-                crate::events::publish(
-                    conversation_id,
-                    crate::events::ConversationEvent::ReplyDelta {
-                        text: delta.to_string(),
-                    },
-                );
+                relay_reply_delta(conversation_id, delta);
                 if let Some(cb) = on_delta.as_deref_mut() {
                     cb(delta);
                 }
@@ -1622,6 +1713,8 @@ pub async fn get_todos(id: i64) -> ServerFnResult<Vec<anthropic::tools::TodoItem
 pub struct SandboxOutputLine {
     pub stream: String,
     pub data: String,
+    /// The agent's per-command `seq` (see `SandboxCommandUpdate::position`).
+    pub seq: i64,
 }
 
 /// One terminal's current/most recent command, hydrated for the sandbox
@@ -1724,6 +1817,7 @@ async fn fetch_command_summary(
             .map(|line| SandboxOutputLine {
                 stream: line.stream,
                 data: line.data,
+                seq: line.seq,
             })
             .collect(),
     })
@@ -1926,15 +2020,19 @@ fn conversation_event_stream(
     // Both subscribed now, not on first poll, so nothing published in
     // between is missed.
     let receivers = (events::subscribe(id), events::subscribe_app());
-    futures_util::stream::unfold(receivers, |(mut conversation, mut app)| async move {
+    futures_util::stream::unfold(receivers, move |(mut conversation, mut app)| async move {
         loop {
             tokio::select! {
                 received = conversation.recv() => match received {
                     Ok(event) => return Some((Ok::<_, axum::BoxError>(event), (conversation, app))),
-                    // A subscriber that fell behind just misses some
-                    // ephemeral updates — the frontend's reconciliation
-                    // pull on connect covers the durable state regardless.
-                    Err(RecvError::Lagged(_)) => continue,
+                    // A subscriber that fell behind has missed events it
+                    // can't get back, a saved message or the turn ending
+                    // among them. Ending the stream makes the tab reconnect
+                    // and pull the current state (SME-51 B3).
+                    Err(RecvError::Lagged(skipped)) => {
+                        tracing::info!(conversation_id = id, skipped, "a tab fell behind; ending its stream so it resyncs");
+                        return None;
+                    }
                     Err(RecvError::Closed) => return None,
                 },
                 received = app.recv() => match received {
@@ -1971,6 +2069,29 @@ mod tests {
             content: serde_json::to_string(&blocks).expect("ContentBlock always serializes"),
             created_at: chrono::Utc::now().naive_utc(),
         }
+    }
+
+    /// SME-51 B10: a request the user stopped isn't "unanswered": a
+    /// compaction mustn't hand it back to the model to answer.
+    #[test]
+    fn test_a_stopped_request_isnt_quoted_as_unanswered() {
+        let messages = vec![
+            text_message(1, "assistant", "ok"),
+            text_message(2, "user", "Write a 400-word story"),
+            text_message(3, "user", STOP_NOTICE),
+            text_message(4, "user", "What is 2 + 2?"),
+        ];
+        assert_eq!(unanswered_user_text(&messages), vec!["What is 2 + 2?".to_string()]);
+    }
+
+    /// SME-51 B10: a huge pasted message quoted whole would leave the
+    /// compacted request as big as the one compaction was for.
+    #[test]
+    fn test_the_continuation_quotes_a_huge_message_only_in_part() {
+        let huge = "x".repeat(100_000);
+        let prompt = continuation_prompt(&[huge]);
+        assert!(prompt.chars().count() < 10_000, "{} chars", prompt.chars().count());
+        assert!(prompt.contains("cut"), "it should say the quote was cut");
     }
 
     fn text_message(id: i64, role: &str, text: &str) -> Message {
@@ -2367,6 +2488,56 @@ mod tests {
             matches!(event, Some(Ok(events::ConversationEvent::PodsChanged {}))),
             "got {event:?}"
         );
+    }
+
+    /// SME-51 B3: each delta says where it starts, measured against the
+    /// same text `get_reply_in_progress` returns.
+    #[tokio::test]
+    async fn test_reply_deltas_carry_their_offset_in_the_reply_so_far() {
+        let conversation_id = 9_000_000_052;
+        let mut rx = events::subscribe(conversation_id);
+        relay_reply_delta(conversation_id, "héllo ");
+        relay_reply_delta(conversation_id, "world");
+        let mut offsets = Vec::new();
+        while let Ok(events::ConversationEvent::ReplyDelta { offset, .. }) = rx.try_recv() {
+            offsets.push(offset);
+        }
+        assert_eq!(offsets, vec![0, "héllo ".len()]);
+        assert_eq!(reply_in_progress(conversation_id).as_deref(), Some("héllo world"));
+        clear_reply_in_progress(conversation_id);
+        events::forget(conversation_id);
+    }
+
+    /// SME-51 B3: a tab that falls behind loses events it can't get back
+    /// (a saved message, the turn ending). Its stream ends instead, so the
+    /// tab reconnects and pulls the current state again.
+    #[tokio::test]
+    async fn test_a_stream_that_falls_behind_ends_instead_of_skipping() {
+        use futures_util::StreamExt;
+        let conversation_id = 9_000_000_051;
+        let stream = conversation_event_stream(conversation_id);
+        futures_util::pin_mut!(stream);
+        for i in 0..2_000 {
+            events::publish(
+                conversation_id,
+                events::ConversationEvent::ReplyDelta { text: format!("{i} "), offset: 0 },
+            );
+        }
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match stream.next().await {
+                    None => return true,
+                    // App-wide events from tests running alongside.
+                    Some(Ok(events::ConversationEvent::PodsChanged {}))
+                    | Some(Ok(events::ConversationEvent::TurnsChanged {})) => continue,
+                    Some(_) => return false,
+                }
+            }
+        })
+        .await
+        .expect("the stream should answer");
+        assert!(ended, "a lagging stream kept going with events missing");
+        events::forget(conversation_id);
     }
 
     /// SME-41 D9: a turn starting or ending is announced app-wide, and
@@ -3303,7 +3474,14 @@ mod tests {
             "a stopped turn should release the turn lock"
         );
         let saved = db::list_messages(&pool, conversation.id).await.expect("list");
-        assert_eq!(saved.len(), 1, "the user's message is kept");
+        assert_eq!(saved.len(), 2, "the user's message is kept, then the stop is noted");
+        // SME-51 B10: the stop is in the conversation, for the model (and
+        // a compaction) to see that request was called off.
+        assert!(
+            saved[1].content.contains(STOP_NOTICE),
+            "the stop isn't recorded: {}",
+            saved[1].content
+        );
 
         // A turn started after the stop isn't affected by it.
         let later = start_recording_mock_upstream(vec![text_reply_body("Hi!")]).await;
@@ -3803,7 +3981,7 @@ mod tests {
             .into_iter()
             .filter_map(|event| match event {
                 events::ConversationEvent::ReplyReset {} => Some("<reset>".to_string()),
-                events::ConversationEvent::ReplyDelta { text } => Some(text),
+                events::ConversationEvent::ReplyDelta { text, .. } => Some(text),
                 _ => None,
             })
             .collect();
@@ -3937,6 +4115,44 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         stop_turn_now(stopped.id);
         assert_eq!(next_turn_error(&mut rx).await.as_deref(), Some(TURN_STOPPED));
+    }
+
+    /// SME-51 B11: a failed turn's error was only an event, so a tab that
+    /// reloaded (or connected) afterwards showed a message with no reply
+    /// and no reason. The last error is kept for the reconnect pull, and
+    /// the user's next message clears it.
+    #[sqlx::test]
+    async fn test_a_turn_error_is_still_there_after_a_reload(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation_with_id(&pool, 9_100_000_014)
+            .await
+            .expect("create conversation");
+        start_mock_upstream_failing_n_times(0, None).await;
+        let mut rx = events::subscribe(conversation.id);
+        start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
+        next_turn_error(&mut rx).await.expect("a TurnError");
+        let kept = last_turn_error(conversation.id).expect("the error is kept");
+        assert!(kept.contains("error parsing tool call"), "got: {kept}");
+
+        start_hanging_mock_upstream().await;
+        start_turn(pool.clone(), conversation.id, "again".to_string()).await.expect("send");
+        assert_eq!(last_turn_error(conversation.id), None, "the next message clears it");
+        stop_turn_now(conversation.id);
+    }
+
+    /// SME-51 code review 1: a turn the user didn't send (a finished
+    /// task's, say) that goes fine replaces an earlier failure; a reload
+    /// mustn't show that error under the newer reply.
+    #[sqlx::test]
+    async fn test_any_new_turn_clears_the_kept_error(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation_with_id(&pool, 9_100_000_015)
+            .await
+            .expect("create conversation");
+        remember_turn_error(conversation.id, Some("an earlier failure".to_string()));
+        start_recording_mock_upstream(vec![text_reply_body("Done.")]).await;
+        run_turn(&pool, conversation.id, hello(), None).await.expect("a background turn");
+        assert_eq!(last_turn_error(conversation.id), None);
     }
 
     async fn next_turn_error(
@@ -4188,6 +4404,33 @@ mod tests {
             description.contains("implement") && description.contains("in_progress"),
             "expected the second todo and its status in: {description}"
         );
+    }
+
+    /// SME-51 B10: the usage that triggered a compaction describes the old,
+    /// long history. Kept after it, a failed or stopped next call left the
+    /// following turn compacting again at once.
+    #[sqlx::test]
+    async fn test_a_compaction_forgets_the_usage_that_triggered_it(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "earlier".to_string() }])
+            .await
+            .expect("seed");
+        db::create_message(&pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: "reply".to_string() }])
+            .await
+            .expect("seed");
+        let near_limit = anthropic::TokenUsage {
+            input_tokens: 190_000,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        db::upsert_conversation_usage(&pool, conversation.id, &near_limit).await.expect("seed usage");
+        start_mock_upstream(vec![text_reply_body("Summary: earlier.")]).await;
+        compact_conversation(&pool, conversation.id, Some("test-key"), None)
+            .await
+            .expect("compaction");
+        assert_eq!(db::get_conversation_usage(&pool, conversation.id).await.expect("usage"), None);
     }
 
     #[sqlx::test]

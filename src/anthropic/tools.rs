@@ -107,26 +107,26 @@ mod server {
         match name {
             "run_async" => run_async(pool, conversation_id, tool_use_id, input).await,
             "list_tasks" => Ok(list_tasks(conversation_id)),
-            "task_status" => task_status_tool(input),
-            "task_stdout" => task_stdout_tool(input),
-            "task_stderr" => task_stderr_tool(input),
-            "task_result" => task_result_tool(input),
-            "wait_task" => wait_task_tool(input).await,
+            "task_status" => task_status_tool(conversation_id, input),
+            "task_stdout" => task_stdout_tool(conversation_id, input),
+            "task_stderr" => task_stderr_tool(conversation_id, input),
+            "task_result" => task_result_tool(conversation_id, input),
+            "wait_task" => wait_task_tool(conversation_id, input).await,
             "cancel_task" => cancel_task_tool(conversation_id, input).await,
-            "write_task_stdin" => write_task_stdin_tool(input),
+            "write_task_stdin" => write_task_stdin_tool(conversation_id, input),
             "create_pod" => create_pod_tool(pool, conversation_id, input).await,
             "terminate_pod" => terminate_pod_tool(pool, conversation_id).await,
             "list_pods" => list_pods_tool(pool, conversation_id).await,
             "create_terminal" => create_terminal_tool(pool, conversation_id).await,
-            "terminate_terminal" => terminate_terminal_tool(pool, input).await,
+            "terminate_terminal" => terminate_terminal_tool(pool, conversation_id, input).await,
             "list_terminals" => list_terminals_tool(pool, conversation_id).await,
             "run_terminal_command" => {
                 run_terminal_command_tool(pool, conversation_id, tool_use_id, input).await
             }
-            "send_signal" => send_signal_tool(pool, input).await,
-            "terminal_command_status" => terminal_command_status_tool(pool, input).await,
-            "read_terminal_output" => read_terminal_output_tool(pool, input).await,
-            "list_commands" => list_commands_tool(pool, input).await,
+            "send_signal" => send_signal_tool(pool, conversation_id, input).await,
+            "terminal_command_status" => terminal_command_status_tool(pool, conversation_id, input).await,
+            "read_terminal_output" => read_terminal_output_tool(pool, conversation_id, input).await,
+            "list_commands" => list_commands_tool(pool, conversation_id, input).await,
             "read_file" => read_file_tool(pool, conversation_id, input).await,
             "write_file" => write_file_tool(pool, conversation_id, input).await,
             "edit_file" => edit_file_tool(pool, conversation_id, input).await,
@@ -1315,6 +1315,7 @@ mod server {
                 status: "running".to_string(),
                 stream: None,
                 latest_output: None,
+                position: None,
             },
         );
 
@@ -1333,18 +1334,21 @@ mod server {
     /// pushes the line to the conversation as a real turn via
     /// `chat::run_turn`, the expensive, model-facing path.
     async fn record_task_line(task_id: &str, stream: Stream, line: String) {
-        let Some((conversation_id, tool, stream_output, pool)) = ({
+        let Some((conversation_id, tool, stream_output, pool, position)) = ({
             let mut tasks = lock_tasks();
             tasks.get_mut(task_id).map(|task| {
-                match stream {
-                    Stream::Stdout => task.stdout.push(line.clone()),
-                    Stream::Stderr => task.stderr.push(line.clone()),
-                }
+                let lines = match stream {
+                    Stream::Stdout => &mut task.stdout,
+                    Stream::Stderr => &mut task.stderr,
+                };
+                let position = lines.len() as i64;
+                lines.push(line.clone());
                 (
                     task.conversation_id,
                     task.tool.clone(),
                     task.stream_output,
                     task.pool.clone(),
+                    position,
                 )
             })
         }) else {
@@ -1359,6 +1363,7 @@ mod server {
                 status: "running".to_string(),
                 stream: Some(stream.label().to_string()),
                 latest_output: Some(line.clone()),
+                position: Some(position),
             },
         );
 
@@ -1435,6 +1440,7 @@ mod server {
                 status: status.to_string(),
                 stream: None,
                 latest_output: None,
+                position: None,
             },
         );
 
@@ -1483,35 +1489,43 @@ mod server {
     }
 
     /// Non-blocking `ps <pid>`.
-    fn task_status_tool(input: &Value) -> Result<String, String> {
+    /// `task_id`'s task if `conversation_id` started it. Another
+    /// conversation's task is reported as unknown, not as someone else's
+    /// (SME-51 B2).
+    fn owned_task<'a>(
+        tasks: &'a HashMap<String, Task>,
+        conversation_id: i64,
+        task_id: &str,
+    ) -> Result<&'a Task, String> {
+        tasks
+            .get(task_id)
+            .filter(|task| task.conversation_id == conversation_id)
+            .ok_or_else(|| format!("unknown task id: {task_id}"))
+    }
+
+    fn task_status_tool(conversation_id: i64, input: &Value) -> Result<String, String> {
         let task_id = required_str(input, "task_id")?;
         let tasks = lock_tasks();
-        let task = tasks
-            .get(&task_id)
-            .ok_or_else(|| format!("unknown task id: {task_id}"))?;
+        let task = owned_task(&tasks, conversation_id, &task_id)?;
         Ok(status_str(task.status).to_string())
     }
 
     /// `tail` on a task's stdout — the accumulated log so far, in one
     /// string.
-    fn task_stdout_tool(input: &Value) -> Result<String, String> {
+    fn task_stdout_tool(conversation_id: i64, input: &Value) -> Result<String, String> {
         let task_id = required_str(input, "task_id")?;
         let tasks = lock_tasks();
-        let task = tasks
-            .get(&task_id)
-            .ok_or_else(|| format!("unknown task id: {task_id}"))?;
+        let task = owned_task(&tasks, conversation_id, &task_id)?;
         Ok(task.stdout.join("\n"))
     }
 
     /// `tail` on a task's stderr — same shape as `task_stdout_tool`, a
     /// separate log so diagnostics don't get mixed into a tool's real
     /// output (or vice versa).
-    fn task_stderr_tool(input: &Value) -> Result<String, String> {
+    fn task_stderr_tool(conversation_id: i64, input: &Value) -> Result<String, String> {
         let task_id = required_str(input, "task_id")?;
         let tasks = lock_tasks();
-        let task = tasks
-            .get(&task_id)
-            .ok_or_else(|| format!("unknown task id: {task_id}"))?;
+        let task = owned_task(&tasks, conversation_id, &task_id)?;
         Ok(task.stderr.join("\n"))
     }
 
@@ -1521,13 +1535,11 @@ mod server {
     /// write succeeding even into a process that ignores stdin. Errors if
     /// the task is unknown or has already reached a terminal state (no one
     /// is ever going to read it at that point).
-    fn write_task_stdin_tool(input: &Value) -> Result<String, String> {
+    fn write_task_stdin_tool(conversation_id: i64, input: &Value) -> Result<String, String> {
         let task_id = required_str(input, "task_id")?;
         let data = required_str(input, "data")?;
         let tasks = lock_tasks();
-        let task = tasks
-            .get(&task_id)
-            .ok_or_else(|| format!("unknown task id: {task_id}"))?;
+        let task = owned_task(&tasks, conversation_id, &task_id)?;
         if task.status != TaskStatus::Running {
             return Err(format!(
                 "task {task_id} is not running (status: {}) — nothing is reading its stdin",
@@ -1541,12 +1553,10 @@ mod server {
     }
 
     /// The wrapped tool's final return value once `Finished`.
-    fn task_result_tool(input: &Value) -> Result<String, String> {
+    fn task_result_tool(conversation_id: i64, input: &Value) -> Result<String, String> {
         let task_id = required_str(input, "task_id")?;
         let tasks = lock_tasks();
-        let task = tasks
-            .get(&task_id)
-            .ok_or_else(|| format!("unknown task id: {task_id}"))?;
+        let task = owned_task(&tasks, conversation_id, &task_id)?;
         match task.status {
             TaskStatus::Running => {
                 Err("not finished yet — use wait_task or check task_status".to_string())
@@ -1567,7 +1577,7 @@ mod server {
     /// now much wider range, instead of needing many repeated calls.
     const WAIT_TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 1..=120;
 
-    async fn wait_task_tool(input: &Value) -> Result<String, String> {
+    async fn wait_task_tool(conversation_id: i64, input: &Value) -> Result<String, String> {
         let task_id = required_str(input, "task_id")?;
         let timeout_seconds = required_f64(input, "timeout_seconds")? as u64;
         if !WAIT_TIMEOUT_RANGE.contains(&timeout_seconds) {
@@ -1585,18 +1595,14 @@ mod server {
         // check would risk missing a notification that fires in between.
         let notify = {
             let tasks = lock_tasks();
-            let task = tasks
-                .get(&task_id)
-                .ok_or_else(|| format!("unknown task id: {task_id}"))?;
+            let task = owned_task(&tasks, conversation_id, &task_id)?;
             task.notify.clone()
         };
         let notified = notify.notified();
 
         let already_done = {
             let tasks = lock_tasks();
-            let task = tasks
-                .get(&task_id)
-                .ok_or_else(|| format!("unknown task id: {task_id}"))?;
+            let task = owned_task(&tasks, conversation_id, &task_id)?;
             task.status != TaskStatus::Running
         };
 
@@ -1609,7 +1615,7 @@ mod server {
             }
         }
 
-        task_result_tool(input)
+        task_result_tool(conversation_id, input)
     }
 
     /// `kill`: if `Running`, marks the registry entry `Cancelled` *before*
@@ -1628,6 +1634,7 @@ mod server {
             let mut tasks = lock_tasks();
             let task = tasks
                 .get_mut(&task_id)
+                .filter(|task| task.conversation_id == conversation_id)
                 .ok_or_else(|| format!("unknown task id: {task_id}"))?;
             if task.status == TaskStatus::Running {
                 task.status = TaskStatus::Cancelled;
@@ -1649,7 +1656,6 @@ mod server {
             )),
             Outcome::Cancelled { abort, pool } => {
                 abort.abort();
-                let _ = conversation_id; // already captured in the registry entry
                 // Spawned, not awaited: `cancel_task` runs synchronously
                 // inside the *calling* `run_turn`'s own tool-dispatch loop,
                 // which already holds conversation_id's lock for its whole
@@ -1776,8 +1782,33 @@ mod server {
         Ok(serde_json::json!({"terminal_id": terminal_id}).to_string())
     }
 
-    async fn terminate_terminal_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
+    /// Refuses a terminal that isn't in one of `conversation_id`'s pods, as
+    /// unknown: terminal ids are sequential, so another conversation's are
+    /// easy to guess (SME-51 B2).
+    async fn owned_terminal(pool: &PgPool, conversation_id: i64, terminal_id: i64) -> Result<(), String> {
+        match db::terminal_conversation_id(pool, terminal_id).await.map_err(|e| e.to_string())? {
+            Some(owner) if owner == conversation_id => Ok(()),
+            _ => Err(format!("unknown terminal id: {terminal_id}")),
+        }
+    }
+
+    /// `command_id`'s command if it ran in `conversation_id`; another
+    /// conversation's is reported as unknown (SME-51 B2).
+    async fn owned_command(
+        pool: &PgPool,
+        conversation_id: i64,
+        command_id: &str,
+    ) -> Result<db::TerminalCommand, String> {
+        db::get_terminal_command(pool, command_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .filter(|command| command.conversation_id == conversation_id)
+            .ok_or_else(|| format!("unknown command id: {command_id}"))
+    }
+
+    async fn terminate_terminal_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
         let terminal_id = required_i64(input, "terminal_id")?;
+        owned_terminal(pool, conversation_id, terminal_id).await?;
         sandbox::terminate_terminal(pool, terminal_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1805,6 +1836,7 @@ mod server {
     ) -> Result<String, String> {
         let terminal_id = required_i64(input, "terminal_id")?;
         let command = required_str(input, "command")?;
+        owned_terminal(pool, conversation_id, terminal_id).await?;
 
         if db::terminal_command_is_running(pool, terminal_id)
             .await
@@ -1843,6 +1875,7 @@ mod server {
                 exit_code: None,
                 stream: None,
                 latest_output: None,
+                position: None,
             },
         );
 
@@ -1851,7 +1884,7 @@ mod server {
 
     const ALLOWED_SIGNALS: &[&str] = &["INT", "TERM", "KILL"];
 
-    async fn send_signal_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
+    async fn send_signal_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
         let command_id = required_str(input, "command_id")?;
         let signal = required_str(input, "signal")?;
         if !ALLOWED_SIGNALS.contains(&signal.as_str()) {
@@ -1859,18 +1892,16 @@ mod server {
                 "signal must be one of {ALLOWED_SIGNALS:?}, got {signal}"
             ));
         }
-        let command = db::get_terminal_command(pool, &command_id)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("unknown command id: {command_id}"))?;
+        let command = owned_command(pool, conversation_id, &command_id).await?;
         sandbox::send_signal(pool, command.terminal_id, &command_id, &signal)
             .await
             .map_err(|e| e.to_string())?;
         Ok(format!("signal {signal} sent to {command_id}"))
     }
 
-    async fn terminal_command_status_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
+    async fn terminal_command_status_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
         let command_id = required_str(input, "command_id")?;
+        owned_command(pool, conversation_id, &command_id).await?;
         let status = db::terminal_command_status(pool, &command_id)
             .await
             .map_err(|e| e.to_string())?
@@ -1887,8 +1918,9 @@ mod server {
     const DEFAULT_READ_LIMIT: i64 = 200;
     const MAX_READ_LIMIT: i64 = 500;
 
-    async fn read_terminal_output_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
+    async fn read_terminal_output_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
         let command_id = required_str(input, "command_id")?;
+        owned_command(pool, conversation_id, &command_id).await?;
         let stream = input
             .get("stream")
             .and_then(Value::as_str)
@@ -1927,8 +1959,9 @@ mod server {
     const DEFAULT_LIST_COMMANDS_LIMIT: i64 = 20;
     const MAX_LIST_COMMANDS_LIMIT: i64 = 50;
 
-    async fn list_commands_tool(pool: &PgPool, input: &Value) -> Result<String, String> {
+    async fn list_commands_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
         let terminal_id = required_i64(input, "terminal_id")?;
+        owned_terminal(pool, conversation_id, terminal_id).await?;
         let limit = input
             .get("limit")
             .and_then(Value::as_i64)
@@ -2544,6 +2577,51 @@ mod server {
             assert!(
                 message.contains("mutually exclusive"),
                 "expected a mutual-exclusivity error, got: {message}"
+            );
+        }
+
+        /// SME-51 B2: terminal and command ids are sequential or visible,
+        /// so each tool checks the terminal or command is the calling
+        /// conversation's before touching it.
+        #[sqlx::test]
+        async fn test_another_conversations_terminal_and_command_are_unknown(pool: sqlx::PgPool) {
+            let owner = db::create_conversation(&pool).await.expect("conversation");
+            let other = db::create_conversation(&pool).await.expect("conversation");
+            let pod = db::create_sandbox_pod(&pool, owner.id).await.expect("pod");
+            let terminal = db::create_sandbox_terminal(&pool, pod.id).await.expect("terminal");
+            db::create_terminal_command(&pool, owner.id, terminal.id, "cmd-b2", "ls")
+                .await
+                .expect("command");
+            let command = serde_json::json!({"command_id": "cmd-b2"});
+            let term = serde_json::json!({"terminal_id": terminal.id});
+
+            // The owner sees them.
+            execute(&pool, owner.id, "t1", "terminal_command_status", &command)
+                .await
+                .expect("the owner can read its command");
+            let listed = execute(&pool, owner.id, "t2", "list_commands", &term).await.expect("list");
+            assert!(listed.contains("cmd-b2"), "{listed}");
+
+            // Read-only ones first: they return data rather than reaching
+            // for a pod.
+            for (tool, input, unknown) in [
+                ("terminal_command_status", command.clone(), "unknown command id"),
+                ("read_terminal_output", command.clone(), "unknown command id"),
+                ("list_commands", term.clone(), "unknown terminal id"),
+                ("send_signal", serde_json::json!({"command_id": "cmd-b2", "signal": "INT"}), "unknown command id"),
+                ("run_terminal_command", serde_json::json!({"terminal_id": terminal.id, "command": "id"}), "unknown terminal id"),
+                ("terminate_terminal", term.clone(), "unknown terminal id"),
+            ] {
+                let result = execute(&pool, other.id, "t3", tool, &input).await;
+                assert!(
+                    result.as_ref().is_err_and(|e| e.contains(unknown)),
+                    "{tool} from another conversation: {result:?}"
+                );
+            }
+            assert_eq!(
+                db::list_terminal_commands(&pool, terminal.id, 10).await.expect("list").len(),
+                1,
+                "no command was recorded against the other conversation"
             );
         }
 
@@ -3455,6 +3533,47 @@ mod server {
             .await
             .expect("echo should succeed");
             assert!(result.contains("no stdin"), "got: {result}");
+        }
+
+        /// SME-51 B2: a task belongs to the conversation that started it;
+        /// every other conversation is told it doesn't exist.
+        #[tokio::test]
+        async fn test_another_conversations_task_is_unknown() {
+            let pool = test_pool();
+            let (owner, other) = (1100, 1101);
+            execute(
+                &pool,
+                owner,
+                "toolu_b2_task",
+                "run_async",
+                &serde_json::json!({"tool": "echo", "input": {"timeout_seconds": 30}}),
+            )
+            .await
+            .expect("run_async should succeed");
+            let id = serde_json::json!({"task_id": "toolu_b2_task"});
+            for (tool, input) in [
+                ("task_status", id.clone()),
+                ("task_stdout", id.clone()),
+                ("task_stderr", id.clone()),
+                ("task_result", id.clone()),
+                ("write_task_stdin", serde_json::json!({"task_id": "toolu_b2_task", "data": "x"})),
+                ("wait_task", serde_json::json!({"task_id": "toolu_b2_task", "timeout_seconds": 1})),
+                ("cancel_task", id.clone()),
+            ] {
+                let result = execute(&pool, other, "toolu_b2_probe", tool, &input).await;
+                assert!(
+                    result.as_ref().is_err_and(|e| e.contains("unknown task id")),
+                    "{tool} from another conversation: {result:?}"
+                );
+            }
+            assert!(!list_tasks(other).contains("toolu_b2_task"));
+            assert_eq!(
+                execute(&pool, owner, "toolu_b2_status", "task_status", &id).await,
+                Ok("running".to_string())
+            );
+            execute(&pool, owner, "toolu_b2_cancel", "cancel_task", &id)
+                .await
+                .expect("the owner can cancel it");
         }
 
         #[tokio::test]

@@ -52,6 +52,10 @@ pub enum ConversationEvent {
         /// that doesn't carry a line at all.
         stream: Option<String>,
         latest_output: Option<String>,
+        /// Where `latest_output` goes in its stream: the number of lines
+        /// before it. A tab that reconnects skips a line its snapshot
+        /// already has (SME-51 B3). `None` when there's no line.
+        position: Option<i64>,
     },
     /// A struct variant, not `MessagesAppended(Vec<Message>)`: this enum
     /// is internally tagged, and serde can't write a tuple variant holding
@@ -98,6 +102,10 @@ pub enum ConversationEvent {
         exit_code: Option<i32>,
         stream: Option<String>,
         latest_output: Option<String>,
+        /// The agent's `seq` for `latest_output`, one counter per command
+        /// across both streams. A tab that reconnects skips a line its
+        /// snapshot already has (SME-51 B3). `None` when there's no line.
+        position: Option<i64>,
     },
     /// Published when `api::chat::wake_conversation` (fired when a terminal
     /// command finishes, to notify the model with no further tool call
@@ -178,6 +186,9 @@ pub enum ConversationEvent {
     /// `api::chat::get_reply_in_progress`.
     ReplyDelta {
         text: String,
+        /// The reply's length in bytes before `text`, so a tab that
+        /// fetched the reply so far skips what it already has (SME-51 B3).
+        offset: usize,
     },
     /// A turn the user started by sending a message failed or was
     /// stopped (`message` is then `api::chat::TURN_STOPPED`). Turns
@@ -296,11 +307,11 @@ mod server {
             let conversation_id = 9_100_000_009;
             let mut rx = subscribe(conversation_id);
             for i in 0..500 {
-                publish(conversation_id, ConversationEvent::ReplyDelta { text: i.to_string() });
+                publish(conversation_id, ConversationEvent::ReplyDelta { text: i.to_string(), offset: 0 });
             }
             for i in 0..500 {
                 match rx.try_recv() {
-                    Ok(ConversationEvent::ReplyDelta { text }) => assert_eq!(text, i.to_string()),
+                    Ok(ConversationEvent::ReplyDelta { text, .. }) => assert_eq!(text, i.to_string()),
                     other => panic!("delta {i}: got {other:?}"),
                 }
             }
@@ -341,6 +352,7 @@ mod server {
                     status: "running".to_string(),
                     stream: None,
                     latest_output: None,
+                    position: None,
                 },
             );
             // No assertion beyond "doesn't panic" — there's nothing else to
@@ -356,6 +368,7 @@ mod server {
                 status: "running".to_string(),
                 stream: Some("stdout".to_string()),
                 latest_output: Some("count: 1/5".to_string()),
+                position: None,
             };
             publish(2, event.clone());
 
@@ -372,6 +385,7 @@ mod server {
                 status: "finished".to_string(),
                 stream: None,
                 latest_output: None,
+                position: None,
             };
             publish(3, event.clone());
 
@@ -388,6 +402,7 @@ mod server {
                 status: "finished".to_string(),
                 stream: None,
                 latest_output: None,
+                position: None,
             };
             publish(5, rx_b_event);
 
@@ -397,6 +412,7 @@ mod server {
                 status: "running".to_string(),
                 stream: None,
                 latest_output: None,
+                position: None,
             };
             publish(4, a_event.clone());
 
@@ -450,6 +466,7 @@ mod server {
                 exit_code: None,
                 stream: Some("stdout".to_string()),
                 latest_output: Some("hi".to_string()),
+                position: None,
             };
             publish(6, command_event.clone());
             assert_eq!(
@@ -523,7 +540,7 @@ mod wire_tests {
         vec![
             ConversationEvent::TurnError { message: "boom".to_string() },
             ConversationEvent::ReplyReset {},
-            ConversationEvent::ReplyDelta { text: "Hi".to_string() },
+            ConversationEvent::ReplyDelta { text: "Hi".to_string(), offset: 0 },
             ConversationEvent::TurnState { running: true },
             ConversationEvent::PodsChanged {},
             ConversationEvent::TurnsChanged {},
@@ -533,6 +550,7 @@ mod wire_tests {
                 status: "running".to_string(),
                 stream: Some("stdout".to_string()),
                 latest_output: Some("1".to_string()),
+                position: None,
             },
             ConversationEvent::MessagesAppended { messages: vec![Message {
                 id: 7,
@@ -577,6 +595,7 @@ mod wire_tests {
                 exit_code: None,
                 stream: None,
                 latest_output: None,
+                position: None,
             },
             ConversationEvent::NotificationDeliveryFailed {
                 detail: "boom".to_string(),

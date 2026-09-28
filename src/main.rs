@@ -24,6 +24,8 @@ mod models;
 #[cfg(feature = "server")]
 mod preview;
 #[cfg(feature = "server")]
+mod request_guard;
+#[cfg(feature = "server")]
 mod sandbox;
 #[cfg(feature = "server")]
 mod webfetch;
@@ -47,6 +49,9 @@ fn build_router() -> axum::Router {
             axum::routing::get(mcp_oauth::callback_handler),
         )
         .serve_dioxus_application(dioxus::prelude::ServeConfig::new(), frontend::App)
+        // No login, so another site's page mustn't be able to act as the
+        // user (SME-51 B1).
+        .layer(axum::middleware::from_fn(request_guard::guard))
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }
 
@@ -70,6 +75,13 @@ async fn main() {
         .init();
     if let Some(problem) = dotenv_problem {
         tracing::error!("{problem}");
+    }
+
+    if request_guard::allowed_hosts_from_env().is_empty() {
+        tracing::warn!(
+            "SMELT_ALLOWED_HOSTS is unset, so requests for any host name are served; set it to \
+             the names smelt is reached by to refuse DNS-rebinding requests"
+        );
     }
 
     let pool = db::init().await;
@@ -173,6 +185,33 @@ mod dotenv_tests {
     fn test_a_missing_env_file_is_fine() {
         let missing = std::env::temp_dir().join("smelt-no-such-dir/.env");
         assert_eq!(dotenv_problem(dotenvy::from_path(&missing).map(|_| missing.clone())), None);
+    }
+}
+
+/// SME-51 B1: the real router refuses another site's writes before any
+/// server function runs.
+#[cfg(all(test, feature = "server"))]
+mod request_guard_tests {
+    #[tokio::test]
+    async fn test_the_app_refuses_a_cross_site_post() {
+        // The router wants a public directory; a POST never reads it.
+        let public = std::env::temp_dir().join("smelt-request-guard-public");
+        std::fs::create_dir_all(&public).unwrap();
+        // SAFETY: only the browser tier sets this too, and it runs apart.
+        unsafe { std::env::set_var("DIOXUS_PUBLIC_PATH", &public) };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, super::build_router()).await.unwrap() });
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/api/conversations"))
+            .header("content-type", "text/plain")
+            .header("origin", "https://evil.example")
+            .header("sec-fetch-site", "cross-site")
+            .body("")
+            .send()
+            .await
+            .expect("a response, not a dropped connection");
+        assert_eq!(response.status(), 403);
     }
 }
 

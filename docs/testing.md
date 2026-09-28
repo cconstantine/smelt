@@ -205,6 +205,8 @@ dx serve --fullstack &                             # start the app (see setup.md
                                                      # goto/click/fill, .screenshot(path=...)
 ```
 
+For checks with a real model, start from `scripts/ui-check/smelt_ui.py`: a `Tab` wrapper that starts and deletes conversations, sends a message and waits for the turn to finish, reads the transcript and notices, and handles several things that each cost a rerun on SME-51. For example, a conversation page never reaches "network idle" (its event stream stays open), and the message box is an `<input>`. Its docstring has a complete example. Run it against `scripts/check-server`, not a `dx serve` in the working tree.
+
 Then view the screenshot (the `Read` tool renders images directly). This is a plain Python script per check, not a fixed CLI — see any recent UI-change conversation in this project for concrete examples (navigating to a conversation, clicking a sidebar entry, reading back `scrollTop`/`scrollHeight` via `page.eval_on_selector`, etc.).
 
 ### `scripts/browser-check/` (fallback)

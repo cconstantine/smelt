@@ -1819,6 +1819,11 @@ mod tests {
     }
 }
 
+/// SIGTERM's handler: `_exit` is safe to call from a signal handler.
+extern "C" fn exit_on_sigterm(_: nix::libc::c_int) {
+    unsafe { nix::libc::_exit(0) }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -1847,6 +1852,11 @@ async fn main() {
             .expect("reset SIGINT to default disposition");
         signal::signal(Signal::SIGQUIT, signal::SigHandler::SigDfl)
             .expect("reset SIGQUIT to default disposition");
+        // As PID 1 with no handler, SIGTERM would be ignored, and every
+        // deleted pod would wait out its whole grace period before being
+        // killed. The pod is going away: exit at once (SME-51 B6).
+        signal::signal(Signal::SIGTERM, signal::SigHandler::Handler(exit_on_sigterm))
+            .expect("handle SIGTERM");
     }
 
     let (tx, rx) = mpsc::unbounded_channel();

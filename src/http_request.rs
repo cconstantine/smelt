@@ -71,16 +71,21 @@ async fn request_with_guard(
     // no per-request hook to check a redirect target *before* connecting
     // to it, so redirects are followed manually here, one hop at a time,
     // re-running the SSRF guard against each target.
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
-
     let mut current_url = url.to_string();
     let mut current_method = method;
     for _ in 0..=MAX_REDIRECTS {
-        if !fetch_guard::is_request_allowed_with(&current_url, is_addr_allowed).await {
+        // Resolved once, and the client then connects only to those
+        // addresses: letting reqwest resolve the name again would let a
+        // DNS-rebinding name pass the check with one address and connect
+        // to another (SME-51 B4).
+        let checked = match fetch_guard::parse_fetch_target(&current_url) {
+            Ok((host, port)) => fetch_guard::resolve_allowed(&host, port, is_addr_allowed)
+                .await
+                .ok()
+                .map(|addrs| (host, addrs)),
+            Err(_) => None,
+        };
+        let Some((host, addrs)) = checked else {
             // localhost means the sandbox only in the browser tools (SME-42):
             // say so, rather than leave the model guessing.
             let sandbox_hint = fetch_guard::parse_fetch_target(&current_url)
@@ -94,7 +99,13 @@ async fn request_with_guard(
             } else {
                 format!("refusing to request {current_url}: not a safe address")
             });
-        }
+        };
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(REQUEST_TIMEOUT)
+            .resolve_to_addrs(&host, &addrs)
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
         let mut req = client.request(current_method.clone(), &current_url);
         for (name, value) in headers {
             req = req.header(name, value);
@@ -133,11 +144,27 @@ async fn request_with_guard(
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let text = resp
-            .text()
+        // Read only as far as the body is kept: a character is at most 4
+        // bytes, so past that everything would be cut anyway (SME-51 B8).
+        let limit = MAX_BODY_CHARS * 4;
+        let mut bytes = Vec::new();
+        let mut stopped_early = false;
+        let mut resp = resp;
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| format!("failed to read response body: {e}"))?;
-        let (body, truncated) = fetch_guard::truncate(text, MAX_BODY_CHARS);
+            .map_err(|e| format!("failed to read response body: {e}"))?
+        {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() >= limit {
+                bytes.truncate(limit);
+                stopped_early = true;
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let (body, cut) = fetch_guard::truncate(text, MAX_BODY_CHARS);
+        let truncated = cut || stopped_early;
         return Ok(HttpResponseResult {
             url: current_url,
             status,
@@ -205,6 +232,14 @@ mod tests {
                 }),
             )
             .route(
+                "/endless",
+                axum::routing::get(|| async {
+                    let chunk = axum::body::Bytes::from(vec![b'a'; 64 * 1024]);
+                    let stream = futures_util::stream::repeat_with(move || Ok::<_, std::io::Error>(chunk.clone()));
+                    axum::body::Body::from_stream(stream)
+                }),
+            )
+            .route(
                 "/not-found",
                 axum::routing::get(|| async { (axum::http::StatusCode::NOT_FOUND, "nope") }),
             )
@@ -222,6 +257,43 @@ mod tests {
             axum::serve(listener, router).await.expect("test server error");
         });
         (format!("http://127.0.0.1:{port}"), task)
+    }
+
+    /// SME-51 B4: the request goes to the address the guard checked. A
+    /// name the guard resolves (here, only through the test DNS) but the
+    /// system can't stands in for a DNS-rebinding name, which answers the
+    /// guard with a public address and the connection with a private one.
+    #[tokio::test]
+    async fn test_the_request_connects_to_the_address_that_was_checked() {
+        let (base, _server) = start_test_server().await;
+        let port = base.rsplit(':').next().unwrap();
+        fetch_guard::test_dns::set("rebind.smelt-test.invalid", vec!["127.0.0.1".parse().unwrap()]);
+        let result = request_with_guard(
+            "GET",
+            &format!("http://rebind.smelt-test.invalid:{port}/echo"),
+            &[],
+            None,
+            allow_loopback_too,
+        )
+        .await
+        .expect("the request should go to the checked address");
+        assert_eq!(result.body, "hello from the test server");
+    }
+
+    /// SME-51 B8: the body was read whole before being cut to size, so an
+    /// endless or huge response filled memory until the timeout.
+    #[tokio::test]
+    async fn test_an_endless_body_is_read_only_as_far_as_it_is_kept() {
+        let (base, _server) = start_test_server().await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            request_with_guard("GET", &format!("{base}/endless"), &[], None, allow_loopback_too),
+        )
+        .await
+        .expect("the request should stop reading once it has enough")
+        .expect("request");
+        assert!(result.truncated);
+        assert!(result.body.chars().count() <= MAX_BODY_CHARS + 200);
     }
 
     #[tokio::test]

@@ -98,6 +98,27 @@ pub struct GitIdentity {
     pub email: String,
 }
 
+/// A remote as the user wrote it, from its trust key: a local repo's
+/// `file/tmp/origin` reads as `file:///tmp/origin` (SME-51 B12). Hosted
+/// remotes' keys (`github.com/owner/repo`) already read well.
+pub fn remote_label(key: &str) -> String {
+    match key.strip_prefix("file/") {
+        Some(path) => format!("file:///{path}"),
+        None => key.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::remote_label;
+
+    #[test]
+    fn test_a_local_remote_reads_as_its_url() {
+        assert_eq!(remote_label("file/workspace/bbsrc"), "file:///workspace/bbsrc");
+        assert_eq!(remote_label("github.com/agentsmd/agents.md"), "github.com/agentsmd/agents.md");
+    }
+}
+
 #[cfg(feature = "server")]
 mod server {
     use super::{
@@ -1046,10 +1067,7 @@ mod server {
 
     /// The conversation's live pod, started if it has none.
     async fn ensure_sandbox(pool: &PgPool, conversation_id: i64) -> Result<i64, String> {
-        if let Ok(pod_id) = sandbox::live_pod_id(pool, conversation_id).await {
-            return Ok(pod_id);
-        }
-        sandbox::create_pod(pool, conversation_id, sandbox::PodLimitOverrides::default())
+        sandbox::start_or_get_pod(pool, conversation_id)
             .await
             .map_err(|e| format!("Couldn't start the sandbox: {e}"))
     }

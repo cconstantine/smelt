@@ -30,7 +30,7 @@ use crate::api::chat::{
 #[cfg(feature = "web")]
 use crate::api::chat::{
     get_context_usage, get_reply_in_progress, get_sandbox_state, get_tasks, get_todos,
-    get_turn_state, subscribe_conversation_events,
+    get_turn_error, get_turn_state, subscribe_conversation_events,
 };
 #[cfg(feature = "web")]
 use crate::api::browsing::{get_browsing_state, subscribe_browser_frames};
@@ -304,6 +304,26 @@ fn merge_task_snapshot(existing: &mut Vec<TaskPanelEntry>, snapshot: Vec<TaskSum
     }
 }
 
+/// Adds a streamed reply's `text`, which starts `offset` bytes in. A tab
+/// that connected mid-reply fetched the text so far and then receives the
+/// deltas published since it subscribed, some already in that text; only
+/// the part past what it has is added (SME-51 B3).
+#[cfg(any(feature = "web", test))]
+fn apply_reply_delta(reply: &mut Option<String>, offset: usize, text: &str) {
+    let current = reply.get_or_insert_with(String::new);
+    let have = current.len();
+    // At or past the end: new text. (Past it means something was missed;
+    // adding it still beats dropping it.)
+    if offset >= have {
+        current.push_str(text);
+        return;
+    }
+    let already = have - offset;
+    if already < text.len() && text.is_char_boundary(already) {
+        current.push_str(&text[already..]);
+    }
+}
+
 /// Applies one live `TaskUpdate` event onto the panel's current entries —
 /// same upsert shape as `merge_task_snapshot`, but appends a single new
 /// line rather than replacing the whole scrollback. A "just started"/
@@ -317,14 +337,22 @@ fn apply_task_update(
     status: String,
     stream: Option<String>,
     latest_output: Option<String>,
+    position: Option<i64>,
 ) {
     if let Some(entry) = existing.iter_mut().find(|e| e.task_id == task_id) {
         entry.tool = tool;
         entry.status = status;
-        match (stream.as_deref(), latest_output) {
-            (Some("stdout"), Some(line)) => entry.stdout.push(line),
-            (Some("stderr"), Some(line)) => entry.stderr.push(line),
-            _ => {}
+        let lines = match stream.as_deref() {
+            Some("stdout") => Some(&mut entry.stdout),
+            Some("stderr") => Some(&mut entry.stderr),
+            _ => None,
+        };
+        if let (Some(lines), Some(line)) = (lines, latest_output) {
+            // A line the snapshot already has (SME-51 B3).
+            let known = position.is_some_and(|p| (p as usize) < lines.len());
+            if !known {
+                lines.push(line);
+            }
         }
     } else {
         let (stdout, stderr) = match (stream.as_deref(), latest_output) {
@@ -360,6 +388,9 @@ struct SandboxPodPanelEntry {
 struct SandboxOutputLinePanelEntry {
     stream: String,
     data: String,
+    /// The agent's per-command `seq`, when known, so a reconnect doesn't
+    /// add a line twice (SME-51 B3).
+    seq: Option<i64>,
 }
 
 /// One command's widget state within a terminal's history. Unlike
@@ -427,6 +458,7 @@ fn merge_sandbox_snapshot(
                         .map(|line| SandboxOutputLinePanelEntry {
                             stream: line.stream,
                             data: line.data,
+                            seq: Some(line.seq),
                         })
                         .collect(),
                 })
@@ -533,12 +565,17 @@ fn apply_sandbox_command_update(
     exit_code: Option<i32>,
     stream: Option<String>,
     latest_output: Option<String>,
+    position: Option<i64>,
 ) {
     let Some(entry) = terminals.iter_mut().find(|t| t.terminal_id == terminal_id) else {
         return;
     };
 
     if let Some(command) = command {
+        // Already known from the snapshot (SME-51 B3).
+        if entry.commands.iter().any(|c| c.command_id == command_id) {
+            return;
+        }
         entry.commands.push(SandboxCommandPanelEntry {
             command_id,
             command,
@@ -555,9 +592,16 @@ fn apply_sandbox_command_update(
     current.status = status;
     current.exit_code = exit_code;
     if let (Some(stream), Some(data)) = (stream, latest_output) {
+        // A line the snapshot already has (SME-51 B3).
+        let last_seq = current.output.iter().filter_map(|l| l.seq).max();
+        if let (Some(seq), Some(last)) = (position, last_seq)
+            && seq <= last
+        {
+            return;
+        }
         current
             .output
-            .push(SandboxOutputLinePanelEntry { stream, data });
+            .push(SandboxOutputLinePanelEntry { stream, data, seq: position });
     }
 }
 
@@ -1117,6 +1161,9 @@ fn system_notice(text: &str, commands: &HashMap<String, String>) -> Option<Strin
             .map(|(reason, _)| format!(" ({reason})"))
             .unwrap_or_default();
         return Some(format!("The sandbox stopped unexpectedly{reason}; its terminals are gone"));
+    }
+    if text == crate::api::chat::STOP_NOTICE {
+        return Some("Stopped.".to_string());
     }
     if text.starts_with("The user stopped sandbox pod ") {
         return Some(
@@ -1727,6 +1774,54 @@ mod tests {
         assert_eq!(existing[1].task_id, "t2");
     }
 
+    /// SME-51 B3: a tab that reconnects mid-reply fetches the text so far,
+    /// then gets the deltas published since it subscribed. Some are
+    /// already in that text and mustn't be added twice.
+    #[test]
+    fn test_a_reconnect_adds_only_reply_text_it_doesnt_have() {
+        let mut reply = Some("one two ".to_string());
+        for (offset, text) in [(0, "one "), (4, "two "), (8, "three ")] {
+            apply_reply_delta(&mut reply, offset, text);
+        }
+        assert_eq!(reply.as_deref(), Some("one two three "));
+        // A delta that straddles the end of the fetched text.
+        let mut reply = Some("one tw".to_string());
+        apply_reply_delta(&mut reply, 4, "two ");
+        assert_eq!(reply.as_deref(), Some("one two "));
+        let mut reply = None;
+        apply_reply_delta(&mut reply, 0, "hi");
+        assert_eq!(reply.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn test_a_reconnect_adds_only_task_lines_it_doesnt_have() {
+        let mut existing = Vec::new();
+        for (i, line) in ["a", "b"].into_iter().enumerate() {
+            apply_task_update(&mut existing, "t1".to_string(), "count".to_string(), "running".to_string(), Some("stdout".to_string()), Some(line.to_string()), Some(i as i64));
+        }
+        // The snapshot had both; the stream replays "b", then sends "c".
+        apply_task_update(&mut existing, "t1".to_string(), "count".to_string(), "running".to_string(), Some("stdout".to_string()), Some("b".to_string()), Some(1));
+        apply_task_update(&mut existing, "t1".to_string(), "count".to_string(), "running".to_string(), Some("stdout".to_string()), Some("c".to_string()), Some(2));
+        assert_eq!(existing[0].stdout, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_a_reconnect_adds_only_commands_and_lines_it_doesnt_have() {
+        let mut terminals = vec![test_sandbox_terminal_entry(10, 1)];
+        terminals[0].commands.push(test_sandbox_command_entry("cmd-1", "echo"));
+        terminals[0].commands[0].output = vec![
+            SandboxOutputLinePanelEntry { stream: "stdout".into(), data: "one".into(), seq: Some(1) },
+            SandboxOutputLinePanelEntry { stream: "stdout".into(), data: "two".into(), seq: Some(2) },
+        ];
+        // Replayed: the command starting, and line 2.
+        apply_sandbox_command_update(&mut terminals, 10, "cmd-1".into(), Some("echo".into()), "running".into(), None, None, None, None);
+        apply_sandbox_command_update(&mut terminals, 10, "cmd-1".into(), None, "running".into(), None, Some("stdout".into()), Some("two".into()), Some(2));
+        apply_sandbox_command_update(&mut terminals, 10, "cmd-1".into(), None, "running".into(), None, Some("stdout".into()), Some("three".into()), Some(3));
+        assert_eq!(terminals[0].commands.len(), 1, "the command was added twice");
+        let data: Vec<_> = terminals[0].commands[0].output.iter().map(|l| l.data.as_str()).collect();
+        assert_eq!(data, vec!["one", "two", "three"]);
+    }
+
     #[test]
     fn test_apply_task_update_appends_to_stdout_when_stream_is_stdout() {
         let mut existing = Vec::new();
@@ -1736,7 +1831,7 @@ mod tests {
             "count".to_string(),
             "running".to_string(),
             Some("stdout".to_string()),
-            Some("count: 1/3".to_string()),
+            Some("count: 1/3".to_string()), None,
         );
         apply_task_update(
             &mut existing,
@@ -1744,7 +1839,7 @@ mod tests {
             "count".to_string(),
             "running".to_string(),
             Some("stdout".to_string()),
-            Some("count: 2/3".to_string()),
+            Some("count: 2/3".to_string()), None,
         );
         assert_eq!(existing.len(), 1);
         assert_eq!(
@@ -1764,7 +1859,7 @@ mod tests {
             "echo".to_string(),
             "running".to_string(),
             Some("stderr".to_string()),
-            Some("echo: received 5 byte(s) of input".to_string()),
+            Some("echo: received 5 byte(s) of input".to_string()), None,
         );
         assert_eq!(existing.len(), 1);
         assert!(existing[0].stdout.is_empty());
@@ -1784,7 +1879,7 @@ mod tests {
             "count".to_string(),
             "finished".to_string(),
             None,
-            None,
+            None, None,
         );
         assert_eq!(existing[0].status, "finished");
         assert_eq!(existing[0].stdout, vec!["count: 1/3".to_string()]);
@@ -1897,6 +1992,14 @@ mod tests {
         assert_eq!(format_elapsed(42), "42s");
         assert_eq!(format_elapsed(125), "2m 05s");
         assert_eq!(format_elapsed(3600), "60m 00s");
+    }
+
+    #[test]
+    fn test_a_stop_reads_as_stopped() {
+        assert_eq!(
+            system_notice(crate::api::chat::STOP_NOTICE, &HashMap::new()).as_deref(),
+            Some("Stopped.")
+        );
     }
 
     #[test]
@@ -2201,6 +2304,7 @@ mod tests {
         SandboxOutputLine {
             stream: stream.to_string(),
             data: data.to_string(),
+            seq: 0,
         }
     }
 
@@ -2208,6 +2312,7 @@ mod tests {
         SandboxOutputLinePanelEntry {
             stream: stream.to_string(),
             data: data.to_string(),
+            seq: None,
         }
     }
 
@@ -2453,7 +2558,7 @@ mod tests {
             "running".to_string(),
             None,
             None,
-            None,
+            None, None,
         );
 
         assert_eq!(
@@ -2492,7 +2597,7 @@ mod tests {
             "running".to_string(),
             None,
             Some("stdout".to_string()),
-            Some("hi".to_string()),
+            Some("hi".to_string()), None,
         );
 
         assert_eq!(
@@ -2521,7 +2626,7 @@ mod tests {
                 "running".to_string(),
                 None,
                 Some(stream.to_string()),
-                Some(data.to_string()),
+                Some(data.to_string()), None,
             );
         }
 
@@ -2552,7 +2657,7 @@ mod tests {
             "finished".to_string(),
             Some(0),
             None,
-            None,
+            None, None,
         );
 
         assert_eq!(terminals[0].commands[0].status, "finished");
@@ -2570,7 +2675,7 @@ mod tests {
             "running".to_string(),
             None,
             Some("stdout".to_string()),
-            Some("hi".to_string()),
+            Some("hi".to_string()), None,
         );
         assert!(
             terminals[0].commands.is_empty(),
@@ -2589,7 +2694,7 @@ mod tests {
             "running".to_string(),
             None,
             None,
-            None,
+            None, None,
         );
         assert!(terminals.is_empty());
     }
@@ -2874,11 +2979,16 @@ fn ChatPanel(
     });
     let stop = move |_| {
         let Some(id) = selected() else { return };
-        // Shown as "Stopped." where the reply would have been; the next
-        // send clears it.
-        stream_errors.write().insert(id, crate::api::chat::TURN_STOPPED.to_string());
+        // "Stopped." comes from the notice the stop saves, in every tab and
+        // after a reload (SME-51 B10); a stop that fails says so (B11).
         spawn(async move {
-            let _ = crate::api::chat::stop_turn(id).await;
+            if let Err(e) = crate::api::chat::stop_turn(id).await
+                && selected() == Some(id)
+            {
+                stream_errors
+                    .write()
+                    .insert(id, format!("Couldn't stop the turn: {}", server_error_message(&e)));
+            }
         });
     };
     // Set when a background wake-up (a terminal command finishing with no
@@ -2919,8 +3029,14 @@ fn ChatPanel(
     let mut request_pod_stop = move |pod_id: i64| {
         if pending_pod_stop() == Some(pod_id) {
             pending_pod_stop.set(None);
+            let conversation = selected();
             spawn(async move {
-                match crate::api::pods::stop_pod(pod_id).await {
+                let result = crate::api::pods::stop_pod(pod_id).await;
+                // Not onto another conversation's panel (SME-51 B11).
+                if selected() != conversation {
+                    return;
+                }
+                match result {
                     Ok(()) => pod_stop_error.set(None),
                     Err(e) => pod_stop_error.set(Some(server_error_message(&e))),
                 }
@@ -3086,6 +3202,16 @@ fn ChatPanel(
             turn_running.set(false);
             streaming_reply.set(None);
             context_usage.set(None);
+            // The rest of what belonged to the conversation left (SME-51 B11).
+            messages.set(Vec::new());
+            load_error.set(None);
+            turn_elapsed.set(0);
+            pending_pod_stop.set(None);
+            pod_stop_error.set(None);
+            context_detail.set(None);
+            context_detail_open.set(false);
+            address_pending.set(false);
+            address_draft.set(String::new());
 
             let handle = spawn(async move {
                 loop {
@@ -3124,6 +3250,11 @@ fn ChatPanel(
                         if let Ok(reply) = get_reply_in_progress(id).await {
                             streaming_reply.set(reply);
                         }
+                        // A turn that failed before this tab connected
+                        // (SME-51 B11).
+                        if let Ok(Some(error)) = get_turn_error(id).await {
+                            stream_errors.write().insert(id, error);
+                        }
                         // Kept last: the browser tests take this request
                         // completing as the sign the client is live.
                         if let Ok(state) = get_browsing_state(id).await {
@@ -3147,6 +3278,7 @@ fn ChatPanel(
                                     status,
                                     stream,
                                     latest_output,
+                                    position,
                                 })) => {
                                     apply_task_update(
                                         &mut tasks.write(),
@@ -3155,6 +3287,7 @@ fn ChatPanel(
                                         status,
                                         stream,
                                         latest_output,
+                                        position,
                                     );
                                 }
                                 Some(Ok(ConversationEvent::SandboxPodUpdate {
@@ -3195,6 +3328,7 @@ fn ChatPanel(
                                     exit_code,
                                     stream,
                                     latest_output,
+                                    position,
                                 })) => {
                                     apply_sandbox_command_update(
                                         &mut sandbox_terminals.write(),
@@ -3205,6 +3339,7 @@ fn ChatPanel(
                                         exit_code,
                                         stream,
                                         latest_output,
+                                        position,
                                     );
                                 }
                                 Some(Ok(ConversationEvent::NotificationDeliveryFailed {
@@ -3249,15 +3384,16 @@ fn ChatPanel(
                                 Some(Ok(ConversationEvent::ReplyReset {})) => {
                                     streaming_reply.set(Some(String::new()));
                                 }
-                                Some(Ok(ConversationEvent::ReplyDelta { text })) => {
-                                    streaming_reply
-                                        .write()
-                                        .get_or_insert_with(String::new)
-                                        .push_str(&text);
+                                Some(Ok(ConversationEvent::ReplyDelta { text, offset })) => {
+                                    apply_reply_delta(&mut streaming_reply.write(), offset, &text);
                                 }
-                                Some(Ok(ConversationEvent::TurnError { message })) => {
+                                // A stop shows as its saved notice instead.
+                                Some(Ok(ConversationEvent::TurnError { message }))
+                                    if message != crate::api::chat::TURN_STOPPED =>
+                                {
                                     stream_errors.write().insert(id, message);
                                 }
+                                Some(Ok(ConversationEvent::TurnError { .. })) => {}
                                 Some(Ok(ConversationEvent::ReposUpdate { repos: list })) => {
                                     repos.set(list);
                                 }
@@ -3327,8 +3463,12 @@ fn ChatPanel(
     let mut open_context_detail = move || {
         let Some(id) = selected() else { return };
         context_detail_open.set(true);
+        // Not the last snapshot, possibly another conversation's (SME-51 B11).
+        context_detail.set(None);
         spawn(async move {
-            if let Ok(detail) = get_context_detail(id).await {
+            if let Ok(detail) = get_context_detail(id).await
+                && selected() == Some(id)
+            {
                 context_detail.set(Some(detail));
             }
         });
@@ -3491,7 +3631,12 @@ fn ChatPanel(
                                             address_pending.set(true);
                                             address_error.set(None);
                                             spawn(async move {
-                                                match navigate_browser(id, address).await {
+                                                let result = navigate_browser(id, address).await;
+                                                // Not onto another conversation's bar (SME-51 B11).
+                                                if selected() != Some(id) {
+                                                    return;
+                                                }
+                                                match result {
                                                     Ok(()) => address_editing.set(false),
                                                     Err(e) => address_error.set(Some(server_error_message(&e))),
                                                 }
@@ -4038,11 +4183,7 @@ fn ChatPanel(
                                 }
                             }
                             if let Some(err) = stream_error() {
-                                if err == crate::api::chat::TURN_STOPPED {
-                                    p { class: "muted turn-stopped", "Stopped." }
-                                } else {
-                                    p { class: "error", "{err}" }
-                                }
+                                p { class: "error", "{err}" }
                             }
                             if let Some(err) = notification_delivery_error() {
                                 p { class: "error", "A background notification failed to reach the model: {err}" }

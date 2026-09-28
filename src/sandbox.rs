@@ -278,6 +278,23 @@ fn volume_mounts_for(volumes: &[db::SandboxVolume]) -> (Vec<Volume>, Vec<VolumeM
 /// matters in practice: a plain `sleep infinity` container doesn't trap
 /// `SIGTERM`, so a default-grace-period delete leaves the pod `Terminating`
 /// for the full grace period before it actually disappears.
+/// How long a deleted pod's containers get to stop. dockerd needs it to stop
+/// its containers (its own shutdown timeout is 15s), and until then
+/// Kubernetes keeps listing the pod, which is what lets the next `create_pod`
+/// wait for it rather than mount the Docker claim alongside a dockerd that's
+/// still writing to it (SME-51 B6).
+const POD_DELETE_GRACE_SECS: u32 = 20;
+
+/// Every delete of a sandbox pod smelt makes.
+fn pod_delete_params() -> DeleteParams {
+    DeleteParams {
+        grace_period_seconds: Some(POD_DELETE_GRACE_SECS),
+        ..Default::default()
+    }
+}
+
+/// Tests' own cleanup, which needs nothing to stop cleanly.
+#[cfg(test)]
 fn immediate_delete_params() -> DeleteParams {
     DeleteParams {
         grace_period_seconds: Some(0),
@@ -629,7 +646,7 @@ impl SandboxManager {
                 // pod name deterministically (as `sandbox_volume_pvc_name`
                 // does; see `test_terminal_lifecycle_end_to_end`'s own
                 // precheck) collides with it on every subsequent attempt.
-                pods.delete(&name, &immediate_delete_params()).await.ok();
+                pods.delete(&name, &pod_delete_params()).await.ok();
             }
             return Err(e);
         }
@@ -649,7 +666,7 @@ impl SandboxManager {
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn delete(&self, sandbox: Sandbox) -> Result<(), SandboxError> {
         let pods = pods_api(&self.client);
-        pods.delete(&sandbox.pod_name, &immediate_delete_params())
+        pods.delete(&sandbox.pod_name, &pod_delete_params())
             .await?;
         // Disarms Drop: safe to skip since none of Sandbox's fields have
         // meaningful Drop side effects of their own (a String, a
@@ -1259,7 +1276,7 @@ async fn drain_cleanup_queue(client: kube::Client, mut rx: mpsc::UnboundedReceiv
     while let Some(name) = rx.recv().await {
         match tokio::time::timeout(
             Duration::from_secs(30),
-            pods.delete(&name, &immediate_delete_params()),
+            pods.delete(&name, &pod_delete_params()),
         )
         .await
         {
@@ -1600,21 +1617,31 @@ fn decide_pod_death_reason(pod: Option<Pod>) -> Option<Option<String>> {
     let Some(pod) = pod else {
         return Some(None); // pod object gone entirely — confirmed dead, nothing left to inspect
     };
-    let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
-    if phase != Some("Failed") {
-        return None; // Running, Pending, or no status yet — inconclusive, not confirmed either way
+    let status = pod.status.as_ref();
+    // The sandbox container's status: by name, or the only one (tests'
+    // pods, and pods from before the Docker sidecar, have just it).
+    let sandbox = status.and_then(|s| s.container_statuses.as_ref()).and_then(|statuses| {
+        statuses
+            .iter()
+            .find(|cs| cs.name == "sandbox")
+            .or_else(|| statuses.first())
+    });
+    let current_end = sandbox
+        .and_then(|cs| cs.state.as_ref())
+        .and_then(|s| s.terminated.as_ref());
+    let phase = status.and_then(|s| s.phase.as_deref());
+    // Dead when the pod has failed, or when the sandbox container has
+    // ended while the Docker sidecar keeps the pod Running as dockerd
+    // shuts down (SME-51 B9). Anything else is inconclusive.
+    if phase != Some("Failed") && current_end.is_none() {
+        return None;
     }
 
-    let container_terminated_reason = pod
-        .status
-        .as_ref()
-        .and_then(|s| s.container_statuses.as_ref())
-        .and_then(|statuses| statuses.first())
-        .and_then(|cs| {
-            cs.state
-                .as_ref()
+    let container_terminated_reason = current_end
+        .or_else(|| {
+            sandbox
+                .and_then(|cs| cs.last_state.as_ref())
                 .and_then(|s| s.terminated.as_ref())
-                .or_else(|| cs.last_state.as_ref().and_then(|s| s.terminated.as_ref()))
         })
         .and_then(|t| t.reason.clone());
 
@@ -1655,6 +1682,73 @@ pub async fn create_pod(
     conversation_id: i64,
     limits: PodLimitOverrides,
 ) -> Result<i64, SandboxError> {
+    let pool = pool.clone();
+    run_pod_start(conversation_id, async move { create_pod_now(&pool, conversation_id, limits).await }).await
+}
+
+/// The conversation's running pod, starting one if it has none. Waits for
+/// a pod that's still starting rather than taking its record early
+/// (SME-51 B7).
+pub async fn start_or_get_pod(pool: &PgPool, conversation_id: i64) -> Result<i64, SandboxError> {
+    let pool = pool.clone();
+    run_pod_start(conversation_id, async move {
+        if let Ok(pod_id) = live_pod_id(&pool, conversation_id).await {
+            return Ok(pod_id);
+        }
+        create_pod_now(&pool, conversation_id, PodLimitOverrides::default()).await
+    })
+    .await
+}
+
+/// Runs `start` in a task of its own, holding the conversation's pod-start
+/// lock (SME-51 B7). Its own task: a Stop drops the turn that asked for the
+/// pod, and a start cut off partway would leave a record with no pod, or a
+/// pod never given its git setup. The lock makes a second start wait for
+/// the first.
+async fn run_pod_start<F>(conversation_id: i64, start: F) -> Result<i64, SandboxError>
+where
+    F: std::future::Future<Output = Result<i64, SandboxError>> + Send + 'static,
+{
+    let lock = pod_start_lock(conversation_id);
+    tokio::spawn(async move {
+        let _starting = lock.lock().await;
+        start.await
+    })
+    .await
+    .unwrap_or_else(|e| Err(SandboxError::StartFailed(format!("starting the sandbox failed: {e}"))))
+}
+
+/// After a failed pod start: if the conversation was deleted meanwhile,
+/// removes what the start may have re-created after the delete's teardown
+/// ran, its claims (SME-51 code review 1). `label_id` is the conversation
+/// id its pods and claims are labelled with (the same, outside tests).
+async fn clean_up_after_failed_start(pool: &PgPool, client: &kube::Client, conversation_id: i64, label_id: i64) {
+    if !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
+        teardown_conversation_with(client, label_id).await;
+    }
+}
+
+/// `create_pod_attempt`, cleaning up after a failure for a conversation
+/// deleted while it ran.
+async fn create_pod_now(
+    pool: &PgPool,
+    conversation_id: i64,
+    limits: PodLimitOverrides,
+) -> Result<i64, SandboxError> {
+    let result = create_pod_attempt(pool, conversation_id, limits).await;
+    // Only a deleted conversation needs the cluster touched; a refused
+    // start for a live one (a pod already exists, say) doesn't.
+    if result.is_err() && !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
+        clean_up_after_failed_start(pool, &get().client, conversation_id, conversation_id).await;
+    }
+    result
+}
+
+async fn create_pod_attempt(
+    pool: &PgPool,
+    conversation_id: i64,
+    limits: PodLimitOverrides,
+) -> Result<i64, SandboxError> {
     let existing = db::list_sandbox_pods(pool, conversation_id)
         .await
         .map_err(SandboxError::Db)?;
@@ -1663,9 +1757,14 @@ pub async fn create_pod(
     let (memory, cpu, docker) = limits.resolve(conversation_id);
 
     let manager = get();
-    let row = db::create_sandbox_pod(pool, conversation_id)
-        .await
-        .map_err(SandboxError::Db)?;
+    // The database's own one-live-pod rule backs up the check above.
+    let row = db::create_sandbox_pod(pool, conversation_id).await.map_err(|e| {
+        if e.as_database_error().is_some_and(|d| d.is_unique_violation()) {
+            SandboxError::PodAlreadyExists
+        } else {
+            SandboxError::Db(e)
+        }
+    })?;
     let volumes = db::list_sandbox_volumes(pool)
         .await
         .map_err(SandboxError::Db)?;
@@ -1702,6 +1801,14 @@ pub async fn create_pod(
                 return Err(SandboxError::GitSetup(e));
             }
             std::mem::forget(sandbox);
+            // The conversation may have been deleted while this pod was
+            // starting; its teardown had nothing to find yet (SME-51 B5).
+            if !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
+                teardown_conversation_with(&manager.client, conversation_id).await;
+                return Err(SandboxError::StartFailed(
+                    "the conversation was deleted while its sandbox was starting".to_string(),
+                ));
+            }
             events::publish(
                 conversation_id,
                 events::ConversationEvent::SandboxPodUpdate {
@@ -1718,6 +1825,18 @@ pub async fn create_pod(
             Err(e)
         }
     }
+}
+
+/// Each conversation's "a pod is being started" lock (SME-51 B7).
+fn pod_start_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: LazyLock<StdMutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> =
+        LazyLock::new(Default::default);
+    LOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(conversation_id)
+        .or_default()
+        .clone()
 }
 
 /// Refuses the ports in a pod no route may reach: the sandbox agent's
@@ -1878,6 +1997,9 @@ pub async fn pod_port_is_listening(
 
 const LISTEN_PROBE: Duration = Duration::from_millis(500);
 
+/// How long opening the port-forward for the probe may take (SME-51 B8).
+const LISTEN_OPEN_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(1) } else { Duration::from_secs(10) };
+
 async fn pod_port_is_listening_with(
     pool: &PgPool,
     conversation_id: i64,
@@ -1885,8 +2007,14 @@ async fn pod_port_is_listening_with(
     port: u16,
     client: impl FnOnce() -> kube::Client,
 ) -> Result<bool, TerminalError> {
-    let stream = open_pod_port_with(pool, conversation_id, host, port, client).await?;
-    Ok(stream_is_listening(stream).await)
+    // A port-forward that doesn't open in time says as much as one that's
+    // refused: nothing is serving there yet (SME-51 B8).
+    let Ok(opened) =
+        tokio::time::timeout(LISTEN_OPEN_TIMEOUT, open_pod_port_with(pool, conversation_id, host, port, client)).await
+    else {
+        return Ok(false);
+    };
+    Ok(stream_is_listening(opened?).await)
 }
 
 /// `pod_port_is_listening`'s judgement of a freshly opened stream.
@@ -1946,7 +2074,7 @@ async fn force_terminate_pod(
     let name = pod_name(pod_id);
     let pods = pods_api(&manager.client);
     if pods.get_opt(&name).await?.is_some() {
-        pods.delete(&name, &immediate_delete_params()).await?;
+        pods.delete(&name, &pod_delete_params()).await?;
     }
 
     let row = db::terminate_sandbox_pod(pool, pod_id)
@@ -2296,23 +2424,33 @@ pub(crate) async fn pod_exists(pod_id: i64) -> bool {
     )
 }
 
-pub async fn teardown_conversation(pool: &PgPool, conversation_id: i64) {
-    let manager = get();
-    let pods = pods_api(&manager.client);
-    let rows = db::list_sandbox_pods(pool, conversation_id)
-        .await
-        .unwrap_or_default();
-    for row in rows {
-        deregister(row.id);
-        let name = pod_name(row.id);
-        if let Ok(Some(_)) = pods.get_opt(&name).await {
-            if let Err(e) = pods.delete(&name, &immediate_delete_params()).await {
-                tracing::warn!(pod = %name, error = %e, "failed to delete pod during conversation teardown");
+pub async fn teardown_conversation(conversation_id: i64) {
+    teardown_conversation_with(&get().client, conversation_id).await;
+}
+
+/// `teardown_conversation` on `client`. Pods are found by their
+/// conversation label, not by their records: a `create_pod` racing the
+/// conversation's deletion makes a pod whose record the delete then
+/// cascades away (SME-51 B5).
+async fn teardown_conversation_with(client: &kube::Client, conversation_id: i64) {
+    let pods = pods_api(client);
+    let selector = ListParams::default().labels(&format!("{CONVERSATION_LABEL}={conversation_id}"));
+    match pods.list(&selector).await {
+        Ok(list) => {
+            for pod in list {
+                if let Some(pod_id) = watched_pod_id(&pod) {
+                    deregister(pod_id);
+                }
+                let Some(name) = pod.metadata.name else { continue };
+                if let Err(e) = pods.delete(&name, &pod_delete_params()).await {
+                    tracing::warn!(pod = %name, error = %e, "failed to delete pod during conversation teardown");
+                }
             }
         }
+        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't list a deleted conversation's pods"),
     }
     // After the pods: Kubernetes holds a claim until no pod mounts it.
-    delete_conversation_pvcs(&manager.client, conversation_id).await;
+    delete_conversation_pvcs(client, conversation_id).await;
 }
 
 /// Returns the existing registry entry for `pod_id` if there is one;
@@ -3171,6 +3309,7 @@ async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, tex
                             exit_code: Some(code),
                             stream: None,
                             latest_output: None,
+                            position: None,
                         },
                     );
                 }
@@ -3308,6 +3447,7 @@ async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, tex
                     exit_code: None,
                     stream: Some(stream),
                     latest_output: Some(data),
+                    position: Some(seq),
                 },
             );
         }
@@ -3957,6 +4097,34 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    /// SME-51 B9: since the Docker sidecar (SME-33) the pod stays Running
+    /// after the sandbox container is killed, while dockerd shuts down. The
+    /// sandbox container's own end is the death, with its reason.
+    #[test]
+    fn test_decide_pod_death_reason_sandbox_container_ended_while_the_sidecar_runs() {
+        let pod = Pod {
+            status: Some(PodStatus {
+                phase: Some("Running".to_string()),
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "sandbox".to_string(),
+                    state: Some(terminated(Some("OOMKilled"))),
+                    ..Default::default()
+                }]),
+                init_container_statuses: Some(vec![ContainerStatus {
+                    name: "docker".to_string(),
+                    state: Some(ContainerState {
+                        running: Some(Default::default()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(decide_pod_death_reason(Some(pod)), Some(Some("OOMKilled".to_string())));
     }
 
     #[test]
@@ -4915,9 +5083,13 @@ mod tests {
         let name = sandbox.pod_name.clone();
         std::mem::forget(sandbox);
 
-        pods.delete(&name, &DeleteParams { grace_period_seconds: Some(5), ..Default::default() })
+        // The same delete production makes (SME-51 B6): a forced one (grace
+        // 0) removes the pod object at once while dockerd is still
+        // stopping, and the wait below would see nothing to wait for.
+        pods.delete(&name, &pod_delete_params())
             .await
             .expect("start deleting the pod");
+        let listed_while_stopping = pods.get_opt(&name).await.expect("get pod").is_some();
         let waited =
             wait_for_conversation_pods_gone(&client, conversation_id, Duration::from_secs(60)).await;
         let still_there = pods.get_opt(&name).await.expect("get pod").is_some();
@@ -4928,8 +5100,114 @@ mod tests {
         }
         pvc_api(&client).delete(&docker_pvc_name(conversation_id), &DeleteParams::default()).await.ok();
 
+        assert!(listed_while_stopping, "the delete removed {name} before its containers stopped");
         assert!(waited.is_ok(), "the wait should finish once the pod is gone: {waited:?}");
         assert!(!still_there, "the wait returned while {name} was still stopping");
+    }
+
+    /// SME-51 B8: the listening probe (`sandbox_preview_url`) waited as
+    /// long as the Kubernetes client would for a port-forward to open,
+    /// minutes when the API server hangs, holding the turn.
+    #[sqlx::test]
+    async fn test_the_listening_probe_gives_up_on_a_hanging_cluster(pool: PgPool) {
+        let conversation = db::create_conversation(&pool).await.expect("conversation");
+        db::create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+        // An "API server" that accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = kube::Config::new(format!("http://{addr}").parse().expect("url"));
+        let client = kube::Client::try_from(config).expect("client");
+        let probed = tokio::time::timeout(
+            LISTEN_OPEN_TIMEOUT + Duration::from_secs(5),
+            pod_port_is_listening_with(&pool, conversation.id, PodHost::Localhost, 8000, || client),
+        )
+        .await;
+        assert!(matches!(probed, Ok(Ok(false))), "the probe should give up and say nothing's listening: {probed:?}");
+    }
+
+    /// SME-51 code review 1: a pod start that fails after its conversation
+    /// was deleted may have re-created the conversation's claims after the
+    /// delete's teardown ran; they're removed. A live conversation's stay.
+    #[sqlx::test]
+    async fn test_a_failed_start_for_a_deleted_conversation_leaves_no_claims(pool: PgPool) {
+        let client = test_client().await;
+        let pvcs = pvc_api(&client);
+        let deleted = db::create_conversation(&pool).await.expect("conversation");
+        let live = db::create_conversation(&pool).await.expect("conversation");
+        // Ids from a fresh test database are tiny; offset them away from
+        // other runs' claims in the shared test namespace.
+        let offset = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64 + 2_000_000_000;
+        db::delete_conversation(&pool, deleted.id).await.expect("delete");
+        for id in [deleted.id, live.id] {
+            ensure_conversation_pvcs(&client, id + offset).await.expect("claims");
+        }
+
+        clean_up_after_failed_start(&pool, &client, deleted.id, deleted.id + offset).await;
+        clean_up_after_failed_start(&pool, &client, live.id, live.id + offset).await;
+
+        let gone = pvcs.get_opt(&docker_pvc_name(deleted.id + offset)).await.expect("get").is_none_or(|p| p.metadata.deletion_timestamp.is_some());
+        let kept = pvcs.get_opt(&docker_pvc_name(live.id + offset)).await.expect("get").is_some();
+        delete_conversation_pvcs(&client, live.id + offset).await;
+        delete_conversation_pvcs(&client, deleted.id + offset).await;
+        assert!(gone, "the deleted conversation's re-created claim was left behind");
+        assert!(kept, "a live conversation's claims must stay");
+    }
+
+    /// SME-51 B7: "Work on a repo" while the sandbox is still starting
+    /// waits for it, rather than taking the half-made pod's record and
+    /// cloning into a pod that isn't running.
+    #[sqlx::test]
+    async fn test_start_or_get_pod_waits_for_a_pod_still_starting(pool: PgPool) {
+        let conversation = db::create_conversation(&pool).await.expect("conversation");
+        // A pod being made: its record exists, and its start holds the lock.
+        let row = db::create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+        let starting = pod_start_lock(conversation.id);
+        let guard = starting.lock().await;
+        let early = tokio::time::timeout(Duration::from_millis(300), start_or_get_pod(&pool, conversation.id)).await;
+        assert!(early.is_err(), "it took the pod before it had started");
+        drop(guard);
+        let pod = start_or_get_pod(&pool, conversation.id).await.expect("the started pod");
+        assert_eq!(pod, row.id);
+    }
+
+    /// SME-51 B5: deleting a conversation removes every pod labelled with
+    /// it, including one whose record is already gone. That's what a
+    /// `create_pod` racing the delete leaves: its row cascades away with
+    /// the conversation, and a teardown that listed rows missed the pod.
+    #[tokio::test]
+    async fn test_teardown_deletes_a_conversations_pod_that_has_no_record() {
+        let client = test_client().await;
+        let pods = pods_api(&client);
+        let conversation_id = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64
+            + 1_000_000_000;
+        // Only the label matters, so the pod never needs to start: an image
+        // that doesn't exist keeps it Pending and costs the cluster nothing.
+        let name = format!("sandbox-{conversation_id}");
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": name, "labels": {CONVERSATION_LABEL: conversation_id.to_string()}},
+            "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
+        }))
+        .expect("pod");
+        pods.create(&PostParams::default(), &pod).await.expect("create pod");
+
+        teardown_conversation_with(&client, conversation_id).await;
+        let gone = tokio::time::timeout(Duration::from_secs(60), async {
+            while pods.get_opt(&name).await.ok().flatten().is_some() {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .is_ok();
+
+        pods.delete(&name, &immediate_delete_params()).await.ok();
+        assert!(gone, "{name} survived its conversation's teardown");
     }
 
     /// A conversation's Docker claim is created once and reused, and
@@ -6037,8 +6315,13 @@ mod tests {
                 "should give up as NoTerminal once reconnect attempts are exhausted, got {:?}",
                 gave_up.is_ok()
             );
-            let pod_g_gone = pods_api(&client).get_opt(&pod_name(pod_g)).await.expect("get_opt");
-            assert!(pod_g_gone.is_none(), "exhausting reconnect attempts should force-terminate the k8s pod");
+            // Deleted, though this agentless pod's `sleep` may take its grace
+            // period to stop (SME-51 B6).
+            let pod_g_now = pods_api(&client).get_opt(&pod_name(pod_g)).await.expect("get_opt");
+            assert!(
+                pod_g_now.is_none_or(|p| p.metadata.deletion_timestamp.is_some()),
+                "exhausting reconnect attempts should delete the k8s pod"
+            );
             let recreated = create_pod(&pool, conversation_g.id, PodLimitOverrides::default()).await;
             assert!(
                 recreated.is_ok(),
@@ -6099,7 +6382,7 @@ mod tests {
                 .map(|c| c.claim_name);
             assert_eq!(mounted_workspace.as_deref(), Some(workspace_claim.as_str()), "pod j's /workspace is its conversation's claim");
 
-            teardown_conversation(&pool, conversation_j.id).await;
+            teardown_conversation(conversation_j.id).await;
             // The claim's `pvc-protection` finalizer holds it until the pod
             // is really gone.
             let docker_claim_gone = tokio::time::timeout(Duration::from_secs(60), async {
@@ -6116,6 +6399,31 @@ mod tests {
             })
             .await;
             assert!(workspace_claim_gone.is_ok(), "teardown_conversation should delete the workspace claim");
+
+            // --- SME-51 B7: a create_pod whose caller goes away (a Stop
+            // drops the turn mid-call) still finishes: the pod gets its git
+            // setup and is announced Running, rather than being left with
+            // whatever step it had reached. ---
+            let conversation_k = db::create_conversation(&pool).await.expect("create conversation k");
+            let mut events_k = events::subscribe(conversation_k.id);
+            let dropped = tokio::time::timeout(
+                Duration::from_secs(2),
+                create_pod(&pool, conversation_k.id, PodLimitOverrides::default()),
+            )
+            .await;
+            assert!(dropped.is_err(), "the create should still be under way after 2s");
+            let announced = tokio::time::timeout(Duration::from_secs(90), async {
+                loop {
+                    if let Ok(events::ConversationEvent::SandboxPodUpdate { status, .. }) = events_k.recv().await
+                        && status == "Running"
+                    {
+                        return;
+                    }
+                }
+            })
+            .await;
+            teardown_conversation(conversation_k.id).await;
+            assert!(announced.is_ok(), "a create_pod whose caller went away never finished");
 
             // --- Generic volumes: create_volume/delete_volume manage a
             // real PVC alongside the sandbox_volumes row, and a volume
@@ -6692,15 +7000,16 @@ mod tests {
             .await
             .expect("delete should succeed");
 
+        // Pods are deleted with a grace period (SME-51 B6), and the agent
+        // exits on SIGTERM, so the pod goes well within it.
         let pods = pods_api(&client);
-        let still_there = pods
-            .get_opt(&pod_name)
-            .await
-            .expect("get_opt should not error");
-        assert!(
-            still_there.is_none(),
-            "pod should be gone immediately after manager.delete returns Ok"
-        );
+        let gone = tokio::time::timeout(Duration::from_secs(10), async {
+            while pods.get_opt(&pod_name).await.expect("get_opt should not error").is_some() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await;
+        assert!(gone.is_ok(), "the pod should stop within seconds of manager.delete, not wait out its grace");
     }
 
     #[tokio::test]

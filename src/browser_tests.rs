@@ -1688,6 +1688,38 @@ async fn test_end_to_end_browser_scenarios() {
             "Browser tier rule: always run the linter.\n"
         );
         trust_page.close().await.expect("close the trust tab");
+
+        // --- SME-51 B11: switching conversations resets what belonged to
+        // the one left: its context detail view doesn't stay open over the
+        // next conversation. ---
+        let leaving = new_conversation(pool, &created).await;
+        let arriving = new_conversation(pool, &created).await;
+        db::create_message(pool, leaving.id, "user", &[anthropic::ContentBlock::Text { text: "hello".to_string() }])
+            .await
+            .expect("seed a message");
+        db::upsert_conversation_usage(
+            pool,
+            leaving.id,
+            &anthropic::TokenUsage { input_tokens: 1_000, output_tokens: 100, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        )
+        .await
+        .expect("seed usage");
+        let switching = harness
+            .browser
+            .new_page(&format!("{}conversation/{}", harness.base_url, leaving.id))
+            .await
+            .expect("open the first conversation");
+        click_when_present(&switching, ".context-usage-bar", Duration::from_secs(10)).await;
+        assert!(
+            wait_for_count(&switching, ".context-detail-overlay", 1, Duration::from_secs(5)).await,
+            "the context detail should open"
+        );
+        click_conversation(&switching, arriving.id).await;
+        assert!(
+            wait_for_count(&switching, ".context-detail-overlay", 0, Duration::from_secs(5)).await,
+            "the first conversation's context detail stayed open after switching"
+        );
+        switching.close().await.expect("close the switching tab");
         page.close().await.expect("close the tab");
     })))
     .await;
@@ -1735,7 +1767,7 @@ async fn sandbox_pod_ids(pool: &sqlx::PgPool, conversations: &[i64]) -> Vec<i64>
 /// terminals and so on go with it).
 async fn remove_conversations(pool: &sqlx::PgPool, conversations: &[i64]) {
     for &conversation in conversations {
-        sandbox::teardown_conversation(pool, conversation).await;
+        sandbox::teardown_conversation(conversation).await;
         if let Err(e) = db::delete_conversation(pool, conversation).await {
             eprintln!("failed to delete test conversation {conversation}: {e}");
         }

@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# A check server for hands-on checks: `dx serve` from a separate git worktree,
+# so saving a file in the working tree doesn't rebuild and restart it
+# (development-process.md, "Run hands-on checks against a server that doesn't
+# watch the files you're editing").
+#
+#   scripts/check-server start [REF] [-- KEY=VALUE ...]   build and serve REF (default: HEAD)
+#   scripts/check-server stop                             stop it, and everything it started
+#   scripts/check-server status
+#
+# KEY=VALUE pairs override the environment for this server only, e.g.
+# `-- ANTHROPIC_CONTEXT_WINDOW=28000` to make compaction happen quickly. They
+# win over .env, which never overrides a variable that's already set.
+#
+# Settings (environment):
+#   CHECK_WORKTREE  the worktree (default: ../smelt-check next to this repo)
+#   CHECK_PORT      the app's port (default: 8081; the dev server uses 8080)
+#
+# `dx serve` runs its server as a child process, so stopping only the `dx`
+# process leaves the server running (SME-51). This starts `dx` in a process
+# group of its own and stops the whole group.
+set -euo pipefail
+
+repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+worktree=${CHECK_WORKTREE:-$repo/../smelt-check}
+port=${CHECK_PORT:-8081}
+pid_file() { echo "$worktree/.check-server.pid"; }
+log_file() { echo "$worktree/.check-server.log"; }
+
+running_pgid() {
+    local file
+    file=$(pid_file)
+    [ -f "$file" ] || return 1
+    local pgid
+    pgid=$(cat "$file")
+    # Still ours if a process in that group is still alive.
+    pgrep -g "$pgid" >/dev/null 2>&1 || return 1
+    echo "$pgid"
+}
+
+stop() {
+    local pgid
+    if ! pgid=$(running_pgid); then
+        echo "no check server running"
+        rm -f "$(pid_file)"
+        return 0
+    fi
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        pgrep -g "$pgid" >/dev/null 2>&1 || break
+        sleep 0.5
+    done
+    if pgrep -g "$pgid" >/dev/null 2>&1; then
+        kill -KILL -- "-$pgid" 2>/dev/null || true
+    fi
+    rm -f "$(pid_file)"
+    echo "stopped the check server (process group $pgid)"
+}
+
+start() {
+    local ref=HEAD
+    if [ $# -gt 0 ] && [ "$1" != "--" ]; then
+        ref=$1
+        shift
+    fi
+    [ "${1:-}" = "--" ] && shift
+    local overrides=("$@")
+
+    if running_pgid >/dev/null; then
+        echo "a check server is already running; scripts/check-server stop first" >&2
+        exit 1
+    fi
+
+    local commit
+    commit=$(git -C "$repo" rev-parse --verify "$ref^{commit}")
+    if [ -d "$worktree" ]; then
+        git -C "$worktree" checkout -q --detach "$commit"
+    else
+        git -C "$repo" worktree add -q --detach "$worktree" "$commit"
+    fi
+    # The dev .env (never printed), and headless Chrome for webfetch and
+    # browsing sessions: headless_chrome.rs finds it under the checkout it
+    # was built from, and a fresh worktree has none (SME-51).
+    [ -f "$worktree/.env" ] || { [ -f "$repo/.env" ] && cp "$repo/.env" "$worktree/.env"; }
+    if [ ! -e "$worktree/.browser-check-cache" ] && [ -d "$repo/.browser-check-cache" ]; then
+        ln -s "$repo/.browser-check-cache" "$worktree/.browser-check-cache"
+    fi
+
+    : >"$(log_file)"
+    (
+        cd "$worktree"
+        exec setsid env "${overrides[@]}" dx serve --fullstack --addr 0.0.0.0 --port "$port" \
+            >"$(log_file)" 2>&1 </dev/null
+    ) &
+    # setsid made the child a group leader: its pid is the group's id.
+    local pgid=$!
+    echo "$pgid" >"$(pid_file)"
+    echo "building $(git -C "$worktree" log --oneline -1) (log: $(log_file))"
+
+    for _ in $(seq 1 360); do
+        if ! pgrep -g "$pgid" >/dev/null 2>&1; then
+            echo "dx serve exited; see $(log_file)" >&2
+            exit 1
+        fi
+        if curl -s -o /dev/null "http://localhost:$port/"; then
+            echo "check server up at http://localhost:$port/"
+            return 0
+        fi
+        sleep 2
+    done
+    echo "not up after 12 minutes; see $(log_file)" >&2
+    exit 1
+}
+
+case "${1:-}" in
+    start) shift; start "$@" ;;
+    stop) stop ;;
+    status)
+        if pgid=$(running_pgid); then
+            echo "running (process group $pgid) at http://localhost:$port/, $(git -C "$worktree" log --oneline -1)"
+        else
+            echo "not running"
+        fi
+        ;;
+    *)
+        sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+        exit 2
+        ;;
+esac
