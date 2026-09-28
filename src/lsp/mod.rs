@@ -3,3 +3,4 @@
 //! `pods/exec` stream.
 
 pub mod client;
+pub mod config;

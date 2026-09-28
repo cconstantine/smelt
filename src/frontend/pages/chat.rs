@@ -2728,6 +2728,9 @@ pub fn Chat() -> Element {
         Route::SandboxVolumesRoute {} => None,
         Route::PodsRoute {} => None,
         Route::GitRoute {} => None,
+        Route::LanguageServersRoute {} => None,
+        Route::LanguageServerNewRoute {} => None,
+        Route::LanguageServerEditRoute { .. } => None,
         Route::SandboxVolumeNewRoute {} => None,
         Route::NotFound { .. } => None,
     });
@@ -2869,6 +2872,7 @@ fn ConversationSidebar(
             Link { to: Route::PodsRoute {}, class: "pods-link", "Sandboxes" }
             Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
             Link { to: Route::GitRoute {}, class: "sandbox-volumes-link git-link", "Git" }
+            Link { to: Route::LanguageServersRoute {}, class: "sandbox-volumes-link language-servers-link", "Language servers" }
             if let Some(err) = error() {
                 p { class: "error", "{err}" }
             }
