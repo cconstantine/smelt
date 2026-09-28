@@ -171,6 +171,16 @@ pub async fn get_conversation_usage(
     .await
 }
 
+/// Forgets `conversation_id`'s last known usage, after a compaction made
+/// it describe a history that's no longer sent (SME-51 B10).
+pub async fn clear_conversation_usage(pool: &PgPool, conversation_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM conversation_context_usage WHERE conversation_id = $1")
+        .bind(conversation_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Overwrites `conversation_id`'s usage row with `usage` — "last known
 /// only," not a history, so this is always a full replace, not an
 /// accumulation.

@@ -1162,6 +1162,9 @@ fn system_notice(text: &str, commands: &HashMap<String, String>) -> Option<Strin
             .unwrap_or_default();
         return Some(format!("The sandbox stopped unexpectedly{reason}; its terminals are gone"));
     }
+    if text == crate::api::chat::STOP_NOTICE {
+        return Some("Stopped.".to_string());
+    }
     if text.starts_with("The user stopped sandbox pod ") {
         return Some(
             "You stopped the sandbox; its terminals are gone, and /workspace is kept".to_string(),
@@ -1989,6 +1992,14 @@ mod tests {
         assert_eq!(format_elapsed(42), "42s");
         assert_eq!(format_elapsed(125), "2m 05s");
         assert_eq!(format_elapsed(3600), "60m 00s");
+    }
+
+    #[test]
+    fn test_a_stop_reads_as_stopped() {
+        assert_eq!(
+            system_notice(crate::api::chat::STOP_NOTICE, &HashMap::new()).as_deref(),
+            Some("Stopped.")
+        );
     }
 
     #[test]
@@ -2968,9 +2979,8 @@ fn ChatPanel(
     });
     let stop = move |_| {
         let Some(id) = selected() else { return };
-        // Shown as "Stopped." where the reply would have been; the next
-        // send clears it.
-        stream_errors.write().insert(id, crate::api::chat::TURN_STOPPED.to_string());
+        // "Stopped." comes from the notice the stop saves, in every tab and
+        // after a reload (SME-51 B10).
         spawn(async move {
             let _ = crate::api::chat::stop_turn(id).await;
         });
@@ -3350,9 +3360,13 @@ fn ChatPanel(
                                 Some(Ok(ConversationEvent::ReplyDelta { text, offset })) => {
                                     apply_reply_delta(&mut streaming_reply.write(), offset, &text);
                                 }
-                                Some(Ok(ConversationEvent::TurnError { message })) => {
+                                // A stop shows as its saved notice instead.
+                                Some(Ok(ConversationEvent::TurnError { message }))
+                                    if message != crate::api::chat::TURN_STOPPED =>
+                                {
                                     stream_errors.write().insert(id, message);
                                 }
+                                Some(Ok(ConversationEvent::TurnError { .. })) => {}
                                 Some(Ok(ConversationEvent::ReposUpdate { repos: list })) => {
                                     repos.set(list);
                                 }
@@ -4133,11 +4147,7 @@ fn ChatPanel(
                                 }
                             }
                             if let Some(err) = stream_error() {
-                                if err == crate::api::chat::TURN_STOPPED {
-                                    p { class: "muted turn-stopped", "Stopped." }
-                                } else {
-                                    p { class: "error", "{err}" }
-                                }
+                                p { class: "error", "{err}" }
                             }
                             if let Some(err) = notification_delivery_error() {
                                 p { class: "error", "A background notification failed to reach the model: {err}" }

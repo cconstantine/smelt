@@ -287,12 +287,26 @@ fn continuation_prompt(unanswered: &[String]) -> String {
     if unanswered.is_empty() {
         return COMPACTION_CONTINUATION_PROMPT.to_string();
     }
+    // Each quoted in part at most: a huge paste quoted whole would leave
+    // the compacted request as big as the one compaction was for, and the
+    // summary already covers it (SME-51 B10).
+    let quoted: Vec<String> = unanswered
+        .iter()
+        .map(|text| match crate::fetch_guard::truncate(text.clone(), CONTINUATION_QUOTE_MAX_CHARS) {
+            (kept, true) => format!("{kept}\n[cut to its first {CONTINUATION_QUOTE_MAX_CHARS} characters; the summary covers the rest]"),
+            (whole, false) => whole,
+        })
+        .collect();
     format!(
         "{COMPACTION_CONTINUATION_PROMPT} The summary includes these latest messages, which you \
          haven't answered yet; respond to them now:\n\n{}",
-        unanswered.join("\n\n")
+        quoted.join("\n\n")
     )
 }
+
+/// How much of each unanswered message a continuation quotes.
+#[cfg(feature = "server")]
+const CONTINUATION_QUOTE_MAX_CHARS: usize = 4_000;
 
 /// The text of the user messages at the end of `messages`, after the
 /// model's last reply: what a compaction happening now would summarize
@@ -311,6 +325,10 @@ fn unanswered_user_text(messages: &[Message]) -> Vec<String> {
         })
         .collect();
     texts.reverse();
+    // What came before the user's last stop was called off (SME-51 B10).
+    if let Some(stop) = texts.iter().rposition(|text| text == STOP_NOTICE) {
+        texts.drain(..=stop);
+    }
     texts
 }
 
@@ -766,6 +784,12 @@ async fn compact_conversation(
         // Watching tabs show the divider as it happens (SME-40 F5).
         record_saved(conversation_id, &mut Vec::new(), saved);
     }
+    // The usage that triggered this described the old, long history. Kept,
+    // a failed or stopped next call would have the following turn compact
+    // again at once; the next real reply records the new size (SME-51 B10).
+    db::clear_conversation_usage(pool, conversation_id)
+        .await
+        .map_err(ServerFnError::new)?;
     Ok(())
 }
 
@@ -1245,16 +1269,17 @@ fn run_turn_bounded<'a>(
         // background task's notice, say), without running a turn for it;
         // the conversation is paused, so the model sees it next time the
         // user writes (SME-40 F4).
+        let lock = conversation_lock(conversation_id);
+        let _turn = lock.lock().await;
         if let Some(message) = unsaved
             && !saved.load(std::sync::atomic::Ordering::SeqCst)
         {
-            let lock = conversation_lock(conversation_id);
-            let _turn = lock.lock().await;
             match db::create_message(pool, conversation_id, &message.role, &message.content).await {
                 Ok(saved) => record_saved(conversation_id, &mut Vec::new(), saved),
                 Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't keep a stopped turn's message"),
             }
         }
+        record_stop(pool, conversation_id).await;
         Err(ServerFnError::new(TURN_STOPPED))
     })
 }
@@ -1278,9 +1303,34 @@ fn relay_reply_delta(conversation_id: i64, delta: &str) {
     );
 }
 
+/// Notes in the conversation that the user stopped it (`STOP_NOTICE`),
+/// once however many turns the stop ended. Call holding the turn lock.
+#[cfg(feature = "server")]
+async fn record_stop(pool: &PgPool, conversation_id: i64) {
+    let already = db::list_messages(pool, conversation_id)
+        .await
+        .ok()
+        .and_then(|messages| messages.last().map(|m| m.content.contains(STOP_NOTICE)))
+        .unwrap_or(false);
+    if already {
+        return;
+    }
+    let notice = [anthropic::ContentBlock::Text { text: STOP_NOTICE.to_string() }];
+    match db::create_message(pool, conversation_id, "user", &notice).await {
+        Ok(saved) => record_saved(conversation_id, &mut Vec::new(), saved),
+        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't note a stop"),
+    }
+}
+
 /// The error a stopped turn ends with. Not server-only: the chat page
 /// recognizes it to show "Stopped." instead of an error.
 pub const TURN_STOPPED: &str = "stopped by the user";
+
+/// Saved in the conversation when the user stops a turn, so the model (and
+/// a compaction's continuation) knows the request before it was called
+/// off, rather than taking it as still waiting for an answer (SME-51 B10).
+/// Not server-only: the chat page shows it as "Stopped.".
+pub const STOP_NOTICE: &str = "The user stopped this turn before it finished. Don't carry on with what it asked unless they ask again.";
 
 /// What `send_message` does: checks the conversation exists, then runs
 /// the user's turn in the background and returns without waiting for it.
@@ -1989,6 +2039,29 @@ mod tests {
             content: serde_json::to_string(&blocks).expect("ContentBlock always serializes"),
             created_at: chrono::Utc::now().naive_utc(),
         }
+    }
+
+    /// SME-51 B10: a request the user stopped isn't "unanswered": a
+    /// compaction mustn't hand it back to the model to answer.
+    #[test]
+    fn test_a_stopped_request_isnt_quoted_as_unanswered() {
+        let messages = vec![
+            text_message(1, "assistant", "ok"),
+            text_message(2, "user", "Write a 400-word story"),
+            text_message(3, "user", STOP_NOTICE),
+            text_message(4, "user", "What is 2 + 2?"),
+        ];
+        assert_eq!(unanswered_user_text(&messages), vec!["What is 2 + 2?".to_string()]);
+    }
+
+    /// SME-51 B10: a huge pasted message quoted whole would leave the
+    /// compacted request as big as the one compaction was for.
+    #[test]
+    fn test_the_continuation_quotes_a_huge_message_only_in_part() {
+        let huge = "x".repeat(100_000);
+        let prompt = continuation_prompt(&[huge]);
+        assert!(prompt.chars().count() < 10_000, "{} chars", prompt.chars().count());
+        assert!(prompt.contains("cut"), "it should say the quote was cut");
     }
 
     fn text_message(id: i64, role: &str, text: &str) -> Message {
@@ -3371,7 +3444,14 @@ mod tests {
             "a stopped turn should release the turn lock"
         );
         let saved = db::list_messages(&pool, conversation.id).await.expect("list");
-        assert_eq!(saved.len(), 1, "the user's message is kept");
+        assert_eq!(saved.len(), 2, "the user's message is kept, then the stop is noted");
+        // SME-51 B10: the stop is in the conversation, for the model (and
+        // a compaction) to see that request was called off.
+        assert!(
+            saved[1].content.contains(STOP_NOTICE),
+            "the stop isn't recorded: {}",
+            saved[1].content
+        );
 
         // A turn started after the stop isn't affected by it.
         let later = start_recording_mock_upstream(vec![text_reply_body("Hi!")]).await;
@@ -4256,6 +4336,33 @@ mod tests {
             description.contains("implement") && description.contains("in_progress"),
             "expected the second todo and its status in: {description}"
         );
+    }
+
+    /// SME-51 B10: the usage that triggered a compaction describes the old,
+    /// long history. Kept after it, a failed or stopped next call left the
+    /// following turn compacting again at once.
+    #[sqlx::test]
+    async fn test_a_compaction_forgets_the_usage_that_triggered_it(pool: PgPool) {
+        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "earlier".to_string() }])
+            .await
+            .expect("seed");
+        db::create_message(&pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: "reply".to_string() }])
+            .await
+            .expect("seed");
+        let near_limit = anthropic::TokenUsage {
+            input_tokens: 190_000,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        db::upsert_conversation_usage(&pool, conversation.id, &near_limit).await.expect("seed usage");
+        start_mock_upstream(vec![text_reply_body("Summary: earlier.")]).await;
+        compact_conversation(&pool, conversation.id, Some("test-key"), None)
+            .await
+            .expect("compaction");
+        assert_eq!(db::get_conversation_usage(&pool, conversation.id).await.expect("usage"), None);
     }
 
     #[sqlx::test]
