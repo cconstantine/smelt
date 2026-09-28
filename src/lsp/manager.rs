@@ -313,6 +313,21 @@ fn request_error(config: &LanguageServerConfig, error: LspError) -> String {
     }
 }
 
+/// A rename whose write to `failed` was refused after `written` were
+/// changed: what the model needs to put things right.
+fn partial_rename_error(new_name: &str, written: &[String], failed: &str, error: &str, not_written: &[String]) -> String {
+    if written.is_empty() {
+        return format!("The rename to {new_name} was refused: {error}. Nothing was changed.");
+    }
+    let unchanged: Vec<&str> = std::iter::once(failed).chain(not_written.iter().map(String::as_str)).collect();
+    format!(
+        "The rename to {new_name} stopped partway: {error}.\nAlready changed: {}\nNot changed: {}\n\
+         Read those files again before renaming the rest or undoing it.",
+        written.join(", "),
+        unchanged.join(", ")
+    )
+}
+
 /// The `lsp` tool's input, checked before anything is asked: a position
 /// needs a path and a line, and lines and characters count from 1.
 fn check_input(operation: Operation, input: &OperationInput) -> Result<(), String> {
@@ -485,7 +500,10 @@ pub async fn operate(
                 if files.is_empty() {
                     break 'answer "Nothing to rename there.".to_string();
                 }
-                // Every file first, so none is written if one can't be.
+                // Every file is read and edited first, so one that can't be
+                // stops the rename before anything is written. A write can
+                // still be refused midway (the file changed in between), and
+                // then the error says which files were already changed.
                 let mut planned = Vec::new();
                 for (path, edits) in &files {
                     let current = read_in_pod(client, &pod_name, path).await?;
@@ -498,10 +516,15 @@ pub async fn operate(
                     planned.push((path.clone(), current, updated, edits.len()));
                 }
                 let mut report = Vec::new();
-                for (path, current, updated, count) in planned {
-                    write_in_pod(client, &pod_name, &path, &updated, &sha256(&current)).await?;
-                    let _ = session.sync(&path, &updated).await;
-                    report.push(format!("{path} ({count} edit{})", if count == 1 { "" } else { "s" }));
+                let mut written = Vec::new();
+                for (i, (path, current, updated, count)) in planned.iter().enumerate() {
+                    if let Err(error) = write_in_pod(client, &pod_name, path, updated, &sha256(current)).await {
+                        let rest: Vec<String> = planned[i + 1..].iter().map(|(p, ..)| p.clone()).collect();
+                        return Err(partial_rename_error(&new_name, &written, path, &error, &rest));
+                    }
+                    written.push(path.clone());
+                    let _ = session.sync(path, updated).await;
+                    report.push(format!("{path} ({count} edit{})", if *count == 1 { "" } else { "s" }));
                 }
                 format!(
                     "Renamed to {new_name} in {} file{}:\n{}\nRead a file again before editing it.",
@@ -615,6 +638,28 @@ mod tests {
         assert!(check_input(Operation::References, &at(None, None)).is_err(), "no line");
         // Operations without a position don't look at them.
         assert_eq!(check_input(Operation::WorkspaceSymbols, &OperationInput::default()), Ok(()));
+    }
+
+    #[test]
+    fn a_partial_rename_says_what_was_and_was_not_changed() {
+        let message = partial_rename_error(
+            "sum_areas",
+            &["/workspace/a.rs".to_string()],
+            "/workspace/b.rs",
+            "/workspace/b.rs changed while it was being renamed",
+            &["/workspace/c.rs".to_string()],
+        );
+        assert_eq!(
+            message,
+            "The rename to sum_areas stopped partway: /workspace/b.rs changed while it was being renamed.\n\
+             Already changed: /workspace/a.rs\n\
+             Not changed: /workspace/b.rs, /workspace/c.rs\n\
+             Read those files again before renaming the rest or undoing it."
+        );
+        assert_eq!(
+            partial_rename_error("x", &[], "/workspace/a.rs", "/workspace/a.rs changed while it was being renamed", &[]),
+            "The rename to x was refused: /workspace/a.rs changed while it was being renamed. Nothing was changed."
+        );
     }
 
     #[test]
