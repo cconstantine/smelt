@@ -55,6 +55,27 @@ const TOOL_LIST_WAIT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(10)
 };
 
+/// How long connecting to a server (and listing its tools) may take, for a
+/// turn or the status page alike. Without it an unreachable host waited
+/// out the operating system's own connect timeout, minutes (SME-51 B8).
+const CONNECT_TIMEOUT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(1)
+} else {
+    std::time::Duration::from_secs(15)
+};
+
+/// How long one tool call may take. A call holds the turn, and the
+/// conversation's lock, while it waits (SME-51 B8).
+const CALL_TIMEOUT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(1)
+} else {
+    std::time::Duration::from_secs(120)
+};
+
+/// A tool result goes into the model's context and the database; past
+/// this it's cut, saying so (SME-51 B8).
+const MAX_RESULT_CHARS: usize = 100_000;
+
 /// After a failed connection, model calls skip the server for this long
 /// instead of trying (and waiting) again on every call. The status page
 /// still tries each time it's opened.
@@ -268,17 +289,28 @@ async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connec
     let handler = SmeltClientHandler {
         stale: stale.clone(),
     };
-    let service = handler
-        .serve(transport)
+    let connecting = async {
+        let service = handler
+            .serve(transport)
+            .await
+            .map_err(|e| format!("failed to connect to MCP server {:?}: {e}", config.name))?;
+        let tools = service.list_all_tools().await.map_err(|e| {
+            format!(
+                "failed to list tools from MCP server {:?}: {e}",
+                config.name
+            )
+        })?;
+        Ok::<_, String>((service, tools))
+    };
+    let (service, tools) = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
         .await
-        .map_err(|e| format!("failed to connect to MCP server {:?}: {e}", config.name))?;
-
-    let tools = service.list_all_tools().await.map_err(|e| {
-        format!(
-            "failed to list tools from MCP server {:?}: {e}",
-            config.name
-        )
-    })?;
+        .map_err(|_| {
+            format!(
+                "MCP server {:?} didn't answer within {}s",
+                config.name,
+                CONNECT_TIMEOUT.as_secs()
+            )
+        })??;
 
     Ok(Connection {
         service: Arc::new(service),
@@ -474,12 +506,21 @@ pub async fn call_tool(
         request = request.with_arguments(arguments);
     }
 
-    let result = service.call_tool(request).await.map_err(|e| {
-        format!(
-            "MCP tool call to {:?} on {:?} failed: {e}",
-            tool_name, config.name
-        )
-    })?;
+    let result = tokio::time::timeout(CALL_TIMEOUT, service.call_tool(request))
+        .await
+        .map_err(|_| {
+            format!(
+                "MCP server {:?} didn't answer {tool_name:?} within {}s",
+                config.name,
+                CALL_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| {
+            format!(
+                "MCP tool call to {:?} on {:?} failed: {e}",
+                tool_name, config.name
+            )
+        })?;
 
     let content = result
         .content
@@ -491,6 +532,10 @@ pub async fn call_tool(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let content = match crate::fetch_guard::truncate(content, MAX_RESULT_CHARS) {
+        (kept, true) => format!("{kept}\n[the result was cut to its first {MAX_RESULT_CHARS} characters]"),
+        (whole, false) => whole,
+    };
 
     if result.is_error.unwrap_or(false) {
         Err(content)
@@ -582,6 +627,10 @@ mod tests {
             request: CallToolRequestParams,
             context: RequestContext<RoleServer>,
         ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+            // An unlisted tool that never answers, for the call timeout.
+            if request.name == "hang" {
+                std::future::pending::<()>().await;
+            }
             let router = self.router.read().await;
             router
                 .call(ToolCallContext::new(self, request, context))
@@ -969,6 +1018,51 @@ mod tests {
         let other = tokio::time::timeout(std::time::Duration::from_secs(1), evict(-1102)).await;
         assert!(other.is_ok(), "evicting another server waited behind the hanging connect");
         listing.abort();
+    }
+
+    /// SME-51 B8: the status page's check had no time limit of its own, so
+    /// an unreachable server read "Checking…" until the operating system
+    /// gave up on the connection (143 s on the bug bash).
+    #[tokio::test]
+    async fn test_the_status_check_gives_up_on_a_hanging_server() {
+        let hanging = config_at(-1111, start_hanging_server().await);
+        let checked = tokio::time::timeout(
+            CONNECT_TIMEOUT * 2 + std::time::Duration::from_secs(3),
+            connection_check(&test_pool(), &hanging),
+        )
+        .await;
+        assert!(checked.is_ok_and(|r| r.is_err()), "the check should fail in bounded time");
+    }
+
+    /// SME-51 B8: a tool call that never returns held the turn, and the
+    /// conversation's lock, forever.
+    #[tokio::test]
+    async fn test_a_tool_call_that_never_returns_times_out() {
+        register_test_connection(-1112, false).await;
+        let config = test_config(-1112, "hangs");
+        let called = tokio::time::timeout(
+            CALL_TIMEOUT + std::time::Duration::from_secs(3),
+            call_tool(&test_pool(), &config, "hang", serde_json::json!({})),
+        )
+        .await;
+        assert!(
+            called.as_ref().is_ok_and(|r| r.as_ref().is_err_and(|e| e.contains("didn't answer"))),
+            "{called:?}"
+        );
+    }
+
+    /// SME-51 B8: a result goes into the model's context and the database,
+    /// so it's cut to a size, saying so.
+    #[tokio::test]
+    async fn test_a_huge_tool_result_is_cut() {
+        register_test_connection(-1113, false).await;
+        let config = test_config(-1113, "huge");
+        let huge = "x".repeat(MAX_RESULT_CHARS * 3);
+        let result = call_tool(&test_pool(), &config, "echo", serde_json::json!({"s": huge}))
+            .await
+            .expect("echo");
+        assert!(result.chars().count() < MAX_RESULT_CHARS + 200, "{} chars", result.chars().count());
+        assert!(result.contains("cut"), "the result should say it was cut");
     }
 
     /// SME-40 F1: listing tools for a turn waited the full connect timeout

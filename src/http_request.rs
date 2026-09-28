@@ -144,11 +144,27 @@ async fn request_with_guard(
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let text = resp
-            .text()
+        // Read only as far as the body is kept: a character is at most 4
+        // bytes, so past that everything would be cut anyway (SME-51 B8).
+        let limit = MAX_BODY_CHARS * 4;
+        let mut bytes = Vec::new();
+        let mut stopped_early = false;
+        let mut resp = resp;
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| format!("failed to read response body: {e}"))?;
-        let (body, truncated) = fetch_guard::truncate(text, MAX_BODY_CHARS);
+            .map_err(|e| format!("failed to read response body: {e}"))?
+        {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() >= limit {
+                bytes.truncate(limit);
+                stopped_early = true;
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let (body, cut) = fetch_guard::truncate(text, MAX_BODY_CHARS);
+        let truncated = cut || stopped_early;
         return Ok(HttpResponseResult {
             url: current_url,
             status,
@@ -216,6 +232,14 @@ mod tests {
                 }),
             )
             .route(
+                "/endless",
+                axum::routing::get(|| async {
+                    let chunk = axum::body::Bytes::from(vec![b'a'; 64 * 1024]);
+                    let stream = futures_util::stream::repeat_with(move || Ok::<_, std::io::Error>(chunk.clone()));
+                    axum::body::Body::from_stream(stream)
+                }),
+            )
+            .route(
                 "/not-found",
                 axum::routing::get(|| async { (axum::http::StatusCode::NOT_FOUND, "nope") }),
             )
@@ -254,6 +278,22 @@ mod tests {
         .await
         .expect("the request should go to the checked address");
         assert_eq!(result.body, "hello from the test server");
+    }
+
+    /// SME-51 B8: the body was read whole before being cut to size, so an
+    /// endless or huge response filled memory until the timeout.
+    #[tokio::test]
+    async fn test_an_endless_body_is_read_only_as_far_as_it_is_kept() {
+        let (base, _server) = start_test_server().await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            request_with_guard("GET", &format!("{base}/endless"), &[], None, allow_loopback_too),
+        )
+        .await
+        .expect("the request should stop reading once it has enough")
+        .expect("request");
+        assert!(result.truncated);
+        assert!(result.body.chars().count() <= MAX_BODY_CHARS + 200);
     }
 
     #[tokio::test]

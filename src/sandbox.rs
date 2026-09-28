@@ -1961,6 +1961,9 @@ pub async fn pod_port_is_listening(
 
 const LISTEN_PROBE: Duration = Duration::from_millis(500);
 
+/// How long opening the port-forward for the probe may take (SME-51 B8).
+const LISTEN_OPEN_TIMEOUT: Duration = if cfg!(test) { Duration::from_secs(1) } else { Duration::from_secs(10) };
+
 async fn pod_port_is_listening_with(
     pool: &PgPool,
     conversation_id: i64,
@@ -1968,8 +1971,14 @@ async fn pod_port_is_listening_with(
     port: u16,
     client: impl FnOnce() -> kube::Client,
 ) -> Result<bool, TerminalError> {
-    let stream = open_pod_port_with(pool, conversation_id, host, port, client).await?;
-    Ok(stream_is_listening(stream).await)
+    // A port-forward that doesn't open in time says as much as one that's
+    // refused: nothing is serving there yet (SME-51 B8).
+    let Ok(opened) =
+        tokio::time::timeout(LISTEN_OPEN_TIMEOUT, open_pod_port_with(pool, conversation_id, host, port, client)).await
+    else {
+        return Ok(false);
+    };
+    Ok(stream_is_listening(opened?).await)
 }
 
 /// `pod_port_is_listening`'s judgement of a freshly opened stream.
@@ -5030,6 +5039,33 @@ mod tests {
         assert!(listed_while_stopping, "the delete removed {name} before its containers stopped");
         assert!(waited.is_ok(), "the wait should finish once the pod is gone: {waited:?}");
         assert!(!still_there, "the wait returned while {name} was still stopping");
+    }
+
+    /// SME-51 B8: the listening probe (`sandbox_preview_url`) waited as
+    /// long as the Kubernetes client would for a port-forward to open,
+    /// minutes when the API server hangs, holding the turn.
+    #[sqlx::test]
+    async fn test_the_listening_probe_gives_up_on_a_hanging_cluster(pool: PgPool) {
+        let conversation = db::create_conversation(&pool).await.expect("conversation");
+        db::create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+        // An "API server" that accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = kube::Config::new(format!("http://{addr}").parse().expect("url"));
+        let client = kube::Client::try_from(config).expect("client");
+        let probed = tokio::time::timeout(
+            LISTEN_OPEN_TIMEOUT + Duration::from_secs(5),
+            pod_port_is_listening_with(&pool, conversation.id, PodHost::Localhost, 8000, || client),
+        )
+        .await;
+        assert!(matches!(probed, Ok(Ok(false))), "the probe should give up and say nothing's listening: {probed:?}");
     }
 
     /// SME-51 B7: "Work on a repo" while the sandbox is still starting
