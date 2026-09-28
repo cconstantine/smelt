@@ -15,6 +15,12 @@
 # Settings (environment):
 #   CHECK_WORKTREE  the worktree (default: ../smelt-check next to this repo)
 #   CHECK_PORT      the app's port (default: 8081; the dev server uses 8080)
+#   CHECK_SCRATCH_DB=1  serve from a database of its own, created on start
+#                   (smelt migrates it) and dropped on stop, instead of the dev
+#                   database. For when the dev database has migrations from
+#                   another branch, which stop smelt starting: on SME-65 every
+#                   page was a 500 because SME-35's branch had applied one.
+#                   Nothing from the dev database is copied into it.
 #
 # `dx serve` runs its server as a child process, so stopping only the `dx`
 # process leaves the server running (SME-51). This starts `dx` in a process
@@ -26,6 +32,35 @@ worktree=${CHECK_WORKTREE:-$repo/../smelt-check}
 port=${CHECK_PORT:-8081}
 pid_file() { echo "$worktree/.check-server.pid"; }
 log_file() { echo "$worktree/.check-server.log"; }
+# Holds the scratch database's URL while one exists, so `stop` can drop it.
+scratch_db_file() { echo "$worktree/.check-server.scratch-db"; }
+
+# The dev DATABASE_URL (the environment's, else the worktree's .env) with the
+# database renamed after the worktree: a fixed name, so a leftover from a
+# failed run is easy to find and the next run reuses it.
+scratch_db_url() {
+    local url=${DATABASE_URL:-}
+    if [ -z "$url" ] && [ -f "$worktree/.env" ]; then
+        url=$(sed -n 's/^DATABASE_URL=//p' "$worktree/.env" | tail -n 1)
+        url=${url%\"}
+        url=${url#\"}
+    fi
+    [ -n "$url" ] || { echo "CHECK_SCRATCH_DB needs DATABASE_URL (environment or .env)" >&2; return 1; }
+    local query=""
+    case "$url" in *\?*) query="?${url#*\?}"; url=${url%%\?*} ;; esac
+    local name
+    name=smelt_scratch_$(basename "$worktree" | tr -c 'a-zA-Z0-9\n' '_')
+    echo "${url%/*}/$name$query"
+}
+
+drop_scratch_db() {
+    local file
+    file=$(scratch_db_file)
+    [ -f "$file" ] || return 0
+    sqlx database drop -y --database-url "$(cat "$file")" >/dev/null
+    rm -f "$file"
+    echo "dropped the scratch database"
+}
 
 running_pgid() {
     local file
@@ -43,6 +78,7 @@ stop() {
     if ! pgid=$(running_pgid); then
         echo "no check server running"
         rm -f "$(pid_file)"
+        drop_scratch_db
         return 0
     fi
     kill -TERM -- "-$pgid" 2>/dev/null || true
@@ -55,6 +91,8 @@ stop() {
     fi
     rm -f "$(pid_file)"
     echo "stopped the check server (process group $pgid)"
+    # Only once the server is gone: Postgres won't drop a database in use.
+    drop_scratch_db
 }
 
 start() {
@@ -84,6 +122,17 @@ start() {
     [ -f "$worktree/.env" ] || { [ -f "$repo/.env" ] && cp "$repo/.env" "$worktree/.env"; }
     if [ ! -e "$worktree/.browser-check-cache" ] && [ -d "$repo/.browser-check-cache" ]; then
         ln -s "$repo/.browser-check-cache" "$worktree/.browser-check-cache"
+    fi
+    if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
+        local db_url
+        db_url=$(scratch_db_url)
+        # Start from an empty database, even after a run that failed to drop it.
+        sqlx database drop -y --database-url "$db_url" >/dev/null
+        sqlx database create --database-url "$db_url"
+        echo "$db_url" >"$(scratch_db_file)"
+        # Before the caller's overrides, so an explicit DATABASE_URL still wins.
+        overrides=("DATABASE_URL=$db_url" "${overrides[@]}")
+        echo "serving from scratch database ${db_url##*/}"
     fi
 
     : >"$(log_file)"
