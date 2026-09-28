@@ -22,6 +22,9 @@ pub const LSP_POD_LABEL: &str = "smelt/lsp-pod";
 /// When the config it started with was last saved, to tell the model a
 /// running server's config has changed since.
 pub const CONFIG_VERSION_ANNOTATION: &str = "smelt/lsp-config-version";
+/// Set once a server's install has finished: only a pod that got that far
+/// is reported when it stops.
+pub const READY_ANNOTATION: &str = "smelt/lsp-ready";
 
 /// Where the pod records its install's outcome.
 pub const INSTALL_RC: &str = "/tmp/install.rc";
@@ -168,7 +171,13 @@ pub async fn start_with(
         return Err(e);
     }
     match wait_installed(client, &name).await {
-        Ok(()) => Ok(if created { Started::Started } else { Started::AlreadyRunning }),
+        Ok(()) => {
+            let ready = json!({"metadata": {"annotations": {READY_ANNOTATION: "true"}}});
+            if let Err(e) = pods.patch(&name, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&ready)).await {
+                tracing::warn!(pod = %name, error = %e, "couldn't mark a language server pod ready");
+            }
+            Ok(if created { Started::Started } else { Started::AlreadyRunning })
+        }
         Err(e) => {
             let _ = pods.delete(&name, &crate::sandbox::pod_delete_params()).await;
             Err(e)
@@ -373,6 +382,10 @@ pub fn note_server_stop(seen: &mut std::collections::HashSet<String>, pod: &Pod,
     if pod.metadata.deletion_timestamp.is_some() || !matches!(phase, "Failed" | "Succeeded") {
         return None;
     }
+    // One whose install never finished: its start already said why.
+    if pod.metadata.annotations.as_ref().and_then(|a| a.get(READY_ANNOTATION)).is_none() {
+        return None;
+    }
     if !seen.insert(pod.metadata.uid.clone()?) || initial {
         return None;
     }
@@ -503,6 +516,13 @@ pub(crate) mod tests {
     }
 
     fn server_pod(uid: &str, phase: &str, reason: Option<&str>, deleting: bool) -> Pod {
+        let mut pod = unready_server_pod(uid, phase, reason, deleting);
+        pod.metadata.annotations = Some([(READY_ANNOTATION.to_string(), "true".to_string())].into());
+        pod
+    }
+
+    /// A server pod whose install never finished.
+    fn unready_server_pod(uid: &str, phase: &str, reason: Option<&str>, deleting: bool) -> Pod {
         serde_json::from_value(serde_json::json!({
             "metadata": {
                 "name": "lsp-7-rust-analyzer",
@@ -541,6 +561,9 @@ pub(crate) mod tests {
         assert_eq!(note_server_stop(&mut seen, &server_pod("a", "Failed", Some("Error"), true), false), None);
         assert_eq!(note_server_stop(&mut seen, &server_pod("b", "Failed", Some("Error"), false), true), None);
         assert_eq!(note_server_stop(&mut seen, &server_pod("b", "Failed", Some("Error"), false), false), None);
+        // One that never got through its install: its start already said
+        // what went wrong.
+        assert_eq!(note_server_stop(&mut seen, &unready_server_pod("c", "Failed", Some("StartError"), false), false), None);
     }
 
     #[test]
@@ -674,6 +697,8 @@ pub(crate) mod tests {
             let listed = list_with(&client, sandbox.conversation_id).await.expect("list");
             assert_eq!(listed.len(), 1);
             assert_eq!((listed[0].name.as_str(), &listed[0].state, listed[0].config_version.as_str()), ("echo", &ServerState::Ready, "v1"));
+            let pod = crate::sandbox::pods_api(&client).get(&listed[0].pod_name).await.expect("pod");
+            assert_eq!(pod.metadata.annotations.as_ref().and_then(|a| a.get(READY_ANNOTATION)).map(String::as_str), Some("true"));
 
             let mut io = open_stdio(&client, &listed[0].pod_name, &config).await.expect("stdio");
             io.stdin.write_all(b"Content-Length: 2\r\n\r\n{}").await.expect("write");
