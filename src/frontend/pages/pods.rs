@@ -1,7 +1,7 @@
 use chrono::NaiveDateTime;
 use dioxus::prelude::*;
 
-use crate::api::pods::{PodActivity, PodUsage, get_pods, stop_pod};
+use crate::api::pods::{PodActivity, PodUsage, ServerPodOverview, get_pods, stop_pod};
 use crate::frontend::Route;
 
 /// A counter that goes up every time a pod is created or goes away, in
@@ -123,6 +123,11 @@ pub fn PodsIndex() -> Element {
                                         }
                                     }
                                 }
+                                if !pod.language_servers.is_empty() {
+                                    tr { key: "{pod.pod_id}-servers", class: "pod-servers",
+                                        td { colspan: "8", span { class: "muted", "Language servers: " } "{servers_text(&pod.language_servers)}" }
+                                    }
+                                }
                             }
                         }
                     }
@@ -133,6 +138,16 @@ pub fn PodsIndex() -> Element {
             }
         }
     }
+}
+
+/// A sandbox's language servers: `rust-analyzer ready, 512 MiB of 2Gi`,
+/// one per server, joined with ` · `.
+fn servers_text(servers: &[ServerPodOverview]) -> String {
+    servers
+        .iter()
+        .map(|server| format!("{} {}, {}", server.name, server.state, memory_text(server.usage.as_ref(), server.memory_limit.as_deref())))
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ")
 }
 
 /// Seconds from `since` to `now`, never negative.
@@ -211,6 +226,20 @@ mod tests {
             .expect("a valid date")
             .and_hms_opt(10, minute, second)
             .expect("a valid time")
+    }
+
+    #[test]
+    fn test_servers_text_gives_each_servers_state_and_memory() {
+        let servers = vec![
+            ServerPodOverview {
+                name: "rust-analyzer".to_string(),
+                state: "ready".to_string(),
+                memory_limit: Some("2Gi".to_string()),
+                usage: Some(PodUsage { memory_bytes: 512 * 1024 * 1024, cpu_millicores: 10 }),
+            },
+            ServerPodOverview { name: "pyright".to_string(), state: "stopped (OOMKilled)".to_string(), memory_limit: Some("1Gi".to_string()), usage: None },
+        ];
+        assert_eq!(servers_text(&servers), "rust-analyzer ready, 512 MiB of 2Gi \u{b7} pyright stopped (OOMKilled), unavailable of 1Gi");
     }
 
     #[test]

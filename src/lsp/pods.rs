@@ -130,6 +130,8 @@ pub struct ServerPod {
     pub pod_name: String,
     pub state: ServerState,
     pub config_version: String,
+    /// The server container's memory limit (`"2Gi"`).
+    pub memory_limit: Option<String>,
 }
 
 /// Starts `config`'s server next to `sandbox`, or finds it already
@@ -309,6 +311,12 @@ pub async fn list_with(client: &kube::Client, conversation_id: i64) -> Result<Ve
                 .and_then(|a| a.get(CONFIG_VERSION_ANNOTATION))
                 .cloned()
                 .unwrap_or_default(),
+            memory_limit: pod
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.containers.first())
+                .and_then(|c| c.resources.as_ref()?.limits.as_ref()?.get("memory"))
+                .map(|q| q.0.clone()),
         });
     }
     servers.sort_by(|a, b| a.name.cmp(&b.name));
@@ -344,6 +352,47 @@ pub async fn stop_everywhere_in(client: &kube::Client, conversation_id: i64, nam
     Ok(())
 }
 
+/// A server pod that stopped on its own, for `watch_pods` to tell the
+/// model: its conversation, the server's name, and a notice.
+#[derive(Debug, PartialEq)]
+pub struct ServerStopped {
+    pub conversation_id: i64,
+    pub notice: String,
+}
+
+/// `watch_pods`' bookkeeping for server pods: remembers in `seen` each pod
+/// (by uid) that stopped, and returns the stop to report the first time.
+/// A pod being deleted (stopped by smelt, or going with its sandbox) isn't
+/// reported, and neither is one already stopped when first listed
+/// (`initial`, after smelt starts or the watch reconnects).
+pub fn note_server_stop(seen: &mut std::collections::HashSet<String>, pod: &Pod, initial: bool) -> Option<ServerStopped> {
+    let labels = pod.metadata.labels.as_ref()?;
+    let conversation_id = labels.get(LSP_OF_LABEL)?.parse().ok()?;
+    let server = labels.get(LSP_SERVER_LABEL)?;
+    let phase = pod.status.as_ref()?.phase.as_deref()?;
+    if pod.metadata.deletion_timestamp.is_some() || !matches!(phase, "Failed" | "Succeeded") {
+        return None;
+    }
+    if !seen.insert(pod.metadata.uid.clone()?) || initial {
+        return None;
+    }
+    let reason = stop_reason(pod);
+    let why = match reason.as_deref() {
+        Some("OOMKilled") => " (OOMKilled: it ran out of memory; the user can raise its memory limit on the \
+                             Language servers page)"
+            .to_string(),
+        Some(reason) => format!(" ({reason})"),
+        None => String::new(),
+    };
+    Some(ServerStopped {
+        conversation_id,
+        notice: format!(
+            "Language server {server} stopped{why}. The sandbox is unaffected. start_language_server \
+             starts it again."
+        ),
+    })
+}
+
 /// A running server's stdin and stdout, over `pods/exec` into its pod.
 pub struct ServerIo {
     pub stdin: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
@@ -373,7 +422,7 @@ pub async fn open_stdio(client: &kube::Client, pod_name: &str, config: &Language
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn sandbox() -> SandboxRef {
@@ -453,6 +502,47 @@ mod tests {
         assert!(script.contains(INSTALL_RC) && script.contains("trap 'exit 0' TERM"), "{script}");
     }
 
+    fn server_pod(uid: &str, phase: &str, reason: Option<&str>, deleting: bool) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {
+                "name": "lsp-7-rust-analyzer",
+                "uid": uid,
+                "labels": {LSP_OF_LABEL: "42", LSP_SERVER_LABEL: "rust-analyzer", LSP_POD_LABEL: "7"},
+                "deletionTimestamp": if deleting { Some("2026-09-28T00:00:00Z") } else { None },
+            },
+            "status": {
+                "phase": phase,
+                "containerStatuses": [{
+                    "name": "server", "image": "rust:1", "imageID": "", "ready": false, "restartCount": 0,
+                    "state": {"terminated": {"exitCode": 137, "reason": reason}},
+                }],
+            },
+        }))
+        .expect("a pod")
+    }
+
+    #[test]
+    fn test_a_server_pod_that_stops_is_reported_once() {
+        let mut seen = std::collections::HashSet::new();
+        assert_eq!(note_server_stop(&mut seen, &server_pod("a", "Running", None, false), false), None);
+        let stopped = note_server_stop(&mut seen, &server_pod("a", "Failed", Some("OOMKilled"), false), false).expect("reported");
+        assert_eq!(stopped.conversation_id, 42);
+        assert!(stopped.notice.contains("rust-analyzer") && stopped.notice.contains("OOMKilled"), "{}", stopped.notice);
+        assert!(stopped.notice.contains("memory limit"), "an OOM says what to change: {}", stopped.notice);
+        assert!(stopped.notice.contains("start_language_server"), "{}", stopped.notice);
+        assert_eq!(note_server_stop(&mut seen, &server_pod("a", "Failed", Some("OOMKilled"), false), false), None);
+        // A new pod for the same server is reported again.
+        assert!(note_server_stop(&mut seen, &server_pod("b", "Failed", Some("Error"), false), false).is_some());
+    }
+
+    #[test]
+    fn test_a_server_pod_stopped_by_smelt_or_before_is_not_reported() {
+        let mut seen = std::collections::HashSet::new();
+        assert_eq!(note_server_stop(&mut seen, &server_pod("a", "Failed", Some("Error"), true), false), None);
+        assert_eq!(note_server_stop(&mut seen, &server_pod("b", "Failed", Some("Error"), false), true), None);
+        assert_eq!(note_server_stop(&mut seen, &server_pod("b", "Failed", Some("Error"), false), false), None);
+    }
+
     #[test]
     fn test_an_empty_install_still_records_success() {
         assert!(pod_script("  ").contains("( true )"));
@@ -460,7 +550,7 @@ mod tests {
 
     /// Real-cluster tests: a stand-in sandbox pod (the real image, idle)
     /// and its conversation's workspace claim, with `cat` as the "server".
-    mod cluster {
+    pub(crate) mod cluster {
         use super::super::*;
 
         use k8s_openapi::api::core::v1::PersistentVolumeClaim;
@@ -468,19 +558,19 @@ mod tests {
         use std::time::Duration;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        async fn client() -> kube::Client {
+        pub(crate) async fn client() -> kube::Client {
             let _ = rustls::crypto::ring::default_provider().install_default();
             kube::Client::try_default().await.expect("KUBECONFIG must point at a reachable cluster")
         }
 
-        fn unique() -> i64 {
+        pub(crate) fn unique() -> i64 {
             let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
             (nanos % 1_000_000_000) as i64 + 3_000_000_000
         }
 
         /// A sandbox stand-in for conversation `id`, with its workspace
         /// claim. Deleted by `tear_down`.
-        async fn stand_in_sandbox(client: &kube::Client, id: i64) -> SandboxRef {
+        pub(crate) async fn stand_in_sandbox(client: &kube::Client, id: i64) -> SandboxRef {
             let pods = crate::sandbox::pods_api(client);
             let pvcs: kube::Api<PersistentVolumeClaim> = kube::Api::namespaced(client.clone(), pods_namespace(&pods));
             let claim: PersistentVolumeClaim = serde_json::from_value(json!({
@@ -527,7 +617,7 @@ mod tests {
             pods.namespace().expect("namespaced")
         }
 
-        async fn tear_down(client: &kube::Client, sandbox: &SandboxRef) {
+        pub(crate) async fn tear_down(client: &kube::Client, sandbox: &SandboxRef) {
             let pods = crate::sandbox::pods_api(client);
             let gone = DeleteParams { grace_period_seconds: Some(0), ..Default::default() };
             let _ = pods.delete(&sandbox.pod_name, &gone).await;
@@ -537,7 +627,7 @@ mod tests {
 
         /// Runs `body` with a stand-in sandbox, and tears it down whether
         /// or not the body panics.
-        async fn with_sandbox<F, Fut>(body: F)
+        pub(crate) async fn with_sandbox<F, Fut>(body: F)
         where
             F: FnOnce(kube::Client, SandboxRef) -> Fut,
             Fut: std::future::Future<Output = ()>,
@@ -622,6 +712,45 @@ mod tests {
             let error = result.expect_err("the install failed");
             assert!(error.contains("no such package") && error.contains('3'), "{error}");
             assert!(listed.is_empty(), "the failed server's pod was left: {listed:?}");
+            })
+            .await;
+        }
+
+        /// A server that runs out of memory takes only its own pod down
+        /// (the kernel kills the whole container): the sandbox keeps
+        /// running, the server shows as stopped, and starting it again
+        /// replaces the pod.
+        #[tokio::test]
+        async fn test_a_server_out_of_memory_leaves_the_sandbox_running() {
+            with_sandbox(|client, sandbox| async move {
+            let config = LanguageServerConfig {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "head -c 1G /dev/zero | tail".to_string()],
+                ..echo_server("hungry", "")
+            };
+            start_with(&client, &sandbox, &config, "v1").await.expect("start");
+            let pod_name = server_pod_name(sandbox.pod_id, "hungry");
+            let mut io = open_stdio(&client, &pod_name, &config).await.expect("stdio");
+            let mut rest = Vec::new();
+            tokio::time::timeout(Duration::from_secs(60), io.stdout.read_to_end(&mut rest))
+                .await
+                .expect("the server's output should end when it's killed")
+                .expect("read");
+
+            let mut state = None;
+            for _ in 0..120 {
+                state = list_with(&client, sandbox.conversation_id).await.expect("list").pop().map(|p| p.state);
+                if matches!(state, Some(ServerState::Stopped(_))) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            assert_eq!(state, Some(ServerState::Stopped(Some("OOMKilled".to_string()))));
+            let pods = crate::sandbox::pods_api(&client);
+            let sandbox_pod = pods.get(&sandbox.pod_name).await.expect("sandbox");
+            assert_eq!(sandbox_pod.status.and_then(|s| s.phase).as_deref(), Some("Running"));
+
+            assert_eq!(start_with(&client, &sandbox, &config, "v1").await, Ok(Started::Started));
             })
             .await;
         }

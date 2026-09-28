@@ -2844,3 +2844,9 @@ div.mcp-status-not-connected::before {
   align-items: center;
   gap: 6px;
 }
+
+/* A sandbox's language servers, under its row on /pods (SME-35). */
+.pods-table tr.pod-servers td {
+    padding-top: 0;
+    font-size: 0.9em;
+}

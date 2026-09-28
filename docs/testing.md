@@ -128,6 +128,12 @@ already gone.
 - Each test's checks run inside `catch_unwind`, so the pods and claim it made are deleted even when an assertion fails; a panic otherwise unwinds past the cleanup.
 - Run `scripts/build-sandbox-image.sh` after changing the agent (`src/bin/sandbox_agent.rs`) or `docker/sandbox/`: the pod runs the imported image, not the tree you just built.
 
+### Language servers (SME-35)
+
+- `src/lsp/pods.rs`'s cluster tests use a stand-in sandbox (the sandbox image, idle, with the conversation's workspace claim, `with_sandbox`, torn down even after a panic) and `cat` as the "server". `src/lsp/manager.rs`'s run the real rust-analyzer and pyright, configured from the catalog's own suggestion for the mason fixtures, so they pull `rust:1` and `node:22-slim` and download the servers: they need the network.
+- A fresh server answers before it has indexed: rust-analyzer returns partial references and `-32801 content modified` for a while. Ask until the answer has what you expect (`until_contains`) rather than asserting on the first one.
+- A server's out-of-memory kill takes its whole container (cgroup v2 kills the group), so the pod stops as `OOMKilled`; it isn't just the one process.
+
 ## Testing the Anthropic streaming client without the network
 
 `anthropic::stream::stream_anthropic_message` is tested against a mock upstream — a throwaway Axum server bound to an ephemeral port, with `ANTHROPIC_BASE_URL` pointed at it for the duration of the test:

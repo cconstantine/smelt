@@ -2961,11 +2961,14 @@ pub async fn watch_pods(pool: PgPool) {
     let mut listed = std::collections::HashSet::new();
     // Each pod's Docker sidecar restart count, see `note_docker_restarts`.
     let mut docker_restarts = HashMap::new();
+    // Server pods whose stop was seen, see `lsp::pods::note_server_stop`.
+    let mut stopped_servers = std::collections::HashSet::new();
     while let Some(event) = events.next().await {
         match event {
             Ok(watcher::Event::Init) => listed.clear(),
             Ok(watcher::Event::InitApply(pod)) => {
                 note_docker_restarts(&mut docker_restarts, &pod, true);
+                crate::lsp::pods::note_server_stop(&mut stopped_servers, &pod, true);
                 if let Some(pod_id) = watched_pod_id(&pod) {
                     if !pod_has_finished(&pod) {
                         listed.insert(pod_id);
@@ -2983,6 +2986,12 @@ pub async fn watch_pods(pool: PgPool) {
                 }
             }
             Ok(watcher::Event::Apply(pod)) if pod_has_finished(&pod) => {
+                if let Some(stopped) = crate::lsp::pods::note_server_stop(&mut stopped_servers, &pod, false) {
+                    let pool = pool.clone();
+                    tokio::spawn(async move {
+                        crate::api::chat::deliver_notice(&pool, stopped.conversation_id, stopped.notice).await;
+                    });
+                }
                 if let Some(pod_id) = watched_pod_id(&pod) {
                     close_after_grace(pool.clone(), pod_id);
                 }

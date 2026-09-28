@@ -135,10 +135,13 @@ pub async fn start(pool: &PgPool, client: &kube::Client, sandbox: &SandboxRef, n
         pods::stop_everywhere_in(client, sandbox.conversation_id, name).await?;
     }
     match pods::start_with(client, sandbox, config, version).await? {
-        pods::Started::Started => Ok(format!(
+        pods::Started::Started => {
+            forget_session(&pods::server_pod_name(sandbox.pod_id, name));
+            Ok(format!(
             "{name} is running. It takes {}; use the lsp tool on those files, and edits to them come back with diagnostics.",
             config.file_types.keys().map(|e| format!(".{e}")).collect::<Vec<_>>().join(" ")
-        )),
+            ))
+        }
         pods::Started::AlreadyRunning => Ok(format!("{name} is already running.")),
     }
 }
@@ -146,6 +149,13 @@ pub async fn start(pool: &PgPool, client: &kube::Client, sandbox: &SandboxRef, n
 /// Sessions by server pod name, and when each was (re)opened.
 static SESSIONS: std::sync::LazyLock<Mutex<HashMap<String, Arc<Session>>>> = std::sync::LazyLock::new(Default::default);
 static OPENED: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> = std::sync::LazyLock::new(Default::default);
+
+/// A new pod under `pod_name`: its old session (if any) is gone, and it
+/// gets a fresh reconnect budget.
+fn forget_session(pod_name: &str) {
+    SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).remove(pod_name);
+    OPENED.lock().unwrap_or_else(|e| e.into_inner()).remove(pod_name);
+}
 
 fn connect_lock(pod_name: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
@@ -289,6 +299,24 @@ fn request_error(config: &LanguageServerConfig, error: LspError) -> String {
     }
 }
 
+/// A request, asked again (a few times) when the server says the content
+/// changed under it or it cancelled it: it's still loading, and the LSP
+/// spec has the client retry.
+async fn request_retrying(session: &Session, method: &str, params: Value) -> Result<Value, LspError> {
+    const CONTENT_MODIFIED: i64 = -32801;
+    const SERVER_CANCELLED: i64 = -32802;
+    let mut attempts = 0;
+    loop {
+        match session.request(method, params.clone(), REQUEST_TIMEOUT).await {
+            Err(LspError::Server { code, .. }) if (code == CONTENT_MODIFIED || code == SERVER_CANCELLED) && attempts < 5 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(500 * attempts)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// The `lsp` tool.
 pub async fn operate(
     pool: &PgPool,
@@ -349,7 +377,7 @@ pub async fn operate(
     let request = |method: &'static str, params: Value| {
         let session = session.clone();
         let config = config.clone();
-        async move { session.request(method, params, REQUEST_TIMEOUT).await.map_err(|e| request_error(&config, e)) }
+        async move { request_retrying(&session, method, params).await.map_err(|e| request_error(&config, e)) }
     };
     let format_locations = |result: Value, files: HashMap<String, Vec<String>>| {
         ops::format_locations(&result, &mut |p, l| files.get(p).and_then(|lines| lines.get(l as usize).cloned()))
@@ -472,10 +500,13 @@ pub async fn diagnostics_after_edit(pool: &PgPool, conversation_id: i64, path: &
         return None;
     }
     let client = crate::sandbox::kube_client();
-    let client = &client;
-    let sandbox = &sandbox_ref(pool, client, conversation_id).await.ok()?;
+    let sandbox = sandbox_ref(pool, &client, conversation_id).await.ok()?;
+    edit_diagnostics(&config_list, &client, &sandbox, path).await
+}
+
+async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::Client, sandbox: &SandboxRef, path: &str) -> Option<String> {
     let running = ready_servers(client, sandbox).await.ok()?;
-    let config = ops::choose_server(path, &config_list, &running).ok()?.clone();
+    let config = ops::choose_server(path, config_list, &running).ok()?.clone();
     let pod_name = pods::server_pod_name(sandbox.pod_id, &config.name);
     let root = root_in_pod(client, &pod_name, path, &config.root_markers).await;
     let session = session_for(client, &pod_name, &config, &root).await.ok()?;
@@ -528,5 +559,179 @@ mod tests {
         let mut paths = Vec::new();
         paths_in(&result, &mut paths);
         assert_eq!(paths, vec!["/workspace/a.rs", "/workspace/b.rs", "/workspace/c.rs"]);
+    }
+}
+
+/// Real-cluster tests: servers from the catalog's own suggestions (the
+/// mason fixtures), next to a stand-in sandbox.
+#[cfg(test)]
+mod cluster {
+    use super::*;
+    use crate::lsp::pods::tests::cluster::with_sandbox;
+
+    const HELIX: &str = include_str!("fixtures/helix-languages-excerpt.toml");
+
+    async fn configure(pool: &PgPool, package_yaml: &str) -> LanguageServerConfig {
+        let mut config = crate::lsp::catalog::suggest(package_yaml, HELIX).expect("a suggestion").config;
+        config.memory_limit = "2Gi".to_string();
+        crate::lsp::config::save(pool, None, &config).await.expect("saved");
+        config
+    }
+
+    /// Writes `files` into the sandbox's workspace, their project (the
+    /// directory under `/workspace`) writable by the server.
+    async fn write_files(client: &kube::Client, sandbox: &SandboxRef, files: &[(&str, &str)]) {
+        for (path, content) in files {
+            let script = r#"mkdir -p "$(dirname "$1")" && cat > "$1" && chmod -R a+rwX "/workspace/$(echo "$1" | cut -d/ -f3)""#;
+            let result = crate::sandbox::exec_with(client, &sandbox.pod_name, "sandbox", &["sh", "-c", script, "_", path], Some(content.as_bytes()))
+                .await
+                .expect("exec");
+            assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        }
+    }
+
+    async fn read(client: &kube::Client, sandbox: &SandboxRef, path: &str) -> String {
+        crate::sandbox::exec_with(client, &sandbox.pod_name, "sandbox", &["cat", path], None).await.expect("exec").stdout
+    }
+
+    fn at(path: &str, line: u32, character: u32) -> OperationInput {
+        OperationInput { path: Some(path.to_string()), line: Some(line), character: Some(character), ..Default::default() }
+    }
+
+    /// Runs `operation` until its answer contains `expected` (the server
+    /// may still be indexing), for up to three minutes.
+    async fn until_contains(
+        pool: &PgPool,
+        client: &kube::Client,
+        sandbox: &SandboxRef,
+        operation: Operation,
+        input: &OperationInput,
+        expected: &str,
+    ) -> String {
+        let mut last = Err(String::new());
+        for _ in 0..60 {
+            last = operate(pool, client, sandbox, operation, input).await;
+            if last.as_ref().is_ok_and(|answer| answer.contains(expected)) {
+                return last.unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        panic!("{} never answered with {expected:?}; last: {last:?}", operation.name());
+    }
+
+    const MAIN: &str = "/workspace/demo/src/main.rs";
+    const SHAPES: &str = "/workspace/demo/src/shapes.rs";
+    const MAIN_RS: &str = "mod shapes;
+use shapes::{Shape, Square};
+
+fn total(shapes: &[&dyn Shape]) -> f64 {
+    shapes.iter().map(|s| s.area()).sum()
+}
+
+fn main() {
+    let square = Square { side: 2.0 };
+    println!(\"{}\", total(&[&square]));
+}
+";
+    const SHAPES_RS: &str = "pub trait Shape {
+    fn area(&self) -> f64;
+}
+
+pub struct Square {
+    pub side: f64,
+}
+
+impl Shape for Square {
+    fn area(&self) -> f64 {
+        self.side * self.side
+    }
+}
+";
+
+    /// rust-analyzer, installed as the catalog suggests: navigation across
+    /// files, calls, diagnostics (after an edit too), a rename's edits, and
+    /// a session that comes back after its server process dies.
+    #[sqlx::test]
+    async fn test_rust_analyzer_from_the_catalog_answers_across_files(pool: PgPool) {
+        let config = configure(&pool, include_str!("fixtures/mason-rust-analyzer.yaml")).await;
+        with_sandbox(|client, sandbox| async move {
+            write_files(&client, &sandbox, &[
+                ("/workspace/demo/Cargo.toml", "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+                (MAIN, MAIN_RS),
+                (SHAPES, SHAPES_RS),
+            ])
+            .await;
+
+            let started = start(&pool, &client, &sandbox, &config.name).await.expect("started");
+            assert!(started.contains("is running"), "{started}");
+            let listed = servers_summary(&pool, &client, Some(&sandbox)).await.expect("summary");
+            assert!(listed.contains("rust-analyzer: .rs (running)"), "{listed}");
+
+            // `Square` in main.rs is defined in shapes.rs.
+            let found = until_contains(&pool, &client, &sandbox, Operation::Definition, &at(MAIN, 9, 18), "shapes.rs").await;
+            assert!(found.contains("pub struct Square"), "{found}");
+
+            let refs = until_contains(&pool, &client, &sandbox, Operation::References, &at(SHAPES, 2, 8), "main.rs").await;
+            assert!(refs.contains("shapes.rs:10:"), "{refs}");
+
+            until_contains(&pool, &client, &sandbox, Operation::Implementation, &at(SHAPES, 1, 11), "impl Shape for Square").await;
+
+            until_contains(&pool, &client, &sandbox, Operation::IncomingCalls, &at(MAIN, 4, 4), "main.rs").await;
+
+            // A type error, seen by diagnostics, and after an edit.
+            let broken = MAIN_RS.replace("let square", "let wrong: i32 = \"no\";\n    let square");
+            write_files(&client, &sandbox, &[(MAIN, &broken)]).await;
+            let problems = until_contains(&pool, &client, &sandbox, Operation::Diagnostics, &at(MAIN, 1, 1), "error").await;
+            assert!(problems.contains("let wrong"), "the problem's line is shown: {problems}");
+            let after_edit = edit_diagnostics(&[config.clone()], &client, &sandbox, MAIN).await.expect("a running server answers");
+            assert!(after_edit.starts_with("rust-analyzer"), "{after_edit}");
+            write_files(&client, &sandbox, &[(MAIN, MAIN_RS)]).await;
+
+            // A rename edits both files.
+            let renamed = operate(&pool, &client, &sandbox, Operation::Rename, &OperationInput { new_name: Some("sum_areas".to_string()), ..at(MAIN, 4, 4) })
+                .await
+                .expect("rename");
+            assert!(renamed.contains("Renamed to sum_areas"), "{renamed}");
+            let main = read(&client, &sandbox, MAIN).await;
+            assert!(main.contains("fn sum_areas(") && main.contains("sum_areas(&[&square])"), "{main}");
+
+            // The server process dies; the next request reconnects.
+            let pod_name = pods::server_pod_name(sandbox.pod_id, &config.name);
+            let killed = crate::sandbox::exec_with(&client, &pod_name, "server", &["sh", "-c", "kill $(pidof rust-analyzer)"], None).await.expect("kill");
+            assert_eq!(killed.exit_code, 0, "{}", killed.stderr);
+            let session = SESSIONS.lock().unwrap().get(&pod_name).cloned().expect("a session");
+            for _ in 0..50 {
+                if session.is_closed() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(session.is_closed(), "the session sees its server die");
+            until_contains(&pool, &client, &sandbox, Operation::Definition, &at(MAIN, 9, 18), "shapes.rs").await;
+        })
+        .await;
+    }
+
+    /// pyright, installed with npm as the catalog suggests: a definition
+    /// in another module, and a type error.
+    #[sqlx::test]
+    async fn test_pyright_from_the_catalog_answers(pool: PgPool) {
+        let config = configure(&pool, include_str!("fixtures/mason-pyright.yaml")).await;
+        with_sandbox(|client, sandbox| async move {
+            let app = "/workspace/py/app.py";
+            write_files(&client, &sandbox, &[
+                ("/workspace/py/pyproject.toml", "[project]\nname = \"py\"\n"),
+                ("/workspace/py/shapes.py", "def area(side: float) -> float:\n    return side * side\n"),
+                (app, "from shapes import area\n\nprint(area(2.0))\nwrong: int = \"no\"\n"),
+            ])
+            .await;
+            start(&pool, &client, &sandbox, &config.name).await.expect("started");
+
+            let found = until_contains(&pool, &client, &sandbox, Operation::Definition, &at(app, 3, 7), "shapes.py").await;
+            assert!(found.contains("def area"), "{found}");
+            let problems = until_contains(&pool, &client, &sandbox, Operation::Diagnostics, &at(app, 1, 1), "error").await;
+            assert!(problems.contains("wrong: int"), "{problems}");
+        })
+        .await;
     }
 }
