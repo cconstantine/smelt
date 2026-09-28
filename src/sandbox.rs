@@ -278,6 +278,23 @@ fn volume_mounts_for(volumes: &[db::SandboxVolume]) -> (Vec<Volume>, Vec<VolumeM
 /// matters in practice: a plain `sleep infinity` container doesn't trap
 /// `SIGTERM`, so a default-grace-period delete leaves the pod `Terminating`
 /// for the full grace period before it actually disappears.
+/// How long a deleted pod's containers get to stop. dockerd needs it to stop
+/// its containers (its own shutdown timeout is 15s), and until then
+/// Kubernetes keeps listing the pod, which is what lets the next `create_pod`
+/// wait for it rather than mount the Docker claim alongside a dockerd that's
+/// still writing to it (SME-51 B6).
+const POD_DELETE_GRACE_SECS: u32 = 20;
+
+/// Every delete of a sandbox pod smelt makes.
+fn pod_delete_params() -> DeleteParams {
+    DeleteParams {
+        grace_period_seconds: Some(POD_DELETE_GRACE_SECS),
+        ..Default::default()
+    }
+}
+
+/// Tests' own cleanup, which needs nothing to stop cleanly.
+#[cfg(test)]
 fn immediate_delete_params() -> DeleteParams {
     DeleteParams {
         grace_period_seconds: Some(0),
@@ -629,7 +646,7 @@ impl SandboxManager {
                 // pod name deterministically (as `sandbox_volume_pvc_name`
                 // does; see `test_terminal_lifecycle_end_to_end`'s own
                 // precheck) collides with it on every subsequent attempt.
-                pods.delete(&name, &immediate_delete_params()).await.ok();
+                pods.delete(&name, &pod_delete_params()).await.ok();
             }
             return Err(e);
         }
@@ -649,7 +666,7 @@ impl SandboxManager {
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn delete(&self, sandbox: Sandbox) -> Result<(), SandboxError> {
         let pods = pods_api(&self.client);
-        pods.delete(&sandbox.pod_name, &immediate_delete_params())
+        pods.delete(&sandbox.pod_name, &pod_delete_params())
             .await?;
         // Disarms Drop: safe to skip since none of Sandbox's fields have
         // meaningful Drop side effects of their own (a String, a
@@ -1259,7 +1276,7 @@ async fn drain_cleanup_queue(client: kube::Client, mut rx: mpsc::UnboundedReceiv
     while let Some(name) = rx.recv().await {
         match tokio::time::timeout(
             Duration::from_secs(30),
-            pods.delete(&name, &immediate_delete_params()),
+            pods.delete(&name, &pod_delete_params()),
         )
         .await
         {
@@ -1954,7 +1971,7 @@ async fn force_terminate_pod(
     let name = pod_name(pod_id);
     let pods = pods_api(&manager.client);
     if pods.get_opt(&name).await?.is_some() {
-        pods.delete(&name, &immediate_delete_params()).await?;
+        pods.delete(&name, &pod_delete_params()).await?;
     }
 
     let row = db::terminate_sandbox_pod(pool, pod_id)
@@ -2322,7 +2339,7 @@ async fn teardown_conversation_with(client: &kube::Client, conversation_id: i64)
                     deregister(pod_id);
                 }
                 let Some(name) = pod.metadata.name else { continue };
-                if let Err(e) = pods.delete(&name, &immediate_delete_params()).await {
+                if let Err(e) = pods.delete(&name, &pod_delete_params()).await {
                     tracing::warn!(pod = %name, error = %e, "failed to delete pod during conversation teardown");
                 }
             }
@@ -4935,9 +4952,13 @@ mod tests {
         let name = sandbox.pod_name.clone();
         std::mem::forget(sandbox);
 
-        pods.delete(&name, &DeleteParams { grace_period_seconds: Some(5), ..Default::default() })
+        // The same delete production makes (SME-51 B6): a forced one (grace
+        // 0) removes the pod object at once while dockerd is still
+        // stopping, and the wait below would see nothing to wait for.
+        pods.delete(&name, &pod_delete_params())
             .await
             .expect("start deleting the pod");
+        let listed_while_stopping = pods.get_opt(&name).await.expect("get pod").is_some();
         let waited =
             wait_for_conversation_pods_gone(&client, conversation_id, Duration::from_secs(60)).await;
         let still_there = pods.get_opt(&name).await.expect("get pod").is_some();
@@ -4948,6 +4969,7 @@ mod tests {
         }
         pvc_api(&client).delete(&docker_pvc_name(conversation_id), &DeleteParams::default()).await.ok();
 
+        assert!(listed_while_stopping, "the delete removed {name} before its containers stopped");
         assert!(waited.is_ok(), "the wait should finish once the pod is gone: {waited:?}");
         assert!(!still_there, "the wait returned while {name} was still stopping");
     }
@@ -6090,8 +6112,13 @@ mod tests {
                 "should give up as NoTerminal once reconnect attempts are exhausted, got {:?}",
                 gave_up.is_ok()
             );
-            let pod_g_gone = pods_api(&client).get_opt(&pod_name(pod_g)).await.expect("get_opt");
-            assert!(pod_g_gone.is_none(), "exhausting reconnect attempts should force-terminate the k8s pod");
+            // Deleted, though this agentless pod's `sleep` may take its grace
+            // period to stop (SME-51 B6).
+            let pod_g_now = pods_api(&client).get_opt(&pod_name(pod_g)).await.expect("get_opt");
+            assert!(
+                pod_g_now.is_none_or(|p| p.metadata.deletion_timestamp.is_some()),
+                "exhausting reconnect attempts should delete the k8s pod"
+            );
             let recreated = create_pod(&pool, conversation_g.id, PodLimitOverrides::default()).await;
             assert!(
                 recreated.is_ok(),
@@ -6745,15 +6772,16 @@ mod tests {
             .await
             .expect("delete should succeed");
 
+        // Pods are deleted with a grace period (SME-51 B6), and the agent
+        // exits on SIGTERM, so the pod goes well within it.
         let pods = pods_api(&client);
-        let still_there = pods
-            .get_opt(&pod_name)
-            .await
-            .expect("get_opt should not error");
-        assert!(
-            still_there.is_none(),
-            "pod should be gone immediately after manager.delete returns Ok"
-        );
+        let gone = tokio::time::timeout(Duration::from_secs(10), async {
+            while pods.get_opt(&pod_name).await.expect("get_opt should not error").is_some() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await;
+        assert!(gone.is_ok(), "the pod should stop within seconds of manager.delete, not wait out its grace");
     }
 
     #[tokio::test]
