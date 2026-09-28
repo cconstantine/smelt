@@ -586,9 +586,13 @@ pub(crate) mod tests {
             kube::Client::try_default().await.expect("KUBECONFIG must point at a reachable cluster")
         }
 
+        /// A conversation id no other test run is using: the time (so runs
+        /// don't meet leftovers from earlier ones) plus a count (so tests
+        /// started at once in this run never share one).
         pub(crate) fn unique() -> i64 {
-            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-            (nanos % 1_000_000_000) as i64 + 3_000_000_000
+            static COUNT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+            3_000_000_000 + (seconds % 1_000_000) * 1_000 + COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % 1_000
         }
 
         /// A sandbox stand-in for conversation `id`, with its workspace
