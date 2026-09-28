@@ -205,3 +205,8 @@ required-features = ["server"]
 name = "sandbox_image_import"
 path = "src/bin/sandbox_image_import.rs"
 required-features = ["server"]
+
+[dev-dependencies]
+# Paused time in tests (`#[tokio::test(start_paused = true)]`), for timeouts
+# too long to wait out (SME-35's 120 s `initialize`).
+tokio = { version = "1", features = ["test-util"] }

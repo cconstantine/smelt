@@ -755,6 +755,47 @@ pub(crate) mod tests {
             .await;
         }
 
+        /// Closing a server's stdin over `pods/exec` reaches the process in
+        /// its pod, whether the stream is shut down or just dropped: that's
+        /// how a language server is told to exit.
+        #[tokio::test]
+        async fn test_closing_a_servers_stdin_reaches_it() {
+            with_sandbox(|client, sandbox| async move {
+            let config = |marker: &str| LanguageServerConfig {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), format!("cat > /dev/null; touch /tmp/{marker}")],
+                ..echo_server("reader", "")
+            };
+            start_with(&client, &sandbox, &config("x"), "v1").await.expect("start");
+            let pod_name = server_pod_name(sandbox.pod_id, "reader");
+            let exists = |marker: &'static str| {
+                let client = client.clone();
+                let pod_name = pod_name.clone();
+                async move {
+                    for _ in 0..40 {
+                        let found = crate::sandbox::exec_with(&client, &pod_name, "server", &["test", "-e", &format!("/tmp/{marker}")], None)
+                            .await
+                            .expect("exec");
+                        if found.exit_code == 0 {
+                            return true;
+                        }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    false
+                }
+            };
+
+            let mut io = open_stdio(&client, &pod_name, &config("shut")).await.expect("stdio");
+            io.stdin.shutdown().await.expect("shutdown");
+            assert!(exists("shut").await, "shutting stdin down should end the server");
+
+            let io = open_stdio(&client, &pod_name, &config("dropped")).await.expect("stdio");
+            drop(io);
+            assert!(exists("dropped").await, "dropping the stream should end the server");
+            })
+            .await;
+        }
+
         /// Deleting a server's config stops its pods everywhere.
         #[tokio::test]
         async fn test_stopping_a_server_everywhere_deletes_its_pods() {

@@ -70,6 +70,17 @@ pub struct LspClient {
     pending: Pending,
     next_id: AtomicI64,
     closed: Arc<AtomicBool>,
+    /// The read loop, stopped with the client: it holds the writer too, so
+    /// while it runs the server's stdin stays open and the server with it.
+    reading: tokio::task::AbortHandle,
+}
+
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        // With the read loop gone, the last handle on the writer goes with
+        // the client, which closes the server's stdin.
+        self.reading.abort();
+    }
 }
 
 /// The bytes of one message: a `Content-Length` header, then the JSON.
@@ -117,20 +128,21 @@ impl LspClient {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let client = LspClient {
-            writer: Arc::new(tokio::sync::Mutex::new(Box::new(writer))),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicI64::new(1),
-            closed: Arc::new(AtomicBool::new(false)),
-        };
-        tokio::spawn(read_loop(
-            reader,
-            client.writer.clone(),
-            client.pending.clone(),
-            client.closed.clone(),
-            handler,
-        ));
-        client
+        let writer: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Send + Unpin>>> =
+            Arc::new(tokio::sync::Mutex::new(Box::new(writer)));
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+        let reading = tokio::spawn(read_loop(reader, writer.clone(), pending.clone(), closed.clone(), handler)).abort_handle();
+        LspClient { writer, pending, next_id: AtomicI64::new(1), closed, reading }
+    }
+
+    /// Ends the connection: closes the server's stdin (a language server
+    /// exits when it ends) and fails every waiting request.
+    pub async fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.reading.abort();
+        let _ = self.writer.lock().await.shutdown().await;
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Whether the connection has ended.

@@ -126,7 +126,7 @@ impl Session {
         let heard = Arc::new(Heard::default());
         let client = LspClient::start(reader, writer, handler(heard.clone(), config.settings.clone(), root));
         let folder = json!({"uri": file_uri(root), "name": root.rsplit('/').next().unwrap_or("workspace")});
-        let result = client
+        let result = match client
             .request(
                 "initialize",
                 json!({
@@ -140,7 +140,16 @@ impl Session {
                 }),
                 INITIALIZE_TIMEOUT,
             )
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                // Close it, or the server keeps running beside the next
+                // attempt's.
+                client.close().await;
+                return Err(e);
+            }
+        };
         client.notify("initialized", json!({})).await?;
         if let Some(settings) = &config.settings {
             client.notify("workspace/didChangeConfiguration", json!({"settings": settings})).await?;
@@ -421,6 +430,21 @@ mod tests {
         let (client_out, from_client) = duplex(1 << 16);
         let (to_client, client_in) = duplex(1 << 16);
         (client_in, client_out, StandIn { from_client, to_client, buffer: Vec::new() })
+    }
+
+    /// A server that never answers `initialize` has its stdin closed when
+    /// the open gives up, so it exits rather than running on unused (a
+    /// retry would otherwise start a second copy beside it).
+    #[tokio::test(start_paused = true)]
+    async fn test_a_failed_open_closes_the_servers_stdin() {
+        let (reader, writer, mut server) = connect();
+        let opening = tokio::spawn(Session::open(reader, writer, config(None), "/workspace"));
+        assert_eq!(server.next().await["method"], "initialize");
+        let failed = opening.await.unwrap();
+        assert!(matches!(failed, Err(LspError::Timeout(_))), "{:?}", failed.err());
+        assert_eq!(server.next().await["method"], "$/cancelRequest");
+        let rest = tokio::time::timeout(Duration::from_secs(5), read_message(&mut server.from_client, &mut server.buffer)).await;
+        assert!(matches!(rest, Ok(None)), "the server's stdin should be closed: {rest:?}");
     }
 
     #[tokio::test]
