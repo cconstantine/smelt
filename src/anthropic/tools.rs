@@ -1315,6 +1315,7 @@ mod server {
                 status: "running".to_string(),
                 stream: None,
                 latest_output: None,
+                position: None,
             },
         );
 
@@ -1333,18 +1334,21 @@ mod server {
     /// pushes the line to the conversation as a real turn via
     /// `chat::run_turn`, the expensive, model-facing path.
     async fn record_task_line(task_id: &str, stream: Stream, line: String) {
-        let Some((conversation_id, tool, stream_output, pool)) = ({
+        let Some((conversation_id, tool, stream_output, pool, position)) = ({
             let mut tasks = lock_tasks();
             tasks.get_mut(task_id).map(|task| {
-                match stream {
-                    Stream::Stdout => task.stdout.push(line.clone()),
-                    Stream::Stderr => task.stderr.push(line.clone()),
-                }
+                let lines = match stream {
+                    Stream::Stdout => &mut task.stdout,
+                    Stream::Stderr => &mut task.stderr,
+                };
+                let position = lines.len() as i64;
+                lines.push(line.clone());
                 (
                     task.conversation_id,
                     task.tool.clone(),
                     task.stream_output,
                     task.pool.clone(),
+                    position,
                 )
             })
         }) else {
@@ -1359,6 +1363,7 @@ mod server {
                 status: "running".to_string(),
                 stream: Some(stream.label().to_string()),
                 latest_output: Some(line.clone()),
+                position: Some(position),
             },
         );
 
@@ -1435,6 +1440,7 @@ mod server {
                 status: status.to_string(),
                 stream: None,
                 latest_output: None,
+                position: None,
             },
         );
 
@@ -1869,6 +1875,7 @@ mod server {
                 exit_code: None,
                 stream: None,
                 latest_output: None,
+                position: None,
             },
         );
 

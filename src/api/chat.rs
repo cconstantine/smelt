@@ -1256,6 +1256,25 @@ fn run_turn_bounded<'a>(
     })
 }
 
+/// Adds `delta` to `conversation_id`'s reply so far and publishes it with
+/// its offset. Both happen under the lock `get_reply_in_progress` reads
+/// through, so a tab's fetched text and the offsets it then receives
+/// agree (SME-51 B3).
+#[cfg(feature = "server")]
+fn relay_reply_delta(conversation_id: i64, delta: &str) {
+    let mut replies = REPLIES_IN_PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+    let reply = replies.entry(conversation_id).or_default();
+    let offset = reply.len();
+    reply.push_str(delta);
+    crate::events::publish(
+        conversation_id,
+        crate::events::ConversationEvent::ReplyDelta {
+            text: delta.to_string(),
+            offset,
+        },
+    );
+}
+
 /// The error a stopped turn ends with. Not server-only: the chat page
 /// recognizes it to show "Stopped." instead of an error.
 pub const TURN_STOPPED: &str = "stopped by the user";
@@ -1444,18 +1463,7 @@ fn run_turn_body<'a>(
             // Every tab watching streams the reply: the text so far is kept
             // for a tab that connects mid-reply, and each delta published.
             let mut relay = |delta: &str| {
-                REPLIES_IN_PROGRESS
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .entry(conversation_id)
-                    .or_default()
-                    .push_str(delta);
-                crate::events::publish(
-                    conversation_id,
-                    crate::events::ConversationEvent::ReplyDelta {
-                        text: delta.to_string(),
-                    },
-                );
+                relay_reply_delta(conversation_id, delta);
                 if let Some(cb) = on_delta.as_deref_mut() {
                     cb(delta);
                 }
@@ -1622,6 +1630,8 @@ pub async fn get_todos(id: i64) -> ServerFnResult<Vec<anthropic::tools::TodoItem
 pub struct SandboxOutputLine {
     pub stream: String,
     pub data: String,
+    /// The agent's per-command `seq` (see `SandboxCommandUpdate::position`).
+    pub seq: i64,
 }
 
 /// One terminal's current/most recent command, hydrated for the sandbox
@@ -1724,6 +1734,7 @@ async fn fetch_command_summary(
             .map(|line| SandboxOutputLine {
                 stream: line.stream,
                 data: line.data,
+                seq: line.seq,
             })
             .collect(),
     })
@@ -2373,6 +2384,24 @@ mod tests {
         );
     }
 
+    /// SME-51 B3: each delta says where it starts, measured against the
+    /// same text `get_reply_in_progress` returns.
+    #[tokio::test]
+    async fn test_reply_deltas_carry_their_offset_in_the_reply_so_far() {
+        let conversation_id = 9_000_000_052;
+        let mut rx = events::subscribe(conversation_id);
+        relay_reply_delta(conversation_id, "héllo ");
+        relay_reply_delta(conversation_id, "world");
+        let mut offsets = Vec::new();
+        while let Ok(events::ConversationEvent::ReplyDelta { offset, .. }) = rx.try_recv() {
+            offsets.push(offset);
+        }
+        assert_eq!(offsets, vec![0, "héllo ".len()]);
+        assert_eq!(reply_in_progress(conversation_id).as_deref(), Some("héllo world"));
+        clear_reply_in_progress(conversation_id);
+        events::forget(conversation_id);
+    }
+
     /// SME-51 B3: a tab that falls behind loses events it can't get back
     /// (a saved message, the turn ending). Its stream ends instead, so the
     /// tab reconnects and pulls the current state again.
@@ -2385,7 +2414,7 @@ mod tests {
         for i in 0..2_000 {
             events::publish(
                 conversation_id,
-                events::ConversationEvent::ReplyDelta { text: format!("{i} ") },
+                events::ConversationEvent::ReplyDelta { text: format!("{i} "), offset: 0 },
             );
         }
         let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -3839,7 +3868,7 @@ mod tests {
             .into_iter()
             .filter_map(|event| match event {
                 events::ConversationEvent::ReplyReset {} => Some("<reset>".to_string()),
-                events::ConversationEvent::ReplyDelta { text } => Some(text),
+                events::ConversationEvent::ReplyDelta { text, .. } => Some(text),
                 _ => None,
             })
             .collect();

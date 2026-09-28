@@ -3171,6 +3171,7 @@ async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, tex
                             exit_code: Some(code),
                             stream: None,
                             latest_output: None,
+                            position: None,
                         },
                     );
                 }
@@ -3308,6 +3309,7 @@ async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, tex
                     exit_code: None,
                     stream: Some(stream),
                     latest_output: Some(data),
+                    position: Some(seq),
                 },
             );
         }
