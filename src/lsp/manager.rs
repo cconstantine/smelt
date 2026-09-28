@@ -463,14 +463,16 @@ pub async fn operate(
             }
             Operation::Hover => ops::format_hover(&request("textDocument/hover", position()?).await?),
             Operation::DocumentSymbols => {
-                let (path, _, _) = file.as_ref().expect("a path");
+                let (path, text, _) = file.as_ref().expect("a path");
                 let result = request("textDocument/documentSymbol", json!({"textDocument": {"uri": session::file_uri(path)}})).await?;
-                ops::format_symbols(&result, &mut |_, _| None)
+                let lines: Vec<&str> = text.lines().collect();
+                ops::format_symbols(&result, Some(path), &mut |_, l| lines.get(l as usize).map(|s| s.to_string()))
             }
             Operation::WorkspaceSymbols => {
                 let query = input.query.clone().unwrap_or_default();
                 let result = request("workspace/symbol", json!({"query": query})).await?;
-                ops::format_symbols(&result, &mut |_, _| None)
+                let files = source_lines(client, &pod_name, &result).await;
+                ops::format_symbols(&result, None, &mut |p, l| files.get(p).and_then(|lines| lines.get(l as usize).cloned()))
             }
             Operation::Diagnostics => {
                 let (path, text, version) = file.as_ref().expect("a path");

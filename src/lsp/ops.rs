@@ -186,20 +186,25 @@ fn symbol_kind(kind: u64) -> &'static str {
     KINDS.get(kind as usize).copied().unwrap_or("symbol")
 }
 
-/// `DocumentSymbol[]` (nested) or `SymbolInformation[]`/`WorkspaceSymbol[]`
-/// as one symbol a line.
-pub fn format_symbols(value: &Value, source_line: &mut dyn FnMut(&str, u32) -> Option<String>) -> String {
-    let _ = source_line;
-    fn nested(symbols: &[Value], depth: usize, out: &mut Vec<String>) {
+/// `DocumentSymbol[]` (nested, from `document`) or
+/// `SymbolInformation[]`/`WorkspaceSymbol[]` as one symbol a line, with
+/// 1-based characters where `source_line` has the line.
+pub fn format_symbols(value: &Value, document: Option<&str>, source_line: &mut dyn FnMut(&str, u32) -> Option<String>) -> String {
+    // A 1-based character for a UTF-16 column, where the line can be read.
+    let mut character = |path: &str, line: u32, column: u32| match source_line(path, line) {
+        Some(text) => from_utf16(&text, column),
+        None => column + 1,
+    };
+    fn nested(symbols: &[Value], depth: usize, out: &mut Vec<String>, character: &mut dyn FnMut(u32, u32) -> u32) {
         for symbol in symbols {
             let name = symbol.get("name").and_then(Value::as_str).unwrap_or("?");
             let kind = symbol_kind(symbol.get("kind").and_then(Value::as_u64).unwrap_or(0));
             let start = symbol.get("selectionRange").or_else(|| symbol.get("range")).and_then(|r| r.get("start"));
-            let line = start.and_then(|s| s.get("line")).and_then(Value::as_u64).unwrap_or(0) + 1;
-            let column = start.and_then(|s| s.get("character")).and_then(Value::as_u64).unwrap_or(0) + 1;
-            out.push(format!("{}{kind} {name}  {line}:{column}", "  ".repeat(depth)));
+            let line = start.and_then(|s| s.get("line")).and_then(Value::as_u64).unwrap_or(0) as u32;
+            let column = start.and_then(|s| s.get("character")).and_then(Value::as_u64).unwrap_or(0) as u32;
+            out.push(format!("{}{kind} {name}  {}:{}", "  ".repeat(depth), line + 1, character(line, column)));
             if let Some(children) = symbol.get("children").and_then(Value::as_array) {
-                nested(children, depth + 1, out);
+                nested(children, depth + 1, out, character);
             }
         }
     }
@@ -214,12 +219,13 @@ pub fn format_symbols(value: &Value, source_line: &mut dyn FnMut(&str, u32) -> O
             let place = symbol
                 .get("location")
                 .and_then(location_parts)
-                .map(|(path, line, column)| format!("{path}:{}:{}", line + 1, column + 1))
+                .map(|(path, line, column)| format!("{path}:{}:{}", line + 1, character(&path, line, column)))
                 .unwrap_or_default();
             lines.push(format!("{kind} {name}  {place}"));
         }
     } else {
-        nested(symbols, 0, &mut lines);
+        let document = document.unwrap_or_default();
+        nested(symbols, 0, &mut lines, &mut |line, column| character(document, line, column));
     }
     capped(lines)
 }
@@ -467,15 +473,31 @@ mod tests {
         assert_eq!(format_hover(&json!(null)), "No hover information here.");
     }
 
+    /// Symbol columns are characters, as the tool takes them, not UTF-16
+    /// units: they differ after an emoji.
+    #[test]
+    fn test_symbol_columns_are_characters() {
+        let line = "let s = \"\u{1F600}\"; fn after() {}";
+        let character = line.chars().position(|c| c == 'a').unwrap() as u32 + 1;
+        let units = to_utf16(line, character);
+        assert_ne!(units + 1, character, "the emoji makes them differ");
+        let range = json!({"start": {"line": 0, "character": units}, "end": {"line": 0, "character": units + 5}});
+        let mut lines = |_: &str, n: u32| (n == 0).then(|| line.to_string());
+        let nested = json!([{"name": "after", "kind": 12, "range": range, "selectionRange": range}]);
+        assert_eq!(format_symbols(&nested, Some("/workspace/a.rs"), &mut lines), format!("function after  1:{character}"));
+        let flat = json!([{"name": "after", "kind": 12, "location": {"uri": "file:///workspace/a.rs", "range": range}}]);
+        assert_eq!(format_symbols(&flat, None, &mut lines), format!("function after  /workspace/a.rs:1:{character}"));
+    }
+
     #[test]
     fn test_symbols_read_one_to_a_line_nested_or_flat() {
         let nested = json!([{"name": "Config", "kind": 23, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 1}},
             "selectionRange": {"start": {"line": 0, "character": 7}, "end": {"line": 0, "character": 13}},
             "children": [{"name": "new", "kind": 6, "range": {"start": {"line": 2, "character": 4}, "end": {"line": 4, "character": 5}},
                 "selectionRange": {"start": {"line": 2, "character": 11}, "end": {"line": 2, "character": 14}}}]}]);
-        assert_eq!(format_symbols(&nested, &mut |_, _| None), "struct Config  1:8\n  method new  3:12");
+        assert_eq!(format_symbols(&nested, Some("/workspace/a.rs"), &mut |_, _| None), "struct Config  1:8\n  method new  3:12");
         let flat = json!([{"name": "helper", "kind": 12, "location": {"uri": "file:///workspace/a.rs", "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 9}}}}]);
-        assert_eq!(format_symbols(&flat, &mut |_, _| None), "function helper  /workspace/a.rs:1:4");
+        assert_eq!(format_symbols(&flat, None, &mut |_, _| None), "function helper  /workspace/a.rs:1:4");
     }
 
     #[test]
