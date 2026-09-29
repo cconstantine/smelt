@@ -1720,14 +1720,30 @@ fn registry_contains(pod_id: i64) -> bool {
     registry().connections.contains_key(&pod_id)
 }
 
-/// Makes `conn` the pod's connection, unless the pod was torn down.
-fn register(pod_id: i64, conn: Arc<TerminalConnection>) -> bool {
+/// Why `register` refused a connection.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    TornDown,
+    /// Its socket already closed. Its reader, finding it unregistered,
+    /// took that for a deliberate teardown and won't reconnect, so a
+    /// registered dead connection would never be replaced.
+    Ended,
+}
+
+/// Makes `conn` the pod's connection, unless the pod was torn down or the
+/// connection has already ended. Checked under the registry's lock, and the
+/// reader fails its waiters before it looks in the registry, so a
+/// connection either is refused here or is found there by its reader.
+fn register(pod_id: i64, conn: Arc<TerminalConnection>) -> Result<(), Refused> {
     let mut registry = registry();
     if registry.torn_down.contains(&pod_id) {
-        return false;
+        return Err(Refused::TornDown);
+    }
+    if conn.pending.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        return Err(Refused::Ended);
     }
     registry.connections.insert(pod_id, conn);
-    true
+    Ok(())
 }
 
 /// The pod is being torn down: close its connection, and keep any connect
@@ -2795,17 +2811,23 @@ fn connect_with_retry(
 
         let mut last_err = None;
         for attempt in 0..RECONNECT_ATTEMPTS {
-            match connect(pool.clone(), pod_id, dialer.clone()).await {
-                Ok(conn) => {
-                    if !register(pod_id, conn.clone()) {
+            let failure = match connect(pool.clone(), pod_id, dialer.clone()).await {
+                Ok(conn) => match register(pod_id, conn.clone()) {
+                    Ok(()) => return Ok(conn),
+                    Err(Refused::TornDown) => {
                         // Torn down while this connected: a teardown doesn't
                         // wait for the lock.
                         conn.close();
                         return Err(TerminalError::NoPod);
                     }
-                    return Ok(conn);
-                }
-                Err(ConnectError::Outdated { found, certain }) => {
+                    Err(Refused::Ended) => ConnectError::Failed(SandboxError::WebSocket(
+                        tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+                    )),
+                },
+                Err(e) => e,
+            };
+            match failure {
+                ConnectError::Outdated { found, certain } => {
                     tracing::warn!(pod_id, ?found, certain, "the sandbox agent is outdated");
                     // Silence might be a slow link rather than an old agent,
                     // so only a message that says so is remembered.
@@ -2814,7 +2836,7 @@ fn connect_with_retry(
                     }
                     return Err(TerminalError::AgentOutdated { found });
                 }
-                Err(ConnectError::Failed(e)) => {
+                ConnectError::Failed(e) => {
                     tracing::info!(pod_id, attempt, error = %e, "couldn't connect to the sandbox agent");
                     if mode == ConnectMode::Reconnect {
                         if let Some(reason) = dialer.death_reason(pod_id).await {
@@ -7610,6 +7632,30 @@ mod agent_connection_tests {
         let conn = reconnect_if_needed(&pool, pod_id).await;
         assert!(conn.is_ok(), "the pod is unusable after a failed teardown: {:?}", conn.map(|_| ()));
         assert!(registry_contains(pod_id));
+    }
+
+    /// A connection whose socket closed before `connect_with_retry` got to
+    /// register it isn't registered: its reader has already given up on it,
+    /// and nothing would ever replace it.
+    #[sqlx::test]
+    async fn test_a_connection_that_already_ended_is_not_registered(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
+        let conn = connect(pool.clone(), pod_id, dialer_for(pod_id)).await.expect("connects");
+        let fake = agent.next_connection().await;
+        let _ = fake.send.send(Out::Close);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while conn.request(|request_id| ClientMessage::ListDirectory { request_id, path: "/".into() }).await
+                != Err(AgentRequestError::Disconnected)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the reader never noticed the close");
+
+        assert!(register(pod_id, conn).is_err(), "a connection that already ended was registered");
+        assert!(!registry_contains(pod_id));
     }
 
     /// A page load doesn't wait behind a connect that's already under way.
