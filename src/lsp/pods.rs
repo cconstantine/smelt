@@ -622,7 +622,11 @@ pub(crate) mod tests {
                 return Err(format!("creating the claim: {e}"));
             }
             let name = format!("sandbox-lsp-test-{id}");
+            let mut guard = StandInGuard { name: name.clone(), claim_name: claim_name.clone(), armed: true };
             let started = start_stand_in(&pods, &name, id, image, &claim_name, wait).await;
+            // Finished, either way: a success is the caller's to tear down,
+            // and a failure is cleaned up just below, where it can report.
+            guard.armed = false;
             if let Err(e) = started {
                 // The caller never gets a `SandboxRef` to tear down, so this
                 // has to, however it failed: on SME-53, every failed run left
@@ -644,6 +648,63 @@ pub(crate) mod tests {
                 });
             }
             started
+        }
+
+        /// Deletes a stand-in's pod and claim if it's dropped while armed:
+        /// when `stand_in_sandbox_with`'s future is dropped part-way, by a
+        /// caller that gave up or a panic that took its runtime down. `Drop`
+        /// can't await, and the runtime dropping it may be shutting down, so
+        /// the deletes run on a thread with a runtime and client of its own
+        /// (a client only works on the runtime it was made on), and `drop`
+        /// waits for them.
+        struct StandInGuard {
+            name: String,
+            claim_name: String,
+            armed: bool,
+        }
+
+        impl Drop for StandInGuard {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                let name = std::mem::take(&mut self.name);
+                let claim_name = std::mem::take(&mut self.claim_name);
+                let cleanup = std::thread::spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                        Ok(runtime) => runtime,
+                        Err(e) => {
+                            eprintln!("stand-in cleanup: no runtime ({e}); delete pod {name} and claim {claim_name} by hand");
+                            return;
+                        }
+                    };
+                    runtime.block_on(async {
+                        let _ = rustls::crypto::ring::default_provider().install_default();
+                        let client = match kube::Client::try_default().await {
+                            Ok(client) => client,
+                            Err(e) => {
+                                eprintln!("stand-in cleanup: no client ({e}); delete pod {name} and claim {claim_name} by hand");
+                                return;
+                            }
+                        };
+                        let pods = crate::sandbox::pods_api(&client);
+                        let pvcs: kube::Api<PersistentVolumeClaim> =
+                            kube::Api::namespaced(client.clone(), pods_namespace(&pods));
+                        let gone = DeleteParams { grace_period_seconds: Some(0), ..Default::default() };
+                        let pod = pods.delete(&name, &gone).await.map(|_| ());
+                        let claim = pvcs.delete(&claim_name, &DeleteParams::default()).await.map(|_| ());
+                        for left in [left_behind(&format!("pod {name}"), pod), left_behind(&format!("claim {claim_name}"), claim)]
+                            .into_iter()
+                            .flatten()
+                        {
+                            eprintln!("stand-in cleanup failed, delete by hand: {left}");
+                        }
+                    });
+                });
+                if cleanup.join().is_err() {
+                    eprintln!("stand-in cleanup: its thread panicked");
+                }
+            }
         }
 
         /// What a cleanup delete left behind, if anything: nothing when it
@@ -797,20 +858,49 @@ pub(crate) mod tests {
                         .map(|_| ())
                 }
             });
-            for _ in 0..40 {
-                if pods.get_opt(&name).await.expect("get pod").is_some() {
+            for _ in 0..240 {
+                if matches!(pods.get_opt(&name).await, Ok(Some(_))) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             let gone = DeleteParams { grace_period_seconds: Some(0), ..Default::default() };
-            pods.delete(&name, &gone).await.expect("delete the pod under it");
+            let deleted = pods.delete(&name, &gone).await;
             let started = tokio::time::timeout(Duration::from_secs(30), starting)
                 .await
                 .expect("the stand-in kept waiting on a deleted pod")
                 .expect("join");
+            assert_left_nothing(&client, id).await;
+            deleted.expect("delete the pod under it");
             let err = started.expect_err("a deleted pod started");
             assert!(err.contains("reading the pod"), "{err}");
+        }
+
+        /// A caller that gives up on the stand-in (a timeout, a panic that
+        /// takes its runtime down) drops it mid-wait; that must not leave
+        /// the pod and claim behind either.
+        #[tokio::test]
+        async fn test_a_stand_in_sandbox_dropped_while_waiting_leaves_nothing_behind() {
+            let client = client().await;
+            let id = unique();
+            let name = format!("sandbox-lsp-test-{id}");
+            let pods = crate::sandbox::pods_api(&client);
+            let starting = tokio::spawn({
+                let client = client.clone();
+                async move {
+                    stand_in_sandbox_with(&client, id, "docker.io/library/smelt-no-such-image:never", Duration::from_secs(120))
+                        .await
+                        .map(|_| ())
+                }
+            });
+            for _ in 0..240 {
+                if matches!(pods.get_opt(&name).await, Ok(Some(_))) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            starting.abort();
+            let _ = starting.await;
             assert_left_nothing(&client, id).await;
         }
 
