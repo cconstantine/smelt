@@ -402,6 +402,10 @@ struct AppState {
     /// has taken over (`take_over`).
     current: std::sync::Mutex<Option<(u64, oneshot::Sender<()>)>>,
     next_connection: AtomicU64,
+    /// An event taken off `events_rx` whose send failed, sent first on the
+    /// next connection. One is enough: a connection stops taking events once
+    /// a send fails.
+    unsent: std::sync::Mutex<Option<AgentMessage>>,
 }
 
 fn new_state() -> Arc<AppState> {
@@ -412,6 +416,7 @@ fn new_state() -> Arc<AppState> {
         events_rx: AsyncMutex::new(rx),
         current: std::sync::Mutex::new(None),
         next_connection: AtomicU64::new(0),
+        unsent: std::sync::Mutex::new(None),
     })
 }
 
@@ -455,10 +460,19 @@ impl AppState {
 /// to whichever held it, and a half-open connection left by a smelt restart
 /// could swallow a command's exit. Now the older one closes. Events that
 /// arrive while no connection is open wait in `events_rx` for the next one,
-/// so an exit during a smelt restart still reaches it.
+/// so an exit during a smelt restart still reaches it. So does one whose
+/// send failed (`send_or_keep`). Not covered: a send the kernel accepted
+/// into a socket smelt had already abandoned counts as sent, and is lost.
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let (connection, mut replaced) = state.take_over();
     send_message(&mut socket, &AgentMessage::Hello(PROTOCOL_VERSION)).await;
+    let unsent = state.unsent.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(unsent) = unsent {
+        if !send_or_keep(&mut socket, &state, unsent).await {
+            state.release(connection);
+            return;
+        }
+    }
     loop {
         tokio::select! {
             // Checked first, so a replaced connection takes no more events.
@@ -484,14 +498,18 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         let shell = state.terminals.lock().await.get(&terminal_id).cloned();
                         let Some(shell) = shell else { continue };
                         let id = shell.current.lock().await.clone().unwrap_or_default();
-                        send_message(&mut socket, &AgentMessage::Output { id, terminal_id, stream, seq, data }).await;
+                        if !send_or_keep(&mut socket, &state, AgentMessage::Output { id, terminal_id, stream, seq, data }).await {
+                            break;
+                        }
                     }
                     Some(ShellEvent::Marker { terminal_id, exit_code }) => {
                         let shell = state.terminals.lock().await.get(&terminal_id).cloned();
                         let Some(shell) = shell else { continue };
                         let id = shell.current.lock().await.take();
                         if let Some(id) = id {
-                            send_message(&mut socket, &AgentMessage::Exit { id, terminal_id, code: exit_code }).await;
+                            if !send_or_keep(&mut socket, &state, AgentMessage::Exit { id, terminal_id, code: exit_code }).await {
+                                break;
+                            }
                         }
                     }
                     None => break, // AppState (and its events_tx) dropped — agent shutting down
@@ -504,6 +522,29 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
 async fn recv_shell_event(state: &Arc<AppState>) -> Option<ShellEvent> {
     state.events_rx.lock().await.recv().await
+}
+
+/// Sends an event to smelt. If the send fails, the event is kept for the
+/// next connection (`AppState::unsent`) and this returns false: the event
+/// was already taken off `events_rx`, and an exit lost here would leave its
+/// command running in smelt's records for good.
+async fn send_or_keep<S>(sink: &mut S, state: &AppState, message: AgentMessage) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    use futures_util::SinkExt;
+    let text = match serde_json::to_string(&message) {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::error!(%e, "couldn't serialize a message for smelt");
+            return true;
+        }
+    };
+    if sink.send(Message::Text(text.into())).await.is_ok() {
+        return true;
+    }
+    *state.unsent.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
+    false
 }
 
 async fn send_message(socket: &mut WebSocket, message: &AgentMessage) {
@@ -1639,9 +1680,13 @@ mod socket_tests {
     const WAIT: Duration = Duration::from_secs(5);
 
     async fn serve_agent() -> std::net::SocketAddr {
+        serve_agent_with(new_state()).await
+    }
+
+    async fn serve_agent_with(state: Arc<AppState>) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move { axum::serve(listener, router(new_state())).await });
+        tokio::spawn(async move { axum::serve(listener, router(state)).await });
         addr
     }
 
@@ -1899,6 +1944,23 @@ mod socket_tests {
         let mut second = connect_ready(addr).await;
         assert!(matches!(next(&mut second).await, AgentMessage::Output { data, .. } if data == "later"));
         assert!(matches!(next(&mut second).await, AgentMessage::Exit { id, code: 0, .. } if id == "c1"));
+    }
+
+    /// An event the agent took off the queue but couldn't send (smelt's end
+    /// died before the agent noticed) goes to the next connection, after its
+    /// hello, instead of being lost with the socket.
+    #[tokio::test]
+    async fn test_an_event_that_failed_to_send_goes_to_the_next_connection() {
+        let state = new_state();
+        let mut dead = Box::pin(futures_util::sink::unfold((), |(), _: Message| async {
+            Err::<(), _>(std::io::Error::other("connection reset"))
+        }));
+        let exit = AgentMessage::Exit { id: "c1".into(), terminal_id: "t1".into(), code: 0 };
+        assert!(!send_or_keep(&mut dead, &state, exit.clone()).await, "a failed send reported success");
+
+        let addr = serve_agent_with(state).await;
+        let mut client = connect_ready(addr).await;
+        assert_eq!(next(&mut client).await, exit);
     }
 
     /// A failing `accept()` (EMFILE, say) waits before trying again, instead
