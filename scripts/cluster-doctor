@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Checks the cluster the tests use before they run (SME-53's retrospective),
+# so a missing or stale sandbox image is one clear message instead of every
+# real-cluster test failing with ErrImageNeverPull:
+#
+# - the node still has both sandbox images (the kubelet deletes unused ones
+#   once its disk is over 85% full), via `sandbox_image_import --check`;
+# - the imported agent was built from this working tree's agent sources, as
+#   recorded by scripts/build-sandbox-image.sh. The record is per checkout:
+#   an import from another checkout into the same cluster isn't seen.
+#
+# Run by scripts/check.sh before the server tests; exits non-zero with what
+# to do.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+record=target/sandbox-image/agent-sources.sha256
+
+cargo run -q --bin sandbox_image_import --features server -- --check
+
+current=$(scripts/agent-sources-hash)
+if [ ! -f "$record" ]; then
+    echo "cluster-doctor: no record of which agent the cluster's image was built from; run scripts/build-sandbox-image.sh" >&2
+    exit 1
+fi
+if [ "$(cat "$record")" != "$current" ]; then
+    echo "cluster-doctor: the cluster's sandbox image was built from other agent sources than this working tree's (src/bin/sandbox_agent.rs, src/agent_protocol.rs, src/docker_net.rs or docker/sandbox/Dockerfile changed); run scripts/build-sandbox-image.sh" >&2
+    exit 1
+fi
+echo "cluster-doctor: the cluster's sandbox image matches this working tree"
