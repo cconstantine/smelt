@@ -69,11 +69,8 @@ pub enum SandboxError {
     /// `Terminating`, `Failed`). What to do here is an open question in
     /// SME-7's plan — not resolved, just surfaced rather than guessed at.
     ExistingPodNotRunning(String),
-    // Only ever constructed by `Sandbox::exec`, which is itself only called
-    // by the real-cluster tests below (see its own cfg) — production code
-    // talks to the sandbox through `sandbox_agent`'s WebSocket protocol
-    // instead, never this lower-level kube-exec path.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// A local I/O failure: `Sandbox::exec`'s (real-cluster tests only), or
+    /// a port-forward that gave no stream for the agent's port.
     Io(std::io::Error),
     WebSocket(tokio_tungstenite::tungstenite::Error),
     /// A `sandbox_pods`/`sandbox_terminals` query failed — see SME-9's
@@ -1475,6 +1472,8 @@ pub enum AgentRequestError {
     Rejected(String),
     /// The agent answered with a kind of reply that doesn't fit the request.
     UnexpectedReply(&'static str),
+    /// smelt couldn't turn its own request into JSON.
+    Unencodable(String),
 }
 
 impl std::fmt::Display for AgentRequestError {
@@ -1495,6 +1494,9 @@ impl std::fmt::Display for AgentRequestError {
                 f,
                 "the sandbox agent answered {action} with a different kind of reply (a smelt bug)"
             ),
+            AgentRequestError::Unencodable(e) => {
+                write!(f, "smelt couldn't encode its request to the sandbox agent ({e}; a smelt bug)")
+            }
         }
     }
 }
@@ -1533,9 +1535,9 @@ impl AgentDialer for ClusterDialer {
     fn dial(&self, pod_id: i64) -> BoxFuture<'_, Result<Box<dyn AgentIo>, SandboxError>> {
         Box::pin(async move {
             let mut forward = pods_api(&self.0).portforward(&pod_name(pod_id), &[AGENT_PORT]).await?;
-            let stream = forward
-                .take_stream(AGENT_PORT)
-                .expect("stream requested for the forwarded port");
+            let stream = forward.take_stream(AGENT_PORT).ok_or_else(|| {
+                SandboxError::Io(std::io::Error::other("the port-forward has no stream for the agent's port"))
+            })?;
             Ok(Box::new(stream) as Box<dyn AgentIo>)
         })
     }
@@ -1597,7 +1599,7 @@ struct TerminalConnection {
 impl TerminalConnection {
     /// Sends a message that gets no reply (`command`, `signal`).
     fn send(&self, message: &ClientMessage) -> Result<(), AgentRequestError> {
-        let text = serde_json::to_string(message).expect("a ClientMessage always serializes");
+        let text = serde_json::to_string(message).map_err(|e| AgentRequestError::Unencodable(e.to_string()))?;
         self.outgoing.send(text).map_err(|_| AgentRequestError::Disconnected)
     }
 
@@ -2853,7 +2855,7 @@ fn connect_with_retry(
         }
 
         match mode {
-            ConnectMode::First => Err(last_err.expect("the loop runs at least once").into()),
+            ConnectMode::First => Err(last_err.map(TerminalError::from).unwrap_or(TerminalError::AgentUnreachable)),
             ConnectMode::Reconnect => {
                 // Every attempt failed without the cluster ever confirming
                 // the pod is dead (a pod stuck reporting `Running` while
