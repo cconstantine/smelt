@@ -597,47 +597,207 @@ pub(crate) mod tests {
 
         /// A sandbox stand-in for conversation `id`, with its workspace
         /// claim. Deleted by `tear_down`.
-        pub(crate) async fn stand_in_sandbox(client: &kube::Client, id: i64) -> SandboxRef {
+        pub(crate) async fn stand_in_sandbox(client: &kube::Client, id: i64) -> Result<SandboxRef, String> {
+            stand_in_sandbox_with(client, id, "docker.io/library/smelt-sandbox:latest", Duration::from_secs(120)).await
+        }
+
+        async fn stand_in_sandbox_with(
+            client: &kube::Client,
+            id: i64,
+            image: &str,
+            wait: Duration,
+        ) -> Result<SandboxRef, String> {
             let pods = crate::sandbox::pods_api(client);
             let pvcs: kube::Api<PersistentVolumeClaim> = kube::Api::namespaced(client.clone(), pods_namespace(&pods));
+            let claim_name = crate::sandbox::workspace_pvc_name(id);
             let claim: PersistentVolumeClaim = serde_json::from_value(json!({
-                "metadata": {"name": crate::sandbox::workspace_pvc_name(id)},
+                "metadata": {"name": claim_name},
                 "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}},
             }))
-            .unwrap();
-            pvcs.create(&PostParams::default(), &claim).await.expect("claim");
+            .map_err(|e| format!("the claim's spec: {e}"))?;
+            if let Err(e) = pvcs.create(&PostParams::default(), &claim).await {
+                if may_have_created(&e) {
+                    let _ = pvcs.delete(&claim_name, &DeleteParams::default()).await;
+                }
+                return Err(format!("creating the claim: {e}"));
+            }
             let name = format!("sandbox-lsp-test-{id}");
+            let mut guard = StandInGuard { name: name.clone(), claim_name: claim_name.clone(), armed: true };
+            let started = start_stand_in(&pods, &name, id, image, &claim_name, wait).await;
+            // Finished, either way: a success is the caller's to tear down,
+            // and a failure is cleaned up just below, where it can report.
+            guard.armed = false;
+            if let Err(e) = started {
+                // The caller never gets a `SandboxRef` to tear down, so this
+                // has to, however it failed: on SME-53, every failed run left
+                // its stand-ins behind. What it can't delete, it names.
+                let gone = DeleteParams { grace_period_seconds: Some(0), ..Default::default() };
+                let pod = pods.delete(&name, &gone).await.map(|_| ());
+                let claim = pvcs.delete(&claim_name, &DeleteParams::default()).await.map(|_| ());
+                let left: Vec<String> = [
+                    left_behind(&format!("pod {name}"), pod),
+                    left_behind(&format!("claim {claim_name}"), claim),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                return Err(if left.is_empty() {
+                    e
+                } else {
+                    format!("{e}; cleaning up failed, so delete by hand: {}", left.join("; "))
+                });
+            }
+            started
+        }
+
+        /// Deletes a stand-in's pod and claim if it's dropped while armed:
+        /// when `stand_in_sandbox_with`'s future is dropped part-way, by a
+        /// caller that gave up or a panic that took its runtime down. `Drop`
+        /// can't await, and the runtime dropping it may be shutting down, so
+        /// the deletes run on a thread with a runtime and client of its own
+        /// (a client only works on the runtime it was made on), and `drop`
+        /// waits for them.
+        struct StandInGuard {
+            name: String,
+            claim_name: String,
+            armed: bool,
+        }
+
+        impl Drop for StandInGuard {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                let name = std::mem::take(&mut self.name);
+                let claim_name = std::mem::take(&mut self.claim_name);
+                let cleanup = std::thread::spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                        Ok(runtime) => runtime,
+                        Err(e) => {
+                            eprintln!("stand-in cleanup: no runtime ({e}); delete pod {name} and claim {claim_name} by hand");
+                            return;
+                        }
+                    };
+                    runtime.block_on(async {
+                        let _ = rustls::crypto::ring::default_provider().install_default();
+                        let client = match kube::Client::try_default().await {
+                            Ok(client) => client,
+                            Err(e) => {
+                                eprintln!("stand-in cleanup: no client ({e}); delete pod {name} and claim {claim_name} by hand");
+                                return;
+                            }
+                        };
+                        let pods = crate::sandbox::pods_api(&client);
+                        let pvcs: kube::Api<PersistentVolumeClaim> =
+                            kube::Api::namespaced(client.clone(), pods_namespace(&pods));
+                        let gone = DeleteParams { grace_period_seconds: Some(0), ..Default::default() };
+                        let pod = pods.delete(&name, &gone).await.map(|_| ());
+                        let claim = pvcs.delete(&claim_name, &DeleteParams::default()).await.map(|_| ());
+                        for left in [left_behind(&format!("pod {name}"), pod), left_behind(&format!("claim {claim_name}"), claim)]
+                            .into_iter()
+                            .flatten()
+                        {
+                            eprintln!("stand-in cleanup failed, delete by hand: {left}");
+                        }
+                    });
+                });
+                if cleanup.join().is_err() {
+                    eprintln!("stand-in cleanup: its thread panicked");
+                }
+            }
+        }
+
+        /// What a cleanup delete left behind, if anything: nothing when it
+        /// worked or the object was already gone.
+        fn left_behind(what: &str, deleted: Result<(), kube::Error>) -> Option<String> {
+            match deleted {
+                Ok(()) => None,
+                Err(kube::Error::Api(status)) if status.is_not_found() => None,
+                Err(e) => Some(format!("{what}: {e}")),
+            }
+        }
+
+        #[test]
+        fn test_left_behind_names_what_a_failed_delete_left() {
+            let api = |reason: &str, code: u16| {
+                kube::Error::Api(Box::new(kube::core::Status::failure("no", reason).with_code(code)))
+            };
+            assert_eq!(left_behind("pod p", Ok(())), None);
+            assert_eq!(left_behind("pod p", Err(api("NotFound", 404))), None, "already gone is gone");
+            let left = left_behind("pod p", Err(api("InternalError", 500))).expect("a failed delete is named");
+            assert!(left.starts_with("pod p: "), "{left}");
+            assert!(left_behind("claim c", Err(kube::Error::Service(Box::new(std::io::Error::other("timed out"))))).is_some());
+        }
+
+        /// Whether a create that failed may still have made the object. An
+        /// API error is the server refusing (including "already exists",
+        /// which isn't ours to delete); anything else, a timeout or a dropped
+        /// connection, can come after the server made it.
+        fn may_have_created(error: &kube::Error) -> bool {
+            !matches!(error, kube::Error::Api(_))
+        }
+
+        #[test]
+        fn test_only_a_failure_short_of_the_server_answering_may_have_created_the_object() {
+            let refused = |reason: &str, code: u16| {
+                kube::Error::Api(Box::new(kube::core::Status::failure("refused", reason).with_code(code)))
+            };
+            assert!(!may_have_created(&refused("AlreadyExists", 409)));
+            assert!(!may_have_created(&refused("Forbidden", 403)));
+            assert!(!may_have_created(&refused("Invalid", 422)));
+            assert!(may_have_created(&kube::Error::Service(Box::new(std::io::Error::other("timed out")))));
+        }
+
+        /// The stand-in's pod, once the claim exists, waited on until Running.
+        async fn start_stand_in(
+            pods: &kube::Api<Pod>,
+            name: &str,
+            id: i64,
+            image: &str,
+            claim_name: &str,
+            wait: Duration,
+        ) -> Result<SandboxRef, String> {
             let pod: Pod = serde_json::from_value(json!({
                 "metadata": {"name": name},
                 "spec": {
                     "restartPolicy": "Never",
                     "containers": [{
                         "name": "sandbox",
-                        "image": "docker.io/library/smelt-sandbox:latest",
+                        "image": image,
                         "imagePullPolicy": "Never",
                         "command": ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1 & wait; done"],
                         "volumeMounts": [{"name": "workspace", "mountPath": "/workspace"}],
                         "resources": {"requests": {"memory": "64Mi", "cpu": "50m"}, "limits": {"memory": "256Mi", "cpu": "1"}},
                     }],
-                    "volumes": [{"name": "workspace", "persistentVolumeClaim": {"claimName": crate::sandbox::workspace_pvc_name(id)}}],
+                    "volumes": [{"name": "workspace", "persistentVolumeClaim": {"claimName": claim_name}}],
                 },
             }))
-            .unwrap();
-            pods.create(&PostParams::default(), &pod).await.expect("stand-in sandbox pod");
-            for _ in 0..240 {
-                let p = pods.get(&name).await.expect("get");
+            .map_err(|e| format!("the pod's spec: {e}"))?;
+            pods.create(&PostParams::default(), &pod).await.map_err(|e| format!("creating the pod: {e}"))?;
+            let mut waiting_on = None;
+            for _ in 0..wait.as_millis() / 500 {
+                let p = pods.get(name).await.map_err(|e| format!("reading the pod: {e}"))?;
+                waiting_on = p
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.container_statuses.as_ref())
+                    .and_then(|statuses| statuses.iter().find_map(|c| c.state.as_ref()?.waiting.as_ref()?.reason.clone()));
                 if p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running") {
-                    return SandboxRef {
+                    return Ok(SandboxRef {
                         conversation_id: id,
                         pod_id: id,
-                        pod_name: name,
-                        pod_uid: p.metadata.uid.clone().expect("uid"),
-                        node: p.spec.as_ref().and_then(|s| s.node_name.clone()).expect("node"),
-                    };
+                        pod_name: name.to_string(),
+                        pod_uid: p.metadata.uid.clone().ok_or("the Running pod has no uid")?,
+                        node: p.spec.as_ref().and_then(|s| s.node_name.clone()).ok_or("the Running pod has no node")?,
+                    });
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            panic!("the stand-in sandbox pod didn't start");
+            Err(format!(
+                "the stand-in sandbox pod didn't start within {}s{}",
+                wait.as_secs(),
+                waiting_on.map(|reason| format!(" (waiting: {reason})")).unwrap_or_default()
+            ))
         }
 
         fn pods_namespace(pods: &kube::Api<Pod>) -> &str {
@@ -661,12 +821,111 @@ pub(crate) mod tests {
         {
             use futures_util::FutureExt;
             let client = client().await;
-            let sandbox = stand_in_sandbox(&client, unique()).await;
+            let sandbox = stand_in_sandbox(&client, unique()).await.expect("a stand-in sandbox");
             let outcome = std::panic::AssertUnwindSafe(body(client.clone(), sandbox.clone())).catch_unwind().await;
             tear_down(&client, &sandbox).await;
             if let Err(panic) = outcome {
                 std::panic::resume_unwind(panic);
             }
+        }
+
+        /// A stand-in whose pod never starts (here, an image the node
+        /// doesn't have) takes its pod and claim with it: nothing else can,
+        /// since the test never gets a `SandboxRef` to tear down.
+        #[tokio::test]
+        async fn test_a_stand_in_sandbox_that_never_starts_leaves_nothing_behind() {
+            let client = client().await;
+            let id = unique();
+            let started =
+                stand_in_sandbox_with(&client, id, "docker.io/library/smelt-no-such-image:never", Duration::from_secs(5)).await;
+            started.map(|_| ()).expect_err("a pod with no image started");
+            assert_left_nothing(&client, id).await;
+        }
+
+        /// The same when the stand-in fails any other way once its claim
+        /// exists: here its pod is deleted while it waits, so reading it fails.
+        #[tokio::test]
+        async fn test_a_stand_in_sandbox_that_fails_while_waiting_leaves_nothing_behind() {
+            let client = client().await;
+            let id = unique();
+            let name = format!("sandbox-lsp-test-{id}");
+            let pods = crate::sandbox::pods_api(&client);
+            let starting = tokio::spawn({
+                let client = client.clone();
+                async move {
+                    stand_in_sandbox_with(&client, id, "docker.io/library/smelt-no-such-image:never", Duration::from_secs(60))
+                        .await
+                        .map(|_| ())
+                }
+            });
+            for _ in 0..240 {
+                if matches!(pods.get_opt(&name).await, Ok(Some(_))) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            let gone = DeleteParams { grace_period_seconds: Some(0), ..Default::default() };
+            let deleted = pods.delete(&name, &gone).await;
+            let started = tokio::time::timeout(Duration::from_secs(30), starting)
+                .await
+                .expect("the stand-in kept waiting on a deleted pod")
+                .expect("join");
+            assert_left_nothing(&client, id).await;
+            deleted.expect("delete the pod under it");
+            let err = started.expect_err("a deleted pod started");
+            assert!(err.contains("reading the pod"), "{err}");
+        }
+
+        /// A caller that gives up on the stand-in (a timeout, a panic that
+        /// takes its runtime down) drops it mid-wait; that must not leave
+        /// the pod and claim behind either.
+        #[tokio::test]
+        async fn test_a_stand_in_sandbox_dropped_while_waiting_leaves_nothing_behind() {
+            let client = client().await;
+            let id = unique();
+            let name = format!("sandbox-lsp-test-{id}");
+            let pods = crate::sandbox::pods_api(&client);
+            let starting = tokio::spawn({
+                let client = client.clone();
+                async move {
+                    stand_in_sandbox_with(&client, id, "docker.io/library/smelt-no-such-image:never", Duration::from_secs(120))
+                        .await
+                        .map(|_| ())
+                }
+            });
+            for _ in 0..240 {
+                if matches!(pods.get_opt(&name).await, Ok(Some(_))) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            starting.abort();
+            let _ = starting.await;
+            assert_left_nothing(&client, id).await;
+        }
+
+        /// Waits up to 30s for stand-in `id`'s pod and claim to be gone,
+        /// deletes whatever is left, and fails if anything was.
+        async fn assert_left_nothing(client: &kube::Client, id: i64) {
+            let pods = crate::sandbox::pods_api(client);
+            let pvcs: kube::Api<PersistentVolumeClaim> = kube::Api::namespaced(client.clone(), pods_namespace(&pods));
+            let name = format!("sandbox-lsp-test-{id}");
+            let claim = crate::sandbox::workspace_pvc_name(id);
+            let mut left = (true, true);
+            for _ in 0..60 {
+                left = (
+                    pods.get_opt(&name).await.expect("get pod").is_some(),
+                    pvcs.get_opt(&claim).await.expect("get claim").is_some(),
+                );
+                if left == (false, false) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            // Clean up after this test itself, whatever it found.
+            let _ = pods.delete(&name, &DeleteParams { grace_period_seconds: Some(0), ..Default::default() }).await;
+            let _ = pvcs.delete(&claim, &DeleteParams::default()).await;
+            assert_eq!(left, (false, false), "(pod, claim) left behind");
         }
 
         fn echo_server(name: &str, install: &str) -> LanguageServerConfig {
