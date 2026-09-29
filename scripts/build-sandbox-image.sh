@@ -16,6 +16,10 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
+# Taken before building, so an edit made while this runs doesn't pass for
+# what was built. Recorded once both images are in (see scripts/cluster-doctor).
+SOURCES_HASH=$(scripts/agent-sources-hash)
+
 scripts/build-sandbox-agent.sh "$@"
 
 docker build -f docker/sandbox/Dockerfile -t smelt-sandbox:latest target/sandbox-agent/
@@ -35,5 +39,7 @@ DOCKER_TAR_PATH=target/sandbox-image/docker-dind.tar
 docker pull -q "$DOCKER_IMAGE"
 docker save -o "$DOCKER_TAR_PATH" "$DOCKER_IMAGE"
 cargo run --bin sandbox_image_import --features server -- "$DOCKER_TAR_PATH"
+
+echo "$SOURCES_HASH" > target/sandbox-image/agent-sources.sha256
 
 echo "smelt-sandbox:latest and $DOCKER_IMAGE built and imported into the cluster"

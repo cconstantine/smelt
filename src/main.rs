@@ -1,3 +1,5 @@
+#[cfg(feature = "server")]
+mod agent_protocol;
 mod anthropic;
 mod api;
 mod browsing;

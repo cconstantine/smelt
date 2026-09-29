@@ -1,7 +1,7 @@
 use chrono::NaiveDateTime;
 use dioxus::prelude::*;
 
-use crate::api::pods::{PodActivity, PodUsage, ServerPodOverview, get_pods, stop_pod};
+use crate::api::pods::{AgentStatus, PodActivity, PodUsage, ServerPodOverview, get_pods, stop_pod};
 use crate::frontend::Route;
 
 /// A counter that goes up every time a pod is created or goes away, in
@@ -108,7 +108,7 @@ pub fn PodsIndex() -> Element {
                                         Link { to: Route::ConversationRoute { id: pod.conversation_id }, "{pod.conversation_title}" }
                                         span { class: "muted pod-id", " pod {pod.pod_id}" }
                                     }
-                                    td { "{pod.status.clone().unwrap_or_else(|| \"unknown\".to_string())}" }
+                                    td { "{status_text(pod.status.as_deref(), pod.agent.as_ref())}" }
                                     td { "{format_age(age_seconds(pod.started_at, pod.observed_at))}" }
                                     td { "{activity_text(&pod.activity, pod.observed_at)}" }
                                     td { "{memory_text(pod.usage.as_ref(), pod.memory_limit.as_deref())}" }
@@ -203,6 +203,16 @@ fn against_limit(used: Option<String>, limit: Option<&str>) -> String {
     }
 }
 
+/// Kubernetes' phase, then the agent's status once smelt knows it:
+/// `Running · agent 1.0`, `Running · old agent, restart required`.
+fn status_text(phase: Option<&str>, agent: Option<&AgentStatus>) -> String {
+    let phase = phase.unwrap_or("unknown");
+    match agent {
+        Some(agent) => format!("{phase} \u{b7} {}", agent.describe()),
+        None => phase.to_string(),
+    }
+}
+
 /// Memory use against its limit: `512 MiB of 8Gi`, `unavailable of 8Gi`.
 fn memory_text(usage: Option<&PodUsage>, limit: Option<&str>) -> String {
     against_limit(usage.map(|u| format_bytes(u.memory_bytes)), limit)
@@ -240,6 +250,20 @@ mod tests {
             ServerPodOverview { name: "pyright".to_string(), state: "stopped (OOMKilled)".to_string(), memory_limit: Some("1Gi".to_string()), usage: None },
         ];
         assert_eq!(servers_text(&servers), "rust-analyzer ready, 512 MiB of 2Gi \u{b7} pyright stopped (OOMKilled), unavailable of 1Gi");
+    }
+
+    #[test]
+    fn test_status_text_adds_the_agent_once_known() {
+        assert_eq!(status_text(Some("Running"), None), "Running");
+        assert_eq!(status_text(None, None), "unknown");
+        assert_eq!(
+            status_text(Some("Running"), Some(&AgentStatus::Current { version: "1.0".into() })),
+            "Running \u{b7} agent 1.0"
+        );
+        assert_eq!(
+            status_text(Some("Running"), Some(&AgentStatus::RestartRequired { version: None })),
+            "Running \u{b7} old agent, restart required"
+        );
     }
 
     #[test]

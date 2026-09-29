@@ -23,7 +23,6 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, AttachParams, DeleteParams, ListParams, PostParams};
-use serde::Deserialize;
 use sqlx::PgPool;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
@@ -70,11 +69,8 @@ pub enum SandboxError {
     /// `Terminating`, `Failed`). What to do here is an open question in
     /// SME-7's plan — not resolved, just surfaced rather than guessed at.
     ExistingPodNotRunning(String),
-    // Only ever constructed by `Sandbox::exec`, which is itself only called
-    // by the real-cluster tests below (see its own cfg) — production code
-    // talks to the sandbox through `sandbox_agent`'s WebSocket protocol
-    // instead, never this lower-level kube-exec path.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// A local I/O failure: `Sandbox::exec`'s (real-cluster tests only), or
+    /// a port-forward that gave no stream for the agent's port.
     Io(std::io::Error),
     WebSocket(tokio_tungstenite::tungstenite::Error),
     /// A `sandbox_pods`/`sandbox_terminals` query failed — see SME-9's
@@ -87,12 +83,20 @@ pub enum SandboxError {
     StartFailed(String),
     /// Writing the SSH keys and git config into a pod failed (SME-32).
     GitSetup(String),
+    /// Reaching the sandbox agent (port-forward, WebSocket handshake and
+    /// hello) took longer than `AGENT_CONNECT_TIMEOUT`.
+    AgentConnectTimeout,
 }
 
 impl std::fmt::Display for SandboxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SandboxError::Kube(e) => write!(f, "kubernetes API error: {e}"),
+            SandboxError::AgentConnectTimeout => write!(
+                f,
+                "timed out connecting to the sandbox agent after {}s",
+                AGENT_CONNECT_TIMEOUT.as_secs()
+            ),
             SandboxError::Timeout(None) => write!(f, "timed out waiting for pod to become Running"),
             SandboxError::Timeout(Some(detail)) => {
                 write!(f, "timed out waiting for pod to become Running ({detail})")
@@ -1335,22 +1339,25 @@ pub enum TerminalError {
     /// A call referencing a `pod_id` that doesn't exist (never created,
     /// already terminated, or not `Running`).
     NoPod,
-    /// A call referencing a `terminal_id` that doesn't exist, or whose
-    /// pod's agent is unreachable (a failed reconnect after the agent was
-    /// found unreachable also surfaces this, after crash-cleanup runs).
+    /// A call referencing a `terminal_id` that doesn't exist.
     NoTerminal,
     /// `terminate_pod` refuses while that pod still has a live terminal.
     TerminalStillExists,
     /// `terminate_terminal` refuses while a command is still `running` in
     /// that terminal.
     CommandStillRunning,
-    /// A `read_file`/`write_file`/`edit_file`/`list_directory` call the
-    /// agent rejected — hash mismatch, not found, ambiguous match, over
-    /// the size cap, etc. Carries the agent's own message straight
-    /// through, unlike `create_terminal`/`terminate_terminal`'s acks
-    /// (which only ever distinguish success from a generic failure) —
-    /// the model needs to see and act on exactly what went wrong.
-    FileOperation(String),
+    /// A request to the pod's agent failed: it refused (its own words,
+    /// which the model needs to see and act on), didn't answer, or the
+    /// connection dropped.
+    Agent(AgentRequestError),
+    /// The pod's agent speaks another major version of the protocol, or
+    /// predates versioning (`found: None`). Only a new pod fixes it.
+    AgentOutdated { found: Option<ProtocolVersion> },
+    /// A feature needs a newer minor version than the pod's agent has.
+    AgentTooOld { needs: ProtocolVersion, found: ProtocolVersion },
+    /// Every attempt to reach the pod's agent failed, so its pod was
+    /// cleaned up and stopped, as after a crash.
+    AgentUnreachable,
     /// A request to open one of the sandbox agent's own ports (`AGENT_PORT`,
     /// `RELAY_PORT`) from a route into the pod — see `check_reachable_port`.
     AgentPort(u16),
@@ -1366,12 +1373,7 @@ impl std::fmt::Display for TerminalError {
                     "no such pod (it doesn't exist, isn't Running, or was already terminated)"
                 )
             }
-            TerminalError::NoTerminal => {
-                write!(
-                    f,
-                    "no such terminal (it doesn't exist, or its pod's agent is unreachable)"
-                )
-            }
+            TerminalError::NoTerminal => write!(f, "no such terminal"),
             TerminalError::TerminalStillExists => {
                 write!(
                     f,
@@ -1384,7 +1386,30 @@ impl std::fmt::Display for TerminalError {
                     "a command is still running in this terminal; send_signal or wait for it to finish first"
                 )
             }
-            TerminalError::FileOperation(message) => write!(f, "{message}"),
+            TerminalError::Agent(e) => write!(f, "{e}"),
+            TerminalError::AgentOutdated { found } => {
+                let found = match found {
+                    Some(version) => format!("protocol {version}"),
+                    None => "an agent from before the protocol was versioned".to_string(),
+                };
+                write!(
+                    f,
+                    "this sandbox runs an incompatible sandbox agent ({found}; smelt needs protocol {}.x), \
+                     so its terminals and file tools can't be used. Call terminate_pod, then create_pod, \
+                     for a sandbox that works; /workspace is kept.",
+                    PROTOCOL_VERSION.major
+                )
+            }
+            TerminalError::AgentTooOld { needs, found } => write!(
+                f,
+                "this needs a newer sandbox agent (protocol {needs} or later; this sandbox has {found}). \
+                 Call terminate_pod, then create_pod, to get one; /workspace is kept."
+            ),
+            TerminalError::AgentUnreachable => write!(
+                f,
+                "the sandbox's agent couldn't be reached, so its pod was stopped (a notice says why, if \
+                 the cluster gave a reason). Call create_pod for a new one."
+            ),
             TerminalError::AgentPort(port) => write!(
                 f,
                 "port {port} is smelt's own sandbox agent, which can't be opened from a \
@@ -1418,6 +1443,8 @@ impl From<sqlx::Error> for TerminalError {
 pub struct PodInfo {
     pub pod_id: i64,
     pub status: String,
+    /// See `agent_status`.
+    pub agent: Option<crate::api::pods::AgentStatus>,
 }
 
 #[derive(Debug)]
@@ -1427,148 +1454,323 @@ pub struct TerminalInfo {
     pub status: String,
 }
 
-/// `read_file`'s result — `hash` is the SHA-256 of the *full* file (not
-/// just `lines`, the requested slice), what a later `edit_file`/
-/// `write_file` call's `expected_hash` is checked against. See
-/// SME-11's "Change detection, not just 'was it
-/// read.'"
+// --- The sandbox agent's connection. The wire types are shared with the
+// agent in `agent_protocol` (SME-53). ---
+
+pub use crate::agent_protocol::{DirEntry, FileContents, GlobResult, GrepResult};
+use crate::agent_protocol::{AgentMessage, ClientMessage, PROTOCOL_VERSION, ProtocolVersion, Reply};
+
+/// Why one request to a pod's agent failed.
 #[derive(Debug, Clone, PartialEq)]
-pub struct FileContents {
-    pub lines: Vec<String>,
-    pub total_lines: usize,
-    pub hash: String,
+pub enum AgentRequestError {
+    /// No answer within `ACK_TIMEOUT`.
+    Timeout,
+    /// The connection ended, or had already ended, before the answer came.
+    Disconnected,
+    /// The agent refused, in words meant for the model: a hash mismatch, an
+    /// ambiguous edit, an unknown terminal.
+    Rejected(String),
+    /// The agent answered with a kind of reply that doesn't fit the request.
+    UnexpectedReply(&'static str),
+    /// smelt couldn't turn its own request into JSON.
+    Unencodable(String),
 }
 
-/// One `list_directory` entry — `size` is only meaningful for a file.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DirEntry {
-    pub name: String,
-    pub is_dir: bool,
-    pub size: Option<u64>,
+impl std::fmt::Display for AgentRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentRequestError::Timeout => write!(
+                f,
+                "the sandbox agent didn't answer within {}s; the pod may be overloaded. Try again.",
+                ACK_TIMEOUT.as_secs()
+            ),
+            AgentRequestError::Disconnected => write!(
+                f,
+                "the connection to the sandbox agent dropped during the request. Try again; if the pod \
+                 stopped, you'll be told separately."
+            ),
+            AgentRequestError::Rejected(message) => write!(f, "{message}"),
+            AgentRequestError::UnexpectedReply(action) => write!(
+                f,
+                "the sandbox agent answered {action} with a different kind of reply (a smelt bug)"
+            ),
+            AgentRequestError::Unencodable(e) => {
+                write!(f, "smelt couldn't encode its request to the sandbox agent ({e}; a smelt bug)")
+            }
+        }
+    }
 }
 
-/// One `grep` match — see SME-19.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GrepMatch {
-    pub path: String,
-    pub line: u32,
-    pub text: String,
+impl From<AgentRequestError> for TerminalError {
+    fn from(e: AgentRequestError) -> Self {
+        TerminalError::Agent(e)
+    }
 }
 
-/// One file `grep` excluded (too large, or not valid UTF-8) — reported
-/// explicitly rather than silently dropped, per SME-19's "Decisions from
-/// review."
-#[derive(Debug, Clone, PartialEq)]
-pub struct SkippedFile {
-    pub path: String,
-    pub reason: String,
-}
-
-/// `glob`'s result. `total` is the match count the walk actually found, up
-/// to its internal scan ceiling (`sandbox_agent`'s `MAX_GLOB_SCAN`) — not
-/// just how many fit in this page. `scan_capped` is true only when that
-/// ceiling itself was hit, distinct from ordinary pagination (`total`
-/// larger than one page, `scan_capped: false`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct GlobResult {
-    pub paths: Vec<String>,
-    pub total: usize,
-    pub scan_capped: bool,
-}
-
-/// `grep`'s result — same `total`/`scan_capped` meaning as `GlobResult`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GrepResult {
-    pub matches: Vec<GrepMatch>,
-    pub total: usize,
-    pub scan_capped: bool,
-    pub skipped: Vec<SkippedFile>,
-}
-
-/// The parsed, successful body of a file-tool agent response — what a
-/// pending `pending_file_requests` oneshot resolves to on success (an
-/// `Err(String)` carries the agent's own error message instead, same as
-/// `pending_acks`). One enum covering all six operations since they share
-/// one correlation map (keyed by `request_id`, not tied to a
-/// `terminal_id`).
-#[derive(Debug, Clone, PartialEq)]
-enum FileResponse {
-    Read(FileContents),
-    Written { hash: String },
-    Edited { hash: String },
-    Listed(Vec<DirEntry>),
-    Globbed(GlobResult),
-    Grepped(GrepResult),
-}
-
-/// How long `create_terminal`/`terminate_terminal` wait for the agent's ack
-/// before giving up — see `request_terminal_action`. Not measured, same
-/// spirit as SME-9's plan's other not-yet-sized timeouts (see its Open
-/// Questions).
+/// How long a request to the agent waits for its reply.
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A byte stream to a pod's agent.
+trait AgentIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AgentIo for T {}
+
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// How smelt reaches a pod's agent, and what it asks the cluster about the
+/// pod along the way. `ClusterDialer` is the real one; tests put a fake
+/// agent on a loopback port behind `dialer_for` instead.
+trait AgentDialer: Send + Sync {
+    fn dial(&self, pod_id: i64) -> BoxFuture<'_, Result<Box<dyn AgentIo>, SandboxError>>;
+    /// Whether the pod is `Running`: a first connection waits for that.
+    fn is_running(&self, pod_id: i64) -> BoxFuture<'_, Result<bool, SandboxError>>;
+    /// `Some(reason)` once the cluster says the pod is dead, `None` while it
+    /// may still be alive. See `pod_death_reason`.
+    fn death_reason(&self, pod_id: i64) -> BoxFuture<'_, Option<Option<String>>>;
+}
+
+/// A port-forward to the agent's port in the pod.
+struct ClusterDialer(kube::Client);
+
+impl AgentDialer for ClusterDialer {
+    fn dial(&self, pod_id: i64) -> BoxFuture<'_, Result<Box<dyn AgentIo>, SandboxError>> {
+        Box::pin(async move {
+            let mut forward = pods_api(&self.0).portforward(&pod_name(pod_id), &[AGENT_PORT]).await?;
+            let stream = forward.take_stream(AGENT_PORT).ok_or_else(|| {
+                SandboxError::Io(std::io::Error::other("the port-forward has no stream for the agent's port"))
+            })?;
+            Ok(Box::new(stream) as Box<dyn AgentIo>)
+        })
+    }
+
+    fn is_running(&self, pod_id: i64) -> BoxFuture<'_, Result<bool, SandboxError>> {
+        Box::pin(async move {
+            let pod = pods_api(&self.0).get_opt(&pod_name(pod_id)).await?;
+            Ok(pod.and_then(|p| p.status).and_then(|s| s.phase).as_deref() == Some("Running"))
+        })
+    }
+
+    fn death_reason(&self, pod_id: i64) -> BoxFuture<'_, Option<Option<String>>> {
+        Box::pin(async move { pod_death_reason(&pods_api(&self.0), &pod_name(pod_id)).await })
+    }
+}
+
+/// The dialer for `pod_id`: the cluster, unless a test put a fake agent in
+/// for that pod.
+#[cfg_attr(not(test), allow(unused_variables))] // only a test puts a fake in
+fn dialer_for(pod_id: i64) -> Arc<dyn AgentDialer> {
+    #[cfg(test)]
+    if let Some(dialer) = test_dialers().lock().unwrap_or_else(|e| e.into_inner()).get(&pod_id) {
+        return dialer.clone();
+    }
+    Arc::new(ClusterDialer(get().client.clone()))
+}
+
+/// Fake agents, by the pod id each test owns. Keyed by pod so tests running
+/// in parallel never see each other's.
+#[cfg(test)]
+fn test_dialers() -> &'static StdMutex<HashMap<i64, Arc<dyn AgentDialer>>> {
+    static DIALERS: LazyLock<StdMutex<HashMap<i64, Arc<dyn AgentDialer>>>> = LazyLock::new(Default::default);
+    &DIALERS
+}
+
+/// One pod's agent connection. The WebSocket itself belongs to two tasks
+/// `connect` starts: one writes `outgoing`, the other reads the agent's
+/// messages (`handle_agent_message`).
 struct TerminalConnection {
-    /// JSON-text messages destined for the agent — a background task (see
-    /// `connect`) owns the actual WebSocket sink and drains this.
     outgoing: mpsc::UnboundedSender<String>,
-    /// Resolved by the incoming-message pump when a `terminal_created`/
-    /// `terminal_terminated`/`terminal_error` ack arrives for the matching
-    /// `terminal_id` — see `request_terminal_action`. `send_command`/
-    /// `send_signal` don't use this; they're still fire-and-forget,
-    /// completion arrives later as an ordinary `exit` event.
-    pending_acks: StdMutex<HashMap<i64, tokio::sync::oneshot::Sender<Result<(), String>>>>,
-    /// The file-tool analog of `pending_acks` — keyed by a fresh
-    /// `request_id` per call rather than `terminal_id`, since a file
-    /// operation isn't tied to any one terminal (it's scoped to the pod as
-    /// a whole). Resolved by `resolve_pending_file_request` when a
-    /// `file_read`/`file_written`/`file_edited`/`directory_listed`/
-    /// `file_error` message arrives — see `request_file_action`.
-    pending_file_requests:
-        StdMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<FileResponse, String>>>>,
+    /// Requests waiting for their reply, by request id. `None` once the
+    /// connection has ended: every waiter was told, and nothing new waits.
+    pending: StdMutex<Option<HashMap<u64, tokio::sync::oneshot::Sender<Reply>>>>,
+    /// The reader and writer tasks, stopped by `close`.
+    tasks: StdMutex<Vec<tokio::task::AbortHandle>>,
+    /// Request ids are per connection and never reused, so a late reply
+    /// can't answer a newer request.
+    next_request_id: std::sync::atomic::AtomicU64,
     /// Resolved once, when the connection is first established (see
     /// `connect`) — lets `handle_agent_message` publish a
     /// `SandboxCommandUpdate` for every output line and completion without
     /// a per-line DB round trip. See
     /// SME-10.
     conversation_id: i64,
+    /// What the agent said it speaks, in its hello.
+    agent_version: ProtocolVersion,
+}
+
+impl TerminalConnection {
+    /// Sends a message that gets no reply (`command`, `signal`).
+    fn send(&self, message: &ClientMessage) -> Result<(), AgentRequestError> {
+        let text = serde_json::to_string(message).map_err(|e| AgentRequestError::Unencodable(e.to_string()))?;
+        self.outgoing.send(text).map_err(|_| AgentRequestError::Disconnected)
+    }
+
+    /// Sends the request `build` makes with a fresh request id, and waits
+    /// for its reply. The agent's own refusal (`Reply::Error`) comes back as
+    /// `Rejected`.
+    async fn request(&self, build: impl FnOnce(u64) -> ClientMessage) -> Result<Reply, AgentRequestError> {
+        self.request_within(ACK_TIMEOUT, build).await
+    }
+
+    async fn request_within(
+        &self,
+        timeout: Duration,
+        build: impl FnOnce(u64) -> ClientMessage,
+    ) -> Result<Reply, AgentRequestError> {
+        let request_id = self.next_request_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match self.pending.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            Some(pending) => pending.insert(request_id, tx),
+            None => return Err(AgentRequestError::Disconnected),
+        };
+        if let Err(e) = self.send(&build(request_id)) {
+            self.forget(request_id);
+            return Err(e);
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Reply::Error { message })) => Err(AgentRequestError::Rejected(message)),
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_)) => Err(AgentRequestError::Disconnected),
+            Err(_) => {
+                self.forget(request_id);
+                Err(AgentRequestError::Timeout)
+            }
+        }
+    }
+
+    fn forget(&self, request_id: u64) {
+        if let Some(pending) = self.pending.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            pending.remove(&request_id);
+        }
+    }
+
+    /// Hands `reply` to the request waiting for it. A reply nobody waits for
+    /// (its request timed out) is dropped.
+    fn resolve(&self, request_id: u64, reply: Reply) {
+        let waiter = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .and_then(|pending| pending.remove(&request_id));
+        match waiter {
+            Some(waiter) => {
+                let _ = waiter.send(reply);
+            }
+            None => tracing::debug!(request_id, "a reply for a request nobody waits for any more"),
+        }
+    }
+
+    /// Ends every waiting request with `Disconnected` at once, and refuses
+    /// new ones: the socket is gone, so no reply is coming.
+    fn fail_pending(&self) {
+        // Dropping the senders wakes their receivers.
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+
+    /// Fails every waiting request and stops both tasks, which closes the
+    /// socket.
+    fn close(&self) {
+        self.fail_pending();
+        for task in self.tasks.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            task.abort();
+        }
+    }
+
+    /// Whether the agent has what minor `minor` of this major added. A
+    /// feature added in a later minor checks this first, so an older pod
+    /// fails that one tool and nothing else.
+    #[cfg_attr(not(test), allow(dead_code))] // until a feature needs a minor above 0
+    fn require_minor(&self, minor: u32) -> Result<(), TerminalError> {
+        if self.agent_version.minor >= minor {
+            Ok(())
+        } else {
+            Err(TerminalError::AgentTooOld {
+                needs: ProtocolVersion { major: PROTOCOL_VERSION.major, minor },
+                found: self.agent_version,
+            })
+        }
+    }
 }
 
 /// The per-pod registry — one WebSocket connection per pod, shared by
 /// every terminal that pod hosts (one agent *process* per pod — see
-/// SME-9's "Why N pods and N terminals"). Holds only the connection handle,
-/// nothing else (no scrollback, no exit-code slot; see SME-9's
-/// "sandbox.rs" bullet on why that in-memory state was removed entirely
-/// once nothing needed a hot path fast enough to justify caching it).
-static TERMINAL_CONNECTIONS: LazyLock<StdMutex<HashMap<i64, Arc<TerminalConnection>>>> =
-    LazyLock::new(|| StdMutex::new(HashMap::new()));
+/// SME-9's "Why N pods and N terminals"). Also what smelt knows about pods
+/// it must not connect to: ones torn down, and ones whose agent is
+/// outdated. Kept together under one lock, so a connection finishing
+/// while its pod is torn down is either closed by the teardown or refused
+/// by `register`, never kept.
+#[derive(Default)]
+struct Registry {
+    connections: HashMap<i64, Arc<TerminalConnection>>,
+    /// Pod ids never come back, so this is never cleared.
+    torn_down: std::collections::HashSet<i64>,
+    /// Pods whose agent speaks another major (or none): `found` from its
+    /// hello. The image can't change under a pod, so it doesn't expire.
+    outdated: HashMap<i64, Option<ProtocolVersion>>,
+}
+
+static REGISTRY: LazyLock<StdMutex<Registry>> = LazyLock::new(Default::default);
+
+fn registry() -> std::sync::MutexGuard<'static, Registry> {
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn registry_get(pod_id: i64) -> Option<Arc<TerminalConnection>> {
-    TERMINAL_CONNECTIONS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&pod_id)
-        .cloned()
+    registry().connections.get(&pod_id).cloned()
 }
 
 fn registry_contains(pod_id: i64) -> bool {
-    TERMINAL_CONNECTIONS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains_key(&pod_id)
+    registry().connections.contains_key(&pod_id)
 }
 
-fn register(pod_id: i64, conn: Arc<TerminalConnection>) {
-    TERMINAL_CONNECTIONS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(pod_id, conn);
+/// Why `register` refused a connection.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    TornDown,
+    /// Its socket already closed. Its reader, finding it unregistered,
+    /// took that for a deliberate teardown and won't reconnect, so a
+    /// registered dead connection would never be replaced.
+    Ended,
 }
 
+/// Makes `conn` the pod's connection, unless the pod was torn down or the
+/// connection has already ended. Checked under the registry's lock, and the
+/// reader fails its waiters before it looks in the registry, so a
+/// connection either is refused here or is found there by its reader.
+fn register(pod_id: i64, conn: Arc<TerminalConnection>) -> Result<(), Refused> {
+    let mut registry = registry();
+    if registry.torn_down.contains(&pod_id) {
+        return Err(Refused::TornDown);
+    }
+    if conn.pending.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        return Err(Refused::Ended);
+    }
+    registry.connections.insert(pod_id, conn);
+    Ok(())
+}
+
+/// The pod is being torn down: close its connection, and keep any connect
+/// still under way from registering one. `terminate_pod_with` takes the mark
+/// back if the teardown fails.
 fn deregister(pod_id: i64) {
-    TERMINAL_CONNECTIONS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&pod_id);
+    let conn = {
+        let mut registry = registry();
+        registry.torn_down.insert(pod_id);
+        registry.outdated.remove(&pod_id);
+        registry.connections.remove(&pod_id)
+    };
+    if let Some(conn) = conn {
+        conn.close();
+    }
+}
+
+/// A smelt restart, as far as one pod is concerned: its connection is
+/// closed and forgotten, and the pod is left alone.
+#[cfg(test)]
+fn forget_connection(pod_id: i64) {
+    let conn = registry().connections.remove(&pod_id);
+    if let Some(conn) = conn {
+        conn.close();
+    }
 }
 
 /// Like `deregister`, but only actually removes the entry — and reports
@@ -1580,16 +1782,56 @@ fn deregister(pod_id: i64) {
 /// deliberately torn down" apart from "this connection just crashed"
 /// without any new state.
 fn deregister_if_current(pod_id: i64, conn: &Arc<TerminalConnection>) -> bool {
-    let mut connections = TERMINAL_CONNECTIONS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match connections.get(&pod_id) {
+    let mut registry = registry();
+    match registry.connections.get(&pod_id) {
         Some(current) if Arc::ptr_eq(current, conn) => {
-            connections.remove(&pod_id);
+            registry.connections.remove(&pod_id);
             true
         }
         _ => false,
     }
+}
+
+/// `Some(found)` if the pod's agent is known to be outdated.
+fn outdated(pod_id: i64) -> Option<Option<ProtocolVersion>> {
+    registry().outdated.get(&pod_id).copied()
+}
+
+/// How an agent on `agent` compares with a smelt on `smelt` of the same
+/// major.
+fn classify_agent(agent: ProtocolVersion, smelt: ProtocolVersion) -> crate::api::pods::AgentStatus {
+    use crate::api::pods::AgentStatus;
+    let version = agent.to_string();
+    if agent.minor < smelt.minor {
+        AgentStatus::RestartRecommended { version }
+    } else {
+        AgentStatus::Current { version }
+    }
+}
+
+/// What smelt knows of `pod_id`'s agent: the version it said hello with,
+/// or that it's outdated. `None` while smelt holds no connection to it.
+pub fn agent_status(pod_id: i64) -> Option<crate::api::pods::AgentStatus> {
+    let registry = registry();
+    if let Some(found) = registry.outdated.get(&pod_id) {
+        return Some(crate::api::pods::AgentStatus::RestartRequired {
+            version: found.map(|version| version.to_string()),
+        });
+    }
+    let conn = registry.connections.get(&pod_id)?;
+    Some(classify_agent(conn.agent_version, PROTOCOL_VERSION))
+}
+
+/// Serialises connecting to one pod, so two callers make one connection.
+fn pod_connect_lock(pod_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: LazyLock<StdMutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> =
+        LazyLock::new(Default::default);
+    LOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(pod_id)
+        .or_default()
+        .clone()
 }
 
 // --- Pod ---
@@ -2067,7 +2309,7 @@ pub async fn terminate_pod(pool: &PgPool, conversation_id: i64) -> Result<(), Te
 /// it's still there), mark the DB row terminated, publish the UI event.
 /// Shared by `terminate_pod` (a deliberate, guarded teardown — the guard
 /// above already ensures no live terminals before this runs) and
-/// `reconnect_or_confirm_crash`'s exhausted-retries fallback (unguarded —
+/// `connect_with_retry`'s exhausted-retries fallback (unguarded —
 /// nothing to check, it's already given up reaching this pod). Deregisters
 /// *before* touching the k8s API, not after — see SME-12's "How" on why
 /// that ordering is what lets a deliberate teardown always win the race
@@ -2076,18 +2318,36 @@ async fn force_terminate_pod(
     pool: &PgPool,
     pod_id: i64,
 ) -> Result<Option<db::SandboxPod>, SandboxError> {
+    terminate_pod_with(pool, pod_id, async {
+        let pods = pods_api(&get().client);
+        let name = pod_name(pod_id);
+        if pods.get_opt(&name).await?.is_some() {
+            pods.delete(&name, &pod_delete_params()).await?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// `force_terminate_pod` with the cluster's delete passed in, so a test can
+/// make it fail.
+async fn terminate_pod_with(
+    pool: &PgPool,
+    pod_id: i64,
+    delete: impl std::future::Future<Output = Result<(), SandboxError>>,
+) -> Result<Option<db::SandboxPod>, SandboxError> {
     deregister(pod_id);
-
-    let manager = get();
-    let name = pod_name(pod_id);
-    let pods = pods_api(&manager.client);
-    if pods.get_opt(&name).await?.is_some() {
-        pods.delete(&name, &pod_delete_params()).await?;
+    // The pod stays running and its row live if either step fails, so it
+    // must stay reachable too.
+    let closed = async {
+        delete.await?;
+        db::terminate_sandbox_pod(pool, pod_id).await.map_err(SandboxError::Db)
     }
-
-    let row = db::terminate_sandbox_pod(pool, pod_id)
-        .await
-        .map_err(SandboxError::Db)?;
+    .await;
+    if closed.is_err() {
+        registry().torn_down.remove(&pod_id);
+    }
+    let row = closed?;
     if let Some(row) = &row {
         events::publish(
             row.conversation_id,
@@ -2185,6 +2445,7 @@ pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInf
         result.push(PodInfo {
             pod_id: row.id,
             status,
+            agent: agent_status(row.id),
         });
     }
     Ok(result)
@@ -2293,7 +2554,12 @@ pub async fn create_terminal(pool: &PgPool, conversation_id: i64) -> Result<i64,
     let row = db::create_sandbox_terminal(pool, pod_id).await?;
     let terminal_id = row.id;
 
-    if let Err(e) = request_terminal_action(&conn, terminal_id, "create_terminal").await {
+    let created = conn
+        .request(|request_id| ClientMessage::CreateTerminal { request_id, terminal_id: terminal_id.to_string() })
+        .await;
+    if let Err(e) = expect_reply(created, "create_terminal", |reply| {
+        matches!(reply, Reply::TerminalCreated).then_some(())
+    }) {
         let _ = db::terminate_sandbox_terminal(pool, terminal_id).await;
         return Err(e);
     }
@@ -2329,7 +2595,12 @@ pub async fn terminate_terminal(pool: &PgPool, terminal_id: i64) -> Result<(), T
     }
 
     let conn = reconnect_if_needed(pool, pod_id).await?;
-    request_terminal_action(&conn, terminal_id, "terminate_terminal").await?;
+    let terminated = conn
+        .request(|request_id| ClientMessage::TerminateTerminal { request_id, terminal_id: terminal_id.to_string() })
+        .await;
+    expect_reply(terminated, "terminate_terminal", |reply| {
+        matches!(reply, Reply::TerminalTerminated).then_some(())
+    })?;
 
     db::terminate_sandbox_terminal(pool, terminal_id).await?;
     events::publish(
@@ -2371,8 +2642,7 @@ pub async fn list_terminals(
         .collect())
 }
 
-/// Sends `{"action": "command", "terminal_id", "id": command_id,
-/// "command"}` to the terminal's pod's agent — reconnecting first if the
+/// Sends a `command` to the terminal's pod's agent — reconnecting first if the
 /// registry has no live entry (a smelt restart, or the first send right
 /// after `create_terminal`'s own connect). Never launches a fresh agent
 /// itself (that's `create_terminal`'s job).
@@ -2386,16 +2656,14 @@ pub async fn send_command(
         .await?
         .ok_or(TerminalError::NoTerminal)?;
     let conn = reconnect_if_needed(pool, pod_id).await?;
-    let payload =
-        serde_json::json!({"action": "command", "terminal_id": terminal_id.to_string(), "id": command_id, "command": command})
-            .to_string();
-    conn.outgoing
-        .send(payload)
-        .map_err(|_| TerminalError::NoTerminal)
+    Ok(conn.send(&ClientMessage::Command {
+        terminal_id: terminal_id.to_string(),
+        id: command_id.to_string(),
+        command: command.to_string(),
+    })?)
 }
 
-/// Sends `{"action": "signal", "terminal_id", "id": command_id,
-/// "signal"}` — same reconnect-first, never-launches behavior as
+/// Sends a `signal` — same reconnect-first, never-launches behavior as
 /// `send_command`.
 pub async fn send_signal(
     pool: &PgPool,
@@ -2407,12 +2675,11 @@ pub async fn send_signal(
         .await?
         .ok_or(TerminalError::NoTerminal)?;
     let conn = reconnect_if_needed(pool, pod_id).await?;
-    let payload =
-        serde_json::json!({"action": "signal", "terminal_id": terminal_id.to_string(), "id": command_id, "signal": signal})
-            .to_string();
-    conn.outgoing
-        .send(payload)
-        .map_err(|_| TerminalError::NoTerminal)
+    Ok(conn.send(&ClientMessage::Signal {
+        terminal_id: terminal_id.to_string(),
+        id: command_id.to_string(),
+        signal: signal.to_string(),
+    })?)
 }
 
 /// Deletes every pod that exists for this conversation, unconditionally
@@ -2472,9 +2739,7 @@ async fn delete_listed(pods: &Api<Pod>, selector: &ListParams, conversation_id: 
 /// otherwise tries to (re)connect to that pod's agent. This is what makes
 /// a smelt restart transparently reconnect to a still-healthy agent, *and*
 /// what detects a crashed agent (pod exists, `Running`, but nothing
-/// answers) — see SME-9's "Agent crash recovery": cleanup only, never
-/// touches the pod, and does not attempt to launch a fresh agent itself
-/// (that's `ensure_pod_connection`'s job, used only by `create_terminal`).
+/// answers) — see SME-9's "Agent crash recovery" and `connect_with_retry`.
 async fn reconnect_if_needed(
     pool: &PgPool,
     pod_id: i64,
@@ -2482,7 +2747,7 @@ async fn reconnect_if_needed(
     if let Some(conn) = registry_get(pod_id) {
         return Ok(conn);
     }
-    reconnect_or_confirm_crash(pool, pod_id).await
+    connect_with_retry(pool.clone(), pod_id, ConnectMode::Reconnect).await
 }
 
 /// Bounded retry, not measured against anything real yet — see SME-12's
@@ -2490,64 +2755,122 @@ async fn reconnect_if_needed(
 const RECONNECT_ATTEMPTS: u32 = 3;
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 
-/// Tries to (re)connect to a pod's agent; if that fails, checks the pod's
-/// *actual* status via the Kubernetes API before concluding anything — a
-/// single failed `connect()` doesn't mean the pod is dead (a transient
-/// portforward/API hiccup looks identical to one that does), so
-/// `pod_death_reason` is the authoritative signal, not the connection
-/// attempt itself. See SME-12's "Detection design."
-///
-/// Written as a plain `fn` returning a boxed future, not `async fn` —
-/// `connect()`'s reader task calls this, and this itself calls `connect()`
-/// again on retry, and that `async fn`-to-`async fn` cycle defeats rustc's
-/// `Send`-auto-trait inference (development-process.md's documented
-/// hazard — the same shape as `api::chat::run_turn`/`anthropic::tools::execute`).
-fn reconnect_or_confirm_crash(
-    pool: &PgPool,
-    pod_id: i64,
-) -> std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = Result<Arc<TerminalConnection>, TerminalError>>
-            + Send
-            + '_,
-    >,
-> {
-    Box::pin(async move {
-        let manager = get();
-        let name = pod_name(pod_id);
-        let pods = pods_api(&manager.client);
+/// Who is connecting, which decides what a failure means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectMode {
+    /// `create_terminal`, possibly the pod's first connection ever. The pod
+    /// must be `Running`, and a failure is routine (the agent may not have
+    /// bound its port yet): no crash cleanup.
+    First,
+    /// Everyone else, who expects the agent to be there. After the last
+    /// failed attempt the pod is cleaned up and stopped, as after a crash.
+    Reconnect,
+}
 
+/// Why one attempt to connect failed.
+#[derive(Debug)]
+enum ConnectError {
+    /// Worth another try: the port-forward, the handshake or the network.
+    Failed(SandboxError),
+    /// The agent speaks another major version, or predates versioning. Not
+    /// worth another try. `certain` is false when it only said nothing.
+    Outdated { found: Option<ProtocolVersion>, certain: bool },
+}
+
+/// Connects to `pod_id`'s agent and registers the connection, retrying a
+/// few times. In `Reconnect` mode, a failed attempt first asks the cluster
+/// whether the pod is actually dead (a transient port-forward hiccup looks
+/// the same as a dead pod), so `pod_death_reason` is the authoritative
+/// signal, not the attempt itself. See SME-12's "Detection design."
+///
+/// A plain `fn` returning a boxed future, not `async fn`: `connect()`'s
+/// reader task calls this, this calls `connect()`, and that cycle defeats
+/// rustc's `Send` inference (development-process.md's documented hazard).
+fn connect_with_retry(
+    pool: PgPool,
+    pod_id: i64,
+    mode: ConnectMode,
+) -> BoxFuture<'static, Result<Arc<TerminalConnection>, TerminalError>> {
+    Box::pin(async move {
+        if let Some(found) = outdated(pod_id) {
+            return Err(TerminalError::AgentOutdated { found });
+        }
+        let lock = pod_connect_lock(pod_id);
+        let _connecting = lock.lock().await;
+        // Another caller may have connected, or found the agent outdated,
+        // while this one waited for the lock.
+        if let Some(conn) = registry_get(pod_id) {
+            return Ok(conn);
+        }
+        if let Some(found) = outdated(pod_id) {
+            return Err(TerminalError::AgentOutdated { found });
+        }
+
+        let dialer = dialer_for(pod_id);
+        if mode == ConnectMode::First && !dialer.is_running(pod_id).await? {
+            return Err(TerminalError::NoPod);
+        }
+
+        let mut last_err = None;
         for attempt in 0..RECONNECT_ATTEMPTS {
-            match connect(&manager.client, pool.clone(), pod_id, &name).await {
-                Ok(conn) => {
-                    register(pod_id, conn.clone());
-                    return Ok(conn);
-                }
-                Err(_) => match pod_death_reason(&pods, &name).await {
-                    Some(reason) => {
-                        clean_up_and_terminate_pod(pool, pod_id, reason).await;
-                        return Err(TerminalError::NoTerminal);
+            let failure = match connect(pool.clone(), pod_id, dialer.clone()).await {
+                Ok(conn) => match register(pod_id, conn.clone()) {
+                    Ok(()) => return Ok(conn),
+                    Err(Refused::TornDown) => {
+                        // Torn down while this connected: a teardown doesn't
+                        // wait for the lock.
+                        conn.close();
+                        return Err(TerminalError::NoPod);
                     }
-                    None if attempt + 1 < RECONNECT_ATTEMPTS => {
+                    Err(Refused::Ended) => ConnectError::Failed(SandboxError::WebSocket(
+                        tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+                    )),
+                },
+                Err(e) => e,
+            };
+            match failure {
+                ConnectError::Outdated { found, certain } => {
+                    tracing::warn!(pod_id, ?found, certain, "the sandbox agent is outdated");
+                    // Silence might be a slow link rather than an old agent,
+                    // so only a message that says so is remembered.
+                    if certain {
+                        registry().outdated.insert(pod_id, found);
+                    }
+                    return Err(TerminalError::AgentOutdated { found });
+                }
+                ConnectError::Failed(e) => {
+                    tracing::info!(pod_id, attempt, error = %e, "couldn't connect to the sandbox agent");
+                    if mode == ConnectMode::Reconnect {
+                        if let Some(reason) = dialer.death_reason(pod_id).await {
+                            clean_up_and_terminate_pod(&pool, pod_id, reason).await;
+                            return Err(TerminalError::AgentUnreachable);
+                        }
+                    }
+                    last_err = Some(e);
+                    if attempt + 1 < RECONNECT_ATTEMPTS {
                         tokio::time::sleep(RECONNECT_BACKOFF).await;
                     }
-                    None => {}
-                },
+                }
             }
         }
 
-        // Exhausted every attempt without Kubernetes ever confirming the
-        // pod is actually dead — a pod stuck reporting `Running` while
-        // genuinely unreachable, say. The terminal is unusable either way,
-        // so clean up and terminate it the same as a confirmed crash.
-        clean_up_and_terminate_pod(pool, pod_id, None).await;
-        Err(TerminalError::NoTerminal)
+        match mode {
+            ConnectMode::First => Err(last_err.map(TerminalError::from).unwrap_or(TerminalError::AgentUnreachable)),
+            ConnectMode::Reconnect => {
+                // Every attempt failed without the cluster ever confirming
+                // the pod is dead (a pod stuck reporting `Running` while
+                // unreachable, say). Its terminals are unusable either way,
+                // so clean up and stop it the same as a confirmed crash.
+                clean_up_and_terminate_pod(&pool, pod_id, None).await;
+                Err(TerminalError::AgentUnreachable)
+            }
+        }
     })
 }
 
 /// `handle_crash_cleanup` plus a best-effort attempt to actually terminate
 /// the pod — delete the k8s object, mark `sandbox_pods.terminated_at` (see
-/// `force_terminate_pod`). Used by *every* path in `reconnect_or_confirm_crash`
+/// `force_terminate_pod`). Used by *every* path in `connect_with_retry`
 /// that concludes the pod is gone, confirmed or not: Kubernetes doesn't
 /// clean up after an OOM kill (or any other early exit) on its own — a
 /// `Failed` pod with `restart_policy: Never` just sits there — and leaving
@@ -2570,23 +2893,22 @@ async fn clean_up_and_terminate_pod(pool: &PgPool, pod_id: i64, reason: Option<S
 /// latency, worth paying once for a UI snapshot, not on every tool call.
 /// Errors are swallowed; this is a freshness nicety, not something that
 /// should turn an otherwise-successful snapshot fetch into an error.
+///
+/// Doesn't wait behind a connect already under way: a page load shows the
+/// terminals disconnected for now instead.
 pub async fn try_reconnect(pool: &PgPool, pod_id: i64) {
+    if registry_contains(pod_id) || outdated(pod_id).is_some() {
+        return;
+    }
+    if pod_connect_lock(pod_id).try_lock().is_err() {
+        return;
+    }
     let _ = reconnect_if_needed(pool, pod_id).await;
 }
 
-/// `create_terminal`'s connection step. The pod's agent is its own
-/// `ENTRYPOINT`, so unlike before there's nothing to launch here — this is
-/// "connect," never "inject and launch." A failure to connect here is
-/// routine (the agent hasn't bound its port yet, or this is genuinely the
-/// pod's first-ever connection attempt), not a crash signal, so this
-/// deliberately bypasses `reconnect_or_confirm_crash`'s retry/force-
-/// terminate machinery — that's for callers who already expect a
-/// connection to exist, which isn't true here by design. Still worth a
-/// short bounded retry (same `RECONNECT_ATTEMPTS`/`RECONNECT_BACKOFF`
-/// shape `reconnect_or_confirm_crash` uses) rather than a single attempt:
-/// `Running` and "the agent has bound its port" aren't quite the same
-/// instant, even though they're much closer together now than when the
-/// agent was injected and launched after the fact.
+/// `create_terminal`'s connection step: the pod's agent is its own
+/// `ENTRYPOINT`, so this only ever connects, never launches anything. See
+/// `ConnectMode::First`.
 async fn ensure_pod_connection(
     pool: &PgPool,
     pod_id: i64,
@@ -2594,132 +2916,16 @@ async fn ensure_pod_connection(
     if let Some(conn) = registry_get(pod_id) {
         return Ok(conn);
     }
-
-    let manager = get();
-    let name = pod_name(pod_id);
-    let pods = pods_api(&manager.client);
-    let pod = pods.get_opt(&name).await.map_err(SandboxError::from)?;
-    let Some(pod) = pod else {
-        return Err(TerminalError::NoPod);
-    };
-    if pod.status.and_then(|s| s.phase).as_deref() != Some("Running") {
-        return Err(TerminalError::NoPod);
-    }
-
-    let mut last_err = None;
-    for attempt in 0..RECONNECT_ATTEMPTS {
-        match connect(&manager.client, pool.clone(), pod_id, &name).await {
-            Ok(conn) => {
-                register(pod_id, conn.clone());
-                return Ok(conn);
-            }
-            Err(e) => {
-                last_err = Some(e);
-                if attempt + 1 < RECONNECT_ATTEMPTS {
-                    tokio::time::sleep(RECONNECT_BACKOFF).await;
-                }
-            }
-        }
-    }
-    Err(last_err.expect("loop runs at least once").into())
+    connect_with_retry(pool.clone(), pod_id, ConnectMode::First).await
 }
 
-/// Sends a `create_terminal`/`terminate_terminal` protocol action and
-/// blocks (up to `ACK_TIMEOUT`) for its ack — see SME-9's "Request/ack
-/// correlation, new this round." `send_command`/`send_signal` don't go
-/// through this; they stay fire-and-forget.
-async fn request_terminal_action(
-    conn: &Arc<TerminalConnection>,
-    terminal_id: i64,
-    action: &str,
-) -> Result<(), TerminalError> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    conn.pending_acks
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(terminal_id, tx);
-
-    let payload =
-        serde_json::json!({"action": action, "terminal_id": terminal_id.to_string()}).to_string();
-    if conn.outgoing.send(payload).is_err() {
-        conn.pending_acks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&terminal_id);
-        return Err(TerminalError::NoTerminal);
-    }
-
-    match tokio::time::timeout(ACK_TIMEOUT, rx).await {
-        Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(message))) => {
-            tracing::warn!(%message, terminal_id, %action, "agent reported terminal action failure");
-            Err(TerminalError::NoTerminal)
-        }
-        Ok(Err(_)) => Err(TerminalError::NoTerminal), // sender dropped — connection ended before the ack arrived
-        Err(_) => {
-            conn.pending_acks
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&terminal_id);
-            Err(TerminalError::NoTerminal)
-        }
-    }
-}
-
-/// Entropy for a file-tool `request_id` — only needs to be unique among
-/// this *one pod connection's* outstanding requests (tool calls are
-/// serialized per conversation by `run_turn`'s own lock, so there's never
-/// more than one in flight at a time in practice), not globally unique.
-fn generate_request_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    format!(
-        "freq-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    )
-}
-
-/// Sends a `read_file`/`write_file`/`edit_file`/`list_directory` protocol
-/// action and blocks (up to `ACK_TIMEOUT`) for its response — the file-tool
-/// analog of `request_terminal_action`, correlated by `request_id` instead
-/// of `terminal_id` since a file operation isn't tied to any one terminal.
-/// Unlike `request_terminal_action`, an agent-reported failure's message is
-/// returned to the caller, not collapsed into a generic error — the model
-/// needs to see exactly what went wrong (hash mismatch, ambiguous match,
-/// size cap, ...).
-async fn request_file_action(
-    conn: &Arc<TerminalConnection>,
-    payload: serde_json::Value,
-    request_id: String,
-) -> Result<FileResponse, TerminalError> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    conn.pending_file_requests
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(request_id.clone(), tx);
-
-    if conn.outgoing.send(payload.to_string()).is_err() {
-        conn.pending_file_requests
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&request_id);
-        return Err(TerminalError::NoTerminal);
-    }
-
-    match tokio::time::timeout(ACK_TIMEOUT, rx).await {
-        Ok(Ok(Ok(response))) => Ok(response),
-        Ok(Ok(Err(message))) => Err(TerminalError::FileOperation(message)),
-        Ok(Err(_)) => Err(TerminalError::NoTerminal), // sender dropped — connection ended before the response arrived
-        Err(_) => {
-            conn.pending_file_requests
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&request_id);
-            Err(TerminalError::NoTerminal)
-        }
-    }
+/// The value `pick` finds in a request's reply, or why there isn't one.
+fn expect_reply<T>(
+    result: Result<Reply, AgentRequestError>,
+    action: &'static str,
+    pick: impl FnOnce(Reply) -> Option<T>,
+) -> Result<T, TerminalError> {
+    pick(result?).ok_or(TerminalError::Agent(AgentRequestError::UnexpectedReply(action)))
 }
 
 /// Reads (a paginated slice of) `path` in this conversation's pod.
@@ -2734,20 +2940,13 @@ pub async fn read_file(
 ) -> Result<FileContents, TerminalError> {
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
     let conn = reconnect_if_needed(pool, pod_id).await?;
-    let request_id = generate_request_id();
-    let payload = serde_json::json!({
-        "action": "read_file",
-        "request_id": request_id,
-        "path": path,
-        "offset": offset,
-        "limit": limit,
-    });
-    match request_file_action(&conn, payload, request_id).await? {
-        FileResponse::Read(contents) => Ok(contents),
-        _ => Err(TerminalError::FileOperation(
-            "agent returned an unexpected response type for read_file".to_string(),
-        )),
-    }
+    let reply = conn
+        .request(|request_id| ClientMessage::ReadFile { request_id, path: path.to_string(), offset, limit })
+        .await;
+    expect_reply(reply, "read_file", |reply| match reply {
+        Reply::FileRead(contents) => Some(contents),
+        _ => None,
+    })
 }
 
 /// Creates or overwrites `path` in this conversation's pod. `expected_hash`
@@ -2764,20 +2963,18 @@ pub async fn write_file(
 ) -> Result<String, TerminalError> {
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
     let conn = reconnect_if_needed(pool, pod_id).await?;
-    let request_id = generate_request_id();
-    let payload = serde_json::json!({
-        "action": "write_file",
-        "request_id": request_id,
-        "path": path,
-        "content": content,
-        "expected_hash": expected_hash,
-    });
-    match request_file_action(&conn, payload, request_id).await? {
-        FileResponse::Written { hash } => Ok(hash),
-        _ => Err(TerminalError::FileOperation(
-            "agent returned an unexpected response type for write_file".to_string(),
-        )),
-    }
+    let reply = conn
+        .request(|request_id| ClientMessage::WriteFile {
+            request_id,
+            path: path.to_string(),
+            content: content.to_string(),
+            expected_hash,
+        })
+        .await;
+    expect_reply(reply, "write_file", |reply| match reply {
+        Reply::FileWritten { hash } => Some(hash),
+        _ => None,
+    })
 }
 
 /// Applies a targeted `old_string` → `new_string` replacement to `path` in
@@ -2798,23 +2995,21 @@ pub async fn edit_file(
 ) -> Result<String, TerminalError> {
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
     let conn = reconnect_if_needed(pool, pod_id).await?;
-    let request_id = generate_request_id();
-    let payload = serde_json::json!({
-        "action": "edit_file",
-        "request_id": request_id,
-        "path": path,
-        "old_string": old_string,
-        "new_string": new_string,
-        "replace_all": replace_all,
-        "expected_hash": expected_hash,
-        "expected_line": expected_line,
-    });
-    match request_file_action(&conn, payload, request_id).await? {
-        FileResponse::Edited { hash } => Ok(hash),
-        _ => Err(TerminalError::FileOperation(
-            "agent returned an unexpected response type for edit_file".to_string(),
-        )),
-    }
+    let reply = conn
+        .request(|request_id| ClientMessage::EditFile {
+            request_id,
+            path: path.to_string(),
+            old_string: old_string.to_string(),
+            new_string: new_string.to_string(),
+            replace_all,
+            expected_hash,
+            expected_line,
+        })
+        .await;
+    expect_reply(reply, "edit_file", |reply| match reply {
+        Reply::FileEdited { hash } => Some(hash),
+        _ => None,
+    })
 }
 
 /// Lists `path` (one level, non-recursive) in this conversation's pod.
@@ -2825,15 +3020,13 @@ pub async fn list_directory(
 ) -> Result<Vec<DirEntry>, TerminalError> {
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
     let conn = reconnect_if_needed(pool, pod_id).await?;
-    let request_id = generate_request_id();
-    let payload =
-        serde_json::json!({"action": "list_directory", "request_id": request_id, "path": path});
-    match request_file_action(&conn, payload, request_id).await? {
-        FileResponse::Listed(entries) => Ok(entries),
-        _ => Err(TerminalError::FileOperation(
-            "agent returned an unexpected response type for list_directory".to_string(),
-        )),
-    }
+    let reply = conn
+        .request(|request_id| ClientMessage::ListDirectory { request_id, path: path.to_string() })
+        .await;
+    expect_reply(reply, "list_directory", |reply| match reply {
+        Reply::DirectoryListed { entries } => Some(entries),
+        _ => None,
+    })
 }
 
 /// Finds files under `path` whose path relative to `path` matches
@@ -2849,21 +3042,19 @@ pub async fn glob(
 ) -> Result<GlobResult, TerminalError> {
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
     let conn = reconnect_if_needed(pool, pod_id).await?;
-    let request_id = generate_request_id();
-    let payload = serde_json::json!({
-        "action": "glob",
-        "request_id": request_id,
-        "path": path,
-        "pattern": pattern,
-        "offset": offset,
-        "limit": limit,
-    });
-    match request_file_action(&conn, payload, request_id).await? {
-        FileResponse::Globbed(result) => Ok(result),
-        _ => Err(TerminalError::FileOperation(
-            "agent returned an unexpected response type for glob".to_string(),
-        )),
-    }
+    let reply = conn
+        .request(|request_id| ClientMessage::Glob {
+            request_id,
+            path: path.to_string(),
+            pattern: pattern.to_string(),
+            offset,
+            limit,
+        })
+        .await;
+    expect_reply(reply, "glob", |reply| match reply {
+        Reply::GlobMatched(result) => Some(result),
+        _ => None,
+    })
 }
 
 /// Searches file contents under `path` for `pattern`, optionally narrowed
@@ -2881,23 +3072,21 @@ pub async fn grep(
 ) -> Result<GrepResult, TerminalError> {
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
     let conn = reconnect_if_needed(pool, pod_id).await?;
-    let request_id = generate_request_id();
-    let payload = serde_json::json!({
-        "action": "grep",
-        "request_id": request_id,
-        "path": path,
-        "pattern": pattern,
-        "glob": glob,
-        "case_insensitive": case_insensitive,
-        "offset": offset,
-        "limit": limit,
-    });
-    match request_file_action(&conn, payload, request_id).await? {
-        FileResponse::Grepped(result) => Ok(result),
-        _ => Err(TerminalError::FileOperation(
-            "agent returned an unexpected response type for grep".to_string(),
-        )),
-    }
+    let reply = conn
+        .request(|request_id| ClientMessage::Grep {
+            request_id,
+            path: path.to_string(),
+            pattern: pattern.to_string(),
+            glob,
+            case_insensitive,
+            offset,
+            limit,
+        })
+        .await;
+    expect_reply(reply, "grep", |reply| match reply {
+        Reply::GrepMatched(result) => Some(result),
+        _ => None,
+    })
 }
 
 /// The user stopping a pod from the pods view or the sandbox panel. Tears
@@ -3156,51 +3345,49 @@ async fn close_pod_terminals(pool: &PgPool, pod_id: i64) -> (Option<i64>, bool) 
     (conversation_id, found_live_terminal)
 }
 
-/// Portforward + a client-side WebSocket handshake over the forwarded
-/// stream (kube's own "ws" feature covers exec/attach, not an arbitrary
-/// application-level WS server like the agent's) — spawns one background
-/// task that owns the connection for its whole lifetime: draining
-/// `outgoing` into the WS sink, and parsing every incoming agent message
-/// into `terminal_events`/`terminal_commands` via `db.rs`, or resolving a
-/// pending `create_terminal`/`terminate_terminal` ack. Deregisters itself
-/// on the way out, whatever the reason (clean close, error, agent crash)
-/// — the next call that needs a connection detects that and reconnects or
-/// reports `NoTerminal`. One connection per **pod**, shared by every
-/// terminal it hosts — see SME-9's "Why N pods and N terminals."
+/// Opens a WebSocket to `pod_id`'s agent over `dialer` and starts the two
+/// tasks that own it: one drains `outgoing` into the socket, the other
+/// hands every agent message to `handle_agent_message` (output and exits
+/// into `terminal_events`/`terminal_commands`, replies to their waiting
+/// request). When the socket ends unexpectedly, the reader reconnects, or
+/// confirms a crash. One connection per **pod**, shared by every terminal
+/// it hosts — see SME-9's "Why N pods and N terminals."
 async fn connect(
-    client: &kube::Client,
     pool: PgPool,
     pod_id: i64,
-    pod_name: &str,
-) -> Result<Arc<TerminalConnection>, SandboxError> {
+    dialer: Arc<dyn AgentDialer>,
+) -> Result<Arc<TerminalConnection>, ConnectError> {
     // Resolved once per pod connection, not per message — see the
     // `conversation_id` field's own doc comment on `TerminalConnection`.
     let conversation_id = db::sandbox_pod_conversation_id(&pool, pod_id)
         .await
-        .map_err(SandboxError::Db)?
-        .ok_or(SandboxError::Db(sqlx::Error::RowNotFound))?;
+        .map_err(|e| ConnectError::Failed(SandboxError::Db(e)))?
+        .ok_or(ConnectError::Failed(SandboxError::Db(sqlx::Error::RowNotFound)))?;
 
-    let pods = pods_api(client);
-    let mut pf = pods.portforward(pod_name, &[AGENT_PORT]).await?;
-    let stream = pf
-        .take_stream(AGENT_PORT)
-        .expect("stream requested for the forwarded port");
-
-    let url = format!("ws://{pod_name}.sandbox-agent.local/ws");
-    let (ws_stream, _response) = tokio_tungstenite::client_async(url, stream)
-        .await
-        .map_err(SandboxError::WebSocket)?;
+    let (ws_stream, agent_version) = tokio::time::timeout(AGENT_CONNECT_TIMEOUT, async {
+        let stream = dialer.dial(pod_id).await.map_err(ConnectError::Failed)?;
+        let url = format!("ws://{}.sandbox-agent.local/ws", pod_name(pod_id));
+        let (mut ws_stream, _response) = tokio_tungstenite::client_async(url, stream)
+            .await
+            .map_err(|e| ConnectError::Failed(SandboxError::WebSocket(e)))?;
+        let version = read_hello(&mut ws_stream).await?;
+        Ok((ws_stream, version))
+    })
+    .await
+    .map_err(|_| ConnectError::Failed(SandboxError::AgentConnectTimeout))??;
     let (mut write, mut read) = ws_stream.split();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let conn = Arc::new(TerminalConnection {
         outgoing: tx,
-        pending_acks: StdMutex::new(HashMap::new()),
-        pending_file_requests: StdMutex::new(HashMap::new()),
+        pending: StdMutex::new(Some(HashMap::new())),
+        tasks: StdMutex::new(Vec::new()),
+        next_request_id: std::sync::atomic::AtomicU64::new(1),
         conversation_id,
+        agent_version,
     });
 
-    tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         while let Some(text) = rx.recv().await {
             if write.send(WsMessage::Text(text.into())).await.is_err() {
                 break;
@@ -3209,12 +3396,14 @@ async fn connect(
     });
 
     let conn_for_pump = conn.clone();
-    tokio::spawn(async move {
+    let reader = tokio::spawn(async move {
         while let Some(Ok(msg)) = read.next().await {
             if let WsMessage::Text(text) = msg {
                 handle_agent_message(&pool, &conn_for_pump, &text).await;
             }
         }
+        // No reply is coming for anything still waiting.
+        conn_for_pump.fail_pending();
         // Only treat this as worth reacting to if nobody already tore this
         // *specific* connection down deliberately (`terminate_pod`/
         // `teardown_conversation` already deregister before they delete —
@@ -3226,7 +3415,7 @@ async fn connect(
                 pod_id,
                 "pod connection ended unexpectedly — attempting to reconnect or confirm a crash"
             );
-            let _ = reconnect_or_confirm_crash(&pool, pod_id).await;
+            let _ = connect_with_retry(pool, pod_id, ConnectMode::Reconnect).await;
         } else {
             tracing::info!(
                 pod_id,
@@ -3234,287 +3423,140 @@ async fn connect(
             );
         }
     });
+    conn.tasks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend([writer.abort_handle(), reader.abort_handle()]);
 
     Ok(conn)
 }
 
-/// Mirrors `sandbox_agent::DirEntryInfo`'s wire shape — its own type isn't
-/// reachable from here (a separate binary crate), so this is a parallel
-/// definition, same as the rest of `AgentMessage`.
-#[derive(Deserialize)]
-struct AgentDirEntry {
-    name: String,
-    is_dir: bool,
-    size: Option<u64>,
-}
+/// The whole of `connect`: port-forward, WebSocket handshake and hello.
+const AGENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the agent has to say hello once the WebSocket is open. It sends
+/// it before anything else, so only an agent that predates the hello, or a
+/// very slow link, takes longer.
+const HELLO_TIMEOUT: Duration = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(5) };
 
-/// Mirrors `sandbox_agent`'s `GrepMatchInfo` — see
-/// SME-19.
-#[derive(Deserialize)]
-struct AgentGrepMatch {
-    path: String,
-    line: u32,
-    text: String,
-}
+/// Reads the agent's hello and returns its version, if smelt speaks its
+/// major. Anything else first means an agent smelt can't talk to.
+async fn read_hello<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>) -> Result<ProtocolVersion, ConnectError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let first = tokio::time::timeout(HELLO_TIMEOUT, async {
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Text(text))) => return Ok(text),
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return Err(ConnectError::Failed(SandboxError::WebSocket(e))),
+                None => {
+                    return Err(ConnectError::Failed(SandboxError::WebSocket(
+                        tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+                    )));
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| ConnectError::Outdated { found: None, certain: false })??;
 
-/// Mirrors `sandbox_agent`'s `SkippedFileInfo`.
-#[derive(Deserialize)]
-struct AgentSkippedFile {
-    path: String,
-    reason: String,
-}
-
-/// Flexible enough to cover every message shape `sandbox_agent`'s tagged
-/// `ServerMessage` enum serializes to — a line/exit event names `id`;
-/// a terminal-action ack names `terminal_id` (and, on failure, `message`);
-/// a file-tool response names `request_id` instead, plus whichever of
-/// `lines`/`total_lines`/`hash`/`entries`/`paths`/`matches`/`skipped`/
-/// `total`/`scan_capped` its `event` variant carries.
-#[derive(Deserialize)]
-struct AgentMessage {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    stream: Option<String>,
-    #[serde(default)]
-    seq: Option<i64>,
-    #[serde(default)]
-    data: Option<String>,
-    #[serde(default)]
-    event: Option<String>,
-    #[serde(default)]
-    code: Option<i32>,
-    #[serde(default)]
-    terminal_id: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    lines: Option<Vec<String>>,
-    #[serde(default)]
-    total_lines: Option<usize>,
-    #[serde(default)]
-    hash: Option<String>,
-    #[serde(default)]
-    entries: Option<Vec<AgentDirEntry>>,
-    #[serde(default)]
-    paths: Option<Vec<String>>,
-    #[serde(default)]
-    matches: Option<Vec<AgentGrepMatch>>,
-    #[serde(default)]
-    skipped: Option<Vec<AgentSkippedFile>>,
-    #[serde(default)]
-    total: Option<usize>,
-    #[serde(default)]
-    scan_capped: Option<bool>,
+    match serde_json::from_str::<AgentMessage>(&first) {
+        Ok(AgentMessage::Hello(version)) if version.major == PROTOCOL_VERSION.major => Ok(version),
+        Ok(AgentMessage::Hello(version)) => Err(ConnectError::Outdated { found: Some(version), certain: true }),
+        // An agent from before the hello: whatever it sent first (a queued
+        // output line, say) isn't one.
+        _ => Err(ConnectError::Outdated { found: None, certain: true }),
+    }
 }
 
 async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, text: &str) {
-    let Ok(msg) = serde_json::from_str::<AgentMessage>(text) else {
-        tracing::warn!(%text, "unparseable message from sandbox agent, ignoring");
-        return;
+    let msg = match serde_json::from_str::<AgentMessage>(text) {
+        Ok(msg) => msg,
+        Err(e) => {
+            // Not the text: it can be a line of anything a command printed.
+            tracing::warn!(
+                kind = ?e.classify(),
+                line = e.line(),
+                column = e.column(),
+                bytes = text.len(),
+                "unparseable message from the sandbox agent, ignoring"
+            );
+            return;
+        }
     };
 
-    match msg.event.as_deref() {
-        Some("exit") => {
-            if let (Some(id), Some(code)) = (msg.id.clone(), msg.code) {
-                if let Err(e) = db::mark_terminal_command_finished(pool, &id, code).await {
-                    tracing::error!(command_id = %id, error = %e, "failed to record command completion");
-                }
-                if let Some(terminal_id) = parse_terminal_id(&msg.terminal_id) {
-                    events::publish(
-                        conn.conversation_id,
-                        events::ConversationEvent::SandboxCommandUpdate {
-                            terminal_id,
-                            command_id: id,
-                            command: None,
-                            status: "finished".to_string(),
-                            exit_code: Some(code),
-                            stream: None,
-                            latest_output: None,
-                            position: None,
-                        },
-                    );
-                }
-                // Actively wake the model rather than leaving it to the
-                // passive backlog drain (which only runs the next time
-                // something *else* triggers a turn) — see
-                // SME-13. Detached:
-                // this runs inside the per-pod WebSocket reader loop, and
-                // awaiting a full model round trip here would block it from
-                // processing any further output/exit events, this pod's or
-                // a sibling terminal's, until the turn finishes.
-                let pool = pool.clone();
-                let conversation_id = conn.conversation_id;
-                tokio::spawn(async move {
-                    let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
-                });
+    match msg {
+        AgentMessage::Output { id, terminal_id, stream, seq, data } => {
+            let seq = seq as i64;
+            if let Err(e) = db::append_terminal_event(pool, &id, stream.as_str(), seq, &data).await {
+                tracing::error!(command_id = %id, error = %e, "failed to record terminal output");
             }
-            return;
+            if let Ok(terminal_id) = terminal_id.parse::<i64>() {
+                events::publish(
+                    conn.conversation_id,
+                    events::ConversationEvent::SandboxCommandUpdate {
+                        terminal_id,
+                        command_id: id,
+                        command: None,
+                        status: "running".to_string(),
+                        exit_code: None,
+                        stream: Some(stream.as_str().to_string()),
+                        latest_output: Some(data),
+                        position: Some(seq),
+                    },
+                );
+            }
         }
-        Some("terminal_created") | Some("terminal_terminated") => {
-            resolve_pending_ack(conn, msg.terminal_id, Ok(()));
-            return;
+        AgentMessage::Exit { id, terminal_id, code } => {
+            if let Err(e) = db::mark_terminal_command_finished(pool, &id, code).await {
+                tracing::error!(command_id = %id, error = %e, "failed to record command completion");
+            }
+            if let Ok(terminal_id) = terminal_id.parse::<i64>() {
+                events::publish(
+                    conn.conversation_id,
+                    events::ConversationEvent::SandboxCommandUpdate {
+                        terminal_id,
+                        command_id: id,
+                        command: None,
+                        status: "finished".to_string(),
+                        exit_code: Some(code),
+                        stream: None,
+                        latest_output: None,
+                        position: None,
+                    },
+                );
+            }
+            // Actively wake the model rather than leaving it to the
+            // passive backlog drain (which only runs the next time
+            // something *else* triggers a turn) — see
+            // SME-13. Detached:
+            // this runs inside the per-pod WebSocket reader loop, and
+            // awaiting a full model round trip here would block it from
+            // processing any further output/exit events, this pod's or
+            // a sibling terminal's, until the turn finishes.
+            let pool = pool.clone();
+            let conversation_id = conn.conversation_id;
+            tokio::spawn(async move {
+                let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
+            });
         }
-        Some("terminal_error") => {
-            resolve_pending_ack(conn, msg.terminal_id, Err(msg.message.unwrap_or_default()));
-            return;
+        AgentMessage::Reply { request_id, result } => conn.resolve(request_id, result),
+        AgentMessage::ProtocolError { request_id: Some(request_id), message } => conn.resolve(
+            request_id,
+            Reply::Error {
+                message: format!("the sandbox agent couldn't read smelt's request ({message}); this is a smelt bug"),
+            },
+        ),
+        AgentMessage::ProtocolError { request_id: None, message } => {
+            // Not the text: serde's error quotes the values it choked on,
+            // which can be part of a request's content.
+            tracing::warn!(bytes = message.len(), "the sandbox agent couldn't read a message from smelt");
         }
-        Some("file_read") => {
-            let contents = FileContents {
-                lines: msg.lines.unwrap_or_default(),
-                total_lines: msg.total_lines.unwrap_or(0),
-                hash: msg.hash.unwrap_or_default(),
-            };
-            resolve_pending_file_request(conn, msg.request_id, Ok(FileResponse::Read(contents)));
-            return;
+        AgentMessage::Hello(version) => tracing::debug!(%version, "the sandbox agent said hello again"),
+        AgentMessage::Unknown => {
+            tracing::debug!("an event from a newer sandbox agent that this smelt doesn't know; ignored");
         }
-        Some("file_written") => {
-            resolve_pending_file_request(
-                conn,
-                msg.request_id,
-                Ok(FileResponse::Written {
-                    hash: msg.hash.unwrap_or_default(),
-                }),
-            );
-            return;
-        }
-        Some("file_edited") => {
-            resolve_pending_file_request(
-                conn,
-                msg.request_id,
-                Ok(FileResponse::Edited {
-                    hash: msg.hash.unwrap_or_default(),
-                }),
-            );
-            return;
-        }
-        Some("directory_listed") => {
-            let entries = msg
-                .entries
-                .unwrap_or_default()
-                .into_iter()
-                .map(|e| DirEntry {
-                    name: e.name,
-                    is_dir: e.is_dir,
-                    size: e.size,
-                })
-                .collect();
-            resolve_pending_file_request(conn, msg.request_id, Ok(FileResponse::Listed(entries)));
-            return;
-        }
-        Some("glob_matched") => {
-            let result = GlobResult {
-                paths: msg.paths.unwrap_or_default(),
-                total: msg.total.unwrap_or(0),
-                scan_capped: msg.scan_capped.unwrap_or(false),
-            };
-            resolve_pending_file_request(conn, msg.request_id, Ok(FileResponse::Globbed(result)));
-            return;
-        }
-        Some("grep_matched") => {
-            let result = GrepResult {
-                matches: msg
-                    .matches
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|m| GrepMatch {
-                        path: m.path,
-                        line: m.line,
-                        text: m.text,
-                    })
-                    .collect(),
-                total: msg.total.unwrap_or(0),
-                scan_capped: msg.scan_capped.unwrap_or(false),
-                skipped: msg
-                    .skipped
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|s| SkippedFile {
-                        path: s.path,
-                        reason: s.reason,
-                    })
-                    .collect(),
-            };
-            resolve_pending_file_request(conn, msg.request_id, Ok(FileResponse::Grepped(result)));
-            return;
-        }
-        Some("file_error") => {
-            resolve_pending_file_request(
-                conn,
-                msg.request_id,
-                Err(msg.message.unwrap_or_default()),
-            );
-            return;
-        }
-        _ => {}
-    }
-
-    if let (Some(id), Some(stream), Some(seq), Some(data)) = (
-        msg.id.clone(),
-        msg.stream.clone(),
-        msg.seq,
-        msg.data.clone(),
-    ) {
-        if let Err(e) = db::append_terminal_event(pool, &id, &stream, seq, &data).await {
-            tracing::error!(command_id = %id, error = %e, "failed to record terminal output");
-        }
-        if let Some(terminal_id) = parse_terminal_id(&msg.terminal_id) {
-            events::publish(
-                conn.conversation_id,
-                events::ConversationEvent::SandboxCommandUpdate {
-                    terminal_id,
-                    command_id: id,
-                    command: None,
-                    status: "running".to_string(),
-                    exit_code: None,
-                    stream: Some(stream),
-                    latest_output: Some(data),
-                    position: Some(seq),
-                },
-            );
-        }
-    }
-}
-
-fn parse_terminal_id(terminal_id: &Option<String>) -> Option<i64> {
-    terminal_id.as_deref().and_then(|s| s.parse::<i64>().ok())
-}
-
-fn resolve_pending_ack(
-    conn: &Arc<TerminalConnection>,
-    terminal_id: Option<String>,
-    result: Result<(), String>,
-) {
-    let Some(terminal_id) = parse_terminal_id(&terminal_id) else {
-        return;
-    };
-    if let Some(tx) = conn
-        .pending_acks
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&terminal_id)
-    {
-        let _ = tx.send(result);
-    }
-}
-
-fn resolve_pending_file_request(
-    conn: &Arc<TerminalConnection>,
-    request_id: Option<String>,
-    result: Result<FileResponse, String>,
-) {
-    let Some(request_id) = request_id else {
-        return;
-    };
-    if let Some(tx) = conn
-        .pending_file_requests
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&request_id)
-    {
-        let _ = tx.send(result);
     }
 }
 
@@ -5795,12 +5837,12 @@ mod tests {
             run_and_wait(&pool, conversation_a.id, terminal_a1, "external-write", &format!("echo changed_externally > {file_path}")).await;
             let stale_edit = edit_file(&pool, conversation_a.id, file_path, "line ONE", "line X", false, hash2.clone(), None).await;
             assert!(
-                matches!(stale_edit, Err(TerminalError::FileOperation(_))),
+                matches!(stale_edit, Err(TerminalError::Agent(AgentRequestError::Rejected(_)))),
                 "edit_file should refuse a stale expected_hash, got {stale_edit:?}"
             );
             let stale_write = write_file(&pool, conversation_a.id, file_path, "clobber", Some(hash2.clone())).await;
             assert!(
-                matches!(stale_write, Err(TerminalError::FileOperation(_))),
+                matches!(stale_write, Err(TerminalError::Agent(AgentRequestError::Rejected(_)))),
                 "write_file should refuse a stale expected_hash, got {stale_write:?}"
             );
 
@@ -5834,18 +5876,18 @@ mod tests {
             // --- Ambiguous match without replace_all/expected_line is a clear error ---
             let ambiguous = edit_file(&pool, conversation_a.id, file_path, "rep", "x", false, read7.hash.clone(), None).await;
             assert!(
-                matches!(ambiguous, Err(TerminalError::FileOperation(_))),
+                matches!(ambiguous, Err(TerminalError::Agent(AgentRequestError::Rejected(_)))),
                 "expected an ambiguous-match error, got {ambiguous:?}"
             );
 
             // --- read_file on a nonexistent path is a clear error, not a panic ---
             let missing = read_file(&pool, conversation_a.id, "/tmp/file-tools-test/does-not-exist.txt", 1, 10).await;
-            assert!(matches!(missing, Err(TerminalError::FileOperation(_))), "expected a file error, got {missing:?}");
+            assert!(matches!(missing, Err(TerminalError::Agent(AgentRequestError::Rejected(_)))), "expected a file error, got {missing:?}");
 
             // --- Oversized content is refused, not silently truncated ---
             let oversized_content = "x".repeat(300 * 1024); // over the 256 KiB cap
             let oversized = write_file(&pool, conversation_a.id, "/tmp/file-tools-test/big.txt", &oversized_content, None).await;
-            assert!(matches!(oversized, Err(TerminalError::FileOperation(_))), "expected a size-limit error, got {oversized:?}");
+            assert!(matches!(oversized, Err(TerminalError::Agent(AgentRequestError::Rejected(_)))), "expected a size-limit error, got {oversized:?}");
 
             // --- list_directory: non-recursive, sorted, correct type/size,
             // and (via a nested path) proves write_file creates parent
@@ -5938,7 +5980,7 @@ mod tests {
             assert_eq!(filtered_grep.matches[0].path, "/tmp/file-tools-test/glob-grep/nested/two.rs");
 
             // --- Pod vanishes out from under us (deleted, evicted, node
-            // lost) while smelt still thinks it's live — reconnect_or_confirm_crash
+            // lost) while smelt still thinks it's live — connect_with_retry
             // should run the same crash cleanup a failed `connect()` already
             // did, not just error out and leave the terminal wedged forever
             // — and now also fully terminate the pod itself (not just its
@@ -5956,7 +5998,7 @@ mod tests {
             deregister(pod_c);
 
             let err = terminate_terminal(&pool, terminal_c1).await;
-            assert!(matches!(err, Err(TerminalError::NoTerminal)), "expected NoTerminal, got {err:?}");
+            assert!(matches!(err, Err(TerminalError::AgentUnreachable)), "expected AgentUnreachable, got {err:?}");
 
             let live_c = db::list_sandbox_terminals_for_pod(&pool, pod_c).await.expect("list_sandbox_terminals_for_pod");
             assert!(
@@ -5975,13 +6017,13 @@ mod tests {
 
             // --- try_reconnect: a still-healthy pod that just lost its
             // in-memory registry entry (e.g. a smelt restart, simulated
-            // here with a bare `deregister` — the k8s pod itself is left
+            // here with `forget_connection` — the k8s pod itself is left
             // alone) should flip back to "connected" once try_reconnect
             // runs, not need an unrelated tool call to happen first.
             // Another separate conversation, same reason as pod_c. ---
             let pod_d = create_pod(&pool, conversation_d.id, PodLimitOverrides::default()).await.expect("create_pod (d) should succeed");
             let terminal_d1 = create_terminal(&pool, conversation_d.id).await.expect("create_terminal (d1) should succeed");
-            deregister(pod_d);
+            forget_connection(pod_d);
 
             let disconnected = list_terminals(&pool, conversation_d.id).await.expect("list_terminals");
             assert_eq!(
@@ -6355,10 +6397,10 @@ mod tests {
             pods_api(&client).create(&PostParams::default(), &no_agent_pod).await.expect("create no-agent pod (g)");
             wait_for_running(&pods_api(&client), &pod_name(pod_g)).await.expect("no-agent pod (g) should reach Running");
 
-            let gave_up = reconnect_or_confirm_crash(&pool, pod_g).await;
+            let gave_up = connect_with_retry(pool.clone(), pod_g, ConnectMode::Reconnect).await;
             assert!(
-                matches!(gave_up, Err(TerminalError::NoTerminal)),
-                "should give up as NoTerminal once reconnect attempts are exhausted, got {:?}",
+                matches!(gave_up, Err(TerminalError::AgentUnreachable)),
+                "should give up as AgentUnreachable once reconnect attempts are exhausted, got {:?}",
                 gave_up.is_ok()
             );
             // Deleted, though this agentless pod's `sleep` may take its grace
@@ -7093,3 +7135,544 @@ mod tests {
     }
 }
 
+
+/// smelt's side of the agent connection against a fake agent on a loopback
+/// port (SME-53): requests and their errors, the hello, and one connection
+/// per pod. The real agent and cluster are `test_terminal_lifecycle_end_to_end`'s.
+#[cfg(test)]
+mod agent_connection_tests {
+    use super::*;
+    use crate::agent_protocol::{DirEntry, Reply};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// What the fake agent sends first on every connection.
+    #[derive(Clone)]
+    enum Greeting {
+        Hello(ProtocolVersion),
+        /// A raw text frame, e.g. a protocol-0 output line.
+        Raw(String),
+        Nothing,
+    }
+
+    enum Out {
+        Message(AgentMessage),
+        Raw(String),
+        Close,
+    }
+
+    /// One connection the fake agent accepted: what smelt sent on it, and a
+    /// way to answer.
+    struct FakeConnection {
+        received: mpsc::UnboundedReceiver<ClientMessage>,
+        send: mpsc::UnboundedSender<Out>,
+        /// Fires when the socket ends, whoever ended it.
+        ended: tokio::sync::oneshot::Receiver<()>,
+    }
+
+    impl FakeConnection {
+        async fn next_request(&mut self) -> ClientMessage {
+            tokio::time::timeout(Duration::from_secs(5), self.received.recv())
+                .await
+                .expect("smelt sent nothing within 5s")
+                .expect("the connection ended")
+        }
+
+        fn reply(&self, request_id: u64, result: Reply) {
+            let _ = self.send.send(Out::Message(AgentMessage::Reply { request_id, result }));
+        }
+    }
+
+    struct FakeAgent {
+        connections: mpsc::UnboundedReceiver<FakeConnection>,
+        dials: Arc<AtomicUsize>,
+    }
+
+    impl FakeAgent {
+        async fn next_connection(&mut self) -> FakeConnection {
+            tokio::time::timeout(Duration::from_secs(5), self.connections.recv())
+                .await
+                .expect("smelt didn't connect within 5s")
+                .expect("the fake agent stopped")
+        }
+    }
+
+    /// Dials the fake agent's port, after `delay`, counting dials.
+    struct FakeDialer {
+        addr: std::net::SocketAddr,
+        delay: Duration,
+        dials: Arc<AtomicUsize>,
+    }
+
+    impl AgentDialer for FakeDialer {
+        fn dial(&self, _pod_id: i64) -> BoxFuture<'_, Result<Box<dyn AgentIo>, SandboxError>> {
+            Box::pin(async move {
+                self.dials.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(self.delay).await;
+                let stream = tokio::net::TcpStream::connect(self.addr).await.map_err(SandboxError::Io)?;
+                Ok(Box::new(stream) as Box<dyn AgentIo>)
+            })
+        }
+
+        fn is_running(&self, _pod_id: i64) -> BoxFuture<'_, Result<bool, SandboxError>> {
+            Box::pin(async { Ok(true) })
+        }
+
+        fn death_reason(&self, _pod_id: i64) -> BoxFuture<'_, Option<Option<String>>> {
+            Box::pin(async { None })
+        }
+    }
+
+    /// A fake agent for `pod_id`, reached through `dialer_for`.
+    async fn fake_agent(pod_id: i64, greeting: Greeting, dial_delay: Duration) -> FakeAgent {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (connections_tx, connections) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else { continue };
+                let (received_tx, received) = mpsc::unbounded_channel();
+                let (send, mut outgoing) = mpsc::unbounded_channel::<Out>();
+                let (ended_tx, ended) = tokio::sync::oneshot::channel();
+                let _ = connections_tx.send(FakeConnection { received, send, ended });
+                let greeting = greeting.clone();
+                tokio::spawn(async move {
+                    let first = match greeting {
+                        Greeting::Hello(version) => Some(serde_json::to_string(&AgentMessage::Hello(version)).expect("json")),
+                        Greeting::Raw(text) => Some(text),
+                        Greeting::Nothing => None,
+                    };
+                    if let Some(first) = first {
+                        let _ = ws.send(WsMessage::Text(first.into())).await;
+                    }
+                    loop {
+                        tokio::select! {
+                            frame = ws.next() => match frame {
+                                Some(Ok(WsMessage::Text(text))) => {
+                                    let message = serde_json::from_str(&text).expect("smelt sent a v1 message");
+                                    let _ = received_tx.send(message);
+                                }
+                                Some(Ok(_)) => {}
+                                _ => break,
+                            },
+                            out = outgoing.recv() => match out {
+                                Some(Out::Message(message)) => {
+                                    let text = serde_json::to_string(&message).expect("json");
+                                    let _ = ws.send(WsMessage::Text(text.into())).await;
+                                }
+                                Some(Out::Raw(text)) => {
+                                    let _ = ws.send(WsMessage::Text(text.into())).await;
+                                }
+                                Some(Out::Close) | None => {
+                                    let _ = ws.close(None).await;
+                                    break;
+                                }
+                            },
+                        }
+                    }
+                    let _ = ended_tx.send(());
+                });
+            }
+        });
+        let dials = Arc::new(AtomicUsize::new(0));
+        let dialer = FakeDialer { addr, delay: dial_delay, dials: dials.clone() };
+        test_dialers().lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, Arc::new(dialer));
+        FakeAgent { connections, dials }
+    }
+
+    /// A conversation and a live pod row for it, with a pod id no other
+    /// test uses (the registry and the fake dialers are keyed by pod id).
+    async fn pod_row(pool: &PgPool) -> (i64, i64) {
+        static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        let unique = (std::process::id() as i64 % 10_000) * 1_000_000
+            + NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 5_000_000_000;
+        sqlx::query("SELECT setval(pg_get_serial_sequence('sandbox_pods', 'id'), $1)")
+            .bind(unique)
+            .execute(pool)
+            .await
+            .expect("move the pod id sequence");
+        let conversation = db::create_conversation(pool).await.expect("conversation");
+        let pod = db::create_sandbox_pod(pool, conversation.id).await.expect("pod row");
+        (conversation.id, pod.id)
+    }
+
+    fn current() -> Greeting {
+        Greeting::Hello(PROTOCOL_VERSION)
+    }
+
+    #[sqlx::test]
+    async fn test_replies_resolve_their_own_requests_in_any_order(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
+        let conn = reconnect_if_needed(&pool, pod_id).await.expect("connects");
+        let mut fake = agent.next_connection().await;
+
+        // Two requests about the same terminal, the old correlation key.
+        let first = conn.request(|request_id| ClientMessage::CreateTerminal { request_id, terminal_id: "7".into() });
+        let second = conn.request(|request_id| ClientMessage::ListDirectory { request_id, path: "/b".into() });
+        let answer = async {
+            let a = fake.next_request().await;
+            let b = fake.next_request().await;
+            let (ClientMessage::CreateTerminal { request_id: a, .. }, ClientMessage::ListDirectory { request_id: b, .. }) = (a, b) else {
+                panic!("unexpected requests");
+            };
+            // Answered in the opposite order.
+            fake.reply(b, Reply::DirectoryListed { entries: vec![DirEntry { name: "b".into(), is_dir: false, size: Some(1) }] });
+            fake.reply(a, Reply::Error { message: "terminal_id already exists".into() });
+        };
+        let (first, second, ()) = tokio::join!(first, second, answer);
+        assert_eq!(first, Err(AgentRequestError::Rejected("terminal_id already exists".into())));
+        assert!(matches!(second, Ok(Reply::DirectoryListed { entries }) if entries[0].name == "b"));
+    }
+
+    /// The agent's own reason reaches the model, for a terminal action too,
+    /// instead of "no such terminal".
+    #[sqlx::test]
+    async fn test_an_agent_refusal_of_create_terminal_reaches_the_model_verbatim(pool: PgPool) {
+        let (conversation_id, pod_id) = pod_row(&pool).await;
+        let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
+        let created = tokio::spawn({
+            let pool = pool.clone();
+            async move { create_terminal(&pool, conversation_id).await }
+        });
+        let mut fake = agent.next_connection().await;
+        let ClientMessage::CreateTerminal { request_id, .. } = fake.next_request().await else {
+            panic!("expected create_terminal");
+        };
+        fake.reply(request_id, Reply::Error { message: "failed to spawn shell: out of memory".into() });
+        let err = created.await.expect("join").expect_err("the agent refused");
+        assert_eq!(err.to_string(), "failed to spawn shell: out of memory");
+        assert!(
+            db::list_sandbox_terminals_for_pod(&pool, pod_id).await.expect("list").is_empty(),
+            "the refused terminal's row is still live"
+        );
+    }
+
+    /// A reply that comes after its request timed out answers nothing, and
+    /// the next request still gets its own.
+    #[sqlx::test]
+    async fn test_a_request_times_out_and_its_late_reply_answers_nothing(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
+        let conn = reconnect_if_needed(&pool, pod_id).await.expect("connects");
+        let mut fake = agent.next_connection().await;
+
+        let timed_out = conn
+            .request_within(Duration::from_millis(200), |request_id| ClientMessage::ListDirectory { request_id, path: "/slow".into() })
+            .await;
+        assert_eq!(timed_out, Err(AgentRequestError::Timeout));
+        let ClientMessage::ListDirectory { request_id: slow, .. } = fake.next_request().await else { panic!() };
+
+        let next = conn.request(|request_id| ClientMessage::ListDirectory { request_id, path: "/fast".into() });
+        let answer = async {
+            let ClientMessage::ListDirectory { request_id: fast, .. } = fake.next_request().await else { panic!() };
+            fake.reply(slow, Reply::DirectoryListed { entries: vec![] });
+            fake.reply(fast, Reply::DirectoryListed { entries: vec![DirEntry { name: "fast".into(), is_dir: true, size: None }] });
+        };
+        let (next, ()) = tokio::join!(next, answer);
+        assert!(matches!(next, Ok(Reply::DirectoryListed { entries }) if entries.len() == 1));
+    }
+
+    /// Waiters learn at once that the connection dropped, instead of
+    /// sitting out the whole timeout.
+    #[sqlx::test]
+    async fn test_a_dropped_connection_fails_waiting_requests_at_once(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
+        let conn = reconnect_if_needed(&pool, pod_id).await.expect("connects");
+        let mut fake = agent.next_connection().await;
+
+        let started = tokio::time::Instant::now();
+        let waiting = conn.request(|request_id| ClientMessage::ListDirectory { request_id, path: "/".into() });
+        let drop_it = async {
+            fake.next_request().await;
+            let _ = fake.send.send(Out::Close);
+        };
+        let (result, ()) = tokio::join!(waiting, drop_it);
+        assert_eq!(result, Err(AgentRequestError::Disconnected));
+        assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
+        test_dialers().lock().unwrap_or_else(|e| e.into_inner()).remove(&pod_id);
+    }
+
+    /// Protocol errors with a request id fail that request at once.
+    #[sqlx::test]
+    async fn test_a_protocol_error_fails_its_request_at_once(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
+        let conn = reconnect_if_needed(&pool, pod_id).await.expect("connects");
+        let mut fake = agent.next_connection().await;
+        let started = tokio::time::Instant::now();
+        let waiting = conn.request(|request_id| ClientMessage::ListDirectory { request_id, path: "/".into() });
+        let answer = async {
+            let ClientMessage::ListDirectory { request_id, .. } = fake.next_request().await else { panic!() };
+            let _ = fake.send.send(Out::Message(AgentMessage::ProtocolError {
+                request_id: Some(request_id),
+                message: "missing field `path`".into(),
+            }));
+        };
+        let (result, ()) = tokio::join!(waiting, answer);
+        assert!(matches!(&result, Err(AgentRequestError::Rejected(m)) if m.contains("missing field")), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// An event from a newer agent that smelt doesn't know is skipped, and
+    /// the connection carries on.
+    #[sqlx::test]
+    async fn test_an_unknown_event_is_ignored(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
+        let conn = reconnect_if_needed(&pool, pod_id).await.expect("connects");
+        let mut fake = agent.next_connection().await;
+        let waiting = conn.request(|request_id| ClientMessage::ListDirectory { request_id, path: "/".into() });
+        let answer = async {
+            let ClientMessage::ListDirectory { request_id, .. } = fake.next_request().await else { panic!() };
+            let _ = fake.send.send(Out::Raw(r#"{"event":"terminal_resized","terminal_id":"1","rows":40}"#.into()));
+            fake.reply(request_id, Reply::DirectoryListed { entries: vec![] });
+        };
+        let (result, ()) = tokio::join!(waiting, answer);
+        assert_eq!(result, Ok(Reply::DirectoryListed { entries: vec![] }));
+    }
+
+    /// Two callers that need the agent at once share one connection.
+    #[sqlx::test]
+    async fn test_two_callers_connecting_at_once_make_one_connection(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let agent = fake_agent(pod_id, current(), Duration::from_millis(300)).await;
+        let (a, b) = tokio::join!(reconnect_if_needed(&pool, pod_id), reconnect_if_needed(&pool, pod_id));
+        let (a, b) = (a.expect("a connects"), b.expect("b connects"));
+        assert!(Arc::ptr_eq(&a, &b), "the two callers got different connections");
+        assert_eq!(agent.dials.load(Ordering::SeqCst), 1, "the pod was dialled more than once");
+    }
+
+    /// A pod torn down while its connection was being made keeps no
+    /// connection: nothing registered, and the socket closed.
+    #[sqlx::test]
+    async fn test_a_teardown_during_a_connect_leaves_no_connection(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let mut agent = fake_agent(pod_id, current(), Duration::from_millis(500)).await;
+        let connecting = tokio::spawn({
+            let pool = pool.clone();
+            async move { reconnect_if_needed(&pool, pod_id).await.map(|_| ()) }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // What `force_terminate_pod` does, without the cluster.
+        deregister(pod_id);
+        db::terminate_sandbox_pod(&pool, pod_id).await.expect("terminate the row");
+
+        let result = connecting.await.expect("join");
+        assert!(matches!(result, Err(TerminalError::NoPod)), "{result:?}");
+        assert!(!registry_contains(pod_id), "a connection to a torn-down pod is registered");
+        let fake = agent.next_connection().await;
+        tokio::time::timeout(Duration::from_secs(3), fake.ended)
+            .await
+            .expect("the connection to the torn-down pod is still open")
+            .ok();
+    }
+
+    /// An agent from before the protocol was versioned: its first message
+    /// isn't a hello. The pod is outdated for good, without a retry or crash
+    /// cleanup, and the next call fails without dialling.
+    #[sqlx::test]
+    async fn test_a_protocol_0_agent_is_outdated_for_good(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let v0_line = r#"{"id":"cmd-1","terminal_id":"3","stream":"stdout","seq":1,"data":"hi"}"#;
+        let agent = fake_agent(pod_id, Greeting::Raw(v0_line.into()), Duration::ZERO).await;
+
+        let err = reconnect_if_needed(&pool, pod_id).await.map(|_| ()).expect_err("outdated");
+        assert!(matches!(err, TerminalError::AgentOutdated { found: None }), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("terminate_pod") && text.contains("create_pod"), "{text}");
+        assert_eq!(agent.dials.load(Ordering::SeqCst), 1, "an outdated agent was retried");
+        assert!(db::sandbox_pod_is_live(&pool, pod_id).await.expect("live?"), "the pod was cleaned up as a crash");
+
+        let again = reconnect_if_needed(&pool, pod_id).await.map(|_| ());
+        assert!(matches!(again, Err(TerminalError::AgentOutdated { found: None })), "{again:?}");
+        assert_eq!(agent.dials.load(Ordering::SeqCst), 1, "the second call dialled again");
+    }
+
+    #[sqlx::test]
+    async fn test_an_agent_on_another_major_is_outdated(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let next_major = ProtocolVersion { major: PROTOCOL_VERSION.major + 1, minor: 0 };
+        let _agent = fake_agent(pod_id, Greeting::Hello(next_major), Duration::ZERO).await;
+        let err = reconnect_if_needed(&pool, pod_id).await.map(|_| ()).expect_err("outdated");
+        assert!(matches!(err, TerminalError::AgentOutdated { found: Some(v) } if v == next_major), "{err:?}");
+        assert!(err.to_string().contains(&format!("protocol {next_major}")), "{err}");
+    }
+
+    /// Silence could be an old agent with nothing to say, or a slow link, so
+    /// it fails this attempt but isn't remembered.
+    #[sqlx::test]
+    async fn test_an_agent_that_says_nothing_is_outdated_but_not_for_good(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let agent = fake_agent(pod_id, Greeting::Nothing, Duration::ZERO).await;
+        let err = reconnect_if_needed(&pool, pod_id).await.map(|_| ()).expect_err("outdated");
+        assert!(matches!(err, TerminalError::AgentOutdated { found: None }), "{err:?}");
+        let _ = reconnect_if_needed(&pool, pod_id).await;
+        assert_eq!(agent.dials.load(Ordering::SeqCst), 2, "silence was remembered as outdated");
+    }
+
+    /// Any minor of smelt's major connects; a feature from a later minor
+    /// fails alone, asking for a restart.
+    #[sqlx::test]
+    async fn test_another_minor_connects_and_gates_only_newer_features(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let older = ProtocolVersion { major: PROTOCOL_VERSION.major, minor: 3 };
+        let _agent = fake_agent(pod_id, Greeting::Hello(older), Duration::ZERO).await;
+        let conn = reconnect_if_needed(&pool, pod_id).await.expect("another minor connects");
+        assert_eq!(conn.agent_version, older);
+        assert!(conn.require_minor(3).is_ok());
+        let err = conn.require_minor(4).expect_err("minor 4 is newer than the agent");
+        assert!(matches!(err, TerminalError::AgentTooOld { found, .. } if found == older), "{err:?}");
+        assert!(err.to_string().contains("needs a newer sandbox agent"), "{err}");
+    }
+
+    /// The Sandboxes page and `list_pods` say what each pod's agent speaks.
+    #[sqlx::test]
+    async fn test_agent_status_follows_what_the_agent_said(pool: PgPool) {
+        use crate::api::pods::AgentStatus;
+
+        let (_, unconnected) = pod_row(&pool).await;
+        let _a = fake_agent(unconnected, current(), Duration::ZERO).await;
+        assert_eq!(agent_status(unconnected), None, "not connected yet, so unknown");
+
+        let (_, same) = pod_row(&pool).await;
+        let _b = fake_agent(same, current(), Duration::ZERO).await;
+        reconnect_if_needed(&pool, same).await.expect("connects");
+        assert_eq!(agent_status(same), Some(AgentStatus::Current { version: PROTOCOL_VERSION.to_string() }));
+
+        let (_, newer) = pod_row(&pool).await;
+        let newer_minor = ProtocolVersion { major: PROTOCOL_VERSION.major, minor: PROTOCOL_VERSION.minor + 1 };
+        let _c = fake_agent(newer, Greeting::Hello(newer_minor), Duration::ZERO).await;
+        reconnect_if_needed(&pool, newer).await.expect("connects");
+        assert_eq!(agent_status(newer), Some(AgentStatus::Current { version: newer_minor.to_string() }));
+
+        // An older minor can't be faked while smelt is at minor 0, so check
+        // the classification itself.
+        let older = ProtocolVersion { major: PROTOCOL_VERSION.major, minor: 2 };
+        let current_minor_3 = ProtocolVersion { major: PROTOCOL_VERSION.major, minor: 3 };
+        assert_eq!(
+            classify_agent(older, current_minor_3),
+            AgentStatus::RestartRecommended { version: older.to_string() }
+        );
+
+        let (_, old) = pod_row(&pool).await;
+        let v0_line = r#"{"id":"c","terminal_id":"1","stream":"stdout","seq":1,"data":"x"}"#;
+        let _d = fake_agent(old, Greeting::Raw(v0_line.into()), Duration::ZERO).await;
+        let _ = reconnect_if_needed(&pool, old).await;
+        assert_eq!(agent_status(old), Some(AgentStatus::RestartRequired { version: None }));
+    }
+
+    /// Every `smelt::sandbox` log line from every test in this binary, through
+    /// one process-wide subscriber (a per-thread one misses events whose
+    /// callsite another test's thread registered first).
+    fn captured_logs() -> &'static Arc<StdMutex<Vec<u8>>> {
+        #[derive(Clone)]
+        struct Writer(Arc<StdMutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        static LOGS: std::sync::OnceLock<Arc<StdMutex<Vec<u8>>>> = std::sync::OnceLock::new();
+        LOGS.get_or_init(|| {
+            let logs = Arc::new(StdMutex::new(Vec::new()));
+            let writer = Writer(logs.clone());
+            tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_env_filter(tracing_subscriber::EnvFilter::new("smelt::sandbox=trace"))
+                .init();
+            logs
+        })
+    }
+
+    /// The agent's protocol error quotes serde's message, which can quote
+    /// the request it couldn't read (a `write_file`'s content). smelt logs
+    /// that it happened, not the text.
+    #[sqlx::test]
+    async fn test_a_protocol_error_is_not_logged_verbatim(pool: PgPool) {
+        let logs = captured_logs();
+        let (_, pod_id) = pod_row(&pool).await;
+        let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
+        let conn = reconnect_if_needed(&pool, pod_id).await.expect("connects");
+        let mut fake = agent.next_connection().await;
+        let _ = fake.send.send(Out::Message(AgentMessage::ProtocolError {
+            request_id: None,
+            message: r#"invalid type: string "password=hunter2-SECRET", expected u32"#.into(),
+        }));
+        // A round trip after it, so the reader has handled the error.
+        let waiting = conn.request(|request_id| ClientMessage::ListDirectory { request_id, path: "/".into() });
+        let answer = async {
+            let ClientMessage::ListDirectory { request_id, .. } = fake.next_request().await else { panic!() };
+            fake.reply(request_id, Reply::DirectoryListed { entries: vec![] });
+        };
+        let (result, ()) = tokio::join!(waiting, answer);
+        result.expect("the connection still works");
+
+        let logged = String::from_utf8_lossy(&logs.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+        assert!(logged.contains("couldn't read a message from smelt"), "nothing was logged: {logged:?}");
+        assert!(!logged.contains("hunter2-SECRET"), "the protocol error's text was logged: {logged}");
+    }
+
+    /// A teardown whose delete fails leaves the pod running and listed as
+    /// live, so it must stay usable: a later connect registers.
+    #[sqlx::test]
+    async fn test_a_failed_teardown_leaves_the_pod_usable(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let _agent = fake_agent(pod_id, current(), Duration::ZERO).await;
+        let failed = terminate_pod_with(&pool, pod_id, async {
+            Err(SandboxError::StartFailed("the API server is down".into()))
+        })
+        .await;
+        assert!(failed.is_err());
+        assert!(db::sandbox_pod_is_live(&pool, pod_id).await.expect("live?"), "the row was closed");
+
+        let conn = reconnect_if_needed(&pool, pod_id).await;
+        assert!(conn.is_ok(), "the pod is unusable after a failed teardown: {:?}", conn.map(|_| ()));
+        assert!(registry_contains(pod_id));
+    }
+
+    /// A connection whose socket closed before `connect_with_retry` got to
+    /// register it isn't registered: its reader has already given up on it,
+    /// and nothing would ever replace it.
+    #[sqlx::test]
+    async fn test_a_connection_that_already_ended_is_not_registered(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
+        let conn = connect(pool.clone(), pod_id, dialer_for(pod_id)).await.expect("connects");
+        let fake = agent.next_connection().await;
+        let _ = fake.send.send(Out::Close);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while conn.request(|request_id| ClientMessage::ListDirectory { request_id, path: "/".into() }).await
+                != Err(AgentRequestError::Disconnected)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the reader never noticed the close");
+
+        assert!(register(pod_id, conn).is_err(), "a connection that already ended was registered");
+        assert!(!registry_contains(pod_id));
+    }
+
+    /// A page load doesn't wait behind a connect that's already under way.
+    #[sqlx::test]
+    async fn test_try_reconnect_does_not_wait_for_a_connect_in_progress(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let _agent = fake_agent(pod_id, current(), Duration::from_secs(2)).await;
+        let connecting = tokio::spawn({
+            let pool = pool.clone();
+            async move { reconnect_if_needed(&pool, pod_id).await.map(|_| ()) }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = tokio::time::Instant::now();
+        try_reconnect(&pool, pod_id).await;
+        assert!(started.elapsed() < Duration::from_millis(500), "try_reconnect waited {:?}", started.elapsed());
+        connecting.await.expect("join").expect("the first connect still succeeds");
+    }
+}

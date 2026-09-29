@@ -38,6 +38,11 @@ if grep -qE '^(warning|error)' <<<"$server_output"; then
     exit 1
 fi
 
+# Before the tests: the real-cluster ones all fail the same way on a
+# missing or stale sandbox image, and this says so once (SME-53).
+echo "== cluster"
+scripts/cluster-doctor
+
 echo "== server tests"
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT

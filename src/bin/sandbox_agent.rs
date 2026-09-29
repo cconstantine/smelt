@@ -18,10 +18,15 @@
 #[path = "../docker_net.rs"]
 #[allow(dead_code)]
 mod docker_net;
+// The wire protocol, shared with the server (SME-53).
+#[path = "../agent_protocol.rs"]
+#[allow(dead_code)]
+mod agent_protocol;
 
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::{
@@ -33,10 +38,13 @@ use axum::{
 };
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
-use serde::{Deserialize, Serialize};
+use agent_protocol::{
+    AgentMessage, ClientMessage, DirEntry, FileContents, GlobResult, GrepMatch, GrepResult, PROTOCOL_VERSION,
+    Reply, SkippedFile, Stream,
+};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 /// Loopback only. The WebSocket runs commands with no login, and the pod's
 /// Docker containers share its network: on 0.0.0.0 any of them could
@@ -245,20 +253,10 @@ fn paginate_slice<T: Clone>(items: &[T], offset: u32, limit: u32) -> (Vec<T>, us
     (page, total)
 }
 
-/// One `list_directory` entry — `size` is only meaningful for a file (a
-/// directory's byte size on disk isn't what a caller of this tool wants to
-/// know), see SME-11's "What."
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct DirEntryInfo {
-    name: String,
-    is_dir: bool,
-    size: Option<u64>,
-}
-
 /// Alphabetical by name, case-sensitive (Rust's default `str` ordering —
 /// uppercase sorts before lowercase) — `list_directory` doesn't group
 /// directories first, just a plain sort, see SME-11's "What."
-fn sort_entries(mut entries: Vec<DirEntryInfo>) -> Vec<DirEntryInfo> {
+fn sort_entries(mut entries: Vec<DirEntry>) -> Vec<DirEntry> {
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
 }
@@ -290,7 +288,7 @@ fn edit_error_message(err: EditError) -> String {
 enum ShellEvent {
     Line {
         terminal_id: String,
-        stream: &'static str,
+        stream: Stream,
         seq: u64,
         data: String,
     },
@@ -333,7 +331,7 @@ async fn run_reader(
                             if tx
                                 .send(ShellEvent::Line {
                                     terminal_id: terminal_id.clone(),
-                                    stream: "stdout",
+                                    stream: Stream::Stdout,
                                     seq,
                                     data: line.to_string(),
                                 })
@@ -354,7 +352,7 @@ async fn run_reader(
                         if tx
                             .send(ShellEvent::Line {
                                 terminal_id: terminal_id.clone(),
-                                stream: "stderr",
+                                stream: Stream::Stderr,
                                 seq,
                                 data: line.to_string(),
                             })
@@ -400,170 +398,97 @@ struct AppState {
     /// `create_terminal`, and the connection must survive that.
     events_tx: mpsc::UnboundedSender<ShellEvent>,
     events_rx: AsyncMutex<mpsc::UnboundedReceiver<ShellEvent>>,
+    /// The connection that gets events, and the way to tell it a newer one
+    /// has taken over (`take_over`).
+    current: std::sync::Mutex<Option<(u64, oneshot::Sender<()>)>>,
+    next_connection: AtomicU64,
+    /// An event taken off `events_rx` whose send failed, sent by the live
+    /// connection (or the next one, straight after its hello). One is
+    /// enough: a connection stops taking events once a send fails.
+    unsent: std::sync::Mutex<Option<AgentMessage>>,
+    /// Signalled when `unsent` fills, so the live connection sends it.
+    unsent_ready: tokio::sync::Notify,
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "action")]
-enum ClientMessage {
-    #[serde(rename = "create_terminal")]
-    CreateTerminal { terminal_id: String },
-    #[serde(rename = "terminate_terminal")]
-    TerminateTerminal { terminal_id: String },
-    #[serde(rename = "command")]
-    Command {
-        terminal_id: String,
-        id: String,
-        command: String,
-    },
-    #[serde(rename = "signal")]
-    Signal {
-        terminal_id: String,
-        id: String,
-        signal: String,
-    },
-    #[serde(rename = "read_file")]
-    ReadFile {
-        request_id: String,
-        path: String,
-        offset: u32,
-        limit: u32,
-    },
-    #[serde(rename = "write_file")]
-    WriteFile {
-        request_id: String,
-        path: String,
-        content: String,
-        expected_hash: Option<String>,
-    },
-    #[serde(rename = "edit_file")]
-    EditFile {
-        request_id: String,
-        path: String,
-        old_string: String,
-        new_string: String,
-        replace_all: bool,
-        expected_hash: String,
-        expected_line: Option<u32>,
-    },
-    #[serde(rename = "list_directory")]
-    ListDirectory { request_id: String, path: String },
-    #[serde(rename = "glob")]
-    Glob {
-        request_id: String,
-        path: String,
-        pattern: String,
-        offset: u32,
-        limit: u32,
-    },
-    #[serde(rename = "grep")]
-    Grep {
-        request_id: String,
-        path: String,
-        pattern: String,
-        glob: Option<String>,
-        case_insensitive: bool,
-        offset: u32,
-        limit: u32,
-    },
+fn new_state() -> Arc<AppState> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    Arc::new(AppState {
+        terminals: AsyncMutex::new(HashMap::new()),
+        events_tx: tx,
+        events_rx: AsyncMutex::new(rx),
+        current: std::sync::Mutex::new(None),
+        next_connection: AtomicU64::new(0),
+        unsent: std::sync::Mutex::new(None),
+        unsent_ready: tokio::sync::Notify::new(),
+    })
 }
 
-/// One `grep` match — see SME-19.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct GrepMatchInfo {
-    path: String,
-    line: u32,
-    text: String,
-}
-
-/// One file `grep` excluded (too large, or not valid UTF-8) — reported
-/// explicitly rather than silently dropped, per SME-19's "Decisions from
-/// review."
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct SkippedFileInfo {
-    path: String,
-    reason: String,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum ServerMessage {
-    Line {
-        id: String,
-        terminal_id: String,
-        stream: &'static str,
-        seq: u64,
-        data: String,
-    },
-    Exit {
-        id: String,
-        terminal_id: String,
-        event: &'static str,
-        code: i32,
-    },
-    TerminalCreated {
-        terminal_id: String,
-        event: &'static str,
-    },
-    TerminalTerminated {
-        terminal_id: String,
-        event: &'static str,
-    },
-    TerminalError {
-        terminal_id: String,
-        event: &'static str,
-        message: String,
-    },
-    FileRead {
-        request_id: String,
-        event: &'static str,
-        lines: Vec<String>,
-        total_lines: usize,
-        hash: String,
-    },
-    FileWritten {
-        request_id: String,
-        event: &'static str,
-        hash: String,
-    },
-    FileEdited {
-        request_id: String,
-        event: &'static str,
-        hash: String,
-    },
-    DirectoryListed {
-        request_id: String,
-        event: &'static str,
-        entries: Vec<DirEntryInfo>,
-    },
-    GlobMatched {
-        request_id: String,
-        event: &'static str,
-        paths: Vec<String>,
-        total: usize,
-        scan_capped: bool,
-    },
-    GrepMatched {
-        request_id: String,
-        event: &'static str,
-        matches: Vec<GrepMatchInfo>,
-        total: usize,
-        scan_capped: bool,
-        skipped: Vec<SkippedFileInfo>,
-    },
-    FileError {
-        request_id: String,
-        event: &'static str,
-        message: String,
-    },
+fn router(state: Arc<AppState>) -> Router {
+    Router::new().route("/ws", get(ws_handler)).with_state(state)
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
+impl AppState {
+    /// Makes the calling connection the current one, and tells the previous
+    /// one, if any, to close. The returned receiver fires when a newer
+    /// connection does the same to this one.
+    fn take_over(&self) -> (u64, oneshot::Receiver<()>) {
+        let (replace_tx, replaced) = oneshot::channel();
+        let id = self.next_connection.fetch_add(1, Ordering::Relaxed);
+        let previous = self
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace((id, replace_tx));
+        if let Some((_, previous)) = previous {
+            let _ = previous.send(());
+        }
+        (id, replaced)
+    }
+
+    /// Clears the current connection if it's still `id`.
+    fn release(&self, id: u64) {
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        if current.as_ref().is_some_and(|(current, _)| *current == id) {
+            *current = None;
+        }
+    }
+}
+
+/// One connection at a time, and the newest wins (SME-53). A second
+/// connection used to share `events_rx` with the first, so each event went
+/// to whichever held it, and a half-open connection left by a smelt restart
+/// could swallow a command's exit. Now the older one closes. Events that
+/// arrive while no connection is open wait in `events_rx` for the next one,
+/// so an exit during a smelt restart still reaches it. So does one whose
+/// send failed (`send_or_keep`). Not covered: a send the kernel accepted
+/// into a socket smelt had already abandoned counts as sent, and is lost.
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
+    let (connection, mut replaced) = state.take_over();
+    send_message(&mut socket, &AgentMessage::Hello(PROTOCOL_VERSION)).await;
+    if !send_unsent(&mut socket, &state).await {
+        state.release(connection);
+        return;
+    }
     loop {
         tokio::select! {
+            // Checked first, so a replaced connection takes no more events.
+            biased;
+            _ = &mut replaced => {
+                tracing::info!(connection, "a newer connection replaced this one");
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            }
+            // The connection this one replaced failed a send after this one
+            // had opened.
+            _ = state.unsent_ready.notified() => {
+                if !send_unsent(&mut socket, &state).await {
+                    break;
+                }
+            }
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
@@ -580,18 +505,18 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         let shell = state.terminals.lock().await.get(&terminal_id).cloned();
                         let Some(shell) = shell else { continue };
                         let id = shell.current.lock().await.clone().unwrap_or_default();
-                        send_server_message(&mut socket, ServerMessage::Line { id, terminal_id, stream, seq, data }).await;
+                        if !send_or_keep(&mut socket, &state, AgentMessage::Output { id, terminal_id, stream, seq, data }).await {
+                            break;
+                        }
                     }
                     Some(ShellEvent::Marker { terminal_id, exit_code }) => {
                         let shell = state.terminals.lock().await.get(&terminal_id).cloned();
                         let Some(shell) = shell else { continue };
                         let id = shell.current.lock().await.take();
                         if let Some(id) = id {
-                            send_server_message(
-                                &mut socket,
-                                ServerMessage::Exit { id, terminal_id, event: "exit", code: exit_code },
-                            )
-                            .await;
+                            if !send_or_keep(&mut socket, &state, AgentMessage::Exit { id, terminal_id, code: exit_code }).await {
+                                break;
+                            }
                         }
                     }
                     None => break, // AppState (and its events_tx) dropped — agent shutting down
@@ -599,54 +524,115 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             }
         }
     }
+    state.release(connection);
+}
+
+/// Sends the event a failed send left in `unsent`, if there is one.
+/// Returns false if that send fails too (it's kept again).
+async fn send_unsent<S>(sink: &mut S, state: &AppState) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    let unsent = state.unsent.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match unsent {
+        Some(unsent) => send_or_keep(sink, state, unsent).await,
+        None => true,
+    }
 }
 
 async fn recv_shell_event(state: &Arc<AppState>) -> Option<ShellEvent> {
     state.events_rx.lock().await.recv().await
 }
 
-async fn send_server_message(socket: &mut WebSocket, message: ServerMessage) {
-    let Ok(text) = serde_json::to_string(&message) else {
-        return;
+/// Sends an event to smelt. If the send fails, the event is kept for the
+/// next connection (`AppState::unsent`) and this returns false: the event
+/// was already taken off `events_rx`, and an exit lost here would leave its
+/// command running in smelt's records for good.
+async fn send_or_keep<S>(sink: &mut S, state: &AppState, message: AgentMessage) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    use futures_util::SinkExt;
+    let text = match serde_json::to_string(&message) {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::error!(%e, "couldn't serialize a message for smelt");
+            return true;
+        }
     };
-    let _ = socket.send(Message::Text(text.into())).await;
+    if sink.send(Message::Text(text.into())).await.is_ok() {
+        return true;
+    }
+    *state.unsent.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
+    // A newer connection may already be open, past its own first look.
+    state.unsent_ready.notify_one();
+    false
 }
 
+async fn send_message(socket: &mut WebSocket, message: &AgentMessage) {
+    match serde_json::to_string(message) {
+        Ok(text) => {
+            let _ = socket.send(Message::Text(text.into())).await;
+        }
+        Err(e) => tracing::error!(%e, "couldn't serialize a message for smelt"),
+    }
+}
+
+/// Handles one message from smelt. A request (anything with a
+/// `request_id`) gets exactly one reply; `command` and `signal` get none.
 async fn handle_client_message(text: &str, state: &Arc<AppState>, socket: &mut WebSocket) {
-    let Ok(msg) = serde_json::from_str::<ClientMessage>(text) else {
-        tracing::warn!(%text, "unparseable client message, ignoring");
-        return;
+    let msg = match serde_json::from_str::<ClientMessage>(text) {
+        Ok(msg) => msg,
+        Err(e) => {
+            // Where and what kind of error, never the text or serde's own
+            // message: a `write_file` carries a whole file, and serde quotes
+            // the values it chokes on.
+            tracing::warn!(
+                kind = ?e.classify(),
+                line = e.line(),
+                column = e.column(),
+                bytes = text.len(),
+                "unparseable client message"
+            );
+            // If the request id is still readable, smelt can fail that one
+            // request at once instead of waiting it out.
+            let request_id = serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .and_then(|value| value.get("request_id")?.as_u64());
+            send_message(socket, &AgentMessage::ProtocolError { request_id, message: e.to_string() }).await;
+            return;
+        }
     };
 
-    match msg {
-        ClientMessage::CreateTerminal { terminal_id } => {
-            create_terminal(state, socket, terminal_id).await
-        }
-        ClientMessage::TerminateTerminal { terminal_id } => {
-            terminate_terminal(state, socket, terminal_id).await
-        }
+    let (request_id, result) = match msg {
         ClientMessage::Command {
             terminal_id,
             id,
             command,
-        } => start_command(state, &terminal_id, id, &command).await,
+        } => return start_command(state, &terminal_id, id, &command).await,
         ClientMessage::Signal {
             terminal_id,
             id,
             signal,
-        } => signal_current_command(state, &terminal_id, &id, &signal).await,
+        } => return signal_current_command(state, &terminal_id, &id, &signal).await,
+        ClientMessage::CreateTerminal { request_id, terminal_id } => {
+            (request_id, create_terminal(state, terminal_id).await)
+        }
+        ClientMessage::TerminateTerminal { request_id, terminal_id } => {
+            (request_id, terminate_terminal(state, terminal_id).await)
+        }
         ClientMessage::ReadFile {
             request_id,
             path,
             offset,
             limit,
-        } => handle_read_file(socket, request_id, path, offset, limit).await,
+        } => (request_id, handle_read_file(path, offset, limit).await),
         ClientMessage::WriteFile {
             request_id,
             path,
             content,
             expected_hash,
-        } => handle_write_file(socket, request_id, path, content, expected_hash).await,
+        } => (request_id, handle_write_file(path, content, expected_hash).await),
         ClientMessage::EditFile {
             request_id,
             path,
@@ -655,21 +641,12 @@ async fn handle_client_message(text: &str, state: &Arc<AppState>, socket: &mut W
             replace_all,
             expected_hash,
             expected_line,
-        } => {
-            handle_edit_file(
-                socket,
-                request_id,
-                path,
-                old_string,
-                new_string,
-                replace_all,
-                expected_hash,
-                expected_line,
-            )
-            .await
-        }
+        } => (
+            request_id,
+            handle_edit_file(path, old_string, new_string, replace_all, expected_hash, expected_line).await,
+        ),
         ClientMessage::ListDirectory { request_id, path } => {
-            handle_list_directory(socket, request_id, path).await
+            (request_id, handle_list_directory(path).await)
         }
         ClientMessage::Glob {
             request_id,
@@ -677,7 +654,7 @@ async fn handle_client_message(text: &str, state: &Arc<AppState>, socket: &mut W
             pattern,
             offset,
             limit,
-        } => handle_glob(socket, request_id, path, pattern, offset, limit).await,
+        } => (request_id, handle_glob(path, pattern, offset, limit).await),
         ClientMessage::Grep {
             request_id,
             path,
@@ -686,20 +663,12 @@ async fn handle_client_message(text: &str, state: &Arc<AppState>, socket: &mut W
             case_insensitive,
             offset,
             limit,
-        } => {
-            handle_grep(
-                socket,
-                request_id,
-                path,
-                pattern,
-                glob,
-                case_insensitive,
-                offset,
-                limit,
-            )
-            .await
-        }
-    }
+        } => (
+            request_id,
+            handle_grep(path, pattern, glob, case_insensitive, offset, limit).await,
+        ),
+    };
+    send_message(socket, &AgentMessage::Reply { request_id, result }).await;
 }
 
 /// Shared across `read_file`/`edit_file`/`write_file` — an unbounded file
@@ -710,7 +679,7 @@ const MAX_FILE_SIZE_BYTES: u64 = 256 * 1024;
 /// `list_directory`'s analogous bound, as an entry count rather than bytes
 /// — same reasoning, see SME-11's "Size bound."
 const MAX_DIR_ENTRIES: usize = 1000;
-/// `grep` skips (never errors out entirely on, see `SkippedFileInfo`) a
+/// `grep` skips (never errors out entirely on, see `SkippedFile`) a
 /// file bigger than this — bounds worst-case per-file scan time. Distinct
 /// from `MAX_FILE_SIZE_BYTES` above, which caps *returned* content
 /// (`read_file`'s concern); grep's returned payload is already bounded by
@@ -725,78 +694,42 @@ const MAX_GREP_FILE_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_GLOB_SCAN: usize = 2000;
 const MAX_GREP_SCAN: usize = 1000;
 
-async fn send_file_error(socket: &mut WebSocket, request_id: String, message: &str) {
-    send_server_message(
-        socket,
-        ServerMessage::FileError {
-            request_id,
-            event: "file_error",
-            message: message.to_string(),
-        },
-    )
-    .await;
+fn reply_error(message: &str) -> Reply {
+    Reply::Error { message: message.to_string() }
 }
 
 async fn handle_read_file(
-    socket: &mut WebSocket,
-    request_id: String,
     path: String,
     offset: u32,
     limit: u32,
-) {
+) -> Reply {
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            send_file_error(socket, request_id, &format!("failed to read {path}: {e}")).await;
-            return;
+            return reply_error(&format!("failed to read {path}: {e}"));
         }
     };
     if bytes.len() as u64 > MAX_FILE_SIZE_BYTES {
-        send_file_error(
-            socket,
-            request_id,
-            &format!("{path} exceeds the {MAX_FILE_SIZE_BYTES}-byte size limit"),
-        )
-        .await;
-        return;
+        return reply_error(&format!("{path} exceeds the {MAX_FILE_SIZE_BYTES}-byte size limit"));
     }
     let content = match String::from_utf8(bytes) {
         Ok(content) => content,
         Err(_) => {
-            send_file_error(socket, request_id, &format!("{path} is not valid UTF-8")).await;
-            return;
+            return reply_error(&format!("{path} is not valid UTF-8"));
         }
     };
     let hash = hash_content(content.as_bytes());
     let (lines, total_lines) = paginate_lines(&content, offset, limit);
-    send_server_message(
-        socket,
-        ServerMessage::FileRead {
-            request_id,
-            event: "file_read",
-            lines,
-            total_lines,
-            hash,
-        },
-    )
-    .await;
+    Reply::FileRead(FileContents { lines, total_lines, hash })
 }
 
 async fn handle_write_file(
-    socket: &mut WebSocket,
-    request_id: String,
     path: String,
     content: String,
     expected_hash: Option<String>,
-) {
+) -> Reply {
     if content.len() as u64 > MAX_FILE_SIZE_BYTES {
-        send_file_error(
-            socket,
-            request_id,
-            &format!("content exceeds the {MAX_FILE_SIZE_BYTES}-byte size limit"),
-        )
-        .await;
-        return;
+        return reply_error(&format!("content exceeds the {MAX_FILE_SIZE_BYTES}-byte size limit"));
     }
 
     if let Some(expected) = &expected_hash {
@@ -804,23 +737,11 @@ async fn handle_write_file(
             Ok(current) => {
                 let current_hash = hash_content(&current);
                 if &current_hash != expected {
-                    send_file_error(
-                        socket,
-                        request_id,
-                        &format!("{path} has changed since it was last read (expected hash {expected}, found {current_hash}); read_file again before writing"),
-                    )
-                    .await;
-                    return;
+                    return reply_error(&format!("{path} has changed since it was last read (expected hash {expected}, found {current_hash}); read_file again before writing"));
                 }
             }
             Err(e) => {
-                send_file_error(
-                    socket,
-                    request_id,
-                    &format!("failed to read {path} for hash check: {e}"),
-                )
-                .await;
-                return;
+                return reply_error(&format!("failed to read {path} for hash check: {e}"));
             }
         }
     }
@@ -828,65 +749,40 @@ async fn handle_write_file(
     if let Some(parent) = std::path::Path::new(&path).parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                send_file_error(
-                    socket,
-                    request_id,
-                    &format!("failed to create parent directories for {path}: {e}"),
-                )
-                .await;
-                return;
+                return reply_error(&format!("failed to create parent directories for {path}: {e}"));
             }
         }
     }
 
     if let Err(e) = tokio::fs::write(&path, content.as_bytes()).await {
-        send_file_error(socket, request_id, &format!("failed to write {path}: {e}")).await;
-        return;
+        return reply_error(&format!("failed to write {path}: {e}"));
     }
     let hash = hash_content(content.as_bytes());
-    send_server_message(
-        socket,
-        ServerMessage::FileWritten {
-            request_id,
-            event: "file_written",
-            hash,
-        },
-    )
-    .await;
+    Reply::FileWritten { hash }
 }
 
 async fn handle_edit_file(
-    socket: &mut WebSocket,
-    request_id: String,
     path: String,
     old_string: String,
     new_string: String,
     replace_all: bool,
     expected_hash: String,
     expected_line: Option<u32>,
-) {
+) -> Reply {
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            send_file_error(socket, request_id, &format!("failed to read {path}: {e}")).await;
-            return;
+            return reply_error(&format!("failed to read {path}: {e}"));
         }
     };
     let current_hash = hash_content(&bytes);
     if current_hash != expected_hash {
-        send_file_error(
-            socket,
-            request_id,
-            &format!("{path} has changed since it was last read (expected hash {expected_hash}, found {current_hash}); read_file again before editing"),
-        )
-        .await;
-        return;
+        return reply_error(&format!("{path} has changed since it was last read (expected hash {expected_hash}, found {current_hash}); read_file again before editing"));
     }
     let content = match String::from_utf8(bytes) {
         Ok(content) => content,
         Err(_) => {
-            send_file_error(socket, request_id, &format!("{path} is not valid UTF-8")).await;
-            return;
+            return reply_error(&format!("{path} is not valid UTF-8"));
         }
     };
 
@@ -899,38 +795,22 @@ async fn handle_edit_file(
     ) {
         Ok(new_content) => new_content,
         Err(edit_err) => {
-            send_file_error(socket, request_id, &edit_error_message(edit_err)).await;
-            return;
+            return reply_error(&edit_error_message(edit_err));
         }
     };
 
     if let Err(e) = tokio::fs::write(&path, new_content.as_bytes()).await {
-        send_file_error(socket, request_id, &format!("failed to write {path}: {e}")).await;
-        return;
+        return reply_error(&format!("failed to write {path}: {e}"));
     }
     let hash = hash_content(new_content.as_bytes());
-    send_server_message(
-        socket,
-        ServerMessage::FileEdited {
-            request_id,
-            event: "file_edited",
-            hash,
-        },
-    )
-    .await;
+    Reply::FileEdited { hash }
 }
 
-async fn handle_list_directory(socket: &mut WebSocket, request_id: String, path: String) {
+async fn handle_list_directory(path: String) -> Reply {
     let mut read_dir = match tokio::fs::read_dir(&path).await {
         Ok(read_dir) => read_dir,
         Err(e) => {
-            send_file_error(
-                socket,
-                request_id,
-                &format!("failed to read directory {path}: {e}"),
-            )
-            .await;
-            return;
+            return reply_error(&format!("failed to read directory {path}: {e}"));
         }
     };
 
@@ -939,13 +819,7 @@ async fn handle_list_directory(socket: &mut WebSocket, request_id: String, path:
         match read_dir.next_entry().await {
             Ok(Some(entry)) => {
                 if entries.len() >= MAX_DIR_ENTRIES {
-                    send_file_error(
-                        socket,
-                        request_id,
-                        &format!("{path} has more than {MAX_DIR_ENTRIES} entries"),
-                    )
-                    .await;
-                    return;
+                    return reply_error(&format!("{path} has more than {MAX_DIR_ENTRIES} entries"));
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
@@ -954,31 +828,17 @@ async fn handle_list_directory(socket: &mut WebSocket, request_id: String, path:
                 } else {
                     entry.metadata().await.ok().map(|m| m.len())
                 };
-                entries.push(DirEntryInfo { name, is_dir, size });
+                entries.push(DirEntry { name, is_dir, size });
             }
             Ok(None) => break,
             Err(e) => {
-                send_file_error(
-                    socket,
-                    request_id,
-                    &format!("failed to read directory {path}: {e}"),
-                )
-                .await;
-                return;
+                return reply_error(&format!("failed to read directory {path}: {e}"));
             }
         }
     }
 
     let entries = sort_entries(entries);
-    send_server_message(
-        socket,
-        ServerMessage::DirectoryListed {
-            request_id,
-            event: "directory_listed",
-            entries,
-        },
-    )
-    .await;
+    Reply::DirectoryListed { entries }
 }
 
 /// Finds files under `path` whose path relative to `path` matches
@@ -989,40 +849,26 @@ async fn handle_list_directory(socket: &mut WebSocket, request_id: String, path:
 /// the real-cluster integration test instead, same as
 /// `handle_list_directory` above already is.
 async fn handle_glob(
-    socket: &mut WebSocket,
-    request_id: String,
     path: String,
     pattern: String,
     offset: u32,
     limit: u32,
-) {
+) -> Reply {
     let matcher = match compile_glob_pattern(&pattern) {
         Ok(matcher) => matcher,
         Err(e) => {
-            send_file_error(socket, request_id, &e).await;
-            return;
+            return reply_error(&e);
         }
     };
     let walked = tokio::task::spawn_blocking(move || walk_glob(&path, &matcher)).await;
     let (all_paths, scan_capped) = match walked {
         Ok(result) => result,
         Err(_) => {
-            send_file_error(socket, request_id, "internal error walking directory").await;
-            return;
+            return reply_error("internal error walking directory");
         }
     };
     let (paths, total) = paginate_slice(&all_paths, offset, limit);
-    send_server_message(
-        socket,
-        ServerMessage::GlobMatched {
-            request_id,
-            event: "glob_matched",
-            paths,
-            total,
-            scan_capped,
-        },
-    )
-    .await;
+    Reply::GlobMatched(GlobResult { paths, total, scan_capped })
 }
 
 /// Synchronous (`ignore`'s walker is not async) — must run inside
@@ -1060,27 +906,23 @@ fn walk_glob(root: &str, matcher: &globset::GlobMatcher) -> (Vec<String>, bool) 
 /// to files matching `glob` first — same walk/testing split as
 /// `handle_glob` above.
 async fn handle_grep(
-    socket: &mut WebSocket,
-    request_id: String,
     path: String,
     pattern: String,
     glob: Option<String>,
     case_insensitive: bool,
     offset: u32,
     limit: u32,
-) {
+) -> Reply {
     let pattern = match compile_grep_pattern(&pattern, case_insensitive) {
         Ok(pattern) => pattern,
         Err(e) => {
-            send_file_error(socket, request_id, &e).await;
-            return;
+            return reply_error(&e);
         }
     };
     let glob_matcher = match glob.as_deref().map(compile_glob_pattern) {
         Some(Ok(matcher)) => Some(matcher),
         Some(Err(e)) => {
-            send_file_error(socket, request_id, &e).await;
-            return;
+            return reply_error(&e);
         }
         None => None,
     };
@@ -1090,23 +932,11 @@ async fn handle_grep(
     let (all_matches, scan_capped, skipped) = match walked {
         Ok(result) => result,
         Err(_) => {
-            send_file_error(socket, request_id, "internal error walking directory").await;
-            return;
+            return reply_error("internal error walking directory");
         }
     };
     let (matches, total) = paginate_slice(&all_matches, offset, limit);
-    send_server_message(
-        socket,
-        ServerMessage::GrepMatched {
-            request_id,
-            event: "grep_matched",
-            matches,
-            total,
-            scan_capped,
-            skipped,
-        },
-    )
-    .await;
+    Reply::GrepMatched(GrepResult { matches, total, scan_capped, skipped })
 }
 
 /// Synchronous, same `spawn_blocking`-only rule as `walk_glob`. Every file
@@ -1119,7 +949,7 @@ fn walk_grep(
     root: &str,
     pattern: &regex::Regex,
     glob_matcher: Option<&globset::GlobMatcher>,
-) -> (Vec<GrepMatchInfo>, bool, Vec<SkippedFileInfo>) {
+) -> (Vec<GrepMatch>, bool, Vec<SkippedFile>) {
     let root_path = std::path::Path::new(root);
     let mut matches = Vec::new();
     let mut skipped = Vec::new();
@@ -1150,7 +980,7 @@ fn walk_grep(
             Err(_) => continue,
         };
         if size > MAX_GREP_FILE_SIZE_BYTES {
-            skipped.push(SkippedFileInfo {
+            skipped.push(SkippedFile {
                 path: display_path,
                 reason: format!("too large ({size} bytes > {MAX_GREP_FILE_SIZE_BYTES} byte limit)"),
             });
@@ -1163,7 +993,7 @@ fn walk_grep(
         let content = match String::from_utf8(bytes) {
             Ok(content) => content,
             Err(_) => {
-                skipped.push(SkippedFileInfo {
+                skipped.push(SkippedFile {
                     path: display_path,
                     reason: "binary".to_string(),
                 });
@@ -1176,7 +1006,7 @@ fn walk_grep(
             scan_capped = true;
         }
         for (line, text) in file_matches {
-            matches.push(GrepMatchInfo {
+            matches.push(GrepMatch {
                 path: display_path.clone(),
                 line,
                 text,
@@ -1192,10 +1022,9 @@ fn walk_grep(
 /// `killpg` it in isolation later. `set -m`/`trap ':' INT` are the same
 /// per-shell startup this design has always used, just no longer only at
 /// agent-launch time.
-async fn create_terminal(state: &Arc<AppState>, socket: &mut WebSocket, terminal_id: String) {
+async fn create_terminal(state: &Arc<AppState>, terminal_id: String) -> Reply {
     if state.terminals.lock().await.contains_key(&terminal_id) {
-        send_terminal_error(socket, terminal_id, "terminal_id already exists").await;
-        return;
+        return reply_error("terminal_id already exists");
     }
 
     let mut child = match Command::new("bash")
@@ -1207,8 +1036,7 @@ async fn create_terminal(state: &Arc<AppState>, socket: &mut WebSocket, terminal
     {
         Ok(child) => child,
         Err(e) => {
-            send_terminal_error(socket, terminal_id, &format!("failed to spawn shell: {e}")).await;
-            return;
+            return reply_error(&format!("failed to spawn shell: {e}"));
         }
     };
     let bash_pid = child
@@ -1237,13 +1065,7 @@ async fn create_terminal(state: &Arc<AppState>, socket: &mut WebSocket, terminal
     // against itself once a foreground job dies from it, taking the whole
     // shell down with it — see SME-9's "Signaling a running command."
     if let Err(e) = stdin.write_all(b"set -m\ntrap ':' INT\n").await {
-        send_terminal_error(
-            socket,
-            terminal_id,
-            &format!("failed to initialize shell: {e}"),
-        )
-        .await;
-        return;
+        return reply_error(&format!("failed to initialize shell: {e}"));
     }
     let _ = stdin.flush().await;
 
@@ -1266,51 +1088,24 @@ async fn create_terminal(state: &Arc<AppState>, socket: &mut WebSocket, terminal
         .await
         .insert(terminal_id.clone(), shell);
 
-    send_server_message(
-        socket,
-        ServerMessage::TerminalCreated {
-            terminal_id,
-            event: "terminal_created",
-        },
-    )
-    .await;
+    Reply::TerminalCreated
 }
 
 /// `killpg` targeting just this terminal's own process group — safe in
 /// isolation because `.process_group(0)` gave it one distinct from the
 /// agent's and every sibling terminal's. See SME-9's "Terminating a
 /// terminal without touching the pod, or its siblings."
-async fn terminate_terminal(state: &Arc<AppState>, socket: &mut WebSocket, terminal_id: String) {
+async fn terminate_terminal(state: &Arc<AppState>, terminal_id: String) -> Reply {
     let shell = state.terminals.lock().await.remove(&terminal_id);
     let Some(shell) = shell else {
-        send_terminal_error(socket, terminal_id, "unknown terminal_id").await;
-        return;
+        return reply_error("unknown terminal_id");
     };
 
     if let Err(err) = signal::kill(Pid::from_raw(-(shell.bash_pid as i32)), Signal::SIGKILL) {
         tracing::warn!(%err, %terminal_id, "killpg failed while terminating terminal");
     }
 
-    send_server_message(
-        socket,
-        ServerMessage::TerminalTerminated {
-            terminal_id,
-            event: "terminal_terminated",
-        },
-    )
-    .await;
-}
-
-async fn send_terminal_error(socket: &mut WebSocket, terminal_id: String, message: &str) {
-    send_server_message(
-        socket,
-        ServerMessage::TerminalError {
-            terminal_id,
-            event: "terminal_error",
-            message: message.to_string(),
-        },
-    )
-    .await;
+    Reply::TerminalTerminated
 }
 
 async fn start_command(state: &Arc<AppState>, terminal_id: &str, id: String, command: &str) {
@@ -1435,17 +1230,41 @@ fn relay_target(line: &str) -> Result<std::net::SocketAddrV4, String> {
 /// container has yet hangs rather than fails, and without it smelt would
 /// take that silence for a server waiting for a request.
 async fn serve_relay(listener: tokio::net::TcpListener) {
+    accept_loop(
+        || async { listener.accept().await.map(|(client, _)| client) },
+        |client| {
+            tokio::spawn(async move {
+                if let Err(e) = relay(client).await {
+                    tracing::debug!("relay: {e}");
+                }
+            });
+        },
+    )
+    .await
+}
+
+/// Accepts connections for ever, handing each to `handle`.
+async fn accept_loop<S, A, Fut, H>(mut accept: A, mut handle: H)
+where
+    A: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<S>>,
+    H: FnMut(S),
+{
     loop {
-        let Ok((client, _)) = listener.accept().await else {
-            continue;
-        };
-        tokio::spawn(async move {
-            if let Err(e) = relay(client).await {
-                tracing::debug!("relay: {e}");
+        match accept().await {
+            Ok(client) => handle(client),
+            Err(e) => {
+                // A failure like EMFILE fails again at once: wait instead of
+                // spinning, as the server's own accept loops do.
+                tracing::warn!("relay: accept failed: {e}");
+                tokio::time::sleep(ACCEPT_RETRY).await;
             }
-        });
+        }
     }
 }
+
+/// How long `accept_loop` waits after a failed accept.
+const ACCEPT_RETRY: Duration = Duration::from_millis(50);
 
 async fn relay(client: tokio::net::TcpStream) -> Result<(), String> {
     let mut client = BufReader::new(client);
@@ -1769,8 +1588,8 @@ mod tests {
         );
     }
 
-    fn entry(name: &str, is_dir: bool, size: Option<u64>) -> DirEntryInfo {
-        DirEntryInfo {
+    fn entry(name: &str, is_dir: bool, size: Option<u64>) -> DirEntry {
+        DirEntry {
             name: name.to_string(),
             is_dir,
             size,
@@ -1834,20 +1653,15 @@ async fn main() {
     std::fs::write(PID_FILE, std::process::id().to_string())
         .unwrap_or_else(|e| panic!("failed to write {PID_FILE}: {e}"));
 
-    // This process is launched (via `pods.exec`) as a descendant of the
-    // pod's PID 1 (`sleep infinity`), which never installs a SIGINT/SIGQUIT
-    // handler — the kernel's PID-1 rule then forces those to SIG_IGN, and
-    // SIG_IGN (unlike a caught signal) survives exec(), so it was inherited
-    // all the way down into this very process. Left alone, that ignore
-    // would keep propagating into every `bash` this agent spawns and every
-    // command it runs — and POSIX forbids a *non-interactive* bash from
-    // overriding a signal that was already ignored "on entry", so
-    // `trap ':' INT` (in `create_terminal`) would be a silent no-op and
-    // `send_signal`'s SIGINT would never actually reach anything. Reset
-    // both to the default disposition once, here, before spawning any
-    // shell, so the ignore stops at the agent and never propagates
-    // further — every terminal's `bash`, whenever it's created, inherits
-    // the corrected disposition.
+    // A signal that is ignored when a process starts stays ignored across
+    // exec(), and POSIX forbids a *non-interactive* bash from trapping one
+    // that was ignored on entry. So if this process inherited SIGINT or
+    // SIGQUIT ignored (as it did when a `sleep infinity` PID 1 launched it,
+    // before it became the image's ENTRYPOINT), `trap ':' INT` in
+    // `create_terminal` would silently do nothing and `send_signal`'s SIGINT
+    // would never reach a command. Reset both to the default once, before
+    // spawning any shell, so every terminal's `bash` starts with them
+    // deliverable whatever launched the agent.
     unsafe {
         signal::signal(Signal::SIGINT, signal::SigHandler::SigDfl)
             .expect("reset SIGINT to default disposition");
@@ -1860,16 +1674,7 @@ async fn main() {
             .expect("handle SIGTERM");
     }
 
-    let (tx, rx) = mpsc::unbounded_channel();
-    let state = Arc::new(AppState {
-        terminals: AsyncMutex::new(HashMap::new()),
-        events_tx: tx,
-        events_rx: AsyncMutex::new(rx),
-    });
-
-    let app = Router::new()
-        .route("/ws", get(ws_handler))
-        .with_state(state);
+    let app = router(new_state());
     let relay_listener = tokio::net::TcpListener::bind(RELAY_ADDR)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {RELAY_ADDR}: {e}"));
@@ -1880,4 +1685,355 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to bind {LISTEN_ADDR}: {e}"));
     tracing::info!("sandbox_agent listening on {LISTEN_ADDR}");
     axum::serve(listener, app).await.expect("server error");
+}
+
+/// The agent's WebSocket end to end, in-process: its real router on a
+/// loopback port, real `bash` terminals, and a tungstenite client in the
+/// test (SME-53).
+#[cfg(test)]
+mod socket_tests {
+    use super::agent_protocol::{AgentMessage, ClientMessage, PROTOCOL_VERSION, Reply, Stream};
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    type Client = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    async fn serve_agent() -> std::net::SocketAddr {
+        serve_agent_with(new_state()).await
+    }
+
+    async fn serve_agent_with(state: Arc<AppState>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, router(state)).await });
+        addr
+    }
+
+    async fn connect(addr: std::net::SocketAddr) -> Client {
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (client, _) = tokio_tungstenite::client_async(format!("ws://{addr}/ws"), stream)
+            .await
+            .expect("upgrade");
+        client
+    }
+
+    /// Connects and reads past the hello.
+    async fn connect_ready(addr: std::net::SocketAddr) -> Client {
+        let mut client = connect(addr).await;
+        assert_eq!(next(&mut client).await, AgentMessage::Hello(PROTOCOL_VERSION));
+        client
+    }
+
+    async fn send(client: &mut Client, message: &ClientMessage) {
+        let text = serde_json::to_string(message).expect("serializes");
+        client.send(WsMessage::Text(text)).await.expect("send");
+    }
+
+    async fn send_raw(client: &mut Client, text: &str) {
+        client.send(WsMessage::Text(text.to_string())).await.expect("send");
+    }
+
+    async fn next(client: &mut Client) -> AgentMessage {
+        loop {
+            let frame = tokio::time::timeout(WAIT, client.next())
+                .await
+                .expect("the agent sent nothing within 5s")
+                .expect("the connection ended")
+                .expect("a WebSocket error");
+            if let WsMessage::Text(text) = frame {
+                return serde_json::from_str(&text)
+                    .unwrap_or_else(|e| panic!("the agent sent something that isn't v1 ({e}): {text}"));
+            }
+        }
+    }
+
+    /// Whether the agent closed this connection within 5s.
+    async fn closed(client: &mut Client) -> bool {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            match tokio::time::timeout_at(deadline, client.next()).await {
+                Err(_) => return false,
+                Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(WsMessage::Close(_)))) => return true,
+                Ok(Some(Ok(_))) => continue,
+            }
+        }
+    }
+
+    async fn create_terminal(client: &mut Client, terminal_id: &str) {
+        send(
+            client,
+            &ClientMessage::CreateTerminal { request_id: 1, terminal_id: terminal_id.into() },
+        )
+        .await;
+        assert_eq!(
+            next(client).await,
+            AgentMessage::Reply { request_id: 1, result: Reply::TerminalCreated }
+        );
+    }
+
+    async fn run(client: &mut Client, terminal_id: &str, id: &str, command: &str) {
+        send(
+            client,
+            &ClientMessage::Command { terminal_id: terminal_id.into(), id: id.into(), command: command.into() },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_hello_is_the_first_message_on_a_connection() {
+        let addr = serve_agent().await;
+        let mut client = connect(addr).await;
+        assert_eq!(next(&mut client).await, AgentMessage::Hello(PROTOCOL_VERSION));
+    }
+
+    #[tokio::test]
+    async fn test_terminal_actions_are_answered_with_their_request_id() {
+        let addr = serve_agent().await;
+        let mut client = connect_ready(addr).await;
+        send(&mut client, &ClientMessage::CreateTerminal { request_id: 11, terminal_id: "t1".into() }).await;
+        assert_eq!(next(&mut client).await, AgentMessage::Reply { request_id: 11, result: Reply::TerminalCreated });
+        send(&mut client, &ClientMessage::CreateTerminal { request_id: 12, terminal_id: "t1".into() }).await;
+        assert_eq!(
+            next(&mut client).await,
+            AgentMessage::Reply {
+                request_id: 12,
+                result: Reply::Error { message: "terminal_id already exists".into() }
+            }
+        );
+        send(&mut client, &ClientMessage::TerminateTerminal { request_id: 13, terminal_id: "t1".into() }).await;
+        assert_eq!(next(&mut client).await, AgentMessage::Reply { request_id: 13, result: Reply::TerminalTerminated });
+        send(&mut client, &ClientMessage::TerminateTerminal { request_id: 14, terminal_id: "t1".into() }).await;
+        assert_eq!(
+            next(&mut client).await,
+            AgentMessage::Reply { request_id: 14, result: Reply::Error { message: "unknown terminal_id".into() } }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_file_request_is_answered_with_its_request_id() {
+        let addr = serve_agent().await;
+        let mut client = connect_ready(addr).await;
+        let dir = std::env::temp_dir().join(format!("smelt-agent-test-{}", std::process::id()));
+        let path = dir.join("note.txt").to_string_lossy().into_owned();
+        send(
+            &mut client,
+            &ClientMessage::WriteFile { request_id: 21, path: path.clone(), content: "a\nb\n".into(), expected_hash: None },
+        )
+        .await;
+        let AgentMessage::Reply { request_id: 21, result: Reply::FileWritten { hash } } = next(&mut client).await else {
+            panic!("write_file wasn't answered with file_written");
+        };
+        send(&mut client, &ClientMessage::ReadFile { request_id: 22, path: path.clone(), offset: 0, limit: 10 }).await;
+        let AgentMessage::Reply { request_id: 22, result: Reply::FileRead(contents) } = next(&mut client).await else {
+            panic!("read_file wasn't answered with file_read");
+        };
+        assert_eq!(contents.lines, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(contents.hash, hash);
+        send(&mut client, &ClientMessage::ReadFile { request_id: 23, path: format!("{path}.missing"), offset: 0, limit: 10 }).await;
+        assert!(matches!(
+            next(&mut client).await,
+            AgentMessage::Reply { request_id: 23, result: Reply::Error { .. } }
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_a_command_streams_its_output_and_exit() {
+        let addr = serve_agent().await;
+        let mut client = connect_ready(addr).await;
+        create_terminal(&mut client, "t1").await;
+        // stdout and stderr are read concurrently, so the sleep keeps the
+        // stderr line ahead of the exit marker on stdout.
+        run(&mut client, "t1", "c1", "echo err >&2; sleep 0.2; echo out; exit_code() { return 3; }; exit_code").await;
+        let mut seen = Vec::new();
+        loop {
+            match next(&mut client).await {
+                AgentMessage::Output { id, stream, data, .. } => {
+                    assert_eq!(id, "c1");
+                    seen.push((stream, data));
+                }
+                AgentMessage::Exit { id, code, .. } => {
+                    assert_eq!((id.as_str(), code), ("c1", 3));
+                    break;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        seen.sort_by_key(|(stream, _)| stream.as_str());
+        assert_eq!(seen, vec![(Stream::Stderr, "err".to_string()), (Stream::Stdout, "out".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn test_an_unparseable_message_gets_a_protocol_error_with_its_request_id() {
+        let addr = serve_agent().await;
+        let mut client = connect_ready(addr).await;
+        send_raw(&mut client, r#"{"action":"read_file","request_id":42}"#).await;
+        let AgentMessage::ProtocolError { request_id, message } = next(&mut client).await else {
+            panic!("expected a protocol_error");
+        };
+        assert_eq!(request_id, Some(42));
+        assert!(message.contains("path"), "the error should name what's wrong: {message}");
+
+        send_raw(&mut client, "not json at all").await;
+        let AgentMessage::ProtocolError { request_id, .. } = next(&mut client).await else {
+            panic!("expected a protocol_error");
+        };
+        assert_eq!(request_id, None);
+    }
+
+    /// A `std::io::Write` into a shared buffer, for capturing log lines.
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Every agent log line from every test in this binary. One process-wide
+    /// subscriber: a per-thread one (`set_default`) misses events whose
+    /// callsite another thread registered first, and tests run in parallel.
+    fn captured_logs() -> &'static LogBuffer {
+        static LOGS: std::sync::OnceLock<LogBuffer> = std::sync::OnceLock::new();
+        LOGS.get_or_init(|| {
+            let logs = LogBuffer::default();
+            let writer = logs.clone();
+            // The agent's own logs only: tungstenite's trace logs in the
+            // test's client dump every frame it sends.
+            tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_env_filter(tracing_subscriber::EnvFilter::new("sandbox_agent=trace"))
+                .init();
+            logs
+        })
+    }
+
+    /// A `write_file` carries a whole file, which may hold secrets. When it
+    /// can't be parsed, the log says why and how long it was, not what it
+    /// said.
+    #[tokio::test]
+    async fn test_an_unparseable_message_is_not_logged_verbatim() {
+        let logs = captured_logs();
+
+        let addr = serve_agent().await;
+        let mut client = connect_ready(addr).await;
+        send_raw(
+            &mut client,
+            r#"{"action":"write_file","request_id":5,"path":"/tmp/x","content":"password=hunter2-SECRET","expected_hash":7}"#,
+        )
+        .await;
+        assert!(matches!(next(&mut client).await, AgentMessage::ProtocolError { request_id: Some(5), .. }));
+
+        let logged = String::from_utf8_lossy(&logs.0.lock().expect("log buffer")).into_owned();
+        assert!(logged.contains("unparseable"), "nothing was logged: {logged:?}");
+        assert!(!logged.contains("hunter2-SECRET"), "the message's content was logged: {logged}");
+    }
+
+    #[tokio::test]
+    async fn test_a_second_connection_replaces_the_first() {
+        let addr = serve_agent().await;
+        let mut first = connect_ready(addr).await;
+        create_terminal(&mut first, "t1").await;
+
+        let mut second = connect_ready(addr).await;
+        assert!(closed(&mut first).await, "the first connection is still open");
+
+        run(&mut second, "t1", "c1", "echo hi").await;
+        assert!(matches!(next(&mut second).await, AgentMessage::Output { data, .. } if data == "hi"));
+        assert!(matches!(next(&mut second).await, AgentMessage::Exit { code: 0, .. }));
+    }
+
+    /// The exit of a command that finishes while smelt isn't connected (a
+    /// smelt restart) reaches the next connection.
+    #[tokio::test]
+    async fn test_events_queued_with_no_connection_reach_the_next_one() {
+        let addr = serve_agent().await;
+        let mut first = connect_ready(addr).await;
+        create_terminal(&mut first, "t1").await;
+        run(&mut first, "t1", "c1", "sleep 0.5; echo later").await;
+        first.close(None).await.expect("close");
+        drop(first);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let mut second = connect_ready(addr).await;
+        assert!(matches!(next(&mut second).await, AgentMessage::Output { data, .. } if data == "later"));
+        assert!(matches!(next(&mut second).await, AgentMessage::Exit { id, code: 0, .. } if id == "c1"));
+    }
+
+    /// An event the agent took off the queue but couldn't send (smelt's end
+    /// died before the agent noticed) goes to the next connection, after its
+    /// hello, instead of being lost with the socket.
+    #[tokio::test]
+    async fn test_an_event_that_failed_to_send_goes_to_the_next_connection() {
+        let state = new_state();
+        let mut dead = Box::pin(futures_util::sink::unfold((), |(), _: Message| async {
+            Err::<(), _>(std::io::Error::other("connection reset"))
+        }));
+        let exit = AgentMessage::Exit { id: "c1".into(), terminal_id: "t1".into(), code: 0 };
+        assert!(!send_or_keep(&mut dead, &state, exit.clone()).await, "a failed send reported success");
+
+        let addr = serve_agent_with(state).await;
+        let mut client = connect_ready(addr).await;
+        assert_eq!(next(&mut client).await, exit);
+    }
+
+    /// An event a replaced connection fails to send after the new one has
+    /// already opened goes to the new one, not only to the one after it.
+    #[tokio::test]
+    async fn test_an_event_that_failed_to_send_reaches_the_live_connection() {
+        let state = new_state();
+        let addr = serve_agent_with(state.clone()).await;
+        let mut live = connect_ready(addr).await;
+
+        let mut dead = Box::pin(futures_util::sink::unfold((), |(), _: Message| async {
+            Err::<(), _>(std::io::Error::other("connection reset"))
+        }));
+        let exit = AgentMessage::Exit { id: "c1".into(), terminal_id: "t1".into(), code: 0 };
+        assert!(!send_or_keep(&mut dead, &state, exit.clone()).await);
+        assert_eq!(next(&mut live).await, exit);
+    }
+
+    /// A failing `accept()` (EMFILE, say) waits before trying again, instead
+    /// of spinning, and the loop keeps accepting once it recovers.
+    #[tokio::test(start_paused = true)]
+    async fn test_the_accept_loop_backs_off_after_a_failed_accept() {
+        let start = tokio::time::Instant::now();
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (handled_tx, handled_rx) = tokio::sync::oneshot::channel();
+        let mut handled_tx = Some(handled_tx);
+        let counter = calls.clone();
+        tokio::spawn(accept_loop(
+            move || {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n < 5 {
+                        Err(std::io::Error::other("too many open files"))
+                    } else {
+                        // One connection, then nothing more to accept.
+                        if n == 5 { Ok(n) } else { std::future::pending().await }
+                    }
+                }
+            },
+            move |n| {
+                if let Some(tx) = handled_tx.take() {
+                    let _ = tx.send((n, tokio::time::Instant::now()));
+                }
+            },
+        ));
+        let (n, at) = handled_rx.await.expect("the loop stopped accepting");
+        assert_eq!(n, 5);
+        assert!(
+            at - start >= Duration::from_millis(5 * 50),
+            "five failed accepts took {:?}, so the loop didn't wait between them",
+            at - start
+        );
+    }
 }

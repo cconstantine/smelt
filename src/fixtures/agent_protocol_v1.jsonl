@@ -1,0 +1,23 @@
+{"action":"create_terminal","request_id":1,"terminal_id":"3"}
+{"action":"terminate_terminal","request_id":2,"terminal_id":"3"}
+{"action":"command","terminal_id":"3","id":"cmd-7","command":"cargo test"}
+{"action":"signal","terminal_id":"3","id":"cmd-7","signal":"INT"}
+{"action":"read_file","request_id":3,"path":"/workspace/src/main.rs","offset":0,"limit":200}
+{"action":"write_file","request_id":4,"path":"/workspace/notes.txt","content":"héllo\n","expected_hash":null}
+{"action":"edit_file","request_id":5,"path":"/workspace/src/main.rs","old_string":"foo","new_string":"bar","replace_all":false,"expected_hash":"ab12","expected_line":14}
+{"action":"list_directory","request_id":6,"path":"/workspace"}
+{"action":"glob","request_id":7,"path":"/workspace","pattern":"**/*.rs","offset":0,"limit":100}
+{"action":"grep","request_id":8,"path":"/workspace","pattern":"fn main","glob":"*.rs","case_insensitive":true,"offset":0,"limit":50}
+{"event":"hello","major":1,"minor":0}
+{"event":"output","id":"cmd-7","terminal_id":"3","stream":"stderr","seq":0,"data":"   Compiling smelt"}
+{"event":"exit","id":"cmd-7","terminal_id":"3","code":101}
+{"event":"reply","request_id":1,"result":{"kind":"terminal_created"}}
+{"event":"reply","request_id":2,"result":{"kind":"terminal_terminated"}}
+{"event":"reply","request_id":3,"result":{"kind":"file_read","lines":["fn main() {","}"],"total_lines":2,"hash":"ab12"}}
+{"event":"reply","request_id":4,"result":{"kind":"file_written","hash":"cd34"}}
+{"event":"reply","request_id":5,"result":{"kind":"file_edited","hash":"ef56"}}
+{"event":"reply","request_id":6,"result":{"kind":"directory_listed","entries":[{"name":"src","is_dir":true,"size":null},{"name":"Cargo.toml","is_dir":false,"size":812}]}}
+{"event":"reply","request_id":7,"result":{"kind":"glob_matched","paths":["src/main.rs"],"total":1,"scan_capped":false}}
+{"event":"reply","request_id":8,"result":{"kind":"grep_matched","matches":[{"path":"src/main.rs","line":1,"text":"fn main() {"}],"total":1,"scan_capped":false,"skipped":[{"path":"big.bin","reason":"not valid UTF-8"}]}}
+{"event":"reply","request_id":9,"result":{"kind":"error","message":"file has changed since it was last read"}}
+{"event":"protocol_error","request_id":10,"message":"missing field `path` at line 1 column 40"}

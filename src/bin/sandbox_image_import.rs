@@ -3,7 +3,9 @@
 //! custom sandbox image (see
 //! SME-17's Phase 1). Run by
 //! `scripts/build-sandbox-image.sh` after `docker build`/`docker save`,
-//! never by the main `smelt` server process at runtime.
+//! never by the main `smelt` server process at runtime. With `--check`
+//! instead of a tarball, it only checks that the node still has every
+//! sandbox image (`scripts/cluster-doctor`).
 //!
 //! A short-lived pod gets the node's containerd socket hostPath-mounted
 //! (`/run/k3s/containerd` — the path this project's own `rancher/k3s`
@@ -41,9 +43,9 @@ const REMOTE_TAR_PATH: &str = "/tmp/sandbox-image.tar";
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    let tar_path = std::env::args()
+    let arg = std::env::args()
         .nth(1)
-        .ok_or("usage: sandbox_image_import <path-to-docker-save-tarball>")?;
+        .ok_or("usage: sandbox_image_import <path-to-docker-save-tarball> | --check")?;
 
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -51,7 +53,7 @@ async fn main() -> Result<(), BoxError> {
     let client = kube::Client::try_default().await?;
     let pods: Api<Pod> = Api::namespaced(client, NAMESPACE);
 
-    let result = import(&pods, &tar_path).await;
+    let result = if arg == "--check" { check(&pods).await } else { import(&pods, &arg).await };
     // Best-effort cleanup regardless of how `import` above went — this is
     // a one-shot CLI tool, not a long-lived process with its own cleanup
     // queue, so a plain delete-on-the-way-out is enough (same "disposable,
@@ -68,16 +70,19 @@ async fn import(pods: &Api<Pod>, tar_path: &str) -> Result<(), BoxError> {
         tar_bytes.len()
     );
 
-    let _ = pods.delete(LOADER_POD_NAME, &immediate_delete()).await;
-    wait_gone(pods, LOADER_POD_NAME).await;
-
-    pods.create(&PostParams::default(), &loader_pod_spec())
-        .await?;
-    wait_running(pods, LOADER_POD_NAME).await?;
-    println!("sandbox_image_import: loader pod Running");
-
+    start_loader(pods).await?;
     stream_and_import(pods, &tar_bytes).await?;
     println!("sandbox_image_import: done");
+    Ok(())
+}
+
+/// A fresh loader pod, Running.
+async fn start_loader(pods: &Api<Pod>) -> Result<(), BoxError> {
+    let _ = pods.delete(LOADER_POD_NAME, &immediate_delete()).await;
+    wait_gone(pods, LOADER_POD_NAME).await;
+    pods.create(&PostParams::default(), &loader_pod_spec()).await?;
+    wait_running(pods, LOADER_POD_NAME).await?;
+    println!("sandbox_image_import: loader pod Running");
     Ok(())
 }
 
@@ -268,4 +273,67 @@ async fn stream_and_import(pods: &Api<Pod>, data: &[u8]) -> Result<(), BoxError>
     .await?;
     println!("{import_out}");
     Ok(())
+}
+
+/// The images sandbox pods start from, as containerd names them. Pods use
+/// `imagePullPolicy: Never`, so a missing one fails every pod
+/// (`ErrImageNeverPull`); the kubelet deletes unused images when the node's
+/// disk passes its garbage-collection threshold.
+const SANDBOX_IMAGES: &[&str] = &[
+    "docker.io/library/smelt-sandbox:latest",
+    "docker.io/library/docker:29-dind",
+];
+
+/// Which of `wanted` aren't in `listed`, the output of `ctr images ls -q`
+/// (one image reference per line).
+fn missing_images(listed: &str, wanted: &[&str]) -> Vec<String> {
+    let listed: std::collections::HashSet<&str> = listed.lines().map(str::trim).collect();
+    wanted
+        .iter()
+        .filter(|image| !listed.contains(**image))
+        .map(|image| image.to_string())
+        .collect()
+}
+
+/// `--check`: fails, naming them, if the node lacks any of `SANDBOX_IMAGES`.
+async fn check(pods: &Api<Pod>) -> Result<(), BoxError> {
+    start_loader(pods).await?;
+    let listed = exec_capture(
+        pods,
+        LOADER_POD_NAME,
+        &["ctr", "--address", CONTAINERD_SOCKET, "--namespace", "k8s.io", "images", "ls", "-q"],
+    )
+    .await?;
+    let missing = missing_images(&listed, SANDBOX_IMAGES);
+    if missing.is_empty() {
+        println!("sandbox_image_import: the node has every sandbox image");
+        Ok(())
+    } else {
+        Err(format!(
+            "the cluster's node is missing {} (the kubelet deletes unused images when its disk is \
+             over 85% full); free space if need be, then run scripts/build-sandbox-image.sh",
+            missing.join(" and ")
+        )
+        .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_missing_images_names_each_wanted_image_not_listed() {
+        let listed = "docker.io/library/smelt-sandbox:latest\nsha256:0123abcd\ndocker.io/rancher/mirrored-pause:3.6\n";
+        assert_eq!(missing_images(listed, SANDBOX_IMAGES), vec!["docker.io/library/docker:29-dind".to_string()]);
+        assert!(missing_images("docker.io/library/smelt-sandbox:latest\ndocker.io/library/docker:29-dind\n", SANDBOX_IMAGES).is_empty());
+        assert_eq!(missing_images("", SANDBOX_IMAGES).len(), 2);
+    }
+
+    /// A tag that only starts like a wanted one isn't it.
+    #[test]
+    fn test_missing_images_matches_whole_references() {
+        let listed = "docker.io/library/smelt-sandbox:latest-old\ndocker.io/library/docker:29-dind\n";
+        assert_eq!(missing_images(listed, SANDBOX_IMAGES), vec!["docker.io/library/smelt-sandbox:latest".to_string()]);
+    }
 }

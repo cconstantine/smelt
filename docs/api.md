@@ -178,6 +178,7 @@ Only the `/pods` page subscribes to it directly; chat tabs get both relayed on t
   - Reading metrics needs `get`/`list` on `pods` in the `metrics.k8s.io` group (`k8s/smelt-park-rbac.yaml`). Without it, or if the metrics call fails for any other reason, every pod's `usage` is `None` and the rest of the view still works.
   - Quantities are parsed by `parse_cpu_nanocores`/`parse_memory_bytes`, and CPU is summed across containers in nanocores.
 - **Language servers** (`language_servers`): the server pods next to it, each with its state, memory limit and use (SME-35).
+- **Agent** (`agent`, `sandbox::agent_status`): the protocol version its sandbox agent said hello with, and whether that's current, needs a restart for new features (an older minor), or needs one before its terminals and files work (another major, or an agent from before versioning). `None` until smelt has connected to it. The model's `list_pods` gives the same text (SME-53).
 - **`observed_at`:** the database's `now()`, so the page measures ages on the database's clock rather than the browser's.
 
 **Records are kept in step with the cluster.** A pod can vanish while smelt isn't connected to it: a cluster rebuild, a pod deleted outside smelt, one that died while smelt was down. Crash detection only notices a pod with a live connection. So `main()` starts `sandbox::watch_pods`, a Kubernetes watch on smelt's namespace (`kube::runtime::watcher`), which works in this order:

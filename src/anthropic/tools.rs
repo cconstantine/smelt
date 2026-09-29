@@ -1821,7 +1821,13 @@ mod server {
             .map_err(|e| e.to_string())?;
         let payload: Vec<_> = pods
             .iter()
-            .map(|p| serde_json::json!({"pod_id": p.pod_id, "status": p.status}))
+            .map(|p| {
+                serde_json::json!({
+                    "pod_id": p.pod_id,
+                    "status": p.status,
+                    "agent": p.agent.as_ref().map(|agent| agent.describe()),
+                })
+            })
             .collect();
         Ok(serde_json::json!({"pods": payload}).to_string())
     }

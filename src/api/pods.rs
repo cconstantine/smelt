@@ -29,11 +29,39 @@ pub struct PodOverview {
     /// installed) or has no numbers for this pod yet.
     pub usage: Option<PodUsage>,
     pub terminals: i64,
+    /// Its sandbox agent's protocol version, once smelt has connected to it
+    /// (SME-53). `None` until then.
+    pub agent: Option<AgentStatus>,
     /// The language servers running next to it (SME-35).
     pub language_servers: Vec<ServerPodOverview>,
     /// The database's clock when this was read; ages are measured against
     /// it, not the browser's clock.
     pub observed_at: NaiveDateTime,
+}
+
+/// A sandbox pod's agent, against the protocol this smelt speaks (SME-53).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum AgentStatus {
+    /// Smelt's own version, or a newer minor.
+    Current { version: String },
+    /// An older minor: everything works except features added since, which
+    /// ask for a restart.
+    RestartRecommended { version: String },
+    /// Another major, or (`None`) an agent from before versioning: the
+    /// terminals and file tools don't work until the pod is replaced.
+    RestartRequired { version: Option<String> },
+}
+
+impl AgentStatus {
+    /// One line, for the Sandboxes page and the model's `list_pods`.
+    pub fn describe(&self) -> String {
+        match self {
+            AgentStatus::Current { version } => format!("agent {version}"),
+            AgentStatus::RestartRecommended { version } => format!("agent {version}, restart for new features"),
+            AgentStatus::RestartRequired { version: Some(version) } => format!("agent {version}, restart required"),
+            AgentStatus::RestartRequired { version: None } => "old agent, restart required".to_string(),
+        }
+    }
 }
 
 /// A language server's pod, next to a sandbox pod.
@@ -211,6 +239,7 @@ pub(crate) async fn pod_overviews(pool: &sqlx::PgPool) -> Result<Vec<PodOverview
             cpu_limit: sum_cpu_limits(&details.cpu_limits),
             usage: usage.get(&crate::sandbox::kubernetes_pod_name(row.pod_id)).cloned(),
             terminals: row.live_terminals,
+            agent: crate::sandbox::agent_status(row.pod_id),
             language_servers: server_overviews(row.conversation_id, row.pod_id, &usage).await,
             observed_at: row.observed_at,
         });
@@ -337,6 +366,56 @@ mod tests {
 
     fn parse_cpu_millicores(quantity: &str) -> Option<u64> {
         parse_cpu_nanocores(quantity).map(|nanos| (nanos / 1_000_000.0) as u64)
+    }
+
+    #[test]
+    fn test_agent_status_says_whether_a_restart_is_needed() {
+        assert_eq!(AgentStatus::Current { version: "1.0".into() }.describe(), "agent 1.0");
+        assert_eq!(
+            AgentStatus::RestartRecommended { version: "1.2".into() }.describe(),
+            "agent 1.2, restart for new features"
+        );
+        assert_eq!(
+            AgentStatus::RestartRequired { version: Some("2.0".into()) }.describe(),
+            "agent 2.0, restart required"
+        );
+        assert_eq!(AgentStatus::RestartRequired { version: None }.describe(), "old agent, restart required");
+    }
+
+    /// `PodOverview` crosses to the browser, so each agent status must
+    /// survive JSON.
+    #[test]
+    fn test_a_pod_overview_round_trips_through_json_with_each_agent_status() {
+        let at = chrono::NaiveDate::from_ymd_opt(2026, 9, 29)
+            .expect("date")
+            .and_hms_opt(1, 2, 3)
+            .expect("time");
+        for agent in [
+            None,
+            Some(AgentStatus::Current { version: "1.0".into() }),
+            Some(AgentStatus::RestartRecommended { version: "1.0".into() }),
+            Some(AgentStatus::RestartRequired { version: Some("2.1".into()) }),
+            Some(AgentStatus::RestartRequired { version: None }),
+        ] {
+            let overview = PodOverview {
+                pod_id: 7,
+                conversation_id: 3,
+                conversation_title: "t".into(),
+                status: Some("Running".into()),
+                started_at: at,
+                activity: PodActivity::Busy,
+                memory_limit: None,
+                cpu_limit: None,
+                usage: None,
+                terminals: 1,
+                agent,
+                language_servers: vec![],
+                observed_at: at,
+            };
+            let json = serde_json::to_string(&overview).expect("serializes");
+            let back: PodOverview = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back, overview);
+        }
     }
 
     #[test]
