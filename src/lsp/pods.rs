@@ -623,15 +623,49 @@ pub(crate) mod tests {
             }
             let name = format!("sandbox-lsp-test-{id}");
             let started = start_stand_in(&pods, &name, id, image, &claim_name, wait).await;
-            if started.is_err() {
+            if let Err(e) = started {
                 // The caller never gets a `SandboxRef` to tear down, so this
                 // has to, however it failed: on SME-53, every failed run left
-                // its stand-ins behind.
+                // its stand-ins behind. What it can't delete, it names.
                 let gone = DeleteParams { grace_period_seconds: Some(0), ..Default::default() };
-                let _ = pods.delete(&name, &gone).await;
-                let _ = pvcs.delete(&claim_name, &DeleteParams::default()).await;
+                let pod = pods.delete(&name, &gone).await.map(|_| ());
+                let claim = pvcs.delete(&claim_name, &DeleteParams::default()).await.map(|_| ());
+                let left: Vec<String> = [
+                    left_behind(&format!("pod {name}"), pod),
+                    left_behind(&format!("claim {claim_name}"), claim),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                return Err(if left.is_empty() {
+                    e
+                } else {
+                    format!("{e}; cleaning up failed, so delete by hand: {}", left.join("; "))
+                });
             }
             started
+        }
+
+        /// What a cleanup delete left behind, if anything: nothing when it
+        /// worked or the object was already gone.
+        fn left_behind(what: &str, deleted: Result<(), kube::Error>) -> Option<String> {
+            match deleted {
+                Ok(()) => None,
+                Err(kube::Error::Api(status)) if status.is_not_found() => None,
+                Err(e) => Some(format!("{what}: {e}")),
+            }
+        }
+
+        #[test]
+        fn test_left_behind_names_what_a_failed_delete_left() {
+            let api = |reason: &str, code: u16| {
+                kube::Error::Api(Box::new(kube::core::Status::failure("no", reason).with_code(code)))
+            };
+            assert_eq!(left_behind("pod p", Ok(())), None);
+            assert_eq!(left_behind("pod p", Err(api("NotFound", 404))), None, "already gone is gone");
+            let left = left_behind("pod p", Err(api("InternalError", 500))).expect("a failed delete is named");
+            assert!(left.starts_with("pod p: "), "{left}");
+            assert!(left_behind("claim c", Err(kube::Error::Service(Box::new(std::io::Error::other("timed out"))))).is_some());
         }
 
         /// Whether a create that failed may still have made the object. An
