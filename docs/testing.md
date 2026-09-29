@@ -126,7 +126,14 @@ already gone.
 - `test_docker_in_a_sandbox_pod_works_and_stays_inside_the_pod` and `test_an_oom_in_a_nested_container_restarts_only_the_docker_sidecar` run real containers. Their base image is the sandbox's own files (`sudo tar -C / -c bin sbin lib lib64 usr etc | docker import - local/base`), so no test pulls from Docker Hub. Leave out `usr/lib64` or `etc` and a container fails with `exec /usr/bin/sh: no such file or directory`.
 - An OOM test needs memory that's actually written: `head -c 900M /dev/zero | tail` holds it, Python's `bytearray(n)` doesn't (its zero pages are never allocated, so nothing is killed). After the sidecar's OOM kill, a restarted dockerd reports the old containers as `Exited (255)`, often before the pod's status shows the restart.
 - Each test's checks run inside `catch_unwind`, so the pods and claim it made are deleted even when an assertion fails; a panic otherwise unwinds past the cleanup.
-- Run `scripts/build-sandbox-image.sh` after changing the agent (`src/bin/sandbox_agent.rs`) or `docker/sandbox/`: the pod runs the imported image, not the tree you just built.
+- Run `scripts/build-sandbox-image.sh` after changing the agent (`src/bin/sandbox_agent.rs`, `src/agent_protocol.rs`) or `docker/sandbox/`: the pod runs the imported image, not the tree you just built. The kubelet deletes images no pod is using once the node's disk passes 85%, so a cluster test that suddenly fails with `ErrImageNeverPull` means a full disk, then a re-import.
+
+### The sandbox agent's protocol (SME-53)
+
+- Neither end needs a cluster to be tested. `sandbox_agent`'s `socket_tests` run its real router on a loopback port with real `bash` terminals and a tungstenite client. `sandbox::agent_connection_tests` put a fake agent on a loopback port behind `dialer_for` (keyed by pod id, so parallel tests don't meet) and script its hello and replies, for smelt's side: timeouts, a dropped connection, outdated agents, two callers connecting at once, a teardown during a connect. They use `#[sqlx::test]` for the pod's row; `pod_row` moves the pod id sequence so the registry, which is keyed by pod id, never sees two tests' pods as one.
+- Change `src/agent_protocol.rs` and the fixture test (`src/fixtures/agent_protocol_v1.jsonl`) fails until the change is either additive (bump the minor, add an example) or a new major with a new fixture file. `PROTOCOL_VERSION`'s comment says which is which.
+- `test_terminal_lifecycle_end_to_end` is still the one run of the real agent in a real pod: rebuild the image after changing either end of the protocol, or its pods come up with an agent smelt reports as outdated.
+- The agent's `test_an_unparseable_message_is_not_logged_verbatim` captures logs through one process-wide subscriber limited to the agent's own target: a per-thread subscriber misses events whose callsite another test's thread registered first, and tungstenite's trace logs dump every frame the test client sends.
 
 ### Language servers (SME-35)
 

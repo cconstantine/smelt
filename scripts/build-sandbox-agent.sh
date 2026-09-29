@@ -1,9 +1,8 @@
 #!/bin/sh
 # Builds the sandbox_agent binary and copies it to a fixed,
-# profile-independent path (target/sandbox-agent/sandbox_agent) that
-# src/sandbox.rs's `include_bytes!` references. Must run before building
-# the main server binary — see docs/setup.md and
-# SME-9's "Build ordering."
+# profile-independent path (target/sandbox-agent/sandbox_agent), the Docker
+# build context scripts/build-sandbox-image.sh bakes it into the sandbox
+# image from. Run through that script — see docs/setup.md.
 #
 # Deliberately a separate script rather than a build.rs: a build.rs that
 # itself shells out to `cargo build --bin sandbox_agent` for a *second*

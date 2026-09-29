@@ -1446,6 +1446,8 @@ impl From<sqlx::Error> for TerminalError {
 pub struct PodInfo {
     pub pod_id: i64,
     pub status: String,
+    /// See `agent_status`.
+    pub agent: Option<crate::api::pods::AgentStatus>,
 }
 
 #[derive(Debug)]
@@ -1774,6 +1776,31 @@ fn deregister_if_current(pod_id: i64, conn: &Arc<TerminalConnection>) -> bool {
 /// `Some(found)` if the pod's agent is known to be outdated.
 fn outdated(pod_id: i64) -> Option<Option<ProtocolVersion>> {
     registry().outdated.get(&pod_id).copied()
+}
+
+/// How an agent on `agent` compares with a smelt on `smelt` of the same
+/// major.
+fn classify_agent(agent: ProtocolVersion, smelt: ProtocolVersion) -> crate::api::pods::AgentStatus {
+    use crate::api::pods::AgentStatus;
+    let version = agent.to_string();
+    if agent.minor < smelt.minor {
+        AgentStatus::RestartRecommended { version }
+    } else {
+        AgentStatus::Current { version }
+    }
+}
+
+/// What smelt knows of `pod_id`'s agent: the version it said hello with,
+/// or that it's outdated. `None` while smelt holds no connection to it.
+pub fn agent_status(pod_id: i64) -> Option<crate::api::pods::AgentStatus> {
+    let registry = registry();
+    if let Some(found) = registry.outdated.get(&pod_id) {
+        return Some(crate::api::pods::AgentStatus::RestartRequired {
+            version: found.map(|version| version.to_string()),
+        });
+    }
+    let conn = registry.connections.get(&pod_id)?;
+    Some(classify_agent(conn.agent_version, PROTOCOL_VERSION))
 }
 
 /// Serialises connecting to one pod, so two callers make one connection.
@@ -2381,6 +2408,7 @@ pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInf
         result.push(PodInfo {
             pod_id: row.id,
             status,
+            agent: agent_status(row.id),
         });
     }
     Ok(result)
@@ -7452,6 +7480,42 @@ mod agent_connection_tests {
         let err = conn.require_minor(4).expect_err("minor 4 is newer than the agent");
         assert!(matches!(err, TerminalError::AgentTooOld { found, .. } if found == older), "{err:?}");
         assert!(err.to_string().contains("needs a newer sandbox agent"), "{err}");
+    }
+
+    /// The Sandboxes page and `list_pods` say what each pod's agent speaks.
+    #[sqlx::test]
+    async fn test_agent_status_follows_what_the_agent_said(pool: PgPool) {
+        use crate::api::pods::AgentStatus;
+
+        let (_, unconnected) = pod_row(&pool).await;
+        let _a = fake_agent(unconnected, current(), Duration::ZERO).await;
+        assert_eq!(agent_status(unconnected), None, "not connected yet, so unknown");
+
+        let (_, same) = pod_row(&pool).await;
+        let _b = fake_agent(same, current(), Duration::ZERO).await;
+        reconnect_if_needed(&pool, same).await.expect("connects");
+        assert_eq!(agent_status(same), Some(AgentStatus::Current { version: PROTOCOL_VERSION.to_string() }));
+
+        let (_, newer) = pod_row(&pool).await;
+        let newer_minor = ProtocolVersion { major: PROTOCOL_VERSION.major, minor: PROTOCOL_VERSION.minor + 1 };
+        let _c = fake_agent(newer, Greeting::Hello(newer_minor), Duration::ZERO).await;
+        reconnect_if_needed(&pool, newer).await.expect("connects");
+        assert_eq!(agent_status(newer), Some(AgentStatus::Current { version: newer_minor.to_string() }));
+
+        // An older minor can't be faked while smelt is at minor 0, so check
+        // the classification itself.
+        let older = ProtocolVersion { major: PROTOCOL_VERSION.major, minor: 2 };
+        let current_minor_3 = ProtocolVersion { major: PROTOCOL_VERSION.major, minor: 3 };
+        assert_eq!(
+            classify_agent(older, current_minor_3),
+            AgentStatus::RestartRecommended { version: older.to_string() }
+        );
+
+        let (_, old) = pod_row(&pool).await;
+        let v0_line = r#"{"id":"c","terminal_id":"1","stream":"stdout","seq":1,"data":"x"}"#;
+        let _d = fake_agent(old, Greeting::Raw(v0_line.into()), Duration::ZERO).await;
+        let _ = reconnect_if_needed(&pool, old).await;
+        assert_eq!(agent_status(old), Some(AgentStatus::RestartRequired { version: None }));
     }
 
     /// A page load doesn't wait behind a connect that's already under way.
