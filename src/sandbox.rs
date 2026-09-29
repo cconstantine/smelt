@@ -3506,7 +3506,9 @@ async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConnection>, tex
             },
         ),
         AgentMessage::ProtocolError { request_id: None, message } => {
-            tracing::warn!(%message, "the sandbox agent couldn't read a message from smelt");
+            // Not the text: serde's error quotes the values it choked on,
+            // which can be part of a request's content.
+            tracing::warn!(bytes = message.len(), "the sandbox agent couldn't read a message from smelt");
         }
         AgentMessage::Hello(version) => tracing::debug!(%version, "the sandbox agent said hello again"),
         AgentMessage::Unknown => {
@@ -7516,6 +7518,61 @@ mod agent_connection_tests {
         let _d = fake_agent(old, Greeting::Raw(v0_line.into()), Duration::ZERO).await;
         let _ = reconnect_if_needed(&pool, old).await;
         assert_eq!(agent_status(old), Some(AgentStatus::RestartRequired { version: None }));
+    }
+
+    /// Every `smelt::sandbox` log line from every test in this binary, through
+    /// one process-wide subscriber (a per-thread one misses events whose
+    /// callsite another test's thread registered first).
+    fn captured_logs() -> &'static Arc<StdMutex<Vec<u8>>> {
+        #[derive(Clone)]
+        struct Writer(Arc<StdMutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        static LOGS: std::sync::OnceLock<Arc<StdMutex<Vec<u8>>>> = std::sync::OnceLock::new();
+        LOGS.get_or_init(|| {
+            let logs = Arc::new(StdMutex::new(Vec::new()));
+            let writer = Writer(logs.clone());
+            tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_env_filter(tracing_subscriber::EnvFilter::new("smelt::sandbox=trace"))
+                .init();
+            logs
+        })
+    }
+
+    /// The agent's protocol error quotes serde's message, which can quote
+    /// the request it couldn't read (a `write_file`'s content). smelt logs
+    /// that it happened, not the text.
+    #[sqlx::test]
+    async fn test_a_protocol_error_is_not_logged_verbatim(pool: PgPool) {
+        let logs = captured_logs();
+        let (_, pod_id) = pod_row(&pool).await;
+        let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
+        let conn = reconnect_if_needed(&pool, pod_id).await.expect("connects");
+        let mut fake = agent.next_connection().await;
+        let _ = fake.send.send(Out::Message(AgentMessage::ProtocolError {
+            request_id: None,
+            message: r#"invalid type: string "password=hunter2-SECRET", expected u32"#.into(),
+        }));
+        // A round trip after it, so the reader has handled the error.
+        let waiting = conn.request(|request_id| ClientMessage::ListDirectory { request_id, path: "/".into() });
+        let answer = async {
+            let ClientMessage::ListDirectory { request_id, .. } = fake.next_request().await else { panic!() };
+            fake.reply(request_id, Reply::DirectoryListed { entries: vec![] });
+        };
+        let (result, ()) = tokio::join!(waiting, answer);
+        result.expect("the connection still works");
+
+        let logged = String::from_utf8_lossy(&logs.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+        assert!(logged.contains("couldn't read a message from smelt"), "nothing was logged: {logged:?}");
+        assert!(!logged.contains("hunter2-SECRET"), "the protocol error's text was logged: {logged}");
     }
 
     /// A page load doesn't wait behind a connect that's already under way.
