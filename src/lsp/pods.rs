@@ -615,7 +615,12 @@ pub(crate) mod tests {
                 "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}},
             }))
             .map_err(|e| format!("the claim's spec: {e}"))?;
-            pvcs.create(&PostParams::default(), &claim).await.map_err(|e| format!("creating the claim: {e}"))?;
+            if let Err(e) = pvcs.create(&PostParams::default(), &claim).await {
+                if may_have_created(&e) {
+                    let _ = pvcs.delete(&claim_name, &DeleteParams::default()).await;
+                }
+                return Err(format!("creating the claim: {e}"));
+            }
             let name = format!("sandbox-lsp-test-{id}");
             let started = start_stand_in(&pods, &name, id, image, &claim_name, wait).await;
             if started.is_err() {
@@ -627,6 +632,25 @@ pub(crate) mod tests {
                 let _ = pvcs.delete(&claim_name, &DeleteParams::default()).await;
             }
             started
+        }
+
+        /// Whether a create that failed may still have made the object. An
+        /// API error is the server refusing (including "already exists",
+        /// which isn't ours to delete); anything else, a timeout or a dropped
+        /// connection, can come after the server made it.
+        fn may_have_created(error: &kube::Error) -> bool {
+            !matches!(error, kube::Error::Api(_))
+        }
+
+        #[test]
+        fn test_only_a_failure_short_of_the_server_answering_may_have_created_the_object() {
+            let refused = |reason: &str, code: u16| {
+                kube::Error::Api(Box::new(kube::core::Status::failure("refused", reason).with_code(code)))
+            };
+            assert!(!may_have_created(&refused("AlreadyExists", 409)));
+            assert!(!may_have_created(&refused("Forbidden", 403)));
+            assert!(!may_have_created(&refused("Invalid", 422)));
+            assert!(may_have_created(&kube::Error::Service(Box::new(std::io::Error::other("timed out")))));
         }
 
         /// The stand-in's pod, once the claim exists, waited on until Running.
