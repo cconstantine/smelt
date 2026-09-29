@@ -1,3 +1,7 @@
+// Wired into the agent and `sandbox.rs` over SME-53's next commits.
+#[cfg(feature = "server")]
+#[allow(dead_code)]
+mod agent_protocol;
 mod anthropic;
 mod api;
 mod browsing;
