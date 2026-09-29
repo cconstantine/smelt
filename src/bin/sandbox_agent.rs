@@ -402,10 +402,12 @@ struct AppState {
     /// has taken over (`take_over`).
     current: std::sync::Mutex<Option<(u64, oneshot::Sender<()>)>>,
     next_connection: AtomicU64,
-    /// An event taken off `events_rx` whose send failed, sent first on the
-    /// next connection. One is enough: a connection stops taking events once
-    /// a send fails.
+    /// An event taken off `events_rx` whose send failed, sent by the live
+    /// connection (or the next one, straight after its hello). One is
+    /// enough: a connection stops taking events once a send fails.
     unsent: std::sync::Mutex<Option<AgentMessage>>,
+    /// Signalled when `unsent` fills, so the live connection sends it.
+    unsent_ready: tokio::sync::Notify,
 }
 
 fn new_state() -> Arc<AppState> {
@@ -417,6 +419,7 @@ fn new_state() -> Arc<AppState> {
         current: std::sync::Mutex::new(None),
         next_connection: AtomicU64::new(0),
         unsent: std::sync::Mutex::new(None),
+        unsent_ready: tokio::sync::Notify::new(),
     })
 }
 
@@ -466,12 +469,9 @@ impl AppState {
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let (connection, mut replaced) = state.take_over();
     send_message(&mut socket, &AgentMessage::Hello(PROTOCOL_VERSION)).await;
-    let unsent = state.unsent.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if let Some(unsent) = unsent {
-        if !send_or_keep(&mut socket, &state, unsent).await {
-            state.release(connection);
-            return;
-        }
+    if !send_unsent(&mut socket, &state).await {
+        state.release(connection);
+        return;
     }
     loop {
         tokio::select! {
@@ -481,6 +481,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 tracing::info!(connection, "a newer connection replaced this one");
                 let _ = socket.send(Message::Close(None)).await;
                 return;
+            }
+            // The connection this one replaced failed a send after this one
+            // had opened.
+            _ = state.unsent_ready.notified() => {
+                if !send_unsent(&mut socket, &state).await {
+                    break;
+                }
             }
             incoming = socket.recv() => {
                 match incoming {
@@ -520,6 +527,19 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     state.release(connection);
 }
 
+/// Sends the event a failed send left in `unsent`, if there is one.
+/// Returns false if that send fails too (it's kept again).
+async fn send_unsent<S>(sink: &mut S, state: &AppState) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    let unsent = state.unsent.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match unsent {
+        Some(unsent) => send_or_keep(sink, state, unsent).await,
+        None => true,
+    }
+}
+
 async fn recv_shell_event(state: &Arc<AppState>) -> Option<ShellEvent> {
     state.events_rx.lock().await.recv().await
 }
@@ -544,6 +564,8 @@ where
         return true;
     }
     *state.unsent.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
+    // A newer connection may already be open, past its own first look.
+    state.unsent_ready.notify_one();
     false
 }
 
@@ -1961,6 +1983,22 @@ mod socket_tests {
         let addr = serve_agent_with(state).await;
         let mut client = connect_ready(addr).await;
         assert_eq!(next(&mut client).await, exit);
+    }
+
+    /// An event a replaced connection fails to send after the new one has
+    /// already opened goes to the new one, not only to the one after it.
+    #[tokio::test]
+    async fn test_an_event_that_failed_to_send_reaches_the_live_connection() {
+        let state = new_state();
+        let addr = serve_agent_with(state.clone()).await;
+        let mut live = connect_ready(addr).await;
+
+        let mut dead = Box::pin(futures_util::sink::unfold((), |(), _: Message| async {
+            Err::<(), _>(std::io::Error::other("connection reset"))
+        }));
+        let exit = AgentMessage::Exit { id: "c1".into(), terminal_id: "t1".into(), code: 0 };
+        assert!(!send_or_keep(&mut dead, &state, exit.clone()).await);
+        assert_eq!(next(&mut live).await, exit);
     }
 
     /// A failing `accept()` (EMFILE, say) waits before trying again, instead
