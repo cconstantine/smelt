@@ -13,7 +13,8 @@
 # win over .env, which never overrides a variable that's already set.
 #
 # Settings (environment):
-#   CHECK_WORKTREE  the worktree (default: ../smelt-check next to this repo)
+#   CHECK_WORKTREE  the worktree (default: ../smelt-check next to this repo,
+#                   or $TMPDIR/smelt-check when that isn't writable)
 #   CHECK_PORT      the app's port (default: 8081; the dev server uses 8080)
 #   CHECK_SCRATCH_DB=1  serve from a database of its own, created on start
 #                   (smelt migrates it) and dropped on stop, instead of the dev
@@ -28,7 +29,14 @@
 set -euo pipefail
 
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
-worktree=${CHECK_WORKTREE:-$repo/../smelt-check}
+# Next to the repo, unless its parent isn't writable (a container whose
+# repo is at /app, say): then under $TMPDIR.
+if [ -w "$repo/.." ]; then
+    default_worktree=$repo/../smelt-check
+else
+    default_worktree=${TMPDIR:-/tmp}/smelt-check
+fi
+worktree=${CHECK_WORKTREE:-$default_worktree}
 port=${CHECK_PORT:-8081}
 pid_file() { echo "$worktree/.check-server.pid"; }
 log_file() { echo "$worktree/.check-server.log"; }
@@ -151,7 +159,9 @@ start() {
             echo "dx serve exited; see $(log_file)" >&2
             exit 1
         fi
-        if curl -s -o /dev/null "http://localhost:$port/"; then
+        # A 2xx only: while dx is still building it answers with a 500,
+        # which once passed for up (SME-53).
+        if curl -sf -o /dev/null --max-time 60 "http://localhost:$port/"; then
             echo "check server up at http://localhost:$port/"
             return 0
         fi
