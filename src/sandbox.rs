@@ -1731,7 +1731,8 @@ fn register(pod_id: i64, conn: Arc<TerminalConnection>) -> bool {
 }
 
 /// The pod is being torn down: close its connection, and keep any connect
-/// still under way from registering one.
+/// still under way from registering one. `terminate_pod_with` takes the mark
+/// back if the teardown fails.
 fn deregister(pod_id: i64) {
     let conn = {
         let mut registry = registry();
@@ -2299,18 +2300,36 @@ async fn force_terminate_pod(
     pool: &PgPool,
     pod_id: i64,
 ) -> Result<Option<db::SandboxPod>, SandboxError> {
+    terminate_pod_with(pool, pod_id, async {
+        let pods = pods_api(&get().client);
+        let name = pod_name(pod_id);
+        if pods.get_opt(&name).await?.is_some() {
+            pods.delete(&name, &pod_delete_params()).await?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// `force_terminate_pod` with the cluster's delete passed in, so a test can
+/// make it fail.
+async fn terminate_pod_with(
+    pool: &PgPool,
+    pod_id: i64,
+    delete: impl std::future::Future<Output = Result<(), SandboxError>>,
+) -> Result<Option<db::SandboxPod>, SandboxError> {
     deregister(pod_id);
-
-    let manager = get();
-    let name = pod_name(pod_id);
-    let pods = pods_api(&manager.client);
-    if pods.get_opt(&name).await?.is_some() {
-        pods.delete(&name, &pod_delete_params()).await?;
+    // The pod stays running and its row live if either step fails, so it
+    // must stay reachable too.
+    let closed = async {
+        delete.await?;
+        db::terminate_sandbox_pod(pool, pod_id).await.map_err(SandboxError::Db)
     }
-
-    let row = db::terminate_sandbox_pod(pool, pod_id)
-        .await
-        .map_err(SandboxError::Db)?;
+    .await;
+    if closed.is_err() {
+        registry().torn_down.remove(&pod_id);
+    }
+    let row = closed?;
     if let Some(row) = &row {
         events::publish(
             row.conversation_id,
@@ -7573,6 +7592,24 @@ mod agent_connection_tests {
         let logged = String::from_utf8_lossy(&logs.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
         assert!(logged.contains("couldn't read a message from smelt"), "nothing was logged: {logged:?}");
         assert!(!logged.contains("hunter2-SECRET"), "the protocol error's text was logged: {logged}");
+    }
+
+    /// A teardown whose delete fails leaves the pod running and listed as
+    /// live, so it must stay usable: a later connect registers.
+    #[sqlx::test]
+    async fn test_a_failed_teardown_leaves_the_pod_usable(pool: PgPool) {
+        let (_, pod_id) = pod_row(&pool).await;
+        let _agent = fake_agent(pod_id, current(), Duration::ZERO).await;
+        let failed = terminate_pod_with(&pool, pod_id, async {
+            Err(SandboxError::StartFailed("the API server is down".into()))
+        })
+        .await;
+        assert!(failed.is_err());
+        assert!(db::sandbox_pod_is_live(&pool, pod_id).await.expect("live?"), "the row was closed");
+
+        let conn = reconnect_if_needed(&pool, pod_id).await;
+        assert!(conn.is_ok(), "the pod is unusable after a failed teardown: {:?}", conn.map(|_| ()));
+        assert!(registry_contains(pod_id));
     }
 
     /// A page load doesn't wait behind a connect that's already under way.
