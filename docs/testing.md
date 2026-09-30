@@ -143,35 +143,27 @@ already gone.
 
 ## Testing the Anthropic streaming client without the network
 
-`anthropic::stream::stream_anthropic_message(api_key, auth_token, request, on_delta) -> Result<StreamedTurn, String>` is tested against a mock upstream — a throwaway Axum server bound to an ephemeral port, with `ANTHROPIC_BASE_URL` pointed at it for the duration of the test. The helper `run_against_mock_upstream` does the setup:
+`anthropic::stream::stream_anthropic_message(endpoint, request, on_delta) -> Result<StreamedTurn, String>` is tested against a mock upstream — a throwaway Axum server bound to an ephemeral port, passed in as the `Endpoint`. The helper `run_against_mock_upstream` does the setup:
 
 ```rust
 async fn run_against_mock_upstream(
     mock_body: &'static str,
     on_delta: impl FnMut(&str),
 ) -> Result<StreamedTurn, String> {
-    let _guard = crate::anthropic::test_support::lock_anthropic_base_url();
     // bind 127.0.0.1:0, serve POST /v1/messages with `mock_body` as text/event-stream
-    unsafe { std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}")) };
-    stream_anthropic_message(Some("test-key"), None, &request, on_delta).await
-}
-
-#[tokio::test]
-async fn test_stream_anthropic_message_assembles_turns_from_mock_upstream() {
-    let mut deltas = Vec::new();
-    let turn = run_against_mock_upstream(text_mock_body, |delta| deltas.push(delta.to_string()))
-        .await
-        .expect("stream should succeed");
-    assert_eq!(deltas, vec!["Hel".to_string(), "lo!".to_string()]);
-    assert_eq!(turn.content, vec![ContentBlock::Text { text: "Hello!".to_string() }]);
-    assert_eq!(turn.stop_reason, "end_turn");
-    // ... then a tool-use body and a thinking body, in the same test
+    stream_anthropic_message(&test_endpoint(addr), &request, on_delta).await
 }
 ```
 
-`ANTHROPIC_BASE_URL` is process-global, so **every** test across the whole binary that sets it must hold `anthropic::test_support::lock_anthropic_base_url()` (a `#[cfg(test)]`-only `std::sync::Mutex<()>` in `anthropic/mod.rs`, recovering from poisoning) for the duration. `anthropic::stream`'s and `api::chat`'s mock-upstream tests do, and so do the tests in `anthropic::tools`, `sandbox.rs` and `browser_tests.rs` that point it somewhere (some at a dead address, `127.0.0.1:1`, so an accidental turn fails loudly). Without it, two such tests on different OS threads can each set the var to their own mock server's address and race, with one test's HTTP client ending up pointed at the other's server. The lock serializes those tests, so separate tests are fine: `anthropic::stream` has several, each going through a helper that takes the lock (`run_against_mock_upstream`, `run_against_responses` for the retry tests). Tests of `send_and_await_response` (auth headers, a timeout, an unreachable endpoint) pass the base URL in directly and don't touch the variable or the lock. The pure parsing logic (`interpret_stream_event`, deciding what a single decoded SSE payload means) is tested separately and synchronously, with no network or async runtime involved at all.
+Nothing process-global is involved, so these tests run in parallel. `run_against_responses` serves a list of statuses and bodies for the retry tests; tests of `send_and_await_response` (auth headers, a timeout, an unreachable endpoint) build their own `Endpoint`. The pure parsing logic (`interpret_stream_event`) is tested synchronously.
 
-A mock upstream that needs to return a *different* response per call (e.g. a tool-use turn, then a follow-up turn once the tool result comes back) tracks a request count with a shared `AtomicUsize` in the route closure and indexes into a `Vec<String>` of bodies, clamped to the last one once exhausted — see `api::chat`'s `start_mock_upstream` test helper, which also sets `ANTHROPIC_API_KEY`. `start_mock_upstream_failing_n_times` answers the first N requests with an HTTP 500 (Ollama's "error parsing tool call" body) and then a normal stream, for the retry path.
+**A turn's mock is a provider in the test's own database** (SME-72). `api::chat`'s helpers (`start_mock_upstream`, `start_mock_upstream_failing_n_times`, `start_recording_mock_upstream`, `start_hanging_mock_upstream`, `start_partial_then_hanging_mock_upstream`) take the pool and call `providers::test_support::add_mock_provider(pool, addr)`: it saves a provider at the mock's address, makes `MOCK_MODEL` on it the default, and moves every conversation already in that database onto it, so a test that starts a second mock switches to it. A test database with no provider fails any turn at once with `NO_MODEL_CONFIGURED`, without touching the network; the tests in `anthropic::tools` and `sandbox.rs` whose commands wake the model rely on exactly that, where they used to point `ANTHROPIC_BASE_URL` at a dead port. Before SME-72, a real `ANTHROPIC_API_KEY` in the environment could send those wake-ups to the live API.
+
+**Turn tests still take a lock**, `providers::test_support::lock_turn_tests()`, used by `api::chat`'s tests and by the `sandbox.rs` tests whose finished commands wake the model: they share process-wide state keyed by conversation id (the turn lock, the reply so far, a stop or pause), and every `#[sqlx::test]` database numbers conversations from 1. Other tests that run turns use `db::create_conversation_with_id` with an id of their own instead (not for a test that creates a sandbox pod: a conversation's `/workspace` claim is named after its id, so a fixed id reuses a claim across runs).
+
+A mock upstream that needs to return a *different* response per call (e.g. a tool-use turn, then a follow-up turn once the tool result comes back) tracks a request count with a shared `AtomicUsize` in the route closure and indexes into a `Vec<String>` of bodies, clamped to the last one once exhausted — see `start_mock_upstream`. `start_mock_upstream_failing_n_times` answers the first N requests with an HTTP 500 (Ollama's "error parsing tool call" body) and then a normal stream, for the retry path.
+
+**Model listing** (`anthropic::models`) is tested against the responses in `src/anthropic/fixtures/`: a real llama.cpp `/v1/models`, and Anthropic's and Ollama's documented examples (see its `README.md`), plus mock servers for paging, Ollama's `/api/show`-then-`/api/ps` fallback, a 404 and an unreachable address.
 
 ## Testing code that touches a process-global resource across `#[tokio::test]` runtimes
 
@@ -284,10 +276,12 @@ dx build --platform web                  # once per frontend change — dioxus-s
                                           # time this test actually ran, not anticipated
                                           # up front.
 
+scripts/browser-tier   # dx build, then the tests below against a scratch database
+# which is:
 cargo test --features "server browser-test" -- --ignored --test-threads=1
 ```
 
-`#[ignore]`d by default (needs the two setup steps above, plus a real Postgres and k3s cluster reachable the same way every other real-cluster test already assumes) and deliberately just the one test for this file's own scope — see SME-10 for the design and reasoning (in-process server via a factored-out `build_router()`, `chromiumoxide` talking directly to `chrome-headless-shell` over CDP rather than a `chromedriver`/WebDriver setup this environment doesn't have). Reaches into `db`/`sandbox`/`anthropic::tools` directly to set up most scenarios (this tier verifies the browser/live-event pipeline, not tool-selection behavior) and asserts against the rendered DOM via `page.evaluate(...)`, not screenshots. Neither this environment nor CI has real Anthropic credentials, so where a scenario needs the model — a send typed into the page (scenarios 8, 13, 14) or a turn the AGENTS.md trust decision wakes — the model is a slow local mock upstream on `ANTHROPIC_BASE_URL` (`start_slow_mock_upstream`, under the lock above). It runs in CI (`.github/workflows/ci.yml`, see [development-process.md](development-process.md#definition-of-done)).
+`#[ignore]`d by default (needs the two setup steps above, plus a real Postgres and k3s cluster reachable the same way every other real-cluster test already assumes). Run it with `scripts/browser-tier`, which gives it a database of its own: the test runs smelt's migrations on whatever `DATABASE_URL` names, and a branch's migration applied to the shared dev database stops `main` from starting there (SME-72's retrospective). It's deliberately just the one test for this file's own scope — see SME-10 for the design and reasoning (in-process server via a factored-out `build_router()`, `chromiumoxide` talking directly to `chrome-headless-shell` over CDP rather than a `chromedriver`/WebDriver setup this environment doesn't have). Reaches into `db`/`sandbox`/`anthropic::tools` directly to set up most scenarios (this tier verifies the browser/live-event pipeline, not tool-selection behavior) and asserts against the rendered DOM via `page.evaluate(...)`, not screenshots. Neither this environment nor CI has real Anthropic credentials, so where a scenario needs the model — a send typed into the page (scenarios 8, 13, 14) or a turn the AGENTS.md trust decision wakes — the model is a slow local mock upstream (`start_slow_mock_upstream`), saved as a provider of the test's own that every conversation it creates uses, so the providers and default of the database it runs against are left alone; it's deleted with the conversations at the end. It runs in CI (`.github/workflows/ci.yml`, see [development-process.md](development-process.md#definition-of-done)).
 
 It runs these scenarios, in order, in one `#[tokio::test]` (`test_end_to_end_browser_scenarios`):
 1. The sandbox panel on a cold load: one pod, two terminals. Also checks the stylesheet loads.

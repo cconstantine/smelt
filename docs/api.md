@@ -56,7 +56,15 @@ Every turn request carries a **system prompt**: `system_prompt(&prompt_environme
 
 The prompt changes with the date and configuration, and within a conversation when its repos or loaded instructions change. `test_system_prompt_only_names_real_tools` fails if the base prompt names a tool that doesn't exist, so renaming a tool means updating the prompt too. Compaction's summarization call keeps its own `COMPACTION_SYSTEM_PROMPT`.
 
-Requests carry `thinking: {"type": "adaptive"}` by default (`ANTHROPIC_THINKING=0` to turn it off — see [setup.md](setup.md)), so an assistant turn's `content` can start with a `ContentBlock::Thinking { thinking, signature }` block ahead of any `Text`/`ToolUse` blocks — `run_turn` persists and replays it exactly like any other block, uninterpreted; the frontend renders it as a collapsed-by-default `<details>` (see `frontend/pages/chat.rs`'s `render_block_element`).
+Requests carry `thinking: {"type": "adaptive"}` unless the conversation's model has it off (its setting on `/providers`, or its Ollama server saying it can't think — see [setup.md](setup.md#model-providers)), so an assistant turn's `content` can start with a `ContentBlock::Thinking { thinking, signature }` block ahead of any `Text`/`ToolUse` blocks — `run_turn` persists and replays it exactly like any other block, uninterpreted; the frontend renders it as a collapsed-by-default `<details>` (see `frontend/pages/chat.rs`'s `render_block_element`).
+
+### Which model a turn runs on
+
+Each conversation has its own provider and model (`conversations.provider_id`/`model`, SME-72). `run_turn_body` resolves them into a `providers::TurnModel` (endpoint, model id, thinking, context window) the first time it needs to call the model: after the new message and any pending notices are saved, so both survive a turn that can't run, and not at all when a wake-up finds nothing to do. The whole turn, its tool loop and any compaction use that one snapshot; a change made meanwhile applies from the next turn.
+- **No model yet** (a new conversation, one from before providers, or one whose provider was deleted): it takes the default (`db::adopt_default_model`, one statement, which leaves a model the picker set meanwhile alone), keeps it, and publishes `ModelChanged`.
+- **No default either:** the turn fails with `providers::NO_MODEL_CONFIGURED`. The chat page shows that with a link to `/providers` rather than as an error, for a `TurnError` and a `NotificationDeliveryFailed` alike; the picker disables Send until there's a model.
+- **After a switch** of backend, thinking blocks written before it aren't replayed: their signatures were issued for the other one. The switch is recorded when a turn *starts* on a backend (provider, base URL, model) other than the last turn's (`db::record_turn_model`, under the turn lock), not when the model is picked, since a turn still running keeps writing for the old one; editing a provider's base URL counts too. `history_for_request` drops thinking up to `conversations.model_changed_at_message_id`; a message that was only thinking keeps its reasoning as plain text (the API rejects empty content). A conversation from before providers counts as switched on its first turn, since it may have run on another backend. Nothing stored changes.
+- **The context indicator and detail view** show the conversation's model's window, or the default's, without saving anything (`providers::conversation_context_window`).
 
 If a request fails with Ollama's specific "error parsing tool call" 500 (its Anthropic-compat shim, at least for `gpt-oss` models, doesn't always turn a model's raw output into valid tool-call JSON — either because thinking's reasoning landed in the same text as the call, or the model just wrote invalid JSON on its own), `run_turn_bounded` retries: first with `thinking` dropped, then up to `TOOL_CALL_PARSE_RETRIES` further plain regenerations, since a local model's next sampling pass often doesn't repeat the same malformed output. Gives up and surfaces the error once that's exhausted. Any other failure propagates from `run_turn_bounded` immediately. See `is_ollama_thinking_tool_call_corruption`.
 
@@ -137,6 +145,8 @@ pub enum ConversationEvent {
     ReposUpdate { repos: Vec<git::RepoSummary> },
     PodsChanged {},
     TurnsChanged {},
+    ModelChanged {},
+    ProvidersChanged {},
     TurnState { running: bool },
     ReplyReset {},
     ReplyDelta { text: String, offset: usize },
@@ -150,7 +160,7 @@ pub enum ConversationEvent {
 
 `ReposUpdate` carries the conversation's whole repo list (SME-32): each repo's path, what's checked out, clone status, its `AGENTS.md` files, which of them are loaded, and any loads waiting on the user's trust (with the file shown on the card). It's published when a repo is added, starts or finishes cloning, when the model loads or asks to load an `AGENTS.md`, and when a trust decision is made. `list_conversation_repos` is its snapshot.
 
-`PodsChanged` and `TurnsChanged` are the app-wide `AppEvent`s (below), relayed on every conversation's stream: the server merges the app-wide channel into each subscription (`conversation_event_stream`). A chat tab therefore needs no second always-open connection for the sidebar's pod dots and busy marks: on each, the sidebar refetches `get_live_pod_conversations` or `get_busy_conversations`. Over plain HTTP/1.1 a browser allows only 6 connections per host, shared by every tab, and a chat tab holds one stream (`subscribe_conversation_events`), plus `subscribe_browser_frames` while a browsing session is open. `TurnState` is published when a conversation's first turn starts and when its last one ends, including turns nobody started from a tab (a finished command, a background task, another tab). `get_turn_state` is its snapshot for reconnects.
+`ModelChanged` says the conversation's provider or model changed (the picker, or a turn taking the default); the picker refetches `get_conversation_model`. `PodsChanged`, `TurnsChanged` and `ProvidersChanged` are the app-wide `AppEvent`s (below), relayed on every conversation's stream: the server merges the app-wide channel into each subscription (`conversation_event_stream`). A chat tab therefore needs no second always-open connection for the sidebar's pod dots and busy marks: on each, the sidebar refetches `get_live_pod_conversations` or `get_busy_conversations`. Over plain HTTP/1.1 a browser allows only 6 connections per host, shared by every tab, and a chat tab holds one stream (`subscribe_conversation_events`), plus `subscribe_browser_frames` while a browsing session is open. `TurnState` is published when a conversation's first turn starts and when its last one ends, including turns nobody started from a tab (a finished command, a background task, another tab). `get_turn_state` is its snapshot for reconnects.
 
 ### Stopping a turn
 
@@ -168,6 +178,7 @@ pub enum ConversationEvent {
 `subscribe_app_events` is the stream of `AppEvent` (`src/events.rs`), for views that span conversations. Both events carry nothing; listeners refetch:
 - **`PodsChanged`**, published when a pod is created (`create_pod`), goes away (`force_terminate_pod`: a model's terminate, a user's stop, a crash), or is torn down with its conversation (`delete_conversation`).
 - **`TurnsChanged`**, published when a conversation goes from idle to busy or back (`TurnInFlight`). Listeners refetch `get_busy_conversations`: every conversation with a turn running or queued.
+- **`ProvidersChanged`**, published when a model provider, a model's settings or the default model is added, changed or removed (SME-72). The model picker refetches.
 
 Only the `/pods` page subscribes to it directly; chat tabs get both relayed on their conversation stream (see above).
 
@@ -233,6 +244,15 @@ pub async fn navigate_browser(id: i64, address: String) -> ServerFnResult<()>;
 | `get_reply_in_progress` | `GET /api/conversations/{id}/reply` | the reply streamed so far, for a tab that (re)connects mid-reply |
 | `get_turn_error` | `GET /api/conversations/{id}/turn-error` | the last failed turn's error, until the user writes again, for a tab that connects after `TurnError` |
 | `get_busy_conversations` | `GET /api/conversations/busy` | conversations with a turn running or queued, for the sidebar |
+| `get_conversation_model` / `set_conversation_model` | `GET`, `POST /api/conversations/{id}/model` | the picker: which model the next turn uses (`ConversationModel`: `Chosen`, `Default`, `NoDefault`, `NoProviders`), and choosing one (SME-72) |
+| `list_providers` / `get_provider` | `GET /api/providers`, `GET /api/providers/{id}` | the `/providers` pages; never the secret, only `secret_hint` |
+| `create_provider` / `update_provider` | `POST /api/providers`, `POST /api/providers/{id}` | checked (a name, an http(s) base URL, a key when new); an empty key on update keeps the stored one, unless the base URL changed: the key only goes where it was entered for |
+| `delete_provider` | `DELETE /api/providers/{id}` | conversations using it, and the default if it was the default's, go back to having none |
+| `list_provider_models` | `GET /api/providers/{id}/models?ask_each` | asks the provider (see [setup.md](setup.md#model-providers)), stores what it reports, and adds models with stored settings it didn't list; a listing error is returned with them. `ask_each` also asks an Ollama server about every model (the provider's page); the picker leaves it off |
+| `add_provider_model` | `POST /api/providers/{id}/models/add` | a model the listing doesn't show, keeping any settings it has |
+| `refresh_model_details` | `POST /api/providers/{id}/models/refresh` | asks about one model, when it's chosen |
+| `set_model_settings` | `POST /api/providers/{id}/models/settings` | a model's thinking and context-window overrides |
+| `get_default_model` / `set_default_model` | `GET`, `POST /api/default-model` | the default provider and model |
 | `get_pods` | `GET /api/pods` | every live pod with status, activity, limits and usage, see above |
 | `stop_pod` | `POST /api/pods/{pod_id}/stop` | the user stopping a pod, see above |
 | `get_live_pod_conversations` | `GET /api/pods/conversations` | conversations with a live pod, for the sidebar |

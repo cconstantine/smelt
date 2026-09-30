@@ -9,8 +9,9 @@
 #   scripts/check-server status
 #
 # KEY=VALUE pairs override the environment for this server only, e.g.
-# `-- ANTHROPIC_CONTEXT_WINDOW=28000` to make compaction happen quickly. They
-# win over .env, which never overrides a variable that's already set.
+# `-- SANDBOX_MEMORY_LIMIT=2Gi`. They win over .env, which never overrides a
+# variable that's already set. (To make compaction happen quickly, set a
+# small context window on the model's row at /providers.)
 #
 # Settings (environment):
 #   CHECK_WORKTREE  the worktree (default: ../smelt-check next to this repo,

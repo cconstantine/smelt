@@ -27,6 +27,7 @@ mod mcp_oauth;
 mod models;
 #[cfg(feature = "server")]
 mod preview;
+mod providers;
 #[cfg(feature = "server")]
 mod request_guard;
 #[cfg(feature = "server")]
@@ -154,7 +155,7 @@ fn log_filter_directives(rust_log: &str) -> String {
 /// there isn't one (production sets real env vars instead), otherwise the
 /// parse error. dotenvy stops at a line it can't parse, so that line and
 /// every one after it are silently not applied (SME-40 F6: an unquoted
-/// value with a space dropped `ANTHROPIC_MODEL`).
+/// value with a space dropped the model name).
 #[cfg(feature = "server")]
 fn dotenv_problem(result: Result<std::path::PathBuf, dotenvy::Error>) -> Option<String> {
     match result {
@@ -176,7 +177,7 @@ mod dotenv_tests {
         let dir = std::env::temp_dir().join(format!("smelt-dotenv-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join(".env");
-        std::fs::write(&path, "A=1\nANTHROPIC_MODEL=Qwen3.8-Flash-Next (UD-Q2_K_XL)\nB=2\n").expect("write");
+        std::fs::write(&path, "A=1\nSMELT_EXAMPLE=Qwen3.8-Flash-Next (UD-Q2_K_XL)\nB=2\n").expect("write");
         let problem = dotenv_problem(dotenvy::from_path_iter(&path).and_then(|iter| {
             iter.collect::<Result<Vec<_>, _>>().map(|_| path.clone())
         }));

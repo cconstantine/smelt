@@ -14,6 +14,7 @@ frontend/
     language_servers.rs # LanguageServersIndex, LanguageServerNew, LanguageServerEdit
     mcp_servers.rs     # McpServersIndex, McpServerNew, McpServerEdit
     pods.rs            # PodsIndex, use_pods_changed
+    providers.rs       # ProvidersIndex, ProviderNew, ProviderEdit, ModelPicker (SME-72)
     sandbox_volumes.rs # SandboxVolumesIndex, SandboxVolumeNew
 ```
 
@@ -86,6 +87,10 @@ The reconnect pull (run once per stream connection, see [Streaming into the UI](
 **Connections are scarce.** Over plain HTTP/1.1, a browser allows 6 connections per host, shared by every tab. Each chat tab holds one always-open conversation stream, plus the frame stream while a browsing session is open; a `/pods` tab holds its own app-events stream. Replies stream on the conversation stream, not on the send request. Any other request (a send, a Stop click, a snapshot) needs a free connection. Don't add another always-open stream per tab; relay on the conversation stream instead, as `PodsChanged` and `TurnsChanged` do.
 
 If `get_messages` fails with `conversation not found`, the page says "This conversation doesn't exist. It may have been deleted." and hides the message box.
+
+## The model picker
+
+`ModelPicker` (`pages/providers.rs`) sits above the message box, keyed by conversation, and shows which model the next turn uses (`get_conversation_model`): "Provider · model", "Default: …" before the conversation has taken one, "Choose a model" when there's no default, or a link to `/providers` when there are no providers. It sets the chat panel's `model_ready` signal, which disables Send in the last two cases (and `send` checks it too). Choosing uses `ModelChooser`, a provider select plus a text field whose `<datalist>` suggests the provider's listed models, so an id can be typed when the listing fails; the same chooser sets the default on `/providers`. A choice is refetched on `ModelChanged`/`ProvidersChanged` (the `model_changed` signal). It warns when the provider says the model can't call tools, or when nothing sized its context window. It's its own row above the composer rather than inside the composer's form, so Enter in its field can't send the message.
 
 ## Calling server functions
 

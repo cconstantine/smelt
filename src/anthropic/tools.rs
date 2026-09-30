@@ -3132,15 +3132,10 @@ mod server {
         }
 
         /// After the user stops a conversation, a finishing task's notice is
-        /// saved but doesn't start a turn: nothing reaches the model (whose
-        /// address here goes nowhere, so a turn would fail loudly).
+        /// saved but doesn't start a turn (the test database has no model
+        /// provider, so a turn would fail loudly).
         #[sqlx::test]
         async fn test_a_paused_conversation_saves_task_notices_without_a_turn(pool: PgPool) {
-            let _guard = crate::anthropic::test_support::lock_anthropic_base_url();
-            unsafe {
-                std::env::set_var("ANTHROPIC_BASE_URL", "http://127.0.0.1:1");
-                std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-            }
             let conversation = db::create_conversation_with_id(&pool, 9_100_000_005)
                 .await
                 .expect("create conversation");

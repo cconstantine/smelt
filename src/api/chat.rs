@@ -66,31 +66,6 @@ pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
     Ok(())
 }
 
-#[cfg(feature = "server")]
-fn anthropic_model() -> String {
-    std::env::var("ANTHROPIC_MODEL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "claude-opus-4-8".to_string())
-}
-
-/// On by default — set `ANTHROPIC_THINKING=0` (or `false`/`off`) to turn it
-/// back off. Was briefly made opt-in after thinking broke tool use against
-/// a local Ollama `gpt-oss` model (Ollama's Anthropic-compatibility shim
-/// doesn't cleanly split the model's reasoning out of a tool call's
-/// arguments the way real Anthropic does — see
-/// `is_ollama_thinking_tool_call_corruption`) — safe to default back on
-/// now that `run_turn_bounded` retries that *specific* failure without
-/// thinking instead of surfacing a raw 500, rather than requiring everyone
-/// to manually opt in just to get thinking against the real API.
-#[cfg(feature = "server")]
-fn thinking_enabled() -> bool {
-    !matches!(
-        std::env::var("ANTHROPIC_THINKING").as_deref(),
-        Ok("0" | "false" | "off")
-    )
-}
-
 /// Ollama's Anthropic-compatibility shim can fail to turn a model's raw
 /// output into a valid tool call, surfacing as a flat 500 with a message
 /// like `error parsing tool call: raw='...', err=...` instead of streaming
@@ -342,9 +317,13 @@ fn unanswered_user_text(messages: &[Message]) -> Vec<String> {
 /// message at or before that boundary, and translates the summary itself
 /// from `CompactionSummary` into a plain `Text` block — Anthropic has no
 /// concept of the former. See SME-18.
+///
+/// Thinking blocks in messages up to `thinking_stripped_through` were
+/// signed by another provider or model, so they're left out (SME-72).
 #[cfg(feature = "server")]
 fn history_for_request(
     messages: Vec<Message>,
+    thinking_stripped_through: Option<i64>,
 ) -> Result<Vec<anthropic::AnthropicMessage>, serde_json::Error> {
     let parsed = messages
         .into_iter()
@@ -369,8 +348,9 @@ fn history_for_request(
     let history = parsed
         .into_iter()
         .filter(|(id, _, _)| latest_boundary.is_none_or(|boundary| *id > boundary))
-        .map(|(_, role, blocks)| {
-            let content = blocks
+        .map(|(id, role, blocks)| {
+            let strip_thinking = thinking_stripped_through.is_some_and(|through| id <= through);
+            let content = strip_foreign_thinking(blocks, strip_thinking)
                 .into_iter()
                 .map(|block| match block {
                     anthropic::ContentBlock::CompactionSummary { summary, .. } => {
@@ -386,6 +366,29 @@ fn history_for_request(
         })
         .collect();
     Ok(answer_unfinished_tool_calls(history))
+}
+
+/// `blocks` without their thinking blocks when `strip` is set. A message
+/// that was nothing but thinking keeps its reasoning as plain text instead:
+/// the API rejects a message with no content, and a made-up stand-in would
+/// be text the model might imitate (SME-72 review 3).
+#[cfg(feature = "server")]
+fn strip_foreign_thinking(blocks: Vec<anthropic::ContentBlock>, strip: bool) -> Vec<anthropic::ContentBlock> {
+    if !strip {
+        return blocks;
+    }
+    let only_thinking = blocks
+        .iter()
+        .all(|block| matches!(block, anthropic::ContentBlock::Thinking { .. }));
+    blocks
+        .into_iter()
+        .filter_map(|block| match block {
+            anthropic::ContentBlock::Thinking { thinking, .. } => {
+                only_thinking.then_some(anthropic::ContentBlock::Text { text: thinking })
+            }
+            other => Some(other),
+        })
+        .collect()
 }
 
 /// Gives every tool call that has no result an error result
@@ -536,7 +539,11 @@ pub(crate) fn system_prompt(env: &PromptEnvironment) -> String {
 /// leaves its list empty (and is logged) rather than failing the turn: the
 /// prompt without it is still useful.
 #[cfg(feature = "server")]
-pub(crate) async fn prompt_environment(pool: &PgPool, conversation_id: i64) -> PromptEnvironment {
+pub(crate) async fn prompt_environment(
+    pool: &PgPool,
+    conversation_id: i64,
+    model: &str,
+) -> PromptEnvironment {
     let repos = crate::git::list_repos(pool, conversation_id).await.unwrap_or_else(|e| {
         tracing::warn!(error = %e, "couldn't list repos for the system prompt");
         Vec::new()
@@ -563,7 +570,7 @@ pub(crate) async fn prompt_environment(pool: &PgPool, conversation_id: i64) -> P
     };
     PromptEnvironment {
         date: chrono::Utc::now().date_naive(),
-        model: anthropic_model(),
+        model: model.to_string(),
         volumes,
         mcp_servers,
         repos,
@@ -701,8 +708,8 @@ fn compaction_transcript(messages: &[Message], max_chars: usize) -> String {
 /// less room for its instructions, the live-state listing and its own
 /// output, at a conservative 3 characters per token.
 #[cfg(feature = "server")]
-fn compaction_transcript_budget() -> usize {
-    (context_window() as usize).saturating_sub(8_192) * 3
+fn compaction_transcript_budget(context_window: u32) -> usize {
+    (context_window as usize).saturating_sub(8_192) * 3
 }
 
 /// Runs one compaction pass: summarizes everything currently persisted (up
@@ -722,8 +729,7 @@ fn compaction_transcript_budget() -> usize {
 async fn compact_conversation(
     pool: &PgPool,
     conversation_id: i64,
-    api_key: Option<&str>,
-    auth_token: Option<&str>,
+    turn_model: &crate::providers::TurnModel,
 ) -> ServerFnResult<()> {
     let messages = db::list_messages(pool, conversation_id)
         .await
@@ -737,7 +743,10 @@ async fn compact_conversation(
     }
     let covers_through_message_id = last.id;
 
-    let transcript = compaction_transcript(&messages, compaction_transcript_budget());
+    let transcript = compaction_transcript(
+        &messages,
+        compaction_transcript_budget(turn_model.context_window),
+    );
 
     let live_state = describe_live_state(pool, conversation_id).await;
     let prompt = format!(
@@ -746,7 +755,7 @@ async fn compact_conversation(
     );
 
     let summarization_request = anthropic::CreateMessageRequest {
-        model: anthropic_model(),
+        model: turn_model.model.clone(),
         max_tokens: 2048,
         system: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
         messages: vec![anthropic::AnthropicMessage {
@@ -760,8 +769,7 @@ async fn compact_conversation(
 
     let mut discard_deltas = |_: &str| {};
     let turn = anthropic::stream::stream_anthropic_message(
-        api_key,
-        auth_token,
+        &turn_model.endpoint,
         &summarization_request,
         &mut discard_deltas,
     )
@@ -892,28 +900,6 @@ fn forget_conversation_lock(conversation_id: i64) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&conversation_id);
-}
-
-/// The credential-requirement decision `run_turn_bounded` makes at the top
-/// of every call, pulled out as a pure function over already-read env
-/// values — testable without any env-var mutation, locking, or thread
-/// coordination at all (mutating real `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`
-/// process env vars from a test is fundamentally unsound across concurrent
-/// test threads, `getenv`/`setenv` not being thread-safe at the OS level —
-/// this sidesteps that entirely). At least one of `api_key`/`auth_token`
-/// must be present (either is enough — `ANTHROPIC_AUTH_TOKEN` is what a
-/// Hugging Face-hosted Anthropic-compatible endpoint uses instead of a
-/// real Anthropic API key).
-#[cfg(feature = "server")]
-fn require_at_least_one_credential(
-    api_key: &Option<String>,
-    auth_token: &Option<String>,
-) -> Result<(), String> {
-    if api_key.is_none() && auth_token.is_none() {
-        Err("neither ANTHROPIC_API_KEY nor ANTHROPIC_AUTH_TOKEN is set on the server".to_string())
-    } else {
-        Ok(())
-    }
 }
 
 /// Runs one full tool-use round trip for `conversation_id`: persists
@@ -1458,15 +1444,11 @@ fn run_turn_body<'a>(
             record_saved(conversation_id, &mut persisted, saved);
         }
 
-        // Checked after saving the new message, so what the user typed
-        // survives a reload even when the turn can't run.
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty());
-        require_at_least_one_credential(&api_key, &auth_token).map_err(ServerFnError::new)?;
+        // The model this turn runs on, read the first time it's needed
+        // (after the new message and any pending notices are saved, so
+        // they survive a turn that can't run) and then kept: a model or
+        // provider changed mid-turn applies from the next turn (SME-72).
+        let mut resolved_model: Option<crate::providers::TurnModel> = None;
 
         // A repo the user just attached may still be cloning; its AGENTS.md
         // belongs in this turn's system prompt (SME-32). Bounded: past it,
@@ -1502,6 +1484,14 @@ fn run_turn_body<'a>(
                 return Ok(persisted);
             }
 
+            let turn_model = match resolved_model.take() {
+                Some(model) => model,
+                None => crate::providers::resolve_turn_model(pool, conversation_id)
+                    .await
+                    .map_err(ServerFnError::new)?,
+            };
+            let turn_model = &*resolved_model.insert(turn_model);
+
             // Proactive, not reactive: checked *before* building the
             // request that would be too big, using the last real
             // response's own usage plus a cheap estimate of what's new
@@ -1512,35 +1502,32 @@ fn run_turn_body<'a>(
             if should_compact(
                 last_known_usage.as_ref(),
                 estimate_tokens(&pending_new_content),
-                context_window(),
+                turn_model.context_window,
             ) {
-                compact_conversation(
-                    pool,
-                    conversation_id,
-                    api_key.as_deref(),
-                    auth_token.as_deref(),
-                )
-                .await?;
+                compact_conversation(pool, conversation_id, turn_model).await?;
             }
 
             let history = history_for_request(
                 db::list_messages(pool, conversation_id)
                     .await
                     .map_err(ServerFnError::new)?,
+                turn_model.thinking_stripped_through,
             )
             .map_err(ServerFnError::new)?;
 
             let mut request = anthropic::CreateMessageRequest {
-                model: anthropic_model(),
+                model: turn_model.model.clone(),
                 // Raised alongside `thinking`: adaptive thinking shares
                 // this budget with the actual reply, and 4096 left no
                 // headroom for both once thinking turned on.
                 max_tokens: MAX_TOKENS,
-                system: Some(system_prompt(&prompt_environment(pool, conversation_id).await)),
+                system: Some(system_prompt(
+                    &prompt_environment(pool, conversation_id, &turn_model.model).await,
+                )),
                 messages: history,
                 stream: true,
                 tools: anthropic::tools::tool_definitions(pool).await,
-                thinking: thinking_enabled().then_some(anthropic::ThinkingConfig::Adaptive),
+                thinking: turn_model.thinking.then_some(anthropic::ThinkingConfig::Adaptive),
             };
 
             // Every tab watching streams the reply: the text so far is kept
@@ -1572,8 +1559,7 @@ fn run_turn_body<'a>(
                     crate::events::ConversationEvent::ReplyReset {},
                 );
                 match anthropic::stream::stream_anthropic_message(
-                    api_key.as_deref(),
-                    auth_token.as_deref(),
+                    &turn_model.endpoint,
                     &request,
                     &mut relay,
                 )
@@ -1619,7 +1605,7 @@ fn run_turn_body<'a>(
                 conversation_id,
                 crate::events::ConversationEvent::ContextUsageUpdate {
                     usage: turn.usage,
-                    context_window: context_window(),
+                    context_window: turn_model.context_window,
                 },
             );
             last_known_usage = Some(turn.usage);
@@ -1913,32 +1899,36 @@ pub struct ContextUsageSnapshot {
     pub context_window: u32,
 }
 
-/// `context_window_for(&anthropic_model())`, falling back to
-/// `ANTHROPIC_CONTEXT_WINDOW` (for a gateway/local model the built-in table
-/// doesn't recognize), falling back again to a conservative default if
-/// neither resolves it — see SME-18's
-/// "Resolved: the context window is looked up per-model."
-#[cfg(feature = "server")]
-fn context_window() -> u32 {
-    crate::anthropic::context_window_for(&anthropic_model())
-        .or_else(|| {
-            std::env::var("ANTHROPIC_CONTEXT_WINDOW")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(200_000)
+/// Which model the conversation's next turn uses, for the picker above the
+/// message box (SME-72).
+#[get("/api/conversations/{id}/model")]
+pub async fn get_conversation_model(id: i64) -> ServerFnResult<crate::providers::ConversationModel> {
+    crate::providers::conversation_model(db::get(), id)
+        .await
+        .map_err(ServerFnError::new)?
+        .ok_or_else(|| ServerFnError::new("conversation not found"))
+}
+
+/// The picker's choice: the conversation's turns run on this provider and
+/// model from the next one on.
+#[post("/api/conversations/{id}/model")]
+pub async fn set_conversation_model(id: i64, provider_id: i64, model: String) -> ServerFnResult<()> {
+    crate::providers::set_conversation_model(db::get(), id, provider_id, &model)
+        .await
+        .map_err(ServerFnError::new)
 }
 
 /// One-shot pull for the always-visible context-usage indicator — same
 /// shape as `get_tasks`/`get_sandbox_state`.
 #[get("/api/conversations/{id}/context-usage")]
 pub async fn get_context_usage(id: i64) -> ServerFnResult<ContextUsageSnapshot> {
-    let usage = db::get_conversation_usage(db::get(), id)
+    let pool = db::get();
+    let usage = db::get_conversation_usage(pool, id)
         .await
         .map_err(ServerFnError::new)?;
     Ok(ContextUsageSnapshot {
         usage,
-        context_window: context_window(),
+        context_window: crate::providers::conversation_context_window(pool, id).await,
     })
 }
 
@@ -1977,15 +1967,23 @@ async fn context_detail(pool: &PgPool, id: i64) -> ServerFnResult<ContextDetailS
     let usage = db::get_conversation_usage(pool, id)
         .await
         .map_err(ServerFnError::new)?;
+    let (model, context_window) = crate::providers::conversation_model(pool, id)
+        .await
+        .map_err(ServerFnError::new)?
+        .as_ref()
+        .and_then(crate::providers::ConversationModel::choice)
+        .map_or((String::new(), crate::providers::ASSUMED_CONTEXT_WINDOW), |choice| {
+            (choice.model.clone(), choice.context_window)
+        });
     Ok(ContextDetailSnapshot {
-        system: Some(system_prompt(&prompt_environment(pool, id).await)),
+        system: Some(system_prompt(&prompt_environment(pool, id, &model).await)),
         instructions: crate::git::project_instructions(pool, id)
             .await
             .map_err(ServerFnError::new)?,
         tools,
         message_count,
         usage,
-        context_window: context_window(),
+        context_window,
     })
 }
 
@@ -2009,7 +2007,7 @@ pub async fn subscribe_conversation_events(
 }
 
 /// Everything a tab watching `id` hears: that conversation's events, plus
-/// the app-wide `PodsChanged` and `TurnsChanged`, relayed as their
+/// the app-wide `PodsChanged`, `TurnsChanged` and `ProvidersChanged`, relayed as their
 /// `ConversationEvent` namesakes for the sidebar.
 /// Ends when the conversation's channel closes (it was deleted).
 #[cfg(feature = "server")]
@@ -2044,6 +2042,10 @@ fn conversation_event_stream(
                         let event = events::ConversationEvent::TurnsChanged {};
                         return Some((Ok(event), (conversation, app)));
                     }
+                    Ok(events::AppEvent::ProvidersChanged) => {
+                        let event = events::ConversationEvent::ProvidersChanged {};
+                        return Some((Ok(event), (conversation, app)));
+                    }
                     // Missing some just means one refetch covers several.
                     Err(RecvError::Lagged(_)) => continue,
                     // The app-wide channel lives as long as the process.
@@ -2060,6 +2062,60 @@ mod tests {
     use axum::response::IntoResponse;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::providers::test_support::lock_turn_tests;
+
+    fn thinking_block(text: &str) -> anthropic::ContentBlock {
+        anthropic::ContentBlock::Thinking {
+            thinking: text.to_string(),
+            signature: "sig".to_string(),
+        }
+    }
+
+    /// SME-72: after a switch of provider or model, thinking signed for the
+    /// old one isn't replayed. A message that was only thinking keeps its
+    /// reasoning as plain text (the API rejects empty content, and a
+    /// made-up stand-in is text the model might imitate; review 3). Later
+    /// messages keep theirs.
+    #[test]
+    fn test_history_leaves_out_thinking_from_before_a_model_switch() {
+        let text = |t: &str| anthropic::ContentBlock::Text { text: t.to_string() };
+        let messages = vec![
+            message_with_blocks(1, "user", vec![text("hi")]),
+            message_with_blocks(2, "assistant", vec![thinking_block("old reasoning"), text("hello")]),
+            message_with_blocks(3, "user", vec![text("go on")]),
+            message_with_blocks(4, "assistant", vec![thinking_block("only thinking")]),
+            message_with_blocks(5, "user", vec![text("and now?")]),
+            message_with_blocks(6, "assistant", vec![thinking_block("new reasoning"), text("sure")]),
+        ];
+        let history = history_for_request(messages, Some(4)).expect("parses");
+        let contents: Vec<Vec<anthropic::ContentBlock>> = history.into_iter().map(|m| m.content).collect();
+        assert_eq!(
+            contents,
+            vec![
+                vec![text("hi")],
+                vec![text("hello")],
+                vec![text("go on")],
+                vec![text("only thinking")],
+                vec![text("and now?")],
+                vec![thinking_block("new reasoning"), text("sure")],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_history_keeps_thinking_when_the_model_never_changed() {
+        let messages = vec![message_with_blocks(2, "assistant", vec![thinking_block("r")])];
+        let history = history_for_request(messages, None).expect("parses");
+        assert_eq!(history[0].content, vec![thinking_block("r")]);
+    }
+
+    /// `history_for_request` with nothing stripped.
+    fn history_for_request_all(
+        messages: Vec<Message>,
+    ) -> Result<Vec<anthropic::AnthropicMessage>, serde_json::Error> {
+        history_for_request(messages, None)
+    }
 
     fn message_with_blocks(id: i64, role: &str, blocks: Vec<anthropic::ContentBlock>) -> Message {
         Message {
@@ -2232,7 +2288,7 @@ mod tests {
     /// the next user message.
     #[test]
     fn test_history_for_request_answers_a_tool_call_left_without_a_result() {
-        let history = history_for_request(vec![
+        let history = history_for_request_all(vec![
             text_message(1, "user", "go"),
             message_with_blocks(2, "assistant", vec![tool_use("t1")]),
             text_message(3, "user", "notice"),
@@ -2245,7 +2301,7 @@ mod tests {
 
     #[test]
     fn test_history_for_request_answers_only_the_missing_calls_of_several() {
-        let history = history_for_request(vec![
+        let history = history_for_request_all(vec![
             text_message(1, "user", "go"),
             message_with_blocks(2, "assistant", vec![tool_use("t1"), tool_use("t2")]),
             message_with_blocks(3, "user", vec![tool_result("t1")]),
@@ -2256,7 +2312,7 @@ mod tests {
 
     #[test]
     fn test_history_for_request_adds_a_message_for_calls_left_at_the_end() {
-        let history = history_for_request(vec![
+        let history = history_for_request_all(vec![
             text_message(1, "user", "go"),
             message_with_blocks(2, "assistant", vec![text_block("on it"), tool_use("t1")]),
         ])
@@ -2272,7 +2328,7 @@ mod tests {
             message_with_blocks(1, "user", vec![text_block("hi")]),
             message_with_blocks(2, "assistant", vec![text_block("hello")]),
         ];
-        let history = history_for_request(messages).expect("should parse");
+        let history = history_for_request(messages, None).expect("should parse");
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].role, "user");
         assert_eq!(history[0].content, vec![text_block("hi")]);
@@ -2295,7 +2351,7 @@ mod tests {
             ),
             message_with_blocks(4, "user", vec![text_block("new message")]),
         ];
-        let history = history_for_request(messages).expect("should parse");
+        let history = history_for_request(messages, None).expect("should parse");
         assert_eq!(
             history,
             vec![
@@ -2323,7 +2379,7 @@ mod tests {
                 text: "Continue based on the summary above.".to_string(),
             }],
         )];
-        let history = history_for_request(messages).expect("should parse");
+        let history = history_for_request(messages, None).expect("should parse");
         assert_eq!(
             history,
             vec![anthropic::AnthropicMessage {
@@ -2356,7 +2412,7 @@ mod tests {
             ),
             message_with_blocks(5, "user", vec![text_block("recent")]),
         ];
-        let history = history_for_request(messages).expect("should parse");
+        let history = history_for_request(messages, None).expect("should parse");
         // Message 2 (the first compaction's own summary) has id 2 <= the
         // second compaction's boundary (3), so it's superseded and skipped
         // entirely too — only the second summary and what came after it
@@ -2618,12 +2674,11 @@ mod tests {
     }
 
     /// Spins up a mock Anthropic upstream that returns `bodies` in order (one
-    /// per request, clamped to the last body once exhausted) and points
-    /// `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY` (both process-global) at it.
-    /// Callers must hold `anthropic::test_support::lock_anthropic_base_url`
-    /// for the duration, same as `anthropic::stream`'s own mock-upstream
-    /// tests.
-    async fn start_mock_upstream(bodies: Vec<String>) -> Arc<AtomicUsize> {
+    /// per request, clamped to the last body once exhausted) and saves it
+    /// as `pool`'s default provider. Callers hold `lock_turn_tests`.
+    async fn start_mock_upstream(
+        pool: &PgPool,
+        bodies: Vec<String>) -> Arc<AtomicUsize> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -2651,10 +2706,7 @@ mod tests {
             axum::serve(listener, app).await.ok();
         });
 
-        unsafe {
-            std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}"));
-            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-        }
+        crate::providers::test_support::add_mock_provider(pool, addr).await;
         counter
     }
 
@@ -2672,7 +2724,9 @@ mod tests {
     /// `success_body` (a normal 200 SSE stream), if any. `success_body:
     /// None` means every request fails, for testing the give-up path once
     /// `TOOL_CALL_PARSE_RETRIES` is exhausted.
-    async fn start_mock_upstream_failing_n_times(fail_count: usize, success_body: Option<String>) {
+    async fn start_mock_upstream_failing_n_times(
+        pool: &PgPool,
+        fail_count: usize, success_body: Option<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -2710,46 +2764,7 @@ mod tests {
             axum::serve(listener, app).await.ok();
         });
 
-        unsafe {
-            std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}"));
-            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-        }
-    }
-
-    /// `ANTHROPIC_THINKING` is process-global like `ANTHROPIC_BASE_URL`, but
-    /// unlike it, no other test reads `thinking_enabled()`'s result, so
-    /// nothing else can fail if a concurrently-running test transiently
-    /// observes this one's value — restoring it afterward (rather than a
-    /// dedicated lock) is enough.
-    #[test]
-    fn test_thinking_enabled_defaults_to_on_and_recognizes_opt_out_values() {
-        // `ANTHROPIC_THINKING` is process-global, same as `ANTHROPIC_BASE_URL`
-        // — reusing that lock (rather than a dedicated one) keeps this
-        // mutually exclusive with `test_run_turn_retries_without_thinking_...`,
-        // which needs the *default* (on) to actually exercise the retry path.
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
-        let original = std::env::var("ANTHROPIC_THINKING").ok();
-
-        unsafe { std::env::remove_var("ANTHROPIC_THINKING") };
-        assert!(
-            thinking_enabled(),
-            "should default to on — see the doc comment for why"
-        );
-
-        for value in ["0", "false", "off"] {
-            unsafe { std::env::set_var("ANTHROPIC_THINKING", value) };
-            assert!(!thinking_enabled(), "{value:?} should disable thinking");
-        }
-
-        for value in ["1", "true", "on", "nonsense"] {
-            unsafe { std::env::set_var("ANTHROPIC_THINKING", value) };
-            assert!(thinking_enabled(), "{value:?} should not disable thinking");
-        }
-
-        match original {
-            Some(value) => unsafe { std::env::set_var("ANTHROPIC_THINKING", value) },
-            None => unsafe { std::env::remove_var("ANTHROPIC_THINKING") },
-        }
+        crate::providers::test_support::add_mock_provider(pool, addr).await;
     }
 
     #[test]
@@ -2768,116 +2783,59 @@ mod tests {
         ));
     }
 
-    /// `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` are process-global, same
-    /// as `ANTHROPIC_BASE_URL` — restoring both afterward (rather than a
-    /// dedicated lock) is enough, same reasoning
-    /// `test_thinking_enabled_defaults_to_on_and_recognizes_opt_out_values`
-    /// already applies to `ANTHROPIC_THINKING`. Callers must still hold
-    /// `lock_anthropic_base_url` for the duration, since this also touches
-    /// `ANTHROPIC_BASE_URL`-adjacent test infrastructure other tests share.
-    struct CredentialEnvGuard {
-        original_api_key: Option<String>,
-        original_auth_token: Option<String>,
-    }
-
-    impl CredentialEnvGuard {
-        fn capture() -> Self {
-            Self {
-                original_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
-                original_auth_token: std::env::var("ANTHROPIC_AUTH_TOKEN").ok(),
-            }
-        }
-    }
-
-    impl Drop for CredentialEnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.original_api_key {
-                    Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
-                    None => std::env::remove_var("ANTHROPIC_API_KEY"),
-                }
-                match &self.original_auth_token {
-                    Some(v) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", v),
-                    None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_require_at_least_one_credential_errors_when_both_are_missing() {
-        let err = require_at_least_one_credential(&None, &None)
-            .expect_err("should error when neither credential is set");
-        assert!(
-            err.contains("ANTHROPIC_API_KEY") && err.contains("ANTHROPIC_AUTH_TOKEN"),
-            "expected the error to name both env vars, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_require_at_least_one_credential_allows_api_key_only() {
-        require_at_least_one_credential(&Some("sk-ant-...".to_string()), &None)
-            .expect("an API key alone should be sufficient");
-    }
-
-    #[test]
-    fn test_require_at_least_one_credential_allows_auth_token_only() {
-        require_at_least_one_credential(&None, &Some("hf-token".to_string())).expect(
-            "an auth token alone should be sufficient — e.g. a Hugging Face-hosted endpoint",
-        );
-    }
-
-    #[test]
-    fn test_require_at_least_one_credential_allows_both_present() {
-        require_at_least_one_credential(
-            &Some("sk-ant-...".to_string()),
-            &Some("hf-token".to_string()),
-        )
-        .expect("both being present should still be fine");
-    }
-
+    /// A bearer provider's turn authenticates with its token as a bearer
+    /// header, and no `x-api-key` (an Anthropic-compatible gateway such as
+    /// Hugging Face's wants exactly that).
     #[sqlx::test]
-    async fn test_run_turn_succeeds_with_only_auth_token_set_no_api_key(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
-        let _env_guard = CredentialEnvGuard::capture();
+    async fn test_a_bearer_providers_turn_sends_its_token_as_a_bearer_header(pool: PgPool) {
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
-
-        let body = sse_body(&[
-            ("message_start", r#"{"type":"message_start"}"#),
-            (
-                "content_block_delta",
-                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi!"}}"#,
-            ),
-            (
-                "content_block_stop",
-                r#"{"type":"content_block_stop","index":0}"#,
-            ),
-            (
-                "message_delta",
-                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
-            ),
-            ("message_stop", r#"{"type":"message_stop"}"#),
-        ]);
-        start_mock_upstream(vec![body]).await;
-        unsafe {
-            std::env::remove_var("ANTHROPIC_API_KEY");
-            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "hf-token");
-        }
-
-        let new_message = anthropic::AnthropicMessage {
-            role: "user".to_string(),
-            content: vec![anthropic::ContentBlock::Text {
-                text: "hello".to_string(),
-            }],
-        };
-
-        let messages = run_turn(&pool, conversation.id, new_message, None)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("run_turn should succeed using only ANTHROPIC_AUTH_TOKEN, with no ANTHROPIC_API_KEY set");
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let body = text_reply_body("Hi!");
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let recorded = recorded.clone();
+                let body = body.clone();
+                async move {
+                    recorded.lock().unwrap_or_else(|e| e.into_inner()).push(headers);
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body)
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let provider = db::create_inference_provider(
+            &pool,
+            "gateway",
+            "other",
+            &format!("http://{addr}"),
+            "bearer",
+            "hf-token",
+        )
+        .await
+        .expect("create provider");
+        db::set_default_model(&pool, provider.id, "some-model")
+            .await
+            .expect("set default");
+
+        let messages = run_turn(&pool, conversation.id, hello(), None)
+            .await
+            .expect("the turn should run on the bearer provider");
+
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1].role, "assistant");
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let headers = seen.first().expect("the mock should have been called");
+        assert_eq!(headers.get("authorization").expect("Authorization header"), "Bearer hf-token");
+        assert!(headers.get("x-api-key").is_none(), "no x-api-key for a bearer provider");
     }
 
     /// A finished, not-yet-notified terminal command — the state
@@ -2900,11 +2858,11 @@ mod tests {
 
     #[sqlx::test]
     async fn test_wake_conversation_is_a_noop_when_nothing_is_pending(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
-        let counter = start_mock_upstream(vec!["unused".to_string()]).await;
+        let counter = start_mock_upstream(&pool, vec!["unused".to_string()]).await;
 
         let result = wake_conversation(&pool, conversation.id)
             .await
@@ -2930,7 +2888,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_wake_conversation_drains_a_pending_command_and_completes_a_turn(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
@@ -2952,7 +2910,7 @@ mod tests {
             ),
             ("message_stop", r#"{"type":"message_stop"}"#),
         ]);
-        start_mock_upstream(vec![body]).await;
+        start_mock_upstream(&pool, vec![body]).await;
 
         let messages = wake_conversation(&pool, conversation.id)
             .await
@@ -2985,7 +2943,7 @@ mod tests {
     async fn test_wake_conversation_second_call_is_a_noop_once_the_first_drained_everything(
         pool: PgPool,
     ) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
@@ -3007,7 +2965,7 @@ mod tests {
             ),
             ("message_stop", r#"{"type":"message_stop"}"#),
         ]);
-        let counter = start_mock_upstream(vec![body]).await;
+        let counter = start_mock_upstream(&pool, vec![body]).await;
 
         let first = wake_conversation(&pool, conversation.id)
             .await
@@ -3036,9 +2994,61 @@ mod tests {
         );
     }
 
+    /// SME-72: with no model to run on, a wake-up still saves the finished
+    /// command's notice (the model sees it once there is one) and says why
+    /// it couldn't deliver it; a wake with nothing pending doesn't take the
+    /// default or say anything.
+    #[sqlx::test]
+    async fn test_a_wake_with_no_model_still_saves_the_notice(pool: PgPool) {
+        let _guard = lock_turn_tests();
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+        unnotified_finished_command(&pool, conversation.id, "cmd-1").await;
+        let mut rx = events::subscribe(conversation.id);
+
+        let error = wake_conversation(&pool, conversation.id)
+            .await
+            .expect_err("no model to deliver to");
+
+        assert_eq!(chat_error_text(&error), crate::providers::NO_MODEL_CONFIGURED);
+        let saved = db::list_messages(&pool, conversation.id).await.expect("list messages");
+        assert_eq!(saved.len(), 1, "the notice is saved: {saved:?}");
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let events::ConversationEvent::NotificationDeliveryFailed { detail } =
+                    rx.recv().await.expect("event channel should not close")
+                {
+                    return detail;
+                }
+            }
+        })
+        .await
+        .expect("the failure is published");
+        assert_eq!(failure, crate::providers::NO_MODEL_CONFIGURED);
+    }
+
+    #[sqlx::test]
+    async fn test_a_wake_with_nothing_pending_leaves_the_model_alone(pool: PgPool) {
+        let _guard = lock_turn_tests();
+        // The mock first: it moves conversations already there onto it.
+        start_mock_upstream(&pool, vec!["unused".to_string()]).await;
+        let conversation = db::create_conversation(&pool)
+            .await
+            .expect("create conversation");
+
+        wake_conversation(&pool, conversation.id).await.expect("nothing to do");
+
+        let model = db::get_conversation_model(&pool, conversation.id)
+            .await
+            .expect("read")
+            .expect("exists");
+        assert_eq!(model.provider_id, None, "a wake with nothing to say doesn't take the default");
+    }
+
     #[sqlx::test]
     async fn test_wake_conversation_publishes_notification_delivery_failed_on_error(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
@@ -3046,7 +3056,7 @@ mod tests {
 
         // `fail_count` is irrelevant when `success_body` is `None` — every
         // request fails regardless (see the helper's doc comment).
-        start_mock_upstream_failing_n_times(0, None).await;
+        start_mock_upstream_failing_n_times(&pool, 0, None).await;
 
         let mut rx = events::subscribe(conversation.id);
 
@@ -3185,6 +3195,8 @@ mod tests {
     /// test can check what was actually sent. Same locking rule as
     /// `start_mock_upstream`.
     async fn start_recording_mock_upstream(
+        pool: &PgPool,
+        
         bodies: Vec<String>,
     ) -> Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3210,10 +3222,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
         });
-        unsafe {
-            std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}"));
-            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-        }
+        crate::providers::test_support::add_mock_provider(pool, addr).await;
         requests
     }
 
@@ -3258,7 +3267,7 @@ mod tests {
             commit: Some("abc123".to_string()),
         };
         db::load_instruction(&pool, conversation.id, repo.id, "AGENTS.md", &loaded).await.expect("load");
-        let env = prompt_environment(&pool, conversation.id).await;
+        let env = prompt_environment(&pool, conversation.id, "some-model").await;
         assert_eq!(env.repos[0].loaded_instructions, vec!["AGENTS.md".to_string()]);
         assert_eq!(env.repos.len(), 1);
         assert_eq!(env.repos[0].path, "/workspace/r");
@@ -3274,7 +3283,7 @@ mod tests {
             }]
         );
         assert_eq!(env.date, chrono::Utc::now().date_naive());
-        assert_eq!(env.model, anthropic_model());
+        assert_eq!(env.model, "some-model");
         assert_eq!(
             env.volumes,
             vec![("cargo-cache".to_string(), "/home/sandbox/.cargo".to_string())]
@@ -3286,14 +3295,14 @@ mod tests {
     /// turn's environment.
     #[sqlx::test]
     async fn test_run_turn_sends_the_system_prompt(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
         db::create_sandbox_volume(&pool, "cargo-cache", "/home/sandbox/.cargo")
             .await
             .expect("create volume");
-        let requests = start_recording_mock_upstream(vec![text_reply_body("Hi!")]).await;
+        let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
 
         run_turn(&pool, conversation.id, hello(), None)
             .await
@@ -3301,7 +3310,9 @@ mod tests {
 
         let requests = requests.lock().expect("the request log");
         assert_eq!(requests.len(), 1);
-        let expected = system_prompt(&prompt_environment(&pool, conversation.id).await);
+        let expected = system_prompt(
+            &prompt_environment(&pool, conversation.id, crate::providers::test_support::MOCK_MODEL).await,
+        );
         assert_eq!(requests[0]["system"].as_str(), Some(expected.as_str()));
         assert!(expected.contains("cargo-cache mounted at /home/sandbox/.cargo"));
     }
@@ -3310,7 +3321,7 @@ mod tests {
     /// turn after it gets the agent's system prompt.
     #[sqlx::test]
     async fn test_compaction_keeps_its_own_system_prompt(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
@@ -3338,7 +3349,7 @@ mod tests {
         )
         .await
         .expect("seed usage");
-        let requests = start_recording_mock_upstream(vec![
+        let requests = start_recording_mock_upstream(&pool, vec![
             text_reply_body("Summary: nothing live."),
             text_reply_body("Hi again"),
         ])
@@ -3351,7 +3362,9 @@ mod tests {
         let requests = requests.lock().expect("the request log");
         assert_eq!(requests.len(), 2, "a compaction call, then the real turn");
         assert_eq!(requests[0]["system"].as_str(), Some(COMPACTION_SYSTEM_PROMPT));
-        let expected = system_prompt(&prompt_environment(&pool, conversation.id).await);
+        let expected = system_prompt(
+            &prompt_environment(&pool, conversation.id, crate::providers::test_support::MOCK_MODEL).await,
+        );
         assert_eq!(requests[1]["system"].as_str(), Some(expected.as_str()));
     }
 
@@ -3364,7 +3377,8 @@ mod tests {
         let detail = context_detail(&pool, conversation.id)
             .await
             .expect("context detail");
-        let expected = system_prompt(&prompt_environment(&pool, conversation.id).await);
+        // No provider, so no model to name.
+        let expected = system_prompt(&prompt_environment(&pool, conversation.id, "").await);
         assert_eq!(detail.system.as_deref(), Some(expected.as_str()));
     }
 
@@ -3425,7 +3439,8 @@ mod tests {
     /// A mock Anthropic upstream that accepts requests and never answers,
     /// for a turn that stays in flight until stopped. Same locking rule as
     /// `start_mock_upstream`.
-    async fn start_hanging_mock_upstream() {
+    async fn start_hanging_mock_upstream(
+        pool: &PgPool) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -3440,21 +3455,18 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
         });
-        unsafe {
-            std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}"));
-            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-        }
+        crate::providers::test_support::add_mock_provider(pool, addr).await;
     }
 
     /// Stopping ends an in-flight turn at once, frees the turn lock, and
     /// keeps the user's message.
     #[sqlx::test]
     async fn test_stop_turn_ends_a_turn_in_flight(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation_with_id(&pool, 9100000001)
             .await
             .expect("create conversation");
-        start_hanging_mock_upstream().await;
+        start_hanging_mock_upstream(&pool).await;
 
         let turn = tokio::spawn({
             let pool = pool.clone();
@@ -3484,7 +3496,7 @@ mod tests {
         );
 
         // A turn started after the stop isn't affected by it.
-        let later = start_recording_mock_upstream(vec![text_reply_body("Hi!")]).await;
+        let later = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
         run_turn(&pool, conversation.id, hello(), None)
             .await
             .expect("a later turn runs normally");
@@ -3495,11 +3507,11 @@ mod tests {
     /// notice started, and when it ends.
     #[sqlx::test]
     async fn test_turn_state_is_published_while_a_turn_runs(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation_with_id(&pool, 9100000002)
             .await
             .expect("create conversation");
-        start_hanging_mock_upstream().await;
+        start_hanging_mock_upstream(&pool).await;
         let mut rx = events::subscribe(conversation.id);
         assert!(!turn_running(conversation.id));
 
@@ -3546,11 +3558,11 @@ mod tests {
     /// next message does, and its turn includes the command's notice.
     #[sqlx::test]
     async fn test_a_stopped_conversation_waits_for_the_user_before_waking(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation_with_id(&pool, 9100000003)
             .await
             .expect("create conversation");
-        let requests = start_recording_mock_upstream(vec![text_reply_body("Hi!")]).await;
+        let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
 
         stop_turn_now(conversation.id);
         assert!(is_paused(conversation.id), "a stop pauses the conversation");
@@ -3581,8 +3593,8 @@ mod tests {
     /// code review 6: the old save-then-wake never ran a turn).
     #[sqlx::test]
     async fn test_a_delivered_notice_is_answered_unless_stopped(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
-        let requests = start_recording_mock_upstream(vec![text_reply_body("Noted.")]).await;
+        let _guard = lock_turn_tests();
+        let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Noted.")]).await;
         let conversation = db::create_conversation(&pool).await.expect("create conversation");
 
         deliver_notice(&pool, conversation.id, "Docker in your sandbox was restarted.".to_string()).await;
@@ -3703,8 +3715,8 @@ mod tests {
 
     #[sqlx::test]
     async fn test_run_turn_for_a_missing_conversation_says_so(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
-        start_mock_upstream(vec![String::new()]).await;
+        let _guard = lock_turn_tests();
+        start_mock_upstream(&pool, vec![String::new()]).await;
         let error = run_turn(&pool, 987_654_321, hello(), None)
             .await
             .expect_err("a turn for a conversation that doesn't exist should fail")
@@ -3713,21 +3725,18 @@ mod tests {
         assert!(!error.contains("foreign key"), "a raw database error leaked: {error}");
     }
 
-    /// With no model credentials the turn can't run, but what the user
+    /// With no model to run on the turn can't run, but what the user
     /// typed is still theirs: it shouldn't vanish on the next reload.
     #[sqlx::test]
-    async fn test_run_turn_without_credentials_still_saves_the_message(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+    async fn test_run_turn_without_a_model_still_saves_the_message(pool: PgPool) {
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
-        // SAFETY: the lock above serializes every test that touches these.
-        unsafe {
-            std::env::remove_var("ANTHROPIC_API_KEY");
-            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
-        }
-        let result = run_turn(&pool, conversation.id, hello(), None).await;
-        assert!(result.is_err(), "no credentials should fail the turn");
+        let error = run_turn(&pool, conversation.id, hello(), None)
+            .await
+            .expect_err("no provider should fail the turn");
+        assert_eq!(chat_error_text(&error), crate::providers::NO_MODEL_CONFIGURED);
         let saved = db::list_messages(&pool, conversation.id)
             .await
             .expect("list messages");
@@ -3737,7 +3746,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_run_turn_persists_user_and_assistant_messages_for_text_only_reply(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
@@ -3758,7 +3767,7 @@ mod tests {
             ),
             ("message_stop", r#"{"type":"message_stop"}"#),
         ]);
-        start_mock_upstream(vec![body]).await;
+        start_mock_upstream(&pool, vec![body]).await;
 
         let new_message = anthropic::AnthropicMessage {
             role: "user".to_string(),
@@ -3797,7 +3806,7 @@ mod tests {
     async fn test_run_turn_retries_without_thinking_after_ollama_tool_call_corruption(
         pool: PgPool,
     ) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
@@ -3818,7 +3827,7 @@ mod tests {
             ),
             ("message_stop", r#"{"type":"message_stop"}"#),
         ]);
-        start_mock_upstream_failing_n_times(1, Some(success_body)).await;
+        start_mock_upstream_failing_n_times(&pool, 1, Some(success_body)).await;
 
         let new_message = anthropic::AnthropicMessage {
             role: "user".to_string(),
@@ -3849,7 +3858,7 @@ mod tests {
     /// regeneration to still recover.
     #[sqlx::test]
     async fn test_run_turn_recovers_after_two_ollama_tool_call_failures(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
@@ -3870,7 +3879,7 @@ mod tests {
             ),
             ("message_stop", r#"{"type":"message_stop"}"#),
         ]);
-        start_mock_upstream_failing_n_times(2, Some(success_body)).await;
+        start_mock_upstream_failing_n_times(&pool, 2, Some(success_body)).await;
 
         let new_message = anthropic::AnthropicMessage {
             role: "user".to_string(),
@@ -3898,14 +3907,14 @@ mod tests {
     /// model is reliably bad at.
     #[sqlx::test]
     async fn test_run_turn_gives_up_after_exhausting_tool_call_parse_retries(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
 
         // `fail_count` is irrelevant when `success_body` is `None` — every
         // request fails regardless (see the helper's doc comment).
-        start_mock_upstream_failing_n_times(0, None).await;
+        start_mock_upstream_failing_n_times(&pool, 0, None).await;
 
         let new_message = anthropic::AnthropicMessage {
             role: "user".to_string(),
@@ -3965,11 +3974,11 @@ mod tests {
     /// call: a reset when each call starts, then its text.
     #[sqlx::test]
     async fn test_a_turn_streams_its_reply_to_every_tab(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation_with_id(&pool, 9_100_000_007)
             .await
             .expect("create conversation");
-        start_mock_upstream(text_tool_then_text_bodies()).await;
+        start_mock_upstream(&pool, text_tool_then_text_bodies()).await;
         let mut rx = events::subscribe(conversation.id);
 
         run_turn(&pool, conversation.id, hello(), None)
@@ -3991,7 +4000,9 @@ mod tests {
 
     /// A mock upstream that streams `text` and then never finishes. Same
     /// locking rule as `start_mock_upstream`.
-    async fn start_partial_then_hanging_mock_upstream(text: &'static str) {
+    async fn start_partial_then_hanging_mock_upstream(
+        pool: &PgPool,
+        text: &'static str) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -4015,20 +4026,17 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
         });
-        unsafe {
-            std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}"));
-            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-        }
+        crate::providers::test_support::add_mock_provider(pool, addr).await;
     }
 
     /// A tab that connects mid-reply can show the text so far.
     #[sqlx::test]
     async fn test_the_reply_so_far_is_available_mid_turn(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation_with_id(&pool, 9_100_000_008)
             .await
             .expect("create conversation");
-        start_partial_then_hanging_mock_upstream("Partial answer").await;
+        start_partial_then_hanging_mock_upstream(&pool, "Partial answer").await;
 
         let turn = tokio::spawn({
             let pool = pool.clone();
@@ -4054,11 +4062,11 @@ mod tests {
     /// Sending returns at once; the turn carries on and every tab hears it.
     #[sqlx::test]
     async fn test_start_turn_returns_before_the_turn_finishes(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation_with_id(&pool, 9_100_000_010)
             .await
             .expect("create conversation");
-        start_hanging_mock_upstream().await;
+        start_hanging_mock_upstream(&pool).await;
         let mut rx = events::subscribe(conversation.id);
 
         tokio::time::timeout(
@@ -4096,11 +4104,11 @@ mod tests {
     /// A sent turn that fails, or is stopped, tells every tab why.
     #[sqlx::test]
     async fn test_a_sent_turn_publishes_its_failure(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let failing = db::create_conversation_with_id(&pool, 9_100_000_012)
             .await
             .expect("create conversation");
-        start_mock_upstream_failing_n_times(0, None).await;
+        start_mock_upstream_failing_n_times(&pool, 0, None).await;
         let mut rx = events::subscribe(failing.id);
         start_turn(pool.clone(), failing.id, "hi".to_string()).await.expect("send");
         let error = next_turn_error(&mut rx).await.expect("a TurnError");
@@ -4109,7 +4117,7 @@ mod tests {
         let stopped = db::create_conversation_with_id(&pool, 9_100_000_013)
             .await
             .expect("create conversation");
-        start_hanging_mock_upstream().await;
+        start_hanging_mock_upstream(&pool).await;
         let mut rx = events::subscribe(stopped.id);
         start_turn(pool.clone(), stopped.id, "hi".to_string()).await.expect("send");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -4123,18 +4131,18 @@ mod tests {
     /// the user's next message clears it.
     #[sqlx::test]
     async fn test_a_turn_error_is_still_there_after_a_reload(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation_with_id(&pool, 9_100_000_014)
             .await
             .expect("create conversation");
-        start_mock_upstream_failing_n_times(0, None).await;
+        start_mock_upstream_failing_n_times(&pool, 0, None).await;
         let mut rx = events::subscribe(conversation.id);
         start_turn(pool.clone(), conversation.id, "hi".to_string()).await.expect("send");
         next_turn_error(&mut rx).await.expect("a TurnError");
         let kept = last_turn_error(conversation.id).expect("the error is kept");
         assert!(kept.contains("error parsing tool call"), "got: {kept}");
 
-        start_hanging_mock_upstream().await;
+        start_hanging_mock_upstream(&pool).await;
         start_turn(pool.clone(), conversation.id, "again".to_string()).await.expect("send");
         assert_eq!(last_turn_error(conversation.id), None, "the next message clears it");
         stop_turn_now(conversation.id);
@@ -4145,12 +4153,12 @@ mod tests {
     /// mustn't show that error under the newer reply.
     #[sqlx::test]
     async fn test_any_new_turn_clears_the_kept_error(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation_with_id(&pool, 9_100_000_015)
             .await
             .expect("create conversation");
         remember_turn_error(conversation.id, Some("an earlier failure".to_string()));
-        start_recording_mock_upstream(vec![text_reply_body("Done.")]).await;
+        start_recording_mock_upstream(&pool, vec![text_reply_body("Done.")]).await;
         run_turn(&pool, conversation.id, hello(), None).await.expect("a background turn");
         assert_eq!(last_turn_error(conversation.id), None);
     }
@@ -4176,12 +4184,12 @@ mod tests {
     /// notification.
     #[sqlx::test]
     async fn test_stopping_a_woken_turn_is_not_reported_as_a_failure(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation_with_id(&pool, 9_100_000_014)
             .await
             .expect("create conversation");
         unnotified_finished_command(&pool, conversation.id, "cmd-woken").await;
-        start_hanging_mock_upstream().await;
+        start_hanging_mock_upstream(&pool).await;
         let mut rx = events::subscribe(conversation.id);
 
         let wake = tokio::spawn({
@@ -4203,11 +4211,11 @@ mod tests {
     /// then each step of a multi-step reply, not one batch at the end.
     #[sqlx::test]
     async fn test_a_turn_publishes_each_message_as_it_is_saved(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation_with_id(&pool, 9_100_000_006)
             .await
             .expect("create conversation");
-        start_mock_upstream(text_tool_then_text_bodies()).await;
+        start_mock_upstream(&pool, text_tool_then_text_bodies()).await;
         let mut rx = events::subscribe(conversation.id);
 
         run_turn(&pool, conversation.id, hello(), None)
@@ -4238,7 +4246,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_run_turn_executes_tool_and_persists_full_round_trip(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
@@ -4279,7 +4287,7 @@ mod tests {
             ),
             ("message_stop", r#"{"type":"message_stop"}"#),
         ]);
-        start_mock_upstream(vec![tool_use_body, final_body]).await;
+        start_mock_upstream(&pool, vec![tool_use_body, final_body]).await;
 
         let new_message = anthropic::AnthropicMessage {
             role: "user".to_string(),
@@ -4411,7 +4419,7 @@ mod tests {
     /// following turn compacting again at once.
     #[sqlx::test]
     async fn test_a_compaction_forgets_the_usage_that_triggered_it(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool).await.expect("create conversation");
         db::create_message(&pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "earlier".to_string() }])
             .await
@@ -4426,8 +4434,11 @@ mod tests {
             cache_read_input_tokens: 0,
         };
         db::upsert_conversation_usage(&pool, conversation.id, &near_limit).await.expect("seed usage");
-        start_mock_upstream(vec![text_reply_body("Summary: earlier.")]).await;
-        compact_conversation(&pool, conversation.id, Some("test-key"), None)
+        start_mock_upstream(&pool, vec![text_reply_body("Summary: earlier.")]).await;
+        let turn_model = crate::providers::resolve_turn_model(&pool, conversation.id)
+            .await
+            .expect("the mock is the default");
+        compact_conversation(&pool, conversation.id, &turn_model)
             .await
             .expect("compaction");
         assert_eq!(db::get_conversation_usage(&pool, conversation.id).await.expect("usage"), None);
@@ -4435,7 +4446,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_run_turn_compacts_before_sending_when_usage_is_near_the_ceiling(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
@@ -4503,7 +4514,7 @@ mod tests {
             ),
             ("message_stop", r#"{"type":"message_stop"}"#),
         ]);
-        start_mock_upstream(vec![summary_body, real_body]).await;
+        start_mock_upstream(&pool, vec![summary_body, real_body]).await;
 
         let new_message = anthropic::AnthropicMessage {
             role: "user".to_string(),
@@ -4591,7 +4602,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_run_turn_errors_when_max_turns_exceeded(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
@@ -4619,7 +4630,7 @@ mod tests {
             ),
             ("message_stop", r#"{"type":"message_stop"}"#),
         ]);
-        start_mock_upstream(vec![tool_use_body]).await;
+        start_mock_upstream(&pool, vec![tool_use_body]).await;
 
         let new_message = anthropic::AnthropicMessage {
             role: "user".to_string(),
@@ -4653,7 +4664,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_run_turn_serializes_concurrent_calls_for_the_same_conversation(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
@@ -4674,7 +4685,7 @@ mod tests {
             ),
             ("message_stop", r#"{"type":"message_stop"}"#),
         ]);
-        start_mock_upstream(vec![body]).await;
+        start_mock_upstream(&pool, vec![body]).await;
 
         let conversation_id = conversation.id;
         let pool_a = pool.clone();
@@ -4731,7 +4742,7 @@ mod tests {
     /// fails loudly instead of hanging the test suite.
     #[sqlx::test]
     async fn test_run_turn_does_not_deadlock_when_model_calls_cancel_task(pool: PgPool) {
-        let _guard = anthropic::test_support::lock_anthropic_base_url();
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
@@ -4785,7 +4796,7 @@ mod tests {
             ),
             ("message_stop", r#"{"type":"message_stop"}"#),
         ]);
-        start_mock_upstream(vec![cancel_turn_body, final_body]).await;
+        start_mock_upstream(&pool, vec![cancel_turn_body, final_body]).await;
 
         let new_message = anthropic::AnthropicMessage {
             role: "user".to_string(),

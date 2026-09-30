@@ -22,15 +22,64 @@ pub struct StreamedTurn {
     pub usage: TokenUsage,
 }
 
-/// Upstream base URL, overridable via `ANTHROPIC_BASE_URL` (used by tests to
-/// point at a mock; also handy for routing through an API-compatible gateway).
-fn anthropic_base_url() -> String {
-    std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".to_string())
+/// How a request authenticates to a provider (SME-72).
+#[derive(Clone, PartialEq)]
+pub enum Auth {
+    /// An `x-api-key` header, as Anthropic (and local Ollama) expect.
+    ApiKey(String),
+    /// An `Authorization: Bearer` header, for gateways that want one.
+    Bearer(String),
 }
 
-/// The Messages endpoint under `base_url`.
-fn messages_url(base_url: &str) -> String {
-    format!("{}/v1/messages", base_url.trim_end_matches('/'))
+// By hand, so a secret never reaches a log line.
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApiKey(_) => f.write_str("ApiKey(..)"),
+            Self::Bearer(_) => f.write_str("Bearer(..)"),
+        }
+    }
+}
+
+/// A model provider to send requests to: its base URL and credential,
+/// from its `inference_providers` row (`providers::endpoint`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Endpoint {
+    pub base_url: String,
+    pub auth: Auth,
+}
+
+impl Endpoint {
+    /// `path` (starting with `/`) under the base URL.
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url.trim_end_matches('/'))
+    }
+
+    /// The HTTP client for requests to this provider. It doesn't follow
+    /// redirects: reqwest drops `Authorization` on a redirect to another
+    /// host but not `x-api-key`, so following one could hand the key to a
+    /// host it wasn't entered for. Anthropic-compatible APIs don't redirect.
+    /// One client for every provider, so connections are reused.
+    pub fn client(&self) -> Result<reqwest::Client, String> {
+        static CLIENT: std::sync::LazyLock<Result<reqwest::Client, String>> =
+            std::sync::LazyLock::new(|| {
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|e| format!("couldn't set up the HTTP client: {e}"))
+            });
+        CLIENT.clone()
+    }
+
+    /// Adds the credential and the `anthropic-version` header every
+    /// Anthropic-compatible request carries.
+    pub fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let request = request.header("anthropic-version", "2023-06-01");
+        match &self.auth {
+            Auth::ApiKey(key) => request.header("x-api-key", key),
+            Auth::Bearer(token) => request.header("Authorization", format!("Bearer {token}")),
+        }
+    }
 }
 
 /// A single interpreted Anthropic SSE payload, reduced to what
@@ -234,7 +283,7 @@ const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// error).
 ///
 /// Raised from the original 90s: a local Ollama server (a supported
-/// `ANTHROPIC_BASE_URL` override, not just the real Anthropic API) can take
+/// provider, not just the real Anthropic API) can take
 /// several minutes to cold-load a model into memory before it sends
 /// anything back at all, and that wait genuinely belongs here rather than
 /// in `CHUNK_TIMEOUT` — nothing has started streaming yet. Still just a
@@ -246,25 +295,13 @@ const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600
 /// test can exercise the timeout with a short duration instead of the real
 /// `RESPONSE_TIMEOUT`.
 async fn send_and_await_response(
-    api_key: Option<&str>,
-    auth_token: Option<&str>,
+    endpoint: &Endpoint,
     request: &CreateMessageRequest,
-    base_url: &str,
     response_timeout: std::time::Duration,
 ) -> Result<reqwest::Response, String> {
-    let client = reqwest::Client::new()
-        .post(messages_url(base_url))
-        .header("anthropic-version", "2023-06-01")
+    let client = endpoint
+        .authorize(endpoint.client()?.post(endpoint.url("/v1/messages")))
         .json(request);
-    let client = if let Some(auth_token) = auth_token {
-        client.header("Authorization", format!("Bearer {auth_token}"))
-    } else if let Some(api_key) = api_key {
-        client.header("x-api-key", api_key)
-    } else {
-        return Err(
-            "no ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN credential was provided".to_string(),
-        );
-    };
     tokio::time::timeout(response_timeout, client.send())
         .await
         .map_err(|_| "timed out waiting for Anthropic to respond".to_string())?
@@ -314,8 +351,7 @@ const RETRY_DELAYS: [std::time::Duration; 2] = [
 /// stream ends. Tool-use blocks accumulate silently; `on_delta` only ever
 /// fires for text. `request.stream` should be `true`.
 pub async fn stream_anthropic_message(
-    api_key: Option<&str>,
-    auth_token: Option<&str>,
+    endpoint: &Endpoint,
     request: &CreateMessageRequest,
     mut on_delta: impl FnMut(&str),
 ) -> Result<StreamedTurn, String> {
@@ -323,14 +359,7 @@ pub async fn stream_anthropic_message(
     // shown to the viewer yet, so a retry is invisible to them.
     let mut attempt = 0;
     let response = loop {
-        let response = send_and_await_response(
-            api_key,
-            auth_token,
-            request,
-            &anthropic_base_url(),
-            RESPONSE_TIMEOUT,
-        )
-        .await?;
+        let response = send_and_await_response(endpoint, request, RESPONSE_TIMEOUT).await?;
         let status = response.status();
         if status.is_success() {
             break response;
@@ -465,9 +494,70 @@ mod tests {
     /// produced `//v1/messages`.
     #[test]
     fn test_messages_url_ignores_a_trailing_slash() {
-        assert_eq!(messages_url("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
-        assert_eq!(messages_url("https://gateway.example/"), "https://gateway.example/v1/messages");
-        assert_eq!(messages_url("https://gateway.example/proxy/"), "https://gateway.example/proxy/v1/messages");
+        let url = |base: &str| {
+            Endpoint { base_url: base.to_string(), auth: Auth::ApiKey(String::new()) }.url("/v1/messages")
+        };
+        assert_eq!(url("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(url("https://gateway.example/"), "https://gateway.example/v1/messages");
+        assert_eq!(url("https://gateway.example/proxy/"), "https://gateway.example/proxy/v1/messages");
+    }
+
+    /// SME-72 review 2: reqwest drops `Authorization` on a cross-host
+    /// redirect but not `x-api-key`, so a provider that redirects could
+    /// hand the key to another host. Provider requests don't follow
+    /// redirects.
+    #[tokio::test]
+    async fn test_a_redirect_never_carries_the_key_to_another_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let elsewhere = listener.local_addr().expect("addr");
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = reached.clone();
+        let app = axum::Router::new().fallback(move || {
+            let flag = flag.clone();
+            async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                "gotcha"
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let provider = listener.local_addr().expect("addr");
+        let app = axum::Router::new().fallback(move || async move {
+            axum::response::Redirect::temporary(&format!("http://localhost:{}/steal", elsewhere.port()))
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let endpoint = Endpoint {
+            base_url: format!("http://{provider}"),
+            auth: Auth::ApiKey("sk-secret".to_string()),
+        };
+        let request = CreateMessageRequest {
+            model: "m".to_string(),
+            max_tokens: 10,
+            system: None,
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+            thinking: None,
+        };
+        let result = stream_anthropic_message(&endpoint, &request, |_| {}).await;
+        assert!(result.is_err(), "a redirect isn't a reply");
+        assert!(!reached.load(std::sync::atomic::Ordering::SeqCst), "the redirect was followed");
+    }
+
+    /// A credential never reaches a log line through `{:?}`.
+    #[test]
+    fn test_an_endpoints_debug_hides_its_secret() {
+        let endpoint = Endpoint {
+            base_url: "https://api.anthropic.com".to_string(),
+            auth: Auth::Bearer("sk-very-secret".to_string()),
+        };
+        let shown = format!("{endpoint:?}");
+        assert!(!shown.contains("sk-very-secret"), "{shown}");
+        assert!(shown.contains("Bearer"), "{shown}");
     }
 
     #[test]
@@ -644,16 +734,19 @@ mod tests {
         assert_eq!(interpret_stream_event(&value), StreamOutcome::Ignored);
     }
 
-    /// Spins up a throwaway mock upstream returning `mock_body` verbatim and
-    /// points `ANTHROPIC_BASE_URL` (process-global) at it, then runs
-    /// `stream_anthropic_message` against it. Holds the shared
-    /// `test_support` lock for the duration, since `ANTHROPIC_BASE_URL` is
-    /// process-global and other test files (`api::chat`) mutate it too.
+    fn test_endpoint(addr: std::net::SocketAddr) -> Endpoint {
+        Endpoint {
+            base_url: format!("http://{addr}"),
+            auth: Auth::ApiKey("test-key".to_string()),
+        }
+    }
+
+    /// Spins up a throwaway mock upstream returning `mock_body` verbatim
+    /// and runs `stream_anthropic_message` against it.
     async fn run_against_mock_upstream(
         mock_body: &'static str,
         on_delta: impl FnMut(&str),
     ) -> Result<StreamedTurn, String> {
-        let _guard = crate::anthropic::test_support::lock_anthropic_base_url();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -672,8 +765,6 @@ mod tests {
             axum::serve(listener, app).await.ok();
         });
 
-        unsafe { std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}")) };
-
         let request = CreateMessageRequest {
             model: "claude-opus-4-8".to_string(),
             max_tokens: 100,
@@ -684,7 +775,7 @@ mod tests {
             thinking: None,
         };
 
-        stream_anthropic_message(Some("test-key"), None, &request, on_delta).await
+        stream_anthropic_message(&test_endpoint(addr), &request, on_delta).await
     }
 
     /// The body a paused provider actually returned during the bug bash,
@@ -710,7 +801,6 @@ mod tests {
     async fn run_against_responses(
         responses: Vec<(u16, &'static str)>,
     ) -> (Result<StreamedTurn, String>, usize) {
-        let _guard = crate::anthropic::test_support::lock_anthropic_base_url();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -737,7 +827,6 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
         });
-        unsafe { std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}")) };
         let request = CreateMessageRequest {
             model: "claude-opus-4-8".to_string(),
             max_tokens: 100,
@@ -747,7 +836,7 @@ mod tests {
             tools: vec![],
             thinking: None,
         };
-        let result = stream_anthropic_message(Some("test-key"), None, &request, |_| {}).await;
+        let result = stream_anthropic_message(&test_endpoint(addr), &request, |_| {}).await;
         (result, count.load(std::sync::atomic::Ordering::SeqCst))
     }
 
@@ -1001,10 +1090,8 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             send_and_await_response(
-                Some("test-key"),
-                None,
+                &test_endpoint(addr),
                 &request,
-                &format!("http://{addr}"),
                 std::time::Duration::from_millis(50),
             ),
         )
@@ -1020,11 +1107,8 @@ mod tests {
     /// Spins up a throwaway mock upstream that captures the request's
     /// headers (instead of caring about the body) and calls
     /// `send_and_await_response` against it — for asserting exactly which
-    /// auth header a given credential combination actually sends.
-    async fn send_and_capture_headers(
-        api_key: Option<&str>,
-        auth_token: Option<&str>,
-    ) -> (
+    /// auth header a given credential actually sends.
+    async fn send_and_capture_headers(auth: Auth) -> (
         Result<reqwest::Response, String>,
         Option<axum::http::HeaderMap>,
     ) {
@@ -1063,22 +1147,20 @@ mod tests {
             thinking: None,
         };
 
-        let result = send_and_await_response(
-            api_key,
-            auth_token,
-            &request,
-            &format!("http://{addr}"),
-            std::time::Duration::from_secs(5),
-        )
-        .await;
+        let endpoint = Endpoint {
+            base_url: format!("http://{addr}"),
+            auth,
+        };
+        let result =
+            send_and_await_response(&endpoint, &request, std::time::Duration::from_secs(5)).await;
         let headers = captured.lock().unwrap_or_else(|e| e.into_inner()).clone();
         (result, headers)
     }
 
     #[tokio::test]
-    async fn test_send_and_await_response_uses_bearer_auth_when_auth_token_is_set() {
+    async fn test_send_and_await_response_uses_bearer_auth_for_a_bearer_provider() {
         let (result, headers) =
-            send_and_capture_headers(Some("api-key-value"), Some("hf-token-value")).await;
+            send_and_capture_headers(Auth::Bearer("hf-token-value".to_string())).await;
         result.expect("request should succeed");
         let headers = headers.expect("mock upstream should have received the request");
         assert_eq!(
@@ -1087,13 +1169,14 @@ mod tests {
         );
         assert!(
             headers.get("x-api-key").is_none(),
-            "should not also send x-api-key when auth_token is set"
+            "should not also send x-api-key for a bearer provider"
         );
     }
 
     #[tokio::test]
-    async fn test_send_and_await_response_uses_x_api_key_when_only_api_key_is_set() {
-        let (result, headers) = send_and_capture_headers(Some("api-key-value"), None).await;
+    async fn test_send_and_await_response_uses_x_api_key_for_an_api_key_provider() {
+        let (result, headers) =
+            send_and_capture_headers(Auth::ApiKey("api-key-value".to_string())).await;
         result.expect("request should succeed");
         let headers = headers.expect("mock upstream should have received the request");
         assert_eq!(
@@ -1102,7 +1185,7 @@ mod tests {
         );
         assert!(
             headers.get("authorization").is_none(),
-            "should not send Authorization when only api_key is set"
+            "should not send Authorization for an api-key provider"
         );
     }
 
@@ -1111,8 +1194,10 @@ mod tests {
     #[tokio::test]
     async fn test_an_unreachable_model_endpoint_is_reported_as_the_model() {
         let result = send_and_await_response(
-            Some("key"),
-            None,
+            &Endpoint {
+                base_url: "http://127.0.0.1:1".to_string(),
+                auth: Auth::ApiKey("key".to_string()),
+            },
             &CreateMessageRequest {
                 model: "local".to_string(),
                 max_tokens: 100,
@@ -1122,38 +1207,10 @@ mod tests {
                 tools: vec![],
                 thinking: None,
             },
-            "http://127.0.0.1:1",
             std::time::Duration::from_secs(5),
         )
         .await;
         let message = result.expect_err("nothing listens on port 1");
         assert!(message.starts_with("The model request failed"), "got: {message}");
-    }
-
-    #[tokio::test]
-    async fn test_send_and_await_response_errors_clearly_when_neither_credential_is_set() {
-        let result = send_and_await_response(
-            None,
-            None,
-            &CreateMessageRequest {
-                model: "claude-opus-4-8".to_string(),
-                max_tokens: 100,
-                system: None,
-                messages: vec![],
-                stream: true,
-                tools: vec![],
-                thinking: None,
-            },
-            "http://127.0.0.1:1", // unreachable — must never even try to connect
-            std::time::Duration::from_secs(5),
-        )
-        .await;
-        let message = result.expect_err("expected an error when neither credential is set");
-        assert!(
-            message.contains("API key")
-                || message.contains("auth token")
-                || message.contains("credential"),
-            "expected a clear missing-credentials error, got: {message}"
-        );
     }
 }

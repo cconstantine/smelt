@@ -193,7 +193,7 @@ pub async fn disconnect(pool: &PgPool, config: &McpServerConfig) -> Result<(), S
 /// when the `Host`/`X-Forwarded-Proto`-derived guess below is wrong (e.g.
 /// smelt reachable through a tunnel or proxy that doesn't forward a usable
 /// `Host`). Set-but-empty is treated as unset, same rule every other env
-/// var in this codebase follows (see `ANTHROPIC_API_KEY`). Trims a trailing
+/// var in this codebase follows. Trims a trailing
 /// slash so callers can always append `/oauth/mcp-callback/{id}` directly.
 fn oauth_base_url_override() -> Option<String> {
     let value = std::env::var("SMELT_BASE_URL").ok()?;
@@ -340,8 +340,7 @@ mod tests {
     use axum::routing::{get, post};
 
     /// `SMELT_BASE_URL` is process-global and only this test touches it —
-    /// no cross-test lock needed (contrast `anthropic::test_support::lock_anthropic_base_url`,
-    /// shared by several `api::chat` tests). Save/restore around the body
+    /// no cross-test lock needed. Save/restore around the body
     /// so a run order that puts another test after this one never sees a
     /// value this test set.
     #[test]

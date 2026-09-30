@@ -1614,6 +1614,358 @@ pub async fn set_mcp_server_oauth_credentials(
     Ok(())
 }
 
+// --- Model providers (SME-72) ---
+// Configuration a person edits on /providers, like mcp_servers: plain
+// CRUD. `kind` and `auth_kind` are plain strings, the table's `CHECK`s
+// being the source of truth (`McpServerConfig::auth_mode`'s precedent);
+// `providers.rs` turns them into enums at its boundary.
+
+#[derive(Clone, PartialEq, sqlx::FromRow)]
+pub struct InferenceProvider {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub base_url: String,
+    pub auth_kind: String,
+    /// Never sent to the browser; `providers::secret_hint` is.
+    pub secret: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+// By hand, so the secret never reaches a log line.
+impl std::fmt::Debug for InferenceProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InferenceProvider")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("base_url", &self.base_url)
+            .field("auth_kind", &self.auth_kind)
+            .field("secret", &"..")
+            .finish_non_exhaustive()
+    }
+}
+
+pub async fn create_inference_provider(
+    pool: &PgPool,
+    name: &str,
+    kind: &str,
+    base_url: &str,
+    auth_kind: &str,
+    secret: &str,
+) -> Result<InferenceProvider, sqlx::Error> {
+    sqlx::query_as::<_, InferenceProvider>(
+        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret)
+         VALUES ($1, $2, $3, $4, $5) RETURNING *",
+    )
+    .bind(name)
+    .bind(kind)
+    .bind(base_url)
+    .bind(auth_kind)
+    .bind(secret)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn list_inference_providers(pool: &PgPool) -> Result<Vec<InferenceProvider>, sqlx::Error> {
+    sqlx::query_as::<_, InferenceProvider>("SELECT * FROM inference_providers ORDER BY name ASC")
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn get_inference_provider(
+    pool: &PgPool,
+    id: i64,
+) -> Result<Option<InferenceProvider>, sqlx::Error> {
+    sqlx::query_as::<_, InferenceProvider>("SELECT * FROM inference_providers WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Sets every field outright, except `secret`: `None` keeps the stored
+/// one, so the edit form never needs to know it.
+pub async fn update_inference_provider(
+    pool: &PgPool,
+    id: i64,
+    name: &str,
+    kind: &str,
+    base_url: &str,
+    auth_kind: &str,
+    secret: Option<&str>,
+) -> Result<Option<InferenceProvider>, sqlx::Error> {
+    sqlx::query_as::<_, InferenceProvider>(
+        "UPDATE inference_providers
+         SET name = $2, kind = $3, base_url = $4, auth_kind = $5,
+             secret = COALESCE($6, secret), updated_at = now()
+         WHERE id = $1 RETURNING *",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(kind)
+    .bind(base_url)
+    .bind(auth_kind)
+    .bind(secret)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Deletes a provider, first clearing it as the default and from every
+/// conversation using it, all in one transaction: those conversations take
+/// the default at their next turn. The foreign keys are `RESTRICT`, so a
+/// reference this missed fails the delete instead of leaving a model with
+/// no provider. Returns whether the provider existed.
+pub async fn delete_inference_provider(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE inference_settings SET default_provider_id = NULL, default_model = NULL
+         WHERE default_provider_id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE conversations SET provider_id = NULL, model = NULL WHERE provider_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let deleted = sqlx::query("DELETE FROM inference_providers WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(deleted == 1)
+}
+
+/// A model's row in `provider_models`: the user's overrides and what the
+/// provider last reported. Null means unset or not reported.
+#[derive(Clone, Debug, Default, PartialEq, sqlx::FromRow)]
+pub struct ProviderModelRow {
+    pub provider_id: i64,
+    pub model: String,
+    pub thinking: Option<bool>,
+    pub context_window: Option<i32>,
+    pub reported_context_window: Option<i32>,
+    pub reported_thinking: Option<bool>,
+    pub reported_tools: Option<bool>,
+    /// Added on the provider's page as a model its listing doesn't show,
+    /// so it's shown even when the listing works and lacks it.
+    pub added_by_hand: bool,
+}
+
+pub async fn get_provider_model(
+    pool: &PgPool,
+    provider_id: i64,
+    model: &str,
+) -> Result<Option<ProviderModelRow>, sqlx::Error> {
+    sqlx::query_as::<_, ProviderModelRow>(
+        "SELECT * FROM provider_models WHERE provider_id = $1 AND model = $2",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn list_provider_models(
+    pool: &PgPool,
+    provider_id: i64,
+) -> Result<Vec<ProviderModelRow>, sqlx::Error> {
+    sqlx::query_as::<_, ProviderModelRow>(
+        "SELECT * FROM provider_models WHERE provider_id = $1 ORDER BY model ASC",
+    )
+    .bind(provider_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Marks a model as added by hand, adding its row if it has none and
+/// leaving its settings as they are.
+pub async fn ensure_provider_model(pool: &PgPool, provider_id: i64, model: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model, added_by_hand) VALUES ($1, $2, true)
+         ON CONFLICT (provider_id, model) DO UPDATE SET added_by_hand = true",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Sets the user's overrides for a model, leaving what the provider
+/// reported alone. `None` clears an override.
+pub async fn set_provider_model_overrides(
+    pool: &PgPool,
+    provider_id: i64,
+    model: &str,
+    thinking: Option<bool>,
+    context_window: Option<i32>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model, thinking, context_window)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (provider_id, model) DO UPDATE
+         SET thinking = $3, context_window = $4",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .bind(thinking)
+    .bind(context_window)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Replaces what the provider reported about a model, leaving the user's
+/// overrides alone. A report without a context window keeps the last one:
+/// Ollama only says while the model is loaded.
+pub async fn set_provider_model_reported(
+    pool: &PgPool,
+    provider_id: i64,
+    model: &str,
+    context_window: Option<i32>,
+    thinking: Option<bool>,
+    tools: Option<bool>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO provider_models
+             (provider_id, model, reported_context_window, reported_thinking, reported_tools)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (provider_id, model) DO UPDATE
+         SET reported_context_window = COALESCE($3, provider_models.reported_context_window),
+             reported_thinking = $4, reported_tools = $5",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .bind(context_window)
+    .bind(thinking)
+    .bind(tools)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The default provider and model, if one is set.
+pub async fn get_default_model(pool: &PgPool) -> Result<Option<(i64, String)>, sqlx::Error> {
+    let row: Option<(Option<i64>, Option<String>)> =
+        sqlx::query_as("SELECT default_provider_id, default_model FROM inference_settings")
+            .fetch_optional(pool)
+            .await?;
+    Ok(match row {
+        Some((Some(provider_id), Some(model))) => Some((provider_id, model)),
+        _ => None,
+    })
+}
+
+pub async fn set_default_model(
+    pool: &PgPool,
+    provider_id: i64,
+    model: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO inference_settings (default_provider_id, default_model) VALUES ($1, $2)
+         ON CONFLICT (id) DO UPDATE SET default_provider_id = $1, default_model = $2",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A conversation's own provider and model (both `None` until its first
+/// turn takes the default), and its last message when they last changed.
+#[derive(Clone, Debug, Default, PartialEq, sqlx::FromRow)]
+pub struct ConversationModelRow {
+    pub provider_id: Option<i64>,
+    pub model: Option<String>,
+    pub model_changed_at_message_id: Option<i64>,
+}
+
+/// `None` when the conversation doesn't exist.
+pub async fn get_conversation_model(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Option<ConversationModelRow>, sqlx::Error> {
+    sqlx::query_as::<_, ConversationModelRow>(
+        "SELECT provider_id, model, model_changed_at_message_id FROM conversations WHERE id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Sets a conversation's provider and model, from its next turn on. The
+/// switch point for its thinking blocks is recorded when that turn starts
+/// (`record_turn_model`), since a turn still running keeps writing for the
+/// old model. Returns whether the conversation exists.
+pub async fn set_conversation_model(
+    pool: &PgPool,
+    conversation_id: i64,
+    provider_id: i64,
+    model: &str,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query("UPDATE conversations SET provider_id = $2, model = $3 WHERE id = $1")
+    .bind(conversation_id)
+    .bind(provider_id)
+    .bind(model)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(updated == 1)
+}
+
+/// Records that a turn is starting on the backend `model_key` names
+/// (provider, base URL and model), and returns the message up to which
+/// thinking must be left out: when it differs from the last turn's
+/// backend, that's the conversation's last message now. Call under the
+/// conversation's turn lock, so no turn is writing meanwhile.
+pub async fn record_turn_model(
+    pool: &PgPool,
+    conversation_id: i64,
+    model_key: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    // The right-hand sides read the row's values from before the update.
+    let stamp: Option<(Option<i64>,)> = sqlx::query_as(
+        "UPDATE conversations
+         SET model_changed_at_message_id = CASE
+                 WHEN last_turn_model_key IS DISTINCT FROM $2
+                 THEN (SELECT max(id) FROM messages WHERE conversation_id = $1)
+                 ELSE model_changed_at_message_id
+             END,
+             last_turn_model_key = $2
+         WHERE id = $1
+         RETURNING model_changed_at_message_id",
+    )
+    .bind(conversation_id)
+    .bind(model_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(stamp.and_then(|(id,)| id))
+}
+
+/// Gives a conversation with no model the default, in one statement so a
+/// racing change isn't overwritten. Returns the provider and model it took,
+/// or `None` when it already had one or there's no default.
+pub async fn adopt_default_model(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Option<(i64, String)>, sqlx::Error> {
+    let adopted: Option<(i64, String)> = sqlx::query_as(
+        "UPDATE conversations c
+         SET provider_id = s.default_provider_id, model = s.default_model
+         FROM inference_settings s
+         WHERE c.id = $1 AND c.provider_id IS NULL AND s.default_provider_id IS NOT NULL
+         RETURNING c.provider_id, c.model",
+    )
+    .bind(conversation_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(adopted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3301,5 +3653,191 @@ mod tests {
             Some(credentials),
             "renaming without changing the URL must not disturb stored OAuth credentials"
         );
+    }
+
+    // --- Model providers (SME-72) ---
+
+    async fn test_provider(pool: &PgPool, name: &str) -> InferenceProvider {
+        create_inference_provider(pool, name, "anthropic", "https://api.anthropic.com", "api_key", "sk-ant-0123456789")
+            .await
+            .expect("create provider")
+    }
+
+    /// Mechanical CRUD, mirroring the MCP server table's: a characterization
+    /// round trip rather than test-first.
+    #[sqlx::test]
+    async fn test_inference_provider_round_trip_keeps_the_secret_unless_replaced(pool: PgPool) {
+        let created = test_provider(&pool, "anthropic").await;
+        assert_eq!(list_inference_providers(&pool).await.expect("list"), vec![created.clone()]);
+
+        let renamed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", None)
+            .await
+            .expect("update")
+            .expect("exists");
+        assert_eq!(
+            (renamed.name.as_str(), renamed.kind.as_str(), renamed.base_url.as_str(), renamed.auth_kind.as_str()),
+            ("work", "other", "https://gw.example", "bearer")
+        );
+        assert_eq!(renamed.secret, "sk-ant-0123456789", "no new secret keeps the stored one");
+
+        let rekeyed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", Some("new-secret"))
+            .await
+            .expect("update")
+            .expect("exists");
+        assert_eq!(rekeyed.secret, "new-secret");
+
+        assert_eq!(
+            update_inference_provider(&pool, 999_999, "x", "other", "u", "bearer", None).await.expect("update"),
+            None
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_a_providers_debug_hides_its_secret(pool: PgPool) {
+        let provider = test_provider(&pool, "p").await;
+        let shown = format!("{provider:?}");
+        assert!(!shown.contains("sk-ant-0123456789"), "{shown}");
+        assert!(shown.contains("anthropic"), "{shown}");
+    }
+
+    #[sqlx::test]
+    async fn test_deleting_a_provider_clears_the_default_and_conversations_using_it(pool: PgPool) {
+        let doomed = test_provider(&pool, "doomed").await;
+        let kept = test_provider(&pool, "kept").await;
+        set_default_model(&pool, doomed.id, "m1").await.expect("default");
+        let on_doomed = create_conversation(&pool).await.expect("conversation");
+        let on_kept = create_conversation(&pool).await.expect("conversation");
+        set_conversation_model(&pool, on_doomed.id, doomed.id, "m1").await.expect("set");
+        set_conversation_model(&pool, on_kept.id, kept.id, "m2").await.expect("set");
+
+        assert!(delete_inference_provider(&pool, doomed.id).await.expect("delete"));
+
+        assert_eq!(get_inference_provider(&pool, doomed.id).await.expect("get"), None);
+        assert_eq!(get_default_model(&pool).await.expect("default"), None);
+        let cleared = get_conversation_model(&pool, on_doomed.id).await.expect("get").expect("exists");
+        assert_eq!((cleared.provider_id, cleared.model), (None, None));
+        let untouched = get_conversation_model(&pool, on_kept.id).await.expect("get").expect("exists");
+        assert_eq!((untouched.provider_id, untouched.model.as_deref()), (Some(kept.id), Some("m2")));
+        assert!(!delete_inference_provider(&pool, doomed.id).await.expect("delete again"));
+    }
+
+    #[sqlx::test]
+    async fn test_deleting_a_provider_keeps_another_providers_default(pool: PgPool) {
+        let doomed = test_provider(&pool, "doomed").await;
+        let kept = test_provider(&pool, "kept").await;
+        set_default_model(&pool, kept.id, "m2").await.expect("default");
+
+        assert!(delete_inference_provider(&pool, doomed.id).await.expect("delete"));
+
+        assert_eq!(get_default_model(&pool).await.expect("default"), Some((kept.id, "m2".to_string())));
+    }
+
+    #[sqlx::test]
+    async fn test_setting_a_conversations_model_leaves_the_switch_point_to_its_next_turn(pool: PgPool) {
+        let provider = test_provider(&pool, "p").await;
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let text = [ContentBlock::Text { text: "hi".to_string() }];
+        create_message(&pool, conversation.id, "user", &text).await.expect("message");
+
+        assert!(set_conversation_model(&pool, conversation.id, provider.id, "m1").await.expect("set"));
+        let set = get_conversation_model(&pool, conversation.id).await.expect("get").expect("exists");
+        assert_eq!(
+            set,
+            ConversationModelRow {
+                provider_id: Some(provider.id),
+                model: Some("m1".to_string()),
+                model_changed_at_message_id: None,
+            },
+            "a running turn may still write for the old model, so the pick doesn't mark the switch"
+        );
+        assert!(!set_conversation_model(&pool, 999_999, provider.id, "m1").await.expect("set"));
+    }
+
+    /// SME-72 review: the switch point is where a turn starts on a
+    /// different backend than the last turn, recorded under the turn lock.
+    #[sqlx::test]
+    async fn test_a_turn_on_a_different_backend_records_the_switch_point(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let text = [ContentBlock::Text { text: "hi".to_string() }];
+        let first = create_message(&pool, conversation.id, "user", &text).await.expect("message");
+
+        assert_eq!(record_turn_model(&pool, conversation.id, "1 http://a m1").await.expect("record"), Some(first.id));
+        let reply = create_message(&pool, conversation.id, "assistant", &text).await.expect("message");
+        assert_eq!(
+            record_turn_model(&pool, conversation.id, "1 http://a m1").await.expect("record"),
+            Some(first.id),
+            "the same backend again: unchanged"
+        );
+        assert_eq!(
+            record_turn_model(&pool, conversation.id, "1 http://b m1").await.expect("record"),
+            Some(reply.id),
+            "another base URL is another backend"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_setting_a_deleted_providers_model_is_refused(pool: PgPool) {
+        let provider = test_provider(&pool, "p").await;
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        delete_inference_provider(&pool, provider.id).await.expect("delete");
+
+        assert!(set_conversation_model(&pool, conversation.id, provider.id, "m1").await.is_err());
+        assert!(set_default_model(&pool, provider.id, "m1").await.is_err());
+    }
+
+    #[sqlx::test]
+    async fn test_a_conversation_adopts_the_default_only_when_it_has_no_model(pool: PgPool) {
+        let provider = test_provider(&pool, "p").await;
+        let conversation = create_conversation(&pool).await.expect("conversation");
+
+        assert_eq!(adopt_default_model(&pool, conversation.id).await.expect("adopt"), None, "no default yet");
+
+        set_default_model(&pool, provider.id, "m1").await.expect("default");
+        assert_eq!(
+            adopt_default_model(&pool, conversation.id).await.expect("adopt"),
+            Some((provider.id, "m1".to_string()))
+        );
+        let adopted = get_conversation_model(&pool, conversation.id).await.expect("get").expect("exists");
+        assert_eq!((adopted.provider_id, adopted.model.as_deref()), (Some(provider.id), Some("m1")));
+
+        set_default_model(&pool, provider.id, "m2").await.expect("default");
+        assert_eq!(adopt_default_model(&pool, conversation.id).await.expect("adopt"), None, "it has one now");
+        let kept = get_conversation_model(&pool, conversation.id).await.expect("get").expect("exists");
+        assert_eq!(kept.model.as_deref(), Some("m1"));
+    }
+
+    /// SME-72 review 2: Ollama reports a window from `/api/ps` only while
+    /// the model is loaded; asking again when it isn't keeps what it said.
+    #[sqlx::test]
+    async fn test_a_report_without_a_window_keeps_the_last_one(pool: PgPool) {
+        let provider = test_provider(&pool, "p").await;
+        set_provider_model_reported(&pool, provider.id, "m", Some(8192), Some(true), Some(true)).await.expect("loaded");
+        set_provider_model_reported(&pool, provider.id, "m", None, Some(false), Some(true)).await.expect("unloaded");
+        let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
+        assert_eq!((row.reported_context_window, row.reported_thinking), (Some(8192), Some(false)));
+    }
+
+    #[sqlx::test]
+    async fn test_model_overrides_and_reported_details_leave_each_other_alone(pool: PgPool) {
+        let provider = test_provider(&pool, "p").await;
+        set_provider_model_reported(&pool, provider.id, "m", Some(4096), Some(false), Some(true)).await.expect("reported");
+        set_provider_model_overrides(&pool, provider.id, "m", Some(true), Some(32_768)).await.expect("overrides");
+        set_provider_model_reported(&pool, provider.id, "m", Some(8192), None, Some(true)).await.expect("reported");
+
+        let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
+        assert_eq!(
+            row,
+            ProviderModelRow {
+                provider_id: provider.id,
+                model: "m".to_string(),
+                thinking: Some(true),
+                context_window: Some(32_768),
+                reported_context_window: Some(8192),
+                reported_thinking: None,
+                reported_tools: Some(true),
+                added_by_hand: false,
+            }
+        );
+        assert_eq!(list_provider_models(&pool, provider.id).await.expect("list"), vec![row]);
     }
 }

@@ -89,28 +89,31 @@ same `docker-compose.yml` stack described above and in
 [testing.md](testing.md), just running on GitHub's runner instead of a local
 machine. See [development-process.md](development-process.md#definition-of-done).
 
+## Model providers
+
+smelt doesn't read a model or an API key from the environment (SME-72). Set them up in the app: **Model providers** in the sidebar (`/providers`). Until there's one, a conversation says "No model provider is set up" above its message box, with a link there, and Send waits.
+
+- **A provider** is a name, a kind, a base URL and a key. Every turn goes to the base URL's `/v1/messages`, whatever the kind. The key is sent as `x-api-key` (API key) or `Authorization: Bearer` (bearer token), and pages only ever show its last four characters. Changing a provider's base URL needs the key entered again, so a stored key only goes where it was entered for. It's stored in plain text for now, like the SSH key ([SME-48](https://linear.app/smelt-agent/issue/SME-48)).
+- **The kind** decides how smelt lists the provider's models and what it learns about each (`src/anthropic/models.rs`):
+  - **Anthropic** lists `GET /v1/models`, whose entries carry each model's context window (`max_input_tokens`) and thinking support.
+  - **Ollama** lists `GET /api/tags`, then asks `POST /api/show` about each model: whether it can call tools and think, and a Modelfile's `num_ctx`. Without `num_ctx`, the window the model is loaded with right now (`GET /api/ps`), if it's loaded. Ollama's own default window (4k, 32k or 256k by GPU memory, or `OLLAMA_CONTEXT_LENGTH`) isn't reported anywhere, so for a model with neither, set the window by hand. Local Ollama needs a key but ignores it; any value works.
+  - **Other** (any Anthropic-compatible server: a gateway, llama.cpp's `llama-server`) tries `GET /v1/models`, reading a context window from `max_input_tokens` or llama.cpp's `meta.n_ctx`.
+- **The default model** is what a conversation without a model of its own takes when its next turn starts, and then keeps. That covers every conversation from before providers existed. Each conversation's model can be changed from the picker above its message box; the change applies from its next turn.
+- **Per-model settings**, on the provider's page: a context window (smelt compacts a conversation before it outgrows it, and the context indicator measures against it) and thinking on or off. Unset, they come from what the provider reported, else a known `claude-*` model's window, else 200,000, shown as "unknown, assuming 200,000". Thinking defaults to on unless the provider says the model can't. `run_turn` still retries without thinking if a request fails with Ollama's "error parsing tool call" (see [api.md](api.md)).
+
 ## Environment Variables
 
-Copy `.env.example` to `.env` and fill in `ANTHROPIC_API_KEY` (or
-`ANTHROPIC_AUTH_TOKEN` — see below). Loaded automatically at server startup
+Copy `.env.example` to `.env` if you need any of these. Loaded automatically at server startup
 (`dotenvy::dotenv()` in `main.rs`); a value already set in the real
 environment takes precedence over `.env`. Most vars treat set-but-empty the
-same as unset (see `anthropic_model()` and the credential checks in
-`src/api/chat.rs`), so no empty API key or auth token is ever sent. The
-exceptions: `ANTHROPIC_BASE_URL`, `SMELT_MASON_REGISTRY_URL` and
+same as unset. The exceptions: `SMELT_MASON_REGISTRY_URL` and
 `SMELT_HELIX_LANGUAGES_URL` use an empty value as given (so leave them unset
-rather than empty), and an empty `DATABASE_URL` fails to parse and panics at
+rather than empty; [SME-70](https://linear.app/smelt-agent/issue/SME-70)), and an empty `DATABASE_URL` fails to parse and panics at
 startup just like an unset one.
 
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
-| `ANTHROPIC_API_KEY` | yes, unless `ANTHROPIC_AUTH_TOKEN` is set | — | Read server-side only; the browser never sees it. Sent as the `x-api-key` header. Missing (with no `ANTHROPIC_AUTH_TOKEN` either) surfaces as a `TurnError` in the chat UI, not a crash. |
-| `ANTHROPIC_AUTH_TOKEN` | no | — | Alternative to `ANTHROPIC_API_KEY`, sent as an `Authorization: Bearer` header instead of `x-api-key` — for an Anthropic-compatible gateway that expects bearer auth (e.g. Hugging Face's hosted endpoint) rather than a real Anthropic API key. If both are set, `ANTHROPIC_AUTH_TOKEN` takes precedence (only one auth header is ever sent). At least one of the two must be set. |
-| `ANTHROPIC_MODEL` | no | `claude-opus-4-8` | Model id passed to the Messages API. |
-| `ANTHROPIC_BASE_URL` | no | `https://api.anthropic.com` | Override for pointing at a mock upstream in tests, or an API-compatible gateway — e.g. a local Ollama server (v0.14.0+ serves an Anthropic-compatible `/v1/messages`; see the commented-out example in `.env.example`). Pick a model with a large-enough context window for tool-calling to work — some models default to a much smaller one than they support. |
-| `ANTHROPIC_THINKING` | no | on | Set to `0`/`false`/`off` to stop sending `thinking: {"type": "adaptive"}`. On by default — `run_turn` retries a request without thinking if the upstream fails with Ollama's specific "error parsing tool call" shape (seen with `gpt-oss` models, whose Anthropic-compat shim doesn't cleanly separate reasoning from a tool call's arguments), so this only needs turning off if some other backend hits a *different* thinking-related failure that retry doesn't cover. See [docs/api.md](api.md). |
-| `ANTHROPIC_CONTEXT_WINDOW` | no | `200000` | Real token count for the configured model's context window — used to decide when auto-compaction should trigger and to compute the context-usage indicator's percentage. `context_window_for` already recognizes every current `claude-*` model id (all sharing the same standard 200K window) without needing this set; only a fallback for a gateway or local model (`ANTHROPIC_BASE_URL` pointed elsewhere) with no real Anthropic model id to look up. See [SME-18](https://linear.app/smelt-agent/issue/SME-18). |
 | `DATABASE_URL` | yes | — | Postgres connection string; `db::init()` panics on startup if unset or empty. Set in `docker-compose.yml`'s `smelt` service, pointing at the `postgres` compose service (only reachable from other compose services, not the host) — only needed in `.env` if running outside docker compose. |
 | `PORT` | no | `8080` | Port the server binary binds, on `0.0.0.0` (`src/main.rs`). Under `dx serve`, dx sets it for the server it launches and proxies to that. |
 | `RUST_LOG` | no | errors only | Standard `tracing-subscriber` env filter, e.g. `RUST_LOG=info,tower_http=debug`. The `chromiumoxide::conn` and `chromiumoxide::handler` targets are always off, even with `RUST_LOG` set: they log a harmless deserialize error on every real page (`log_filter_directives` in `src/main.rs`). |
