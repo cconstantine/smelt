@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# The automated browser tier (src/browser_tests.rs and webfetch's real-browser
+# test), against a database of its own (SME-72's retrospective):
+#
+#   scripts/browser-tier
+#
+# The tier runs smelt's migrations on whatever DATABASE_URL names. On the
+# shared dev database, a branch's new migration would stop `main` from
+# starting there until the branch merges (SME-65), so this creates a scratch
+# database named after the checkout, runs the tier against it, and drops it
+# again, pass or fail. It also:
+# - builds the web bundle first (`dx build --platform web`): the tier serves
+#   a separately built one that `cargo test` never rebuilds;
+# - links the main checkout's .browser-check-cache (headless Chrome) into a
+#   worktree that lacks one (SME-51).
+#
+# Exits with the tests' status. CI runs the same tests on its own stack
+# (.github/workflows/ci.yml) and doesn't use this.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+url=${DATABASE_URL:-}
+if [ -z "$url" ] && [ -f .env ]; then
+    url=$(sed -n 's/^DATABASE_URL=//p' .env | tail -n 1)
+    url=${url%\"}
+    url=${url#\"}
+fi
+[ -n "$url" ] || { echo "browser-tier needs DATABASE_URL (environment or .env)" >&2; exit 1; }
+query=""
+case "$url" in *\?*) query="?${url#*\?}"; url=${url%%\?*} ;; esac
+name=smelt_browser_tier_$(basename "$PWD" | tr -c 'a-zA-Z0-9\n' '_')
+scratch="${url%/*}/$name$query"
+
+if [ ! -e .browser-check-cache ]; then
+    main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+    if [ -d "$main/.browser-check-cache" ]; then
+        ln -s "$main/.browser-check-cache" .browser-check-cache
+        echo "linked $main/.browser-check-cache"
+    else
+        echo "no .browser-check-cache: run scripts/browser-check/setup.sh first" >&2
+        exit 1
+    fi
+fi
+
+echo "== web bundle"
+log=$(mktemp)
+if ! dx build --platform web >"$log" 2>&1; then
+    tail -30 "$log"
+    rm -f "$log"
+    echo "dx build failed" >&2
+    exit 1
+fi
+rm -f "$log"
+
+echo "== scratch database $name"
+# From empty, even after a run that failed to drop it.
+sqlx database drop -y --database-url "$scratch" >/dev/null 2>&1
+sqlx database create --database-url "$scratch" || exit 1
+trap 'sqlx database drop -y --database-url "$scratch" >/dev/null 2>&1' EXIT
+
+echo "== browser tier"
+DATABASE_URL="$scratch" cargo test --features "server browser-test" -- --ignored --test-threads=1
