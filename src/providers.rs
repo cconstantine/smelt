@@ -360,11 +360,12 @@ mod server {
             if db::adopt_default_model(pool, conversation_id)
                 .await
                 .map_err(db_error)?
-                .is_none()
+                .is_some()
             {
-                return Err(NO_MODEL_CONFIGURED.to_string());
+                crate::events::publish(conversation_id, crate::events::ConversationEvent::ModelChanged {});
             }
-            crate::events::publish(conversation_id, crate::events::ConversationEvent::ModelChanged {});
+            // Read again either way: the picker may have set one meanwhile,
+            // which the adoption then (rightly) left alone.
             row = db::get_conversation_model(pool, conversation_id)
                 .await
                 .map_err(db_error)?
@@ -382,11 +383,17 @@ mod server {
         let settings = db::get_provider_model(pool, provider_id, &model)
             .await
             .map_err(db_error)?;
+        // Thinking is signed by the backend that wrote it: a provider moved
+        // to another address is another backend.
+        let model_key = format!("{provider_id} {} {model}", provider.base_url);
+        let thinking_stripped_through = db::record_turn_model(pool, conversation_id, &model_key)
+            .await
+            .map_err(db_error)?;
         Ok(TurnModel {
             endpoint: endpoint(&provider),
             thinking: thinking(settings.as_ref()),
             context_window: context_window(&model, settings.as_ref()).0,
-            thinking_stripped_through: row.model_changed_at_message_id,
+            thinking_stripped_through,
             model,
         })
     }
@@ -455,6 +462,17 @@ mod server {
         input: ProviderInput,
     ) -> Result<ProviderSummary, String> {
         let input = checked(input)?;
+        if input.secret.is_empty() {
+            let stored = db::get_inference_provider(pool, id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("That provider no longer exists.")?;
+            // The stored key only ever goes where it was entered for (the
+            // MCP servers' OAuth credentials follow the same rule).
+            if stored.base_url != input.base_url {
+                return Err("Enter the key again to use it at a new address.".to_string());
+            }
+        }
         let secret = (!input.secret.is_empty()).then_some(input.secret.as_str());
         let provider = db::update_inference_provider(
             pool,
@@ -480,6 +498,16 @@ mod server {
             .map_err(|e| e.to_string())?;
         providers_changed();
         Ok(())
+    }
+
+    /// A foreign-key violation means the provider was deleted meanwhile.
+    fn provider_gone(error: sqlx::Error) -> String {
+        match &error {
+            sqlx::Error::Database(d) if d.is_foreign_key_violation() => {
+                "That provider no longer exists.".to_string()
+            }
+            _ => error.to_string(),
+        }
     }
 
     fn to_column(value: Option<u32>) -> Option<i32> {
@@ -513,10 +541,15 @@ mod server {
 
     /// A provider's models: its listing (storing what it reports about
     /// each), plus every model with stored settings the listing lacks (one
-    /// typed by hand, say). An Ollama server is asked about each listed
-    /// model. A listing that fails still returns the stored models, with
-    /// the error.
-    pub async fn provider_models(pool: &PgPool, provider_id: i64) -> Result<ProviderModels, String> {
+    /// typed by hand, say). With `ask_each`, an Ollama server is also asked
+    /// about each listed model (the provider's page); without, what's
+    /// stored is used (the picker's suggestions, opened often). A listing
+    /// that fails still returns the stored models, with the error.
+    pub async fn provider_models(
+        pool: &PgPool,
+        provider_id: i64,
+        ask_each: bool,
+    ) -> Result<ProviderModels, String> {
         use futures_util::StreamExt;
 
         let provider = db::get_inference_provider(pool, provider_id)
@@ -532,7 +565,7 @@ mod server {
             };
 
         let mut details_errors = std::collections::HashMap::new();
-        if kind == ProviderKind::Ollama {
+        if kind == ProviderKind::Ollama && ask_each {
             let endpoint = &endpoint;
             let fetched: Vec<_> = futures_util::stream::iter(listed.iter().map(|m| m.id.clone()))
                 .map(|model| async move {
@@ -607,6 +640,19 @@ mod server {
         Ok(model_info(model.to_string(), None, row.as_ref(), error))
     }
 
+    /// Adds a model the listing doesn't show, keeping any settings it has.
+    pub async fn add_model(pool: &PgPool, provider_id: i64, model: &str) -> Result<(), String> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err("Enter the model's id.".to_string());
+        }
+        db::ensure_provider_model(pool, provider_id, model)
+            .await
+            .map_err(provider_gone)?;
+        providers_changed();
+        Ok(())
+    }
+
     /// Sets the user's overrides for a model: thinking on or off, and its
     /// context window. `None` goes back to what the provider says.
     pub async fn set_model_settings(
@@ -631,12 +677,7 @@ mod server {
         };
         db::set_provider_model_overrides(pool, provider_id, model, thinking, context_window)
             .await
-            .map_err(|e| match &e {
-                sqlx::Error::Database(d) if d.is_foreign_key_violation() => {
-                    "That provider no longer exists.".to_string()
-                }
-                _ => e.to_string(),
-            })?;
+            .map_err(provider_gone)?;
         providers_changed();
         Ok(())
     }
@@ -658,12 +699,7 @@ mod server {
         }
         db::set_default_model(pool, provider_id, model)
             .await
-            .map_err(|e| match &e {
-                sqlx::Error::Database(d) if d.is_foreign_key_violation() => {
-                    "That provider no longer exists.".to_string()
-                }
-                _ => e.to_string(),
-            })?;
+            .map_err(provider_gone)?;
         providers_changed();
         Ok(())
     }
@@ -911,10 +947,50 @@ mod tests {
             let conversation = db::create_conversation(&pool).await.expect("conversation");
             let p = provider(&pool, "p", "api_key").await;
             let text = [crate::anthropic::ContentBlock::Text { text: "hi".to_string() }];
-            let last = db::create_message(&pool, conversation.id, "assistant", &text).await.expect("message");
+            db::set_conversation_model(&pool, conversation.id, p.id, "m1").await.expect("model");
+            resolve_turn_model(&pool, conversation.id).await.expect("the first turn, on m1");
+            // The user picks m2 while that turn is still running and saving
+            // messages m1 signed.
             set_conversation_model(&pool, conversation.id, p.id, "m2").await.expect("switch");
-            let turn = resolve_turn_model(&pool, conversation.id).await.expect("resolves");
-            assert_eq!(turn.thinking_stripped_through, Some(last.id));
+            let during = db::create_message(&pool, conversation.id, "assistant", &text).await.expect("message");
+
+            let turn = resolve_turn_model(&pool, conversation.id).await.expect("the next turn, on m2");
+            assert_eq!(turn.thinking_stripped_through, Some(during.id), "includes what m1 wrote after the pick");
+        }
+
+        /// SME-72 review: a provider moved to another address is another
+        /// backend, whose signatures don't match.
+        #[sqlx::test]
+        async fn test_a_provider_moved_to_another_address_strips_old_thinking(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let p = provider(&pool, "p", "api_key").await;
+            let text = [crate::anthropic::ContentBlock::Text { text: "hi".to_string() }];
+            db::set_conversation_model(&pool, conversation.id, p.id, "m1").await.expect("model");
+            resolve_turn_model(&pool, conversation.id).await.expect("first turn");
+            let reply = db::create_message(&pool, conversation.id, "assistant", &text).await.expect("message");
+            update_provider(&pool, p.id, input("p", "http://elsewhere:11434", "new-key")).await.expect("move it");
+
+            let turn = resolve_turn_model(&pool, conversation.id).await.expect("next turn");
+            assert_eq!(turn.thinking_stripped_through, Some(reply.id));
+        }
+
+        /// SME-72 review: the stored key only ever goes to the address it
+        /// was entered for.
+        #[sqlx::test]
+        async fn test_moving_a_provider_needs_its_key_again(pool: PgPool) {
+            let created = create_provider(&pool, input("p", "http://one:11434", "secret-1234567890"))
+                .await
+                .expect("create");
+            let refused = update_provider(&pool, created.id, input("p", "http://two:11434", ""))
+                .await
+                .expect_err("a new address without the key");
+            assert!(refused.contains("key"), "{refused}");
+            let stored = db::get_inference_provider(&pool, created.id).await.expect("get").expect("exists");
+            assert_eq!(stored.base_url, "http://one:11434", "nothing changed");
+            // The same address with a blank key still keeps it.
+            update_provider(&pool, created.id, input("renamed", " http://one:11434 ", ""))
+                .await
+                .expect("a rename keeps the key");
         }
 
         fn input(name: &str, base_url: &str, secret: &str) -> ProviderInput {
@@ -959,7 +1035,7 @@ mod tests {
                 Err("There's already a provider named \u{201c}Home\u{201d}.".to_string())
             );
 
-            let kept = update_provider(&pool, created.id, input("Home", "http://other:11434", ""))
+            let kept = update_provider(&pool, created.id, input("Home", "http://ollama:11434", ""))
                 .await
                 .expect("update");
             assert_eq!(kept.secret_hint, created.secret_hint, "a blank secret keeps the stored one");
@@ -1024,7 +1100,7 @@ mod tests {
                 .expect("create");
             set_model_settings(&pool, p.id, "typed-by-hand", None, Some(16_384)).await.expect("set");
 
-            let listing = provider_models(&pool, p.id).await.expect("models");
+            let listing = provider_models(&pool, p.id, true).await.expect("models");
 
             assert_eq!(listing.listing_error, None);
             let ids: Vec<&str> = listing.models.iter().map(|m| m.id.as_str()).collect();
@@ -1044,13 +1120,45 @@ mod tests {
             assert_eq!(stored.reported_context_window, Some(8192));
         }
 
+        /// SME-72 review: the picker's list doesn't ask an Ollama server
+        /// about every model each time it opens; it uses what's stored.
+        #[sqlx::test]
+        async fn test_a_quick_listing_skips_the_per_model_questions(pool: PgPool) {
+            let base = mock_ollama().await;
+            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k")
+                .await
+                .expect("create");
+            let listing = provider_models(&pool, p.id, false).await.expect("models");
+            let ids: Vec<&str> = listing.models.iter().map(|m| m.id.as_str()).collect();
+            assert_eq!(ids, vec!["gemma4", "broken"]);
+            assert!(listing.models.iter().all(|m| m.details_error.is_none()), "nobody asked");
+            assert_eq!(db::get_provider_model(&pool, p.id, "gemma4").await.expect("get"), None, "nothing stored");
+        }
+
+        /// SME-72 review: adding a model by id keeps any settings it has.
+        #[sqlx::test]
+        async fn test_adding_a_model_by_id_keeps_its_settings(pool: PgPool) {
+            let p = provider(&pool, "p", "api_key").await;
+            set_model_settings(&pool, p.id, "llama3", Some(false), Some(32_768)).await.expect("set");
+            add_model(&pool, p.id, " llama3 ").await.expect("add");
+            let row = db::get_provider_model(&pool, p.id, "llama3").await.expect("get").expect("exists");
+            assert_eq!((row.thinking, row.context_window), (Some(false), Some(32_768)));
+            add_model(&pool, p.id, "fresh").await.expect("add");
+            assert!(db::get_provider_model(&pool, p.id, "fresh").await.expect("get").is_some());
+            assert!(add_model(&pool, p.id, "  ").await.is_err());
+            assert_eq!(
+                add_model(&pool, p.id + 1, "m").await,
+                Err("That provider no longer exists.".to_string())
+            );
+        }
+
         #[sqlx::test]
         async fn test_an_unreachable_providers_models_still_list_what_is_stored(pool: PgPool) {
             let p = db::create_inference_provider(&pool, "gone", "anthropic", "http://127.0.0.1:1", "api_key", "k")
                 .await
                 .expect("create");
             set_model_settings(&pool, p.id, "claude-opus-5", Some(true), None).await.expect("set");
-            let listing = provider_models(&pool, p.id).await.expect("models");
+            let listing = provider_models(&pool, p.id, true).await.expect("models");
             assert!(listing.listing_error.is_some());
             assert_eq!(listing.models.len(), 1);
             assert_eq!(listing.models[0].id, "claude-opus-5");

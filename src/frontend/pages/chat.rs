@@ -3415,6 +3415,15 @@ fn ChatPanel(
                                 }
                                 Some(Ok(ConversationEvent::ModelChanged {} | ConversationEvent::ProvidersChanged {})) => {
                                     *model_changed.write() += 1;
+                                    // Another model can mean another context
+                                    // window: the meter measures against it.
+                                    spawn(async move {
+                                        if let Ok(snapshot) = get_context_usage(id).await
+                                            && selected() == Some(id)
+                                        {
+                                            context_usage.set(Some(snapshot));
+                                        }
+                                    });
                                 }
                                 Some(Ok(ConversationEvent::TurnState { running })) => {
                                     turn_running.set(running);

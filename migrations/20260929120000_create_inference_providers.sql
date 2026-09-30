@@ -43,12 +43,16 @@ CREATE TABLE inference_settings (
 );
 
 -- A conversation's own provider and model; null until its first turn takes
--- the default. model_changed_at_message_id: the conversation's last message
--- when its model last changed, so older thinking blocks (signed by another
--- provider) aren't replayed.
+-- the default. last_turn_model_key: the backend its last turn ran on
+-- (provider, base URL, model), and model_changed_at_message_id its last
+-- message when a turn started on a different one, so older thinking blocks
+-- (signed by another backend) aren't replayed. Both are set when a turn
+-- starts, under the turn lock, not when the model is picked: a turn still
+-- running keeps writing for the old model.
 ALTER TABLE conversations
     ADD COLUMN provider_id BIGINT REFERENCES inference_providers (id) ON DELETE RESTRICT,
     ADD COLUMN model TEXT,
+    ADD COLUMN last_turn_model_key TEXT,
     ADD COLUMN model_changed_at_message_id BIGINT,
     ADD CONSTRAINT conversations_provider_and_model_together
         CHECK ((provider_id IS NULL) = (model IS NULL));

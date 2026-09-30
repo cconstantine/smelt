@@ -5,7 +5,7 @@ use dioxus::prelude::*;
 
 use crate::api::chat::{get_conversation_model, set_conversation_model};
 use crate::api::providers::{
-    create_provider, delete_provider, get_default_model, get_provider, list_provider_models,
+    add_provider_model, create_provider, delete_provider, get_default_model, get_provider, list_provider_models,
     list_providers, refresh_model_details, set_default_model, set_model_settings, update_provider,
 };
 use crate::frontend::Route;
@@ -50,6 +50,34 @@ pub(crate) fn group_digits(n: u32) -> String {
     out
 }
 
+/// A thinking override as the row's select names it.
+fn thinking_choice(thinking: Option<bool>) -> &'static str {
+    match thinking {
+        None => "default",
+        Some(true) => "on",
+        Some(false) => "off",
+    }
+}
+
+fn thinking_from_choice(choice: &str) -> Option<bool> {
+    match choice {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// The select's labels; "default" says what it currently means when known.
+fn thinking_label(choice: &str, provider_thinking: Option<bool>) -> &'static str {
+    match (choice, provider_thinking) {
+        ("on", _) => "On",
+        ("off", _) => "Off",
+        (_, Some(true)) => "Provider's default (on)",
+        (_, Some(false)) => "Provider's default (off)",
+        (_, None) => "Provider's default",
+    }
+}
+
 /// A model's line in a list: its id, and its display name when it has one.
 fn model_label(model: &ModelInfo) -> String {
     match &model.display_name {
@@ -82,7 +110,7 @@ fn ModelChooser(
     let mut model = use_signal(|| initial_model.clone());
     let listing = use_resource(move || async move {
         match provider() {
-            Some(id) => Some(list_provider_models(id).await),
+            Some(id) => Some(list_provider_models(id, false).await),
             None => None,
         }
     });
@@ -227,6 +255,7 @@ pub(crate) fn ModelPicker(conversation_id: i64, refresh: Signal<u64>, ready: Sig
                 Some(Ok(ConversationModel::Default { choice })) if !choosing() => rsx! {
                     ModelPickerCurrent { choice, is_default: true, on_change: move |_| choosing.set(true) }
                 },
+                Some(Ok(_)) if provider_list.is_empty() => rsx! { span { class: "muted", "Loading providers\u{2026}" } },
                 Some(Ok(_)) => rsx! {
                     ModelChooser {
                         providers: provider_list,
@@ -430,8 +459,8 @@ fn ProviderFields(
     };
     let secret_placeholder = match (is_new, &secret_hint) {
         (true, _) => "The API key or token".to_string(),
-        (false, Some(hint)) => format!("Stored ({hint}). Leave blank to keep it."),
-        (false, None) => "Stored. Leave blank to keep it.".to_string(),
+        (false, Some(hint)) => format!("Stored ({hint}). Leave blank to keep it, unless the URL changes."),
+        (false, None) => "Stored. Leave blank to keep it, unless the URL changes.".to_string(),
     };
     rsx! {
         form { class: "mcp-add-form provider-form", onsubmit: submit,
@@ -607,9 +636,10 @@ fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
     let listing = use_resource(move || async move {
         refresh();
         local_refresh();
-        list_provider_models(id).await
+        list_provider_models(id, true).await
     });
     let mut typed = use_signal(String::new);
+    let mut add_error: Signal<Option<String>> = use_signal(|| None);
     rsx! {
         section { class: "provider-models",
             h2 { "Models" }
@@ -628,7 +658,7 @@ fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
                     }
                     div { class: "provider-model-list",
                         for model in listing.models {
-                            ProviderModelRow { key: "{model.id}", id, model, on_saved: move |_| *local_refresh.write() += 1 }
+                            ProviderModelRow { key: "{model.id}", id, model }
                         }
                     }
                 },
@@ -642,9 +672,13 @@ fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
                         return;
                     }
                     spawn(async move {
-                        if set_model_settings(id, model, None, None).await.is_ok() {
-                            typed.set(String::new());
-                            *local_refresh.write() += 1;
+                        match add_provider_model(id, model).await {
+                            Ok(()) => {
+                                add_error.set(None);
+                                typed.set(String::new());
+                                *local_refresh.write() += 1;
+                            }
+                            Err(e) => add_error.set(Some(server_error_message(&e))),
                         }
                     });
                 },
@@ -652,18 +686,28 @@ fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
                 input { id: "provider-model-typed", r#type: "text", placeholder: "Model id", value: "{typed}",
                     oninput: move |e| typed.set(e.value()) }
                 button { r#type: "submit", "Add" }
+                if let Some(err) = add_error() {
+                    span { class: "error", "{err}" }
+                }
             }
         }
     }
 }
 
 #[component]
-fn ProviderModelRow(id: i64, model: ModelInfo, on_saved: EventHandler<()>) -> Element {
+fn ProviderModelRow(id: i64, model: ModelInfo) -> Element {
     let mut window = use_signal(|| model.context_window_override.map(|w| w.to_string()).unwrap_or_default());
-    let mut thinking = use_signal(|| model.thinking);
+    let mut thinking = use_signal(|| model.thinking_override);
     let mut error: Signal<Option<String>> = use_signal(|| None);
     let mut saved = use_signal(|| false);
     let model_id = model.id.clone();
+    // What "provider's default" currently means: shown only when the row
+    // has no override, since `model.thinking` is then the provider's.
+    let provider_thinking = if model.thinking_override.is_some() {
+        None
+    } else {
+        Some(model.thinking)
+    };
     let window_placeholder = if model.context_window_known {
         group_digits(model.context_window)
     } else {
@@ -686,11 +730,10 @@ fn ProviderModelRow(id: i64, model: ModelInfo, on_saved: EventHandler<()>) -> El
         };
         let model_id = model_id.clone();
         spawn(async move {
-            match set_model_settings(id, model_id, Some(thinking()), context_window).await {
+            match set_model_settings(id, model_id, thinking(), context_window).await {
                 Ok(()) => {
                     error.set(None);
                     saved.set(true);
-                    on_saved.call(());
                 }
                 Err(e) => error.set(Some(server_error_message(&e))),
             }
@@ -712,11 +755,22 @@ fn ProviderModelRow(id: i64, model: ModelInfo, on_saved: EventHandler<()>) -> El
                     } }
             }
             label { class: "provider-model-thinking",
-                input { r#type: "checkbox", checked: thinking(), onchange: move |e| {
-                    thinking.set(e.checked());
-                    saved.set(false);
-                } }
-                " Thinking"
+                "Thinking "
+                select {
+                    aria_label: "Thinking for {model.id}",
+                    onchange: move |e| {
+                        thinking.set(thinking_from_choice(&e.value()));
+                        saved.set(false);
+                    },
+                    for choice in ["default", "on", "off"] {
+                        option {
+                            key: "{choice}",
+                            value: "{choice}",
+                            selected: thinking_choice(thinking()) == choice,
+                            "{thinking_label(choice, provider_thinking)}"
+                        }
+                    }
+                }
             }
             button { r#type: "submit", "Save" }
             if saved() {
@@ -756,6 +810,16 @@ mod tests {
         assert_eq!(warnings.len(), 2);
         assert!(warnings[0].contains("tools"), "{warnings:?}");
         assert!(warnings[1].contains("200,000"), "{warnings:?}");
+    }
+
+    /// SME-72 review: "provider's default" is a choice of its own, so
+    /// saving a context window doesn't pin thinking.
+    #[test]
+    fn test_thinking_choices_round_trip_including_no_override() {
+        for thinking in [None, Some(true), Some(false)] {
+            assert_eq!(thinking_from_choice(thinking_choice(thinking)), thinking);
+        }
+        assert_eq!(thinking_label("default", Some(false)), "Provider's default (off)");
     }
 
     #[test]

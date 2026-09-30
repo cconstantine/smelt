@@ -47,10 +47,21 @@ pub async fn delete_provider(id: i64) -> ServerFnResult<()> {
         .map_err(ServerFnError::new)
 }
 
-/// The provider's models, asking the provider (up to 10 seconds a request).
-#[get("/api/providers/{id}/models")]
-pub async fn list_provider_models(id: i64) -> ServerFnResult<ProviderModels> {
-    crate::providers::provider_models(db::get(), id)
+/// The provider's models, asking the provider (up to 10 seconds a
+/// request). `ask_each`: also ask an Ollama server about each model, for
+/// the provider's page; the picker's suggestions skip that.
+#[get("/api/providers/{id}/models?ask_each")]
+pub async fn list_provider_models(id: i64, ask_each: bool) -> ServerFnResult<ProviderModels> {
+    crate::providers::provider_models(db::get(), id, ask_each)
+        .await
+        .map_err(ServerFnError::new)
+}
+
+/// Adds a model the provider's listing doesn't show, keeping any settings
+/// it already has.
+#[post("/api/providers/{id}/models/add")]
+pub async fn add_provider_model(id: i64, model: String) -> ServerFnResult<()> {
+    crate::providers::add_model(db::get(), id, &model)
         .await
         .map_err(ServerFnError::new)
 }

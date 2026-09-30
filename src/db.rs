@@ -1777,6 +1777,19 @@ pub async fn list_provider_models(
     .await
 }
 
+/// Adds a row for a model, leaving an existing one as it is.
+pub async fn ensure_provider_model(pool: &PgPool, provider_id: i64, model: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model) VALUES ($1, $2)
+         ON CONFLICT (provider_id, model) DO NOTHING",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Sets the user's overrides for a model, leaving what the provider
 /// reported alone. `None` clears an override.
 pub async fn set_provider_model_overrides(
@@ -1878,27 +1891,17 @@ pub async fn get_conversation_model(
     .await
 }
 
-/// Sets a conversation's provider and model. When that changes them, it
-/// also records the conversation's last message, so thinking blocks up to
-/// there (signed by the old provider) aren't replayed to the new one.
-/// Returns whether the conversation exists.
+/// Sets a conversation's provider and model, from its next turn on. The
+/// switch point for its thinking blocks is recorded when that turn starts
+/// (`record_turn_model`), since a turn still running keeps writing for the
+/// old model. Returns whether the conversation exists.
 pub async fn set_conversation_model(
     pool: &PgPool,
     conversation_id: i64,
     provider_id: i64,
     model: &str,
 ) -> Result<bool, sqlx::Error> {
-    // The right-hand sides read the row's values from before the update.
-    let updated = sqlx::query(
-        "UPDATE conversations
-         SET provider_id = $2, model = $3,
-             model_changed_at_message_id = CASE
-                 WHEN provider_id IS DISTINCT FROM $2 OR model IS DISTINCT FROM $3
-                 THEN (SELECT max(id) FROM messages WHERE conversation_id = $1)
-                 ELSE model_changed_at_message_id
-             END
-         WHERE id = $1",
-    )
+    let updated = sqlx::query("UPDATE conversations SET provider_id = $2, model = $3 WHERE id = $1")
     .bind(conversation_id)
     .bind(provider_id)
     .bind(model)
@@ -1906,6 +1909,35 @@ pub async fn set_conversation_model(
     .await?
     .rows_affected();
     Ok(updated == 1)
+}
+
+/// Records that a turn is starting on the backend `model_key` names
+/// (provider, base URL and model), and returns the message up to which
+/// thinking must be left out: when it differs from the last turn's
+/// backend, that's the conversation's last message now. Call under the
+/// conversation's turn lock, so no turn is writing meanwhile.
+pub async fn record_turn_model(
+    pool: &PgPool,
+    conversation_id: i64,
+    model_key: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    // The right-hand sides read the row's values from before the update.
+    let stamp: Option<(Option<i64>,)> = sqlx::query_as(
+        "UPDATE conversations
+         SET model_changed_at_message_id = CASE
+                 WHEN last_turn_model_key IS DISTINCT FROM $2
+                 THEN (SELECT max(id) FROM messages WHERE conversation_id = $1)
+                 ELSE model_changed_at_message_id
+             END,
+             last_turn_model_key = $2
+         WHERE id = $1
+         RETURNING model_changed_at_message_id",
+    )
+    .bind(conversation_id)
+    .bind(model_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(stamp.and_then(|(id,)| id))
 }
 
 /// Gives a conversation with no model the default, in one statement so a
@@ -1917,8 +1949,7 @@ pub async fn adopt_default_model(
 ) -> Result<Option<(i64, String)>, sqlx::Error> {
     let adopted: Option<(i64, String)> = sqlx::query_as(
         "UPDATE conversations c
-         SET provider_id = s.default_provider_id, model = s.default_model,
-             model_changed_at_message_id = (SELECT max(id) FROM messages WHERE conversation_id = c.id)
+         SET provider_id = s.default_provider_id, model = s.default_model
          FROM inference_settings s
          WHERE c.id = $1 AND c.provider_id IS NULL AND s.default_provider_id IS NOT NULL
          RETURNING c.provider_id, c.model",
@@ -3696,12 +3727,11 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_changing_a_conversations_model_records_its_last_message(pool: PgPool) {
+    async fn test_setting_a_conversations_model_leaves_the_switch_point_to_its_next_turn(pool: PgPool) {
         let provider = test_provider(&pool, "p").await;
         let conversation = create_conversation(&pool).await.expect("conversation");
         let text = [ContentBlock::Text { text: "hi".to_string() }];
         create_message(&pool, conversation.id, "user", &text).await.expect("message");
-        let last = create_message(&pool, conversation.id, "assistant", &text).await.expect("message");
 
         assert!(set_conversation_model(&pool, conversation.id, provider.id, "m1").await.expect("set"));
         let set = get_conversation_model(&pool, conversation.id).await.expect("get").expect("exists");
@@ -3710,23 +3740,33 @@ mod tests {
             ConversationModelRow {
                 provider_id: Some(provider.id),
                 model: Some("m1".to_string()),
-                model_changed_at_message_id: Some(last.id),
-            }
+                model_changed_at_message_id: None,
+            },
+            "a running turn may still write for the old model, so the pick doesn't mark the switch"
         );
-
-        // Setting the same pair again after more messages isn't a change.
-        create_message(&pool, conversation.id, "user", &text).await.expect("message");
-        assert!(set_conversation_model(&pool, conversation.id, provider.id, "m1").await.expect("set"));
-        let same = get_conversation_model(&pool, conversation.id).await.expect("get").expect("exists");
-        assert_eq!(same.model_changed_at_message_id, Some(last.id));
-
-        // A different model is.
-        let newest = create_message(&pool, conversation.id, "assistant", &text).await.expect("message");
-        set_conversation_model(&pool, conversation.id, provider.id, "m2").await.expect("set");
-        let switched = get_conversation_model(&pool, conversation.id).await.expect("get").expect("exists");
-        assert_eq!(switched.model_changed_at_message_id, Some(newest.id));
-
         assert!(!set_conversation_model(&pool, 999_999, provider.id, "m1").await.expect("set"));
+    }
+
+    /// SME-72 review: the switch point is where a turn starts on a
+    /// different backend than the last turn, recorded under the turn lock.
+    #[sqlx::test]
+    async fn test_a_turn_on_a_different_backend_records_the_switch_point(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let text = [ContentBlock::Text { text: "hi".to_string() }];
+        let first = create_message(&pool, conversation.id, "user", &text).await.expect("message");
+
+        assert_eq!(record_turn_model(&pool, conversation.id, "1 http://a m1").await.expect("record"), Some(first.id));
+        let reply = create_message(&pool, conversation.id, "assistant", &text).await.expect("message");
+        assert_eq!(
+            record_turn_model(&pool, conversation.id, "1 http://a m1").await.expect("record"),
+            Some(first.id),
+            "the same backend again: unchanged"
+        );
+        assert_eq!(
+            record_turn_model(&pool, conversation.id, "1 http://b m1").await.expect("record"),
+            Some(reply.id),
+            "another base URL is another backend"
+        );
     }
 
     #[sqlx::test]

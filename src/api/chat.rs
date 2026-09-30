@@ -1901,10 +1901,8 @@ pub struct ContextUsageSnapshot {
     pub context_window: u32,
 }
 
-/// One-shot pull for the always-visible context-usage indicator — same
-/// shape as `get_tasks`/`get_sandbox_state`.
-/// Which model the conversation's next turn uses, for the picker next to
-/// Send (SME-72).
+/// Which model the conversation's next turn uses, for the picker above the
+/// message box (SME-72).
 #[get("/api/conversations/{id}/model")]
 pub async fn get_conversation_model(id: i64) -> ServerFnResult<crate::providers::ConversationModel> {
     crate::providers::conversation_model(db::get(), id)
@@ -1922,6 +1920,8 @@ pub async fn set_conversation_model(id: i64, provider_id: i64, model: String) ->
         .map_err(ServerFnError::new)
 }
 
+/// One-shot pull for the always-visible context-usage indicator — same
+/// shape as `get_tasks`/`get_sandbox_state`.
 #[get("/api/conversations/{id}/context-usage")]
 pub async fn get_context_usage(id: i64) -> ServerFnResult<ContextUsageSnapshot> {
     let pool = db::get();
@@ -1969,15 +1969,15 @@ async fn context_detail(pool: &PgPool, id: i64) -> ServerFnResult<ContextDetailS
     let usage = db::get_conversation_usage(pool, id)
         .await
         .map_err(ServerFnError::new)?;
-    let model = match crate::providers::conversation_model(pool, id)
+    let (model, context_window) = match crate::providers::conversation_model(pool, id)
         .await
         .map_err(ServerFnError::new)?
     {
         Some(
             crate::providers::ConversationModel::Chosen { choice }
             | crate::providers::ConversationModel::Default { choice },
-        ) => choice.model,
-        _ => String::new(),
+        ) => (choice.model, choice.context_window),
+        _ => (String::new(), crate::providers::ASSUMED_CONTEXT_WINDOW),
     };
     Ok(ContextDetailSnapshot {
         system: Some(system_prompt(&prompt_environment(pool, id, &model).await)),
@@ -1987,7 +1987,7 @@ async fn context_detail(pool: &PgPool, id: i64) -> ServerFnResult<ContextDetailS
         tools,
         message_count,
         usage,
-        context_window: crate::providers::conversation_context_window(pool, id).await,
+        context_window,
     })
 }
 
