@@ -174,47 +174,56 @@ fn unique_id(label: &str) -> String {
 }
 
 /// Clicks `selector` once it exists and has stopped moving, and makes sure
-/// the press landed on it, retrying until `timeout` if it didn't.
+/// the click landed on it, retrying until `timeout` if it didn't.
 ///
-/// A chromiumoxide click reads the element's position and then presses the
-/// mouse there, in separate round trips. In the first moments after a load
-/// the chat page keeps re-scrolling its transcript to the bottom as data
-/// arrives, so a click aimed at an element that moves in between lands on
-/// something else. On SME-68 that was 8 clicks in 40 on the compaction
-/// divider, throttled: the press hit `.messages` and nothing opened. So
-/// this scrolls the element into view and waits until it's still
-/// (`wait_for_stable`), clicks, then reads what the press actually hit (a
-/// capturing `mousedown` listener): a miss is tried again. A press that
-/// lands elsewhere does whatever that element does, which in practice has
-/// been the transcript's background.
+/// A chromiumoxide click scrolls the element into view, reads its position,
+/// then presses and releases the mouse there, in separate round trips. In
+/// the first moments after a load the chat page keeps re-scrolling its
+/// transcript to the bottom as data arrives, so a click aimed at an element
+/// that moves in between lands on something else. On SME-68 that was 8
+/// clicks in 40 on the compaction divider, throttled: the press hit
+/// `.messages` and nothing opened. So this waits until the element is still
+/// (`wait_for_stable`), clicks, then checks the resulting `click` event's
+/// target was that very element (held by reference, so a list re-sorting
+/// meanwhile doesn't confuse it): a miss is tried again. A click that
+/// loaded another page takes the check with it, and counts as landed. A
+/// miss that hit something with its own action does that action too; in
+/// practice it has been the transcript's background.
 async fn click_when_present(page: &chromiumoxide::Page, selector: &str, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     let watch = format!(
-        "(() => {{ window.__smeltPressSelector = {selector:?}; window.__smeltPress = 'no press seen'; \
-         if (!window.__smeltPressWatcher) {{ window.__smeltPressWatcher = true; \
-         document.addEventListener('mousedown', e => {{ const el = document.querySelector(window.__smeltPressSelector); \
-         window.__smeltPress = el && (el === e.target || el.contains(e.target)) ? 'hit' : 'pressed ' + (e.target.className || e.target.tagName); }}, true); }} }})()"
+        "(() => {{ const el = document.querySelector({selector:?}); if (!el) return false; \
+         window.__smeltClickTarget = el; window.__smeltClick = 'no click seen'; \
+         if (!window.__smeltClickWatcher) {{ window.__smeltClickWatcher = true; \
+         document.addEventListener('click', e => {{ const t = window.__smeltClickTarget; \
+         window.__smeltClick = t && (t === e.target || t.contains(e.target)) ? 'hit' : 'clicked ' + (e.target.className || e.target.tagName); }}, true); }} \
+         return true; }})()"
     );
+    let outcome = "typeof window.__smeltClick === 'string' ? window.__smeltClick : 'navigated'";
     let mut last = String::new();
     loop {
         wait_for_stable(page, selector, deadline).await;
-        if let Err(e) = page.evaluate(watch.as_str()).await {
-            last = format!("couldn't watch the press: {e}");
-        } else {
+        let watching = match page.evaluate(watch.as_str()).await {
+            Ok(value) => value.into_value::<bool>().unwrap_or(false),
+            Err(e) => {
+                last = format!("couldn't watch the click: {e}");
+                false
+            }
+        };
+        if watching {
             match page.find_element(selector).await {
                 Err(e) => last = format!("gone before the click: {e}"),
                 Ok(element) => match element.click().await {
                     Err(e) => last = format!("the click failed: {e}"),
-                    Ok(_) => match page.evaluate("window.__smeltPress").await {
-                        // A click that navigated away took the listener
-                        // with it: it did something, so it counts.
+                    Ok(_) => match page.evaluate(outcome).await {
+                        // The page went away mid-read: the click did something.
                         Err(_) => return,
                         Ok(value) => {
-                            let press: String = value.into_value().unwrap_or_default();
-                            if press == "hit" {
+                            let result: String = value.into_value().unwrap_or_default();
+                            if result == "hit" || result == "navigated" {
                                 return;
                             }
-                            last = press;
+                            last = result;
                         }
                     },
                 },
@@ -228,17 +237,19 @@ async fn click_when_present(page: &chromiumoxide::Page, selector: &str, timeout:
     }
 }
 
-/// Scrolls `selector`'s element into view and waits until it has the same
-/// box on two reads 150 ms apart and is the element at its own centre (or
-/// contains it), so a click aimed at it lands on it. Panics at `deadline`
-/// naming what kept it from settling.
-async fn wait_for_stable(page: &chromiumoxide::Page, selector: &str, deadline: tokio::time::Instant) {
+/// Waits until `selector`'s element exists and has the same box on two
+/// reads 150 ms apart, without scrolling anything itself (that would both
+/// hide movement and change the page: scrolling the transcript turns off
+/// its stick-to-bottom). When its centre is on screen, it must also be the
+/// element there (or contain it), so nothing covers it. Returns its box;
+/// panics at `deadline` naming what kept it from settling.
+async fn wait_for_stable(page: &chromiumoxide::Page, selector: &str, deadline: tokio::time::Instant) -> String {
     let probe = format!(
         "(() => {{ const el = document.querySelector({selector:?}); if (!el) return 'missing'; \
-         el.scrollIntoView({{ block: 'nearest', inline: 'nearest' }}); \
          const r = el.getBoundingClientRect(); if (r.width === 0 || r.height === 0) return 'hidden'; \
-         const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2); \
-         if (!hit || !(hit === el || el.contains(hit))) return 'covered by ' + (hit ? (hit.className || hit.tagName) : 'nothing'); \
+         const x = r.x + r.width / 2, y = r.y + r.height / 2; \
+         if (x >= 0 && y >= 0 && x < innerWidth && y < innerHeight) {{ const hit = document.elementFromPoint(x, y); \
+         if (!hit || !(hit === el || el.contains(hit))) return 'covered by ' + (hit ? (hit.className || hit.tagName) : 'nothing'); }} \
          return [r.x, r.y, r.width, r.height].map(Math.round).join(','); }})()"
     );
     let mut last = String::new();
@@ -248,7 +259,7 @@ async fn wait_for_stable(page: &chromiumoxide::Page, selector: &str, deadline: t
             Err(e) => format!("couldn't read it: {e}"),
         };
         if state.contains(',') && !state.starts_with("couldn't") && state == last {
-            return;
+            return state;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -736,20 +747,10 @@ async fn test_end_to_end_browser_scenarios() {
         .await;
         // The open state first: if it's closed, the click missed or
         // something closed it (SME-68), which the text alone can't tell.
-        let mut open = false;
-        for _ in 0..25 {
-            open = context_page
-                .evaluate("!!document.querySelector('.compaction-summary-block')?.open")
-                .await
-                .expect("read the divider")
-                .into_value()
-                .expect("a bool");
-            if open {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        assert!(open, "the divider should be open after clicking its header");
+        assert!(
+            wait_for_count(&context_page, ".compaction-summary-block[open]", 1, Duration::from_secs(5)).await,
+            "the divider should be open after clicking its header"
+        );
         assert!(
             wait_for_text(
                 &context_page,
@@ -1247,8 +1248,7 @@ async fn test_end_to_end_browser_scenarios() {
         // button had reserved for it (SME-40 F9). Arming is client-side
         // only; closing this tab disarms it.
         let delete = ".conversation-item .delete-conversation";
-        wait_for_element(&page, delete, Duration::from_secs(10)).await;
-        wait_for_stable(&page, delete, tokio::time::Instant::now() + Duration::from_secs(5)).await;
+        wait_for_stable(&page, delete, tokio::time::Instant::now() + Duration::from_secs(10)).await;
         let before = element_box(&page, delete).await;
         click_when_present(&page, delete, Duration::from_secs(5)).await;
         wait_for_element(&page, ".conversation-item .delete-conversation.confirm", Duration::from_secs(5)).await;
