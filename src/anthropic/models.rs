@@ -53,39 +53,40 @@ fn parse_v1_models(body: &Value) -> Result<(Vec<ListedModel>, Option<String>), S
         .get("data")
         .and_then(Value::as_array)
         .ok_or("the model listing has no \"data\" array")?;
-    let models = data
-        .iter()
-        .filter_map(|entry| {
-            let id = entry.get("id")?.as_str()?.to_string();
-            // Anthropic's `max_input_tokens`, or llama.cpp's runtime
-            // `meta.n_ctx`. Zero (the docs' placeholder) isn't a size.
-            let context_window = entry
-                .get("max_input_tokens")
-                .or_else(|| entry.pointer("/meta/n_ctx"))
-                .and_then(Value::as_u64)
-                .and_then(|n| u32::try_from(n).ok())
-                .filter(|n| *n > 0);
-            Some(ListedModel {
-                display_name: entry
-                    .get("display_name")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                details: ModelDetails {
-                    context_window,
-                    thinking: entry
-                        .pointer("/capabilities/thinking/supported")
-                        .and_then(Value::as_bool),
-                    tools: None,
-                },
-                id,
-            })
-        })
-        .collect();
+    let models = data.iter().filter_map(parse_v1_model).collect();
     let next = match body.get("has_more").and_then(Value::as_bool) {
         Some(true) => body.get("last_id").and_then(Value::as_str).map(str::to_string),
         _ => None,
     };
     Ok((models, next))
+}
+
+/// One model entry of a `/v1/models` listing, or Anthropic's
+/// `/v1/models/{id}`.
+fn parse_v1_model(entry: &Value) -> Option<ListedModel> {
+    let id = entry.get("id")?.as_str()?.to_string();
+    // Anthropic's `max_input_tokens`, or llama.cpp's runtime
+    // `meta.n_ctx`. Zero (the docs' placeholder) isn't a size.
+    let context_window = entry
+        .get("max_input_tokens")
+        .or_else(|| entry.pointer("/meta/n_ctx"))
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0);
+    Some(ListedModel {
+        display_name: entry
+            .get("display_name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        details: ModelDetails {
+            context_window,
+            thinking: entry
+                .pointer("/capabilities/thinking/supported")
+                .and_then(Value::as_bool),
+            tools: None,
+        },
+        id,
+    })
 }
 
 /// Parses Ollama's `/api/tags`: the local models' names.
@@ -155,6 +156,16 @@ fn parse_ollama_ps(body: &Value, model: &str) -> Option<u32> {
         .as_u64()
         .and_then(|n| u32::try_from(n).ok())
         .filter(|n| *n > 0)
+}
+
+/// `text` as one URL path segment: a model id may hold `/` or `:`.
+fn url_segment(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// Sends `request` (with `endpoint`'s credential) and reads a JSON body,
@@ -265,7 +276,15 @@ pub async fn model_details(
     model: &str,
 ) -> Result<ModelDetails, String> {
     match kind {
-        ProviderKind::Anthropic | ProviderKind::Other => Ok(list_v1_models(endpoint)
+        // One request: Anthropic serves a single model's entry.
+        ProviderKind::Anthropic => {
+            let request = endpoint
+                .client()?
+                .get(endpoint.url(&format!("/v1/models/{}", url_segment(model))));
+            let body = fetch_json(endpoint, request).await?;
+            Ok(parse_v1_model(&body).map(|m| m.details).unwrap_or_default())
+        }
+        ProviderKind::Other => Ok(list_v1_models(endpoint)
             .await?
             .into_iter()
             .find(|listed| listed.id == model)
@@ -529,6 +548,17 @@ mod tests {
         assert_eq!(details.context_window, Some(2048));
         let paths: Vec<String> = seen.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(p, _)| p.clone()).collect();
         assert_eq!(paths, vec!["/api/show".to_string()]);
+    }
+
+    /// SME-72 review 3: one Anthropic model's details are one request.
+    #[tokio::test]
+    async fn test_an_anthropic_models_details_are_one_request() {
+        let one = r#"{"id":"claude-x","display_name":"X","max_input_tokens":1000000,"capabilities":{"thinking":{"supported":true}},"type":"model"}"#;
+        let (endpoint, seen) = mock_provider(vec![("/v1/models/claude-x", one.to_string())]).await;
+        let details = model_details(ProviderKind::Anthropic, &endpoint, "claude-x").await.expect("details");
+        assert_eq!(details, ModelDetails { context_window: Some(1_000_000), thinking: Some(true), tools: None });
+        let paths: Vec<String> = seen.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(paths, vec!["/v1/models/claude-x".to_string()]);
     }
 
     #[tokio::test]

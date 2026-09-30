@@ -222,14 +222,15 @@ pub(crate) fn ModelPicker(conversation_id: i64, refresh: Signal<u64>, ready: Sig
             }
         });
     };
-    let provider_list = match providers() {
-        Some(Ok(list)) => list,
-        _ => Vec::new(),
+    let (provider_list, providers_error) = match providers() {
+        Some(Ok(list)) => (list, None),
+        Some(Err(e)) => (Vec::new(), Some(server_error_message(&e))),
+        None => (Vec::new(), None),
     };
     let (current_provider, current_model) = match state() {
-        Some(Ok(ConversationModel::Chosen { choice } | ConversationModel::Default { choice })) => {
-            (Some(choice.provider_id), choice.model)
-        }
+        Some(Ok(model)) => model
+            .choice()
+            .map_or((None, String::new()), |c| (Some(c.provider_id), c.model.clone())),
         _ => (None, String::new()),
     };
     rsx! {
@@ -255,7 +256,12 @@ pub(crate) fn ModelPicker(conversation_id: i64, refresh: Signal<u64>, ready: Sig
                 Some(Ok(ConversationModel::Default { choice })) if !choosing() => rsx! {
                     ModelPickerCurrent { choice, is_default: true, on_change: move |_| choosing.set(true) }
                 },
-                Some(Ok(_)) if provider_list.is_empty() => rsx! { span { class: "muted", "Loading providers\u{2026}" } },
+                Some(Ok(_)) if provider_list.is_empty() => rsx! {
+                    match providers_error.clone() {
+                        Some(err) => rsx! { span { class: "error", "Couldn't load the providers: {err}" } },
+                        None => rsx! { span { class: "muted", "Loading providers\u{2026}" } },
+                    }
+                },
                 Some(Ok(_)) => rsx! {
                     ModelChooser {
                         providers: provider_list,
@@ -562,18 +568,22 @@ pub fn ProviderEdit(id: i64) -> Element {
     let mut saved = use_signal(|| false);
     let mut armed = use_signal(|| false);
     let mut models_refresh = use_signal(|| 0u64);
+    // The key's hint, updated by a save that sets a new key.
+    let mut secret_hint: Signal<Option<String>> = use_signal(|| None);
     use_effect(move || {
         if let Some(Ok(p)) = &*provider.read()
             && !loaded()
         {
             form.set(ProviderForm::from_summary(p));
+            secret_hint.set(p.secret_hint.clone());
             loaded.set(true);
         }
     });
     let save = move |input: ProviderInput| {
         spawn(async move {
             match update_provider(id, input).await {
-                Ok(_) => {
+                Ok(saved_provider) => {
+                    secret_hint.set(saved_provider.secret_hint);
                     error.set(None);
                     saved.set(true);
                     form.write().secret.clear();
@@ -610,8 +620,8 @@ pub fn ProviderEdit(id: i64) -> Element {
             match provider() {
                 None => rsx! { p { class: "muted", "Loading..." } },
                 Some(Err(e)) => rsx! { p { class: "error", "{server_error_message(&e)}" } },
-                Some(Ok(p)) => rsx! {
-                    ProviderFields { form, is_new: false, secret_hint: p.secret_hint.clone(), save_label: "Save", error: error(), on_save: save }
+                Some(Ok(_)) => rsx! {
+                    ProviderFields { form, is_new: false, secret_hint: secret_hint(), save_label: "Save", error: error(), on_save: save }
                     if saved() {
                         p { class: "muted provider-saved", "Saved." }
                     }

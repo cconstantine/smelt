@@ -368,29 +368,27 @@ fn history_for_request(
     Ok(answer_unfinished_tool_calls(history))
 }
 
-/// Stands in for a message that was nothing but thinking once that's left
-/// out: the API rejects a message with no content.
-#[cfg(feature = "server")]
-const OMITTED_THINKING: &str = "[reasoning written for another model, omitted]";
-
-/// `blocks` without their thinking when `strip` is set, with a stand-in if
-/// that leaves nothing.
+/// `blocks` without their thinking blocks when `strip` is set. A message
+/// that was nothing but thinking keeps its reasoning as plain text instead:
+/// the API rejects a message with no content, and a made-up stand-in would
+/// be text the model might imitate (SME-72 review 3).
 #[cfg(feature = "server")]
 fn strip_foreign_thinking(blocks: Vec<anthropic::ContentBlock>, strip: bool) -> Vec<anthropic::ContentBlock> {
     if !strip {
         return blocks;
     }
-    let kept: Vec<_> = blocks
+    let only_thinking = blocks
+        .iter()
+        .all(|block| matches!(block, anthropic::ContentBlock::Thinking { .. }));
+    blocks
         .into_iter()
-        .filter(|block| !matches!(block, anthropic::ContentBlock::Thinking { .. }))
-        .collect();
-    if kept.is_empty() {
-        vec![anthropic::ContentBlock::Text {
-            text: OMITTED_THINKING.to_string(),
-        }]
-    } else {
-        kept
-    }
+        .filter_map(|block| match block {
+            anthropic::ContentBlock::Thinking { thinking, .. } => {
+                only_thinking.then_some(anthropic::ContentBlock::Text { text: thinking })
+            }
+            other => Some(other),
+        })
+        .collect()
 }
 
 /// Gives every tool call that has no result an error result
@@ -1969,16 +1967,14 @@ async fn context_detail(pool: &PgPool, id: i64) -> ServerFnResult<ContextDetailS
     let usage = db::get_conversation_usage(pool, id)
         .await
         .map_err(ServerFnError::new)?;
-    let (model, context_window) = match crate::providers::conversation_model(pool, id)
+    let (model, context_window) = crate::providers::conversation_model(pool, id)
         .await
         .map_err(ServerFnError::new)?
-    {
-        Some(
-            crate::providers::ConversationModel::Chosen { choice }
-            | crate::providers::ConversationModel::Default { choice },
-        ) => (choice.model, choice.context_window),
-        _ => (String::new(), crate::providers::ASSUMED_CONTEXT_WINDOW),
-    };
+        .as_ref()
+        .and_then(crate::providers::ConversationModel::choice)
+        .map_or((String::new(), crate::providers::ASSUMED_CONTEXT_WINDOW), |choice| {
+            (choice.model.clone(), choice.context_window)
+        });
     Ok(ContextDetailSnapshot {
         system: Some(system_prompt(&prompt_environment(pool, id, &model).await)),
         instructions: crate::git::project_instructions(pool, id)
@@ -2077,8 +2073,10 @@ mod tests {
     }
 
     /// SME-72: after a switch of provider or model, thinking signed for the
-    /// old one isn't replayed, and a message that was only thinking keeps a
-    /// stand-in (the API rejects empty content). Later messages keep theirs.
+    /// old one isn't replayed. A message that was only thinking keeps its
+    /// reasoning as plain text (the API rejects empty content, and a
+    /// made-up stand-in is text the model might imitate; review 3). Later
+    /// messages keep theirs.
     #[test]
     fn test_history_leaves_out_thinking_from_before_a_model_switch() {
         let text = |t: &str| anthropic::ContentBlock::Text { text: t.to_string() };
@@ -2098,7 +2096,7 @@ mod tests {
                 vec![text("hi")],
                 vec![text("hello")],
                 vec![text("go on")],
-                vec![text(OMITTED_THINKING)],
+                vec![text("only thinking")],
                 vec![text("and now?")],
                 vec![thinking_block("new reasoning"), text("sure")],
             ]

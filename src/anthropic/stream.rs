@@ -59,11 +59,16 @@ impl Endpoint {
     /// redirects: reqwest drops `Authorization` on a redirect to another
     /// host but not `x-api-key`, so following one could hand the key to a
     /// host it wasn't entered for. Anthropic-compatible APIs don't redirect.
+    /// One client for every provider, so connections are reused.
     pub fn client(&self) -> Result<reqwest::Client, String> {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| format!("couldn't set up the HTTP client: {e}"))
+        static CLIENT: std::sync::LazyLock<Result<reqwest::Client, String>> =
+            std::sync::LazyLock::new(|| {
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|e| format!("couldn't set up the HTTP client: {e}"))
+            });
+        CLIENT.clone()
     }
 
     /// Adds the credential and the `anthropic-version` header every

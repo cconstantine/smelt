@@ -193,7 +193,15 @@ pub enum ConversationModel {
 impl ConversationModel {
     /// Whether the next turn has a model to run on.
     pub fn is_ready(&self) -> bool {
-        matches!(self, Self::Chosen { .. } | Self::Default { .. })
+        self.choice().is_some()
+    }
+
+    /// The model the next turn runs on, if there is one.
+    pub fn choice(&self) -> Option<&ModelChoice> {
+        match self {
+            Self::Chosen { choice } | Self::Default { choice } => Some(choice),
+            Self::NoDefault {} | Self::NoProviders {} => None,
+        }
     }
 }
 
@@ -336,10 +344,10 @@ mod server {
     /// its model's, else the default's, else `ASSUMED_CONTEXT_WINDOW`.
     pub async fn conversation_context_window(pool: &PgPool, conversation_id: i64) -> u32 {
         match conversation_model(pool, conversation_id).await {
-            Ok(Some(ConversationModel::Chosen { choice } | ConversationModel::Default { choice })) => {
-                choice.context_window
-            }
-            Ok(_) => ASSUMED_CONTEXT_WINDOW,
+            Ok(model) => model
+                .as_ref()
+                .and_then(ConversationModel::choice)
+                .map_or(ASSUMED_CONTEXT_WINDOW, |choice| choice.context_window),
             Err(e) => {
                 tracing::warn!(conversation_id, error = %e, "couldn't read the conversation's model");
                 ASSUMED_CONTEXT_WINDOW
@@ -351,6 +359,20 @@ mod server {
     /// with no model takes the default (and keeps it); with no default it's
     /// `NO_MODEL_CONFIGURED`.
     pub async fn resolve_turn_model(pool: &PgPool, conversation_id: i64) -> Result<TurnModel, String> {
+        // A provider deleted between reading the conversation and reading
+        // the provider has cleared the conversation too: once more takes
+        // the default (SME-72 review 3).
+        match resolve_once(pool, conversation_id).await? {
+            Some(model) => Ok(model),
+            None => resolve_once(pool, conversation_id)
+                .await?
+                .ok_or_else(|| NO_MODEL_CONFIGURED.to_string()),
+        }
+    }
+
+    /// `resolve_turn_model`'s one attempt: `None` when the conversation's
+    /// provider disappeared while it read.
+    async fn resolve_once(pool: &PgPool, conversation_id: i64) -> Result<Option<TurnModel>, String> {
         let db_error = |e: sqlx::Error| e.to_string();
         let mut row = db::get_conversation_model(pool, conversation_id)
             .await
@@ -374,12 +396,14 @@ mod server {
         let (Some(provider_id), Some(model)) = (row.provider_id, row.model) else {
             return Err(NO_MODEL_CONFIGURED.to_string());
         };
-        // The foreign key keeps the provider while a conversation uses it;
-        // gone anyway means the model is.
-        let provider = db::get_inference_provider(pool, provider_id)
+        // The foreign key keeps the provider while a conversation uses it,
+        // so gone means it was deleted just now.
+        let Some(provider) = db::get_inference_provider(pool, provider_id)
             .await
             .map_err(db_error)?
-            .ok_or(NO_MODEL_CONFIGURED)?;
+        else {
+            return Ok(None);
+        };
         let settings = db::get_provider_model(pool, provider_id, &model)
             .await
             .map_err(db_error)?;
@@ -389,13 +413,13 @@ mod server {
         let thinking_stripped_through = db::record_turn_model(pool, conversation_id, &model_key)
             .await
             .map_err(db_error)?;
-        Ok(TurnModel {
+        Ok(Some(TurnModel {
             endpoint: endpoint(&provider),
             thinking: thinking(settings.as_ref()),
             context_window: context_window(&model, settings.as_ref()).0,
             thinking_stripped_through,
             model,
-        })
+        }))
     }
 
     fn providers_changed() {
@@ -493,9 +517,22 @@ mod server {
     /// Deletes a provider; conversations using it take the default at
     /// their next turn (`db::delete_inference_provider`).
     pub async fn delete_provider(pool: &PgPool, id: i64) -> Result<(), String> {
-        db::delete_inference_provider(pool, id)
-            .await
-            .map_err(|e| e.to_string())?;
+        // A turn taking the default, or a pick, can point a conversation
+        // back at the provider between the delete's clearing and its
+        // delete; the foreign key then refuses it, and trying again clears
+        // that too (SME-72 review 3).
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match db::delete_inference_provider(pool, id).await {
+                Ok(_) => break,
+                Err(sqlx::Error::Database(e)) if e.is_foreign_key_violation() && attempts < 3 => continue,
+                Err(sqlx::Error::Database(e)) if e.is_foreign_key_violation() => {
+                    return Err("The provider is being used right now; try again.".to_string());
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
         providers_changed();
         Ok(())
     }
