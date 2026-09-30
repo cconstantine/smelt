@@ -173,11 +173,22 @@ fn unique_id(label: &str) -> String {
     format!("browser-test-{label}-{nanos}")
 }
 
-/// Polls for `selector` to exist and clicks it — `find_element` doesn't
-/// itself wait/retry, and the sidebar's conversation list only appears once
-/// `get_conversations` resolves after hydration.
+/// Polls for `selector` to exist, then clicks it once it has stopped
+/// moving. `find_element` doesn't itself wait/retry, and the sidebar's
+/// conversation list only appears once `get_conversations` resolves after
+/// hydration.
+///
+/// A chromiumoxide click reads the element's position and then presses the
+/// mouse there, in separate round trips. In the first moments after a load
+/// the chat page keeps re-scrolling its transcript to the bottom as data
+/// arrives, so a click aimed at an element that moves in between lands on
+/// something else. On SME-68 that was 8 clicks in 40 on the compaction
+/// divider, throttled: the press hit `.messages` and nothing opened. So
+/// this waits until the element's box is the same on two reads 150 ms
+/// apart and it's what's under its own centre (`wait_for_stable`).
 async fn click_when_present(page: &chromiumoxide::Page, selector: &str, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
+    wait_for_stable(page, selector, deadline).await;
     loop {
         if let Ok(element) = page.find_element(selector).await {
             if element.click().await.is_ok() {
@@ -189,6 +200,37 @@ async fn click_when_present(page: &chromiumoxide::Page, selector: &str, timeout:
             "{selector} never appeared"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Waits until `selector`'s element exists, has the same box on two reads
+/// 150 ms apart, and is the element at its own centre (or contains it), so
+/// a click aimed at it lands on it. Panics at `deadline` naming what kept
+/// it from settling.
+async fn wait_for_stable(page: &chromiumoxide::Page, selector: &str, deadline: tokio::time::Instant) {
+    let probe = format!(
+        "(() => {{ const el = document.querySelector({selector:?}); if (!el) return 'missing'; \
+         const r = el.getBoundingClientRect(); if (r.width === 0 || r.height === 0) return 'hidden'; \
+         const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); \
+         if (!hit || !(hit === el || el.contains(hit))) return 'covered by ' + (hit ? (hit.className || hit.tagName) : 'nothing'); \
+         return [r.left, r.top, r.width, r.height].map(Math.round).join(','); }})()"
+    );
+    let mut last = String::new();
+    loop {
+        let state: String = match page.evaluate(probe.as_str()).await {
+            Ok(value) => value.into_value().unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        let settled = state.contains(',') && state == last;
+        if settled {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{selector} never settled to be clicked: {state}"
+        );
+        last = state;
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
 
@@ -647,6 +689,7 @@ async fn test_end_to_end_browser_scenarios() {
             ))
             .await
             .expect("reload to see the newly seeded message");
+        wait_for_live_client(&context_page, context_conversation.id).await;
         assert!(
             wait_for_text(&context_page, "Conversation compacted", Duration::from_secs(10)).await,
             "a CompactionSummary block should render as its own distinct divider"
@@ -666,6 +709,15 @@ async fn test_end_to_end_browser_scenarios() {
             Duration::from_secs(5),
         )
         .await;
+        // The open state first: if it's closed, the click missed or
+        // something closed it (SME-68), which the text alone can't tell.
+        let open: bool = context_page
+            .evaluate("!!document.querySelector('.compaction-summary-block')?.open")
+            .await
+            .expect("read the divider")
+            .into_value()
+            .expect("a bool");
+        assert!(open, "the divider should be open after clicking its header");
         assert!(
             wait_for_text(
                 &context_page,
