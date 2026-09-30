@@ -3,7 +3,8 @@ mod pages;
 use dioxus::prelude::*;
 use pages::{
     Chat, GitSettingsPage, LanguageServerEdit, LanguageServerNew, LanguageServersIndex, McpServerEdit,
-    McpServerNew, McpServersIndex, PodsIndex, SandboxVolumeNew, SandboxVolumesIndex,
+    McpServerNew, McpServersIndex, PodsIndex, ProviderEdit, ProviderNew, ProvidersIndex, SandboxVolumeNew,
+    SandboxVolumesIndex,
 };
 
 #[derive(Routable, Clone, PartialEq, Debug)]
@@ -32,6 +33,12 @@ pub(crate) enum Route {
     LanguageServerNewRoute {},
     #[route("/language-servers/:id")]
     LanguageServerEditRoute { id: i64 },
+    #[route("/providers")]
+    ProvidersRoute {},
+    #[route("/providers/new")]
+    ProviderNewRoute {},
+    #[route("/providers/:id")]
+    ProviderEditRoute { id: i64 },
     // Anything else, including a conversation id that isn't a number.
     #[route("/:..segments")]
     NotFound { segments: Vec<String> },
@@ -90,6 +97,21 @@ fn LanguageServerNewRoute() -> Element {
 #[component]
 fn LanguageServerEditRoute(id: i64) -> Element {
     rsx! { LanguageServerEdit { id } }
+}
+
+#[component]
+fn ProvidersRoute() -> Element {
+    rsx! { ProvidersIndex {} }
+}
+
+#[component]
+fn ProviderNewRoute() -> Element {
+    rsx! { ProviderNew {} }
+}
+
+#[component]
+fn ProviderEditRoute(id: i64) -> Element {
+    rsx! { ProviderEdit { id } }
 }
 
 /// A URL that isn't one of smelt's pages. Without this the router showed

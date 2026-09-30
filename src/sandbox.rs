@@ -688,8 +688,7 @@ impl SandboxManager {
     }
 }
 
-/// `SANDBOX_MEMORY_LIMIT`, default `"8Gi"` if unset or empty — same
-/// pattern `api::chat::anthropic_model()` uses for `ANTHROPIC_MODEL`. The
+/// `SANDBOX_MEMORY_LIMIT`, default `"8Gi"` if unset or empty. The
 /// *default* a pod gets when `create_pod`'s caller doesn't specify its own
 /// `memory_limit` — see SME-12's "Per-pod limit overrides."
 fn default_memory_limit() -> String {
@@ -3876,15 +3875,10 @@ mod tests {
     }
 
     /// DB-only: the notice lands in the pod's conversation, saying what
-    /// was lost and what wasn't. The wake after it is pointed at a port
-    /// nothing listens on.
+    /// was lost and what wasn't. The wake after it fails at once: the test
+    /// database has no model provider.
     #[sqlx::test]
     async fn test_report_docker_restart_tells_the_pods_conversation(pool: PgPool) {
-        let _anthropic_guard = crate::anthropic::test_support::lock_anthropic_base_url();
-        unsafe {
-            std::env::set_var("ANTHROPIC_BASE_URL", "http://127.0.0.1:1");
-            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-        }
         let conversation = db::create_conversation(&pool).await.expect("create conversation");
         let pod = db::create_sandbox_pod(&pool, conversation.id).await.expect("create pod row");
 
@@ -5347,23 +5341,10 @@ mod tests {
     /// SME-11's "One pod per conversation."
     #[sqlx::test]
     async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
-        // Every terminal command that finishes during this test now
-        // triggers a detached `chat::wake_conversation` call (see
-        // SME-13) — without this
-        // redirect, `ANTHROPIC_API_KEY` present in this environment's real
-        // process env (not just this test's own doing) would send every one
-        // of those as a genuine request to the live Anthropic API. Pointed
-        // instead at a local port nothing listens on, so every such call
-        // fails fast with a local connection error rather than a real
-        // (slow, costly, non-deterministic) network round trip. Held for
-        // the test's whole duration, guarded the same way
-        // `anthropic::stream`'s and `api::chat`'s own mock-upstream tests
-        // already share this same process-global env var.
-        let _anthropic_guard = crate::anthropic::test_support::lock_anthropic_base_url();
-        unsafe {
-            std::env::set_var("ANTHROPIC_BASE_URL", "http://127.0.0.1:1");
-            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-        }
+        // Every terminal command that finishes during this test triggers a
+        // detached `chat::wake_conversation` call (see SME-13). This
+        // test's database has no model provider (SME-72), so each one
+        // fails at once without reaching any model.
 
         let client = test_client().await;
         MANAGER.set(SandboxManager::new(client.clone())).ok();
@@ -5700,9 +5681,8 @@ mod tests {
 
             // --- A terminal command's own exit event actively wakes the
             // model — no other trigger needed (see
-            // SME-13). ANTHROPIC_API_KEY
-            // isn't set in this test environment, so the resulting
-            // wake_conversation call fails at the API step — but the
+            // SME-13). This test's database has no model provider, so the
+            // resulting wake_conversation call fails before any model call — but the
             // notification text is drained and durably persisted *before*
             // that failing call, and the failure itself publishes a visible
             // event; both are observable without ever touching a real (or
@@ -5729,8 +5709,8 @@ mod tests {
             assert!(
                 saw_wake_failure,
                 "the command's own exit event should have actively woken the model \
-                 (surfacing as NotificationDeliveryFailed since ANTHROPIC_API_KEY isn't set \
-                 in this test env), with no other trigger — not just sat unnotified waiting \
+                 (surfacing as NotificationDeliveryFailed since this test's database has \
+                 no model provider), with no other trigger — not just sat unnotified waiting \
                  for something else to happen to the conversation"
             );
 

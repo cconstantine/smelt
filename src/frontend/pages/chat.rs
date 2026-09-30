@@ -2755,6 +2755,9 @@ pub fn Chat() -> Element {
         Route::LanguageServerNewRoute {} => None,
         Route::LanguageServerEditRoute { .. } => None,
         Route::SandboxVolumeNewRoute {} => None,
+        Route::ProvidersRoute {} => None,
+        Route::ProviderNewRoute {} => None,
+        Route::ProviderEditRoute { .. } => None,
         Route::NotFound { .. } => None,
     });
 
@@ -2891,6 +2894,7 @@ fn ConversationSidebar(
             }
             div { class: "sidebar-body",
             button { class: "new-conversation", onclick: move |e| { open_on_phone.set(false); new_conversation(e) }, "New conversation" }
+            Link { to: Route::ProvidersRoute {}, class: "sandbox-volumes-link providers-link", "Model providers" }
             Link { to: Route::McpServersRoute {}, class: "mcp-servers-link", "MCP servers" }
             Link { to: Route::PodsRoute {}, class: "pods-link", "Sandboxes" }
             Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
@@ -2982,6 +2986,13 @@ fn ChatPanel(
     // tab didn't start (another tab, a finished command waking the model).
     #[allow(unused_mut)]
     let mut turn_running = use_signal(|| false);
+    // Bumped when the conversation's model or the providers change, so the
+    // model picker refetches (SME-72).
+    #[allow(unused_mut)]
+    let mut model_changed = use_signal(|| 0u64);
+    // Whether the conversation has a model to send to, from the picker:
+    // Send waits for one (SME-72). True until the picker knows otherwise.
+    let model_ready = use_signal(|| true);
     // The message box waits while the model works in this conversation,
     // whoever started the turn; Stop is offered instead.
     let is_streaming = move || turn_running();
@@ -3402,6 +3413,9 @@ fn ChatPanel(
                                 Some(Ok(ConversationEvent::TurnsChanged {})) => {
                                     *turns_changed.write() += 1;
                                 }
+                                Some(Ok(ConversationEvent::ModelChanged {} | ConversationEvent::ProvidersChanged {})) => {
+                                    *model_changed.write() += 1;
+                                }
                                 Some(Ok(ConversationEvent::TurnState { running })) => {
                                     turn_running.set(running);
                                     if !running {
@@ -3504,7 +3518,7 @@ fn ChatPanel(
     let mut send = move || {
         let Some(id) = selected() else { return };
         let content = input();
-        if content.trim().is_empty() {
+        if content.trim().is_empty() || !model_ready() {
             return;
         }
         input.set(String::new());
@@ -4210,10 +4224,24 @@ fn ChatPanel(
                                 }
                             }
                             if let Some(err) = stream_error() {
-                                p { class: "error", "{err}" }
+                                if err == crate::providers::NO_MODEL_CONFIGURED {
+                                    p { class: "model-picker-setup", role: "status",
+                                        "{err} "
+                                        Link { to: Route::ProvidersRoute {}, "Model providers" }
+                                    }
+                                } else {
+                                    p { class: "error", "{err}" }
+                                }
                             }
                             if let Some(err) = notification_delivery_error() {
-                                p { class: "error", "A background notification failed to reach the model: {err}" }
+                                if err == crate::providers::NO_MODEL_CONFIGURED {
+                                    p { class: "model-picker-setup", role: "status",
+                                        "A finished command or task is waiting for the model, but there's no model to send it to. "
+                                        Link { to: Route::ProvidersRoute {}, "Model providers" }
+                                    }
+                                } else {
+                                    p { class: "error", "A background notification failed to reach the model: {err}" }
+                                }
                             }
                             // A repo's AGENTS.md waits for the user's trust before it
                             // becomes instructions the model follows (SME-32).
@@ -4284,6 +4312,9 @@ fn ChatPanel(
                             }
                         }
                         if !conversation_missing() {
+                        if let Some(id) = selected() {
+                            super::ModelPicker { key: "{id}", conversation_id: id, refresh: model_changed, ready: model_ready }
+                        }
                         form {
                             class: "composer",
                             onsubmit: move |event| {
@@ -4297,7 +4328,12 @@ fn ChatPanel(
                                 placeholder: "Type a message...",
                                 oninput: move |e| input.set(e.value()),
                             }
-                            button { r#type: "submit", disabled: is_streaming(), "Send" }
+                            button {
+                                r#type: "submit",
+                                disabled: is_streaming() || !model_ready(),
+                                title: if model_ready() { "" } else { "Choose a model first" },
+                                "Send"
+                            }
                             if can_stop() {
                                 button {
                                     r#type: "button",

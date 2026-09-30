@@ -358,9 +358,9 @@ async fn click_conversation(page: &chromiumoxide::Page, id: i64) {
 
 /// A mock Anthropic upstream whose one reply streams 25 words
 /// (`zebra0`..`zebra24`) 200ms apart — slow enough to switch conversations
-/// mid-stream. Points `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY` at it; hold
-/// `anthropic::test_support::lock_anthropic_base_url` while it's in use.
-async fn start_slow_mock_upstream() {
+/// mid-stream. Returns its address; the test saves it as a provider every
+/// conversation it creates uses (`MOCK_PROVIDER`).
+async fn start_slow_mock_upstream() -> std::net::SocketAddr {
     fn event(name: &str, data: &str) -> String {
         format!("event: {name}\ndata: {data}\n\n")
     }
@@ -399,12 +399,7 @@ async fn start_slow_mock_upstream() {
     tokio::spawn(async move {
         axum::serve(listener, router).await.ok();
     });
-    // SAFETY: callers hold the process-wide ANTHROPIC_BASE_URL lock, which
-    // is what every test touching these variables coordinates on.
-    unsafe {
-        std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}"));
-        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-    }
+    addr
 }
 
 async fn wait_for_text_gone(page: &chromiumoxide::Page, needle: &str, timeout: Duration) -> bool {
@@ -434,6 +429,21 @@ async fn test_end_to_end_browser_scenarios() {
     sandbox::init().await;
 
     let harness = BrowserTestHarness::start().await;
+    // The model every conversation the test creates runs on: a provider of
+    // the test's own, so the dev database's providers and default are left
+    // alone (SME-72). Removed with the conversations at the end.
+    let mock_addr = start_slow_mock_upstream().await;
+    let mock_provider = db::create_inference_provider(
+        pool,
+        &format!("browser tier mock {}", std::process::id()),
+        "anthropic",
+        &format!("http://{mock_addr}"),
+        "api_key",
+        "test-key",
+    )
+    .await
+    .expect("save the mock provider");
+    MOCK_PROVIDER.set(mock_provider.id).expect("the mock provider is set once");
     // Every conversation a scenario creates, so they (and their sandbox
     // pods) can be removed afterwards — this runs against the real dev
     // database and cluster, so leftovers show up in the app's own sidebar
@@ -730,8 +740,6 @@ async fn test_end_to_end_browser_scenarios() {
         // flight) and must never show the first one's reply there; going
         // back shows the finished reply, once. The model is a slow mock
         // upstream, so the switch lands mid-stream. ---
-        let _anthropic = anthropic::test_support::lock_anthropic_base_url();
-        start_slow_mock_upstream().await;
         let streaming = new_conversation(pool, &created).await;
         let other = new_conversation(pool, &created).await;
         db::create_message(
@@ -1720,6 +1728,60 @@ async fn test_end_to_end_browser_scenarios() {
             "the first conversation's context detail stayed open after switching"
         );
         switching.close().await.expect("close the switching tab");
+
+        // --- Scenario 24 (SME-72): the model picker above the message box
+        // says which model the conversation runs on, and choosing another
+        // in one tab shows in every tab on it, with no reload. ---
+        let picking = new_conversation(pool, &created).await;
+        let provider_name = db::get_inference_provider(pool, *MOCK_PROVIDER.get().expect("the mock provider"))
+            .await
+            .expect("read the mock provider")
+            .expect("the mock provider exists")
+            .name;
+        let first_tab = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, picking.id))
+            .await
+            .expect("open the picker's conversation");
+        let second_tab = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, picking.id))
+            .await
+            .expect("open it in a second tab");
+        wait_for_live_client(&first_tab, picking.id).await;
+        wait_for_live_client(&second_tab, picking.id).await;
+        let current = format!("{provider_name} \u{b7} {MOCK_MODEL}");
+        for tab in [&first_tab, &second_tab] {
+            assert!(
+                wait_for_text(tab, &current, Duration::from_secs(10)).await,
+                "the picker should show the conversation's model, {current:?}"
+            );
+        }
+        click_when_present(&first_tab, ".model-picker-button", Duration::from_secs(5)).await;
+        let model_field = wait_for_element(&first_tab, ".model-chooser-model", Duration::from_secs(5)).await;
+        model_field.focus().await.expect("focus the model field");
+        first_tab
+            .evaluate("document.querySelector('.model-chooser-model').select()")
+            .await
+            .expect("select the current model id");
+        model_field.type_str("other-model").await.expect("type a model id");
+        click_when_present(&first_tab, ".model-chooser button[type=\"submit\"]", Duration::from_secs(5)).await;
+        let chosen = format!("{provider_name} \u{b7} other-model");
+        assert!(
+            wait_for_text(&first_tab, &chosen, Duration::from_secs(10)).await,
+            "the choosing tab should show the new model"
+        );
+        assert!(
+            wait_for_text(&second_tab, &chosen, Duration::from_secs(10)).await,
+            "the other tab should show the new model live"
+        );
+        let stored = db::get_conversation_model(pool, picking.id)
+            .await
+            .expect("read the conversation's model")
+            .expect("the conversation exists");
+        assert_eq!(stored.model.as_deref(), Some("other-model"));
+        first_tab.close().await.expect("close the first picker tab");
+        second_tab.close().await.expect("close the second picker tab");
         page.close().await.expect("close the tab");
     })))
     .await;
@@ -1733,7 +1795,13 @@ async fn test_end_to_end_browser_scenarios() {
     let created = created.into_inner().expect("the conversation list lock");
     let pod_ids = sandbox_pod_ids(pool, &created).await;
     remove_conversations(pool, &created).await;
-    let leftovers = find_leftovers(pool, &created, &pod_ids).await;
+    if let Err(e) = db::delete_inference_provider(pool, mock_provider.id).await {
+        eprintln!("failed to delete the mock provider: {e}");
+    }
+    let mut leftovers = find_leftovers(pool, &created, &pod_ids).await;
+    if let Ok(Some(_)) = db::get_inference_provider(pool, mock_provider.id).await {
+        leftovers.push(format!("model provider {} in the database", mock_provider.id));
+    }
     harness.shutdown().await;
     match outcome {
         Err(panic) => std::panic::resume_unwind(panic),
@@ -1742,12 +1810,23 @@ async fn test_end_to_end_browser_scenarios() {
     assert!(leftovers.is_empty(), "the test left things behind: {leftovers:?}");
 }
 
+/// The test's own provider (the slow mock), which every conversation it
+/// creates runs on.
+static MOCK_PROVIDER: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+/// The model `MOCK_PROVIDER` serves (any name does: the mock ignores it).
+const MOCK_MODEL: &str = "mock-model";
+
 async fn new_conversation(
     pool: &sqlx::PgPool,
     created: &std::sync::Mutex<Vec<i64>>,
 ) -> crate::models::Conversation {
     let conversation = db::create_conversation(pool).await.expect("create conversation");
     created.lock().expect("the conversation list lock").push(conversation.id);
+    let provider = *MOCK_PROVIDER.get().expect("the mock provider is saved first");
+    db::set_conversation_model(pool, conversation.id, provider, MOCK_MODEL)
+        .await
+        .expect("put the conversation on the mock provider");
     conversation
 }
 

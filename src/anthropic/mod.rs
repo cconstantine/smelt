@@ -3,6 +3,9 @@ pub mod types;
 #[cfg(feature = "server")]
 pub mod stream;
 
+#[cfg(feature = "server")]
+pub mod models;
+
 pub mod tools;
 
 pub use types::{ContentBlock, TokenUsage, ToolDefinition};
@@ -17,8 +20,8 @@ pub use types::{AnthropicMessage, CreateMessageRequest, ThinkingConfig};
 /// `claude-*` model id — nothing in the Messages API surfaces this, so it
 /// can't be derived or queried, only looked up. `None` for anything else
 /// (a gateway or local Ollama model has no "Anthropic model name" to match
-/// at all) — `api::chat`'s caller falls back to `ANTHROPIC_CONTEXT_WINDOW`
-/// in that case. See SME-18.
+/// at all) — `providers::context_window` uses a provider's reported size
+/// or the user's override first (SME-72). See SME-18.
 #[cfg(feature = "server")]
 pub fn context_window_for(model: &str) -> Option<u32> {
     if model.starts_with("claude-") {
@@ -43,28 +46,5 @@ mod context_window_tests {
     fn test_context_window_for_unrecognized_model_is_none() {
         assert_eq!(context_window_for("gpt-oss:120b_128k"), None);
         assert_eq!(context_window_for("llama3"), None);
-    }
-}
-
-/// Shared by every test (in this module, `stream.rs`, and `api::chat`) that
-/// points the process-global `ANTHROPIC_BASE_URL` env var at a mock upstream
-/// — without a shared lock, two such tests running on different OS threads
-/// could each set the var to their own mock server's address and race, with
-/// one test's HTTP client ending up pointed at the other's server.
-#[cfg(feature = "server")]
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::sync::{Mutex, MutexGuard};
-
-    static ANTHROPIC_BASE_URL_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Acquire the lock for the duration of one test's mock-upstream
-    /// interaction. Recovers from poisoning rather than propagating it, so
-    /// one test panicking while holding this doesn't cascade into every
-    /// other test that touches `ANTHROPIC_BASE_URL`.
-    pub(crate) fn lock_anthropic_base_url() -> MutexGuard<'static, ()> {
-        ANTHROPIC_BASE_URL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
     }
 }

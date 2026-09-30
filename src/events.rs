@@ -109,8 +109,8 @@ pub enum ConversationEvent {
     },
     /// Published when `api::chat::wake_conversation` (fired when a terminal
     /// command finishes, to notify the model with no further tool call
-    /// needed) fails to actually reach the model — e.g. `ANTHROPIC_API_KEY`
-    /// unset, a transient Anthropic API error. The underlying notification
+    /// needed) fails to actually reach the model — e.g. no model provider
+    /// set up, a transient Anthropic API error. The underlying notification
     /// text is still durably persisted regardless (`wake_conversation`
     /// drains and persists it *before* the API call that might fail) — this
     /// means "the model hasn't been prompted with it yet," not "it's lost."
@@ -169,6 +169,14 @@ pub enum ConversationEvent {
     /// some conversation), relayed like `PodsChanged` so the sidebar can
     /// mark which conversations are busy (SME-41 D9).
     TurnsChanged {},
+    /// The conversation's provider or model changed (the user chose
+    /// another, or a turn took the default). Carries nothing: the tab
+    /// refetches `api::chat::get_conversation_model` (SME-72).
+    ModelChanged {},
+    /// An app-wide `AppEvent::ProvidersChanged` (a provider or the default
+    /// model was added, edited or removed), relayed like `PodsChanged` so
+    /// the model picker and the no-provider notice stay current (SME-72).
+    ProvidersChanged {},
     /// Whether a model turn is running (or queued) in this conversation,
     /// published when that changes, so every tab watching it can offer a
     /// Stop button, including for turns it didn't start. Regenerable from
@@ -210,6 +218,9 @@ pub enum AppEvent {
     /// A model turn started or ended in some conversation. Carries
     /// nothing: listeners refetch `api::chat::get_busy_conversations`.
     TurnsChanged,
+    /// A model provider or the default model was added, edited or
+    /// removed. Carries nothing: listeners refetch (SME-72).
+    ProvidersChanged,
 }
 
 #[cfg(feature = "server")]
@@ -475,7 +486,7 @@ mod server {
             );
 
             let failure_event = ConversationEvent::NotificationDeliveryFailed {
-                detail: "ANTHROPIC_API_KEY is not set on the server".to_string(),
+                detail: "No model is chosen for this conversation.".to_string(),
             };
             publish(6, failure_event.clone());
             assert_eq!(
@@ -531,9 +542,10 @@ mod wire_tests {
         let json = serde_json::to_string(&event).expect("serialize");
         assert_eq!(json, r#"{"type":"PodsChanged"}"#);
         assert_eq!(serde_json::from_str::<AppEvent>(&json).expect("deserialize"), event);
-        let event = AppEvent::TurnsChanged;
-        let json = serde_json::to_string(&event).expect("serialize");
-        assert_eq!(serde_json::from_str::<AppEvent>(&json).expect("deserialize"), event);
+        for event in [AppEvent::TurnsChanged, AppEvent::ProvidersChanged] {
+            let json = serde_json::to_string(&event).expect("serialize");
+            assert_eq!(serde_json::from_str::<AppEvent>(&json).expect("deserialize"), event);
+        }
     }
 
     fn one_of_each() -> Vec<ConversationEvent> {
@@ -544,6 +556,8 @@ mod wire_tests {
             ConversationEvent::TurnState { running: true },
             ConversationEvent::PodsChanged {},
             ConversationEvent::TurnsChanged {},
+            ConversationEvent::ModelChanged {},
+            ConversationEvent::ProvidersChanged {},
             ConversationEvent::TaskUpdate {
                 task_id: "t1".to_string(),
                 tool: "count".to_string(),
