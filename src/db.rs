@@ -1749,6 +1749,9 @@ pub struct ProviderModelRow {
     pub reported_context_window: Option<i32>,
     pub reported_thinking: Option<bool>,
     pub reported_tools: Option<bool>,
+    /// Added on the provider's page as a model its listing doesn't show,
+    /// so it's shown even when the listing works and lacks it.
+    pub added_by_hand: bool,
 }
 
 pub async fn get_provider_model(
@@ -1777,11 +1780,12 @@ pub async fn list_provider_models(
     .await
 }
 
-/// Adds a row for a model, leaving an existing one as it is.
+/// Marks a model as added by hand, adding its row if it has none and
+/// leaving its settings as they are.
 pub async fn ensure_provider_model(pool: &PgPool, provider_id: i64, model: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO provider_models (provider_id, model) VALUES ($1, $2)
-         ON CONFLICT (provider_id, model) DO NOTHING",
+        "INSERT INTO provider_models (provider_id, model, added_by_hand) VALUES ($1, $2, true)
+         ON CONFLICT (provider_id, model) DO UPDATE SET added_by_hand = true",
     )
     .bind(provider_id)
     .bind(model)
@@ -1815,7 +1819,8 @@ pub async fn set_provider_model_overrides(
 }
 
 /// Replaces what the provider reported about a model, leaving the user's
-/// overrides alone.
+/// overrides alone. A report without a context window keeps the last one:
+/// Ollama only says while the model is loaded.
 pub async fn set_provider_model_reported(
     pool: &PgPool,
     provider_id: i64,
@@ -1829,7 +1834,8 @@ pub async fn set_provider_model_reported(
              (provider_id, model, reported_context_window, reported_thinking, reported_tools)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (provider_id, model) DO UPDATE
-         SET reported_context_window = $3, reported_thinking = $4, reported_tools = $5",
+         SET reported_context_window = COALESCE($3, provider_models.reported_context_window),
+             reported_thinking = $4, reported_tools = $5",
     )
     .bind(provider_id)
     .bind(model)
@@ -3800,6 +3806,17 @@ mod tests {
         assert_eq!(kept.model.as_deref(), Some("m1"));
     }
 
+    /// SME-72 review 2: Ollama reports a window from `/api/ps` only while
+    /// the model is loaded; asking again when it isn't keeps what it said.
+    #[sqlx::test]
+    async fn test_a_report_without_a_window_keeps_the_last_one(pool: PgPool) {
+        let provider = test_provider(&pool, "p").await;
+        set_provider_model_reported(&pool, provider.id, "m", Some(8192), Some(true), Some(true)).await.expect("loaded");
+        set_provider_model_reported(&pool, provider.id, "m", None, Some(false), Some(true)).await.expect("unloaded");
+        let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
+        assert_eq!((row.reported_context_window, row.reported_thinking), (Some(8192), Some(false)));
+    }
+
     #[sqlx::test]
     async fn test_model_overrides_and_reported_details_leave_each_other_alone(pool: PgPool) {
         let provider = test_provider(&pool, "p").await;
@@ -3818,6 +3835,7 @@ mod tests {
                 reported_context_window: Some(8192),
                 reported_thinking: None,
                 reported_tools: Some(true),
+                added_by_hand: false,
             }
         );
         assert_eq!(list_provider_models(&pool, provider.id).await.expect("list"), vec![row]);

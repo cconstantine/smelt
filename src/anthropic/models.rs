@@ -179,7 +179,7 @@ async fn fetch_json(endpoint: &Endpoint, request: reqwest::RequestBuilder) -> Re
 
 /// Every page of a `/v1/models` listing, up to `MAX_PAGES`.
 async fn list_v1_models(endpoint: &Endpoint) -> Result<Vec<ListedModel>, String> {
-    let client = reqwest::Client::new();
+    let client = endpoint.client()?;
     let mut models = Vec::new();
     let mut after: Option<String> = None;
     for _ in 0..MAX_PAGES {
@@ -204,10 +204,56 @@ pub async fn list_models(kind: ProviderKind, endpoint: &Endpoint) -> Result<Vec<
     match kind {
         ProviderKind::Anthropic | ProviderKind::Other => list_v1_models(endpoint).await,
         ProviderKind::Ollama => {
-            let request = reqwest::Client::new().get(endpoint.url("/api/tags"));
+            let request = endpoint.client()?.get(endpoint.url("/api/tags"));
             parse_ollama_tags(&fetch_json(endpoint, request).await?)
         }
     }
+}
+
+/// An Ollama server's details for each of `models`, `at_once` at a time:
+/// `/api/show` each, and `/api/ps` once (it lists every loaded model) if
+/// any of them has no `num_ctx`.
+pub async fn ollama_details(
+    endpoint: &Endpoint,
+    models: Vec<String>,
+    at_once: usize,
+) -> Vec<(String, Result<ModelDetails, String>)> {
+    use futures_util::StreamExt;
+
+    let client = match endpoint.client() {
+        Ok(client) => client,
+        Err(e) => return models.into_iter().map(|m| (m, Err(e.clone()))).collect(),
+    };
+    let client = &client;
+    let mut shown: Vec<(String, Result<ModelDetails, String>)> = futures_util::stream::iter(models)
+        .map(|model| async move {
+            let show = client
+                .post(endpoint.url("/api/show"))
+                .json(&serde_json::json!({ "model": model }));
+            let details = fetch_json(endpoint, show).await.map(|body| parse_ollama_show(&body));
+            (model, details)
+        })
+        .buffer_unordered(at_once.max(1))
+        .collect()
+        .await;
+    let unsized_model = shown
+        .iter()
+        .any(|(_, details)| matches!(details, Ok(d) if d.context_window.is_none()));
+    if unsized_model {
+        match fetch_json(endpoint, client.get(endpoint.url("/api/ps"))).await {
+            Ok(ps) => {
+                for (model, details) in &mut shown {
+                    if let Ok(d) = details
+                        && d.context_window.is_none()
+                    {
+                        d.context_window = parse_ollama_ps(&ps, model);
+                    }
+                }
+            }
+            Err(e) => tracing::info!(error = %e, "couldn't ask Ollama what's loaded"),
+        }
+    }
+    shown
 }
 
 /// What `endpoint` says about `model`. For an Ollama server that's
@@ -226,7 +272,7 @@ pub async fn model_details(
             .map(|listed| listed.details)
             .unwrap_or_default()),
         ProviderKind::Ollama => {
-            let client = reqwest::Client::new();
+            let client = endpoint.client()?;
             let show = client
                 .post(endpoint.url("/api/show"))
                 .json(&serde_json::json!({ "model": model }));

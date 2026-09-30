@@ -18,8 +18,8 @@ CREATE TABLE inference_providers (
     updated_at  TIMESTAMP NOT NULL DEFAULT now()
 );
 
--- Per-model settings, a row only for a model that has any. The user's
--- overrides win over what the provider reported; null means unset.
+-- What's known about a provider's models: the user's overrides, which win,
+-- and what the provider last reported. Null means unset or not reported.
 CREATE TABLE provider_models (
     provider_id              BIGINT NOT NULL REFERENCES inference_providers (id) ON DELETE CASCADE,
     model                    TEXT NOT NULL,
@@ -28,6 +28,11 @@ CREATE TABLE provider_models (
     reported_context_window  INTEGER,
     reported_thinking        BOOLEAN,
     reported_tools           BOOLEAN,
+    -- Added as a model the listing doesn't show: listed even when the
+    -- listing works and lacks it. Other rows are shown only while the
+    -- listing has them (or they have an override), so a model the provider
+    -- dropped goes away.
+    added_by_hand            BOOLEAN NOT NULL DEFAULT false,
     PRIMARY KEY (provider_id, model)
 );
 

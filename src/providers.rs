@@ -550,8 +550,6 @@ mod server {
         provider_id: i64,
         ask_each: bool,
     ) -> Result<ProviderModels, String> {
-        use futures_util::StreamExt;
-
         let provider = db::get_inference_provider(pool, provider_id)
             .await
             .map_err(|e| e.to_string())?
@@ -566,15 +564,9 @@ mod server {
 
         let mut details_errors = std::collections::HashMap::new();
         if kind == ProviderKind::Ollama && ask_each {
-            let endpoint = &endpoint;
-            let fetched: Vec<_> = futures_util::stream::iter(listed.iter().map(|m| m.id.clone()))
-                .map(|model| async move {
-                    let details = crate::anthropic::models::model_details(kind, endpoint, &model).await;
-                    (model, details)
-                })
-                .buffer_unordered(DETAIL_REQUESTS_AT_ONCE)
-                .collect()
-                .await;
+            let ids = listed.iter().map(|m| m.id.clone()).collect();
+            let fetched =
+                crate::anthropic::models::ollama_details(&endpoint, ids, DETAIL_REQUESTS_AT_ONCE).await;
             for (model, details) in fetched {
                 match details {
                     Ok(details) => store_details(pool, provider_id, &model, &details).await?,
@@ -604,9 +596,16 @@ mod server {
                 model_info(m.id, m.display_name, row.as_ref(), error)
             })
             .collect();
+        // The rest of what's stored: a model added by hand or given a
+        // setting always, one only ever seen in a listing only while the
+        // listing can't be had (a model the provider dropped goes away).
+        let listing_failed = listing_error.is_some();
         models.extend(
             stored
                 .into_values()
+                .filter(|row| {
+                    listing_failed || row.added_by_hand || row.thinking.is_some() || row.context_window.is_some()
+                })
                 .map(|row| model_info(row.model.clone(), None, Some(&row), None)),
         );
         Ok(ProviderModels { models, listing_error })
@@ -724,7 +723,7 @@ mod server {
         }
         if !db::set_conversation_model(pool, conversation_id, provider_id, model)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(provider_gone)?
         {
             return Err("conversation not found".to_string());
         }
@@ -815,6 +814,7 @@ mod tests {
                 reported_context_window,
                 reported_thinking,
                 reported_tools: None,
+                added_by_hand: false,
             }
         }
 
@@ -1152,6 +1152,64 @@ mod tests {
             );
         }
 
+        /// SME-72 review 2: a model the provider stopped listing goes away,
+        /// unless it was added by hand or has settings of the user's.
+        #[sqlx::test]
+        async fn test_a_model_the_provider_dropped_isnt_shown(pool: PgPool) {
+            let base = mock_ollama().await;
+            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k")
+                .await
+                .expect("create");
+            db::set_provider_model_reported(&pool, p.id, "removed", Some(4096), None, Some(true))
+                .await
+                .expect("seen once");
+            add_model(&pool, p.id, "by-hand").await.expect("add");
+            set_model_settings(&pool, p.id, "tuned", None, Some(16_384)).await.expect("set");
+
+            let listing = provider_models(&pool, p.id, false).await.expect("models");
+            let ids: Vec<&str> = listing.models.iter().map(|m| m.id.as_str()).collect();
+            assert_eq!(ids, vec!["gemma4", "broken", "by-hand", "tuned"]);
+        }
+
+        /// SME-72 review 2: `/api/ps` is one server-wide list, fetched once
+        /// per page, not once per model.
+        #[sqlx::test]
+        async fn test_ollamas_loaded_models_are_fetched_once(pool: PgPool) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let ps_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = ps_calls.clone();
+            let app = axum::Router::new()
+                .route("/api/tags", axum::routing::get(|| async {
+                    ([(axum::http::header::CONTENT_TYPE, "application/json")],
+                     r#"{"models":[{"name":"a"},{"name":"b"},{"name":"c"}]}"#)
+                }))
+                .route("/api/show", axum::routing::post(|| async {
+                    ([(axum::http::header::CONTENT_TYPE, "application/json")],
+                     r#"{"capabilities":["completion","tools"]}"#)
+                }))
+                .route("/api/ps", axum::routing::get(move || {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        ([(axum::http::header::CONTENT_TYPE, "application/json")],
+                         r#"{"models":[{"name":"b","model":"b","context_length":8192}]}"#)
+                    }
+                }));
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            let p = db::create_inference_provider(&pool, "o", "ollama", &format!("http://{addr}"), "api_key", "k")
+                .await
+                .expect("create");
+
+            let listing = provider_models(&pool, p.id, true).await.expect("models");
+
+            assert_eq!(ps_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let b = listing.models.iter().find(|m| m.id == "b").expect("b");
+            assert_eq!((b.context_window, b.context_window_known), (8192, true));
+        }
+
         #[sqlx::test]
         async fn test_an_unreachable_providers_models_still_list_what_is_stored(pool: PgPool) {
             let p = db::create_inference_provider(&pool, "gone", "anthropic", "http://127.0.0.1:1", "api_key", "k")
@@ -1207,6 +1265,18 @@ pub(crate) mod test_support {
     use sqlx::PgPool;
 
     use crate::db;
+
+    /// Serializes the tests that run turns, here and in `sandbox.rs`. They
+    /// share process-wide state keyed by conversation id (the turn lock,
+    /// the reply so far, a stop or pause), and every `#[sqlx::test]`
+    /// database numbers conversations from 1. Recovers from poisoning, so
+    /// one failing test doesn't fail the rest. (Until SME-72 this was the
+    /// lock around the `ANTHROPIC_BASE_URL` variable, which serialized
+    /// them as a side effect.)
+    pub(crate) fn lock_turn_tests() -> std::sync::MutexGuard<'static, ()> {
+        static TURN_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        TURN_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// The model `add_mock_provider` makes the default.
     pub(crate) const MOCK_MODEL: &str = "mock-model";

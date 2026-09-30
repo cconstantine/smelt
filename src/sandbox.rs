@@ -3879,11 +3879,10 @@ mod tests {
     /// database has no model provider.
     #[sqlx::test]
     async fn test_report_docker_restart_tells_the_pods_conversation(pool: PgPool) {
-        // Its own id: the wake after the notice touches process-wide turn
-        // state keyed by conversation id, as the chat tests' turns do.
-        let conversation = db::create_conversation_with_id(&pool, 9_172_100_001)
-            .await
-            .expect("create conversation");
+        // The wake after the notice touches process-wide turn state keyed
+        // by conversation id, as the chat tests' turns do.
+        let _turns = crate::providers::test_support::lock_turn_tests();
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
         let pod = db::create_sandbox_pod(&pool, conversation.id).await.expect("create pod row");
 
         report_docker_restart(&pool, pod.id, Some("OOMKilled".to_string())).await;
@@ -5349,6 +5348,9 @@ mod tests {
         // detached `chat::wake_conversation` call (see SME-13). This
         // test's database has no model provider (SME-72), so each one
         // fails at once without reaching any model.
+        // Those wakes touch process-wide turn state keyed by conversation
+        // id, as the chat tests' turns do.
+        let _turns = crate::providers::test_support::lock_turn_tests();
 
         let client = test_client().await;
         MANAGER.set(SandboxManager::new(client.clone())).ok();
@@ -5420,15 +5422,13 @@ mod tests {
             }
         }
 
-        // Its own id: finished commands wake the model, which touches
-        // process-wide turn state keyed by conversation id.
-        let conversation_a = db::create_conversation_with_id(&pool, 9172100002)
+        let conversation_a = db::create_conversation(&pool)
             .await
             .expect("create conversation a");
-        let conversation_b = db::create_conversation_with_id(&pool, 9172100003)
+        let conversation_b = db::create_conversation(&pool)
             .await
             .expect("create conversation b");
-        let conversation_c = db::create_conversation_with_id(&pool, 9172100004)
+        let conversation_c = db::create_conversation(&pool)
             .await
             .expect("create conversation c");
         let conversation_d = db::create_conversation(&pool)

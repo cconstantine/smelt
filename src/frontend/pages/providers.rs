@@ -620,7 +620,7 @@ pub fn ProviderEdit(id: i64) -> Element {
                         class: if armed() { "mcp-delete-server confirm" } else { "mcp-delete-server" },
                         r#type: "button",
                         onclick: delete,
-                        super::TwoStepLabel { armed: armed(), idle: "Delete provider", confirm: "Confirm delete? Its conversations move to the default model" }
+                        super::TwoStepLabel { armed: armed(), idle: "Delete provider", confirm: "Confirm delete? Its conversations take the default at their next turn, if there's still one" }
                     }
                 },
             }

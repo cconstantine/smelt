@@ -1758,19 +1758,41 @@ async fn test_end_to_end_browser_scenarios() {
             );
         }
         click_when_present(&first_tab, ".model-picker-button", Duration::from_secs(5)).await;
-        let model_field = wait_for_element(&first_tab, ".model-chooser-model", Duration::from_secs(5)).await;
-        model_field.focus().await.expect("focus the model field");
-        first_tab
-            .evaluate("document.querySelector('.model-chooser-model').select()")
-            .await
-            .expect("select the current model id");
-        model_field.type_str("other-model").await.expect("type a model id");
+        // Clear the field and type, until it holds exactly the new id: a
+        // re-render between selecting the old text and typing would
+        // otherwise leave the two run together.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let model_field = wait_for_element(&first_tab, ".model-chooser-model", Duration::from_secs(5)).await;
+            model_field.focus().await.expect("focus the model field");
+            first_tab
+                .evaluate("document.querySelector('.model-chooser-model').select()")
+                .await
+                .expect("select the current model id");
+            model_field.type_str("other-model").await.expect("type a model id");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let typed: String = first_tab
+                .evaluate("document.querySelector('.model-chooser-model')?.value ?? ''")
+                .await
+                .expect("read the model field")
+                .into_value()
+                .expect("a string");
+            if typed == "other-model" {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "the model field never held just the new id: {typed:?}");
+        }
         click_when_present(&first_tab, ".model-chooser button[type=\"submit\"]", Duration::from_secs(5)).await;
         let chosen = format!("{provider_name} \u{b7} other-model");
-        assert!(
-            wait_for_text(&first_tab, &chosen, Duration::from_secs(10)).await,
-            "the choosing tab should show the new model"
-        );
+        if !wait_for_text(&first_tab, &chosen, Duration::from_secs(10)).await {
+            let shown: String = first_tab
+                .evaluate("document.querySelector('.model-picker')?.innerText ?? ''")
+                .await
+                .expect("read the picker")
+                .into_value()
+                .expect("a string");
+            panic!("the choosing tab should show the new model; the picker says {shown:?}");
+        }
         assert!(
             wait_for_text(&second_tab, &chosen, Duration::from_secs(10)).await,
             "the other tab should show the new model live"

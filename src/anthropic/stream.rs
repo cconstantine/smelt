@@ -55,6 +55,17 @@ impl Endpoint {
         format!("{}{path}", self.base_url.trim_end_matches('/'))
     }
 
+    /// The HTTP client for requests to this provider. It doesn't follow
+    /// redirects: reqwest drops `Authorization` on a redirect to another
+    /// host but not `x-api-key`, so following one could hand the key to a
+    /// host it wasn't entered for. Anthropic-compatible APIs don't redirect.
+    pub fn client(&self) -> Result<reqwest::Client, String> {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("couldn't set up the HTTP client: {e}"))
+    }
+
     /// Adds the credential and the `anthropic-version` header every
     /// Anthropic-compatible request carries.
     pub fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -284,7 +295,7 @@ async fn send_and_await_response(
     response_timeout: std::time::Duration,
 ) -> Result<reqwest::Response, String> {
     let client = endpoint
-        .authorize(reqwest::Client::new().post(endpoint.url("/v1/messages")))
+        .authorize(endpoint.client()?.post(endpoint.url("/v1/messages")))
         .json(request);
     tokio::time::timeout(response_timeout, client.send())
         .await
@@ -484,6 +495,52 @@ mod tests {
         assert_eq!(url("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
         assert_eq!(url("https://gateway.example/"), "https://gateway.example/v1/messages");
         assert_eq!(url("https://gateway.example/proxy/"), "https://gateway.example/proxy/v1/messages");
+    }
+
+    /// SME-72 review 2: reqwest drops `Authorization` on a cross-host
+    /// redirect but not `x-api-key`, so a provider that redirects could
+    /// hand the key to another host. Provider requests don't follow
+    /// redirects.
+    #[tokio::test]
+    async fn test_a_redirect_never_carries_the_key_to_another_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let elsewhere = listener.local_addr().expect("addr");
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = reached.clone();
+        let app = axum::Router::new().fallback(move || {
+            let flag = flag.clone();
+            async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                "gotcha"
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let provider = listener.local_addr().expect("addr");
+        let app = axum::Router::new().fallback(move || async move {
+            axum::response::Redirect::temporary(&format!("http://localhost:{}/steal", elsewhere.port()))
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let endpoint = Endpoint {
+            base_url: format!("http://{provider}"),
+            auth: Auth::ApiKey("sk-secret".to_string()),
+        };
+        let request = CreateMessageRequest {
+            model: "m".to_string(),
+            max_tokens: 10,
+            system: None,
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+            thinking: None,
+        };
+        let result = stream_anthropic_message(&endpoint, &request, |_| {}).await;
+        assert!(result.is_err(), "a redirect isn't a reply");
+        assert!(!reached.load(std::sync::atomic::Ordering::SeqCst), "the redirect was followed");
     }
 
     /// A credential never reaches a log line through `{:?}`.

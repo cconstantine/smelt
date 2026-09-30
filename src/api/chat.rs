@@ -2067,17 +2067,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Serializes the tests that run turns. They share process-wide state
-    /// keyed by conversation id (the turn lock, the reply so far, a stop or
-    /// pause), and every `#[sqlx::test]` database numbers conversations
-    /// from 1. Recovers from poisoning, so one failing test doesn't fail
-    /// the rest. (Until SME-72 this was the lock around the
-    /// `ANTHROPIC_BASE_URL` variable, which serialized them as a side
-    /// effect.)
-    fn lock_turn_tests() -> std::sync::MutexGuard<'static, ()> {
-        static TURN_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        TURN_TESTS.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    use crate::providers::test_support::lock_turn_tests;
 
     fn thinking_block(text: &str) -> anthropic::ContentBlock {
         anthropic::ContentBlock::Thinking {
@@ -2800,6 +2790,7 @@ mod tests {
     /// Hugging Face's wants exactly that).
     #[sqlx::test]
     async fn test_a_bearer_providers_turn_sends_its_token_as_a_bearer_header(pool: PgPool) {
+        let _guard = lock_turn_tests();
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
