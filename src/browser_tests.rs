@@ -173,10 +173,8 @@ fn unique_id(label: &str) -> String {
     format!("browser-test-{label}-{nanos}")
 }
 
-/// Polls for `selector` to exist, then clicks it once it has stopped
-/// moving. `find_element` doesn't itself wait/retry, and the sidebar's
-/// conversation list only appears once `get_conversations` resolves after
-/// hydration.
+/// Clicks `selector` once it exists and has stopped moving, and makes sure
+/// the press landed on it, retrying until `timeout` if it didn't.
 ///
 /// A chromiumoxide click reads the element's position and then presses the
 /// mouse there, in separate round trips. In the first moments after a load
@@ -184,45 +182,72 @@ fn unique_id(label: &str) -> String {
 /// arrives, so a click aimed at an element that moves in between lands on
 /// something else. On SME-68 that was 8 clicks in 40 on the compaction
 /// divider, throttled: the press hit `.messages` and nothing opened. So
-/// this waits until the element's box is the same on two reads 150 ms
-/// apart and it's what's under its own centre (`wait_for_stable`).
+/// this scrolls the element into view and waits until it's still
+/// (`wait_for_stable`), clicks, then reads what the press actually hit (a
+/// capturing `mousedown` listener): a miss is tried again. A press that
+/// lands elsewhere does whatever that element does, which in practice has
+/// been the transcript's background.
 async fn click_when_present(page: &chromiumoxide::Page, selector: &str, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
-    wait_for_stable(page, selector, deadline).await;
+    let watch = format!(
+        "(() => {{ window.__smeltPressSelector = {selector:?}; window.__smeltPress = 'no press seen'; \
+         if (!window.__smeltPressWatcher) {{ window.__smeltPressWatcher = true; \
+         document.addEventListener('mousedown', e => {{ const el = document.querySelector(window.__smeltPressSelector); \
+         window.__smeltPress = el && (el === e.target || el.contains(e.target)) ? 'hit' : 'pressed ' + (e.target.className || e.target.tagName); }}, true); }} }})()"
+    );
+    let mut last = String::new();
     loop {
-        if let Ok(element) = page.find_element(selector).await {
-            if element.click().await.is_ok() {
-                return;
+        wait_for_stable(page, selector, deadline).await;
+        if let Err(e) = page.evaluate(watch.as_str()).await {
+            last = format!("couldn't watch the press: {e}");
+        } else {
+            match page.find_element(selector).await {
+                Err(e) => last = format!("gone before the click: {e}"),
+                Ok(element) => match element.click().await {
+                    Err(e) => last = format!("the click failed: {e}"),
+                    Ok(_) => match page.evaluate("window.__smeltPress").await {
+                        // A click that navigated away took the listener
+                        // with it: it did something, so it counts.
+                        Err(_) => return,
+                        Ok(value) => {
+                            let press: String = value.into_value().unwrap_or_default();
+                            if press == "hit" {
+                                return;
+                            }
+                            last = press;
+                        }
+                    },
+                },
             }
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "{selector} never appeared"
+            "clicking {selector} didn't land on it: {last}"
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
 
-/// Waits until `selector`'s element exists, has the same box on two reads
-/// 150 ms apart, and is the element at its own centre (or contains it), so
-/// a click aimed at it lands on it. Panics at `deadline` naming what kept
-/// it from settling.
+/// Scrolls `selector`'s element into view and waits until it has the same
+/// box on two reads 150 ms apart and is the element at its own centre (or
+/// contains it), so a click aimed at it lands on it. Panics at `deadline`
+/// naming what kept it from settling.
 async fn wait_for_stable(page: &chromiumoxide::Page, selector: &str, deadline: tokio::time::Instant) {
     let probe = format!(
         "(() => {{ const el = document.querySelector({selector:?}); if (!el) return 'missing'; \
+         el.scrollIntoView({{ block: 'nearest', inline: 'nearest' }}); \
          const r = el.getBoundingClientRect(); if (r.width === 0 || r.height === 0) return 'hidden'; \
-         const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); \
+         const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2); \
          if (!hit || !(hit === el || el.contains(hit))) return 'covered by ' + (hit ? (hit.className || hit.tagName) : 'nothing'); \
-         return [r.left, r.top, r.width, r.height].map(Math.round).join(','); }})()"
+         return [r.x, r.y, r.width, r.height].map(Math.round).join(','); }})()"
     );
     let mut last = String::new();
     loop {
         let state: String = match page.evaluate(probe.as_str()).await {
             Ok(value) => value.into_value().unwrap_or_default(),
-            Err(_) => String::new(),
+            Err(e) => format!("couldn't read it: {e}"),
         };
-        let settled = state.contains(',') && state == last;
-        if settled {
+        if state.contains(',') && !state.starts_with("couldn't") && state == last {
             return;
         }
         assert!(
@@ -711,12 +736,19 @@ async fn test_end_to_end_browser_scenarios() {
         .await;
         // The open state first: if it's closed, the click missed or
         // something closed it (SME-68), which the text alone can't tell.
-        let open: bool = context_page
-            .evaluate("!!document.querySelector('.compaction-summary-block')?.open")
-            .await
-            .expect("read the divider")
-            .into_value()
-            .expect("a bool");
+        let mut open = false;
+        for _ in 0..25 {
+            open = context_page
+                .evaluate("!!document.querySelector('.compaction-summary-block')?.open")
+                .await
+                .expect("read the divider")
+                .into_value()
+                .expect("a bool");
+            if open {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         assert!(open, "the divider should be open after clicking its header");
         assert!(
             wait_for_text(
@@ -992,8 +1024,11 @@ async fn test_end_to_end_browser_scenarios() {
         );
         let stop = format!("{row} .pod-stop");
         let neighbour = format!("{row} td:nth-last-child(2)");
+        // In view and still first, so the click's own scrolling can't move
+        // it between the two measurements.
+        wait_for_stable(&pods_page, &stop, tokio::time::Instant::now() + Duration::from_secs(5)).await;
         let before = (element_box(&pods_page, &stop).await, element_box(&pods_page, &neighbour).await);
-        wait_for_element(&pods_page, &stop, Duration::from_secs(5)).await.click().await.expect("arm stop");
+        click_when_present(&pods_page, &stop, Duration::from_secs(5)).await;
         let confirm = format!("{row} .pod-stop.confirm");
         wait_for_element(&pods_page, &confirm, Duration::from_secs(5)).await;
         let after = (element_box(&pods_page, &confirm).await, element_box(&pods_page, &neighbour).await);
@@ -1001,11 +1036,7 @@ async fn test_end_to_end_browser_scenarios() {
             before, after,
             "arming Stop must not move or resize the button or its neighbours (button, cell to its left)"
         );
-        wait_for_element(&pods_page, &confirm, Duration::from_secs(5))
-            .await
-            .click()
-            .await
-            .expect("confirm stop");
+        click_when_present(&pods_page, &confirm, Duration::from_secs(5)).await;
         assert!(
             wait_for_count(&pods_page, &row, 0, Duration::from_secs(20)).await,
             "a stopped pod's row should go away"
@@ -1056,11 +1087,7 @@ async fn test_end_to_end_browser_scenarios() {
             wait_for_count(&observer, &busy_mark, 1, Duration::from_secs(5)).await,
             "the sidebar should mark a conversation whose turn is running"
         );
-        wait_for_element(&sender, ".stop-turn", Duration::from_secs(5))
-            .await
-            .click()
-            .await
-            .expect("click Stop");
+        click_when_present(&sender, ".stop-turn", Duration::from_secs(5)).await;
         assert!(
             wait_for_text(&sender, "Stopped.", Duration::from_secs(5)).await,
             "stopping should say so"
@@ -1141,11 +1168,7 @@ async fn test_end_to_end_browser_scenarios() {
             .into_value()
             .expect("a number");
         assert_eq!(sent_count, 1, "the sender should see its own message once in the conversation");
-        wait_for_element(&tabs[4], ".stop-turn", Duration::from_secs(5))
-            .await
-            .click()
-            .await
-            .expect("click Stop in another tab");
+        click_when_present(&tabs[4], ".stop-turn", Duration::from_secs(5)).await;
         for (i, tab) in tabs.iter().enumerate() {
             assert!(
                 wait_for_count(tab, ".stop-turn", 0, Duration::from_secs(5)).await,
@@ -1225,8 +1248,9 @@ async fn test_end_to_end_browser_scenarios() {
         // only; closing this tab disarms it.
         let delete = ".conversation-item .delete-conversation";
         wait_for_element(&page, delete, Duration::from_secs(10)).await;
+        wait_for_stable(&page, delete, tokio::time::Instant::now() + Duration::from_secs(5)).await;
         let before = element_box(&page, delete).await;
-        page.find_element(delete).await.expect("find Delete").click().await.expect("arm Delete");
+        click_when_present(&page, delete, Duration::from_secs(5)).await;
         wait_for_element(&page, ".conversation-item .delete-conversation.confirm", Duration::from_secs(5)).await;
         let after = element_box(&page, ".conversation-item .delete-conversation.confirm").await;
         assert_eq!(before.2, after.2, "arming the sidebar's Delete changed its width");
@@ -1312,7 +1336,7 @@ async fn test_end_to_end_browser_scenarios() {
             .expect("numbers");
         assert_eq!(order[0], 0.0, "the conversation list should be folded away on a phone: {order:?}");
         assert!(order[2] < 0.0 || order[1] < order[2], "the chat should come before the side panels: {order:?}");
-        page.find_element(".sidebar-toggle").await.expect("the list's button").click().await.expect("open the list");
+        click_when_present(&page, ".sidebar-toggle", Duration::from_secs(5)).await;
         let mut list_shown = false;
         for _ in 0..25 {
             list_shown = page
@@ -1488,7 +1512,7 @@ async fn test_end_to_end_browser_scenarios() {
             "an empty conversation should offer example asks"
         );
         let example: String = page.evaluate("document.querySelector('.example-ask').innerText").await.expect("read").into_value().expect("text");
-        page.find_element(".example-ask").await.expect("an example").click().await.expect("pick it");
+        click_when_present(&page, ".example-ask", Duration::from_secs(5)).await;
         let mut filled = String::new();
         for _ in 0..25 {
             filled = page.evaluate(format!("document.querySelector({CHAT_INPUT:?}).value")).await.expect("read").into_value().expect("text");
