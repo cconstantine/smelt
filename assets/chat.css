@@ -3016,3 +3016,7 @@ div.mcp-status-not-connected::before {
         padding: 8px 12px 0;
     }
 }
+.model-picker-setup a,
+.model-picker-warning a {
+    color: var(--accent);
+}
