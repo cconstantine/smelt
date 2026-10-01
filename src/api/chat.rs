@@ -2046,6 +2046,8 @@ fn conversation_event_stream(
                         let event = events::ConversationEvent::ProvidersChanged {};
                         return Some((Ok(event), (conversation, app)));
                     }
+                    // Only ever decoded, never published.
+                    Ok(events::AppEvent::Unknown) => continue,
                     // Missing some just means one refetch covers several.
                     Err(RecvError::Lagged(_)) => continue,
                     // The app-wide channel lives as long as the process.

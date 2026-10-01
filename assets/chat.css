@@ -3020,3 +3020,51 @@ div.mcp-status-not-connected::before {
 .model-picker-warning a {
     color: var(--accent);
 }
+
+/* The page's bundle is older than the server (SME-43): over everything,
+   since every page with a live stream can show it, and out of the way of
+   the composer at the bottom. */
+.stale-bundle-banner {
+    position: fixed;
+    top: 8px;
+    left: 0;
+    right: 0;
+    width: fit-content;
+    margin: 0 auto;
+    z-index: 200;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: calc(100vw - 32px);
+    padding: 6px 8px 6px 12px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+.stale-bundle-banner button {
+    flex: none;
+    padding: 3px 10px;
+    border: 1px solid var(--ink);
+    border-radius: 6px;
+    background: var(--ink);
+    color: var(--surface);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+}
+.stale-bundle-banner button:hover {
+    background: var(--ink-hover);
+}
+/* Below the phone header's Conversations button, not over it. */
+@media (max-width: 720px) {
+    .stale-bundle-banner {
+        top: 56px;
+        width: auto;
+        margin: 0 16px;
+        max-width: none;
+    }
+}

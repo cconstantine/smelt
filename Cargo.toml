@@ -210,3 +210,7 @@ required-features = ["server"]
 # Paused time in tests (`#[tokio::test(start_paused = true)]`), for timeouts
 # too long to wait out (SME-35's 120 s `initialize`).
 tokio = { version = "1", features = ["test-util"] }
+
+[build-dependencies]
+# `build.rs` hashes the sources into `SMELT_BUILD_ID` (SME-43).
+sha2 = "0.10"

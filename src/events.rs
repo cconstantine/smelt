@@ -205,6 +205,15 @@ pub enum ConversationEvent {
     TurnError {
         message: String,
     },
+    /// A type the browser tier's web bundle doesn't have (`dx build` leaves
+    /// this feature off), standing in for one a newer server adds.
+    #[cfg(feature = "browser-test")]
+    BrowserTestAddedLater {},
+    /// An event type this build doesn't know: one added on a newer server
+    /// than the page's bundle. Never published; a tab skips it and offers
+    /// a reload (SME-43).
+    #[serde(other)]
+    Unknown,
 }
 
 /// Events that aren't about one conversation, for views that span them
@@ -221,6 +230,9 @@ pub enum AppEvent {
     /// A model provider or the default model was added, edited or
     /// removed. Carries nothing: listeners refetch (SME-72).
     ProvidersChanged,
+    /// As `ConversationEvent::Unknown`.
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(feature = "server")]
@@ -545,6 +557,24 @@ mod wire_tests {
         for event in [AppEvent::TurnsChanged, AppEvent::ProvidersChanged] {
             let json = serde_json::to_string(&event).expect("serialize");
             assert_eq!(serde_json::from_str::<AppEvent>(&json).expect("deserialize"), event);
+        }
+    }
+
+    /// A tab still running an older bundle gets event types added since.
+    /// It skips them rather than taking the stream for broken (SME-43).
+    #[test]
+    fn test_an_event_type_added_later_decodes_as_unknown() {
+        for json in [r#"{"type":"AddedLater"}"#, r#"{"type":"AddedLater","x":[1,2],"y":{"z":"w"}}"#] {
+            assert_eq!(
+                serde_json::from_str::<ConversationEvent>(json).expect("conversation event"),
+                ConversationEvent::Unknown,
+                "{json}"
+            );
+            assert_eq!(
+                serde_json::from_str::<AppEvent>(json).expect("app event"),
+                AppEvent::Unknown,
+                "{json}"
+            );
         }
     }
 

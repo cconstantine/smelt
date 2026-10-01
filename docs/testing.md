@@ -126,7 +126,7 @@ already gone.
 - `test_docker_in_a_sandbox_pod_works_and_stays_inside_the_pod` and `test_an_oom_in_a_nested_container_restarts_only_the_docker_sidecar` run real containers. Their base image is the sandbox's own files (`sudo tar -C / -c bin sbin lib lib64 usr etc | docker import - local/base`), so no test pulls from Docker Hub. Leave out `usr/lib64` or `etc` and a container fails with `exec /usr/bin/sh: no such file or directory`.
 - An OOM test needs memory that's actually written: `head -c 900M /dev/zero | tail` holds it, Python's `bytearray(n)` doesn't (its zero pages are never allocated, so nothing is killed). After the sidecar's OOM kill, a restarted dockerd reports the old containers as `Exited (255)`, often before the pod's status shows the restart.
 - Each test's checks run inside `catch_unwind`, so the pods and claim it made are deleted even when an assertion fails; a panic otherwise unwinds past the cleanup.
-- Run `scripts/build-sandbox-image.sh` after changing the agent (`src/bin/sandbox_agent.rs`, `src/agent_protocol.rs`) or `docker/sandbox/`: the pod runs the imported image, not the tree you just built. `scripts/cluster-doctor` (run by `scripts/check.sh`) says when you haven't: it compares the hash `build-sandbox-image.sh` records (`target/sandbox-image/agent-sources.sha256`, per checkout) with the working tree's. It also checks, through `sandbox_image_import --check`, that the node still has both images: the kubelet deletes images no pod is using once the node's disk passes 85%, and every pod then fails with `ErrImageNeverPull`.
+- Run `scripts/build-sandbox-image.sh` after changing the agent (`src/bin/sandbox_agent.rs`, `src/agent_protocol.rs`) or `docker/sandbox/`: the pod runs the imported image, not the tree you just built. `scripts/cluster-doctor` (run by `scripts/check.sh`) says when you haven't: it compares the hash `build-sandbox-image.sh` records (`target/sandbox-image/agent-sources.sha256`, per checkout; a worktree without one takes the main checkout's when the agent sources match) with the working tree's. It also checks, through `sandbox_image_import --check`, that the node still has both images: the kubelet deletes images no pod is using once the node's disk passes 85%, and every pod then fails with `ErrImageNeverPull`.
 
 ### The sandbox agent's protocol (SME-53)
 
@@ -208,6 +208,8 @@ A small automated browser test tier exists (`src/browser_tests.rs`, see below) f
 
 **Run hands-on checks against `scripts/check-server`, not a `dx serve` in the working tree.** `scripts/check-server start [REF]` builds and serves a commit (default `HEAD`) from a separate worktree (`../smelt-check`, or `$TMPDIR/smelt-check` when the repo's parent isn't writable) on port 8081, and says it's up once the app answers with a 2xx (while `dx` builds it answers with a 500); `scripts/check-server stop` stops it and everything it started; `scripts/check-server status` says what's running. It serves the commit, not your uncommitted edits, and saving a file never restarts it. To check a newer commit, `stop` and `start` again. `CHECK_SCRATCH_DB=1` serves from an empty database of its own (dropped on `stop`), for when the dev database has migrations from another branch. See [development-process.md](development-process.md#rules) for why: a `dx serve` in the working tree rebuilds and restarts on every save, and stopping only the `dx` process leaves its server child running.
 
+**Under `dx serve` (a check server included), every open tab reloads itself when the server restarts:** `dx`'s dev client in the page watches its own socket (`/_dioxus`) and reloads on reconnect. A check that needs a tab to outlive a server restart, such as SME-43's reload banner, has to run built servers instead (`dx build --platform web`, then the bundle's own `./server`); see that ticket's Feature checklist row.
+
 A related gotcha with a `dx serve` that is watching files: **a CSS/asset edit doesn't reliably reach a *fresh* page load.** `App`'s `asset!("/assets/chat.css")` resolves to a content-hashed bundle path baked into the served HTML at build time; `dx`'s hot-reload patches tabs that were already open, but a brand-new browser (exactly what a screenshot script launches each run) can get a stale pre-edit bundle. On `sandbox-native-environment` a fresh `browser_check.py` run kept rendering unstyled markup after a CSS edit that the log said was hot-reloaded. With the check server, commit and restart it (`scripts/check-server stop`, then `start`) before assuming the change itself is wrong.
 
 ### Playwright (preferred)
@@ -286,7 +288,7 @@ cargo test --features "server browser-test" -- --ignored --test-threads=1
 It runs these scenarios, in order, in one `#[tokio::test]` (`test_end_to_end_browser_scenarios`):
 1. The sandbox panel on a cold load: one pod, two terminals. Also checks the stylesheet loads.
 2. A terminal command's output streaming live, with no reload.
-3. `terminate_terminal` removing exactly the right card.
+3. `terminate_terminal` removing exactly the right card, and a terminal terminated while the tab is reconnecting gone once it has (SME-43).
 4. A reload mid-command rebuilding the panel, with live updates resuming.
 5. The context-usage indicator and its detail view (SME-18).
 6. A compaction divider, collapsed by default, expanding to the summary.
@@ -307,6 +309,9 @@ It runs these scenarios, in order, in one `#[tokio::test]` (`test_end_to_end_bro
 21. One primary action per form, and intro text lined up with its heading (SME-41 D6).
 22. A new conversation's intro and example asks (SME-41 D12).
 23. A sandbox dev server end to end (SME-42): a server bound to `127.0.0.1` in a real pod loads in the model's browsing session at `localhost`, the model's `sandbox_preview_url` link appears live in the sandbox panel, opens the same page in a tab through the harness's own preview listener (`SMELT_PREVIEW_URL` set to a free port), and survives a reload. Since SME-33 it goes on to a Docker container with an unpublished port, on a network with a fixed address: `webfetch` and a browsing session load it at its address, a private address outside the Docker range stays refused, and its preview link names the container in the panel and opens in a tab.
+24. The model picker naming the conversation's model, and a choice in one tab showing in every tab with no reload (SME-72).
+25. An OAuth MCP server taking extra headers (SME-76).
+26. A tab older than the server (SME-43): an event type the bundle doesn't know (`ConversationEvent::BrowserTestAddedLater`, which only exists with `browser-test`, so the `dx build` bundle really lacks it) neither ends the stream nor loses the next event, and asks for a reload; a reconnect to a server with another build id (`api::version::test_override`) does too, on the chat and Sandboxes pages; Reload clears it.
 
 Then, unnumbered: a repo's AGENTS.md waiting for the user's trust, and trusting it loading exactly that file (SME-32); and switching conversations closing the context detail view (SME-51 B11).
 
