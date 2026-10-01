@@ -95,6 +95,19 @@ pub fn parse_tool_name(name: &str) -> Option<(&str, &str)> {
     rest.split_once(TOOL_NAME_SEPARATOR)
 }
 
+/// Refuses extra headers an `auth_mode` server can't use: an OAuth
+/// server's `Authorization` is its token, which `oauth_headers` sets over
+/// any saved one (SME-76 lets OAuth servers have other headers, such as
+/// GitHub's `X-MCP-Toolsets`).
+pub fn check_extra_headers(auth_mode: &str, headers: &HashMap<String, String>) -> Result<(), String> {
+    if auth_mode == "oauth" && headers.keys().any(|name| name.eq_ignore_ascii_case("authorization")) {
+        return Err(
+            "an OAuth server's Authorization header is set by OAuth; connect it instead".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Parses `extra_headers` into the `http` crate's typed header map
 /// `rmcp`'s transport config expects. A per-server config error (an
 /// invalid header name/value the UI let through) surfaces as a plain
@@ -539,6 +552,17 @@ pub async fn call_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_an_oauth_server_refuses_an_authorization_header_and_takes_others() {
+        let headers = |name: &str| HashMap::from([(name.to_string(), "v".to_string())]);
+        for name in ["Authorization", "authorization"] {
+            let refused = check_extra_headers("oauth", &headers(name));
+            assert!(refused.as_ref().is_err_and(|e| e.contains("OAuth")), "{name}: {refused:?}");
+        }
+        assert_eq!(check_extra_headers("oauth", &headers("X-MCP-Toolsets")), Ok(()));
+        assert_eq!(check_extra_headers("static_headers", &headers("Authorization")), Ok(()));
+    }
 
     use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
     use rmcp::handler::server::tool::ToolCallContext;

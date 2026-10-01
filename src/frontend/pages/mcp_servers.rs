@@ -613,35 +613,41 @@ pub fn McpServerEdit(id: i64) -> Element {
                         oninput: move |e| edit_url.set(e.value()),
                     }
 
-                    if edit_auth_mode() == "static_headers" {
-                        label { "Headers" }
-                        if !existing_header_edits().is_empty() {
-                            div { class: "mcp-header-rows",
-                                for (index , (name , value)) in existing_header_edits().into_iter().enumerate() {
-                                    div { key: "{name}", class: "mcp-header-row",
-                                        span { class: "mcp-header-existing-name", "{name}" }
-                                        input {
-                                            r#type: "text",
-                                            class: "mcp-header-value",
-                                            placeholder: "(unchanged)",
-                                            value: "{value}",
-                                            oninput: move |e| existing_header_edits.write()[index].1 = e.value(),
-                                        }
-                                        button {
-                                            r#type: "button",
-                                            class: "mcp-remove-header",
-                                            onclick: move |_| {
-                                                let (removed_name, _) = existing_header_edits.write().remove(index);
-                                                removed_header_names.write().push(removed_name);
-                                            },
-                                            "Remove"
-                                        }
+                    // An OAuth server takes extra headers too (SME-76: GitHub's
+                    // X-MCP-Toolsets); OAuth sets its Authorization.
+                    label {
+                        if edit_auth_mode() == "oauth" {
+                            "Extra headers (sent with the OAuth token)"
+                        } else {
+                            "Headers"
+                        }
+                    }
+                    if !existing_header_edits().is_empty() {
+                        div { class: "mcp-header-rows",
+                            for (index , (name , value)) in existing_header_edits().into_iter().enumerate() {
+                                div { key: "{name}", class: "mcp-header-row",
+                                    span { class: "mcp-header-existing-name", "{name}" }
+                                    input {
+                                        r#type: "text",
+                                        class: "mcp-header-value",
+                                        placeholder: "(unchanged)",
+                                        value: "{value}",
+                                        oninput: move |e| existing_header_edits.write()[index].1 = e.value(),
+                                    }
+                                    button {
+                                        r#type: "button",
+                                        class: "mcp-remove-header",
+                                        onclick: move |_| {
+                                            let (removed_name, _) = existing_header_edits.write().remove(index);
+                                            removed_header_names.write().push(removed_name);
+                                        },
+                                        "Remove"
                                     }
                                 }
                             }
                         }
-                        {header_rows(new_header_rows, "Header value")}
                     }
+                    {header_rows(new_header_rows, "Header value")}
 
                     if let Some(err) = save_error() {
                         p { class: "error", "{err}" }
