@@ -6,8 +6,9 @@
 # - the node still has both sandbox images (the kubelet deletes unused ones
 #   once its disk is over 85% full), via `sandbox_image_import --check`;
 # - the imported agent was built from this working tree's agent sources, as
-#   recorded by scripts/build-sandbox-image.sh. The record is per checkout:
-#   an import from another checkout into the same cluster isn't seen.
+#   recorded by scripts/build-sandbox-image.sh. The record is per checkout;
+#   a worktree without one takes the main checkout's when the agent sources
+#   match (SME-43).
 #
 # Run by scripts/check.sh before the server tests; exits non-zero with what
 # to do.
@@ -19,6 +20,16 @@ record=target/sandbox-image/agent-sources.sha256
 cargo run -q --bin sandbox_image_import --features server -- --check
 
 current=$(scripts/agent-sources-hash)
+# A new worktree has no record of its own. The main checkout's counts when
+# it was built from the same agent sources: then it's this tree's image too.
+if [ ! -f "$record" ]; then
+    main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+    if [ "$main" != "$PWD" ] && [ -f "$main/$record" ] && [ "$(cat "$main/$record")" = "$current" ]; then
+        mkdir -p "$(dirname "$record")"
+        cp "$main/$record" "$record"
+        echo "cluster-doctor: took $main's record of the cluster's sandbox image (same agent sources)"
+    fi
+fi
 if [ ! -f "$record" ]; then
     echo "cluster-doctor: no record of which agent the cluster's image was built from; run scripts/build-sandbox-image.sh" >&2
     exit 1
