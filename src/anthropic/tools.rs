@@ -2307,9 +2307,27 @@ mod server {
     /// An edit's result: its hash, and the file's diagnostics when a
     /// language server that takes it is running (SME-35).
     async fn edit_result(pool: &PgPool, conversation_id: i64, path: &str, hash: String) -> String {
+        let diagnostics = crate::lsp::manager::diagnostics_after_edit(pool, conversation_id, path).await;
+        edit_result_json(hash, diagnostics)
+    }
+
+    /// `edit_result`'s JSON. The diagnostics are fitted to
+    /// `LINES_BUDGET_CHARS` (`fit_lines`) so the result stays under
+    /// `execute`'s cap: they serialize before `hash`, and a cut there lost
+    /// the new hash and left invalid JSON (SME-76's review).
+    fn edit_result_json(hash: String, diagnostics: Option<String>) -> String {
         let mut result = serde_json::json!({"hash": hash});
-        if let Some(diagnostics) = crate::lsp::manager::diagnostics_after_edit(pool, conversation_id, path).await {
-            result["diagnostics"] = Value::String(diagnostics);
+        if let Some(diagnostics) = diagnostics {
+            let lines: Vec<String> = diagnostics.lines().map(str::to_string).collect();
+            let total = lines.len();
+            // the escaped newline joining each line
+            const PER_LINE: usize = 2;
+            let (kept, truncated) = fit_lines(lines, LINES_BUDGET_CHARS, PER_LINE);
+            let mut shown = kept.join("\n");
+            if truncated {
+                shown.push_str(&format!("\n[diagnostics cut: {} of {total} lines shown]", kept.len()));
+            }
+            result["diagnostics"] = Value::String(shown);
         }
         result.to_string()
     }
@@ -2941,6 +2959,29 @@ mod server {
             let (kept, truncated) = fit_lines(vec!["a".repeat(100), "b".to_string()], 10, 0);
             assert_eq!(kept, vec!["a".repeat(100)]);
             assert!(truncated);
+        }
+
+        /// SME-76 review: the cap in `execute` cut an edit's result inside
+        /// its diagnostics, which serialize before `hash`, so the new hash
+        /// was lost and the next edit was refused as a concurrent change.
+        #[test]
+        fn test_an_edit_result_with_huge_diagnostics_keeps_its_hash_and_stays_json() {
+            let diagnostics = (0..50)
+                .map(|i| format!("error[E0308] at {i}:1  {}", "x".repeat(1_000)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let result = cap_tool_result(edit_result_json("new-hash".to_string(), Some(diagnostics)));
+            let parsed: Value = serde_json::from_str(&result).expect("the result is still JSON");
+            assert_eq!(parsed["hash"], "new-hash");
+            let shown = parsed["diagnostics"].as_str().expect("diagnostics");
+            assert!(shown.starts_with("error[E0308] at 0:1"), "the first diagnostics are kept");
+            assert!(shown.contains("cut"), "it says the diagnostics were cut");
+        }
+
+        #[test]
+        fn test_an_edit_result_with_short_diagnostics_is_unchanged() {
+            let result = edit_result_json("h".to_string(), Some("no errors".to_string()));
+            assert_eq!(result, r#"{"diagnostics":"no errors","hash":"h"}"#);
         }
 
         /// SME-76: conversation 23 read a 73 KB source file whole.
