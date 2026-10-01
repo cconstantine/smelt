@@ -424,13 +424,23 @@ struct SandboxTerminalPanelEntry {
 /// Applies one `get_sandbox_state` snapshot onto the panel's current pods
 /// and terminals — same "snapshot is authoritative" upsert semantics as
 /// `merge_task_snapshot`, flattened from the snapshot's pod→terminal
-/// nesting into the two separate flat lists the panel renders from.
+/// nesting into the two separate flat lists the panel renders from. Unlike
+/// tasks, a pod or terminal the snapshot leaves out is gone: it went away
+/// while the tab wasn't listening (SME-43).
 #[cfg(any(feature = "web", test))]
 fn merge_sandbox_snapshot(
     pods: &mut Vec<SandboxPodPanelEntry>,
     terminals: &mut Vec<SandboxTerminalPanelEntry>,
     snapshot: SandboxSnapshot,
 ) {
+    pods.retain(|p| snapshot.pods.iter().any(|s| s.pod_id == p.pod_id));
+    terminals.retain(|t| {
+        snapshot
+            .pods
+            .iter()
+            .flat_map(|s| &s.terminals)
+            .any(|s| s.terminal_id == t.terminal_id)
+    });
     for pod in snapshot.pods {
         if let Some(entry) = pods.iter_mut().find(|p| p.pod_id == pod.pod_id) {
             entry.status = pod.status.clone();
@@ -2497,6 +2507,40 @@ mod tests {
         assert_eq!(pods[0].status, "Running");
     }
 
+    /// A pod or terminal that went away while the tab was disconnected
+    /// never gets its live `terminated` event; the reconnect's snapshot
+    /// leaving it out is the only sign (SME-43).
+    #[test]
+    fn test_merge_sandbox_snapshot_drops_pods_and_terminals_it_no_longer_lists() {
+        let pod = |pod_id| SandboxPodPanelEntry { pod_id, status: "Running".to_string(), previews: Vec::new() };
+        let terminal = |terminal_id, pod_id| SandboxTerminalPanelEntry {
+            terminal_id,
+            pod_id,
+            status: "connected".to_string(),
+            commands: Vec::new(),
+        };
+        let mut pods = vec![pod(1), pod(2)];
+        let mut terminals = vec![terminal(10, 1), terminal(11, 1), terminal(20, 2)];
+        let snapshot = SandboxSnapshot {
+            pods: vec![SandboxPodSummary {
+                pod_id: 1,
+                status: "Running".to_string(),
+                terminals: vec![SandboxTerminalSummary {
+                    terminal_id: 10,
+                    pod_id: 1,
+                    status: "connected".to_string(),
+                    commands: Vec::new(),
+                }],
+                previews: Vec::new(),
+            }],
+        };
+
+        merge_sandbox_snapshot(&mut pods, &mut terminals, snapshot);
+
+        assert_eq!(pods.iter().map(|p| p.pod_id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(terminals.iter().map(|t| t.terminal_id).collect::<Vec<_>>(), vec![10]);
+    }
+
     #[test]
     fn test_apply_sandbox_pod_update_upserts_when_not_terminated() {
         let mut pods = Vec::new();
@@ -3447,6 +3491,8 @@ fn ChatPanel(
                                 Some(Ok(ConversationEvent::ReposUpdate { repos: list })) => {
                                     repos.set(list);
                                 }
+                                // A type added since this page loaded.
+                                Some(Ok(ConversationEvent::Unknown)) => {}
                                 Some(Err(_)) | None => break,
                             }
                         }
