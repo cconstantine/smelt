@@ -3027,8 +3027,10 @@ div.mcp-status-not-connected::before {
 .stale-bundle-banner {
     position: fixed;
     top: 8px;
-    left: 50%;
-    transform: translateX(-50%);
+    left: 0;
+    right: 0;
+    width: fit-content;
+    margin: 0 auto;
     z-index: 200;
     display: flex;
     align-items: center;
@@ -3056,4 +3058,13 @@ div.mcp-status-not-connected::before {
 }
 .stale-bundle-banner button:hover {
     background: var(--ink-hover);
+}
+/* Below the phone header's Conversations button, not over it. */
+@media (max-width: 720px) {
+    .stale-bundle-banner {
+        top: 56px;
+        width: auto;
+        margin: 0 16px;
+        max-width: none;
+    }
 }

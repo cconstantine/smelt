@@ -286,7 +286,7 @@ cargo test --features "server browser-test" -- --ignored --test-threads=1
 It runs these scenarios, in order, in one `#[tokio::test]` (`test_end_to_end_browser_scenarios`):
 1. The sandbox panel on a cold load: one pod, two terminals. Also checks the stylesheet loads.
 2. A terminal command's output streaming live, with no reload.
-3. `terminate_terminal` removing exactly the right card.
+3. `terminate_terminal` removing exactly the right card, and a terminal terminated while the tab is reconnecting gone once it has (SME-43).
 4. A reload mid-command rebuilding the panel, with live updates resuming.
 5. The context-usage indicator and its detail view (SME-18).
 6. A compaction divider, collapsed by default, expanding to the summary.
@@ -307,6 +307,9 @@ It runs these scenarios, in order, in one `#[tokio::test]` (`test_end_to_end_bro
 21. One primary action per form, and intro text lined up with its heading (SME-41 D6).
 22. A new conversation's intro and example asks (SME-41 D12).
 23. A sandbox dev server end to end (SME-42): a server bound to `127.0.0.1` in a real pod loads in the model's browsing session at `localhost`, the model's `sandbox_preview_url` link appears live in the sandbox panel, opens the same page in a tab through the harness's own preview listener (`SMELT_PREVIEW_URL` set to a free port), and survives a reload. Since SME-33 it goes on to a Docker container with an unpublished port, on a network with a fixed address: `webfetch` and a browsing session load it at its address, a private address outside the Docker range stays refused, and its preview link names the container in the panel and opens in a tab.
+24. The model picker naming the conversation's model, and a choice in one tab showing in every tab with no reload (SME-72).
+25. An OAuth MCP server taking extra headers (SME-76).
+26. A tab older than the server (SME-43): an event type the bundle doesn't know (`ConversationEvent::BrowserTestAddedLater`, which only exists with `browser-test`, so the `dx build` bundle really lacks it) neither ends the stream nor loses the next event, and asks for a reload; a reconnect to a server with another build id (`api::version::test_override`) does too, on the chat and Sandboxes pages; Reload clears it.
 
 Then, unnumbered: a repo's AGENTS.md waiting for the user's trust, and trusting it loading exactly that file (SME-32); and switching conversations closing the context detail view (SME-51 B11).
 
