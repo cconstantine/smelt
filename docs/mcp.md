@@ -38,14 +38,13 @@ At startup `mcp::ensure_default_servers` inserts each of `DEFAULT_MCP_SERVERS` t
 - **Stale** (the server sent `tools/list_changed`, which `SmeltClientHandler` turns into setting the flag): re-list the tools on the same connection. If listing fails, the connection is taken as broken, dropped and reconnected. Every other server notification uses `rmcp`'s no-op defaults.
 - **Not connected:** connect under a per-server lock (`CONNECTING`), so two callers don't both connect and a slow server holds up only callers that want it, not the whole registry (SME-40). `connect` builds the transport with the headers (OAuth adds a bearer token, below), runs the `initialize` handshake and lists all tools. `retry_once` tries once more on failure, since a first connect is the one most likely to hit a one-off problem.
 
-Limits (SME-51); the three timeouts are 1s under `cfg(test)`:
+Limits (SME-51); the three timeouts are 1s under `cfg(test)`. A tool result's size is capped for every tool, MCP or native, by `anthropic::tools::execute` (`MAX_TOOL_RESULT_CHARS`, SME-76; see [api.md](api.md)).
 
 | Constant | Value | Bounds |
 |---|---|---|
 | `CONNECT_TIMEOUT` | 15s | connecting plus listing tools, per attempt |
 | `TOOL_LIST_WAIT` | 10s | how long a turn waits for a server when listing tools; a connect that takes longer carries on in the background and its tools show up on a later call |
 | `CALL_TIMEOUT` | 120s | one tool call (which holds the turn and the conversation's lock) |
-| `MAX_RESULT_CHARS` | 100,000 | a tool result; longer results are cut, with a line saying so |
 | `RETRY_AFTER_FAILURE` | 5 min | after a failed connect, model calls skip the server (`FAILED_AT`) instead of waiting on it every turn |
 
 The skip applies to model calls only (`Attempt::SkipRecentFailures`). The status check uses `Attempt::Always`: the user asked, so it always tries. A successful connect, or an `evict`, clears the failure.

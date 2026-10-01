@@ -72,10 +72,6 @@ const CALL_TIMEOUT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(120)
 };
 
-/// A tool result goes into the model's context and the database; past
-/// this it's cut, saying so (SME-51 B8).
-const MAX_RESULT_CHARS: usize = 100_000;
-
 /// After a failed connection, model calls skip the server for this long
 /// instead of trying (and waiting) again on every call. The status page
 /// still tries each time it's opened.
@@ -532,10 +528,6 @@ pub async fn call_tool(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let content = match crate::fetch_guard::truncate(content, MAX_RESULT_CHARS) {
-        (kept, true) => format!("{kept}\n[the result was cut to its first {MAX_RESULT_CHARS} characters]"),
-        (whole, false) => whole,
-    };
 
     if result.is_error.unwrap_or(false) {
         Err(content)
@@ -1049,20 +1041,6 @@ mod tests {
             called.as_ref().is_ok_and(|r| r.as_ref().is_err_and(|e| e.contains("didn't answer"))),
             "{called:?}"
         );
-    }
-
-    /// SME-51 B8: a result goes into the model's context and the database,
-    /// so it's cut to a size, saying so.
-    #[tokio::test]
-    async fn test_a_huge_tool_result_is_cut() {
-        register_test_connection(-1113, false).await;
-        let config = test_config(-1113, "huge");
-        let huge = "x".repeat(MAX_RESULT_CHARS * 3);
-        let result = call_tool(&test_pool(), &config, "echo", serde_json::json!({"s": huge}))
-            .await
-            .expect("echo");
-        assert!(result.chars().count() < MAX_RESULT_CHARS + 200, "{} chars", result.chars().count());
-        assert!(result.contains("cut"), "the result should say it was cut");
     }
 
     /// SME-40 F1: listing tools for a turn waited the full connect timeout
