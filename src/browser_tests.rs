@@ -366,6 +366,26 @@ async fn wait_for_resource(page: &chromiumoxide::Page, suffix: &str) {
     }
 }
 
+/// How many requests the page has made for a URL ending in `suffix`.
+async fn resource_count(page: &chromiumoxide::Page, suffix: &str) -> usize {
+    page.evaluate(format!(
+        "performance.getEntriesByType('resource').filter(e => e.name.endsWith({suffix:?})).length"
+    ))
+    .await
+    .expect("read resource timings")
+    .into_value()
+    .expect("a count")
+}
+
+/// Whether the page is asking for a reload (SME-43).
+async fn banner_shown(page: &chromiumoxide::Page) -> bool {
+    page.evaluate("!!document.querySelector('.stale-bundle-banner')")
+        .await
+        .expect("look for the reload banner")
+        .into_value()
+        .expect("a bool")
+}
+
 /// Waits until the page's WASM client has hydrated and is live. After
 /// subscribing to the conversation's live events, the client pulls a
 /// one-shot snapshot of each panel, `get_browsing_state` last; that
@@ -596,6 +616,21 @@ async fn test_end_to_end_browser_scenarios() {
             page.evaluate("document.body.innerText").await.expect("read body text").into_value::<String>().expect("string")
                 .contains(&format!("terminal {terminal_a1}")),
             "a sibling terminal in the same pod should be completely unaffected"
+        );
+        // A terminal that goes away while the tab is reconnecting: its
+        // live event reaches nobody, and the reconnect's snapshot is what
+        // must take the card away (SME-43; it used to stay for good).
+        // `forget` ends the tab's stream, which reconnects 1.5 s later.
+        let terminal_a3 = sandbox::create_terminal(pool, conversation.id).await.expect("create_terminal (a3)");
+        assert!(
+            wait_for_text(&page, &format!("terminal {terminal_a3}"), Duration::from_secs(10)).await,
+            "a new terminal's card should appear live"
+        );
+        crate::events::forget(conversation.id);
+        sandbox::terminate_terminal(pool, terminal_a3).await.expect("terminate_terminal (a3)");
+        assert!(
+            wait_for_text_gone(&page, &format!("terminal {terminal_a3}"), Duration::from_secs(10)).await,
+            "a terminal terminated while the tab was reconnecting should be gone once it has"
         );
 
         // --- Scenario 4: reload mid-command reconstructs state, live updates resume ---
@@ -1930,6 +1965,77 @@ async fn test_end_to_end_browser_scenarios() {
         assert_eq!(saved.auth_mode, "oauth", "saving headers keeps the server on OAuth");
         edit.close().await.expect("close the edit page");
         db::delete_mcp_server_config(pool, oauth_server.id).await.expect("delete the OAuth server");
+
+        // --- Scenario 26 (SME-43): a tab running an older bundle than the
+        // server. (a) An event type the bundle doesn't know is skipped: the
+        // stream stays up (one snapshot pull, not a second after a
+        // reconnect), and the next event still arrives live. It also proves
+        // the server is newer, so the tab asks for a reload. ---
+        let stale = new_conversation(pool, &created).await;
+        let stale_url = format!("{}conversation/{}", harness.base_url, stale.id);
+        let snapshot_pull = format!("/api/conversations/{}/browsing", stale.id);
+        let stale_tab = harness.browser.new_page(stale_url.as_str()).await.expect("open the stale tab");
+        wait_for_live_client(&stale_tab, stale.id).await;
+        assert!(
+            !banner_shown(&stale_tab).await,
+            "a page built from the server's own tree shouldn't ask for a reload"
+        );
+        crate::events::publish(stale.id, crate::events::ConversationEvent::BrowserTestAddedLater {});
+        crate::events::publish(
+            stale.id,
+            crate::events::ConversationEvent::TodoListUpdate {
+                items: vec![anthropic::tools::TodoItem {
+                    content: "scenario 26 todo".to_string(),
+                    status: anthropic::tools::TodoStatus::Pending,
+                }],
+            },
+        );
+        assert!(
+            wait_for_text(&stale_tab, "scenario 26 todo", Duration::from_secs(5)).await,
+            "an event after one of an unknown type should still arrive live"
+        );
+        assert_eq!(
+            resource_count(&stale_tab, &snapshot_pull).await,
+            1,
+            "an unknown event type shouldn't end the stream"
+        );
+        assert!(
+            wait_for_text(&stale_tab, "smelt was updated", Duration::from_secs(5)).await,
+            "an unknown event type should ask for a reload"
+        );
+        stale_tab.close().await.expect("close the stale tab");
+
+        // (b) The server is redeployed: the tab's stream drops, and the
+        // reconnect finds another build. The Sandboxes page, whose stream
+        // is the app-wide one, notices too. Reloading clears it.
+        let tab = harness.browser.new_page(stale_url.as_str()).await.expect("open a tab");
+        wait_for_live_client(&tab, stale.id).await;
+        assert!(!banner_shown(&tab).await, "no reload banner before the server changes");
+        crate::api::version::test_override::set(Some("a-newer-build"));
+        crate::events::forget(stale.id);
+        assert!(
+            wait_for_text(&tab, "smelt was updated", Duration::from_secs(10)).await,
+            "a reconnect to a newer server should ask for a reload"
+        );
+        let pods_tab = harness
+            .browser
+            .new_page(format!("{}pods", harness.base_url))
+            .await
+            .expect("open the Sandboxes page");
+        assert!(
+            wait_for_text(&pods_tab, "smelt was updated", Duration::from_secs(10)).await,
+            "the Sandboxes page should notice a newer server too"
+        );
+        pods_tab.close().await.expect("close the Sandboxes page");
+        crate::api::version::test_override::set(None);
+        click_when_present(&tab, ".stale-bundle-banner button", Duration::from_secs(5)).await;
+        assert!(
+            wait_for_text_gone(&tab, "smelt was updated", Duration::from_secs(10)).await,
+            "Reload should load the page again"
+        );
+        wait_for_live_client(&tab, stale.id).await;
+        assert!(!banner_shown(&tab).await, "the reloaded page is current");
+        tab.close().await.expect("close the tab");
         page.close().await.expect("close the tab");
     })))
     .await;

@@ -3337,6 +3337,7 @@ fn ChatPanel(
                         if let Ok(Some(error)) = get_turn_error(id).await {
                             stream_errors.write().insert(id, error);
                         }
+                        crate::frontend::check_build_id().await;
                         // Kept last: the browser tests take this request
                         // completing as the sign the client is live.
                         if let Ok(state) = get_browsing_state(id).await {
@@ -3491,8 +3492,11 @@ fn ChatPanel(
                                 Some(Ok(ConversationEvent::ReposUpdate { repos: list })) => {
                                     repos.set(list);
                                 }
-                                // A type added since this page loaded.
-                                Some(Ok(ConversationEvent::Unknown)) => {}
+                                // A type added since this page loaded: the
+                                // server is newer than this bundle.
+                                Some(Ok(ConversationEvent::Unknown)) => {
+                                    *crate::frontend::STALE_BUNDLE.write() = true;
+                                }
                                 Some(Err(_)) | None => break,
                             }
                         }

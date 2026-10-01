@@ -6,3 +6,4 @@ pub mod mcp;
 pub mod pods;
 pub mod providers;
 pub mod sandbox_volumes;
+pub mod version;

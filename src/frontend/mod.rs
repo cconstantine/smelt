@@ -147,6 +147,49 @@ pub fn App() -> Element {
         // shrinks it to fit (SME-40 F8).
         document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
         document::Stylesheet { href: asset!("/assets/chat.css") }
+        StaleBundleBanner {}
         Router::<Route> {}
+    }
+}
+
+/// Whether this page's bundle is older than the server it talks to
+/// (SME-43): set by `check_build_id`, or by an event type the bundle
+/// doesn't know. Only a reload clears it.
+pub(crate) static STALE_BUNDLE: GlobalSignal<bool> = Signal::global(|| false);
+
+/// Asks the server which build it is, and marks the page stale when that
+/// isn't this bundle's. Called each time a live stream (re)connects: a
+/// deploy restarts the server, which drops every stream. A failed request
+/// leaves things as they were, and the next reconnect asks again.
+#[cfg(feature = "web")]
+pub(crate) async fn check_build_id() {
+    if let Ok(id) = crate::api::version::get_build_id().await
+        && id != crate::api::version::BUILD_ID
+    {
+        *STALE_BUNDLE.write() = true;
+    }
+}
+
+/// Asks for a reload once the page is older than the server. Everything
+/// the page knows how to show keeps working meanwhile, so it never reloads
+/// by itself: a half-typed message is the user's to keep.
+#[component]
+fn StaleBundleBanner() -> Element {
+    if !*STALE_BUNDLE.read() {
+        return rsx! {};
+    }
+    rsx! {
+        div { class: "stale-bundle-banner", role: "status",
+            "smelt was updated. Reload to keep this page current."
+            button {
+                r#type: "button",
+                onclick: move |_| {
+                    spawn(async move {
+                        let _ = document::eval("location.reload()").await;
+                    });
+                },
+                "Reload"
+            }
+        }
     }
 }

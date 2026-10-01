@@ -18,11 +18,15 @@ pub(crate) fn use_pods_changed() -> Signal<u64> {
                 if let Ok(mut events) = crate::api::pods::subscribe_app_events().await {
                     // Anything that changed while disconnected.
                     *changed.write() += 1;
+                    crate::frontend::check_build_id().await;
                     // Other app-wide events (a turn starting, say) aren't
                     // about pods; skip them rather than ending the loop.
                     while let Some(Ok(event)) = events.recv().await {
-                        if event == crate::events::AppEvent::PodsChanged {
-                            *changed.write() += 1;
+                        match event {
+                            crate::events::AppEvent::PodsChanged => *changed.write() += 1,
+                            // Added since this page loaded (SME-43).
+                            crate::events::AppEvent::Unknown => *crate::frontend::STALE_BUNDLE.write() = true,
+                            _ => {}
                         }
                     }
                 }

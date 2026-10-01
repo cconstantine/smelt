@@ -205,6 +205,10 @@ pub enum ConversationEvent {
     TurnError {
         message: String,
     },
+    /// A type the browser tier's web bundle doesn't have (`dx build` leaves
+    /// this feature off), standing in for one a newer server adds.
+    #[cfg(feature = "browser-test")]
+    BrowserTestAddedLater {},
     /// An event type this build doesn't know: one added on a newer server
     /// than the page's bundle. Never published; a tab skips it and offers
     /// a reload (SME-43).
