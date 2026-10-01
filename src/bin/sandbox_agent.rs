@@ -60,7 +60,8 @@ const RELAY_CONNECTED: &[u8] = b"ok\n";
 /// The one line a relay connection starts with, `ip:port\n`, is at most this long.
 const RELAY_TARGET_MAX: usize = 64;
 const PID_FILE: &str = "/tmp/sandbox_agent.pid";
-const MARKER_PREFIX: &str = "MARKER:";
+/// Starts every command's completion marker; `new_marker` adds the nonce.
+const MARKER_PREFIX: &str = "__smelt_done__:";
 /// Bounded retry for the one real race left once PID discovery moved from
 /// eager (right after spawn) to reactive (only when `send_signal` is
 /// called): a `send_signal` arriving essentially back-to-back with the
@@ -68,6 +69,32 @@ const MARKER_PREFIX: &str = "MARKER:";
 /// Not measured — see SME-9's Open Questions.
 const SIGNAL_DISCOVERY_RETRIES: u32 = 10;
 const SIGNAL_DISCOVERY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Finds the in-flight command's completion marker (`marker`, which ends
+/// in that command's nonce and a `:`) at the end of a stdout line, and
+/// returns the output in front of it (non-empty when the command's last
+/// output had no newline) and the exit code after it.
+fn split_marker<'a>(line: &'a str, marker: &str) -> Option<(&'a str, i32)> {
+    let at = line.rfind(marker)?;
+    let code = line[at + marker.len()..].parse().ok()?;
+    Some((&line[..at], code))
+}
+
+/// The completion marker for one command: `MARKER_PREFIX`, a nonce no
+/// output can predict, and `:`. Unique per command (a counter) and per
+/// agent start (pid and clock), hashed so it reads as one opaque token.
+fn new_marker() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    use sha2::{Digest, Sha256};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let seed = format!("{}:{}:{nanos}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+    let digest = Sha256::digest(seed.as_bytes());
+    let nonce: String = digest.iter().take(12).map(|b| format!("{b:02x}")).collect();
+    format!("{MARKER_PREFIX}{nonce}:")
+}
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -299,62 +326,80 @@ enum ShellEvent {
 }
 
 /// Reads one terminal's stdout and stderr concurrently for as long as its
-/// shell lives, filtering the one internal line (the completion marker)
-/// before anything reaches a client — the same filtering this design has
-/// always done. One of these runs per terminal (spawned by
-/// `create_terminal`, not just once at agent startup); while idle (no
-/// command in flight) both branches simply stay pending, costing nothing.
+/// shell lives, filtering the in-flight command's completion marker
+/// (`marker`, set by `start_command`) before anything reaches a client.
+/// The marker is matched at the end of a line, not only as a whole line:
+/// a command whose last output has no newline (`printf abc`, `head -c`)
+/// has the marker glued onto that output (SME-76). Lines come from
+/// `Lines::next_line`, which is cancel safe; `read_line` in this
+/// `select!` dropped half a stdout line whenever stderr won the race.
+/// One of these runs per terminal (spawned by `create_terminal`); while
+/// idle (no command in flight) both branches simply stay pending.
 async fn run_reader(
     terminal_id: String,
-    mut stdout: BufReader<ChildStdout>,
-    mut stderr: BufReader<ChildStderr>,
+    stdout: BufReader<ChildStdout>,
+    stderr: BufReader<ChildStderr>,
+    marker: Arc<std::sync::Mutex<Option<String>>>,
     tx: mpsc::UnboundedSender<ShellEvent>,
 ) {
+    let mut stdout = stdout.lines();
+    let mut stderr = stderr.lines();
     let mut seq: u64 = 0;
     loop {
-        let mut out_line = String::new();
-        let mut err_line = String::new();
         tokio::select! {
-            result = stdout.read_line(&mut out_line) => {
+            result = stdout.next_line() => {
                 match result {
-                    Ok(0) | Err(_) => break, // bash exited or pipe error
-                    Ok(_) => {
-                        let line = out_line.trim_end_matches('\n');
-                        if let Some(rest) = line.strip_prefix(MARKER_PREFIX) {
-                            let exit_code: i32 = rest.trim().parse().unwrap_or(-1);
-                            if tx.send(ShellEvent::Marker { terminal_id: terminal_id.clone(), exit_code }).is_err() {
-                                break;
+                    Ok(None) | Err(_) => break, // bash exited or pipe error
+                    Ok(Some(line)) => {
+                        let found = {
+                            let mut marker = marker.lock().unwrap_or_else(|e| e.into_inner());
+                            let found = marker
+                                .as_deref()
+                                .and_then(|m| split_marker(&line, m))
+                                .map(|(before, exit_code)| (before.to_string(), exit_code));
+                            if found.is_some() {
+                                *marker = None;
                             }
-                            seq = 0;
-                        } else {
+                            found
+                        };
+                        let (data, exit_code) = match found {
+                            Some((before, exit_code)) => (before, Some(exit_code)),
+                            None => (line, None),
+                        };
+                        if exit_code.is_none() || !data.is_empty() {
                             seq += 1;
                             if tx
                                 .send(ShellEvent::Line {
                                     terminal_id: terminal_id.clone(),
                                     stream: Stream::Stdout,
                                     seq,
-                                    data: line.to_string(),
+                                    data,
                                 })
                                 .is_err()
                             {
                                 break;
                             }
                         }
+                        if let Some(exit_code) = exit_code {
+                            if tx.send(ShellEvent::Marker { terminal_id: terminal_id.clone(), exit_code }).is_err() {
+                                break;
+                            }
+                            seq = 0;
+                        }
                     }
                 }
             }
-            result = stderr.read_line(&mut err_line) => {
+            result = stderr.next_line() => {
                 match result {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        let line = err_line.trim_end_matches('\n');
+                    Ok(None) | Err(_) => break,
+                    Ok(Some(line)) => {
                         seq += 1;
                         if tx
                             .send(ShellEvent::Line {
                                 terminal_id: terminal_id.clone(),
                                 stream: Stream::Stderr,
                                 seq,
-                                data: line.to_string(),
+                                data: line,
                             })
                             .is_err()
                         {
@@ -383,6 +428,9 @@ struct Shell {
     /// SME-9's `sandbox.rs` bullet); this is the agent's own defensive
     /// backstop.
     current: AsyncMutex<Option<String>>,
+    /// The in-flight command's completion marker (`new_marker`), shared
+    /// with this terminal's `run_reader`, which clears it on a match.
+    marker: Arc<std::sync::Mutex<Option<String>>>,
     /// Held only so the child isn't dropped early; never otherwise read.
     /// Not killed on drop (tokio's default) — `terminate_terminal`'s
     /// explicit `killpg` is what actually ends it.
@@ -1069,10 +1117,12 @@ async fn create_terminal(state: &Arc<AppState>, terminal_id: String) -> Reply {
     }
     let _ = stdin.flush().await;
 
+    let marker = Arc::new(std::sync::Mutex::new(None));
     tokio::spawn(run_reader(
         terminal_id.clone(),
         stdout,
         stderr,
+        marker.clone(),
         state.events_tx.clone(),
     ));
 
@@ -1080,6 +1130,7 @@ async fn create_terminal(state: &Arc<AppState>, terminal_id: String) -> Reply {
         stdin: AsyncMutex::new(stdin),
         bash_pid,
         current: AsyncMutex::new(None),
+        marker,
         _bash_child: AsyncMutex::new(child),
     });
     state
@@ -1123,11 +1174,18 @@ async fn start_command(state: &Arc<AppState>, terminal_id: &str, id: String, com
         return;
     }
     *current = Some(id);
+    let marker = new_marker();
+    *shell.marker.lock().unwrap_or_else(|e| e.into_inner()) = Some(marker.clone());
     drop(current);
 
+    // stdin from /dev/null: the shell reads this payload from its own
+    // stdin, so a command that reads stdin (`cat`, `read`, a prompt) would
+    // otherwise swallow the marker line and never finish. Nothing writes
+    // to a terminal command's stdin.
     let payload = format!(
-        "eval {}\necho \"{MARKER_PREFIX}$?\"\n",
-        shell_quote(command)
+        "eval {} </dev/null\nprintf '%s%s\\n' {} \"$?\"\n",
+        shell_quote(command),
+        shell_quote(&marker)
     );
     let mut stdin = shell.stdin.lock().await;
     if stdin.write_all(payload.as_bytes()).await.is_ok() {
@@ -1298,6 +1356,29 @@ async fn relay(client: tokio::net::TcpStream) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_split_marker_finds_a_marker_alone_on_its_line() {
+        assert_eq!(split_marker("__smelt_done__:n1:0", "__smelt_done__:n1:"), Some(("", 0)));
+        assert_eq!(split_marker("__smelt_done__:n1:130", "__smelt_done__:n1:"), Some(("", 130)));
+    }
+
+    #[test]
+    fn test_split_marker_finds_a_marker_glued_to_output_without_a_newline() {
+        // Conversation 23's `head -c 400` of a JSON body.
+        assert_eq!(
+            split_marker(r#""conclusion":"succes__smelt_done__:n1:0"#, "__smelt_done__:n1:"),
+            Some((r#""conclusion":"succes"#, 0))
+        );
+    }
+
+    #[test]
+    fn test_split_marker_ignores_another_commands_nonce_and_the_old_marker() {
+        assert_eq!(split_marker("__smelt_done__:n2:0", "__smelt_done__:n1:"), None);
+        assert_eq!(split_marker("MARKER:0", "__smelt_done__:n1:"), None);
+        assert_eq!(split_marker("__smelt_done__:n1:", "__smelt_done__:n1:"), None);
+        assert_eq!(split_marker("__smelt_done__:n1:0 trailing", "__smelt_done__:n1:"), None);
+    }
 
     #[test]
     fn test_relay_target_accepts_a_container_address_and_port() {
@@ -1864,6 +1945,60 @@ mod socket_tests {
         }
         seen.sort_by_key(|(stream, _)| stream.as_str());
         assert_eq!(seen, vec![(Stream::Stderr, "err".to_string()), (Stream::Stdout, "out".to_string())]);
+    }
+
+    /// Runs `command` in a fresh terminal and collects its stdout lines and
+    /// exit code, failing if no exit arrives within `WAIT`.
+    async fn run_to_exit(command: &str) -> (Vec<String>, i32) {
+        let addr = serve_agent().await;
+        let mut client = connect_ready(addr).await;
+        create_terminal(&mut client, "t1").await;
+        run(&mut client, "t1", "c1", command).await;
+        let mut stdout = Vec::new();
+        loop {
+            match next(&mut client).await {
+                AgentMessage::Output { stream: Stream::Stdout, data, .. } => stdout.push(data),
+                AgentMessage::Output { .. } => {}
+                AgentMessage::Exit { id, code, .. } => {
+                    assert_eq!(id, "c1");
+                    return (stdout, code);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_command_whose_output_has_no_trailing_newline_still_exits() {
+        // Conversation 23: `head -c 400` glued the marker onto the output's
+        // last line, so the command never finished and the terminal wedged.
+        assert_eq!(run_to_exit("printf abc").await, (vec!["abc".to_string()], 0));
+    }
+
+    #[tokio::test]
+    async fn test_a_partial_stdout_line_survives_stderr_arriving_first() {
+        // `read_line` isn't cancel safe: when the stderr branch of the
+        // reader's `select!` won while stdout held half a line, that half
+        // was dropped.
+        assert_eq!(
+            run_to_exit("printf abc; sleep 0.3; echo err >&2; sleep 0.3; echo def").await,
+            (vec!["abcdef".to_string()], 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_command_that_reads_stdin_exits_instead_of_eating_the_marker() {
+        assert_eq!(run_to_exit("cat; echo after").await, (vec!["after".to_string()], 0));
+    }
+
+    #[tokio::test]
+    async fn test_output_that_looks_like_a_marker_does_not_end_the_command() {
+        let (stdout, code) = run_to_exit(
+            "echo MARKER:0; echo __smelt_done__:nonce:0; sleep 0.2; f() { return 4; }; f",
+        )
+        .await;
+        assert_eq!(stdout, vec!["MARKER:0".to_string(), "__smelt_done__:nonce:0".to_string()]);
+        assert_eq!(code, 4);
     }
 
     #[tokio::test]

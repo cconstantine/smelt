@@ -1880,6 +1880,56 @@ async fn test_end_to_end_browser_scenarios() {
         assert_eq!(stored.model.as_deref(), Some("other-model"));
         first_tab.close().await.expect("close the first picker tab");
         second_tab.close().await.expect("close the second picker tab");
+
+        // --- Scenario 25 (SME-76): an OAuth server takes extra headers
+        // too, such as GitHub's `X-MCP-Toolsets` (which turns on the tools
+        // that read CI logs). The edit page only showed its header editor
+        // to static-header servers. ---
+        let oauth_server = db::create_mcp_server_config(
+            pool,
+            &unique_id("oauth-headers"),
+            "http://127.0.0.1:9/mcp",
+            &std::collections::HashMap::new(),
+            "oauth",
+            Some("client-id"),
+            None,
+        )
+        .await
+        .expect("create an OAuth server");
+        let edit = harness
+            .browser
+            .new_page(format!("{}mcp-servers/{}", harness.base_url, oauth_server.id))
+            .await
+            .expect("open the OAuth server's edit page");
+        wait_for_element(&edit, ".mcp-oauth-panel", Duration::from_secs(10)).await;
+        click_when_present(&edit, ".mcp-add-header", Duration::from_secs(5)).await;
+        let name_field = wait_for_element(&edit, ".mcp-header-name", Duration::from_secs(5)).await;
+        name_field.focus().await.expect("focus the header name");
+        name_field.type_str("X-MCP-Toolsets").await.expect("type the header name");
+        let value_field = wait_for_element(&edit, ".mcp-header-row .mcp-header-value", Duration::from_secs(5)).await;
+        value_field.focus().await.expect("focus the header value");
+        value_field.type_str("repos,actions").await.expect("type the header value");
+        click_when_present(&edit, ".mcp-save-edit", Duration::from_secs(5)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let saved = loop {
+            let config = db::get_mcp_server_config(pool, oauth_server.id)
+                .await
+                .expect("read the server")
+                .expect("the server exists");
+            if !config.extra_headers.0.is_empty() || tokio::time::Instant::now() >= deadline {
+                break config;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        assert_eq!(
+            saved.extra_headers.0.get("X-MCP-Toolsets").map(String::as_str),
+            Some("repos,actions"),
+            "the header should be saved: {:?}",
+            saved.extra_headers.0.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(saved.auth_mode, "oauth", "saving headers keeps the server on OAuth");
+        edit.close().await.expect("close the edit page");
+        db::delete_mcp_server_config(pool, oauth_server.id).await.expect("delete the OAuth server");
         page.close().await.expect("close the tab");
     })))
     .await;

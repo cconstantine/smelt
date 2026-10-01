@@ -38,14 +38,13 @@ At startup `mcp::ensure_default_servers` inserts each of `DEFAULT_MCP_SERVERS` t
 - **Stale** (the server sent `tools/list_changed`, which `SmeltClientHandler` turns into setting the flag): re-list the tools on the same connection. If listing fails, the connection is taken as broken, dropped and reconnected. Every other server notification uses `rmcp`'s no-op defaults.
 - **Not connected:** connect under a per-server lock (`CONNECTING`), so two callers don't both connect and a slow server holds up only callers that want it, not the whole registry (SME-40). `connect` builds the transport with the headers (OAuth adds a bearer token, below), runs the `initialize` handshake and lists all tools. `retry_once` tries once more on failure, since a first connect is the one most likely to hit a one-off problem.
 
-Limits (SME-51); the three timeouts are 1s under `cfg(test)`:
+Limits (SME-51); the three timeouts are 1s under `cfg(test)`. A tool result's size is capped for every tool, MCP or native, by `anthropic::tools::execute` (`MAX_TOOL_RESULT_CHARS`, SME-76; see [api.md](api.md)).
 
 | Constant | Value | Bounds |
 |---|---|---|
 | `CONNECT_TIMEOUT` | 15s | connecting plus listing tools, per attempt |
 | `TOOL_LIST_WAIT` | 10s | how long a turn waits for a server when listing tools; a connect that takes longer carries on in the background and its tools show up on a later call |
 | `CALL_TIMEOUT` | 120s | one tool call (which holds the turn and the conversation's lock) |
-| `MAX_RESULT_CHARS` | 100,000 | a tool result; longer results are cut, with a line saying so |
 | `RETRY_AFTER_FAILURE` | 5 min | after a failed connect, model calls skip the server (`FAILED_AT`) instead of waiting on it every turn |
 
 The skip applies to model calls only (`Attempt::SkipRecentFailures`). The status check uses `Attempt::Always`: the user asked, so it always tries. A successful connect, or an `evict`, clears the failure.
@@ -71,6 +70,8 @@ Tools are named `mcp__<server>__<tool>`. `parse_tool_name` splits on the first `
 - **Issuer check (RFC 9207, MCP's SEP-2468; SME-65).** When the provider's metadata named an issuer, a callback's `iss` must equal it, and a provider that says it sends `iss` (GitHub and Linear do) must send it. `rmcp` does this for a code callback. An error callback (`error`, e.g. the user denied consent) never reaches `rmcp`, so `verify_error_callback` checks it the same way: the `state` must be the pending attempt's and `issuer_accepted` copies `rmcp`'s rule. Anyone can send an error callback, so until it passes, its text is replaced with `UNVERIFIED_ERROR`. Either way the attempt ends. Separately, `rmcp` refuses metadata whose `issuer` names a different server (RFC 8414 §3.3).
 - **Using the token.** For an `oauth` server, `mcp::connect` calls `oauth_headers`: a fresh `AuthorizationManager` on the same store gets an access token, refreshing an expired one and saving the result, and it's sent as `Authorization: Bearer …` alongside `extra_headers`, down the same header path as static mode. A token that expires while a cached connection is open isn't refreshed; the next fresh connect gets a new one.
 - **Disconnect.** `disconnect_mcp_server_oauth` clears the stored credentials (the row stays) and evicts the connection.
+- **Extra headers (SME-76).** An OAuth server's edit page has the same header editor as a static-header server ("Extra headers (sent with the OAuth token)"). `mcp::check_extra_headers` refuses an `Authorization` header on an OAuth server, on create and on update, since `oauth_headers` sets it.
+- **GitHub's CI logs.** GitHub's hosted server (`https://api.githubcopilot.com/mcp/`) exposes only its default toolsets (`context`, `repos`, `issues`, `pull_requests`, `users`), which can't read Actions logs. Add the header `X-MCP-Toolsets: context,repos,issues,pull_requests,users,actions` to turn on the `actions` toolset too, whose `get_job_logs` reads a job's log (`job_id`, `tail_lines`, `failed_only`). The URL form `/mcp/x/actions` would enable *only* that toolset. See GitHub's [remote server docs](https://github.com/github/github-mcp-server/blob/main/docs/remote-server.md).
 
 ## Tests
 

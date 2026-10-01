@@ -94,8 +94,40 @@ mod server {
     /// for via `db::get()` directly) so `run_async`'s spawned background
     /// task can carry the *same* pool its caller used — this is what lets
     /// tests use an isolated `#[sqlx::test]` pool end-to-end instead of the
-    /// process-global one.
+    /// process-global one. Every result, success or error, is capped at
+    /// `MAX_TOOL_RESULT_CHARS` (`cap_tool_result`).
     pub async fn execute(
+        pool: &PgPool,
+        conversation_id: i64,
+        tool_use_id: &str,
+        name: &str,
+        input: &Value,
+    ) -> Result<String, String> {
+        execute_uncapped(pool, conversation_id, tool_use_id, name, input)
+            .await
+            .map(cap_tool_result)
+            .map_err(cap_tool_result)
+    }
+
+    /// The most of one tool result that reaches the model (SME-76).
+    /// Conversation 23 took in single results of 40–106 KB, which on a
+    /// local model meant 10–30 minutes per step.
+    const MAX_TOOL_RESULT_CHARS: usize = 30_000;
+
+    /// Cuts `result` to `MAX_TOOL_RESULT_CHARS`, saying so and how to see
+    /// the rest. The rest is dropped.
+    fn cap_tool_result(result: String) -> String {
+        let total = result.chars().count();
+        match crate::fetch_guard::truncate(result, MAX_TOOL_RESULT_CHARS) {
+            (kept, true) => format!(
+                "{kept}\n[cut to the first {MAX_TOOL_RESULT_CHARS} of {total} characters; narrow \
+                 the request (a smaller query, offset/limit, tail_lines) to see the rest]"
+            ),
+            (whole, false) => whole,
+        }
+    }
+
+    async fn execute_uncapped(
         pool: &PgPool,
         conversation_id: i64,
         tool_use_id: &str,
@@ -430,7 +462,8 @@ mod server {
                                Use terminal_command_status/read_terminal_output with the \
                                returned id to check on it, or send_signal to interrupt it — \
                                you'll also be notified here when it finishes, with no further \
-                               tool call needed."
+                               tool call needed. If a command seems stuck, send_signal it (or \
+                               use another terminal) rather than retrying this one."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -478,7 +511,9 @@ mod server {
                                the whole thing at once. Line numbers (offset/limit) are \
                                relative to whichever stream(s) you request: offset 0 against \
                                \"stdout\" is not necessarily the same line as offset 0 \
-                               against \"both\"."
+                               against \"both\". Lines over 2000 characters are cut; when the \
+                               slice is too big to return whole, it stops early with \
+                               truncated: true and the next_offset to read from."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -518,7 +553,9 @@ mod server {
                                content, the file's total line count, and a content hash — \
                                edit_file, and write_file when overwriting, need that hash \
                                (as expected_hash) to confirm nothing else changed the file \
-                               first."
+                               first. Lines over 2000 characters are cut; next_offset, when \
+                               present, is where the rest of the file starts (truncated: true \
+                               means this read stopped early for size, not at limit)."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -1864,10 +1901,13 @@ mod server {
     async fn terminate_terminal_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
         let terminal_id = required_i64(input, "terminal_id")?;
         owned_terminal(pool, conversation_id, terminal_id).await?;
-        sandbox::terminate_terminal(pool, terminal_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(format!("terminal {terminal_id} terminated"))
+        match sandbox::terminate_terminal(pool, terminal_id).await {
+            Ok(()) => Ok(format!("terminal {terminal_id} terminated")),
+            Err(sandbox::TerminalError::CommandStillRunning) => {
+                Err(busy_terminal_error(pool, terminal_id).await)
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     async fn list_terminals_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
@@ -1879,6 +1919,32 @@ mod server {
             .map(|t| serde_json::json!({"terminal_id": t.terminal_id, "pod_id": t.pod_id, "status": t.status}))
             .collect();
         Ok(serde_json::json!({"terminals": payload}).to_string())
+    }
+
+    /// The refusal when `command` still holds its terminal: which command,
+    /// for how long, and the ways out (SME-76: a bare "already running"
+    /// left a model retrying the busy terminal for hours).
+    fn busy_terminal_message(command: &db::TerminalCommand, now: chrono::NaiveDateTime) -> String {
+        const SHOWN_CHARS: usize = 80;
+        let shown: String = command.command.chars().take(SHOWN_CHARS).collect();
+        let ellipsis = if command.command.chars().count() > SHOWN_CHARS { "…" } else { "" };
+        let minutes = (now - command.created_at).num_minutes().max(0);
+        format!(
+            "a command is already running in this terminal: {id} (\"{shown}{ellipsis}\"), started \
+             {minutes} min ago with no exit yet. Read its output with read_terminal_output, \
+             interrupt it with send_signal (command_id {id}, INT, then KILL if it ignores that), \
+             or run this in another terminal (create_terminal).",
+            id = command.command_id,
+        )
+    }
+
+    /// `busy_terminal_message` for whatever command holds `terminal_id`.
+    async fn busy_terminal_error(pool: &PgPool, terminal_id: i64) -> String {
+        match db::terminal_command_is_running(pool, terminal_id).await {
+            Ok(Some(command)) => busy_terminal_message(&command, chrono::Utc::now().naive_utc()),
+            Ok(None) => "the command running in this terminal has just finished; try again".to_string(),
+            Err(e) => e.to_string(),
+        }
     }
 
     /// Reuses `tool_use_id` as `command_id`, the same "id already exists,
@@ -1893,16 +1959,11 @@ mod server {
         let command = required_str(input, "command")?;
         owned_terminal(pool, conversation_id, terminal_id).await?;
 
-        if db::terminal_command_is_running(pool, terminal_id)
+        if let Some(running) = db::terminal_command_is_running(pool, terminal_id)
             .await
             .map_err(|e| e.to_string())?
-            .is_some()
         {
-            return Err(
-                "a command is already running in this terminal; send_signal or wait for it to \
-                 finish first"
-                    .to_string(),
-            );
+            return Err(busy_terminal_message(&running, chrono::Utc::now().naive_utc()));
         }
 
         let command_id = tool_use_id.to_string();
@@ -1970,6 +2031,37 @@ mod server {
         .to_string())
     }
 
+    /// A line longer than this is cut, saying so, by `fit_lines`.
+    const MAX_LINE_CHARS: usize = 2_000;
+    /// How much of `MAX_TOOL_RESULT_CHARS` line-based reads fill with lines
+    /// (JSON-encoded), leaving room for the rest of their response, so
+    /// they stop at a whole line with a next offset instead of being cut.
+    const LINES_BUDGET_CHARS: usize = 25_000;
+
+    /// Cuts each line to `MAX_LINE_CHARS` and keeps lines while their
+    /// JSON-encoded size, plus `per_line` for whatever the response wraps
+    /// each one in, fits `budget` (always at least one). Returns the kept
+    /// lines and whether any were left out for the budget.
+    fn fit_lines(lines: Vec<String>, budget: usize, per_line: usize) -> (Vec<String>, bool) {
+        let total = lines.len();
+        let mut kept = Vec::new();
+        let mut used = 0;
+        for line in lines {
+            let line = match crate::fetch_guard::truncate(line, MAX_LINE_CHARS) {
+                (cut, true) => format!("{cut}… [line cut at {MAX_LINE_CHARS} chars]"),
+                (whole, false) => whole,
+            };
+            let size = serde_json::to_string(&line).map_or(line.len(), |s| s.len()) + per_line;
+            if !kept.is_empty() && used + size > budget {
+                break;
+            }
+            used += size;
+            kept.push(line);
+        }
+        let truncated = kept.len() < total;
+        (kept, truncated)
+    }
+
     const DEFAULT_READ_LIMIT: i64 = 200;
     const MAX_READ_LIMIT: i64 = 500;
 
@@ -2004,11 +2096,23 @@ mod server {
         let lines = db::read_terminal_output(pool, &command_id, streams, offset, limit)
             .await
             .map_err(|e| e.to_string())?;
-        let payload: Vec<_> = lines
-            .iter()
-            .map(|l| serde_json::json!({"stream": l.stream, "data": l.data}))
+        let (streams, data): (Vec<String>, Vec<String>) =
+            lines.into_iter().map(|l| (l.stream, l.data)).unzip();
+        // `{"stream":"stdout","data":},`
+        const PER_LINE: usize = 30;
+        let (data, truncated) = fit_lines(data, LINES_BUDGET_CHARS, PER_LINE);
+        let payload: Vec<_> = streams
+            .into_iter()
+            .zip(data)
+            .map(|(stream, data)| serde_json::json!({"stream": stream, "data": data}))
             .collect();
-        Ok(serde_json::json!({"lines": payload, "returned": payload.len()}).to_string())
+        let returned = payload.len();
+        let mut response = serde_json::json!({"lines": payload, "returned": returned});
+        if truncated {
+            response["truncated"] = Value::Bool(true);
+            response["next_offset"] = Value::from(offset + returned as i64);
+        }
+        Ok(response.to_string())
     }
 
     const DEFAULT_LIST_COMMANDS_LIMIT: i64 = 20;
@@ -2062,19 +2166,35 @@ mod server {
         let contents = sandbox::read_file(pool, conversation_id, &path, offset, limit)
             .await
             .map_err(|e| e.to_string())?;
-        let numbered = contents
-            .lines
+        Ok(read_file_response(contents, offset).to_string())
+    }
+
+    /// `read_file`'s answer: `contents`' lines numbered from `offset`, as
+    /// many as fit `LINES_BUDGET_CHARS` (`truncated` when some didn't),
+    /// with `next_offset` whenever the file goes on past them.
+    fn read_file_response(contents: crate::agent_protocol::FileContents, offset: u32) -> Value {
+        // the line number, a tab and the joining newline, JSON-escaped
+        const PER_LINE: usize = 10;
+        let (lines, truncated) = fit_lines(contents.lines, LINES_BUDGET_CHARS, PER_LINE);
+        let numbered = lines
             .iter()
             .enumerate()
             .map(|(i, line)| format!("{:>6}\t{line}", offset as usize + i))
             .collect::<Vec<_>>()
             .join("\n");
-        Ok(serde_json::json!({
+        let mut response = serde_json::json!({
             "content": numbered,
             "total_lines": contents.total_lines,
             "hash": contents.hash,
-        })
-        .to_string())
+        });
+        let next = offset as usize + lines.len();
+        if next <= contents.total_lines {
+            response["next_offset"] = Value::from(next);
+        }
+        if truncated {
+            response["truncated"] = Value::Bool(true);
+        }
+        response
     }
 
     /// Overwriting an existing path requires it to have already been
@@ -2185,9 +2305,27 @@ mod server {
     /// An edit's result: its hash, and the file's diagnostics when a
     /// language server that takes it is running (SME-35).
     async fn edit_result(pool: &PgPool, conversation_id: i64, path: &str, hash: String) -> String {
+        let diagnostics = crate::lsp::manager::diagnostics_after_edit(pool, conversation_id, path).await;
+        edit_result_json(hash, diagnostics)
+    }
+
+    /// `edit_result`'s JSON. The diagnostics are fitted to
+    /// `LINES_BUDGET_CHARS` (`fit_lines`) so the result stays under
+    /// `execute`'s cap: they serialize before `hash`, and a cut there lost
+    /// the new hash and left invalid JSON (SME-76's review).
+    fn edit_result_json(hash: String, diagnostics: Option<String>) -> String {
         let mut result = serde_json::json!({"hash": hash});
-        if let Some(diagnostics) = crate::lsp::manager::diagnostics_after_edit(pool, conversation_id, path).await {
-            result["diagnostics"] = Value::String(diagnostics);
+        if let Some(diagnostics) = diagnostics {
+            let lines: Vec<String> = diagnostics.lines().map(str::to_string).collect();
+            let total = lines.len();
+            // the escaped newline joining each line
+            const PER_LINE: usize = 2;
+            let (kept, truncated) = fit_lines(lines, LINES_BUDGET_CHARS, PER_LINE);
+            let mut shown = kept.join("\n");
+            if truncated {
+                shown.push_str(&format!("\n[diagnostics cut: {} of {total} lines shown]", kept.len()));
+            }
+            result["diagnostics"] = Value::String(shown);
         }
         result.to_string()
     }
@@ -2718,6 +2856,193 @@ mod server {
                 db::list_terminal_commands(&pool, terminal.id, 10).await.expect("list").len(),
                 1,
                 "no command was recorded against the other conversation"
+            );
+        }
+
+        #[test]
+        fn test_busy_terminal_message_names_the_command_its_age_and_the_ways_out() {
+            let started = chrono::NaiveDate::from_ymd_opt(2026, 9, 30)
+                .and_then(|d| d.and_hms_opt(15, 6, 0))
+                .expect("a valid time");
+            let command = db::TerminalCommand {
+                id: 1,
+                conversation_id: 1,
+                terminal_id: 9,
+                command_id: "cmd-a07c".to_string(),
+                command: format!("cd /tmp && curl -fsSL {}", "x".repeat(200)),
+                status: "running".to_string(),
+                exit_code: None,
+                notified_at: None,
+                created_at: started,
+                finished_at: None,
+            };
+            let message = busy_terminal_message(&command, started + chrono::Duration::minutes(59));
+            for wanted in ["cmd-a07c", "cd /tmp && curl -fsSL", "59 min", "send_signal", "create_terminal"] {
+                assert!(message.contains(wanted), "{wanted:?} missing from: {message}");
+            }
+            assert!(!message.contains(&"x".repeat(100)), "the command should be shortened: {message}");
+        }
+
+        /// SME-76: both refusals a busy terminal gives say which command
+        /// holds it, not just that one does.
+        #[sqlx::test]
+        async fn test_a_busy_terminal_names_its_command_to_run_and_terminate(pool: sqlx::PgPool) {
+            let owner = db::create_conversation(&pool).await.expect("conversation");
+            let pod = db::create_sandbox_pod(&pool, owner.id).await.expect("pod");
+            let terminal = db::create_sandbox_terminal(&pool, pod.id).await.expect("terminal");
+            db::create_terminal_command(&pool, owner.id, terminal.id, "cmd-busy", "sleep 600")
+                .await
+                .expect("command");
+            for (tool, input) in [
+                ("run_terminal_command", serde_json::json!({"terminal_id": terminal.id, "command": "id"})),
+                ("terminate_terminal", serde_json::json!({"terminal_id": terminal.id})),
+            ] {
+                let message = execute(&pool, owner.id, "t1", tool, &input)
+                    .await
+                    .expect_err("a busy terminal refuses");
+                assert!(
+                    message.contains("cmd-busy") && message.contains("sleep 600"),
+                    "{tool}: {message}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_cap_tool_result_cuts_a_long_result_and_says_so() {
+            let capped = cap_tool_result("x".repeat(40_000));
+            assert!(capped.starts_with(&"x".repeat(MAX_TOOL_RESULT_CHARS)), "the start is kept");
+            assert!(!capped.contains(&"x".repeat(MAX_TOOL_RESULT_CHARS + 1)), "the rest is dropped");
+            assert!(
+                capped.contains("cut to the first 30000 of 40000 characters"),
+                "the note says how much was cut: {}",
+                &capped[MAX_TOOL_RESULT_CHARS..]
+            );
+        }
+
+        #[test]
+        fn test_cap_tool_result_leaves_a_result_at_the_cap_alone() {
+            let whole = "é".repeat(MAX_TOOL_RESULT_CHARS);
+            assert_eq!(cap_tool_result(whole.clone()), whole);
+        }
+
+        /// The cap is in `execute`, so it covers every tool and errors too.
+        /// An unknown tool's error echoes its name, the cheapest long
+        /// result that needs no pod or server.
+        #[tokio::test]
+        async fn test_execute_caps_an_error_too() {
+            let name = "n".repeat(40_000);
+            let message = execute(&test_pool(), 1, "t1", &name, &serde_json::json!({}))
+                .await
+                .expect_err("an unknown tool is an error");
+            assert!(message.chars().count() < MAX_TOOL_RESULT_CHARS + 200, "{} chars", message.chars().count());
+        }
+
+        #[test]
+        fn test_fit_lines_cuts_a_long_line_and_stops_at_the_budget() {
+            let mut lines = vec!["z".repeat(5_000)];
+            lines.extend((0..40).map(|_| "y".repeat(1_500)));
+            let (kept, truncated) = fit_lines(lines, LINES_BUDGET_CHARS, 0);
+            assert!(truncated, "41 lines of 1.5–5k chars don't fit 25k");
+            assert!(kept[0].starts_with(&"z".repeat(MAX_LINE_CHARS)), "{}", &kept[0][..20]);
+            assert!(kept[0].ends_with("[line cut at 2000 chars]"), "{}", &kept[0][MAX_LINE_CHARS..]);
+            let encoded: usize = kept.iter().map(|l| serde_json::to_string(l).map_or(0, |s| s.len())).sum();
+            assert!(encoded <= LINES_BUDGET_CHARS, "{encoded} chars kept");
+            assert!(kept.len() > 10, "it fills the budget, kept {}", kept.len());
+        }
+
+        #[test]
+        fn test_fit_lines_keeps_one_line_even_over_the_budget() {
+            let (kept, truncated) = fit_lines(vec!["a".repeat(100), "b".to_string()], 10, 0);
+            assert_eq!(kept, vec!["a".repeat(100)]);
+            assert!(truncated);
+        }
+
+        /// SME-76 review: the cap in `execute` cut an edit's result inside
+        /// its diagnostics, which serialize before `hash`, so the new hash
+        /// was lost and the next edit was refused as a concurrent change.
+        #[test]
+        fn test_an_edit_result_with_huge_diagnostics_keeps_its_hash_and_stays_json() {
+            let diagnostics = (0..50)
+                .map(|i| format!("error[E0308] at {i}:1  {}", "x".repeat(1_000)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let result = cap_tool_result(edit_result_json("new-hash".to_string(), Some(diagnostics)));
+            let parsed: Value = serde_json::from_str(&result).expect("the result is still JSON");
+            assert_eq!(parsed["hash"], "new-hash");
+            let shown = parsed["diagnostics"].as_str().expect("diagnostics");
+            assert!(shown.starts_with("error[E0308] at 0:1"), "the first diagnostics are kept");
+            assert!(shown.contains("cut"), "it says the diagnostics were cut");
+        }
+
+        #[test]
+        fn test_an_edit_result_with_short_diagnostics_is_unchanged() {
+            let result = edit_result_json("h".to_string(), Some("no errors".to_string()));
+            assert_eq!(result, r#"{"diagnostics":"no errors","hash":"h"}"#);
+        }
+
+        /// SME-76: conversation 23 read a 73 KB source file whole.
+        #[test]
+        fn test_read_file_response_stops_at_the_budget_and_says_where_to_continue() {
+            let mut lines = vec!["z".repeat(5_000)];
+            lines.extend((0..60).map(|i| format!("{i:02}{}", "y".repeat(1_000))));
+            let contents = crate::agent_protocol::FileContents { lines, total_lines: 100, hash: "h".into() };
+            let response = read_file_response(contents, 11);
+            assert_eq!(response["truncated"], true);
+            let content = response["content"].as_str().expect("content");
+            let shown = content.lines().count() as u64;
+            assert_eq!(response["next_offset"].as_u64(), Some(11 + shown), "{shown} lines shown");
+            assert!(content.lines().next().expect("a line").ends_with("[line cut at 2000 chars]"));
+            assert!(response.to_string().chars().count() < MAX_TOOL_RESULT_CHARS);
+            assert_eq!(response["hash"], "h", "the hash is still the whole file's");
+        }
+
+        #[test]
+        fn test_read_file_response_gives_a_next_offset_when_the_file_goes_on() {
+            let contents = crate::agent_protocol::FileContents {
+                lines: vec!["a".into(), "b".into()],
+                total_lines: 5,
+                hash: "h".into(),
+            };
+            let response = read_file_response(contents, 1);
+            assert_eq!(response["next_offset"], 3);
+            assert!(response.get("truncated").is_none(), "nothing was left out for size");
+            let whole = crate::agent_protocol::FileContents { lines: vec!["a".into()], total_lines: 1, hash: "h".into() };
+            assert!(read_file_response(whole, 1).get("next_offset").is_none(), "the file ends here");
+        }
+
+        /// SME-76: one minified-JSON line could be most of a result.
+        #[sqlx::test]
+        async fn test_read_terminal_output_stops_at_the_budget_with_a_next_offset(pool: sqlx::PgPool) {
+            let owner = db::create_conversation(&pool).await.expect("conversation");
+            let pod = db::create_sandbox_pod(&pool, owner.id).await.expect("pod");
+            let terminal = db::create_sandbox_terminal(&pool, pod.id).await.expect("terminal");
+            db::create_terminal_command(&pool, owner.id, terminal.id, "cmd-big", "cat big")
+                .await
+                .expect("command");
+            db::append_terminal_event(&pool, "cmd-big", "stdout", 1, &"z".repeat(5_000)).await.expect("event");
+            for seq in 2..=41 {
+                let line = format!("{seq:02}{}", "y".repeat(1_500));
+                db::append_terminal_event(&pool, "cmd-big", "stdout", seq, &line).await.expect("event");
+            }
+            let read = |offset: i64| {
+                let pool = pool.clone();
+                async move {
+                    let out = execute(&pool, owner.id, "t1", "read_terminal_output", &serde_json::json!({"command_id": "cmd-big", "offset": offset}))
+                        .await
+                        .expect("read");
+                    serde_json::from_str::<Value>(&out).expect("json")
+                }
+            };
+            let first = read(0).await;
+            assert_eq!(first["truncated"], true, "{}", &first.to_string()[..200]);
+            let next = first["next_offset"].as_i64().expect("a next_offset");
+            assert_eq!(next, first["returned"].as_i64().expect("returned"));
+            assert!(first["lines"][0]["data"].as_str().expect("data").ends_with("[line cut at 2000 chars]"));
+            let second = read(next).await;
+            let expected = format!("{:02}", next + 1);
+            assert!(
+                second["lines"][0]["data"].as_str().expect("data").starts_with(&expected),
+                "the next read starts at line {expected}"
             );
         }
 

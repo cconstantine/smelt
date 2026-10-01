@@ -72,10 +72,6 @@ const CALL_TIMEOUT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(120)
 };
 
-/// A tool result goes into the model's context and the database; past
-/// this it's cut, saying so (SME-51 B8).
-const MAX_RESULT_CHARS: usize = 100_000;
-
 /// After a failed connection, model calls skip the server for this long
 /// instead of trying (and waiting) again on every call. The status page
 /// still tries each time it's opened.
@@ -97,6 +93,19 @@ fn namespaced_tool_name(server_name: &str, tool_name: &str) -> String {
 pub fn parse_tool_name(name: &str) -> Option<(&str, &str)> {
     let rest = name.strip_prefix(TOOL_NAME_PREFIX)?;
     rest.split_once(TOOL_NAME_SEPARATOR)
+}
+
+/// Refuses extra headers an `auth_mode` server can't use: an OAuth
+/// server's `Authorization` is its token, which `oauth_headers` sets over
+/// any saved one (SME-76 lets OAuth servers have other headers, such as
+/// GitHub's `X-MCP-Toolsets`).
+pub fn check_extra_headers(auth_mode: &str, headers: &HashMap<String, String>) -> Result<(), String> {
+    if auth_mode == "oauth" && headers.keys().any(|name| name.eq_ignore_ascii_case("authorization")) {
+        return Err(
+            "an OAuth server's Authorization header is set by OAuth; connect it instead".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Parses `extra_headers` into the `http` crate's typed header map
@@ -532,10 +541,6 @@ pub async fn call_tool(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let content = match crate::fetch_guard::truncate(content, MAX_RESULT_CHARS) {
-        (kept, true) => format!("{kept}\n[the result was cut to its first {MAX_RESULT_CHARS} characters]"),
-        (whole, false) => whole,
-    };
 
     if result.is_error.unwrap_or(false) {
         Err(content)
@@ -547,6 +552,17 @@ pub async fn call_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_an_oauth_server_refuses_an_authorization_header_and_takes_others() {
+        let headers = |name: &str| HashMap::from([(name.to_string(), "v".to_string())]);
+        for name in ["Authorization", "authorization"] {
+            let refused = check_extra_headers("oauth", &headers(name));
+            assert!(refused.as_ref().is_err_and(|e| e.contains("OAuth")), "{name}: {refused:?}");
+        }
+        assert_eq!(check_extra_headers("oauth", &headers("X-MCP-Toolsets")), Ok(()));
+        assert_eq!(check_extra_headers("static_headers", &headers("Authorization")), Ok(()));
+    }
 
     use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
     use rmcp::handler::server::tool::ToolCallContext;
@@ -1049,20 +1065,6 @@ mod tests {
             called.as_ref().is_ok_and(|r| r.as_ref().is_err_and(|e| e.contains("didn't answer"))),
             "{called:?}"
         );
-    }
-
-    /// SME-51 B8: a result goes into the model's context and the database,
-    /// so it's cut to a size, saying so.
-    #[tokio::test]
-    async fn test_a_huge_tool_result_is_cut() {
-        register_test_connection(-1113, false).await;
-        let config = test_config(-1113, "huge");
-        let huge = "x".repeat(MAX_RESULT_CHARS * 3);
-        let result = call_tool(&test_pool(), &config, "echo", serde_json::json!({"s": huge}))
-            .await
-            .expect("echo");
-        assert!(result.chars().count() < MAX_RESULT_CHARS + 200, "{} chars", result.chars().count());
-        assert!(result.contains("cut"), "the result should say it was cut");
     }
 
     /// SME-40 F1: listing tools for a turn waited the full connect timeout

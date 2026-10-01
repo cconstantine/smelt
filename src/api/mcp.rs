@@ -115,6 +115,7 @@ pub async fn create_mcp_server(
     oauth_client_id: Option<String>,
     oauth_client_secret: Option<String>,
 ) -> ServerFnResult<McpServerSummary> {
+    crate::mcp::check_extra_headers(&auth_mode, &extra_headers).map_err(ServerFnError::new)?;
     let config = db::create_mcp_server_config(
         db::get(),
         &name,
@@ -147,6 +148,7 @@ pub async fn update_mcp_server(
     remove_headers: Vec<String>,
     auth_mode: String,
 ) -> ServerFnResult<McpServerSummary> {
+    crate::mcp::check_extra_headers(&auth_mode, &upsert_headers).map_err(ServerFnError::new)?;
     let config = db::update_mcp_server_config(
         db::get(),
         id,
