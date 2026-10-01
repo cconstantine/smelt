@@ -558,20 +558,16 @@ impl SandboxManager {
         &self,
         session_id: &str,
         memory: &str,
-        cpu: &str,
         volumes: &[db::SandboxVolume],
     ) -> Result<Sandbox, SandboxError> {
-        // Limits double as requests, so the deployment's 8Gi default would
-        // reserve 8Gi per test pod.
         let docker = DockerSidecar {
             memory: "512Mi".to_string(),
-            cpu: "250m".to_string(),
             storage: PodStorage::Ephemeral,
         };
-        self.create_with_docker(session_id, memory, cpu, &docker, volumes).await
+        self.create_with_docker(session_id, memory, &docker, volumes).await
     }
 
-    /// `memory`/`cpu` are already-resolved values (the caller's own
+    /// `memory` is an already-resolved value (the caller's own
     /// override, or its default) — only used on the actual-creation
     /// branch below; the reuse branch has nothing to apply them to, since
     /// resources are immutable on an already-existing pod. The same goes
@@ -584,14 +580,12 @@ impl SandboxManager {
         &self,
         session_id: &str,
         memory: &str,
-        cpu: &str,
         docker: &DockerSidecar,
         volumes: &[db::SandboxVolume],
     ) -> Result<Sandbox, SandboxError> {
         self.create_with_running_timeout(
             session_id,
             memory,
-            cpu,
             docker,
             volumes,
             running_wait_timeout(),
@@ -610,7 +604,6 @@ impl SandboxManager {
         &self,
         session_id: &str,
         memory: &str,
-        cpu: &str,
         docker: &DockerSidecar,
         volumes: &[db::SandboxVolume],
         running_timeout: Duration,
@@ -641,7 +634,7 @@ impl SandboxManager {
                 ensure_volume_claims(&self.client, volumes).await?;
                 pods.create(
                     &PostParams::default(),
-                    &build_pod_spec(&name, memory, cpu, docker, volumes),
+                    &build_pod_spec(&name, memory, docker, volumes),
                 )
                 .await?;
                 true
@@ -698,14 +691,6 @@ fn default_memory_limit() -> String {
         .unwrap_or_else(|| "8Gi".to_string())
 }
 
-/// `SANDBOX_CPU_LIMIT`, default `"1"` — see `default_memory_limit`.
-fn default_cpu_limit() -> String {
-    std::env::var("SANDBOX_CPU_LIMIT")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "1".to_string())
-}
-
 /// `SANDBOX_IMAGE`, default `"docker.io/library/smelt-sandbox:latest"` —
 /// same pattern as `default_memory_limit`. The custom image
 /// `scripts/build-sandbox-image.sh` builds and delivers with no registry
@@ -754,12 +739,11 @@ pub enum PodStorage {
     Ephemeral,
 }
 
-/// A pod's Docker sidecar: its own limits, which nested containers count
-/// against, and where its data lives (SME-33).
+/// A pod's Docker sidecar: its own memory limit, which nested containers
+/// count against, and where its data lives (SME-33).
 #[derive(Debug, Clone)]
 pub struct DockerSidecar {
     pub memory: String,
-    pub cpu: String,
     pub storage: PodStorage,
 }
 
@@ -771,14 +755,6 @@ fn default_docker_memory_limit() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "8Gi".to_string())
-}
-
-/// `SANDBOX_DOCKER_CPU_LIMIT`, default `"1"` — see `default_memory_limit`.
-fn default_docker_cpu_limit() -> String {
-    std::env::var("SANDBOX_DOCKER_CPU_LIMIT")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "1".to_string())
 }
 
 /// Shared by the sandbox and Docker sidecar containers: projects that
@@ -1062,7 +1038,7 @@ fn default_docker_image() -> String {
 /// docker:dind image's entrypoint; see the script's own comment.
 const START_DOCKERD_SCRIPT: &str = include_str!("../docker/sandbox/start-dockerd.sh");
 
-/// `memory`/`cpu` are plain Kubernetes `Quantity` strings (`"8Gi"`, `"1"`)
+/// `memory` is a plain Kubernetes `Quantity` string (`"8Gi"`)
 /// — no app-side parsing or validation of the format; an invalid value is
 /// rejected by the Kubernetes API itself when the pod is actually
 /// created, surfacing back through `SandboxError::Kube` as an ordinary
@@ -1071,7 +1047,6 @@ const START_DOCKERD_SCRIPT: &str = include_str!("../docker/sandbox/start-dockerd
 fn build_pod_spec(
     name: &str,
     memory: &str,
-    cpu: &str,
     docker: &DockerSidecar,
     volumes: &[db::SandboxVolume],
 ) -> Pod {
@@ -1149,7 +1124,7 @@ fn build_pod_spec(
                     failure_threshold: Some(DOCKER_STARTUP_PROBE_CHECKS),
                     ..Default::default()
                 }),
-                resources: Some(limits(&docker.memory, &docker.cpu)),
+                resources: Some(memory_only(&docker.memory)),
                 volume_mounts: Some(docker_mounts),
                 ..Default::default()
             }]),
@@ -1168,7 +1143,7 @@ fn build_pod_spec(
                 // the sandbox agent, so it's already running (and keeping
                 // the pod alive) the moment the container starts. See
                 // SME-17.
-                resources: Some(limits(memory, cpu)),
+                resources: Some(memory_only(memory)),
                 volume_mounts: Some(shared_mounts),
                 ..Default::default()
             }],
@@ -1180,12 +1155,15 @@ fn build_pod_spec(
     }
 }
 
-fn limits(memory: &str, cpu: &str) -> ResourceRequirements {
-    let mut limits = std::collections::BTreeMap::new();
-    limits.insert("memory".to_string(), Quantity(memory.to_string()));
-    limits.insert("cpu".to_string(), Quantity(cpu.to_string()));
+/// A container's resources (SME-77): a memory limit, an explicit zero
+/// memory request and nothing for CPU. Without the request Kubernetes
+/// copies the limit into it, so every idle pod reserved its whole limit
+/// on the node; with no CPU limit or request, pods share the node's CPU.
+fn memory_only(memory: &str) -> ResourceRequirements {
+    let quantity = |q: &str| std::collections::BTreeMap::from([("memory".to_string(), Quantity(q.to_string()))]);
     ResourceRequirements {
-        limits: Some(limits),
+        limits: Some(quantity(memory)),
+        requests: Some(quantity("0")),
         ..Default::default()
     }
 }
@@ -2003,7 +1981,7 @@ async fn create_pod_attempt(
         .map_err(SandboxError::Db)?;
     check_pod_guard(&existing)?;
 
-    let (memory, cpu, docker) = limits.resolve(conversation_id);
+    let (memory, docker) = limits.resolve(conversation_id);
 
     let manager = get();
     // The database's own one-live-pod rule backs up the check above.
@@ -2036,7 +2014,7 @@ async fn create_pod_attempt(
         return Err(e);
     }
     match manager
-        .create_with_docker(&row.id.to_string(), &memory, &cpu, &docker, &volumes)
+        .create_with_docker(&row.id.to_string(), &memory, &docker, &volumes)
         .await
     {
         Ok(sandbox) => {
@@ -2100,33 +2078,27 @@ pub fn check_reachable_port(port: u16) -> Result<(), TerminalError> {
     Ok(())
 }
 
-/// `create_pod`'s per-pod overrides of the deployment's limits: the
-/// sandbox container's (`SANDBOX_MEMORY_LIMIT`/`SANDBOX_CPU_LIMIT`, see
-/// SME-12's "Per-pod limit overrides") and the Docker sidecar's
-/// (`SANDBOX_DOCKER_*_LIMIT`, SME-33). Plain Kubernetes quantity strings,
-/// validated by Kubernetes itself against the namespace's `LimitRange`.
+/// `create_pod`'s per-pod overrides of the deployment's memory limits:
+/// the sandbox container's (`SANDBOX_MEMORY_LIMIT`, see SME-12's "Per-pod
+/// limit overrides") and the Docker sidecar's
+/// (`SANDBOX_DOCKER_MEMORY_LIMIT`, SME-33). Plain Kubernetes quantity
+/// strings, validated by Kubernetes itself against the namespace's
+/// `LimitRange`. There's no CPU limit to override (SME-77).
 #[derive(Debug, Clone, Default)]
 pub struct PodLimitOverrides {
     pub memory: Option<String>,
-    pub cpu: Option<String>,
     pub docker_memory: Option<String>,
-    pub docker_cpu: Option<String>,
 }
 
 impl PodLimitOverrides {
-    /// The sandbox container's memory and CPU, and the Docker sidecar on
-    /// the conversation's own claim.
-    fn resolve(self, conversation_id: i64) -> (String, String, DockerSidecar) {
+    /// The sandbox container's memory limit, and the Docker sidecar on the
+    /// conversation's own claim.
+    fn resolve(self, conversation_id: i64) -> (String, DockerSidecar) {
         let docker = DockerSidecar {
             memory: self.docker_memory.unwrap_or_else(default_docker_memory_limit),
-            cpu: self.docker_cpu.unwrap_or_else(default_docker_cpu_limit),
             storage: PodStorage::Conversation(conversation_id),
         };
-        (
-            self.memory.unwrap_or_else(default_memory_limit),
-            self.cpu.unwrap_or_else(default_cpu_limit),
-            docker,
-        )
+        (self.memory.unwrap_or_else(default_memory_limit), docker)
     }
 }
 
@@ -3596,7 +3568,6 @@ mod tests {
     fn docker_for_conversation(conversation_id: i64) -> DockerSidecar {
         DockerSidecar {
             memory: "2Gi".to_string(),
-            cpu: "2".to_string(),
             storage: PodStorage::Conversation(conversation_id),
         }
     }
@@ -3618,7 +3589,7 @@ mod tests {
 
     #[test]
     fn test_pod_spec_runs_dockerd_in_a_privileged_native_sidecar() {
-        let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker_for_conversation(42), &[]);
+        let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[]);
         let spec = pod.spec.expect("pod should have a spec");
         let docker = container(&spec.init_containers, "docker");
 
@@ -3649,13 +3620,12 @@ mod tests {
             .and_then(|r| r.limits.as_ref())
             .expect("sidecar should have limits");
         assert_eq!(limits.get("memory"), Some(&Quantity("2Gi".to_string())));
-        assert_eq!(limits.get("cpu"), Some(&Quantity("2".to_string())));
         assert!(docker.startup_probe.is_some(), "the sandbox should wait until dockerd answers");
     }
 
     #[test]
     fn test_pod_spec_leaves_the_sandbox_container_unprivileged() {
-        let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker_for_conversation(42), &[]);
+        let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[]);
         let spec = pod.spec.expect("pod should have a spec");
         let main = Some(spec.containers);
         let sandbox = container(&main, "sandbox");
@@ -3667,7 +3637,7 @@ mod tests {
 
     #[test]
     fn test_pod_spec_shares_workspace_and_socket_but_keeps_docker_data_in_the_sidecar() {
-        let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker_for_conversation(42), &[]);
+        let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[]);
         let spec = pod.spec.expect("pod should have a spec");
         let docker = container(&spec.init_containers, "docker");
         let main = Some(spec.containers.clone());
@@ -3710,7 +3680,7 @@ mod tests {
             storage: PodStorage::Ephemeral,
             ..docker_for_conversation(42)
         };
-        let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker, &[]);
+        let pod = build_pod_spec("sandbox-1", "1Gi", &docker, &[]);
         let volumes = pod.spec.and_then(|s| s.volumes).expect("pod should have volumes");
         for name in ["docker-data", "workspace"] {
             let v = volumes.iter().find(|v| v.name == name).expect(name);
@@ -3728,7 +3698,7 @@ mod tests {
             created_at: chrono::Utc::now().naive_utc(),
             updated_at: chrono::Utc::now().naive_utc(),
         }];
-        let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker_for_conversation(42), &volumes);
+        let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &volumes);
         let spec = pod.spec.expect("pod should have a spec");
         let docker = container(&spec.init_containers, "docker");
         let main = Some(spec.containers.clone());
@@ -3740,7 +3710,7 @@ mod tests {
 
     #[test]
     fn test_pod_spec_labels_a_pod_with_its_conversation_only_when_it_uses_the_claim() {
-        let labelled = build_pod_spec("sandbox-1", "1Gi", "1", &docker_for_conversation(42), &[]);
+        let labelled = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[]);
         assert_eq!(
             labelled.metadata.labels.as_ref().and_then(|l| l.get(CONVERSATION_LABEL)).map(String::as_str),
             Some("42"),
@@ -3750,7 +3720,7 @@ mod tests {
             storage: PodStorage::Ephemeral,
             ..docker_for_conversation(42)
         };
-        let unlabelled = build_pod_spec("sandbox-1", "1Gi", "1", &ephemeral, &[]);
+        let unlabelled = build_pod_spec("sandbox-1", "1Gi", &ephemeral, &[]);
         assert!(unlabelled.metadata.labels.and_then(|l| l.get(CONVERSATION_LABEL).cloned()).is_none());
     }
 
@@ -3790,14 +3760,11 @@ mod tests {
     fn test_pod_limit_overrides_replace_only_the_limits_they_name() {
         let overrides = PodLimitOverrides {
             memory: Some("3Gi".to_string()),
-            docker_cpu: Some("4".to_string()),
             ..Default::default()
         };
-        let (memory, cpu, docker) = overrides.resolve(7);
+        let (memory, docker) = overrides.resolve(7);
         assert_eq!(memory, "3Gi");
-        assert_eq!(cpu, default_cpu_limit());
         assert_eq!(docker.memory, default_docker_memory_limit());
-        assert_eq!(docker.cpu, "4");
         assert_eq!(docker.storage, PodStorage::Conversation(7));
     }
 
@@ -3916,12 +3883,35 @@ mod tests {
         assert!(check_reachable_port(3000).is_ok());
     }
 
+    /// SME-77: a limit with no request is copied into the request, so an
+    /// idle pod reserved its whole 8Gi + 8Gi. Each container now asks for
+    /// no memory and has no CPU request or limit at all.
+    #[test]
+    fn test_pod_spec_reserves_nothing_and_limits_only_memory() {
+        let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[]);
+        let spec = pod.spec.expect("a pod spec");
+        let containers = spec.containers.iter().chain(spec.init_containers.iter().flatten());
+        for container in containers {
+            let resources = container.resources.clone().unwrap_or_default();
+            let limits = resources.limits.unwrap_or_default();
+            let requests = resources.requests.unwrap_or_default();
+            assert!(limits.contains_key("memory"), "{}: a memory limit", container.name);
+            assert_eq!(
+                requests.get("memory").map(|q| q.0.as_str()),
+                Some("0"),
+                "{}: an explicit zero memory request, not the limit copied over",
+                container.name
+            );
+            assert!(!limits.contains_key("cpu") && !requests.contains_key("cpu"), "{}: no CPU", container.name);
+        }
+    }
+
     #[test]
     fn test_pod_container_limits_include_the_docker_sidecar() {
-        let pod = build_pod_spec("sandbox-1", "1Gi", "1", &docker_for_conversation(42), &[]);
+        let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[]);
         assert_eq!(
             pod_container_limits(&pod),
-            (vec!["1Gi".to_string(), "2Gi".to_string()], vec!["1".to_string(), "2".to_string()])
+            (vec!["1Gi".to_string(), "2Gi".to_string()], Vec::<String>::new())
         );
     }
 
@@ -4356,7 +4346,7 @@ mod tests {
         let without_pod = db::create_conversation(&pool).await.expect("create conversation");
         let row = db::create_sandbox_pod(&pool, with_pod.id).await.expect("create the pod's row");
         let sandbox = manager
-            .create(&row.id.to_string(), "128Mi", "250m", &[])
+            .create(&row.id.to_string(), "128Mi", &[])
             .await
             .expect("create the pod");
         let open = |conversation_id: i64, port: u16| {
@@ -4531,7 +4521,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let sandbox = manager
-            .create(&unique_session_id("git-files"), "256Mi", "250m", &[])
+            .create(&unique_session_id("git-files"), "256Mi", &[])
             .await
             .expect("create pod");
         let pod_name = sandbox.pod_name.clone();
@@ -4655,7 +4645,7 @@ mod tests {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let sandbox = manager
-            .create(&unique_session_id("git-clone"), "256Mi", "250m", &[])
+            .create(&unique_session_id("git-clone"), "256Mi", &[])
             .await
             .expect("create pod");
         let pod_name = sandbox.pod_name.clone();
@@ -4825,7 +4815,6 @@ mod tests {
             + 1_000_000_000;
         let docker = DockerSidecar {
             memory: "1Gi".to_string(),
-            cpu: "500m".to_string(),
             storage: PodStorage::Conversation(conversation_id),
         };
         ensure_conversation_pvcs(&client, conversation_id).await.expect("ensure docker claim");
@@ -4835,7 +4824,7 @@ mod tests {
 
         let checks = tokio::time::timeout(Duration::from_secs(300), async {
             let first = manager
-                .create_with_docker(&unique_session_id("docker"), "256Mi", "250m", &docker, &[])
+                .create_with_docker(&unique_session_id("docker"), "256Mi", &docker, &[])
                 .await
                 .expect("create pod with docker");
             created.lock().expect("created").push(first.pod_name.clone());
@@ -4995,7 +4984,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
             let second = manager
-                .create_with_docker(&unique_session_id("docker"), "256Mi", "250m", &docker, &[])
+                .create_with_docker(&unique_session_id("docker"), "256Mi", &docker, &[])
                 .await
                 .expect("recreate pod on the same claim");
             created.lock().expect("created").push(second.pod_name.clone());
@@ -5041,11 +5030,10 @@ mod tests {
         let pods = pods_api(&client);
         let docker = DockerSidecar {
             memory: "512Mi".to_string(),
-            cpu: "500m".to_string(),
             storage: PodStorage::Ephemeral,
         };
         let sandbox = manager
-            .create_with_docker(&unique_session_id("docker-oom"), "128Mi", "250m", &docker, &[])
+            .create_with_docker(&unique_session_id("docker-oom"), "128Mi", &docker, &[])
             .await
             .expect("create pod");
         let name = sandbox.pod_name.clone();
@@ -5135,12 +5123,11 @@ mod tests {
             + 1_000_000_000;
         let docker = DockerSidecar {
             memory: "256Mi".to_string(),
-            cpu: "250m".to_string(),
             storage: PodStorage::Conversation(conversation_id),
         };
         ensure_conversation_pvcs(&client, conversation_id).await.expect("ensure docker claim");
         let sandbox = manager
-            .create_with_docker(&unique_session_id("stopping"), "128Mi", "250m", &docker, &[])
+            .create_with_docker(&unique_session_id("stopping"), "128Mi", &docker, &[])
             .await
             .expect("create pod");
         let name = sandbox.pod_name.clone();
@@ -6195,10 +6182,7 @@ mod tests {
                 overview_g.memory_limit,
                 crate::api::pods::sum_memory_limits(&[default_memory_limit(), default_docker_memory_limit()])
             );
-            assert_eq!(
-                overview_g.cpu_limit,
-                crate::api::pods::sum_cpu_limits(&[default_cpu_limit(), default_docker_cpu_limit()])
-            );
+            assert_eq!(overview_g.cpu_limit, None, "sandbox pods have no CPU limit (SME-77)");
             assert_eq!(overview_g.terminals, 1);
             assert_eq!(overview_g.activity, crate::api::pods::PodActivity::Busy, "a command is running");
             // Live usage, end to end: metrics-server samples a new pod
@@ -6517,7 +6501,7 @@ mod tests {
             let volumes = db::list_sandbox_volumes(&pool).await.expect("list_sandbox_volumes");
             let volume_session_id = unique_session_id(VOLUME_MOUNT_SESSION_LABEL);
             let volume_sandbox =
-                get().create(&volume_session_id, "128Mi", "250m", &volumes).await.expect("create with a volume should succeed");
+                get().create(&volume_session_id, "128Mi", &volumes).await.expect("create with a volume should succeed");
             let write =
                 volume_sandbox.exec(&["sh", "-c", "echo hello > /data/testvol/marker.txt"]).await.expect("exec should succeed");
             assert_eq!(write.exit_code, 0, "writing into the mounted volume should succeed");
@@ -6655,7 +6639,7 @@ mod tests {
         let session_id = unique_session_id("create");
 
         let sandbox = manager
-            .create(&session_id, "128Mi", "250m", &[])
+            .create(&session_id, "128Mi", &[])
             .await
             .expect("create should succeed");
 
@@ -6699,10 +6683,8 @@ mod tests {
             .create_with_running_timeout(
                 &session_id,
                 "128Mi",
-                "250m",
                 &DockerSidecar {
                     memory: "512Mi".to_string(),
-                    cpu: "250m".to_string(),
                     storage: PodStorage::Ephemeral,
                 },
                 &[],
@@ -6753,7 +6735,7 @@ mod tests {
         };
 
         let result = manager
-            .create(&unique_session_id("missing-claim"), "128Mi", "500m", &[volume])
+            .create(&unique_session_id("missing-claim"), "128Mi", &[volume])
             .await;
         let claim_exists = matches!(pvcs.get_opt(&claim).await, Ok(Some(_)));
         if let Ok(sandbox) = &result {
@@ -6769,13 +6751,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_applies_the_given_memory_and_cpu_limits() {
+    async fn test_create_applies_the_memory_limit_and_reserves_nothing() {
         let client = test_client().await;
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("limits");
 
         let sandbox = manager
-            .create(&session_id, "128Mi", "500m", &[])
+            .create(&session_id, "128Mi", &[])
             .await
             .expect("create should succeed");
 
@@ -6789,11 +6771,12 @@ mod tests {
             .next()
             .expect("pod should have a container")
             .resources
-            .expect("container should have resources")
-            .limits
-            .expect("resources should have limits");
+            .expect("container should have resources");
+        let requests = limits.requests.clone().unwrap_or_default();
+        let limits = limits.limits.expect("resources should have limits");
         assert_eq!(limits.get("memory"), Some(&Quantity("128Mi".to_string())));
-        assert_eq!(limits.get("cpu"), Some(&Quantity("500m".to_string())));
+        assert_eq!(requests.get("memory"), Some(&Quantity("0".to_string())), "no memory reserved (SME-77)");
+        assert!(!limits.contains_key("cpu") && !requests.contains_key("cpu"), "no CPU limit or request (SME-77)");
 
         pods.delete(&sandbox.pod_name, &immediate_delete_params())
             .await
@@ -6814,7 +6797,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("over-limit");
 
-        let result = manager.create(&session_id, "128Gi", "250m", &[]).await;
+        let result = manager.create(&session_id, "128Gi", &[]).await;
         assert!(
             matches!(result, Err(SandboxError::Kube(_))),
             "a memory_limit over the LimitRange's 64Gi max should be rejected by Kubernetes, got is_ok={}",
@@ -6838,7 +6821,7 @@ mod tests {
         // Small on purpose — fast and reliable to trigger, using SME-12's
         // own per-pod override rather than the real 8Gi default.
         let sandbox = manager
-            .create(&session_id, "64Mi", "250m", &[])
+            .create(&session_id, "64Mi", &[])
             .await
             .expect("create should succeed");
         let pods = pods_api(&client);
@@ -6909,11 +6892,11 @@ mod tests {
         let session_id = unique_session_id("reuse");
 
         let first = manager
-            .create(&session_id, "128Mi", "250m", &[])
+            .create(&session_id, "128Mi", &[])
             .await
             .expect("first create should succeed");
         let second = manager
-            .create(&session_id, "128Mi", "250m", &[])
+            .create(&session_id, "128Mi", &[])
             .await
             .expect("second create should reuse, not error");
 
@@ -6933,7 +6916,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("exec");
         let sandbox = manager
-            .create(&session_id, "128Mi", "250m", &[])
+            .create(&session_id, "128Mi", &[])
             .await
             .expect("create should succeed");
 
@@ -6969,7 +6952,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("non-root");
         let sandbox = manager
-            .create(&session_id, "128Mi", "250m", &[])
+            .create(&session_id, "128Mi", &[])
             .await
             .expect("create should succeed");
 
@@ -7023,7 +7006,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("death-reason");
         let sandbox = manager
-            .create(&session_id, "128Mi", "250m", &[])
+            .create(&session_id, "128Mi", &[])
             .await
             .expect("create should succeed");
         let pods = pods_api(&client);
@@ -7064,7 +7047,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("delete");
         let sandbox = manager
-            .create(&session_id, "128Mi", "250m", &[])
+            .create(&session_id, "128Mi", &[])
             .await
             .expect("create should succeed");
         let pod_name = sandbox.pod_name.clone();
@@ -7092,7 +7075,7 @@ mod tests {
         let manager = SandboxManager::new(client.clone());
         let session_id = unique_session_id("drop");
         let sandbox = manager
-            .create(&session_id, "128Mi", "250m", &[])
+            .create(&session_id, "128Mi", &[])
             .await
             .expect("create should succeed");
         let pod_name = sandbox.pod_name.clone();
