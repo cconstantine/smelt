@@ -349,12 +349,12 @@ mod server {
                 description: "Create this conversation's sandbox pod. Refuses if one already \
                                exists — call terminate_pod first if you want a fresh one. \
                                Returns the new pod's id. A terminal can't be created until a \
-                               pod exists. memory_limit/cpu_limit optionally override the \
-                               deployment's default resource limit for just this one pod (e.g. \
+                               pod exists. memory_limit optionally overrides the \
+                               deployment's default memory limit for just this one pod (e.g. \
                                memory_limit: \"4Gi\" for a memory-heavy task) — plain Kubernetes \
                                quantity strings, rejected by Kubernetes itself (as an error from \
                                this call) if malformed or over the deployment's configured \
-                               ceiling. docker_memory_limit/docker_cpu_limit do the same for the \
+                               ceiling. docker_memory_limit does the same for the \
                                pod's Docker daemon, whose containers share its limit, not the \
                                sandbox's (e.g. docker_memory_limit: \"12Gi\" for a big compose \
                                stack)."
@@ -363,9 +363,7 @@ mod server {
                     "type": "object",
                     "properties": {
                         "memory_limit": {"type": "string"},
-                        "cpu_limit": {"type": "string"},
-                        "docker_memory_limit": {"type": "string"},
-                        "docker_cpu_limit": {"type": "string"}
+                        "docker_memory_limit": {"type": "string"}
                     }
                 }),
             },
@@ -1796,15 +1794,15 @@ mod server {
         Ok(serde_json::json!({"pod_id": pod_id}).to_string())
     }
 
-    /// `create_pod`'s optional limit overrides, each a Kubernetes quantity
-    /// string left for Kubernetes itself to validate.
+    /// `create_pod`'s optional memory limit overrides, each a Kubernetes
+    /// quantity string left for Kubernetes itself to validate. A
+    /// `cpu_limit`/`docker_cpu_limit` an older call still passes is
+    /// ignored: sandbox pods have no CPU limit (SME-77).
     fn pod_limit_overrides(input: &Value) -> sandbox::PodLimitOverrides {
         let field = |name| input.get(name).and_then(Value::as_str).map(str::to_string);
         sandbox::PodLimitOverrides {
             memory: field("memory_limit"),
-            cpu: field("cpu_limit"),
             docker_memory: field("docker_memory_limit"),
-            docker_cpu: field("docker_cpu_limit"),
         }
     }
 
@@ -2561,7 +2559,7 @@ mod server {
         }
 
         #[test]
-        fn test_create_pod_reads_all_four_limit_overrides() {
+        fn test_create_pod_reads_both_memory_overrides_and_ignores_cpu() {
             let input = serde_json::json!({
                 "memory_limit": "4Gi",
                 "cpu_limit": "2",
@@ -2570,9 +2568,7 @@ mod server {
             });
             let overrides = pod_limit_overrides(&input);
             assert_eq!(overrides.memory.as_deref(), Some("4Gi"));
-            assert_eq!(overrides.cpu.as_deref(), Some("2"));
             assert_eq!(overrides.docker_memory.as_deref(), Some("6Gi"));
-            assert_eq!(overrides.docker_cpu.as_deref(), Some("3"));
 
             let none = pod_limit_overrides(&serde_json::json!({}));
             assert!(none.memory.is_none() && none.docker_memory.is_none());

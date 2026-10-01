@@ -3416,7 +3416,6 @@ mod tests {
             "web_search",
             "localhost",
             "docker_memory_limit",
-            "docker_cpu_limit",
             "host",
             "web",
         ];

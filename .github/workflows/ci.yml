@@ -103,14 +103,14 @@ jobs:
       # sites now request 128Mi instead of 8Gi, and SANDBOX_MEMORY_LIMIT
       # below does the same for create_pod's tests via the existing
       # env-var default. SME-33 gave every pod a Docker sidecar with limits
-      # of its own; SANDBOX_DOCKER_*_LIMIT lower those the same way.
+      # of its own; SANDBOX_DOCKER_MEMORY_LIMIT lowers that the same way.
+      # Since SME-77 pods request no memory and have no CPU limit, so these
+      # only cap what a test pod can use.
       - name: cargo test --features server
         run: |
           docker compose run --rm \
             -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
-            -e SANDBOX_CPU_LIMIT=250m \
             -e SANDBOX_MEMORY_LIMIT=128Mi \
-            -e SANDBOX_DOCKER_CPU_LIMIT=250m \
             -e SANDBOX_DOCKER_MEMORY_LIMIT=256Mi \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo test --features server
@@ -163,9 +163,7 @@ jobs:
         run: |
           docker compose run --rm \
             -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
-            -e SANDBOX_CPU_LIMIT=250m \
             -e SANDBOX_MEMORY_LIMIT=128Mi \
-            -e SANDBOX_DOCKER_CPU_LIMIT=250m \
             -e SANDBOX_DOCKER_MEMORY_LIMIT=256Mi \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo test --features "server browser-test" -- --ignored --test-threads=1

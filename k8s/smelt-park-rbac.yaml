@@ -81,15 +81,17 @@ roleRef:
   name: park
   apiGroup: rbac.authorization.k8s.io
 ---
-# Ceiling on `create_pod`'s per-pod memory_limit/cpu_limit override (see
+# Ceiling on `create_pod`'s per-pod memory_limit override (see
 # SME-12's "Per-pod limit overrides") — the
 # API server rejects any pod creation over this automatically, model
 # override or not, so nothing in application code needs to parse or
-# compare Kubernetes quantity strings itself. Only `max` is set, not
-# `default`/`defaultRequest`: `build_pod_spec` always sets
-# `resources.limits` explicitly itself (the env-var default or the
-# model's override), so a `LimitRange` default would never actually
-# apply.
+# compare Kubernetes quantity strings itself. Only `max` is set. The API
+# server fills in `default` and `defaultRequest` from it, which matters
+# only for what a container leaves unset: `build_pod_spec` always sets a
+# memory limit and a zero memory request. No `cpu` here at all (SME-77):
+# sandbox pods have no CPU limit or request, and a `cpu` max would hand
+# each container a defaulted 16-CPU limit and request, which can't be
+# scheduled.
 apiVersion: v1
 kind: LimitRange
 metadata:
@@ -100,7 +102,6 @@ spec:
     - type: Container
       max:
         memory: 64Gi
-        cpu: "16"
 ---
 # `smelt-park-test` mirrors every namespaced object above, for real-cluster
 # test runs — see the file-level comment for why this exists as a second
@@ -176,4 +177,3 @@ spec:
     - type: Container
       max:
         memory: 64Gi
-        cpu: "16"

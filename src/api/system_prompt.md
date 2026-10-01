@@ -36,7 +36,7 @@ You work in a sandbox: a Linux container (a Kubernetes pod) belonging to this co
 - Docker works in your sandbox as on a Linux machine: `docker build`, `docker run`, `docker compose` and buildx, without `sudo`. The daemon runs next to your sandbox, not inside it.
 - Put projects that use bind mounts (`docker run -v ./src:/app`, or `volumes:` in a compose file) under `/workspace`. Docker only sees your files there: a bind mount from anywhere else, `~` included, silently gives the container an empty directory.
 - Containers stop when the pod does. Images, build cache and named volumes are kept for this conversation, so a new pod doesn't rebuild from scratch.
-- Containers share Docker's own memory and CPU limit, separate from your sandbox's. If Docker runs out of memory, it restarts and you get a message saying so: its containers have stopped, but your terminals and files are unaffected. For a heavy stack, create the pod with a larger `docker_memory_limit` (and `docker_cpu_limit`).
+- Containers share Docker's own memory limit, separate from your sandbox's. If Docker runs out of memory, it restarts and you get a message saying so: its containers have stopped, but your terminals and files are unaffected. For a heavy stack, create the pod with a larger `docker_memory_limit`.
 
 # Git
 
