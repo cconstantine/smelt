@@ -432,7 +432,8 @@ mod server {
                                Use terminal_command_status/read_terminal_output with the \
                                returned id to check on it, or send_signal to interrupt it — \
                                you'll also be notified here when it finishes, with no further \
-                               tool call needed."
+                               tool call needed. If a command seems stuck, send_signal it (or \
+                               use another terminal) rather than retrying this one."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -1866,10 +1867,13 @@ mod server {
     async fn terminate_terminal_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
         let terminal_id = required_i64(input, "terminal_id")?;
         owned_terminal(pool, conversation_id, terminal_id).await?;
-        sandbox::terminate_terminal(pool, terminal_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(format!("terminal {terminal_id} terminated"))
+        match sandbox::terminate_terminal(pool, terminal_id).await {
+            Ok(()) => Ok(format!("terminal {terminal_id} terminated")),
+            Err(sandbox::TerminalError::CommandStillRunning) => {
+                Err(busy_terminal_error(pool, terminal_id).await)
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     async fn list_terminals_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
@@ -1881,6 +1885,32 @@ mod server {
             .map(|t| serde_json::json!({"terminal_id": t.terminal_id, "pod_id": t.pod_id, "status": t.status}))
             .collect();
         Ok(serde_json::json!({"terminals": payload}).to_string())
+    }
+
+    /// The refusal when `command` still holds its terminal: which command,
+    /// for how long, and the ways out (SME-76: a bare "already running"
+    /// left a model retrying the busy terminal for hours).
+    fn busy_terminal_message(command: &db::TerminalCommand, now: chrono::NaiveDateTime) -> String {
+        const SHOWN_CHARS: usize = 80;
+        let shown: String = command.command.chars().take(SHOWN_CHARS).collect();
+        let ellipsis = if command.command.chars().count() > SHOWN_CHARS { "…" } else { "" };
+        let minutes = (now - command.created_at).num_minutes().max(0);
+        format!(
+            "a command is already running in this terminal: {id} (\"{shown}{ellipsis}\"), started \
+             {minutes} min ago with no exit yet. Read its output with read_terminal_output, \
+             interrupt it with send_signal (command_id {id}, INT, then KILL if it ignores that), \
+             or run this in another terminal (create_terminal).",
+            id = command.command_id,
+        )
+    }
+
+    /// `busy_terminal_message` for whatever command holds `terminal_id`.
+    async fn busy_terminal_error(pool: &PgPool, terminal_id: i64) -> String {
+        match db::terminal_command_is_running(pool, terminal_id).await {
+            Ok(Some(command)) => busy_terminal_message(&command, chrono::Utc::now().naive_utc()),
+            Ok(None) => "the command running in this terminal has just finished; try again".to_string(),
+            Err(e) => e.to_string(),
+        }
     }
 
     /// Reuses `tool_use_id` as `command_id`, the same "id already exists,
@@ -1895,16 +1925,11 @@ mod server {
         let command = required_str(input, "command")?;
         owned_terminal(pool, conversation_id, terminal_id).await?;
 
-        if db::terminal_command_is_running(pool, terminal_id)
+        if let Some(running) = db::terminal_command_is_running(pool, terminal_id)
             .await
             .map_err(|e| e.to_string())?
-            .is_some()
         {
-            return Err(
-                "a command is already running in this terminal; send_signal or wait for it to \
-                 finish first"
-                    .to_string(),
-            );
+            return Err(busy_terminal_message(&running, chrono::Utc::now().naive_utc()));
         }
 
         let command_id = tool_use_id.to_string();
@@ -2723,6 +2748,54 @@ mod server {
                 1,
                 "no command was recorded against the other conversation"
             );
+        }
+
+        #[test]
+        fn test_busy_terminal_message_names_the_command_its_age_and_the_ways_out() {
+            let started = chrono::NaiveDate::from_ymd_opt(2026, 9, 30)
+                .and_then(|d| d.and_hms_opt(15, 6, 0))
+                .expect("a valid time");
+            let command = db::TerminalCommand {
+                id: 1,
+                conversation_id: 1,
+                terminal_id: 9,
+                command_id: "cmd-a07c".to_string(),
+                command: format!("cd /tmp && curl -fsSL {}", "x".repeat(200)),
+                status: "running".to_string(),
+                exit_code: None,
+                notified_at: None,
+                created_at: started,
+                finished_at: None,
+            };
+            let message = busy_terminal_message(&command, started + chrono::Duration::minutes(59));
+            for wanted in ["cmd-a07c", "cd /tmp && curl -fsSL", "59 min", "send_signal", "create_terminal"] {
+                assert!(message.contains(wanted), "{wanted:?} missing from: {message}");
+            }
+            assert!(!message.contains(&"x".repeat(100)), "the command should be shortened: {message}");
+        }
+
+        /// SME-76: both refusals a busy terminal gives say which command
+        /// holds it, not just that one does.
+        #[sqlx::test]
+        async fn test_a_busy_terminal_names_its_command_to_run_and_terminate(pool: sqlx::PgPool) {
+            let owner = db::create_conversation(&pool).await.expect("conversation");
+            let pod = db::create_sandbox_pod(&pool, owner.id).await.expect("pod");
+            let terminal = db::create_sandbox_terminal(&pool, pod.id).await.expect("terminal");
+            db::create_terminal_command(&pool, owner.id, terminal.id, "cmd-busy", "sleep 600")
+                .await
+                .expect("command");
+            for (tool, input) in [
+                ("run_terminal_command", serde_json::json!({"terminal_id": terminal.id, "command": "id"})),
+                ("terminate_terminal", serde_json::json!({"terminal_id": terminal.id})),
+            ] {
+                let message = execute(&pool, owner.id, "t1", tool, &input)
+                    .await
+                    .expect_err("a busy terminal refuses");
+                assert!(
+                    message.contains("cmd-busy") && message.contains("sleep 600"),
+                    "{tool}: {message}"
+                );
+            }
         }
 
         #[sqlx::test]
