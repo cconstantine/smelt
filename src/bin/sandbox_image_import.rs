@@ -307,12 +307,14 @@ fn stream_failure(
             "loader pod {name} stopped ({phase}) {progress}; it runs for at most {}s, so the stream outlasted it: {error}",
             lifetime.as_secs()
         ),
-        LoaderState::Phase { phase, reason } => {
+        LoaderState::Phase { phase, reason } if phase != "Unknown" => {
             let why = reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
             format!("loader pod {name} stopped ({phase}{why}) {progress}: {error}")
         }
         LoaderState::Gone => format!("loader pod {name} stopped (it no longer exists) {progress}: {error}"),
-        LoaderState::Unknown => {
+        // Kubernetes's own Unknown phase: the node can't be reached, so the
+        // pod may well still be running.
+        LoaderState::Unknown | LoaderState::Phase { .. } => {
             format!("streaming the tarball into loader pod {name} failed {progress} (couldn't read the pod's state): {error}")
         }
     }
@@ -522,6 +524,15 @@ mod tests {
         let cut_off = remote_write_finished("").expect_err("no done");
         assert!(cut_off.contains("didn't finish"), "{cut_off}");
         assert!(remote_write_finished("not done\n").is_err());
+    }
+
+    /// Kubernetes's `Unknown` phase (the node can't be reached) isn't a
+    /// stopped pod (SME-89 code review 2).
+    #[test]
+    fn test_a_loader_in_an_unknown_phase_isnt_reported_as_stopped() {
+        let t = Duration::from_secs(60);
+        let unknown = stream_failure("l", &phase("Unknown", None), t, t, 42, "broken pipe");
+        assert!(unknown.contains("couldn't read the pod's state") && !unknown.contains("stopped"), "{unknown}");
     }
 
     fn phase(phase: &str, reason: Option<&str>) -> LoaderState {
