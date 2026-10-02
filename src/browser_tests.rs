@@ -2037,6 +2037,54 @@ async fn test_end_to_end_browser_scenarios() {
         wait_for_live_client(&tab, stale.id).await;
         assert!(!banner_shown(&tab).await, "the reloaded page is current");
         tab.close().await.expect("close the tab");
+
+        // --- Scenario 27 (SME-83): scrolling the transcript up a little
+        // leaves it there. Every scroll event set the stuck-to-bottom flag,
+        // which reran the auto-scroll effect, so a scroll that stayed within
+        // the 32px slack (a trackpad's first small steps) snapped back. ---
+        let long_conversation = new_conversation(pool, &created).await;
+        for i in 0..40 {
+            db::create_message(
+                pool,
+                long_conversation.id,
+                if i % 2 == 0 { "user" } else { "assistant" },
+                &[anthropic::ContentBlock::Text { text: format!("scroll filler message {i}") }],
+            )
+            .await
+            .expect("seed a message");
+        }
+        let long_page = harness
+            .browser
+            .new_page(format!("{}conversation/{}", harness.base_url, long_conversation.id))
+            .await
+            .expect("open the long conversation");
+        wait_for_live_client(&long_page, long_conversation.id).await;
+        // Settled at the bottom: the same distance on two reads apart.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut last = f64::NAN;
+        loop {
+            let distance = transcript_distance_from_bottom(&long_page).await;
+            if distance <= 1.0 && distance == last {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the transcript never settled at its bottom: {distance}px away"
+            );
+            last = distance;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        long_page
+            .evaluate("(() => { const m = document.querySelector('.messages'); m.scrollTop = m.scrollTop - 10; })()")
+            .await
+            .expect("scroll the transcript up");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let distance = transcript_distance_from_bottom(&long_page).await;
+        assert!(
+            (8.0..=12.0).contains(&distance),
+            "a 10px scroll up should stay where it was put, but the transcript is {distance}px from its bottom"
+        );
+        long_page.close().await.expect("close the long conversation");
         page.close().await.expect("close the tab");
     })))
     .await;
@@ -2063,6 +2111,15 @@ async fn test_end_to_end_browser_scenarios() {
         Ok(timed) => timed.expect("browser test should complete within the timeout, not hang"),
     }
     assert!(leftovers.is_empty(), "the test left things behind: {leftovers:?}");
+}
+
+/// How far `.messages` is scrolled from its bottom, in pixels.
+async fn transcript_distance_from_bottom(page: &chromiumoxide::Page) -> f64 {
+    page.evaluate("(() => { const m = document.querySelector('.messages'); return m ? m.scrollHeight - m.scrollTop - m.clientHeight : -1; })()")
+        .await
+        .expect("read the transcript's scroll position")
+        .into_value()
+        .expect("a number")
 }
 
 /// The test's own provider (the slow mock), which every conversation it

@@ -3615,7 +3615,11 @@ fn ChatPanel(
     // the bottom (`messages_stuck_to_bottom`, kept current by the
     // `.messages` div's own `onscroll` handler below). Reads `messages()`
     // and `streaming_reply()` so it reruns on both a persisted message and
-    // an in-flight delta.
+    // an in-flight delta. The stuck flag itself is read with `peek()`:
+    // `onscroll` sets it on every scroll event (a `set` notifies even when
+    // the value is unchanged), so reading it reactively reran this on each
+    // one and pulled a scroll that stayed within the slack back to the
+    // bottom (SME-83).
     //
     // Also reads `tasks()`/`sandbox_pods()`/`sandbox_terminals()`: those
     // panels render below the transcript in `.side-panels-row`, which is
@@ -3633,7 +3637,7 @@ fn ChatPanel(
         let _ = tasks();
         let _ = sandbox_pods();
         let _ = sandbox_terminals();
-        if !messages_stuck_to_bottom() {
+        if !*messages_stuck_to_bottom.peek() {
             return;
         }
         let Some(el) = messages_el() else { return };
@@ -3652,11 +3656,12 @@ fn ChatPanel(
     // Same sticky-bottom behavior, per background task — each task's
     // terminal body scrolls independently as its own output grows. A task
     // with no recorded stuck state yet (just appeared) defaults to stuck,
-    // same as the transcript on first load.
+    // same as the transcript on first load. The stuck map is peeked, as
+    // above, so a scroll doesn't rerun this.
     use_effect(move || {
         let current_tasks = tasks();
         let els = task_body_els();
-        let stuck = task_body_stuck();
+        let stuck = task_body_stuck.peek().clone();
         for task in current_tasks {
             if !stuck.get(&task.task_id).copied().unwrap_or(true) {
                 continue;
@@ -3682,7 +3687,7 @@ fn ChatPanel(
     use_effect(move || {
         let current_terminals = sandbox_terminals();
         let els = terminal_body_els();
-        let stuck = terminal_body_stuck();
+        let stuck = terminal_body_stuck.peek().clone();
         for terminal in current_terminals {
             if !stuck.get(&terminal.terminal_id).copied().unwrap_or(true) {
                 continue;
