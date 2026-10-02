@@ -2079,6 +2079,14 @@ div.mcp-status-not-connected::before {
     padding: 24px;
 }
 
+/* Zero-size stops at the context view's edges that wrap Tab around. */
+.focus-sentinel {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+}
+
 .context-detail-close {
     position: absolute;
     top: 12px;

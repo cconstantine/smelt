@@ -879,6 +879,13 @@ fn is_scrolled_to_bottom(scroll_top: f64, scroll_height: f64, client_height: f64
     scroll_height - scroll_top - client_height <= SCROLL_BOTTOM_SLACK_PX
 }
 
+/// Focus the context view's first and last controls, for the sentinels
+/// that keep Tab inside it.
+const FOCUS_FIRST_IN_CONTEXT_DETAIL: &str = "document.querySelector('.context-detail-close')?.focus();";
+const FOCUS_LAST_IN_CONTEXT_DETAIL: &str = "const p = document.querySelector('.context-detail-panel'); \
+     if (p) { const f = p.querySelectorAll('button, summary, a[href], input, select, textarea, [tabindex=\"0\"]'); \
+     (f[f.length - 1] || p).focus(); }";
+
 /// How full the model's context window is, as a whole-number percent — the
 /// always-visible indicator's own number. `None` if `usage` hasn't arrived
 /// yet (a brand-new conversation). Clamped to 100 — a conversation caught
@@ -4128,6 +4135,18 @@ fn ChatPanel(
                                         close_context_detail();
                                     }
                                 },
+                                // The view is modal, so Tab cycles inside it:
+                                // focus reaching either sentinel wraps around
+                                // to the view's other end.
+                                div {
+                                    class: "focus-sentinel",
+                                    tabindex: "0",
+                                    onfocus: move |_| {
+                                        spawn(async move {
+                                            let _ = document::eval(FOCUS_LAST_IN_CONTEXT_DETAIL).await;
+                                        });
+                                    },
+                                }
                                 div {
                                     class: "context-detail-panel",
                                     role: "dialog",
@@ -4192,6 +4211,15 @@ fn ChatPanel(
                                             }
                                         },
                                     }
+                                }
+                                div {
+                                    class: "focus-sentinel",
+                                    tabindex: "0",
+                                    onfocus: move |_| {
+                                        spawn(async move {
+                                            let _ = document::eval(FOCUS_FIRST_IN_CONTEXT_DETAIL).await;
+                                        });
+                                    },
                                 }
                             }
                         }
