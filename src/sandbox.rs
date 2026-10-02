@@ -5197,13 +5197,18 @@ mod tests {
             note_docker_restarts(&mut seen, &as_watched(first), true);
             let restarted = loop {
                 let pod = pods.get(&name).await.expect("get pod");
+                let restarts = |pod: &Pod| docker_status(pod).map(|c| c.restart_count);
                 match note_docker_restarts(&mut seen, &as_watched(pod.clone()), false) {
-                    Some(DockerRestart::Report { reason, .. }) => break (pod, (1, Some(reason))),
+                    Some(DockerRestart::Report { reason, .. }) => {
+                        let count = restarts(&pod);
+                        break (pod, (count, Some(reason)));
+                    }
                     Some(DockerRestart::Recheck { .. }) => {
                         tokio::time::sleep(DOCKER_REASON_WAIT).await;
                         let pod = pods.get(&name).await.expect("re-read pod");
                         let reason = docker_restart_to_report(&pod, 0).and_then(|(_, reason)| reason);
-                        break (pod, (1, reason));
+                        let count = restarts(&pod);
+                        break (pod, (count, reason));
                     }
                     None => {}
                 }
@@ -5226,7 +5231,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             };
             let (pod, report) = restarted;
-            assert_eq!(report, (1, Some("OOMKilled".to_string())));
+            assert_eq!(report, (Some(1), Some("OOMKilled".to_string())));
             let sandbox_restarts = pod
                 .status
                 .and_then(|s| s.container_statuses)
