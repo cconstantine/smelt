@@ -932,8 +932,9 @@ mod server {
 
     /// Records `url` as one of the conversation's repos and clones it into
     /// the conversation's pod, at `/workspace/<dir>` (the repo's name when
-    /// `dir` is `None`). The same repo and branch already checked out is
-    /// returned as it is rather than cloned twice.
+    /// `dir` is `None`), starting the pod if it has none (SME-49). The same
+    /// repo and branch already checked out is returned as it is rather than
+    /// cloned twice.
     pub async fn clone_repo(
         pool: &PgPool,
         conversation_id: i64,
@@ -947,12 +948,8 @@ mod server {
             ClonePlan::Existing(repo) => return summarise(pool, repo).await,
             ClonePlan::Clone { key, dir, retry } => (key, dir, retry),
         };
-        let pod_id = sandbox::live_pod_id(pool, conversation_id).await.map_err(|_| {
-            "This conversation has no sandbox yet: call create_pod first.".to_string()
-        })?;
         let repo = record_clone(pool, conversation_id, url, branch, &key, &dir, retry).await?;
-        let guard = CloneGuard::new(pool, repo.id, conversation_id);
-        run_clone(pool, conversation_id, pod_id, repo, guard).await
+        clone_recorded(pool, conversation_id, repo).await
     }
 
     /// The user's "Work on a repo": the repo is recorded first, so a
@@ -1052,6 +1049,17 @@ mod server {
             ensure_sandbox(pool, conversation_id).await?;
             return Ok(None);
         };
+        clone_recorded(pool, conversation_id, repo).await.map(Some)
+    }
+
+    /// Clones a repo recorded as `cloning` into the conversation's pod,
+    /// starting the pod if it has none. A pod that won't start fails the
+    /// repo with why.
+    async fn clone_recorded(
+        pool: &PgPool,
+        conversation_id: i64,
+        repo: db::ConversationRepo,
+    ) -> Result<RepoSummary, String> {
         let guard = CloneGuard::new(pool, repo.id, conversation_id);
         let pod_id = match ensure_sandbox(pool, conversation_id).await {
             Ok(pod_id) => pod_id,
@@ -1062,7 +1070,7 @@ mod server {
                 return Err(e);
             }
         };
-        run_clone(pool, conversation_id, pod_id, repo, guard).await.map(Some)
+        run_clone(pool, conversation_id, pod_id, repo, guard).await
     }
 
     /// The conversation's live pod, started if it has none.
@@ -1547,10 +1555,6 @@ mod server {
                 .await
                 .expect_err("bad dir");
             assert!(bad_dir.contains("directory"), "{bad_dir}");
-            let no_pod = clone_repo(&pool, conversation.id, "git@github.com:o/r.git", None, None)
-                .await
-                .expect_err("no pod");
-            assert!(no_pod.contains("create_pod"), "{no_pod}");
             assert!(list_repos(&pool, conversation.id).await.expect("list").is_empty());
         }
 

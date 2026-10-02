@@ -709,8 +709,8 @@ mod server {
                 name: "clone_repo".to_string(),
                 description: "Clone a git repository into this conversation's sandbox pod, \
                                at /workspace/<dir> (the repo's name by default). Use this \
-                               rather than `git clone` in a terminal. Needs a pod (create_pod \
-                               first). Takes an SSH URL (git@github.com:owner/repo.git) or an \
+                               rather than `git clone` in a terminal. Starts the sandbox if \
+                               the conversation has none. Takes an SSH URL (git@github.com:owner/repo.git) or an \
                                https one; https only works for public repos, and pushing \
                                needs SSH. Returns where it is and what was checked out."
                     .to_string(),
@@ -3124,22 +3124,12 @@ mod server {
         }
 
         #[sqlx::test]
-        async fn test_clone_repo_tool_needs_a_url_and_a_pod(pool: sqlx::PgPool) {
+        async fn test_clone_repo_tool_needs_a_url(pool: sqlx::PgPool) {
             let conversation = db::create_conversation(&pool).await.expect("create conversation");
             let missing = execute(&pool, conversation.id, "toolu_1", "clone_repo", &serde_json::json!({}))
                 .await
                 .expect_err("url is required");
             assert!(missing.contains("url"), "{missing}");
-            let no_pod = execute(
-                &pool,
-                conversation.id,
-                "toolu_2",
-                "clone_repo",
-                &serde_json::json!({"url": "git@github.com:o/r.git", "branch": "dev"}),
-            )
-            .await
-            .expect_err("no pod yet");
-            assert!(no_pod.contains("create_pod"), "{no_pod}");
             assert!(native_tool_definitions().iter().any(|d| d.name == "clone_repo"));
             assert!(native_tool_definitions().iter().any(|d| d.name == "load_instructions"));
             // A path outside the conversation's repos is refused before anything is read.
