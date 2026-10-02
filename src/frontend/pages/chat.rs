@@ -3039,7 +3039,17 @@ fn ChatPanel(
             let handle = spawn(async move {
                 let mut pulls = 0u32;
                 loop {
-                    if let Ok(mut events) = subscribe_conversation_events(id).await {
+                    let subscribed = subscribe_conversation_events(id).await;
+                    // Deleted (from another tab, say): the server refuses
+                    // to stream it, so say so instead of retrying for good
+                    // (SME-91).
+                    if let Err(e) = &subscribed
+                        && server_error_message(e) == "conversation not found"
+                    {
+                        load_error.set(Some(server_error_message(e)));
+                        break;
+                    }
+                    if let Ok(mut events) = subscribed {
                         // One-shot reconciliation pull: a `broadcast`
                         // channel has no replay, so anything published
                         // before this subscription connected would
