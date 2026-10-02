@@ -6056,6 +6056,17 @@ mod tests {
             assert_eq!(repos[0].status, crate::git::RepoStatus::Ready, "{repos:?}");
             assert_eq!(repos[0].loaded_instructions, vec!["AGENTS.md".to_string()], "{repos:?}");
             assert_eq!(repos[1].status, crate::git::RepoStatus::Ready, "{repos:?}");
+            // An origin that outlives the pod, for the model's clone below.
+            let seeded = exec_with(
+                &client,
+                &pod_name(pod_a2),
+                "sandbox",
+                &["git", "clone", "-q", "--bare", "/workspace/origin", "/workspace/seed.git"],
+                None,
+            )
+            .await
+            .expect("exec seed origin");
+            assert_eq!(seeded.exit_code, 0, "{}", seeded.stderr);
             terminate_pod(&pool, conversation_a.id).await.expect("terminate the second pod (a)");
 
             let pods_after = list_pods(&pool, conversation_a.id).await.expect("list_pods");
@@ -6091,6 +6102,31 @@ mod tests {
                 "attach_repo started a sandbox"
             );
             terminate_pod(&pool, conversation_a.id).await.expect("terminate the attach pod (a)");
+
+            // The model's clone_repo on a conversation with no sandbox starts
+            // one too, recording the repo first (SME-49).
+            let cloning = tokio::spawn({
+                let pool = pool.clone();
+                let id = conversation_a.id;
+                async move { crate::git::clone_repo(&pool, id, "file:///workspace/seed.git", None, None).await }
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !crate::git::wait_for_clones(&pool, conversation_a.id, Duration::ZERO).await,
+                "a turn started while the sandbox starts should see the clone coming"
+            );
+            let seed = cloning
+                .await
+                .expect("clone task")
+                .expect("clone_repo starts the sandbox and clones");
+            assert_eq!(seed.path, "/workspace/seed");
+            assert_eq!(seed.status, crate::git::RepoStatus::Ready, "{seed:?}");
+            assert_eq!(
+                list_pods(&pool, conversation_a.id).await.expect("list_pods").len(),
+                1,
+                "clone_repo started a sandbox"
+            );
+            terminate_pod(&pool, conversation_a.id).await.expect("terminate the clone pod (a)");
             let terminals_after = list_terminals(&pool, conversation_a.id).await.expect("list_terminals");
             assert!(terminals_after.is_empty(), "no terminals should be listed after terminating all of them");
 
