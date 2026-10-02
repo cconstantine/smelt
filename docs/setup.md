@@ -52,11 +52,13 @@ scripts/build-sandbox-image.sh
 # `src/browser_tests.rs`'s own test tier anymore. `scripts/browser-check/setup.sh`
 # downloads the binary plus its missing shared libraries into
 # `.browser-check-cache/` (gitignored) — no root needed, safe to re-run.
-# smelt looks for Chrome at `<checkout it was built from>/.browser-check-cache/`
-# (the compile-time `CARGO_MANIFEST_DIR`, `src/headless_chrome.rs`), wherever
-# the binary runs from. `BROWSER_CHECK_CACHE` only moves where setup.sh
-# downloads, not where smelt looks; `scripts/check-server` symlinks the
-# checkout's cache into its own worktree.
+# `BROWSER_CHECK_CACHE` moves that directory, for setup.sh and for smelt
+# alike: smelt looks for Chrome there, or, when it's unset, at
+# `<checkout it was built from>/.browser-check-cache/` (the compile-time
+# `CARGO_MANIFEST_DIR`, `src/headless_chrome.rs`). So a binary running
+# anywhere but its build checkout (a deployed build, another worktree) needs
+# it set; `scripts/check-server` and `scripts/browser-tier` set it to the
+# main checkout's cache.
 # Without this, any real `webfetch`/`open_browser_session` call fails with a
 # clear "chrome-headless-shell not found" error rather than hanging or
 # crashing. See SME-21 and
@@ -128,6 +130,7 @@ startup just like an unset one.
 | `SANDBOX_WORKSPACE_STORAGE_SIZE` | no | `20Gi` | Size each conversation's `/workspace` claim (`sandbox-workspace-<conversation id>`, its files and checkouts) requests. |
 | `SANDBOX_VOLUME_STORAGE_SIZE` | no | `10Gi` | Size each generic volume's claim (`sandbox-volume-<id>`, the volumes configured on the `/sandbox-volumes` page) requests (`src/sandbox.rs`). Not configurable per volume. |
 | `SANDBOX_DOCKER_IMAGE` | no | `docker.io/library/docker:29-dind` | The Docker sidecar's image, delivered into the node by `scripts/build-sandbox-image.sh`. Only its `dockerd` is used, never its entrypoint. |
+| `BROWSER_CHECK_CACHE` | no | `<build checkout>/.browser-check-cache` | Where headless Chrome and its libraries are: `scripts/browser-check/setup.sh` downloads into it and smelt launches Chrome from it, for `webfetch` and browsing sessions (see [Commands](#commands) above). Set it wherever smelt runs from somewhere other than the checkout it was built in. |
 | `SMELT_MASON_REGISTRY_URL` | no | `https://raw.githubusercontent.com/mason-org/mason-registry/main` | Where the Language servers page's lookup reads mason's `packages/<name>/package.yaml` (see [Language servers](#language-servers)). |
 | `SMELT_HELIX_LANGUAGES_URL` | no | `https://raw.githubusercontent.com/helix-editor/helix/master/languages.toml` | Helix's `languages.toml`, for the lookup's arguments, file types, root markers and settings. |
 | `SMELT_PREVIEW_URL` | no | `http://{port}-{conversation}.preview.localhost:8181` | The address a sandbox preview gets (see [Sandbox previews](#sandbox-previews)): a scheme and host holding `{port}` and `{conversation}` once each, with something other than digits between them, and no path. In production, e.g. `https://{port}-{conversation}-smelt.constantlee.us`. An invalid value turns previews off, logged as an error at startup; the rest of smelt runs as usual. |

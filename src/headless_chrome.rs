@@ -19,9 +19,13 @@ use std::time::Duration;
 use chromiumoxide::Browser;
 use futures_util::StreamExt;
 
-const CHROME_BINARY: &str =
-    ".browser-check-cache/chrome/chrome-headless-shell-linux64/chrome-headless-shell";
-const LIB_DIR: &str = ".browser-check-cache/libs/usr/lib/x86_64-linux-gnu";
+/// Where `scripts/browser-check/setup.sh` puts Chrome and its libraries,
+/// relative to its cache directory (see `cache_dir`).
+const CHROME_BINARY: &str = "chrome/chrome-headless-shell-linux64/chrome-headless-shell";
+const LIB_DIR: &str = "libs/usr/lib/x86_64-linux-gnu";
+/// The cache directory when `BROWSER_CHECK_CACHE` isn't set, relative to
+/// the checkout smelt was built from.
+const DEFAULT_CACHE_DIR: &str = ".browser-check-cache";
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(20);
 const PROFILE_PREFIX: &str = "smelt-chrome-";
 
@@ -54,18 +58,38 @@ const BASE_ARGS: [&str; 24] = [
     "--lang=en_US",
 ];
 
+/// The directory holding Chrome and its libraries: `setting`
+/// (`BROWSER_CHECK_CACHE`, the same variable that moves where setup.sh
+/// downloads), or `.browser-check-cache` in `build_root`, the checkout smelt
+/// was built from, when it's unset or empty.
+fn cache_dir(setting: Option<&str>, build_root: &Path) -> PathBuf {
+    match setting.filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => build_root.join(DEFAULT_CACHE_DIR),
+    }
+}
+
 /// Launches Chrome with `extra_args` on top of the base headless setup and
 /// returns a connected `Browser`, with its CDP handler already being driven.
 pub async fn launch(extra_args: &[String]) -> Result<Browser, String> {
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let chrome_binary = repo_root.join(CHROME_BINARY);
+    let cache = cache_dir(
+        std::env::var("BROWSER_CHECK_CACHE").ok().as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    );
+    launch_in(&cache, extra_args).await
+}
+
+/// `launch`, with Chrome taken from the cache directory `cache`.
+async fn launch_in(cache: &Path, extra_args: &[String]) -> Result<Browser, String> {
+    let chrome_binary = cache.join(CHROME_BINARY);
     if !chrome_binary.is_file() {
         return Err(format!(
-            "chrome-headless-shell not found at {} — run scripts/browser-check/setup.sh first",
+            "chrome-headless-shell not found at {} — run scripts/browser-check/setup.sh first, \
+             or set BROWSER_CHECK_CACHE to the directory it downloaded into",
             chrome_binary.display()
         ));
     }
-    let lib_dir = repo_root.join(LIB_DIR);
+    let lib_dir = cache.join(LIB_DIR);
     let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
     let ld_library_path = format!("{}:{}/dri:{existing}", lib_dir.display(), lib_dir.display());
 
@@ -212,6 +236,31 @@ fn remove_stale_profiles(temp_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_a_set_cache_dir_is_used_as_given() {
+        assert_eq!(
+            cache_dir(Some("/opt/smelt/chrome-cache"), Path::new("/build/smelt")),
+            PathBuf::from("/opt/smelt/chrome-cache")
+        );
+    }
+
+    #[test]
+    fn test_an_unset_or_empty_cache_dir_is_the_build_checkouts() {
+        let default = PathBuf::from("/build/smelt/.browser-check-cache");
+        assert_eq!(cache_dir(None, Path::new("/build/smelt")), default);
+        assert_eq!(cache_dir(Some(""), Path::new("/build/smelt")), default);
+    }
+
+    #[tokio::test]
+    async fn test_a_cache_dir_without_chrome_says_where_it_looked() {
+        let empty = std::env::temp_dir().join(format!("smelt-no-chrome-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).expect("create temp dir");
+        let error = launch_in(&empty, &[]).await.err().expect("no Chrome there");
+        std::fs::remove_dir_all(&empty).expect("remove temp dir");
+        assert!(error.contains(&empty.display().to_string()), "{error}");
+        assert!(error.contains("BROWSER_CHECK_CACHE"), "{error}");
+    }
 
     #[test]
     fn test_remove_stale_profiles_keeps_live_processes_and_unrelated_dirs() {
