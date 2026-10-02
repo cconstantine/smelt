@@ -3,7 +3,8 @@
 
 use super::*;
 
-pub(super) fn pod_name(pod_id: i64) -> String {
+/// The Kubernetes pod name of smelt's pod `pod_id`.
+pub fn pod_name(pod_id: i64) -> String {
     format!("sandbox-{pod_id}")
 }
 
@@ -578,11 +579,6 @@ pub(super) fn pod_container_limits(pod: &Pod) -> (Vec<String>, Vec<String>) {
             .collect()
     };
     (limits("memory"), limits("cpu"))
-}
-
-/// The Kubernetes pod name for `pod_id`, for matching metrics to rows.
-pub fn kubernetes_pod_name(pod_id: i64) -> String {
-    pod_name(pod_id)
 }
 
 // --- Generic volumes ---

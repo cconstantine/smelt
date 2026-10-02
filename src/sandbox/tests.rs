@@ -1124,7 +1124,7 @@ async fn test_git_files_reach_ssh_and_git_in_a_real_pod() {
         .create(&unique_session_id("git-files"), "256Mi", &[])
         .await
         .expect("create pod");
-    let pod_name = sandbox.pod_name.clone();
+    let shell = sandbox.shell();
 
     let checks = tokio::time::timeout(Duration::from_secs(120), async {
         let key = crate::git::generate_key("test-key");
@@ -1134,7 +1134,7 @@ async fn test_git_files_reach_ssh_and_git_in_a_real_pod() {
         };
         let files =
             crate::git::pod_git_files(&[("test-key".to_string(), key.private_key.clone())], &identity);
-        install_git_files(&client, &pod_name, &files)
+        crate::git::install_git_files(&shell, &files)
             .await
             .expect("install git files");
 
@@ -1184,7 +1184,7 @@ async fn test_git_files_reach_ssh_and_git_in_a_real_pod() {
         ]);
         let reinstall = async {
             for _ in 0..3 {
-                install_git_files(&client, &pod_name, &files).await.expect("reinstall");
+                crate::git::install_git_files(&shell, &files).await.expect("reinstall");
             }
         };
         let (watched, ()) = tokio::join!(watch, reinstall);
@@ -1194,14 +1194,14 @@ async fn test_git_files_reach_ssh_and_git_in_a_real_pod() {
         // A write that fails says why (SME-32 code review 7, finding 5).
         let locked = sandbox.exec(&["chmod", "500", "/etc/smelt/keys"]).await.expect("exec chmod");
         assert_eq!(locked.exit_code, 0);
-        let failed = install_git_files(&client, &pod_name, &files).await.expect_err("keys dir not writable");
+        let failed = crate::git::install_git_files(&shell, &files).await.expect_err("keys dir not writable");
         assert!(failed.to_string().contains("Permission denied"), "{failed}");
         let unlocked = sandbox.exec(&["chmod", "700", "/etc/smelt/keys"]).await.expect("exec chmod");
         assert_eq!(unlocked.exit_code, 0);
 
         // The key is deleted: a reinstall without it removes the file.
         let files = crate::git::pod_git_files(&[], &identity);
-        install_git_files(&client, &pod_name, &files)
+        crate::git::install_git_files(&shell, &files)
             .await
             .expect("reinstall git files");
         let gone = sandbox
@@ -1248,12 +1248,12 @@ async fn test_clone_into_pod_checks_out_a_branch_and_reports_failures() {
         .create(&unique_session_id("git-clone"), "256Mi", &[])
         .await
         .expect("create pod");
-    let pod_name = sandbox.pod_name.clone();
+    let shell = sandbox.shell();
 
     let checks = tokio::time::timeout(Duration::from_secs(120), async {
         let main_commit = make_origin_repo(&sandbox).await;
 
-        let cloned = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin")
+        let cloned = crate::git::clone_into_pod(&shell, "file:///tmp/origin.git", None, "origin")
             .await
             .expect("clone the default branch");
         assert_eq!(cloned.commit.as_deref(), Some(main_commit.as_str()));
@@ -1264,19 +1264,18 @@ async fn test_clone_into_pod_checks_out_a_branch_and_reports_failures() {
             .expect("exec cat");
         assert_eq!(agents.stdout, "Run make test before committing.\n");
 
-        let read = crate::git::read_instructions_file(&client, &pod_name, "/workspace/origin", "/workspace/origin/AGENTS.md")
+        let read = crate::git::read_instructions_file(&shell, "/workspace/origin", "/workspace/origin/AGENTS.md")
             .await
             .expect("read AGENTS.md")
             .expect("origin has an AGENTS.md");
         assert_eq!(read.content, "Run make test before committing.\n");
         assert_eq!(read.file_bytes, 33);
         assert_eq!(read.hash.len(), 64, "sha256 hex: {}", read.hash);
-        let listed = crate::git::list_agents_files(&client, &pod_name, "origin").await.expect("list");
+        let listed = crate::git::list_agents_files(&shell, "origin").await.expect("list");
         assert_eq!(listed, vec!["AGENTS.md".to_string()], "main has no nested files");
 
         let feature = crate::git::clone_into_pod(
-            &client,
-            &pod_name,
+            &shell,
             "file:///tmp/origin.git",
             Some("feature"),
             "origin-feature",
@@ -1285,7 +1284,7 @@ async fn test_clone_into_pod_checks_out_a_branch_and_reports_failures() {
         .expect("clone a branch");
         assert_eq!(feature.branch, "feature");
         assert_ne!(feature.commit.as_deref(), Some(main_commit.as_str()));
-        let listed = crate::git::list_agents_files(&client, &pod_name, "origin-feature").await.expect("list");
+        let listed = crate::git::list_agents_files(&shell, "origin-feature").await.expect("list");
         assert_eq!(listed, vec!["AGENTS.md".to_string(), "web/AGENTS.md".to_string()], "top-level first");
 
         let bare = sandbox
@@ -1293,11 +1292,11 @@ async fn test_clone_into_pod_checks_out_a_branch_and_reports_failures() {
             .await
             .expect("exec git init");
         assert_eq!(bare.exit_code, 0);
-        let none = crate::git::read_instructions_file(&client, &pod_name, "/workspace/no-agents", "/workspace/no-agents/AGENTS.md")
+        let none = crate::git::read_instructions_file(&shell, "/workspace/no-agents", "/workspace/no-agents/AGENTS.md")
             .await
             .expect("read a missing file");
         assert_eq!(none, None);
-        assert!(crate::git::list_agents_files(&client, &pod_name, "no-agents").await.expect("list").is_empty());
+        assert!(crate::git::list_agents_files(&shell, "no-agents").await.expect("list").is_empty());
 
         // Bytes that aren't UTF-8 (or a 1 MiB cut through a character)
         // still load, with the bad bytes replaced (SME-32 code review,
@@ -1307,7 +1306,7 @@ async fn test_clone_into_pod_checks_out_a_branch_and_reports_failures() {
             .await
             .expect("exec make bad bytes");
         assert_eq!(bad.exit_code, 0, "{}", bad.stderr);
-        let read = crate::git::read_instructions_file(&client, &pod_name, "/workspace/bad-bytes", "/workspace/bad-bytes/AGENTS.md")
+        let read = crate::git::read_instructions_file(&shell, "/workspace/bad-bytes", "/workspace/bad-bytes/AGENTS.md")
             .await
             .expect("a file with invalid UTF-8 reads")
             .expect("it exists");
@@ -1322,7 +1321,7 @@ async fn test_clone_into_pod_checks_out_a_branch_and_reports_failures() {
             .await
             .expect("exec make swollen");
         assert_eq!(swollen.exit_code, 0, "{}", swollen.stderr);
-        let read = crate::git::read_instructions_file(&client, &pod_name, "/workspace/swollen", "/workspace/swollen/AGENTS.md")
+        let read = crate::git::read_instructions_file(&shell, "/workspace/swollen", "/workspace/swollen/AGENTS.md")
             .await
             .expect("read")
             .expect("it exists");
@@ -1336,7 +1335,7 @@ async fn test_clone_into_pod_checks_out_a_branch_and_reports_failures() {
             .await
             .expect("exec make unicode");
         assert_eq!(unicode.exit_code, 0, "{}", unicode.stderr);
-        let listed = crate::git::list_agents_files(&client, &pod_name, "unicode").await.expect("list");
+        let listed = crate::git::list_agents_files(&shell, "unicode").await.expect("list");
         assert_eq!(listed, vec!["é/AGENTS.md".to_string()]);
 
         // An AGENTS.md that's a symlink out of the checkout (to a key,
@@ -1346,19 +1345,19 @@ async fn test_clone_into_pod_checks_out_a_branch_and_reports_failures() {
             .await
             .expect("exec make symlink");
         assert_eq!(linked.exit_code, 0, "{}", linked.stderr);
-        let refused = crate::git::read_instructions_file(&client, &pod_name, "/workspace/linked", "/workspace/linked/AGENTS.md")
+        let refused = crate::git::read_instructions_file(&shell, "/workspace/linked", "/workspace/linked/AGENTS.md")
             .await
             .expect_err("a symlink isn't read");
         assert!(refused.contains("isn't a regular file"), "{refused}");
         assert!(!refused.contains("root:"), "nothing of the target leaks: {refused}");
 
-        let missing = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/nope.git", None, "nope")
+        let missing = crate::git::clone_into_pod(&shell, "file:///tmp/nope.git", None, "nope")
             .await
             .expect_err("a missing repo fails");
         assert!(missing.contains("does not appear to be a git repository"), "{missing}");
 
         // The directory is taken: git's own message, not a silent overwrite.
-        let taken = crate::git::clone_into_pod(&client, &pod_name, "file:///tmp/origin.git", None, "origin")
+        let taken = crate::git::clone_into_pod(&shell, "file:///tmp/origin.git", None, "origin")
             .await
             .expect_err("an existing directory fails");
         assert!(taken.contains("already exists"), "{taken}");

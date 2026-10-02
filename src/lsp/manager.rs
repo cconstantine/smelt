@@ -41,7 +41,7 @@ pub async fn sandbox_ref(pool: &PgPool, client: &kube::Client, conversation_id: 
     let pod_id = crate::sandbox::live_pod_id(pool, conversation_id)
         .await
         .map_err(|_| "No sandbox is running: create one with create_pod first.".to_string())?;
-    let pod_name = crate::sandbox::kubernetes_pod_name(pod_id);
+    let pod_name = crate::sandbox::pod_name(pod_id);
     let pod = crate::sandbox::pods_api(client)
         .get(&pod_name)
         .await

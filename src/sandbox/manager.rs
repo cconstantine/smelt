@@ -154,12 +154,10 @@ impl SandboxManager {
         })
     }
 
-    /// Only called by the tests below (production relies on `Sandbox`'s own
-    /// `Drop` impl, which queues the same cleanup asynchronously) — kept as
-    /// an explicit, synchronous alternative for tests that need to assert
-    /// on the pod's absence immediately after deleting, without racing the
-    /// cleanup queue.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Deletes the pod now rather than through `Sandbox`'s `Drop`, which
+    /// queues the same cleanup: for a pod whose start failed after it was
+    /// made (its git install), and for tests that assert on the pod's
+    /// absence right after deleting it, without racing the cleanup queue.
     pub async fn delete(&self, sandbox: Sandbox) -> Result<(), SandboxError> {
         let pods = pods_api(&self.client);
         pods.delete(&sandbox.pod_name, &pod_delete_params())
@@ -173,7 +171,7 @@ impl SandboxManager {
     }
 }
 
-// Only called by the "no-agent pod" real-cluster test below — `create`
+// Only called by the "no-agent pod" real-cluster test in `tests.rs` — `create`
 // itself now goes straight to `create_with_running_timeout`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) async fn wait_for_running(pods: &Api<Pod>, name: &str) -> Result<(), SandboxError> {
@@ -696,13 +694,6 @@ pub async fn delete_volume(pool: &PgPool, id: i64) -> Result<(), SandboxError> {
     Ok(())
 }
 
-/// Deletes every pod that exists for this conversation, unconditionally
-/// (unlike `terminate_pod`, this is a hard teardown on conversation
-/// deletion, not a guarded API the model calls) — see SME-9's
-/// `chat.rs`/`main.rs` bullet. The DB rows themselves don't need clearing
-/// here: `db::delete_conversation`'s `ON DELETE CASCADE` chain removes
-/// `sandbox_pods`/`sandbox_terminals`/`terminal_commands` for real right
-/// after this runs.
 /// Whether sandbox pod `pod_id` still exists in the cluster (terminating
 /// counts as existing).
 #[cfg(all(test, feature = "browser-test"))]
@@ -713,6 +704,13 @@ pub(crate) async fn pod_exists(pod_id: i64) -> bool {
     )
 }
 
+/// Deletes every pod that exists for this conversation, unconditionally
+/// (unlike `terminate_pod`, this is a hard teardown on conversation
+/// deletion, not a guarded API the model calls) — see SME-9's
+/// `chat.rs`/`main.rs` bullet. The DB rows themselves don't need clearing
+/// here: `db::delete_conversation`'s `ON DELETE CASCADE` chain removes
+/// `sandbox_pods`/`sandbox_terminals`/`terminal_commands` for real right
+/// after this runs.
 pub async fn teardown_conversation(conversation_id: i64, pod_ids: &[i64]) {
     teardown_conversation_with(&get().client, conversation_id, pod_ids).await;
 }

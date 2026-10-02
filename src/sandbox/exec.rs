@@ -1,18 +1,18 @@
-//! kube exec into a pod's containers, and `Sandbox`, a pod the real-cluster tests own.
+//! kube exec into a pod's containers: `PodShell` for a conversation's
+//! sandbox container, and `Sandbox`, a pod the real-cluster tests own.
 
 use super::*;
 
 pub struct Sandbox {
     pub(super) pod_name: String,
-    // Only read by `exec` below, which is itself real-cluster-test-only
-    // (see its own cfg) — production code talks to the sandbox through
-    // `sandbox_agent`'s WebSocket protocol instead.
+    // Only read by the test-only `exec` and `shell` below; production
+    // code reaches a pod's sandbox container through `PodShell` or the
+    // sandbox agent.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) client: kube::Client,
     pub(super) cleanup_tx: mpsc::UnboundedSender<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
@@ -20,10 +20,9 @@ pub struct ExecResult {
 }
 
 impl Sandbox {
-    /// Lower-level kube-exec path used only by the real-cluster tests below
-    /// to check a raw property of the pod itself (its mounted volumes, its
-    /// non-root user, ...) independent of `sandbox_agent`'s own WebSocket
-    /// terminal protocol, which is what production code actually uses.
+    /// kube exec in the pod's sandbox container, for the real-cluster
+    /// tests to check a raw property of the pod itself (its mounted
+    /// volumes, its non-root user, ...) independent of the sandbox agent.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn exec(&self, command: &[&str]) -> Result<ExecResult, SandboxError> {
         self.exec_in("sandbox", command).await
@@ -38,6 +37,45 @@ impl Sandbox {
         command: &[&str],
     ) -> Result<ExecResult, SandboxError> {
         exec_with(&self.client, &self.pod_name, container, command, None).await
+    }
+
+    /// A `PodShell` into this pod, with the test's own client.
+    #[cfg(test)]
+    pub fn shell(&self) -> PodShell {
+        PodShell::new(self.client.clone(), self.pod_name.clone())
+    }
+}
+
+/// Commands run in a pod's sandbox container through kube exec, which
+/// sees its exit code and can feed it stdin: how git clones, reads a
+/// checkout's `AGENTS.md` files and installs keys. The model's own
+/// commands go through the sandbox agent's terminals instead.
+pub struct PodShell {
+    client: kube::Client,
+    pod_name: String,
+}
+
+impl PodShell {
+    /// A shell into the Kubernetes pod named `pod_name`, through `client`
+    /// (a real-cluster test brings its own).
+    pub fn new(client: kube::Client, pod_name: String) -> Self {
+        PodShell { client, pod_name }
+    }
+
+    /// A shell into smelt's pod `pod_id`.
+    pub fn for_pod(pod_id: i64) -> Self {
+        Self::new(kube_client(), pod_name(pod_id))
+    }
+
+    /// A shell into `conversation_id`'s live pod.
+    pub async fn for_conversation(pool: &PgPool, conversation_id: i64) -> Result<Self, TerminalError> {
+        Ok(Self::for_pod(live_pod_id(pool, conversation_id).await?))
+    }
+
+    /// Runs `command` in the sandbox container, with `stdin` written and
+    /// closed when given (see `exec_with`).
+    pub async fn run(&self, command: &[&str], stdin: Option<&[u8]>) -> Result<ExecResult, SandboxError> {
+        exec_with(&self.client, &self.pod_name, "sandbox", command, stdin).await
     }
 }
 
@@ -102,94 +140,6 @@ pub(crate) async fn exec_with(
         stderr,
         exit_code: extract_exit_code(status),
     })
-}
-
-/// Writes git's files (`git::pod_git_files`) into a pod's sandbox
-/// container. The keys directory is replaced wholesale, so a key deleted
-/// since the last install goes too.
-pub async fn install_git_files(
-    client: &kube::Client,
-    pod_name: &str,
-    files: &[crate::git::PodFile],
-) -> Result<(), SandboxError> {
-    // Never emptied: a clone or push running during a reinstall must
-    // still find its key. Keys are written over in place, and only the
-    // ones no longer in `files` removed afterwards.
-    let keys_dir = format!("{}/keys", crate::git::POD_GIT_DIR);
-    let made = exec_with(
-        client,
-        pod_name,
-        "sandbox",
-        &["sh", "-c", r#"mkdir -p -m 700 "$1""#, "sh", &keys_dir],
-        None,
-    )
-    .await?;
-    if made.exit_code != 0 {
-        return Err(SandboxError::GitSetup(format!(
-            "couldn't make {keys_dir}: {}",
-            made.stderr.trim()
-        )));
-    }
-    for file in files {
-        // Written beside the target and renamed over it, so ssh or git
-        // never reads half a file; umask keeps a key private from its
-        // first byte.
-        let mode = format!("{:o}", file.mode);
-        let written = exec_with(
-            client,
-            pod_name,
-            "sandbox",
-            &[
-                "sh",
-                "-c",
-                r#"umask 077 && cat > "$1.new" && chmod "$2" "$1.new" && mv "$1.new" "$1""#,
-                "sh",
-                &file.path,
-                &mode,
-            ],
-            Some(file.content.as_bytes()),
-        )
-        .await?;
-        if written.exit_code != 0 {
-            return Err(SandboxError::GitSetup(format!(
-                "couldn't write {}: {}",
-                file.path,
-                written.stderr.trim()
-            )));
-        }
-    }
-    let keep: Vec<&str> = files
-        .iter()
-        .filter_map(|f| f.path.strip_prefix(&format!("{keys_dir}/")))
-        .collect();
-    let mut prune = vec![
-        "sh",
-        "-c",
-        r#"cd "$1" && shift && for f in * .[!.]*; do
-               [ -e "$f" ] || continue
-               keep=; for k in "$@"; do [ "$f" = "$k" ] && keep=1; done
-               [ -n "$keep" ] || rm -f -- "$f"
-           done"#,
-        "sh",
-        &keys_dir,
-    ];
-    prune.extend(keep);
-    let pruned = exec_with(client, pod_name, "sandbox", &prune, None).await?;
-    if pruned.exit_code != 0 {
-        return Err(SandboxError::GitSetup(format!(
-            "couldn't remove deleted keys from {keys_dir}: {}",
-            pruned.stderr.trim()
-        )));
-    }
-    Ok(())
-}
-
-/// `install_git_files` for a live pod of smelt's own, by id.
-pub async fn install_git_files_in_pod(
-    pod_id: i64,
-    files: &[crate::git::PodFile],
-) -> Result<(), SandboxError> {
-    install_git_files(&get().client, &pod_name(pod_id), files).await
 }
 
 /// On success the exec protocol's terminal `Status` carries no exit code at

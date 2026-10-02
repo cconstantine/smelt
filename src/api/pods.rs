@@ -237,7 +237,7 @@ pub(crate) async fn pod_overviews(pool: &sqlx::PgPool) -> Result<Vec<PodOverview
             activity: pod_activity(&row),
             memory_limit: sum_memory_limits(&details.memory_limits),
             cpu_limit: sum_cpu_limits(&details.cpu_limits),
-            usage: usage.get(&crate::sandbox::kubernetes_pod_name(row.pod_id)).cloned(),
+            usage: usage.get(&crate::sandbox::pod_name(row.pod_id)).cloned(),
             terminals: row.live_terminals,
             agent: crate::sandbox::agent_status(row.pod_id),
             language_servers: server_overviews(row.conversation_id, row.pod_id, &usage).await,
