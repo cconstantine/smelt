@@ -316,12 +316,20 @@ mod server {
             origin: header("origin"),
             sec_fetch_site: header("sec-fetch-site"),
             sec_fetch_mode: header("sec-fetch-mode"),
+            referer: header("referer"),
+            upgrade_insecure_requests: header("upgrade-insecure-requests").as_deref() == Some("1"),
         };
+        // Whether the browser sent Sec-Fetch-* to the address it used: not
+        // to a plain-http one that isn't `localhost` (SME-90).
+        let sends_sec_fetch = url::Url::parse(&format!("http://{host}"))
+            .ok()
+            .and_then(|url| url.host_str().map(crate::fetch_guard::browser_sends_sec_fetch))
+            .unwrap_or(false);
         let is_home = |host: &str, port: Option<u16>| {
             let authority = port.map_or_else(|| host.to_string(), |port| format!("{host}:{port}"));
             template.match_host(&authority).is_some_and(|(origin_conversation, _, _)| origin_conversation == conversation)
         };
-        if !crate::fetch_guard::allows_request_from(&source, is_home) {
+        if !crate::fetch_guard::allows_request_from(&source, sends_sec_fetch, is_home) {
             return text_response(
                 StatusCode::FORBIDDEN,
                 "Refused: a page from another site tried to reach this preview. Open the preview's \
@@ -635,15 +643,29 @@ body {{ font-family: system-ui, sans-serif; max-width: 36rem; margin: 4rem auto;
         /// Starts the preview server; returns its address and the template
         /// it answers to (`http://{port}-{conversation}.preview.localhost:<its port>`).
         async fn start_preview(dial_for: DialFor) -> (SocketAddr, PreviewTemplate) {
-            start_preview_linking_to(dial_for, None).await
+            start_preview_with("preview.localhost", dial_for, None).await
         }
 
         /// `start_preview`, with smelt's own address for links back to it.
         async fn start_preview_linking_to(dial_for: DialFor, smelt_url: Option<&str>) -> (SocketAddr, PreviewTemplate) {
+            start_preview_with("preview.localhost", dial_for, smelt_url).await
+        }
+
+        /// A preview server whose addresses are `http://{port}-{conversation}.{domain}:…`.
+        async fn start_preview_at(domain: &str, dial_for: DialFor) -> (SocketAddr, PreviewTemplate) {
+            start_preview_with(domain, dial_for, None).await
+        }
+
+        /// A preview server at `domain`, linking back to `smelt_url`.
+        async fn start_preview_with(
+            domain: &str,
+            dial_for: DialFor,
+            smelt_url: Option<&str>,
+        ) -> (SocketAddr, PreviewTemplate) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let template = PreviewTemplate::parse(&format!(
-                "http://{{port}}-{{conversation}}.preview.localhost:{}",
+                "http://{{port}}-{{conversation}}.{domain}:{}",
                 addr.port()
             ))
             .unwrap();
@@ -737,6 +759,52 @@ body {{ font-family: system-ui, sans-serif; max-width: 36rem; margin: 4rem auto;
                 &[("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "navigate")],
                 // The conversation's frontend calling its API on another port.
                 &[("origin", &other_port), ("sec-fetch-site", "same-site"), ("sec-fetch-mode", "cors")],
+            ];
+            for headers in allowed {
+                let mut request = client.get(&url);
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
+                let response = request.send().await.unwrap();
+                assert_eq!(response.status(), 200, "{headers:?}");
+            }
+        }
+
+        /// Previews at a plain-http address that isn't `localhost` get no
+        /// Sec-Fetch-* headers from a browser, like a container's address
+        /// (SME-90): another site's image must still be refused.
+        #[tokio::test]
+        async fn test_a_preview_without_sec_fetch_still_refuses_other_sites() {
+            let upstream = start_upstream().await;
+            let dials = Dials::default();
+            let (preview, template) =
+                start_preview_at("preview.example.test", dial_for_upstream(upstream, dials.clone())).await;
+            let client = client_for(preview, &["3000-42.preview.example.test"]);
+            let url = format!("{}/", template.url_for(42, PodHost::Localhost, 3000));
+            let other_port = format!("{}/app.js", template.url_for(42, PodHost::Localhost, 5173));
+            let other_conversation = format!("{}/", template.url_for(7, PodHost::Localhost, 3000));
+            let refused: [&[(&str, &str)]; 3] = [
+                &[("referer", "http://evil.test:8703/")],
+                &[("referer", &other_conversation)],
+                &[],
+            ];
+            for headers in refused {
+                let mut request = client.get(&url);
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
+                let response = request.send().await.unwrap();
+                assert_eq!(response.status(), 403, "{headers:?}");
+            }
+            assert!(dials.lock().unwrap().is_empty(), "a refused request must not reach the sandbox");
+
+            let allowed: [&[(&str, &str)]; 3] = [
+                // Opening the link.
+                &[("upgrade-insecure-requests", "1")],
+                // The preview's own image.
+                &[("referer", &url)],
+                // The conversation's frontend on another port.
+                &[("referer", &other_port)],
             ];
             for headers in allowed {
                 let mut request = client.get(&url);

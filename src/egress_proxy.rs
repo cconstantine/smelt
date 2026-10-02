@@ -287,7 +287,9 @@ async fn handle_sandbox(
             (source, first)
         }
     };
-    if !fetch_guard::allows_request_from(&source, |host, _| fetch_guard::sandbox_host(host).is_some()) {
+    if !fetch_guard::allows_request_from(&source, fetch_guard::browser_sends_sec_fetch(&request.host), |host, _| {
+        fetch_guard::sandbox_host(host).is_some()
+    }) {
         let from = source.origin.as_deref().map(|o| format!(" ({o})")).unwrap_or_default();
         let message = format!(
             "Refused: a page from another site{from} tried to reach {} in this conversation's \
@@ -410,6 +412,8 @@ fn request_source(head: &str) -> fetch_guard::RequestSource {
             "origin" => source.origin = value,
             "sec-fetch-site" => source.sec_fetch_site = value,
             "sec-fetch-mode" => source.sec_fetch_mode = value,
+            "referer" => source.referer = value,
+            "upgrade-insecure-requests" => source.upgrade_insecure_requests = value.as_deref() == Some("1"),
             _ => {}
         }
     }
@@ -675,7 +679,13 @@ mod tests {
         let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
             .await
             .unwrap();
-        let response = client_via(proxy.addr).get("http://172.21.0.2:3000/").send().await.unwrap();
+        // As the model's browser opens it: a page load (SME-90).
+        let response = client_via(proxy.addr)
+            .get("http://172.21.0.2:3000/")
+            .header("upgrade-insecure-requests", "1")
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), 200);
         assert_eq!(
             *dialed.lock().unwrap(),
@@ -723,6 +733,43 @@ mod tests {
              Sec-Fetch-Site: same-site\r\nSec-Fetch-Mode: cors\r\n\r\n",
             "GET http://localhost:3000/ HTTP/1.1\r\nHost: localhost:3000\r\nSec-Fetch-Site: none\r\n\
              Sec-Fetch-Mode: navigate\r\n\r\n",
+        ] {
+            let reply = send_raw(proxy.addr, head).await;
+            assert!(reply.starts_with("HTTP/1.1 200") && reply.ends_with("upstream says hi"), "got {reply:?}");
+        }
+    }
+
+    /// A container's address is plain http on a private IP, so Chrome sends
+    /// it no Sec-Fetch-* headers: these are the heads the real
+    /// chrome-headless-shell sent in SME-90's spike.
+    #[tokio::test]
+    async fn test_a_sandbox_route_refuses_other_sites_requests_to_a_container() {
+        let upstream = start_upstream().await;
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
+            .await
+            .unwrap();
+        for head in [
+            // Another site's <img>.
+            "GET http://172.21.0.2:3000/ HTTP/1.1\r\nHost: 172.21.0.2:3000\r\n\
+             Accept: image/avif,image/webp,*/*\r\nReferer: http://evil.test:8703/\r\n\r\n",
+            // The same with referrerpolicy=no-referrer: nothing at all.
+            "GET http://172.21.0.2:3000/ HTTP/1.1\r\nHost: 172.21.0.2:3000\r\nAccept: */*\r\n\r\n",
+            // A no-cors HEAD.
+            "HEAD http://172.21.0.2:3000/ HTTP/1.1\r\nHost: 172.21.0.2:3000\r\nAccept: */*\r\n\r\n",
+        ] {
+            let reply = send_raw(proxy.addr, head).await;
+            assert!(reply.starts_with("HTTP/1.1 403"), "got {reply:?}");
+            assert!(reply.contains("another site"), "the refusal should say why: {reply:?}");
+        }
+        assert!(dialed.lock().unwrap().is_empty(), "a refused request must not reach the sandbox");
+
+        // The model opening the page, and the page's own image.
+        for head in [
+            "GET http://172.21.0.2:3000/ HTTP/1.1\r\nHost: 172.21.0.2:3000\r\n\
+             Upgrade-Insecure-Requests: 1\r\nAccept: text/html\r\n\r\n",
+            "GET http://172.21.0.2:3000/ HTTP/1.1\r\nHost: 172.21.0.2:3000\r\n\
+             Referer: http://172.21.0.2:3000/page\r\n\r\n",
         ] {
             let reply = send_raw(proxy.addr, head).await;
             assert!(reply.starts_with("HTTP/1.1 200") && reply.ends_with("upstream says hi"), "got {reply:?}");
