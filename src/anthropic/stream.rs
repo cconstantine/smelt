@@ -287,6 +287,126 @@ const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// backstop against a truly dead connection, not a real per-request budget.
 const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// How a request replays the conversation's earlier thinking (SME-93).
+/// Under Anthropic's preserved thinking, a thinking block is bound to the
+/// `system` prompt, the `tools` and every message before it; smelt
+/// rebuilds the system prompt each turn, and accounts created on or after
+/// 2026-08-31 refuse a request replaying a block whose prefix changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Binding {
+    /// The request as built: what every provider gets until it refuses it.
+    AsIs,
+    /// `thinking.block_binding.prefix_mismatch_behavior: "drop_block"` under
+    /// the controls beta: the API drops the blocks it can't accept and
+    /// keeps the rest. Needs a `thinking` object, so only with thinking on.
+    DropBlock,
+    /// The history without its thinking blocks, which every
+    /// Anthropic-compatible server accepts.
+    Strip,
+}
+
+/// The beta that lets a request set `block_binding`.
+const BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// The form each provider was last seen to accept after refusing a request
+/// as built, keyed by `provider_key`. Enforcement is per account, so one
+/// provider's answer holds for all its conversations; a restart forgets it
+/// and costs one more refused request per provider.
+static RECOVERY: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, Binding>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A provider's identity for `RECOVERY`: its address and credential,
+/// hashed so the credential isn't kept. A new key may be another account.
+fn provider_key(endpoint: &Endpoint) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    endpoint.base_url.hash(&mut hasher);
+    match &endpoint.auth {
+        Auth::ApiKey(key) => ("key", key).hash(&mut hasher),
+        Auth::Bearer(token) => ("bearer", token).hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
+/// The form to send `request` in, given what `endpoint` accepted before:
+/// drop-block needs thinking on, so a request without it is stripped.
+fn binding_for(endpoint: &Endpoint, request: &CreateMessageRequest) -> Binding {
+    let remembered = RECOVERY
+        .lock()
+        .map(|known| known.get(&provider_key(endpoint)).copied())
+        .unwrap_or(None)
+        .unwrap_or(Binding::AsIs);
+    match remembered {
+        Binding::DropBlock if request.thinking.is_none() => Binding::Strip,
+        other => other,
+    }
+}
+
+fn remember_binding(endpoint: &Endpoint, binding: Binding) {
+    if let Ok(mut known) = RECOVERY.lock() {
+        known.insert(provider_key(endpoint), binding);
+    }
+}
+
+/// Whether a 400's body is the preserved-thinking refusal of a replayed
+/// block ("... bound to a different conversation ..."), as opposed to a
+/// tampered signature or any other error.
+fn is_binding_mismatch(body: &str) -> bool {
+    provider_error_message(body).contains("bound to a different conversation")
+}
+
+/// The next form to try after `binding` was refused with a 400 whose body
+/// is `body`, or `None` when another try won't help. Each step is tried
+/// once: as built, then drop-block (with thinking on), then stripped.
+fn next_binding(binding: Binding, request: &CreateMessageRequest, body: &str) -> Option<Binding> {
+    match binding {
+        Binding::AsIs if is_binding_mismatch(body) && request.thinking.is_some() => Some(Binding::DropBlock),
+        Binding::AsIs if is_binding_mismatch(body) => Some(Binding::Strip),
+        // A server that doesn't know the controls beta refuses the field
+        // itself ("Extra inputs are not permitted") in its own words.
+        Binding::DropBlock => Some(Binding::Strip),
+        _ => None,
+    }
+}
+
+/// How many thinking blocks the API says it dropped before the model saw
+/// them, from a `message_start` event's `input_transformations` (sent
+/// under the controls beta). Entries of any other type are ignored, as
+/// the docs ask: later checks add values.
+fn dropped_thinking(event: &Value) -> usize {
+    if event.get("type").and_then(Value::as_str) != Some("message_start") {
+        return 0;
+    }
+    event
+        .pointer("/message/input_transformations")
+        .and_then(Value::as_array)
+        .map_or(0, |entries| entries.iter().filter(|e| e["type"] == "thinking_dropped").count())
+}
+
+/// `request`'s JSON body in the form `binding` asks for.
+fn request_body(request: &CreateMessageRequest, binding: Binding) -> Result<Value, String> {
+    let mut body = match binding {
+        Binding::Strip => {
+            let mut stripped = request.clone();
+            for message in &mut stripped.messages {
+                message.content = super::types::strip_thinking(std::mem::take(&mut message.content));
+            }
+            serde_json::to_value(&stripped)
+        }
+        _ => serde_json::to_value(request),
+    }
+    .map_err(|e| format!("couldn't encode the model request: {e}"))?;
+    if binding == Binding::DropBlock
+        && let Some(thinking) = body.get_mut("thinking").and_then(Value::as_object_mut)
+    {
+        thinking.insert(
+            "block_binding".to_string(),
+            serde_json::json!({"prefix_mismatch_behavior": "drop_block"}),
+        );
+    }
+    Ok(body)
+}
+
 /// Sends the request and waits for Anthropic's response headers, bounded by
 /// `response_timeout` — factored out from `stream_anthropic_message` so a
 /// test can exercise the timeout with a short duration instead of the real
@@ -294,11 +414,15 @@ const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600
 async fn send_and_await_response(
     endpoint: &Endpoint,
     request: &CreateMessageRequest,
+    binding: Binding,
     response_timeout: std::time::Duration,
 ) -> Result<reqwest::Response, String> {
-    let client = endpoint
+    let mut client = endpoint
         .authorize(endpoint.client()?.post(endpoint.url("/v1/messages")))
-        .json(request);
+        .json(&request_body(request, binding)?);
+    if binding == Binding::DropBlock {
+        client = client.header("anthropic-beta", BINDING_BETA);
+    }
     tokio::time::timeout(response_timeout, client.send())
         .await
         .map_err(|_| "timed out waiting for Anthropic to respond".to_string())?
@@ -355,10 +479,14 @@ pub async fn stream_anthropic_message(
     // Retried only here, before anything has streamed: nothing has been
     // shown to the viewer yet, so a retry is invisible to them.
     let mut attempt = 0;
+    let mut binding = binding_for(endpoint, request);
     let response = loop {
-        let response = send_and_await_response(endpoint, request, RESPONSE_TIMEOUT).await?;
+        let response = send_and_await_response(endpoint, request, binding, RESPONSE_TIMEOUT).await?;
         let status = response.status();
         if status.is_success() {
+            if binding != Binding::AsIs {
+                remember_binding(endpoint, binding);
+            }
             break response;
         }
         if is_transient_status(status) && attempt < RETRY_DELAYS.len() {
@@ -368,6 +496,18 @@ pub async fn stream_anthropic_message(
             continue;
         }
         let body = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::BAD_REQUEST
+            && let Some(next) = next_binding(binding, request, &body)
+        {
+            tracing::warn!(
+                from = ?binding,
+                to = ?next,
+                error = %provider_error_message(&body),
+                "model provider refused the replayed thinking; retrying"
+            );
+            binding = next;
+            continue;
+        }
         return Err(format!(
             "model provider error {status}: {}",
             provider_error_message(&body)
@@ -399,6 +539,10 @@ pub async fn stream_anthropic_message(
             let Ok(value) = serde_json::from_str::<Value>(data) else {
                 continue;
             };
+            let dropped = dropped_thinking(&value);
+            if dropped > 0 {
+                tracing::info!(dropped, "the model provider dropped replayed thinking it couldn't accept");
+            }
             match interpret_stream_event(&value) {
                 StreamOutcome::TextDelta(text) => {
                     on_delta(&text);
@@ -853,6 +997,207 @@ mod tests {
         assert_eq!(requests, 1, "a 400 won't get better by retrying");
     }
 
+    /// The 400 an account enforcing preserved thinking returns when a
+    /// replayed thinking block's prefix changed (SME-93). Its wording is
+    /// the Preserved thinking page's; no enforced account was available
+    /// to capture a real one.
+    const BINDING_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\". That setting requires the `thinking-binding-controls-2026-08-01` value in the `anthropic-beta` header."}}"#;
+
+    /// What a server without the controls beta says to `block_binding`.
+    const EXTRA_INPUTS_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"thinking.adaptive.block_binding: Extra inputs are not permitted"}}"#;
+
+    const BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+    /// One request a recording upstream received.
+    #[derive(Debug, Clone)]
+    struct Seen {
+        beta: Option<String>,
+        body: Value,
+    }
+
+    impl Seen {
+        fn drop_block(&self) -> Option<&str> {
+            self.body.pointer("/thinking/block_binding/prefix_mismatch_behavior")?.as_str()
+        }
+
+        fn thinking_blocks(&self) -> usize {
+            self.body["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|m| m["content"].as_array().into_iter().flatten())
+                .filter(|b| b["type"] == "thinking")
+                .count()
+        }
+
+        fn has_binding_beta(&self) -> bool {
+            self.beta.as_deref().is_some_and(|b| b.split(',').any(|v| v.trim() == BINDING_BETA))
+        }
+    }
+
+    /// An upstream serving `responses` in order (the last one repeats),
+    /// recording each request; returns its endpoint and the record.
+    async fn recording_upstream(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (Endpoint, std::sync::Arc<std::sync::Mutex<Vec<Seen>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Seen>::new()));
+        let record = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+                let responses = responses.clone();
+                let record = record.clone();
+                async move {
+                    let beta = headers
+                        .get("anthropic-beta")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    let body = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let i = {
+                        let mut record = record.lock().expect("record lock");
+                        record.push(Seen { beta, body });
+                        record.len() - 1
+                    };
+                    let (status, body) = responses[i.min(responses.len() - 1)];
+                    let content_type = if status == 200 { "text/event-stream" } else { "application/json" };
+                    (
+                        axum::http::StatusCode::from_u16(status).expect("valid status"),
+                        [(axum::http::header::CONTENT_TYPE, content_type)],
+                        body,
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (test_endpoint(addr), seen)
+    }
+
+    /// A request replaying an earlier turn's thinking block.
+    fn request_replaying_thinking(thinking: Option<super::super::types::ThinkingConfig>) -> CreateMessageRequest {
+        CreateMessageRequest {
+            model: "claude-opus-5-5".to_string(),
+            max_tokens: 100,
+            system: Some("prompt".to_string()),
+            messages: vec![
+                super::super::types::AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::Text { text: "hi".to_string() }],
+                },
+                super::super::types::AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: vec![
+                        ContentBlock::Thinking { thinking: String::new(), signature: "sig".to_string() },
+                        ContentBlock::Text { text: "hello".to_string() },
+                    ],
+                },
+                super::super::types::AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::Text { text: "again".to_string() }],
+                },
+            ],
+            stream: true,
+            tools: vec![],
+            thinking,
+        }
+    }
+
+    fn requests_seen(record: &std::sync::Arc<std::sync::Mutex<Vec<Seen>>>) -> Vec<Seen> {
+        record.lock().expect("record lock").clone()
+    }
+
+    #[test]
+    fn test_dropped_thinking_counts_the_drops_message_start_reports() {
+        let start = serde_json::json!({"type": "message_start", "message": {"id": "msg_1", "input_transformations": [
+            {"type": "thinking_dropped", "path": "messages.1.content.0", "reason": "prefix_binding_mismatch"},
+            {"type": "thinking_dropped", "path": "messages.3.content.0", "reason": "model_binding_mismatch"},
+            {"type": "thinking_mismatch_allowed", "path": "messages.5.content.0", "reason": "prefix_binding_mismatch"},
+            {"type": "some_future_entry"}
+        ]}});
+        assert_eq!(dropped_thinking(&start), 2);
+        let empty = serde_json::json!({"type": "message_start", "message": {"input_transformations": []}});
+        assert_eq!(dropped_thinking(&empty), 0);
+        let absent = serde_json::json!({"type": "message_start", "message": {"id": "msg_1"}});
+        assert_eq!(dropped_thinking(&absent), 0);
+        let other = serde_json::json!({"type": "content_block_stop", "index": 0});
+        assert_eq!(dropped_thinking(&other), 0);
+    }
+
+    #[tokio::test]
+    async fn test_a_binding_mismatch_is_retried_with_drop_block() {
+        let (endpoint, record) = recording_upstream(vec![(400, BINDING_BODY), (200, OK_BODY)]).await;
+        let request = request_replaying_thinking(Some(super::super::types::ThinkingConfig::Adaptive));
+        let result = stream_anthropic_message(&endpoint, &request, |_| {}).await;
+        assert!(result.is_ok(), "should recover: {result:?}");
+        let seen = requests_seen(&record);
+        assert_eq!(seen.len(), 2);
+        assert!(!seen[0].has_binding_beta() && seen[0].drop_block().is_none(), "first try is as before: {:?}", seen[0]);
+        assert!(seen[1].has_binding_beta(), "the retry carries the beta: {:?}", seen[1].beta);
+        assert_eq!(seen[1].drop_block(), Some("drop_block"));
+        assert_eq!(seen[1].thinking_blocks(), 1, "drop_block replays the history verbatim");
+    }
+
+    #[tokio::test]
+    async fn test_a_provider_that_needed_drop_block_gets_it_from_the_start() {
+        let (endpoint, record) = recording_upstream(vec![(400, BINDING_BODY), (200, OK_BODY)]).await;
+        let request = request_replaying_thinking(Some(super::super::types::ThinkingConfig::Adaptive));
+        stream_anthropic_message(&endpoint, &request, |_| {}).await.expect("first turn recovers");
+        stream_anthropic_message(&endpoint, &request, |_| {}).await.expect("second turn");
+        let seen = requests_seen(&record);
+        assert_eq!(seen.len(), 3, "the second turn needs no retry");
+        assert!(seen[2].has_binding_beta());
+        assert_eq!(seen[2].drop_block(), Some("drop_block"));
+
+        let (other, other_record) = recording_upstream(vec![(200, OK_BODY)]).await;
+        stream_anthropic_message(&other, &request, |_| {}).await.expect("another provider");
+        let other_seen = requests_seen(&other_record);
+        assert!(!other_seen[0].has_binding_beta() && other_seen[0].drop_block().is_none(), "another provider is untouched");
+    }
+
+    #[tokio::test]
+    async fn test_a_binding_mismatch_without_thinking_is_retried_stripped() {
+        let (endpoint, record) = recording_upstream(vec![(400, BINDING_BODY), (200, OK_BODY)]).await;
+        let request = request_replaying_thinking(None);
+        let result = stream_anthropic_message(&endpoint, &request, |_| {}).await;
+        assert!(result.is_ok(), "should recover: {result:?}");
+        let seen = requests_seen(&record);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].thinking_blocks(), 0, "the retry drops every thinking block");
+        assert!(!seen[1].has_binding_beta() && seen[1].drop_block().is_none());
+        assert_eq!(seen[1].body["messages"][1]["content"][0]["text"], "hello", "the rest of the turn stays");
+    }
+
+    #[tokio::test]
+    async fn test_a_refused_drop_block_falls_back_to_stripping() {
+        let (endpoint, record) =
+            recording_upstream(vec![(400, BINDING_BODY), (400, EXTRA_INPUTS_BODY), (200, OK_BODY)]).await;
+        let request = request_replaying_thinking(Some(super::super::types::ThinkingConfig::Adaptive));
+        let result = stream_anthropic_message(&endpoint, &request, |_| {}).await;
+        assert!(result.is_ok(), "should recover by stripping: {result:?}");
+        stream_anthropic_message(&endpoint, &request, |_| {}).await.expect("next turn");
+        let seen = requests_seen(&record);
+        assert_eq!(seen.len(), 4, "the next turn goes straight to stripping");
+        for retry in &seen[2..] {
+            assert_eq!(retry.thinking_blocks(), 0);
+            assert!(!retry.has_binding_beta() && retry.drop_block().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_binding_mismatch_on_the_last_retry_is_returned() {
+        let (endpoint, record) = recording_upstream(vec![(400, BINDING_BODY)]).await;
+        let request = request_replaying_thinking(None);
+        let result = stream_anthropic_message(&endpoint, &request, |_| {}).await;
+        let error = result.expect_err("a stripped history that still fails can't be fixed by retrying");
+        assert!(error.contains("bound to a different conversation"), "{error}");
+        assert_eq!(requests_seen(&record).len(), 2);
+    }
+
     #[tokio::test]
     async fn test_a_persistent_provider_error_gives_up_readably() {
         let (result, requests) = run_against_responses(vec![(503, PAUSED_PROVIDER_BODY)]).await;
@@ -1089,6 +1434,7 @@ mod tests {
             send_and_await_response(
                 &test_endpoint(addr),
                 &request,
+                Binding::AsIs,
                 std::time::Duration::from_millis(50),
             ),
         )
@@ -1149,7 +1495,7 @@ mod tests {
             auth,
         };
         let result =
-            send_and_await_response(&endpoint, &request, std::time::Duration::from_secs(5)).await;
+            send_and_await_response(&endpoint, &request, Binding::AsIs, std::time::Duration::from_secs(5)).await;
         let headers = captured.lock().unwrap_or_else(|e| e.into_inner()).clone();
         (result, headers)
     }
@@ -1204,6 +1550,7 @@ mod tests {
                 tools: vec![],
                 thinking: None,
             },
+            Binding::AsIs,
             std::time::Duration::from_secs(5),
         )
         .await;

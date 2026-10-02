@@ -92,6 +92,22 @@ pub struct AnthropicMessage {
     pub content: Vec<ContentBlock>,
 }
 
+/// `blocks` without their thinking blocks. A message that was nothing but
+/// thinking keeps its reasoning as plain text instead: the API rejects a
+/// message with no content, and a made-up stand-in would be text the model
+/// might imitate (SME-72 review 3).
+#[cfg(feature = "server")]
+pub fn strip_thinking(blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
+    let only_thinking = blocks.iter().all(|block| matches!(block, ContentBlock::Thinking { .. }));
+    blocks
+        .into_iter()
+        .filter_map(|block| match block {
+            ContentBlock::Thinking { thinking, .. } => only_thinking.then_some(ContentBlock::Text { text: thinking }),
+            other => Some(other),
+        })
+        .collect()
+}
+
 /// Ungated, unlike `AnthropicMessage`/`CreateMessageRequest` above —
 /// `api::chat::get_context_detail`'s context-visibility view sends every
 /// available tool's full definition to the browser (see
