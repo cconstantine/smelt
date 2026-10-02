@@ -28,7 +28,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, AttachParams, DeleteParams, PostParams};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -40,6 +40,11 @@ const LOADER_POD_NAME: &str = "sandbox-image-import";
 const LOADER_IMAGE: &str = "rancher/k3s:v1.34.6-k3s1";
 const CONTAINERD_SOCKET: &str = "/hostcontainerd/containerd.sock";
 const REMOTE_TAR_PATH: &str = "/tmp/sandbox-image.tar";
+/// How long the loader pod runs unless the tool deletes it first, as it
+/// does on the way out: an hour, the CI job's own limit, so a slow runner's
+/// stream can't outlast it (SME-89: 300 s once did). A run that's killed
+/// leaves the pod until then, or until the next run deletes it.
+const LOADER_LIFETIME: Duration = Duration::from_secs(3600);
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
@@ -70,23 +75,31 @@ async fn import(pods: &Api<Pod>, tar_path: &str) -> Result<(), BoxError> {
         tar_bytes.len()
     );
 
-    start_loader(pods).await?;
-    stream_and_import(pods, &tar_bytes).await?;
+    start_loader(pods, LOADER_POD_NAME, LOADER_LIFETIME).await?;
+    let started = std::time::Instant::now();
+    let sent = stream_tarball(pods, LOADER_POD_NAME, LOADER_LIFETIME, tar_bytes.as_slice()).await?;
+    let secs = started.elapsed().as_secs_f64().max(0.001);
+    println!(
+        "sandbox_image_import: streamed {sent} bytes in {secs:.1}s ({:.1} MB/s)",
+        sent as f64 / secs / 1_000_000.0
+    );
+    run_import(pods).await?;
     println!("sandbox_image_import: done");
     Ok(())
 }
 
-/// A fresh loader pod, Running.
-async fn start_loader(pods: &Api<Pod>) -> Result<(), BoxError> {
-    let _ = pods.delete(LOADER_POD_NAME, &immediate_delete()).await;
-    wait_gone(pods, LOADER_POD_NAME).await;
-    pods.create(&PostParams::default(), &loader_pod_spec()).await?;
-    wait_running(pods, LOADER_POD_NAME).await?;
+/// A fresh loader pod named `name`, Running, that ends on its own after
+/// `lifetime`.
+async fn start_loader(pods: &Api<Pod>, name: &str, lifetime: Duration) -> Result<(), BoxError> {
+    let _ = pods.delete(name, &immediate_delete()).await;
+    wait_gone(pods, name).await;
+    pods.create(&PostParams::default(), &loader_pod_spec(name, lifetime)).await?;
+    wait_running(pods, name).await?;
     println!("sandbox_image_import: loader pod Running");
     Ok(())
 }
 
-fn loader_pod_spec() -> Pod {
+fn loader_pod_spec(name: &str, lifetime: Duration) -> Pod {
     // Explicit and small, on purpose: `smelt-park`'s `LimitRange` sets only
     // a `max` (64Gi/16 cores, see k8s/smelt-park-rbac.yaml), no `default` —
     // Kubernetes fills that gap by making an unspecified request/limit
@@ -102,7 +115,7 @@ fn loader_pod_spec() -> Pod {
 
     Pod {
         metadata: ObjectMeta {
-            name: Some(LOADER_POD_NAME.to_string()),
+            name: Some(name.to_string()),
             namespace: Some(NAMESPACE.to_string()),
             ..Default::default()
         },
@@ -110,7 +123,7 @@ fn loader_pod_spec() -> Pod {
             containers: vec![Container {
                 name: "loader".to_string(),
                 image: Some(LOADER_IMAGE.to_string()),
-                command: Some(vec!["sleep".to_string(), "300".to_string()]),
+                command: Some(vec!["sleep".to_string(), lifetime.as_secs().to_string()]),
                 resources: Some(ResourceRequirements {
                     requests: Some(requests),
                     limits: Some(limits),
@@ -213,27 +226,125 @@ async fn exec_capture(
     Ok(stdout)
 }
 
-/// Streams `data` in via stdin, then runs `ctr images import` against it.
-/// Draining stdout/stderr *concurrently* with the stdin write is required,
-/// not cosmetic — see `docs/testing.md`: writing a multi-MB payload while
-/// the executed command never produces any stdout output reliably breaks
-/// the exec connection (`BrokenPipe`) otherwise. Confirmed by spike on the
-/// real cluster before this binary was written.
-async fn stream_and_import(pods: &Api<Pod>, data: &[u8]) -> Result<(), BoxError> {
+/// Streams `src` into `name`'s `REMOTE_TAR_PATH` via stdin, returning how
+/// many bytes went in. A failure says whether the loader pod had stopped by
+/// then (see `stream_failure`). Draining stdout/stderr *concurrently* with the stdin
+/// write is required, not cosmetic — see `docs/testing.md`: writing a
+/// multi-MB payload while the executed command never produces any stdout
+/// output reliably breaks the exec connection (`BrokenPipe`) otherwise.
+/// Confirmed by spike on the real cluster before this binary was written.
+async fn stream_tarball(
+    pods: &Api<Pod>,
+    name: &str,
+    lifetime: Duration,
+    src: impl AsyncRead + Unpin,
+) -> Result<u64, BoxError> {
+    let started = std::time::Instant::now();
+    let sent = std::sync::atomic::AtomicU64::new(0);
+    match stream_into(pods, name, src, &sent).await {
+        Ok(()) => Ok(sent.into_inner()),
+        Err(e) => {
+            let elapsed = started.elapsed();
+            let phase = settled_loader_state(pods, name).await;
+            let sent = sent.load(std::sync::atomic::Ordering::Relaxed);
+            Err(stream_failure(name, &phase, lifetime, elapsed, sent, &e.to_string()).into())
+        }
+    }
+}
+
+/// `name`'s state once a stream into it has failed. The pod's status lags
+/// its container's exit by a few seconds (the stream breaks while the API
+/// still says Running), so a Running pod is read again for up to 10 s
+/// before it's believed.
+async fn settled_loader_state(pods: &Api<Pod>, name: &str) -> LoaderState {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = match pods.get_opt(name).await {
+            Ok(Some(pod)) => {
+                let status = pod.status.unwrap_or_default();
+                LoaderState::Phase {
+                    phase: status.phase.unwrap_or_else(|| "Unknown".to_string()),
+                    reason: status.reason,
+                }
+            }
+            Ok(None) => LoaderState::Gone,
+            Err(_) => LoaderState::Unknown,
+        };
+        let running = matches!(&state, LoaderState::Phase { phase, .. } if phase == "Running");
+        if !running || tokio::time::Instant::now() >= deadline {
+            return state;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// What a loader pod looked like once a stream into it failed.
+#[derive(Debug)]
+enum LoaderState {
+    /// The pod's phase, and its status's reason (`Evicted`, say) if any.
+    Phase { phase: String, reason: Option<String> },
+    Gone,
+    Unknown,
+}
+
+/// The error for a stream into `name` (a loader that runs for `lifetime`)
+/// that failed with `error` after `elapsed` and `sent` bytes. A loader that has stopped is said so, since
+/// the bare error is only a `BrokenPipe` (SME-89).
+fn stream_failure(
+    name: &str,
+    loader: &LoaderState,
+    lifetime: Duration,
+    elapsed: Duration,
+    sent: u64,
+    error: &str,
+) -> String {
+    let progress = format!("{}s and {sent} bytes into streaming the tarball", elapsed.as_secs());
+    match loader {
+        LoaderState::Phase { phase, .. } if phase == "Running" || phase == "Pending" => {
+            format!("streaming the tarball into loader pod {name} failed {progress}, with the pod still {phase}: {error}")
+        }
+        LoaderState::Phase { phase, .. } if phase == "Succeeded" => format!(
+            "loader pod {name} stopped ({phase}) {progress}; it runs for at most {}s, so the stream outlasted it: {error}",
+            lifetime.as_secs()
+        ),
+        LoaderState::Phase { phase, reason } if phase != "Unknown" => {
+            let why = reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
+            format!("loader pod {name} stopped ({phase}{why}) {progress}: {error}")
+        }
+        LoaderState::Gone => format!("loader pod {name} stopped (it no longer exists) {progress}: {error}"),
+        // Kubernetes's own Unknown phase: the node can't be reached, so the
+        // pod may well still be running.
+        LoaderState::Unknown | LoaderState::Phase { .. } => {
+            format!("streaming the tarball into loader pod {name} failed {progress} (couldn't read the pod's state): {error}")
+        }
+    }
+}
+
+/// `stream_tarball`'s stream, counting the bytes written into `sent`.
+async fn stream_into(
+    pods: &Api<Pod>,
+    name: &str,
+    mut src: impl AsyncRead + Unpin,
+    sent: &std::sync::atomic::AtomicU64,
+) -> Result<(), BoxError> {
     let command = format!("cat > {REMOTE_TAR_PATH} && echo done");
     let mut attached = pods
-        .exec(
-            LOADER_POD_NAME,
-            ["sh", "-c", command.as_str()],
-            &AttachParams::default().stdin(true),
-        )
+        .exec(name, ["sh", "-c", command.as_str()], &AttachParams::default().stdin(true))
         .await?;
-    let mut stdin = attached.stdin().expect("stdin requested");
-    let mut stdout = attached.stdout().expect("stdout requested by default");
-    let mut stderr = attached.stderr().expect("stderr requested by default");
+    let mut stdin = attached.stdin().ok_or("the loader's exec has no stdin")?;
+    let mut stdout = attached.stdout().ok_or("the loader's exec has no stdout")?;
+    let mut stderr = attached.stderr().ok_or("the loader's exec has no stderr")?;
 
     let write_fut = async {
-        stdin.write_all(data).await?;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = src.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            stdin.write_all(&buf[..n]).await?;
+            sent.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         stdin.flush().await?;
         drop(stdin);
         Ok::<(), BoxError>(())
@@ -248,13 +359,30 @@ async fn stream_and_import(pods: &Api<Pod>, data: &[u8]) -> Result<(), BoxError>
         let _ = stderr.read_to_string(&mut buf).await;
         buf
     };
-    let (write_res, _out, err) = tokio::join!(write_fut, drain_out, drain_err);
+    let (write_res, out, err) = tokio::join!(write_fut, drain_out, drain_err);
     write_res?;
     attached.join().await.ok();
     if !err.trim().is_empty() {
         return Err(format!("streaming tarball into loader pod: {err}").into());
     }
+    remote_write_finished(&out)?;
+    Ok(())
+}
 
+/// Whether the loader's `cat > … && echo done` got to its `done`, given its
+/// stdout. Every byte can be handed to the exec's stdin while the loader
+/// dies before `cat` has written them, so a clean local write isn't enough
+/// (SME-89 code review).
+fn remote_write_finished(stdout: &str) -> Result<(), String> {
+    if stdout.lines().any(|line| line.trim() == "done") {
+        Ok(())
+    } else {
+        Err(format!("the loader's cat didn't finish writing the tarball (its output: {:?})", stdout.trim()))
+    }
+}
+
+/// `ctr images import`s the streamed tarball.
+async fn run_import(pods: &Api<Pod>) -> Result<(), BoxError> {
     println!("sandbox_image_import: tarball streamed, running ctr images import");
     let import_out = exec_capture(
         pods,
@@ -297,7 +425,7 @@ fn missing_images(listed: &str, wanted: &[&str]) -> Vec<String> {
 
 /// `--check`: fails, naming them, if the node lacks any of `SANDBOX_IMAGES`.
 async fn check(pods: &Api<Pod>) -> Result<(), BoxError> {
-    start_loader(pods).await?;
+    start_loader(pods, LOADER_POD_NAME, LOADER_LIFETIME).await?;
     let listed = exec_capture(
         pods,
         LOADER_POD_NAME,
@@ -328,6 +456,100 @@ mod tests {
         assert_eq!(missing_images(listed, SANDBOX_IMAGES), vec!["docker.io/library/docker:29-dind".to_string()]);
         assert!(missing_images("docker.io/library/smelt-sandbox:latest\ndocker.io/library/docker:29-dind\n", SANDBOX_IMAGES).is_empty());
         assert_eq!(missing_images("", SANDBOX_IMAGES).len(), 2);
+    }
+
+    /// A loader that ends while the tarball is still streaming in (SME-89:
+    /// a slow CI runner outlasted the loader's lifetime) is reported as
+    /// that, not as a bare `BrokenPipe`. Real cluster: its own short-lived
+    /// loader, fed by a reader that trickles for longer than it lives.
+    #[tokio::test]
+    async fn test_a_loader_that_ends_mid_stream_says_so() -> Result<(), BoxError> {
+        const NAME: &str = "sandbox-image-import-test";
+        rustls::crypto::ring::default_provider().install_default().ok();
+        let pods: Api<Pod> = Api::namespaced(kube::Client::try_default().await?, NAMESPACE);
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let trickle = tokio::spawn(async move {
+            let chunk = vec![0u8; 16 * 1024];
+            for _ in 0..100 {
+                if writer.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+
+        let result = async {
+            start_loader(&pods, NAME, Duration::from_secs(5)).await?;
+            Ok::<_, BoxError>(stream_tarball(&pods, NAME, Duration::from_secs(5), reader).await)
+        }
+        .await;
+        trickle.abort();
+        let _ = pods.delete(NAME, &immediate_delete()).await;
+
+        let error = match result? {
+            Ok(sent) => panic!("streaming into an ended loader succeeded ({sent} bytes)"),
+            Err(e) => e.to_string(),
+        };
+        assert!(error.contains("loader pod") && error.contains("stopped"), "error: {error}");
+        Ok(())
+    }
+
+    /// The loader outlives any import CI can run: the job's own limit is
+    /// 60 minutes (`.github/workflows/ci.yml`), and a slow runner once
+    /// took longer than the old 300 s just to stream the tarball (SME-89).
+    #[test]
+    fn test_the_loader_lives_as_long_as_the_ci_job() {
+        let spec = loader_pod_spec(LOADER_POD_NAME, LOADER_LIFETIME);
+        let command = spec.spec.and_then(|s| s.containers.into_iter().next()).and_then(|c| c.command);
+        assert_eq!(command, Some(vec!["sleep".to_string(), "3600".to_string()]));
+    }
+
+    #[test]
+    fn test_a_stream_failure_says_whether_the_loader_stopped() {
+        let t = Duration::from_secs(300);
+        let ended = stream_failure("l", &phase("Succeeded", None), t, t, 42, "broken pipe");
+        assert!(ended.starts_with("loader pod l stopped (Succeeded) 300s and 42 bytes into"), "{ended}");
+        assert!(ended.contains("at most 300s") && ended.ends_with(": broken pipe"), "{ended}");
+        let gone = stream_failure("l", &LoaderState::Gone, t, t, 42, "broken pipe");
+        assert!(gone.starts_with("loader pod l stopped (it no longer exists)"), "{gone}");
+        let running = stream_failure("l", &phase("Running", None), t, t, 42, "broken pipe");
+        assert!(running.contains("with the pod still Running") && !running.contains("stopped"), "{running}");
+        let unknown = stream_failure("l", &LoaderState::Unknown, t, t, 42, "broken pipe");
+        assert!(unknown.contains("couldn't read the pod's state") && !unknown.contains("stopped"), "{unknown}");
+    }
+
+    #[test]
+    fn test_a_stream_counts_only_once_the_loader_says_done() {
+        assert!(remote_write_finished("done\n").is_ok());
+        let cut_off = remote_write_finished("").expect_err("no done");
+        assert!(cut_off.contains("didn't finish"), "{cut_off}");
+        assert!(remote_write_finished("not done\n").is_err());
+    }
+
+    /// Kubernetes's `Unknown` phase (the node can't be reached) isn't a
+    /// stopped pod (SME-89 code review 2).
+    #[test]
+    fn test_a_loader_in_an_unknown_phase_isnt_reported_as_stopped() {
+        let t = Duration::from_secs(60);
+        let unknown = stream_failure("l", &phase("Unknown", None), t, t, 42, "broken pipe");
+        assert!(unknown.contains("couldn't read the pod's state") && !unknown.contains("stopped"), "{unknown}");
+    }
+
+    fn phase(phase: &str, reason: Option<&str>) -> LoaderState {
+        LoaderState::Phase { phase: phase.to_string(), reason: reason.map(str::to_string) }
+    }
+
+    /// Only a loader whose `sleep` ran out (Succeeded) was outlasted; one
+    /// that Failed was killed for some other reason, an eviction say, and
+    /// is reported with that reason instead (SME-89 code review).
+    #[test]
+    fn test_a_failed_loader_is_reported_with_its_reason_not_as_outlasted() {
+        let t = Duration::from_secs(3600);
+        let evicted = stream_failure("l", &phase("Failed", Some("Evicted")), t, Duration::from_secs(60), 42, "broken pipe");
+        assert!(evicted.starts_with("loader pod l stopped (Failed: Evicted) 60s and 42 bytes into"), "{evicted}");
+        assert!(!evicted.contains("outlasted"), "{evicted}");
+        let failed = stream_failure("l", &phase("Failed", None), t, Duration::from_secs(60), 42, "broken pipe");
+        assert!(failed.starts_with("loader pod l stopped (Failed) 60s") && !failed.contains("outlasted"), "{failed}");
     }
 
     /// A tag that only starts like a wanted one isn't it.
