@@ -904,21 +904,44 @@ mod server {
         key: &str,
         dir: &str,
         retry: Option<i64>,
-    ) -> Result<db::ConversationRepo, String> {
+    ) -> Result<Option<db::ConversationRepo>, String> {
         let repo = match retry {
             // With what's asked for now, not what failed. Only a failed
-            // clone is retried: a second retry racing this one finds it
-            // cloning again and is refused (SME-86).
-            Some(id) => db::retry_repo_clone(pool, id, url, key, branch)
+            // clone is retried: another request that got there first
+            // leaves `None`, for `after_lost_race` (SME-86).
+            Some(id) => match db::retry_repo_clone(pool, id, url, key, branch)
                 .await
                 .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("/workspace/{dir} is already being cloned again."))?,
+            {
+                Some(repo) => repo,
+                None => return Ok(None),
+            },
             None => db::create_conversation_repo(pool, conversation_id, url, key, branch, dir)
                 .await
                 .map_err(|e| e.to_string())?,
         };
         publish_repos(pool, conversation_id).await;
-        Ok(repo)
+        Ok(Some(repo))
+    }
+
+    /// Another request retried the failed clone at `dir` first: what this
+    /// one comes to now. The same repo and branch there (cloning or
+    /// ready) is this request's checkout too; anything else is refused as
+    /// a fresh request would be (SME-86 code review).
+    async fn after_lost_race(
+        pool: &PgPool,
+        conversation_id: i64,
+        url: &str,
+        branch: Option<&str>,
+        dir: &str,
+    ) -> Result<db::ConversationRepo, String> {
+        match plan_clone(pool, conversation_id, url, branch, Some(dir)).await? {
+            ClonePlan::Existing(repo) => Ok(repo),
+            // The other request's attempt has failed already.
+            ClonePlan::Clone { .. } => Err(format!(
+                "Another request retried the clone at /workspace/{dir} at the same time, and it failed; see the repo's error, then clone it again."
+            )),
+        }
     }
 
     /// Clones a recorded repo into pod `pod_id`; `guard` marks it
@@ -954,7 +977,10 @@ mod server {
             ClonePlan::Existing(repo) => return summarise(pool, repo).await,
             ClonePlan::Clone { key, dir, retry } => (key, dir, retry),
         };
-        let repo = record_clone(pool, conversation_id, url, branch, &key, &dir, retry).await?;
+        let Some(repo) = record_clone(pool, conversation_id, url, branch, &key, &dir, retry).await? else {
+            let existing = after_lost_race(pool, conversation_id, url, branch, &dir).await?;
+            return summarise(pool, existing).await;
+        };
         clone_recorded(pool, conversation_id, repo).await
     }
 
@@ -1003,7 +1029,10 @@ mod server {
             .await
             .map_err(|e| e.to_string())?;
         let notices = settle_requests_trusted_elsewhere(pool, &key, url).await?;
-        let repo = record_clone(pool, conversation_id, url, branch, &key, &dir, retry).await?;
+        let Some(repo) = record_clone(pool, conversation_id, url, branch, &key, &dir, retry).await? else {
+            let existing = after_lost_race(pool, conversation_id, url, branch, &dir).await?;
+            return Ok((summarise(pool, existing).await?, None, notices));
+        };
         Ok((summarise(pool, repo.clone()).await?, Some(repo), notices))
     }
 
@@ -2025,13 +2054,43 @@ mod server {
                 .await
                 .expect("repo");
             db::set_repo_failed(&pool, repo.id, repo.attempt, "fatal: nope").await.expect("fail");
-            record_clone(&pool, conversation.id, "u", None, "k", "r", Some(repo.id))
+            assert!(record_clone(&pool, conversation.id, "u", None, "k", "r", Some(repo.id))
                 .await
-                .expect("the first retry");
-            let refused = record_clone(&pool, conversation.id, "u", None, "k", "r", Some(repo.id))
+                .expect("the first retry")
+                .is_some());
+            assert!(
+                record_clone(&pool, conversation.id, "u", None, "k", "r", Some(repo.id))
+                    .await
+                    .expect("the second retry")
+                    .is_none(),
+                "the second retry runs nothing"
+            );
+        }
+
+        /// A request whose retry lost the race gets the other request's
+        /// checkout when it's the same repo and branch, cloning or done, and
+        /// the usual refusal otherwise (SME-86 code review).
+        #[sqlx::test]
+        async fn test_a_retry_that_lost_the_race_gets_the_winners_checkout(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let url = "git@github.com:o/r.git";
+            let repo = db::create_conversation_repo(&pool, conversation.id, url, "github.com/o/r", None, "r")
                 .await
-                .expect_err("the second retry");
-            assert!(refused.contains("already being cloned again"), "{refused}");
+                .expect("repo");
+            // Still cloning for the winner: this request waits on the same row.
+            let cloning = after_lost_race(&pool, conversation.id, url, None, "r").await.expect("cloning");
+            assert_eq!((cloning.id, cloning.status.as_str()), (repo.id, "cloning"));
+            // The winner finished: the checkout is this request's too.
+            db::set_repo_ready(&pool, repo.id, repo.attempt, "main", Some("abc"), &[], None)
+                .await
+                .expect("ready");
+            let ready = after_lost_race(&pool, conversation.id, url, None, "r").await.expect("ready");
+            assert_eq!((ready.id, ready.status.as_str()), (repo.id, "ready"));
+            // Another repo is there now: refused, as a fresh request would be.
+            let other = after_lost_race(&pool, conversation.id, "git@github.com:o/other.git", None, "r")
+                .await
+                .expect_err("another repo");
+            assert!(other.contains("already used by"), "{other}");
         }
 
         /// An attempt that a retry has replaced can't record its clone as
