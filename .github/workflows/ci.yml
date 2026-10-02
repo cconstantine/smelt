@@ -151,11 +151,16 @@ jobs:
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt scripts/browser-check/setup.sh
 
+      # dx's server half sometimes hangs after the client bundle (all this
+      # step is for) is written; scripts/ci-web-bundle stops it with a
+      # process dump and passes (SME-67). The step normally takes about a
+      # minute; the timeout catches a hang the script doesn't.
       - name: dx build --platform web
+        timeout-minutes: 10
         run: |
           docker compose run --rm \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
-            smelt dx build --platform web
+            smelt scripts/ci-web-bundle
 
       # Also creates a real sandbox pod (see src/browser_tests.rs) — same
       # reasoning as the step above.

@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# CI's web bundle build (SME-67): `dx build --platform web`, watched.
+#
+# dx builds the client and the server at once and exits when both are done
+# (smelt's `dioxus` dependency has `fullstack`, so the server half can't be
+# turned off). In CI its server half sometimes hangs without logging a
+# line, after the client bundle is already written, and the step then sat
+# until the job's 60-minute timeout. CI needs only the client bundle (the
+# browser tier serves target/dx/smelt/debug/web/public and builds its own
+# server with `cargo test`), so: once the client is done, if dx then logs
+# nothing for CI_WEB_BUNDLE_SILENCE_SECS (default 120; the server half
+# normally finishes about 40 s after the client, logging as it goes), this
+# prints a warning and every process's state and wait channel, for finding
+# the cause, stops dx and passes. Otherwise dx's own exit status comes
+# through. A hang before the client is done is left to the step's timeout.
+#
+# CI_WEB_BUNDLE_DX replaces the dx command, for scripts/test-ci-web-bundle.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+dx=${CI_WEB_BUNDLE_DX:-dx build --platform web --verbose}
+silence=${CI_WEB_BUNDLE_SILENCE_SECS:-120}
+
+log=$(mktemp)
+group=""
+# However this script ends (done, a hang, or the step's own timeout
+# stopping it), nothing dx started outlives it.
+cleanup() {
+    [ -n "$group" ] && kill -KILL -- -"$group" 2>/dev/null
+    rm -f "$log"
+}
+trap cleanup EXIT
+trap 'exit 143' TERM INT
+
+# In a session of its own, so stopping it stops everything it started.
+setsid bash -c "$dx" >"$log" 2>&1 &
+pid=$!
+# Only a group dx leads: were it this script's own, stopping it would stop
+# the caller too. The child may not have made its session yet, so wait
+# (up to 5 s) for it to.
+for _ in $(seq 50); do
+    g=$(ps -o pgid= -p "$pid" | tr -d ' ')
+    if [ "$g" = "$pid" ]; then
+        group=$g
+        break
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+done
+tail -n +1 -f --pid="$pid" "$log" &
+tailer=$!
+
+client_done=""
+while kill -0 "$pid" 2>/dev/null; do
+    if [ -z "$client_done" ] && grep -q "Client build completed successfully" "$log"; then
+        client_done=1
+    fi
+    if [ -n "$client_done" ]; then
+        idle=$(( $(date +%s) - $(stat -c %Y "$log") ))
+        if [ "$idle" -ge "$silence" ]; then
+            sleep 1 # let tail print the last lines first
+            echo "::warning::dx build: the client bundle is built, but dx then logged nothing for ${idle}s and hasn't exited (SME-67). Stopping it and passing; its processes:"
+            ps -eo pid,ppid,pgid,etime,stat,wchan:32,args --forest
+            if [ -n "$group" ]; then
+                kill -TERM -- -"$group" 2>/dev/null
+                sleep 5
+            fi
+            exit 0
+        fi
+    fi
+    sleep 1
+done
+
+wait "$pid"
+rc=$?
+wait "$tailer" 2>/dev/null
+exit "$rc"
