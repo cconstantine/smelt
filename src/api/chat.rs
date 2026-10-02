@@ -50,7 +50,6 @@ pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
     // Its turns first, so nothing is still making a pod (SME-51 B5).
     stop_turn_now(id);
     let _ = crate::browsing::close_session(id).await;
-    anthropic::tools::forget_conversation_tasks(id);
     // Read before the delete cascades them away: teardown deletes the pods
     // they name too, labelled or not (SME-88). Best-effort, like teardown.
     let pod_ids: Vec<i64> = match db::list_sandbox_pods(db::get(), id).await {
@@ -630,12 +629,6 @@ async fn describe_live_state(pool: &PgPool, conversation_id: i64) -> String {
             ));
         }
     }
-    for task in anthropic::tools::snapshot_tasks(conversation_id) {
-        lines.push(format!(
-            "- background task_id {} ({}, status: {})",
-            task.task_id, task.tool, task.status
-        ));
-    }
     if let Ok(todos) = db::get_conversation_todos(pool, conversation_id).await {
         for todo in todos {
             lines.push(format!(
@@ -915,13 +908,12 @@ fn forget_conversation_lock(conversation_id: i64) {
 /// produces a non-`tool_use` turn or `MAX_TURNS` is exceeded. Returns every
 /// message persisted along the way, in order, starting with `new_message`
 /// itself. `send_message` wires a live `on_delta` into the browser's SSE
-/// stream for the token-by-token typing effect; a later stage's
-/// background-task push notification calls this with `on_delta = None`.
+/// stream for the token-by-token typing effect; a notice that wakes the
+/// model calls this with `on_delta = None`.
 /// Returns a boxed, type-erased future rather than using plain `async fn`
-/// sugar: `run_turn` and `anthropic::tools::execute` call each other
-/// (`execute`'s `run_async` branch spawns a task that can call back into
-/// `run_turn` to push a notification, which calls `execute` again for the
-/// *next* turn's tool calls) — that mutual recursion defeats rustc's
+/// sugar: `run_turn` calls `anthropic::tools::execute`, and a tool's
+/// spawned work can wake the model, calling back into `run_turn` (a
+/// finished clone, a command's completion) — that recursion defeats rustc's
 /// `Send`-auto-trait inference for plain `async fn`s ("cannot satisfy `impl
 /// Future: Send`" with no useful location). Type-erasing one edge of the
 /// cycle here breaks it.
@@ -1678,18 +1670,9 @@ pub async fn get_reply_in_progress(id: i64) -> ServerFnResult<Option<String>> {
     Ok(reply_in_progress(id))
 }
 
-/// Thin wrapper around `anthropic::tools::snapshot_tasks` for the browser —
-/// a one-shot pull, not a subscription. Used both for the initial task-panel
-/// load and for the reconciliation pull `subscribe_conversation_events`'s
-/// caller does on connect/reconnect (a `broadcast` channel has no replay).
-#[get("/api/conversations/{id}/tasks")]
-pub async fn get_tasks(id: i64) -> ServerFnResult<Vec<anthropic::tools::TaskSummary>> {
-    Ok(anthropic::tools::snapshot_tasks(id))
-}
-
-/// One-shot pull of the current todo list for the browser — same shape as
-/// `get_tasks`, used for the todo panel's initial load and the
-/// reconciliation pull on connect/reconnect.
+/// One-shot pull of the current todo list for the browser, used for the
+/// todo panel's initial load and the reconciliation pull on
+/// connect/reconnect (a `broadcast` channel has no replay).
 #[get("/api/conversations/{id}/todos")]
 pub async fn get_todos(id: i64) -> ServerFnResult<Vec<anthropic::tools::TodoItem>> {
     db::get_conversation_todos(db::get(), id)
@@ -1834,7 +1817,7 @@ async fn fetch_terminal_command_history(
 }
 
 /// Thin wrapper over `sandbox::list_pods`/`sandbox::list_terminals` for the
-/// browser — a one-shot pull, not a subscription, same shape as `get_tasks`.
+/// browser — a one-shot pull, not a subscription, same shape as `get_todos`.
 /// Used both for the initial sandbox-panel load and for the reconciliation
 /// pull `subscribe_conversation_events`'s caller does on connect/reconnect.
 ///
@@ -1926,7 +1909,7 @@ pub async fn set_conversation_model(id: i64, provider_id: i64, model: String) ->
 }
 
 /// One-shot pull for the always-visible context-usage indicator — same
-/// shape as `get_tasks`/`get_sandbox_state`.
+/// shape as `get_todos`/`get_sandbox_state`.
 #[get("/api/conversations/{id}/context-usage")]
 pub async fn get_context_usage(id: i64) -> ServerFnResult<ContextUsageSnapshot> {
     let pool = db::get();
@@ -3940,8 +3923,9 @@ mod tests {
         );
     }
 
-    /// A two-step reply: "Adding." and a call to `add`, then (after the
-    /// tool result) "Sum is 5". For the mock upstream, in order.
+    /// A two-step reply: "Adding." and a call to `todoread` (a cheap tool
+    /// that needs only the database), then (after the tool result) "Sum is
+    /// 5". For the mock upstream, in order.
     fn text_tool_then_text_bodies() -> Vec<String> {
         let first = sse_body(&[
             ("message_start", r#"{"type":"message_start"}"#),
@@ -3952,11 +3936,11 @@ mod tests {
             ("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
             (
                 "content_block_start",
-                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"add","input":{}}}"#,
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"todoread","input":{}}}"#,
             ),
             (
                 "content_block_delta",
-                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"a\":2,\"b\":3}"}}"#,
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
             ),
             ("content_block_stop", r#"{"type":"content_block_stop","index":1}"#),
             ("message_delta", r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#),
@@ -4263,11 +4247,11 @@ mod tests {
             ("message_start", r#"{"type":"message_start"}"#),
             (
                 "content_block_start",
-                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"add","input":{}}}"#,
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"todoread","input":{}}}"#,
             ),
             (
                 "content_block_delta",
-                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":2,\"b\":3}"}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
             ),
             (
                 "content_block_stop",
@@ -4300,7 +4284,7 @@ mod tests {
         let new_message = anthropic::AnthropicMessage {
             role: "user".to_string(),
             content: vec![anthropic::ContentBlock::Text {
-                text: "please add 2 and 3".to_string(),
+                text: "what's on the todo list?".to_string(),
             }],
         };
 
@@ -4319,8 +4303,8 @@ mod tests {
             messages[1].blocks().expect("valid blocks"),
             vec![anthropic::ContentBlock::ToolUse {
                 id: "toolu_01".to_string(),
-                name: "add".to_string(),
-                input: serde_json::json!({"a": 2, "b": 3}),
+                name: "todoread".to_string(),
+                input: serde_json::json!({}),
             }]
         );
         assert_eq!(messages[2].role, "user");
@@ -4328,7 +4312,7 @@ mod tests {
             messages[2].blocks().expect("valid blocks"),
             vec![anthropic::ContentBlock::ToolResult {
                 tool_use_id: "toolu_01".to_string(),
-                content: "5".to_string(),
+                content: "[]".to_string(),
                 is_error: None,
             }]
         );
@@ -4342,12 +4326,12 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_describe_live_state_lists_real_pods_terminals_and_tasks(pool: PgPool) {
+    async fn test_describe_live_state_lists_real_pods_and_terminals(pool: PgPool) {
         let conversation = db::create_conversation(&pool)
             .await
             .expect("create conversation");
 
-        // Deliberately real rows/a real registry entry, not hand-built
+        // Deliberately real rows, not hand-built
         // strings — this is the exact data `compact_conversation`'s
         // summarization prompt hands the model, so the format it actually
         // produces from real fixtures is what matters, not an assumption
@@ -4358,16 +4342,6 @@ mod tests {
         let terminal = db::create_sandbox_terminal(&pool, pod.id)
             .await
             .expect("create terminal");
-        anthropic::tools::execute(
-            &pool,
-            conversation.id,
-            "toolu_describe_live_state_test",
-            "run_async",
-            &serde_json::json!({"tool": "add", "input": {"a": 1, "b": 2}}),
-        )
-        .await
-        .expect("seed background task");
-
         let description = describe_live_state(&pool, conversation.id).await;
 
         assert!(
@@ -4377,14 +4351,6 @@ mod tests {
         assert!(
             description.contains(&format!("terminal_id {} in pod_id {}", terminal.id, pod.id)),
             "expected the real terminal id (and its pod) in: {description}"
-        );
-        assert!(
-            description.contains("toolu_describe_live_state_test"),
-            "expected the real task id in: {description}"
-        );
-        assert!(
-            description.contains("add"),
-            "expected the task's tool name in: {description}"
         );
     }
 
@@ -4615,18 +4581,18 @@ mod tests {
             .await
             .expect("create conversation");
 
-        // Always responds with a tool_use turn calling `add` (a fast, valid
-        // call), so the loop never reaches a final reply and must give up
+        // Always responds with a tool_use turn calling `todoread` (a fast,
+        // valid call), so the loop never reaches a final reply and must give up
         // after MAX_TURNS rather than looping forever.
         let tool_use_body = sse_body(&[
             ("message_start", r#"{"type":"message_start"}"#),
             (
                 "content_block_start",
-                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"add","input":{}}}"#,
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"todoread","input":{}}}"#,
             ),
             (
                 "content_block_delta",
-                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1,\"b\":1}"}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
             ),
             (
                 "content_block_stop",
@@ -4739,103 +4705,6 @@ mod tests {
         );
     }
 
-    /// Regression test for a deadlock: `cancel_task` runs synchronously
-    /// inside `run_turn`'s own tool-dispatch loop (same as `add`/`count`/
-    /// any other tool), which already holds `conversation_id`'s lock for
-    /// its entire duration. `cancel_task` also pushes a cancellation
-    /// notification via `chat::run_turn` — if that push were awaited
-    /// in-line rather than detached (`tokio::spawn`), it would try to
-    /// re-acquire the same non-reentrant lock the outer call is still
-    /// holding and hang forever. Wrapped in a timeout so a regression
-    /// fails loudly instead of hanging the test suite.
-    #[sqlx::test]
-    async fn test_run_turn_does_not_deadlock_when_model_calls_cancel_task(pool: PgPool) {
-        let _guard = lock_turn_tests();
-        let conversation = db::create_conversation(&pool)
-            .await
-            .expect("create conversation");
-
-        // Seed a running task directly (bypassing the model) for cancel_task
-        // to act on.
-        let start_result = anthropic::tools::execute(
-            &pool,
-            conversation.id,
-            "toolu_seed_task",
-            "run_async",
-            &serde_json::json!({"tool": "count", "input": {"target": 5, "interval_seconds": 5}}),
-        )
-        .await
-        .expect("seeding the background task should succeed");
-        assert!(start_result.contains("toolu_seed_task"));
-
-        let cancel_turn_body = sse_body(&[
-            ("message_start", r#"{"type":"message_start"}"#),
-            (
-                "content_block_start",
-                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_cancel","name":"cancel_task","input":{}}}"#,
-            ),
-            (
-                "content_block_delta",
-                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"task_id\":\"toolu_seed_task\"}"}}"#,
-            ),
-            (
-                "content_block_stop",
-                r#"{"type":"content_block_stop","index":0}"#,
-            ),
-            (
-                "message_delta",
-                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
-            ),
-            ("message_stop", r#"{"type":"message_stop"}"#),
-        ]);
-        let final_body = sse_body(&[
-            ("message_start", r#"{"type":"message_start"}"#),
-            (
-                "content_block_delta",
-                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"cancelled it"}}"#,
-            ),
-            (
-                "content_block_stop",
-                r#"{"type":"content_block_stop","index":0}"#,
-            ),
-            (
-                "message_delta",
-                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
-            ),
-            ("message_stop", r#"{"type":"message_stop"}"#),
-        ]);
-        start_mock_upstream(&pool, vec![cancel_turn_body, final_body]).await;
-
-        let new_message = anthropic::AnthropicMessage {
-            role: "user".to_string(),
-            content: vec![anthropic::ContentBlock::Text {
-                text: "cancel that task".to_string(),
-            }],
-        };
-
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            run_turn(&pool, conversation.id, new_message, None),
-        )
-        .await
-        .expect("run_turn should complete well within the timeout, not deadlock")
-        .expect("run_turn should succeed");
-
-        assert_eq!(
-            result.len(),
-            4,
-            "expected user, tool_use(cancel_task), tool_result, final assistant"
-        );
-        assert_eq!(
-            result[2].blocks().expect("valid blocks"),
-            vec![anthropic::ContentBlock::ToolResult {
-                tool_use_id: "toolu_cancel".to_string(),
-                content: "task toolu_seed_task cancelled".to_string(),
-                is_error: None,
-            }]
-        );
-    }
-
     /// Regression test: `run_async` and the task-management suite were
     /// fully implemented and unit-tested in `anthropic::tools` before
     /// anyone noticed `tool_definitions()` never listed them — the model
@@ -4855,18 +4724,6 @@ mod tests {
                 .map(|t| t.name)
                 .collect();
         let dispatchable: std::collections::BTreeSet<&str> = [
-            "add",
-            "count",
-            "echo",
-            "run_async",
-            "list_tasks",
-            "task_status",
-            "task_stdout",
-            "task_stderr",
-            "task_result",
-            "wait_task",
-            "cancel_task",
-            "write_task_stdin",
             "create_pod",
             "terminate_pod",
             "list_pods",

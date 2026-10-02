@@ -276,11 +276,8 @@ const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Distinct from `CHUNK_TIMEOUT`, which only bounds the gap between chunks
 /// once a response is already streaming; this call had no bound at all
 /// before (see SME-8's retrospective: a stalled connect
-/// here is indistinguishable from the caller just hanging forever — and
-/// since a `run_async` task with `stream_output: true` awaits exactly this
-/// call once per line before it can continue, that manifested as the
-/// wrapped tool looking permanently "stuck" rather than as a visible
-/// error).
+/// here is indistinguishable from the caller just hanging forever, so a
+/// stalled connect looked like a stuck turn rather than a visible error).
 ///
 /// Raised from the original 90s: a local Ollama server (a supported
 /// provider, not just the real Anthropic API) can take

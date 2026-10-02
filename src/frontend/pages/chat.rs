@@ -8,15 +8,8 @@ use dioxus::prelude::*;
 
 use crate::anthropic::{ContentBlock, TokenUsage};
 // `TodoItem`/`TodoStatus` are used unconditionally (the todo panel itself
-// renders in the shared SSR body, not gated behind `web`) — only
-// `TaskSummary` is web/test-only glue, referenced from
-// `merge_task_snapshot`/`merge_sandbox_snapshot` below (browser-build live
-// subscription, also exercised directly by this module's own tests), so
-// it alone disappears from a plain `server`-feature build, which would
-// otherwise make it an "unused import".
+// renders in the shared SSR body, not gated behind `web`).
 use crate::anthropic::tools::{TodoItem, TodoStatus};
-#[cfg(any(feature = "web", test))]
-use crate::anthropic::tools::TaskSummary;
 #[cfg(any(feature = "web", test))]
 use crate::api::chat::SandboxSnapshot;
 use crate::api::browsing::{navigate_browser, send_browser_input};
@@ -29,7 +22,7 @@ use crate::api::chat::{
 // reaches them.
 #[cfg(feature = "web")]
 use crate::api::chat::{
-    get_context_usage, get_reply_in_progress, get_sandbox_state, get_tasks, get_todos,
+    get_context_usage, get_reply_in_progress, get_sandbox_state, get_todos,
     get_turn_error, get_turn_state, subscribe_conversation_events,
 };
 #[cfg(feature = "web")]
@@ -113,14 +106,6 @@ fn merge_messages_by_id(existing: &mut Vec<Message>, incoming: Vec<Message>) {
     }
 }
 
-/// One "terminal" widget's worth of state for a background task — task id,
-/// tool, status, and the full accumulated stdout/stderr scrollback (kept as
-/// two separate logs, mirroring a process's own two output streams, same
-/// split `anthropic::tools::TaskSummary` and the server-side `Task` registry
-/// use). Unlike the single-line version this replaced, every line is kept
-/// so the widget can render like a real terminal's history rather than a
-/// one-line status row — this is deliberately shaped to grow into a real
-/// shell session later, not just a log viewer.
 /// CSS class suffix for a todo's status marker — a plain string mapping,
 /// not a `Display` impl, since this is presentation-only and the panel is
 /// the only caller.
@@ -268,42 +253,6 @@ fn coalesce_mouse_moves(batch: Vec<(i64, BrowserInputEvent)>) -> Vec<(i64, Brows
     out
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct TaskPanelEntry {
-    task_id: String,
-    tool: String,
-    status: String,
-    stdout: Vec<String>,
-    stderr: Vec<String>,
-}
-
-/// Applies one `get_tasks` snapshot onto the panel's current entries:
-/// updates tool/status/full scrollback for tasks already known (the
-/// snapshot's `stdout`/`stderr` are authoritative — the server's own
-/// accumulated log — so they replace rather than merge with whatever the
-/// panel already had), adds any that are new. Never removes an entry (a
-/// finished/cancelled task should stay visible with its last known output,
-/// not vanish from the panel).
-#[cfg(any(feature = "web", test))]
-fn merge_task_snapshot(existing: &mut Vec<TaskPanelEntry>, snapshot: Vec<TaskSummary>) {
-    for task in snapshot {
-        if let Some(entry) = existing.iter_mut().find(|e| e.task_id == task.task_id) {
-            entry.tool = task.tool;
-            entry.status = task.status;
-            entry.stdout = task.stdout;
-            entry.stderr = task.stderr;
-        } else {
-            existing.push(TaskPanelEntry {
-                task_id: task.task_id,
-                tool: task.tool,
-                status: task.status,
-                stdout: task.stdout,
-                stderr: task.stderr,
-            });
-        }
-    }
-}
-
 /// Adds a streamed reply's `text`, which starts `offset` bytes in. A tab
 /// that connected mid-reply fetched the text so far and then receives the
 /// deltas published since it subscribed, some already in that text; only
@@ -321,52 +270,6 @@ fn apply_reply_delta(reply: &mut Option<String>, offset: usize, text: &str) {
     let already = have - offset;
     if already < text.len() && text.is_char_boundary(already) {
         current.push_str(&text[already..]);
-    }
-}
-
-/// Applies one live `TaskUpdate` event onto the panel's current entries —
-/// same upsert shape as `merge_task_snapshot`, but appends a single new
-/// line rather than replacing the whole scrollback. A "just started"/
-/// terminal event carries `stream: None` (a pure status transition, no line
-/// to append) and only updates `tool`/`status`.
-#[cfg(any(feature = "web", test))]
-fn apply_task_update(
-    existing: &mut Vec<TaskPanelEntry>,
-    task_id: String,
-    tool: String,
-    status: String,
-    stream: Option<String>,
-    latest_output: Option<String>,
-    position: Option<i64>,
-) {
-    if let Some(entry) = existing.iter_mut().find(|e| e.task_id == task_id) {
-        entry.tool = tool;
-        entry.status = status;
-        let lines = match stream.as_deref() {
-            Some("stdout") => Some(&mut entry.stdout),
-            Some("stderr") => Some(&mut entry.stderr),
-            _ => None,
-        };
-        if let (Some(lines), Some(line)) = (lines, latest_output) {
-            // A line the snapshot already has (SME-51 B3).
-            let known = position.is_some_and(|p| (p as usize) < lines.len());
-            if !known {
-                lines.push(line);
-            }
-        }
-    } else {
-        let (stdout, stderr) = match (stream.as_deref(), latest_output) {
-            (Some("stdout"), Some(line)) => (vec![line], Vec::new()),
-            (Some("stderr"), Some(line)) => (Vec::new(), vec![line]),
-            _ => (Vec::new(), Vec::new()),
-        };
-        existing.push(TaskPanelEntry {
-            task_id,
-            tool,
-            status,
-            stdout,
-            stderr,
-        });
     }
 }
 
@@ -393,9 +296,8 @@ struct SandboxOutputLinePanelEntry {
     seq: Option<i64>,
 }
 
-/// One command's widget state within a terminal's history. Unlike
-/// `TaskPanelEntry`'s stdout/stderr split, `output` is a single sequence in
-/// true chronological order (each line tagged with which stream it came
+/// One command's widget state within a terminal's history. `output` is a
+/// single sequence in true chronological order (each line tagged with which stream it came
 /// from) — a real terminal interleaves the two as they happen, and a panel
 /// that rendered them as two separate blocks would show "all stdout, then
 /// all stderr" regardless of when anything was actually written.
@@ -422,10 +324,9 @@ struct SandboxTerminalPanelEntry {
 }
 
 /// Applies one `get_sandbox_state` snapshot onto the panel's current pods
-/// and terminals — same "snapshot is authoritative" upsert semantics as
-/// `merge_task_snapshot`, flattened from the snapshot's pod→terminal
-/// nesting into the two separate flat lists the panel renders from. Unlike
-/// tasks, a pod or terminal the snapshot leaves out is gone: it went away
+/// and terminals — the snapshot is authoritative, flattened from its
+/// pod→terminal nesting into the two separate flat lists the panel renders
+/// from. A pod or terminal the snapshot leaves out is gone: it went away
 /// while the tab wasn't listening (SME-43).
 #[cfg(any(feature = "web", test))]
 fn merge_sandbox_snapshot(
@@ -723,14 +624,6 @@ fn tool_summary(name: &str, input: &serde_json::Value) -> String {
         "todowrite" => "Updated the todo list".to_string(),
         "todoread" => "Checked the todo list".to_string(),
         "clone_repo" => format!("Cloned {}", field("url")),
-        "add" => format!("Added {} and {}", field("a"), field("b")),
-        "count" => format!("Counted to {}", field("target")),
-        "list_tasks" => "Listed background tasks".to_string(),
-        "task_status" | "task_result" | "task_stdout" | "task_stderr" | "wait_task" => {
-            "Checked a background task".to_string()
-        }
-        "cancel_task" => "Cancelled a background task".to_string(),
-        "write_task_stdin" => "Sent input to a background task".to_string(),
         "lsp_servers" => "Listed the language servers".to_string(),
         "start_language_server" => format!("Started {}", field("name")),
         "lsp" => match field("operation").as_str() {
@@ -803,21 +696,6 @@ fn tool_result_label(is_error: bool) -> &'static str {
     }
 }
 
-/// The tool `run_async` was actually asked to start — its own `input.tool`
-/// field, not to be confused with the enclosing `ToolUse` block's `name`
-/// (always the literal `"run_async"`). Used so the compact inline summary
-/// can say "Started count" rather than the uninformative "Started
-/// run_async".
-fn run_async_wrapped_tool(input: &serde_json::Value) -> Option<&str> {
-    input.get("tool").and_then(|v| v.as_str())
-}
-
-/// Maps every `ToolUse` block's id to its tool name across every message in
-/// the conversation. A `ToolResult` block only carries the id of the call
-/// it answers, not the tool's name — this is how `render_block_element`
-/// recognizes a `run_async` result (to fold it into the compact inline
-/// summary instead of rendering its own card; the tasks sidebar already
-/// shows what actually happened).
 /// Each tool call's result, by the call's id: its content and whether it
 /// failed. A call's row shows its result folded in (SME-41 D2).
 fn tool_results_by_id(messages: &[Message]) -> HashMap<String, (String, bool)> {
@@ -834,6 +712,11 @@ fn tool_results_by_id(messages: &[Message]) -> HashMap<String, (String, bool)> {
         .collect()
 }
 
+/// Maps every `ToolUse` block's id to its tool name across every message in
+/// the conversation. A `ToolResult` block only carries the id of the call
+/// it answers, not the tool's name — this is how `render_block_element`
+/// tells a result whose call is in the conversation (shown in the call's
+/// row) from an orphaned one.
 fn tool_use_names_by_id(messages: &[Message]) -> HashMap<String, String> {
     messages
         .iter()
@@ -1288,8 +1171,8 @@ fn render_block_element(
                 span { class: "timestamp", "{timestamp}" }
             }
         },
-        // Collapsed by default, same native-<details> pattern as
-        // `run_async` below — the reasoning is rarely what someone wants
+        // Collapsed by default, a native <details> — the reasoning is
+        // rarely what someone wants
         // to read on every turn, but shouldn't cost space (or a click
         // through some separate view) when they do.
         ContentBlock::Thinking { thinking, .. } => rsx! {
@@ -1302,25 +1185,6 @@ fn render_block_element(
                 div { class: "thinking-body", "{thinking}" }
             }
         },
-        // `run_async` gets a much smaller, collapsed-by-default summary —
-        // "Started <tool>" — instead of the full call card every other
-        // tool gets: the tasks sidebar is the real place to watch what it's
-        // doing, so this only needs to mark that it happened, with the raw
-        // call available on demand via the native <details> disclosure.
-        ContentBlock::ToolUse { name, input, .. } if name == "run_async" => {
-            let pretty_input = format_tool_input(input);
-            let wrapped_tool = run_async_wrapped_tool(input).unwrap_or("tool");
-            rsx! {
-                details { key: "{key}", class: "tool-async-start",
-                    summary { class: "tool-async-start-summary",
-                        span { class: "tool-async-start-icon", "🔧" }
-                        span { "Started" }
-                        code { class: "tool-async-start-tool", "{wrapped_tool}" }
-                    }
-                    pre { class: "tool-async-start-input", "{pretty_input}" }
-                }
-            }
-        }
         // `edit_file` renders as an actual line-level diff instead of a
         // generic tool-call card showing two raw JSON strings — its
         // `old_string`/`new_string` already carry everything a diff needs.
@@ -1395,8 +1259,7 @@ fn render_block_element(
             }
         }
         // A result whose call is in the conversation is shown in that
-        // call's row (or, for `run_async`, not at all: the tasks panel
-        // shows what happened). Only an orphaned result gets a card.
+        // call's row. Only an orphaned result gets a card.
         ContentBlock::ToolResult { tool_use_id, .. } if tool_names.contains_key(tool_use_id) => {
             rsx! {}
         }
@@ -1536,17 +1399,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_run_async_wrapped_tool_reads_the_tool_field() {
-        let input = serde_json::json!({"tool": "count", "input": {"target": 8}});
-        assert_eq!(run_async_wrapped_tool(&input), Some("count"));
-    }
-
-    #[test]
-    fn test_run_async_wrapped_tool_missing_field_returns_none() {
-        assert_eq!(run_async_wrapped_tool(&serde_json::json!({})), None);
-    }
-
     fn message_with_blocks(id: i64, role: &str, blocks: Vec<ContentBlock>) -> Message {
         Message {
             id,
@@ -1576,12 +1428,12 @@ mod tests {
     fn test_tool_use_names_by_id_maps_every_tool_use_across_messages() {
         let messages = vec![
             test_message(1),
-            tool_use_message(2, "call_1", "run_async"),
-            tool_use_message(3, "call_2", "add"),
+            tool_use_message(2, "call_1", "read_file"),
+            tool_use_message(3, "call_2", "todoread"),
         ];
         let names = tool_use_names_by_id(&messages);
-        assert_eq!(names.get("call_1").map(String::as_str), Some("run_async"));
-        assert_eq!(names.get("call_2").map(String::as_str), Some("add"));
+        assert_eq!(names.get("call_1").map(String::as_str), Some("read_file"));
+        assert_eq!(names.get("call_2").map(String::as_str), Some("todoread"));
         assert_eq!(names.get("call_3"), None);
     }
 
@@ -1760,46 +1612,6 @@ mod tests {
         assert_eq!(existing.len(), 2);
     }
 
-    fn test_task_summary(task_id: &str, status: &str) -> TaskSummary {
-        TaskSummary {
-            task_id: task_id.to_string(),
-            tool: "count".to_string(),
-            status: status.to_string(),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        }
-    }
-
-    fn test_task_entry(task_id: &str, stdout: &[&str], stderr: &[&str]) -> TaskPanelEntry {
-        TaskPanelEntry {
-            task_id: task_id.to_string(),
-            tool: "count".to_string(),
-            status: "running".to_string(),
-            stdout: stdout.iter().map(|s| s.to_string()).collect(),
-            stderr: stderr.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    #[test]
-    fn test_merge_task_snapshot_adds_new_and_updates_existing_status() {
-        let mut existing = vec![test_task_entry("t1", &["count: 1/3"], &[])];
-        let mut finished = test_task_summary("t1", "finished");
-        finished.stdout = vec!["count: 1/3".to_string(), "count: 2/3".to_string()];
-        merge_task_snapshot(
-            &mut existing,
-            vec![finished, test_task_summary("t2", "running")],
-        );
-
-        assert_eq!(existing.len(), 2);
-        assert_eq!(existing[0].status, "finished");
-        assert_eq!(
-            existing[0].stdout,
-            vec!["count: 1/3".to_string(), "count: 2/3".to_string()],
-            "the snapshot's own scrollback is authoritative and should replace the panel's"
-        );
-        assert_eq!(existing[1].task_id, "t2");
-    }
-
     /// SME-51 B3: a tab that reconnects mid-reply fetches the text so far,
     /// then gets the deltas published since it subscribed. Some are
     /// already in that text and mustn't be added twice.
@@ -1820,18 +1632,6 @@ mod tests {
     }
 
     #[test]
-    fn test_a_reconnect_adds_only_task_lines_it_doesnt_have() {
-        let mut existing = Vec::new();
-        for (i, line) in ["a", "b"].into_iter().enumerate() {
-            apply_task_update(&mut existing, "t1".to_string(), "count".to_string(), "running".to_string(), Some("stdout".to_string()), Some(line.to_string()), Some(i as i64));
-        }
-        // The snapshot had both; the stream replays "b", then sends "c".
-        apply_task_update(&mut existing, "t1".to_string(), "count".to_string(), "running".to_string(), Some("stdout".to_string()), Some("b".to_string()), Some(1));
-        apply_task_update(&mut existing, "t1".to_string(), "count".to_string(), "running".to_string(), Some("stdout".to_string()), Some("c".to_string()), Some(2));
-        assert_eq!(existing[0].stdout, vec!["a", "b", "c"]);
-    }
-
-    #[test]
     fn test_a_reconnect_adds_only_commands_and_lines_it_doesnt_have() {
         let mut terminals = vec![test_sandbox_terminal_entry(10, 1)];
         terminals[0].commands.push(test_sandbox_command_entry("cmd-1", "echo"));
@@ -1846,70 +1646,6 @@ mod tests {
         assert_eq!(terminals[0].commands.len(), 1, "the command was added twice");
         let data: Vec<_> = terminals[0].commands[0].output.iter().map(|l| l.data.as_str()).collect();
         assert_eq!(data, vec!["one", "two", "three"]);
-    }
-
-    #[test]
-    fn test_apply_task_update_appends_to_stdout_when_stream_is_stdout() {
-        let mut existing = Vec::new();
-        apply_task_update(
-            &mut existing,
-            "t1".to_string(),
-            "count".to_string(),
-            "running".to_string(),
-            Some("stdout".to_string()),
-            Some("count: 1/3".to_string()), None,
-        );
-        apply_task_update(
-            &mut existing,
-            "t1".to_string(),
-            "count".to_string(),
-            "running".to_string(),
-            Some("stdout".to_string()),
-            Some("count: 2/3".to_string()), None,
-        );
-        assert_eq!(existing.len(), 1);
-        assert_eq!(
-            existing[0].stdout,
-            vec!["count: 1/3".to_string(), "count: 2/3".to_string()],
-            "each update should append a new line, not overwrite the last one"
-        );
-        assert!(existing[0].stderr.is_empty());
-    }
-
-    #[test]
-    fn test_apply_task_update_appends_to_stderr_when_stream_is_stderr() {
-        let mut existing = Vec::new();
-        apply_task_update(
-            &mut existing,
-            "t1".to_string(),
-            "echo".to_string(),
-            "running".to_string(),
-            Some("stderr".to_string()),
-            Some("echo: received 5 byte(s) of input".to_string()), None,
-        );
-        assert_eq!(existing.len(), 1);
-        assert!(existing[0].stdout.is_empty());
-        assert_eq!(
-            existing[0].stderr,
-            vec!["echo: received 5 byte(s) of input".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_apply_task_update_without_stream_does_not_erase_either_stream() {
-        let mut existing = vec![test_task_entry("t1", &["count: 1/3"], &["a diagnostic"])];
-        // A "just started" or terminal event carries stream: None.
-        apply_task_update(
-            &mut existing,
-            "t1".to_string(),
-            "count".to_string(),
-            "finished".to_string(),
-            None,
-            None, None,
-        );
-        assert_eq!(existing[0].status, "finished");
-        assert_eq!(existing[0].stdout, vec!["count: 1/3".to_string()]);
-        assert_eq!(existing[0].stderr, vec!["a diagnostic".to_string()]);
     }
 
     fn no_mods() -> keyboard_types::Modifiers {
@@ -2181,8 +1917,9 @@ mod tests {
             "Searched the web for \"rust 1.0 release\""
         );
         assert_eq!(tool_summary("mcp__github__create_issue", &serde_json::json!({})), "Used create_issue (github)");
-        assert_eq!(tool_summary("add", &serde_json::json!({"a": 2, "b": 3})), "Added 2 and 3");
         assert_eq!(tool_summary("something_new", &serde_json::json!({})), "Used something_new");
+        // A tool that no longer exists still reads sensibly in old history.
+        assert_eq!(tool_summary("run_async", &serde_json::json!({"tool": "count"})), "Used run_async");
         assert_eq!(tool_summary("lsp_servers", &serde_json::json!({})), "Listed the language servers");
         assert_eq!(tool_summary("start_language_server", &serde_json::json!({"name": "pyright"})), "Started pyright");
         let lsp = |input| tool_summary("lsp", &input);
@@ -3094,8 +2831,6 @@ fn ChatPanel(
     let mut input = use_signal(String::new);
     let mut next_temp_id = use_signal(|| -1i64);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut tasks: Signal<Vec<TaskPanelEntry>> = use_signal(Vec::new);
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut todos: Signal<Vec<TodoItem>> = use_signal(Vec::new);
     // "Work on a repo" in a new conversation.
     let mut repo_url = use_signal(String::new);
@@ -3208,14 +2943,9 @@ fn ChatPanel(
     let mut messages_el: Signal<Option<MountedEvent>> = use_signal(|| None);
     let mut messages_stuck_to_bottom = use_signal(|| true);
 
-    // Same idea, per background task — each task's own `.task-terminal-body`
-    // scrolls independently, like `tail -f` on its own log, so each needs
-    // its own mounted handle and stuck flag rather than one shared pair.
-    let mut task_body_els: Signal<HashMap<String, MountedEvent>> = use_signal(HashMap::new);
-    let mut task_body_stuck: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
-
-    // Same idea again, per sandbox terminal — keyed by `terminal_id` rather
-    // than `task_id`, otherwise identical to `task_body_els`/`task_body_stuck`.
+    // Same idea, per sandbox terminal — each terminal's own
+    // `.task-terminal-body` scrolls independently, like `tail -f` on its own
+    // log, so each needs its own mounted handle and stuck flag.
     let mut terminal_body_els: Signal<HashMap<i64, MountedEvent>> = use_signal(HashMap::new);
     let mut terminal_body_stuck: Signal<HashMap<i64, bool>> = use_signal(HashMap::new);
 
@@ -3275,7 +3005,6 @@ fn ChatPanel(
             }
             live.set(None);
             let Some(id) = selected() else { return };
-            tasks.set(Vec::new());
             todos.set(Vec::new());
             repos.set(Vec::new());
             // "Work on a repo" and the trust cards belong to the conversation
@@ -3286,8 +3015,6 @@ fn ChatPanel(
             repo_attaching.set(false);
             repo_attach_error.set(None);
             repo_action_error.set(None);
-            task_body_els.write().clear();
-            task_body_stuck.write().clear();
             sandbox_pods.set(Vec::new());
             sandbox_terminals.set(Vec::new());
             terminal_body_els.write().clear();
@@ -3324,9 +3051,6 @@ fn ChatPanel(
                         // timer — not the polling loop this replaces.
                         if let Ok(list) = get_messages(id).await {
                             accept_saved_messages(&mut messages.write(), list);
-                        }
-                        if let Ok(snapshot) = get_tasks(id).await {
-                            merge_task_snapshot(&mut tasks.write(), snapshot);
                         }
                         if let Ok(snapshot) = get_sandbox_state(id).await {
                             merge_sandbox_snapshot(
@@ -3372,24 +3096,6 @@ fn ChatPanel(
                                         streaming_reply.set(None);
                                     }
                                     accept_saved_messages(&mut messages.write(), rows);
-                                }
-                                Some(Ok(ConversationEvent::TaskUpdate {
-                                    task_id,
-                                    tool,
-                                    status,
-                                    stream,
-                                    latest_output,
-                                    position,
-                                })) => {
-                                    apply_task_update(
-                                        &mut tasks.write(),
-                                        task_id,
-                                        tool,
-                                        status,
-                                        stream,
-                                        latest_output,
-                                        position,
-                                    );
                                 }
                                 Some(Ok(ConversationEvent::SandboxPodUpdate {
                                     pod_id,
@@ -3651,10 +3357,10 @@ fn ChatPanel(
     // one and pulled a scroll that stayed within the slack back to the
     // bottom (SME-83).
     //
-    // Also reads `tasks()`/`sandbox_pods()`/`sandbox_terminals()`: those
+    // Also reads `sandbox_pods()`/`sandbox_terminals()`: those
     // panels render below the transcript in `.side-panels-row`, which is
     // conditionally present at all — it only starts rendering once one of
-    // them arrives (see the `if !tasks().is_empty() || !sandbox_pods()...`
+    // them arrives (see the `if !sandbox_pods().is_empty()...`
     // gate further down). That first appearance shrinks `.chat-main` (they
     // split the column's height via flex), which happens *after* the
     // scroll-to-bottom already ran off of `messages()`/`streaming_reply()`
@@ -3664,7 +3370,6 @@ fn ChatPanel(
     use_effect(move || {
         let _ = messages();
         let _ = streaming_reply();
-        let _ = tasks();
         let _ = sandbox_pods();
         let _ = sandbox_terminals();
         if !*messages_stuck_to_bottom.peek() {
@@ -3683,37 +3388,11 @@ fn ChatPanel(
         });
     });
 
-    // Same sticky-bottom behavior, per background task — each task's
-    // terminal body scrolls independently as its own output grows. A task
-    // with no recorded stuck state yet (just appeared) defaults to stuck,
-    // same as the transcript on first load. The stuck map is peeked, as
-    // above, so a scroll doesn't rerun this.
-    use_effect(move || {
-        let current_tasks = tasks();
-        let els = task_body_els();
-        let stuck = task_body_stuck.peek().clone();
-        for task in current_tasks {
-            if !stuck.get(&task.task_id).copied().unwrap_or(true) {
-                continue;
-            }
-            let Some(el) = els.get(&task.task_id).cloned() else {
-                continue;
-            };
-            spawn(async move {
-                if let Ok(size) = el.get_scroll_size().await {
-                    let _ = el
-                        .scroll(
-                            PixelsVector2D::new(0.0, size.height),
-                            ScrollBehavior::Instant,
-                        )
-                        .await;
-                }
-            });
-        }
-    });
-
-    // Same sticky-bottom behavior again, per sandbox terminal — identical
-    // to the background-task effect above, just keyed by `terminal_id`.
+    // Same sticky-bottom behavior, per sandbox terminal — each terminal's
+    // body scrolls independently as its own output grows. A terminal with
+    // no recorded stuck state yet (just appeared) defaults to stuck, same as
+    // the transcript on first load. The stuck map is peeked, as above, so a
+    // scroll doesn't rerun this (SME-83).
     use_effect(move || {
         let current_terminals = sandbox_terminals();
         let els = terminal_body_els();
@@ -3752,7 +3431,7 @@ fn ChatPanel(
                     let tool_results = tool_results_by_id(&messages());
                     let commands = terminal_commands_by_id(&messages());
                     rsx! {
-                    if !tasks().is_empty() || !sandbox_pods().is_empty() || !repos().is_empty() || !todos().is_empty() || browsing_session_open() {
+                    if !sandbox_pods().is_empty() || !repos().is_empty() || !todos().is_empty() || browsing_session_open() {
                         div { class: "side-panels-row",
                             if browsing_session_open() {
                                 aside { class: "browsing-panel",
@@ -3904,66 +3583,6 @@ fn ChatPanel(
                                                 class: "todo-item todo-item-{todo_status_class(todo.status)}",
                                                 span { class: "todo-item-marker" }
                                                 span { class: "todo-item-content", "{todo.content}" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if !tasks().is_empty() {
-                                aside { class: "tasks-panel",
-                                    h3 { "Background tasks" }
-                                    div { class: "task-terminal-stack",
-                                        for task in tasks() {
-                                            div {
-                                                key: "{task.task_id}",
-                                                class: "task-terminal task-terminal-status-{task.status}",
-                                                div { class: "task-terminal-titlebar",
-                                                    span { class: "task-terminal-dots",
-                                                        span { class: "dot dot-red" }
-                                                        span { class: "dot dot-yellow" }
-                                                        span { class: "dot dot-green" }
-                                                    }
-                                                    code { class: "task-terminal-tool", "{task.tool}" }
-                                                    span { class: "task-terminal-id", "{task.task_id}" }
-                                                    span { class: "task-terminal-status", "{task.status}" }
-                                                }
-                                                div {
-                                                    class: "task-terminal-body",
-                                                    onmounted: {
-                                                        let task_id = task.task_id.clone();
-                                                        move |evt| {
-                                                            task_body_els.write().insert(task_id.clone(), evt);
-                                                        }
-                                                    },
-                                                    onscroll: {
-                                                        let task_id = task.task_id.clone();
-                                                        move |evt: Event<ScrollData>| {
-                                                            let d = evt.data();
-                                                            task_body_stuck
-                                                                .write()
-                                                                .insert(
-                                                                    task_id.clone(),
-                                                                    is_scrolled_to_bottom(
-                                                                        d.scroll_top(),
-                                                                        d.scroll_height() as f64,
-                                                                        d.client_height() as f64,
-                                                                    ),
-                                                                );
-                                                        }
-                                                    },
-                                                    if task.stdout.is_empty() && task.stderr.is_empty() {
-                                                        span { class: "task-terminal-empty", "no output yet" }
-                                                    }
-                                                    for (i , line) in task.stdout.iter().enumerate() {
-                                                        div { key: "out-{i}", class: "task-terminal-line", "{line}" }
-                                                    }
-                                                    for (i , line) in task.stderr.iter().enumerate() {
-                                                        div { key: "err-{i}", class: "task-terminal-line task-terminal-line-stderr", "{line}" }
-                                                    }
-                                                    if task.status == "running" {
-                                                        span { class: "task-terminal-cursor" }
-                                                    }
-                                                }
                                             }
                                         }
                                     }
