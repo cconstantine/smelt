@@ -319,12 +319,14 @@ mod server {
             referer: header("referer"),
             upgrade_insecure_requests: header("upgrade-insecure-requests").as_deref() == Some("1"),
         };
-        // Whether the browser sent Sec-Fetch-* to the address it used: not
-        // to a plain-http one that isn't `localhost` (SME-90).
-        let sends_sec_fetch = url::Url::parse(&format!("http://{host}"))
-            .ok()
-            .and_then(|url| url.host_str().map(crate::fetch_guard::browser_sends_sec_fetch))
-            .unwrap_or(false);
+        // Whether the browser sent Sec-Fetch-* to the address it used: it
+        // always does over https (a proxy in front of this listener ends
+        // TLS), but not to a plain-http one that isn't `localhost` (SME-90).
+        let sends_sec_fetch = template.scheme == "https"
+            || url::Url::parse(&format!("http://{host}"))
+                .ok()
+                .and_then(|url| url.host_str().map(crate::fetch_guard::browser_sends_sec_fetch))
+                .unwrap_or(false);
         let is_home = |host: &str, port: Option<u16>| {
             let authority = port.map_or_else(|| host.to_string(), |port| format!("{host}:{port}"));
             template.match_host(&authority).is_some_and(|(origin_conversation, _, _)| origin_conversation == conversation)
@@ -643,21 +645,24 @@ body {{ font-family: system-ui, sans-serif; max-width: 36rem; margin: 4rem auto;
         /// Starts the preview server; returns its address and the template
         /// it answers to (`http://{port}-{conversation}.preview.localhost:<its port>`).
         async fn start_preview(dial_for: DialFor) -> (SocketAddr, PreviewTemplate) {
-            start_preview_with("preview.localhost", dial_for, None).await
+            start_preview_with("http", "preview.localhost", dial_for, None).await
         }
 
         /// `start_preview`, with smelt's own address for links back to it.
         async fn start_preview_linking_to(dial_for: DialFor, smelt_url: Option<&str>) -> (SocketAddr, PreviewTemplate) {
-            start_preview_with("preview.localhost", dial_for, smelt_url).await
+            start_preview_with("http", "preview.localhost", dial_for, smelt_url).await
         }
 
-        /// A preview server whose addresses are `http://{port}-{conversation}.{domain}:…`.
-        async fn start_preview_at(domain: &str, dial_for: DialFor) -> (SocketAddr, PreviewTemplate) {
-            start_preview_with(domain, dial_for, None).await
+        /// A preview server whose addresses are
+        /// `{scheme}://{port}-{conversation}.{domain}:…` (served as plain
+        /// http here: TLS would be a proxy's job in front of it).
+        async fn start_preview_at(scheme: &str, domain: &str, dial_for: DialFor) -> (SocketAddr, PreviewTemplate) {
+            start_preview_with(scheme, domain, dial_for, None).await
         }
 
-        /// A preview server at `domain`, linking back to `smelt_url`.
+        /// `start_preview_at`, linking back to `smelt_url`.
         async fn start_preview_with(
+            scheme: &str,
             domain: &str,
             dial_for: DialFor,
             smelt_url: Option<&str>,
@@ -665,7 +670,7 @@ body {{ font-family: system-ui, sans-serif; max-width: 36rem; margin: 4rem auto;
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let template = PreviewTemplate::parse(&format!(
-                "http://{{port}}-{{conversation}}.{domain}:{}",
+                "{scheme}://{{port}}-{{conversation}}.{domain}:{}",
                 addr.port()
             ))
             .unwrap();
@@ -778,7 +783,7 @@ body {{ font-family: system-ui, sans-serif; max-width: 36rem; margin: 4rem auto;
             let upstream = start_upstream().await;
             let dials = Dials::default();
             let (preview, template) =
-                start_preview_at("preview.example.test", dial_for_upstream(upstream, dials.clone())).await;
+                start_preview_at("http", "preview.example.test", dial_for_upstream(upstream, dials.clone())).await;
             let client = client_for(preview, &["3000-42.preview.example.test"]);
             let url = format!("{}/", template.url_for(42, PodHost::Localhost, 3000));
             let other_port = format!("{}/app.js", template.url_for(42, PodHost::Localhost, 5173));
@@ -814,6 +819,26 @@ body {{ font-family: system-ui, sans-serif; max-width: 36rem; margin: 4rem auto;
                 let response = request.send().await.unwrap();
                 assert_eq!(response.status(), 200, "{headers:?}");
             }
+        }
+
+        /// Over https a browser always sends Sec-Fetch-*, so a request
+        /// without it there isn't from a browser page: a webhook, or `curl`
+        /// (SME-90's code review).
+        #[tokio::test]
+        async fn test_an_https_preview_lets_requests_from_outside_a_browser_through() {
+            let upstream = start_upstream().await;
+            let dials = Dials::default();
+            let (preview, template) =
+                start_preview_at("https", "preview.example.test", dial_for_upstream(upstream, dials.clone())).await;
+            let client = client_for(preview, &["3000-42.preview.example.test"]);
+            let response = client
+                .get(format!("http://3000-42.preview.example.test:{}/", preview.port()))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(*dials.lock().unwrap(), vec![(42, 3000)]);
+            assert!(template.url_for(42, PodHost::Localhost, 3000).starts_with("https://"));
         }
 
         /// Every dial fails with `error`.
