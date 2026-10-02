@@ -973,6 +973,11 @@ fn note_docker_restarts(
         // restart to come, so it's kept (SME-85's second code review).
         return None;
     }
+    // A finished pod's containers are gone with it: crash cleanup reports
+    // that, not a Docker restart (SME-88 code review).
+    if pod_has_finished(pod) {
+        return None;
+    }
     // The exit seen before this restart explains only this one.
     let remembered = entry.exit_reason.take();
     Some(match reason.or(remembered) {
@@ -4037,6 +4042,20 @@ mod tests {
             note_docker_restarts(&mut seen, &restarted, false),
             Some(DockerRestart::Report { pod_id: 7, reason: "OOMKilled".to_string() })
         );
+    }
+
+    /// A pod that finished while the watch was disconnected isn't told its
+    /// Docker restarted: it's gone, and crash cleanup says so (SME-88 code
+    /// review).
+    #[test]
+    fn test_a_finished_pod_in_a_relisting_reports_no_docker_restart() {
+        let mut seen = HashMap::new();
+        note_docker_restarts(&mut seen, &named(pod_with_docker_status(0, None), "sandbox-7"), true);
+        let mut failed = named(pod_with_docker_status(1, Some("OOMKilled")), "sandbox-7");
+        if let Some(status) = failed.status.as_mut() {
+            status.phase = Some("Failed".to_string());
+        }
+        assert_eq!(note_docker_restarts(&mut seen, &failed, true), None);
     }
 
     /// An exit remembered for one restart doesn't explain the next.
