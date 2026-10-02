@@ -137,7 +137,7 @@ already gone.
 
 ### Language servers (SME-35)
 
-- `src/lsp/pods.rs`'s cluster tests use a stand-in sandbox (the sandbox image, idle, with the conversation's workspace claim, `with_sandbox`, torn down even after a panic) and `cat` as the "server". `src/lsp/manager.rs`'s run the real rust-analyzer, pyright and gopls (`go install`), configured from the catalog's own suggestion for the mason fixtures, so they pull `rust:1`, `node:22-slim` and `golang:1` and download the servers: they need the network.
+- `src/lsp/pods.rs`'s cluster tests use a stand-in sandbox (the sandbox image, idle, with the conversation's workspace claim, `with_sandbox`, torn down even after a panic) and `cat` as the "server". `src/lsp/manager.rs`'s run the real rust-analyzer, pyright and gopls (`go install`), configured from the catalog's own suggestion for the mason fixtures, so they pull `rust:1`, `node:22-slim` and `golang:1` and download the servers: they need the network, from inside the cluster (proxy.golang.org, github.com). A DNS or network blip there fails them with errors like `Could not resolve host: github.com`; rerun those tests alone before suspecting the change (SME-86's gate hit this once).
 - A fresh server answers before it has indexed: rust-analyzer returns partial references and `-32801 content modified` for a while. Ask until the answer has what you expect (`until_contains`) rather than asserting on the first one.
 - A server's out-of-memory kill takes its whole container (cgroup v2 kills the group), so the pod stops as `OOMKilled`; it isn't just the one process.
 

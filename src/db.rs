@@ -908,6 +908,8 @@ pub struct ConversationRepo {
     pub updated_at: NaiveDateTime,
     /// The checkout's AGENTS.md files, relative to it, top-level first.
     pub agents_files: Vec<String>,
+    /// Which attempt at the clone is current; a retry increments it.
+    pub attempt: i32,
 }
 
 /// Sets a checkout's AGENTS.md files, for tests; a clone records them
@@ -1193,26 +1195,27 @@ pub async fn list_conversation_repos(
 }
 
 /// A failed clone is being retried, with the URL and branch asked for
-/// this time (the same remote, maybe written another way).
+/// this time (the same remote, maybe written another way). `None` when the
+/// clone isn't failed any more (another retry got there first).
 pub async fn retry_repo_clone(
     pool: &PgPool,
     id: i64,
     url: &str,
     remote_key: &str,
     branch: Option<&str>,
-) -> Result<ConversationRepo, sqlx::Error> {
+) -> Result<Option<ConversationRepo>, sqlx::Error> {
     sqlx::query_as::<_, ConversationRepo>(
         "UPDATE conversation_repos
             SET url = $2, remote_key = $3, branch = $4, status = 'cloning', error = NULL,
-                agents_files = '{}', updated_at = now()
-          WHERE id = $1
+                agents_files = '{}', attempt = attempt + 1, updated_at = now()
+          WHERE id = $1 AND status = 'failed'
       RETURNING *",
     )
     .bind(id)
     .bind(url)
     .bind(remote_key)
     .bind(branch)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
 }
 
@@ -1239,29 +1242,32 @@ pub async fn set_repo_cloned(
 
 /// A clone that finished, with the AGENTS.md files it has (or why they
 /// couldn't be listed) recorded in the same update, so nothing sees it
-/// ready without them.
+/// ready without them. Only `attempt`, still cloning, can finish it
+/// (SME-86); false when it's no longer the current attempt.
 pub async fn set_repo_ready(
     pool: &PgPool,
     id: i64,
+    attempt: i32,
     checked_out_branch: &str,
     commit_sha: Option<&str>,
     agents_files: &[String],
     error: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
         "UPDATE conversation_repos
             SET status = 'ready', error = $4, checked_out_branch = $2, commit_sha = $3,
                 agents_files = $5, updated_at = now()
-          WHERE id = $1",
+          WHERE id = $1 AND status = 'cloning' AND attempt = $6",
     )
     .bind(id)
     .bind(checked_out_branch)
     .bind(commit_sha)
     .bind(error)
     .bind(agents_files)
+    .bind(attempt)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 /// At startup: a clone still marked cloning was cut off by the restart.
@@ -1277,16 +1283,19 @@ pub async fn fail_unfinished_clones(pool: &PgPool, error: &str) -> Result<u64, s
     Ok(result.rows_affected())
 }
 
-pub async fn set_repo_failed(pool: &PgPool, id: i64, error: &str) -> Result<(), sqlx::Error> {
-    sqlx::query(
+/// Attempt `attempt` at a clone failed. Like `set_repo_ready`, only the
+/// current attempt, still cloning, can; false otherwise.
+pub async fn set_repo_failed(pool: &PgPool, id: i64, attempt: i32, error: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
         "UPDATE conversation_repos SET status = 'failed', error = $2, updated_at = now()
-          WHERE id = $1",
+          WHERE id = $1 AND status = 'cloning' AND attempt = $3",
     )
     .bind(id)
     .bind(error)
+    .bind(attempt)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 // --- MCP servers (externally-hosted, configured via the /mcp-servers UI) ---
@@ -3293,13 +3302,14 @@ mod tests {
         assert_eq!(repo.status, "cloning");
         assert_eq!(repo.branch.as_deref(), Some("dev"));
 
-        set_repo_failed(&pool, repo.id, "fatal: nope").await.expect("fail");
+        set_repo_failed(&pool, repo.id, repo.attempt, "fatal: nope").await.expect("fail");
         let listed = list_conversation_repos(&pool, conversation.id).await.expect("list");
         assert_eq!((listed[0].status.as_str(), listed[0].error.as_deref()), ("failed", Some("fatal: nope")));
 
         let retried = retry_repo_clone(&pool, repo.id, "ssh://git@github.com/o/r", "github.com/o/r", None)
             .await
-            .expect("retry");
+            .expect("retry")
+            .expect("it was failed");
         assert_eq!((retried.status.as_str(), retried.error.as_deref()), ("cloning", None));
         assert_eq!((retried.url.as_str(), retried.branch.as_deref()), ("ssh://git@github.com/o/r", None));
         set_repo_cloned(&pool, repo.id, "dev", Some("abc123")).await.expect("cloned");
@@ -3377,6 +3387,68 @@ mod tests {
         // Deleting the conversation deletes its repos.
         delete_conversation(&pool, conversation.id).await.expect("delete conversation");
         assert!(list_conversation_repos(&pool, conversation.id).await.expect("list").is_empty());
+    }
+
+    /// Only a failed clone is retried, and only the current attempt can
+    /// finish a clone: a stale attempt's late "ready" or "failed" changes
+    /// nothing (SME-86).
+    #[sqlx::test]
+    async fn test_only_the_current_attempt_finishes_a_clone(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let repo = create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
+            .await
+            .expect("create repo");
+        assert_eq!(repo.attempt, 1);
+        let status = |pool: PgPool| async move {
+            let row = get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
+            (row.status, row.attempt)
+        };
+
+        // A clone that's still running isn't retried.
+        assert!(retry_repo_clone(&pool, repo.id, "u", "k", None).await.expect("retry").is_none());
+        assert_eq!(status(pool.clone()).await, ("cloning".to_string(), 1));
+
+        // Attempt 1 finishes; its guard's late "failed" changes nothing.
+        assert!(set_repo_ready(&pool, repo.id, 1, "main", None, &[], None).await.expect("ready"));
+        assert!(!set_repo_failed(&pool, repo.id, 1, "interrupted").await.expect("late failed"));
+        assert_eq!(status(pool.clone()).await, ("ready".to_string(), 1));
+        // A ready clone isn't retried either.
+        assert!(retry_repo_clone(&pool, repo.id, "u", "k", None).await.expect("retry").is_none());
+
+        // Another clone's failed attempt 1 is retried as attempt 2;
+        // attempt 1's late writes don't touch it.
+        let failed = create_conversation_repo(&pool, conversation.id, "u", "k", None, "f")
+            .await
+            .expect("create repo");
+        assert!(set_repo_failed(&pool, failed.id, 1, "fatal: nope").await.expect("fail"));
+        let retried = retry_repo_clone(&pool, failed.id, "u", "k", None)
+            .await
+            .expect("retry")
+            .expect("it was failed");
+        assert_eq!((retried.status.as_str(), retried.attempt), ("cloning", 2));
+        assert!(!set_repo_failed(&pool, failed.id, 1, "interrupted").await.expect("stale failed"));
+        assert!(!set_repo_ready(&pool, failed.id, 1, "main", None, &[], None).await.expect("stale ready"));
+        let row = get_conversation_repo(&pool, failed.id).await.expect("get").expect("exists");
+        assert_eq!((row.status.as_str(), row.attempt), ("cloning", 2));
+        assert!(set_repo_ready(&pool, failed.id, 2, "main", None, &[], None).await.expect("ready"));
+        let row = get_conversation_repo(&pool, failed.id).await.expect("get").expect("exists");
+        assert_eq!(row.status, "ready");
+    }
+
+    /// Two retries of the same failed clone at once: exactly one runs.
+    #[sqlx::test]
+    async fn test_two_retries_of_a_failed_clone_one_wins(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let repo = create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
+            .await
+            .expect("create repo");
+        assert!(set_repo_failed(&pool, repo.id, 1, "fatal: nope").await.expect("fail"));
+        let (a, b) = tokio::join!(
+            retry_repo_clone(&pool, repo.id, "u", "k", None),
+            retry_repo_clone(&pool, repo.id, "u", "k", None),
+        );
+        let won = [a.expect("retry a"), b.expect("retry b")].into_iter().flatten().count();
+        assert_eq!(won, 1, "exactly one retry runs");
     }
 
     #[sqlx::test]
