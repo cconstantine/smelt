@@ -5,7 +5,7 @@ use sqlx::PgPool;
 
 use super::Tool;
 use super::server::{required_i64, required_str};
-use crate::{db, events, sandbox};
+use crate::{db, sandbox};
 use crate::anthropic::ToolDefinition;
 
 pub(super) fn tools() -> Vec<Tool> {
@@ -364,41 +364,13 @@ async fn run_terminal_command_tool(
     let command = required_str(input, "command")?;
     owned_terminal(pool, conversation_id, terminal_id).await?;
 
-    if let Some(running) = db::terminal_command_is_running(pool, terminal_id)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        return Err(busy_terminal_message(&running, chrono::Utc::now().naive_utc()));
-    }
-
     let command_id = tool_use_id.to_string();
-    db::create_terminal_command(pool, conversation_id, terminal_id, &command_id, &command)
+    sandbox::run_command(pool, conversation_id, terminal_id, &command_id, &command)
         .await
-        .map_err(|e| e.to_string())?;
-
-    if let Err(e) = sandbox::send_command(pool, terminal_id, &command_id, &command).await {
-        // Nothing is actually running — don't leave a dangling
-        // 'running' row with no agent ever going to report on it.
-        let _ = db::mark_terminal_command_lost(pool, &command_id).await;
-        return Err(e.to_string());
-    }
-
-    // Published immediately, before the agent has produced any output,
-    // so the panel shows the command as started (SME-10).
-    events::publish(
-        conversation_id,
-        events::ConversationEvent::SandboxCommandUpdate {
-            terminal_id,
-            command_id: command_id.clone(),
-            command: Some(command.clone()),
-            status: "running".to_string(),
-            exit_code: None,
-            stream: None,
-            latest_output: None,
-            position: None,
-        },
-    );
-
+        .map_err(|e| match e {
+            sandbox::RunCommandError::Busy(running) => busy_terminal_message(&running, chrono::Utc::now().naive_utc()),
+            sandbox::RunCommandError::Failed(e) => e,
+        })?;
     Ok(format!("command sent (id: {command_id})"))
 }
 

@@ -130,6 +130,61 @@ pub async fn send_command(
     })?)
 }
 
+/// Why `run_command` didn't start a command.
+#[derive(Debug)]
+pub enum RunCommandError {
+    /// The terminal is still running this command; one at a time.
+    Busy(db::TerminalCommand),
+    Failed(String),
+}
+
+/// Starts `command` in `terminal_id` as `command_id`: refuses while another
+/// command runs there, records it as running, sends it to the pod's agent,
+/// and publishes it to the sandbox panel as started. A send that fails
+/// marks the row lost, so nothing waits on a command that never ran.
+pub async fn run_command(
+    pool: &PgPool,
+    conversation_id: i64,
+    terminal_id: i64,
+    command_id: &str,
+    command: &str,
+) -> Result<(), RunCommandError> {
+    if let Some(running) = db::terminal_command_is_running(pool, terminal_id)
+        .await
+        .map_err(|e| RunCommandError::Failed(e.to_string()))?
+    {
+        return Err(RunCommandError::Busy(running));
+    }
+
+    db::create_terminal_command(pool, conversation_id, terminal_id, command_id, command)
+        .await
+        .map_err(|e| RunCommandError::Failed(e.to_string()))?;
+
+    if let Err(e) = send_command(pool, terminal_id, command_id, command).await {
+        // Nothing is actually running — don't leave a dangling
+        // 'running' row with no agent ever going to report on it.
+        let _ = db::mark_terminal_command_lost(pool, command_id).await;
+        return Err(RunCommandError::Failed(e.to_string()));
+    }
+
+    // Published immediately, before the agent has produced any output,
+    // so the panel shows the command as started (SME-10).
+    crate::events::publish(
+        conversation_id,
+        crate::events::ConversationEvent::SandboxCommandUpdate {
+            terminal_id,
+            command_id: command_id.to_string(),
+            command: Some(command.to_string()),
+            status: "running".to_string(),
+            exit_code: None,
+            stream: None,
+            latest_output: None,
+            position: None,
+        },
+    );
+    Ok(())
+}
+
 /// Sends a `signal` — same reconnect-first, never-launches behavior as
 /// `send_command`.
 pub async fn send_signal(

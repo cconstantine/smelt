@@ -5,7 +5,6 @@ use sqlx::PgPool;
 
 use super::Tool;
 use super::server::required_str;
-use crate::db;
 use crate::anthropic::ToolDefinition;
 
 pub(super) fn tools() -> Vec<Tool> {
@@ -117,8 +116,7 @@ async fn http_request_tool(input: &Value) -> Result<String, String> {
 }
 
 /// A link the user can open in their own browser for `port` in this
-/// conversation's sandbox (SME-42), after checking something listens
-/// there. Recorded on the pod, so the sandbox panel shows it.
+/// conversation's sandbox (SME-42); `preview::share` records it.
 pub(super) async fn sandbox_preview_url_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
     let port = input
         .get("port")
@@ -140,42 +138,20 @@ pub(super) async fn sandbox_preview_url_tool(pool: &PgPool, conversation_id: i64
     if host == crate::sandbox::PodHost::Localhost {
         crate::sandbox::check_reachable_port(port).map_err(|e| e.to_string())?;
     }
-    let pod_id = crate::sandbox::live_pod_id(pool, conversation_id)
+    let shared = crate::preview::share(pool, conversation_id, host, port)
         .await
         .map_err(|e| match e {
-            crate::sandbox::TerminalError::NoPod => "This conversation has no running sandbox: \
+            crate::preview::ShareError::NoSandbox => "This conversation has no running sandbox: \
                 call create_pod first, then start the server in it."
                 .to_string(),
-            other => other.to_string(),
+            crate::preview::ShareError::PreviewsOff(e) => format!("Previews are off on this smelt: {e}"),
+            crate::preview::ShareError::Other(e) => e,
         })?;
-    let template = crate::preview::configured_template()
-        .map_err(|e| format!("Previews are off on this smelt: {e}"))?;
-    let listening = crate::sandbox::pod_port_is_listening(pool, conversation_id, host, port)
-        .await
-        .map_err(|e| e.to_string())?;
-    let stored_host = match host {
-        crate::sandbox::PodHost::Localhost => String::new(),
-        crate::sandbox::PodHost::Container(ip) => ip.to_string(),
-    };
     let where_ = match host {
         crate::sandbox::PodHost::Localhost => format!("localhost:{port}"),
         crate::sandbox::PodHost::Container(ip) => format!("{ip}:{port}"),
     };
-    let ports = db::add_pod_preview(pool, pod_id, &stored_host, port)
-        .await
-        .map_err(|e| e.to_string())?;
-    crate::events::publish(
-        conversation_id,
-        crate::events::ConversationEvent::SandboxPreviewUpdate {
-            pod_id,
-            previews: crate::preview::preview_links(
-                &template,
-                conversation_id,
-                &crate::preview::stored_previews(&ports),
-            ),
-        },
-    );
-    let note = if listening {
+    let note = if shared.listening {
         format!(
             "The user can open this link in their own browser; the sandbox panel shows it too. \
              Your own browser tools reach the same server at http://{where_}/, so use \
@@ -189,9 +165,9 @@ pub(super) async fn sandbox_preview_url_tool(pool: &PgPool, conversation_id: i64
         )
     };
     Ok(serde_json::json!({
-        "url": template.url_for(conversation_id, host, port),
+        "url": shared.url,
         "port": port,
-        "listening": listening,
+        "listening": shared.listening,
         "note": note,
     })
     .to_string())
