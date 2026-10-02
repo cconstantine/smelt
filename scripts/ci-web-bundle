@@ -36,9 +36,17 @@ trap 'exit 143' TERM INT
 setsid bash -c "$dx" >"$log" 2>&1 &
 pid=$!
 # Only a group dx leads: were it this script's own, stopping it would stop
-# the caller too.
-group=$(ps -o pgid= -p "$pid" | tr -d ' ')
-[ "$group" = "$pid" ] || group=""
+# the caller too. The child may not have made its session yet, so wait
+# (up to 5 s) for it to.
+for _ in $(seq 50); do
+    g=$(ps -o pgid= -p "$pid" | tr -d ' ')
+    if [ "$g" = "$pid" ]; then
+        group=$g
+        break
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+done
 tail -n +1 -f --pid="$pid" "$log" &
 tailer=$!
 
