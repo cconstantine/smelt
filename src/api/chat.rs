@@ -1248,7 +1248,7 @@ fn run_turn_bounded<'a>(
                         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't keep a stopped turn's message"),
                     }
                 }
-                record_stop(pool, conversation_id).await;
+                end_stopped_turn(pool, conversation_id).await;
                 return Err(ServerFnError::new(TURN_STOPPED));
             }
         };
@@ -1277,7 +1277,7 @@ fn run_turn_bounded<'a>(
         }
         // Stopped mid-turn: the body, and its hold on the lock, is gone.
         let _turn = lock.lock().await;
-        record_stop(pool, conversation_id).await;
+        end_stopped_turn(pool, conversation_id).await;
         Err(ServerFnError::new(TURN_STOPPED))
     })
 }
@@ -1299,6 +1299,18 @@ fn relay_reply_delta(conversation_id: i64, delta: &str) {
             offset,
         },
     );
+}
+
+/// What a stopped turn leaves: no reply in progress, on the server or in
+/// any tab, even while another turn is still in flight (the last turn
+/// ending clears it too, but a queued one may not end soon; SME-91), and
+/// the stop noted (`record_stop`). Call holding the turn lock: replies
+/// only stream under it, so this can't clear another turn's.
+#[cfg(feature = "server")]
+async fn end_stopped_turn(pool: &PgPool, conversation_id: i64) {
+    clear_reply_in_progress(conversation_id);
+    crate::events::publish(conversation_id, crate::events::ConversationEvent::ReplyReset {});
+    record_stop(pool, conversation_id).await;
 }
 
 /// Notes in the conversation that the user stopped it (`STOP_NOTICE`),
@@ -3555,6 +3567,47 @@ mod tests {
         let saved = db::list_messages(&pool, conversation.id).await.expect("list");
         let copies = saved.iter().filter(|m| m.content.contains("\"hello\"")).count();
         assert_eq!(copies, 1, "the user's message is saved once: {saved:?}");
+        resume_turns(conversation.id);
+    }
+
+    /// SME-91: a stopped reply doesn't stay on screen while another turn
+    /// is still in flight: the stop clears it and tells every tab.
+    #[sqlx::test]
+    async fn test_a_stop_clears_the_reply_even_with_another_turn_in_flight(pool: PgPool) {
+        let _guard = lock_turn_tests();
+        let conversation = db::create_conversation_with_id(&pool, 9100000092)
+            .await
+            .expect("create conversation");
+        start_hanging_mock_upstream(&pool).await;
+
+        let turn = tokio::spawn({
+            let pool = pool.clone();
+            async move { run_turn(&pool, conversation.id, hello(), None).await }
+        });
+        // The turn is waiting on the model by now; its reply has begun.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        relay_reply_delta(conversation.id, "Once upon a ");
+        let _another = TurnInFlight::start(conversation.id);
+        let mut rx = events::subscribe(conversation.id);
+
+        stop_turn_now(conversation.id);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), turn)
+            .await
+            .expect("the turn ends after the stop");
+
+        assert_eq!(reply_in_progress(conversation.id), None, "the stopped reply is cleared");
+        let reset = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match rx.recv().await {
+                    Ok(events::ConversationEvent::ReplyReset {}) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(reset, "tabs are told to drop the stopped reply");
         resume_turns(conversation.id);
     }
 
