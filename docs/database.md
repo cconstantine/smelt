@@ -14,7 +14,7 @@ pub fn get() -> &'static PgPool { /* panics if init() hasn't run yet */ }
 
 `main.rs` calls `db::init()` once at startup, before serving, then runs `sqlx::migrate!()` against it. `init()` panics if `DATABASE_URL` isn't set or doesn't parse, opens a pool of at most 5 connections, and retries a failed connect up to 10 times, 500 ms apart (Postgres may still be starting), before panicking.
 
-Server functions in `src/api/` (`chat.rs`, `git.rs`, `language_servers.rs`, `mcp.rs`, `pods.rs`, `sandbox_volumes.rs`) call the `db.rs` functions directly, passing `db::get()` as the pool argument. Server code outside `api/` (`sandbox.rs`, `git.rs`, `mcp_oauth.rs`, `anthropic/tools.rs`, `lsp/`, ...) doesn't reach for `db::get()` itself: it takes a `&PgPool` parameter, passed down from a server function or from `main.rs`.
+Server functions in `src/api/` (`chat.rs`, `git.rs`, `language_servers.rs`, `mcp.rs`, `pods.rs`, `sandbox_volumes.rs`) call the `db.rs` functions directly, passing `db::get()` as the pool argument. Server code outside `api/` (`sandbox/`, `git.rs`, `mcp_oauth.rs`, `anthropic/tools.rs`, `lsp/`, ...) doesn't reach for `db::get()` itself: it takes a `&PgPool` parameter, passed down from a server function or from `main.rs`.
 
 ## Query pattern
 
@@ -63,7 +63,7 @@ Three unique violations are mapped that way today:
 
 - `language_servers.name`: `lsp/config.rs` returns "A language server named … already exists."
 - `ssh_keys_only_one`: `git.rs` returns the "There's already an SSH key" refusal when another request added a key meanwhile.
-- `sandbox_pods_one_live_per_conversation`: `sandbox.rs` returns `SandboxError::PodAlreadyExists`.
+- `sandbox_pods_one_live_per_conversation`: `sandbox` returns `SandboxError::PodAlreadyExists`.
 
 Any other violation (e.g. a duplicate `mcp_servers.name` or `sandbox_volumes.name`) reaches the browser as the raw Postgres message (`duplicate key value violates unique constraint "..."`).
 
