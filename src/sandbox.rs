@@ -968,11 +968,13 @@ fn note_docker_restarts(
     }
     let (count, reason) = docker_restart_to_report(pod, entry.restarts)?;
     entry.restarts = count;
-    // The exit seen before this restart explains only this one.
-    let remembered = entry.exit_reason.take();
     if initial && !known {
+        // A starting point, not a restart: an exit it shows explains the
+        // restart to come, so it's kept (SME-85's second code review).
         return None;
     }
+    // The exit seen before this restart explains only this one.
+    let remembered = entry.exit_reason.take();
     Some(match reason.or(remembered) {
         Some(reason) => DockerRestart::Report { pod_id, reason },
         None => DockerRestart::Recheck { pod_id },
@@ -4020,6 +4022,21 @@ mod tests {
         note_docker_restarts(&mut seen, &known, true);
         let new_pod = named(pod_with_docker_status(2, Some("OOMKilled")), "sandbox-8");
         assert_eq!(note_docker_restarts(&mut seen, &new_pod, true), None);
+    }
+
+    /// A first listing whose sidecar has already stopped again: its count
+    /// is a starting point, and the exit it shows explains the restart to
+    /// come (SME-85's second code review).
+    #[test]
+    fn test_an_exit_in_a_first_listing_explains_the_next_restart() {
+        let mut seen = HashMap::new();
+        let listed = named(pod_with_docker_exited(2, "OOMKilled"), "sandbox-7");
+        assert_eq!(note_docker_restarts(&mut seen, &listed, true), None);
+        let restarted = named(pod_with_docker_status(3, None), "sandbox-7");
+        assert_eq!(
+            note_docker_restarts(&mut seen, &restarted, false),
+            Some(DockerRestart::Report { pod_id: 7, reason: "OOMKilled".to_string() })
+        );
     }
 
     /// An exit remembered for one restart doesn't explain the next.
