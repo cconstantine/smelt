@@ -797,15 +797,16 @@ pub(crate) async fn save_notice_between_turns(
     conversation_id: i64,
     text: String,
 ) -> Result<Message, sqlx::Error> {
-    let lock = conversation_lock(conversation_id);
-    let _turn = lock.lock().await;
-    let saved = db::create_message(
-        pool,
-        conversation_id,
-        "user",
-        &[anthropic::ContentBlock::Text { text }],
-    )
-    .await?;
+    let saved = {
+        let lock = conversation_lock(conversation_id);
+        let _turn = lock.lock().await;
+        db::create_message(pool, conversation_id, "user", &[anthropic::ContentBlock::Text { text }]).await
+    };
+    // Unless a turn is in flight, whose end does it.
+    if !turn_running(conversation_id) {
+        release_idle_turn_state(conversation_id);
+    }
+    let saved = saved?;
     crate::events::publish(
         conversation_id,
         crate::events::ConversationEvent::MessagesAppended {
@@ -1190,12 +1191,39 @@ impl Drop for TurnInFlight {
         if last {
             // A stopped or failed turn leaves no reply in progress.
             clear_reply_in_progress(self.0);
+            release_idle_turn_state(self.0);
             crate::events::publish(
                 self.0,
                 crate::events::ConversationEvent::TurnState { running: false },
             );
             crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
         }
+    }
+}
+
+/// Frees `conversation_id`'s turn lock and stop counter once no one has
+/// them (SME-91): the lock only when the map's is the last handle, so one
+/// in use is never replaced by a fresh one, and the stop counter when no
+/// turn listens to it (a stop with nothing running only pauses). Its kept
+/// error's entry too when it holds no error. Each is made again on next
+/// use. Under each map's lock, which handing one out also takes.
+#[cfg(feature = "server")]
+fn release_idle_turn_state(conversation_id: i64) {
+    {
+        let mut locks = CONVERSATION_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        if locks.get(&conversation_id).is_some_and(|lock| Arc::strong_count(lock) == 1) {
+            locks.remove(&conversation_id);
+        }
+    }
+    {
+        let mut stops = TURN_STOPS.lock().unwrap_or_else(|e| e.into_inner());
+        if stops.get(&conversation_id).is_some_and(|stops| stops.counter.receiver_count() == 0) {
+            stops.remove(&conversation_id);
+        }
+    }
+    let mut errors = TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+    if errors.get(&conversation_id).is_some_and(|kept| kept.error.is_none()) {
+        errors.remove(&conversation_id);
     }
 }
 
@@ -1243,8 +1271,10 @@ fn run_turn_bounded<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
 {
     Box::pin(async move {
-        let mut stop = stop_receiver(conversation_id);
+        // Before the stop receiver, so it's dropped after it: the last turn
+        // ending frees the stop counter once nothing listens to it.
         let _in_flight = TurnInFlight::start(conversation_id);
+        let mut stop = stop_receiver(conversation_id);
         // Any new turn replaces the last failure (SME-51 code review 1).
         let generation = new_turn_generation(conversation_id);
         let result = run_turn_stoppable(pool, conversation_id, new_message, on_delta, max_turns, &mut stop).await;
@@ -2101,7 +2131,28 @@ pub async fn subscribe_conversation_events(
     // page load or reconnect used to leave a subscriber behind for good.
     // Here the response pulls events as it sends them, and dropping it
     // (the tab going away) drops the subscription.
-    Ok(ServerEvents::from_stream(conversation_event_stream(id)))
+    Ok(ServerEvents::from_stream(open_conversation_events(db::get(), id).await?))
+}
+
+/// `id`'s event stream (`conversation_event_stream`), refused for a
+/// conversation that doesn't exist: a tab still reconnecting to a deleted
+/// one would otherwise make it a channel again, for good (SME-91).
+/// Checked again once subscribed, for a delete landing in between; the
+/// refused stream's subscription frees the channel it made.
+#[cfg(feature = "server")]
+async fn open_conversation_events(
+    pool: &PgPool,
+    id: i64,
+) -> ServerFnResult<impl futures_util::Stream<Item = Result<events::ConversationEvent, axum::BoxError>> + use<>> {
+    let exists = || async { db::conversation_exists(pool, id).await.map_err(ServerFnError::new) };
+    if !exists().await? {
+        return Err(ServerFnError::new("conversation not found"));
+    }
+    let stream = conversation_event_stream(id);
+    if !exists().await? {
+        return Err(ServerFnError::new("conversation not found"));
+    }
+    Ok(stream)
 }
 
 /// Everything a tab watching `id` hears: that conversation's events, plus
@@ -2781,12 +2832,13 @@ mod tests {
     /// A subscription belongs to its connection: once the response is
     /// dropped (the tab closed or reloaded), nothing should still be
     /// listening on the conversation's channel.
-    #[tokio::test]
-    async fn test_a_dropped_event_subscription_stops_listening() {
-        let conversation_id = 9_000_000_007;
-        let subscription = subscribe_conversation_events(conversation_id)
-            .await
-            .expect("subscribe");
+    #[sqlx::test]
+    async fn test_a_dropped_event_subscription_stops_listening(pool: PgPool) {
+        let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+        // What `subscribe_conversation_events` answers, on this test's pool.
+        let subscription = ServerEvents::from_stream(
+            open_conversation_events(&pool, conversation_id).await.expect("subscribe"),
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(events::subscriber_count(conversation_id), 1);
         drop(subscription);
@@ -3711,6 +3763,44 @@ mod tests {
         .unwrap_or(false);
         assert!(reset, "tabs are told to drop the stopped reply");
         resume_turns(conversation.id);
+    }
+
+    /// SME-91: a tab still reconnecting to a deleted conversation (or any
+    /// that doesn't exist) is refused, and makes no channel for it.
+    #[sqlx::test]
+    async fn test_subscribing_to_a_missing_conversation_is_refused(pool: PgPool) {
+        let missing = 9_100_000_099;
+        assert!(open_conversation_events(&pool, missing).await.is_err());
+        assert!(!events::has_channel(missing), "a refused subscription leaves no channel");
+
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let stream = open_conversation_events(&pool, conversation.id).await;
+        assert!(stream.is_ok(), "an existing conversation's events open");
+    }
+
+    /// SME-91: a conversation's turn lock and stop counter go once its
+    /// turns are done, but not while someone still holds the lock.
+    #[sqlx::test]
+    async fn test_a_conversations_turn_state_is_freed_after_its_turns(pool: PgPool) {
+        let _guard = lock_turn_tests();
+        let conversation = db::create_conversation_with_id(&pool, 9100000191)
+            .await
+            .expect("create conversation");
+        start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
+        let turn_state_kept = |id: i64| {
+            (
+                CONVERSATION_LOCKS.lock().expect("locks").contains_key(&id),
+                TURN_STOPS.lock().expect("stops").contains_key(&id),
+            )
+        };
+
+        run_turn(&pool, conversation.id, hello(), None).await.expect("a turn");
+        assert_eq!(turn_state_kept(conversation.id), (false, false), "freed after the turn");
+
+        let held = conversation_lock(conversation.id);
+        run_turn(&pool, conversation.id, hello(), None).await.expect("a turn");
+        assert!(turn_state_kept(conversation.id).0, "a lock someone holds isn't replaced");
+        drop(held);
     }
 
     /// Every tab can tell a turn is running, including one a background
