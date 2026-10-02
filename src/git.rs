@@ -916,9 +916,13 @@ mod server {
                 Some(repo) => repo,
                 None => return Ok(None),
             },
-            None => db::create_conversation_repo(pool, conversation_id, url, key, branch, dir)
-                .await
-                .map_err(|e| e.to_string())?,
+            // Another request recorded a clone at `dir` since this one
+            // was planned: the same race, for a fresh clone.
+            None => match db::create_conversation_repo(pool, conversation_id, url, key, branch, dir).await {
+                Ok(repo) => repo,
+                Err(sqlx::Error::Database(e)) if e.is_unique_violation() => return Ok(None),
+                Err(e) => return Err(e.to_string()),
+            },
         };
         publish_repos(pool, conversation_id).await;
         Ok(Some(repo))
@@ -2065,6 +2069,25 @@ mod server {
                     .is_none(),
                 "the second retry runs nothing"
             );
+        }
+
+        /// Two fresh clones into the same directory at once (\"Work on a
+        /// repo\" while the model clones it): the second gets the first's
+        /// checkout, not a database error (SME-86 code review 2).
+        #[sqlx::test]
+        async fn test_a_fresh_clone_that_lost_the_race_gets_the_winners_checkout(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let url = "git@github.com:o/r.git";
+            let first = record_clone(&pool, conversation.id, url, None, "github.com/o/r", "r", None)
+                .await
+                .expect("the first clone")
+                .expect("recorded");
+            let second = record_clone(&pool, conversation.id, url, None, "github.com/o/r", "r", None)
+                .await
+                .expect("the second clone isn't a database error");
+            assert!(second.is_none(), "the second runs nothing: {second:?}");
+            let existing = after_lost_race(&pool, conversation.id, url, None, "r").await.expect("its checkout");
+            assert_eq!(existing.id, first.id);
         }
 
         /// A request whose retry lost the race gets the other request's
