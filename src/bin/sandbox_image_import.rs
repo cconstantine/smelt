@@ -357,13 +357,26 @@ async fn stream_into(
         let _ = stderr.read_to_string(&mut buf).await;
         buf
     };
-    let (write_res, _out, err) = tokio::join!(write_fut, drain_out, drain_err);
+    let (write_res, out, err) = tokio::join!(write_fut, drain_out, drain_err);
     write_res?;
     attached.join().await.ok();
     if !err.trim().is_empty() {
         return Err(format!("streaming tarball into loader pod: {err}").into());
     }
+    remote_write_finished(&out)?;
     Ok(())
+}
+
+/// Whether the loader's `cat > … && echo done` got to its `done`, given its
+/// stdout. Every byte can be handed to the exec's stdin while the loader
+/// dies before `cat` has written them, so a clean local write isn't enough
+/// (SME-89 code review).
+fn remote_write_finished(stdout: &str) -> Result<(), String> {
+    if stdout.lines().any(|line| line.trim() == "done") {
+        Ok(())
+    } else {
+        Err(format!("the loader's cat didn't finish writing the tarball (its output: {:?})", stdout.trim()))
+    }
 }
 
 /// `ctr images import`s the streamed tarball.
@@ -501,6 +514,14 @@ mod tests {
         assert!(running.contains("with the pod still Running") && !running.contains("stopped"), "{running}");
         let unknown = stream_failure("l", &LoaderState::Unknown, t, t, 42, "broken pipe");
         assert!(unknown.contains("couldn't read the pod's state") && !unknown.contains("stopped"), "{unknown}");
+    }
+
+    #[test]
+    fn test_a_stream_counts_only_once_the_loader_says_done() {
+        assert!(remote_write_finished("done\n").is_ok());
+        let cut_off = remote_write_finished("").expect_err("no done");
+        assert!(cut_off.contains("didn't finish"), "{cut_off}");
+        assert!(remote_write_finished("not done\n").is_err());
     }
 
     fn phase(phase: &str, reason: Option<&str>) -> LoaderState {
