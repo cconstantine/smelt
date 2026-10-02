@@ -71,6 +71,18 @@ drop_scratch_db() {
     echo "dropped the scratch database"
 }
 
+# NAME's value in the worktree's .env, as dotenvy reads it: the last line
+# setting it, with or without `export`, unquoted.
+env_file_value() {
+    local value
+    value=$(sed -En "s/^(export[[:space:]]+)?$1=//p" "$worktree/.env" 2>/dev/null | tail -n 1)
+    case "$value" in
+        \"*\") value=${value#\"}; value=${value%\"} ;;
+        \'*\') value=${value#\'}; value=${value%\'} ;;
+    esac
+    echo "$value"
+}
+
 # Headless Chrome's cache directory: this checkout's, or else the main
 # checkout's (a worktree has none of its own).
 browser_check_cache() {
@@ -147,7 +159,7 @@ start() {
     # One already set (environment, else .env) is kept only when absolute:
     # the server runs from the worktree, where a relative one finds nothing.
     local cache given
-    given=${BROWSER_CHECK_CACHE:-$(sed -n 's/^BROWSER_CHECK_CACHE=//p' "$worktree/.env" 2>/dev/null | tail -n 1)}
+    given=${BROWSER_CHECK_CACHE:-$(env_file_value BROWSER_CHECK_CACHE)}
     if [[ "$given" != /* ]] && cache=$(browser_check_cache); then
         # Before the caller's overrides, so an explicit one still wins.
         overrides=("BROWSER_CHECK_CACHE=$cache" "${overrides[@]}")
