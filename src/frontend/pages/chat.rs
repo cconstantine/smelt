@@ -3575,10 +3575,6 @@ fn ChatPanel(
         });
     }
 
-    // Fetches a fresh detail snapshot every time it's opened, rather than
-    // caching — matches the idea's "most recently sent request" decision;
-    // reopening after a new turn should show that turn's numbers, not a
-    // stale first-open snapshot.
     // Closes the detail view from inside it (its ×, Escape, a click
     // outside) and puts focus back on the bar that opened it.
     let mut close_context_detail = move || {
@@ -3590,6 +3586,10 @@ fn ChatPanel(
         }
     };
 
+    // Fetches a fresh detail snapshot every time it's opened, rather than
+    // caching — matches the idea's "most recently sent request" decision;
+    // reopening after a new turn should show that turn's numbers, not a
+    // stale first-open snapshot.
     let mut open_context_detail = move || {
         let Some(id) = selected() else { return };
         context_detail_open.set(true);
