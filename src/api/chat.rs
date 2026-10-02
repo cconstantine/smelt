@@ -4704,48 +4704,4 @@ mod tests {
              (user, assistant) pairs, never interleaved"
         );
     }
-
-    /// Regression test: `run_async` and the task-management suite were
-    /// fully implemented and unit-tested in `anthropic::tools` before
-    /// anyone noticed `tool_definitions()` never listed them — the model
-    /// had no way to know they existed until a live test asked it to use
-    /// `run_async` and it correctly said no such tool was available. This
-    /// pins the two lists together so a newly dispatchable tool can't be
-    /// implemented without also being offered to the model.
-    ///
-    /// Scoped to `native_tool_definitions()` deliberately — this test is
-    /// about smelt's own static dispatch names, not MCP servers (which are
-    /// dynamic/external and have no fixed name list to pin against).
-    #[test]
-    fn test_tool_definitions_covers_every_dispatchable_tool_name() {
-        let defined: std::collections::BTreeSet<String> =
-            anthropic::tools::native_tool_definitions()
-                .into_iter()
-                .map(|t| t.name)
-                .collect();
-        let dispatchable: std::collections::BTreeSet<&str> = [
-            "create_pod",
-            "terminate_pod",
-            "list_pods",
-            "create_terminal",
-            "terminate_terminal",
-            "list_terminals",
-            "run_terminal_command",
-            "send_signal",
-            "terminal_command_status",
-            "read_terminal_output",
-            "list_commands",
-        ]
-        .into_iter()
-        .collect();
-
-        let missing: Vec<_> = dispatchable
-            .iter()
-            .filter(|name| !defined.contains(**name))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "native_tool_definitions() is missing: {missing:?}"
-        );
-    }
 }

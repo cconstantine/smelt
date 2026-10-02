@@ -1,7 +1,7 @@
 //! Per-conversation live event bus — the shared home for pushing updates
-//! that happen with no `send_message` request in flight (a background
-//! task's tick or completion), so neither `anthropic::tools` nor `api::chat`
-//! has to depend on the other to publish or read these. `tools.rs` calls
+//! that happen with no `send_message` request in flight (a command's
+//! output or completion), so neither `anthropic::tools` nor `api::chat`
+//! has to depend on the other to publish or read these. The tools call
 //! `publish`; `chat.rs` calls both `publish` (after persisting a batch of
 //! rows) and `subscribe` (to relay everything to a browser tab).
 
