@@ -1066,18 +1066,30 @@ fn record_saved(conversation_id: i64, persisted: &mut Vec<Message>, saved: Messa
 /// lock) and ends as soon as it changes, so a stop ends the running turn
 /// and any queued behind it, but not turns that start afterwards.
 #[cfg(feature = "server")]
-static TURN_STOPS: LazyLock<Mutex<HashMap<i64, tokio::sync::watch::Sender<u64>>>> =
+static TURN_STOPS: LazyLock<Mutex<HashMap<i64, TurnStops>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A conversation's stop counter, and the last stop already noted in it
+/// (`record_stop`), so one stop is noted once however many turns it ends.
+#[cfg(feature = "server")]
+struct TurnStops {
+    counter: tokio::sync::watch::Sender<u64>,
+    noted: u64,
+}
+
+#[cfg(feature = "server")]
+impl Default for TurnStops {
+    fn default() -> Self {
+        TurnStops { counter: tokio::sync::watch::channel(0).0, noted: 0 }
+    }
+}
 
 /// A receiver for `conversation_id`'s stop counter, with its current value
 /// already seen, so only a later stop wakes it.
 #[cfg(feature = "server")]
 fn stop_receiver(conversation_id: i64) -> tokio::sync::watch::Receiver<u64> {
     let mut stops = TURN_STOPS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut receiver = stops
-        .entry(conversation_id)
-        .or_insert_with(|| tokio::sync::watch::channel(0).0)
-        .subscribe();
+    let mut receiver = stops.entry(conversation_id).or_default().counter.subscribe();
     receiver.borrow_and_update();
     receiver
 }
@@ -1095,7 +1107,7 @@ pub(crate) fn stop_turn_now(conversation_id: i64) {
         .insert(conversation_id);
     let stops = TURN_STOPS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(stop) = stops.get(&conversation_id) {
-        stop.send_modify(|count| *count += 1);
+        stop.counter.send_modify(|count| *count += 1);
     }
 }
 
@@ -1241,6 +1253,7 @@ fn run_turn_bounded<'a>(
         let guard = tokio::select! {
             guard = lock.clone().lock_owned() => guard,
             _ = stop.changed() => {
+                let stopped_by = *stop.borrow_and_update();
                 let _turn = lock.lock().await;
                 if let Some(message) = &new_message {
                     match db::create_message(pool, conversation_id, &message.role, &message.content).await {
@@ -1248,7 +1261,7 @@ fn run_turn_bounded<'a>(
                         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't keep a stopped turn's message"),
                     }
                 }
-                end_stopped_turn(pool, conversation_id).await;
+                end_stopped_turn(pool, conversation_id, stopped_by).await;
                 return Err(ServerFnError::new(TURN_STOPPED));
             }
         };
@@ -1276,8 +1289,9 @@ fn run_turn_bounded<'a>(
             _ = stop.changed() => {}
         }
         // Stopped mid-turn: the body, and its hold on the lock, is gone.
+        let stopped_by = *stop.borrow_and_update();
         let _turn = lock.lock().await;
-        end_stopped_turn(pool, conversation_id).await;
+        end_stopped_turn(pool, conversation_id, stopped_by).await;
         Err(ServerFnError::new(TURN_STOPPED))
     })
 }
@@ -1304,19 +1318,32 @@ fn relay_reply_delta(conversation_id: i64, delta: &str) {
 /// What a stopped turn leaves: no reply in progress, on the server or in
 /// any tab, even while another turn is still in flight (the last turn
 /// ending clears it too, but a queued one may not end soon; SME-91), and
-/// the stop noted (`record_stop`). Call holding the turn lock: replies
-/// only stream under it, so this can't clear another turn's.
+/// stop `stopped_by` noted (`record_stop`). Call holding the turn lock:
+/// replies only stream under it, so this can't clear another turn's.
 #[cfg(feature = "server")]
-async fn end_stopped_turn(pool: &PgPool, conversation_id: i64) {
+async fn end_stopped_turn(pool: &PgPool, conversation_id: i64, stopped_by: u64) {
     clear_reply_in_progress(conversation_id);
     crate::events::publish(conversation_id, crate::events::ConversationEvent::ReplyReset {});
-    record_stop(pool, conversation_id).await;
+    record_stop(pool, conversation_id, stopped_by).await;
 }
 
 /// Notes in the conversation that the user stopped it (`STOP_NOTICE`),
-/// once however many turns the stop ended. Call holding the turn lock.
+/// once however many turns the stop (`stopped_by`, the stop counter's
+/// value) ended: the turns it ended each come here, and a queued one's
+/// own message can land after the first note (SME-91). Also not when the
+/// last message already is the note. Call holding the turn lock.
 #[cfg(feature = "server")]
-async fn record_stop(pool: &PgPool, conversation_id: i64) {
+async fn record_stop(pool: &PgPool, conversation_id: i64, stopped_by: u64) {
+    let first_for_this_stop = {
+        let mut stops = TURN_STOPS.lock().unwrap_or_else(|e| e.into_inner());
+        let stops = stops.entry(conversation_id).or_default();
+        let first = stopped_by > stops.noted;
+        stops.noted = stops.noted.max(stopped_by);
+        first
+    };
+    if !first_for_this_stop {
+        return;
+    }
     let already = db::list_messages(pool, conversation_id)
         .await
         .ok()
@@ -3765,6 +3792,48 @@ mod tests {
         })
         .await;
         assert!(saved.is_ok(), "the queued notice was lost when the turn was stopped");
+        resume_turns(conversation.id);
+    }
+
+    /// SME-91: one Stop is noted once, however many turns it ended, even
+    /// when the queued turns' own messages land after the first note.
+    #[sqlx::test]
+    async fn test_one_stop_is_noted_once(pool: PgPool) {
+        let _guard = lock_turn_tests();
+        let conversation = db::create_conversation_with_id(&pool, 9100000093)
+            .await
+            .expect("create conversation");
+        let lock = conversation_lock(conversation.id);
+        let running = lock.lock().await;
+
+        let queued = |text: &'static str| {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let message = anthropic::AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![anthropic::ContentBlock::Text { text: text.to_string() }],
+                };
+                run_turn(&pool, conversation.id, message, None).await
+            })
+        };
+        let first = queued("first notice");
+        let second = queued("second notice");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        stop_turn_now(conversation.id);
+        drop(running);
+        for turn in [first, second] {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), turn)
+                .await
+                .expect("a stopped turn ends")
+                .expect("join");
+            assert_eq!(result.err().map(|e| chat_error_text(&e)).as_deref(), Some(TURN_STOPPED));
+        }
+
+        let saved = db::list_messages(&pool, conversation.id).await.expect("list");
+        let notes = saved.iter().filter(|m| m.content.contains(STOP_NOTICE)).count();
+        assert_eq!(notes, 1, "one stop, one note: {saved:?}");
+        assert!(saved.iter().any(|m| m.content.contains("first notice")));
+        assert!(saved.iter().any(|m| m.content.contains("second notice")));
         resume_turns(conversation.id);
     }
 
