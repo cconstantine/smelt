@@ -871,7 +871,7 @@ pub(crate) fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<
 /// fresh lock and then fails, since the conversation no longer exists.
 #[cfg(feature = "server")]
 fn forget_conversation_lock(conversation_id: i64) {
-    remember_turn_error(conversation_id, None);
+    TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).remove(&conversation_id);
     CONVERSATION_LOCKS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -915,6 +915,7 @@ pub(crate) fn run_turn<'a>(
         Some(new_message),
         on_delta,
         MAX_TURNS,
+        false,
     )
 }
 
@@ -946,7 +947,7 @@ pub(crate) async fn wake_conversation(
     if is_paused(conversation_id) {
         return Ok(Vec::new());
     }
-    let result = run_turn_bounded(pool, conversation_id, None, None, MAX_TURNS).await;
+    let result = run_turn_bounded(pool, conversation_id, None, None, MAX_TURNS, false).await;
     // A stop is the user's doing, not a failure to reach the model.
     if let Err(e) = &result
         && chat_error_text(e) != TURN_STOPPED
@@ -1238,13 +1239,40 @@ fn run_turn_bounded<'a>(
     new_message: Option<anthropic::AnthropicMessage>,
     on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
     max_turns: usize,
+    keep_error: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
 {
     Box::pin(async move {
         let mut stop = stop_receiver(conversation_id);
         let _in_flight = TurnInFlight::start(conversation_id);
         // Any new turn replaces the last failure (SME-51 code review 1).
-        remember_turn_error(conversation_id, None);
+        let generation = new_turn_generation(conversation_id);
+        let result = run_turn_stoppable(pool, conversation_id, new_message, on_delta, max_turns, &mut stop).await;
+        // Kept for a tab that reconnects, unless a newer turn has started
+        // since this one did: its outcome is the one to show (SME-91).
+        if keep_error
+            && let Err(e) = &result
+            && chat_error_text(e) != TURN_STOPPED
+        {
+            keep_turn_error(conversation_id, generation, chat_error_text(e));
+        }
+        result
+    })
+}
+
+/// `run_turn_bounded`'s turn: waits for the turn lock, saves the turn's
+/// message, and runs it, ending early on a stop (`stop`).
+#[cfg(feature = "server")]
+fn run_turn_stoppable<'a: 'b, 'b>(
+    pool: &'a PgPool,
+    conversation_id: i64,
+    new_message: Option<anthropic::AnthropicMessage>,
+    on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
+    max_turns: usize,
+    stop: &'b mut tokio::sync::watch::Receiver<u64>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'b>>
+{
+    Box::pin(async move {
         let lock = conversation_lock(conversation_id);
         // Queued behind another turn until the lock is free. Stopped while
         // queued: keep the message anyway (a finished command's notice,
@@ -1385,18 +1413,17 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     }
     // The user writing again ends any pause from an earlier stop.
     resume_turns(id);
-    // At once, not only when the turn starts: it may queue behind another.
-    remember_turn_error(id, None);
+    // At once, not only when the turn starts: it may queue behind another,
+    // and a turn already running mustn't keep its error over this one.
+    new_turn_generation(id);
     let new_message = anthropic::AnthropicMessage {
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text: content }],
     };
     tokio::spawn(async move {
-        if let Err(e) = run_turn(&pool, id, new_message, None).await {
+        // Its failure is kept for a reconnecting tab (`keep_error`).
+        if let Err(e) = run_turn_bounded(&pool, id, Some(new_message), None, MAX_TURNS, true).await {
             let message = chat_error_text(&e);
-            if message != TURN_STOPPED {
-                remember_turn_error(id, Some(message.clone()));
-            }
             crate::events::publish(id, crate::events::ConversationEvent::TurnError { message });
         }
     });
@@ -1406,20 +1433,53 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
 /// Each conversation's last failed turn's error, until the user writes
 /// again, for a tab that connects after the `TurnError` event (SME-51 B11).
 #[cfg(feature = "server")]
-static TURN_ERRORS: LazyLock<Mutex<HashMap<i64, String>>> = LazyLock::new(Default::default);
+static TURN_ERRORS: LazyLock<Mutex<HashMap<i64, KeptTurnError>>> = LazyLock::new(Default::default);
 
+/// A conversation's kept error, and its turn generation: bumped by the
+/// user sending and by every turn starting, so a turn's failure is kept
+/// only if no newer turn has started since it did (SME-91).
 #[cfg(feature = "server")]
-fn remember_turn_error(conversation_id: i64, error: Option<String>) {
+#[derive(Default)]
+struct KeptTurnError {
+    generation: u64,
+    error: Option<String>,
+}
+
+/// Starts a new turn generation for `conversation_id`, clearing its kept
+/// error, and returns the new generation.
+#[cfg(feature = "server")]
+fn new_turn_generation(conversation_id: i64) -> u64 {
     let mut errors = TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
-    match error {
-        Some(error) => errors.insert(conversation_id, error),
-        None => errors.remove(&conversation_id),
-    };
+    let kept = errors.entry(conversation_id).or_default();
+    kept.generation += 1;
+    kept.error = None;
+    kept.generation
+}
+
+/// Keeps `error` as `conversation_id`'s, if `generation` is still its
+/// latest turn generation.
+#[cfg(feature = "server")]
+fn keep_turn_error(conversation_id: i64, generation: u64, error: String) {
+    let mut errors = TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(kept) = errors.get_mut(&conversation_id)
+        && kept.generation == generation
+    {
+        kept.error = Some(error);
+    }
+}
+
+#[cfg(test)]
+fn remember_turn_error(conversation_id: i64, error: Option<String>) {
+    TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).entry(conversation_id).or_default().error = error;
 }
 
 #[cfg(feature = "server")]
 fn last_turn_error(conversation_id: i64) -> Option<String> {
-    TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).get(&conversation_id).cloned()
+    TURN_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&conversation_id)
+        .and_then(|kept| kept.error.clone())
 }
 
 /// The conversation's last failed turn's error, if the user hasn't written
@@ -3837,6 +3897,74 @@ mod tests {
         resume_turns(conversation.id);
     }
 
+    /// SME-91 (SME-51 code review 2): a turn that fails after the user
+    /// already sent the next message doesn't leave its error behind once
+    /// that next turn succeeds.
+    #[sqlx::test]
+    async fn test_an_older_turns_failure_isnt_kept_after_a_newer_turn(pool: PgPool) {
+        let _guard = lock_turn_tests();
+        let conversation = db::create_conversation_with_id(&pool, 9100000094)
+            .await
+            .expect("create conversation");
+        // The first request waits for `release`, then fails; later ones
+        // answer.
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let gate = Arc::new(tokio::sync::Mutex::new(Some((reached_tx, release_rx))));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let gate = gate.clone();
+                async move {
+                    if let Some((reached, release)) = gate.lock().await.take() {
+                        let _ = reached.send(());
+                        let _ = release.await;
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            r#"{"type":"error","error":{"type":"invalid_request_error","message":"turn A failed"}}"#.to_string(),
+                        )
+                            .into_response();
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        text_reply_body("B answered"),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        crate::providers::test_support::add_mock_provider(&pool, addr).await;
+
+        start_turn(pool.clone(), conversation.id, "A".to_string()).await.expect("send A");
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached_rx)
+            .await
+            .expect("A reaches the model")
+            .expect("gate");
+        start_turn(pool.clone(), conversation.id, "B".to_string()).await.expect("send B");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = release_tx.send(());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let messages = db::list_messages(&pool, conversation.id).await.expect("list");
+                if messages.iter().any(|m| m.content.contains("B answered")) && !turn_running(conversation.id) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("B finishes");
+        assert_eq!(last_turn_error(conversation.id), None, "A's error outlived B's success");
+    }
+
     /// A notice waits for a running turn to end before it's saved, and
     /// tells a watching tab once it is.
     #[sqlx::test]
@@ -4803,7 +4931,7 @@ mod tests {
         // than run_turn (which would replay the mock upstream the real
         // MAX_TURNS — 10,000 — times just to prove the same "give up and
         // error" behavior).
-        let result = run_turn_bounded(&pool, conversation.id, Some(new_message), None, 3).await;
+        let result = run_turn_bounded(&pool, conversation.id, Some(new_message), None, 3, false).await;
         assert!(result.is_err(), "expected an error, got {result:?}");
     }
 
