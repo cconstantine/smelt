@@ -975,6 +975,12 @@ fn note_docker_restarts(
     })
 }
 
+/// Forgets the Docker sidecars of pods a re-listing didn't include: they
+/// were deleted while the watch was disconnected, so no `Delete` came.
+fn forget_unlisted_docker(seen: &mut HashMap<i64, DockerSeen>, listed: &std::collections::HashSet<i64>) {
+    seen.retain(|pod_id, _| listed.contains(pod_id));
+}
+
 /// How long `watch_pods` waits before re-reading a pod whose Docker
 /// sidecar restarted with no reason given yet (SME-85).
 const DOCKER_REASON_WAIT: Duration = Duration::from_secs(3);
@@ -3194,6 +3200,7 @@ pub async fn watch_pods(pool: PgPool) {
                 }
             }
             Ok(watcher::Event::InitDone) => {
+                forget_unlisted_docker(&mut docker_restarts, &listed);
                 match db::live_pods_older_than(&pool, RECONCILE_MIN_AGE_SECS).await {
                     Ok(rows) => {
                         for row in rows.into_iter().filter(|row| !listed.contains(&row.id)) {
@@ -3955,6 +3962,17 @@ mod tests {
         );
         let later = named(pod_with_docker_status(1, Some("OOMKilled")), "sandbox-7");
         assert_eq!(note_docker_restarts(&mut seen, &later, false), None, "the re-read reports it");
+    }
+
+    /// A pod deleted while the watch was disconnected never gets a
+    /// `Delete`: the re-listing's end forgets it (SME-85 code review).
+    #[test]
+    fn test_a_relisting_forgets_pods_it_did_not_include() {
+        let mut seen = HashMap::new();
+        note_docker_restarts(&mut seen, &named(pod_with_docker_status(0, None), "sandbox-7"), true);
+        note_docker_restarts(&mut seen, &named(pod_with_docker_status(0, None), "sandbox-8"), true);
+        forget_unlisted_docker(&mut seen, &[8].into_iter().collect());
+        assert_eq!(seen.keys().copied().collect::<Vec<_>>(), vec![8]);
     }
 
     /// An exit remembered for one restart doesn't explain the next.
