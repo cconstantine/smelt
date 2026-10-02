@@ -550,8 +550,10 @@ async fn test_end_to_end_browser_scenarios() {
     let created = std::sync::Mutex::new(Vec::new());
 
     // `catch_unwind` so a failing scenario still gets cleaned up after;
-    // its panic is re-raised once that's done.
-    let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(240), async {
+    // its panic is re-raised once that's done. Boxed: every scenario is in
+    // this one future, which outgrew the test thread's stack once SME-46's
+    // and SME-90's scenarios met (SME-59 splits them up).
+    let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(240), Box::pin(async {
         let conversation = new_conversation(pool, &created).await;
 
         // --- Scenario 1: cold-load panel population, one pod, two terminals
@@ -2070,7 +2072,7 @@ async fn test_end_to_end_browser_scenarios() {
         assert!(!banner_shown(&tab).await, "the reloaded page is current");
         tab.close().await.expect("close the tab");
         page.close().await.expect("close the tab");
-    })))
+    }))))
     .await;
 
     // Cleanup and the leftover check both run before `harness.shutdown()`.
