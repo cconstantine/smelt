@@ -906,11 +906,17 @@ mod server {
         retry: Option<i64>,
     ) -> Result<db::ConversationRepo, String> {
         let repo = match retry {
-            // With what's asked for now, not what failed.
-            Some(id) => db::retry_repo_clone(pool, id, url, key, branch).await,
-            None => db::create_conversation_repo(pool, conversation_id, url, key, branch, dir).await,
-        }
-        .map_err(|e| e.to_string())?;
+            // With what's asked for now, not what failed. Only a failed
+            // clone is retried: a second retry racing this one finds it
+            // cloning again and is refused (SME-86).
+            Some(id) => db::retry_repo_clone(pool, id, url, key, branch)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("/workspace/{dir} is already being cloned again."))?,
+            None => db::create_conversation_repo(pool, conversation_id, url, key, branch, dir)
+                .await
+                .map_err(|e| e.to_string())?,
+        };
         publish_repos(pool, conversation_id).await;
         Ok(repo)
     }
@@ -1060,12 +1066,12 @@ mod server {
         conversation_id: i64,
         repo: db::ConversationRepo,
     ) -> Result<RepoSummary, String> {
-        let guard = CloneGuard::new(pool, repo.id, conversation_id);
+        let guard = CloneGuard::new(pool, &repo, conversation_id);
         let pod_id = match ensure_sandbox(pool, conversation_id).await {
             Ok(pod_id) => pod_id,
             Err(e) => {
                 guard.finish();
-                let _ = db::set_repo_failed(pool, repo.id, &e).await;
+                let _ = db::set_repo_failed(pool, repo.id, repo.attempt, &e).await;
                 publish_repos(pool, conversation_id).await;
                 return Err(e);
             }
@@ -1083,6 +1089,11 @@ mod server {
     /// How a clone that ran out of time starts its error.
     pub const CLONE_TIMED_OUT: &str = "The clone took too long and was stopped";
 
+    /// What an attempt at a clone that a newer attempt replaced is told
+    /// (SME-86): its result isn't the repo's.
+    pub const CLONE_SUPERSEDED: &str =
+        "This clone was superseded by another attempt at the same directory; see the repo's status for how that went.";
+
     /// What a clone cut off before it finished is marked with.
     pub const CLONE_INTERRUPTED: &str =
         "The clone was interrupted (the turn was stopped, or smelt restarted). Clone it again.";
@@ -1092,15 +1103,18 @@ mod server {
     pub(crate) struct CloneGuard {
         pool: PgPool,
         repo_id: i64,
+        /// The attempt it guards: marking it failed can't touch a newer one.
+        attempt: i32,
         conversation_id: i64,
         finished: bool,
     }
 
     impl CloneGuard {
-        pub(crate) fn new(pool: &PgPool, repo_id: i64, conversation_id: i64) -> Self {
+        pub(crate) fn new(pool: &PgPool, repo: &db::ConversationRepo, conversation_id: i64) -> Self {
             CloneGuard {
                 pool: pool.clone(),
-                repo_id,
+                repo_id: repo.id,
+                attempt: repo.attempt,
                 conversation_id,
                 finished: false,
             }
@@ -1116,9 +1130,10 @@ mod server {
             if self.finished {
                 return;
             }
-            let (pool, repo_id, conversation_id) = (self.pool.clone(), self.repo_id, self.conversation_id);
+            let (pool, repo_id, attempt, conversation_id) =
+                (self.pool.clone(), self.repo_id, self.attempt, self.conversation_id);
             tokio::spawn(async move {
-                if let Err(e) = db::set_repo_failed(&pool, repo_id, CLONE_INTERRUPTED).await {
+                if let Err(e) = db::set_repo_failed(&pool, repo_id, attempt, CLONE_INTERRUPTED).await {
                     tracing::warn!(repo_id, error = %e, "couldn't mark an interrupted clone failed");
                 }
                 publish_repos(&pool, conversation_id).await;
@@ -1132,7 +1147,7 @@ mod server {
     /// clone "interrupted".
     async fn record_cloned(
         pool: &PgPool,
-        repo_id: i64,
+        repo: &db::ConversationRepo,
         cloned: &ClonedRepo,
         agents_files: Result<Vec<String>, String>,
         guard: CloneGuard,
@@ -1143,11 +1158,12 @@ mod server {
             Ok(files) => (files, None),
             Err(e) => (Vec::new(), Some(format!("Couldn't list its AGENTS.md files: {e}"))),
         };
-        db::set_repo_ready(pool, repo_id, &cloned.branch, cloned.commit.as_deref(), &files, error.as_deref())
-            .await
-            .map_err(|e| e.to_string())?;
+        let recorded =
+            db::set_repo_ready(pool, repo.id, repo.attempt, &cloned.branch, cloned.commit.as_deref(), &files, error.as_deref())
+                .await
+                .map_err(|e| e.to_string())?;
         guard.finish();
-        Ok(())
+        if recorded { Ok(()) } else { Err(CLONE_SUPERSEDED.to_string()) }
     }
 
     async fn clone_repo_row(
@@ -1173,10 +1189,10 @@ mod server {
                     tracing::warn!(repo = %repo.url, error = %e, "couldn't list AGENTS.md files");
                     e.to_string()
                 });
-                record_cloned(pool, repo.id, &cloned, files, guard).await
+                record_cloned(pool, repo, &cloned, files, guard).await
             }
             Err(e) => {
-                let _ = db::set_repo_failed(pool, repo.id, &e).await;
+                let _ = db::set_repo_failed(pool, repo.id, repo.attempt, &e).await;
                 guard.finish();
                 Err(e)
             }
@@ -1790,7 +1806,7 @@ mod server {
             let typo = db::create_conversation_repo(&pool, conversation.id, "git@github.com:me/app.git", "github.com/me/app", None, "app")
                 .await
                 .expect("repo");
-            db::set_repo_failed(&pool, typo.id, "ERROR: Repository not found.").await.expect("failed");
+            db::set_repo_failed(&pool, typo.id, typo.attempt, "ERROR: Repository not found.").await.expect("failed");
 
             let (shown, pending, _) = start_attach(&pool, conversation.id, "git@github.com:org/app.git", None, None)
                 .await
@@ -1910,12 +1926,12 @@ mod server {
                 .await
                 .expect("repo");
             // Finished: left alone.
-            CloneGuard::new(&pool, repo.id, conversation.id).finish();
+            CloneGuard::new(&pool, &repo, conversation.id).finish();
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let row = db::get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
             assert_eq!(row.status, "cloning");
             // Dropped mid-clone: marked failed, so turns stop waiting on it.
-            drop(CloneGuard::new(&pool, repo.id, conversation.id));
+            drop(CloneGuard::new(&pool, &repo, conversation.id));
             let marked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
                     let row = db::get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
@@ -1937,16 +1953,77 @@ mod server {
             let repo = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
                 .await
                 .expect("repo");
-            let guard = CloneGuard::new(&pool, repo.id, conversation.id);
+            let guard = CloneGuard::new(&pool, &repo, conversation.id);
             let cloned = ClonedRepo {
                 commit: Some("abc".to_string()),
                 branch: "main".to_string(),
             };
-            record_cloned(&pool, repo.id, &cloned, Ok(vec![]), guard).await.expect("record");
+            record_cloned(&pool, &repo, &cloned, Ok(vec![]), guard).await.expect("record");
             // What follows is cut off here.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let row = db::get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
             assert_eq!((row.status.as_str(), row.error.as_deref()), ("ready", None));
+        }
+
+        /// A turn stopped just after the clone was recorded ready, before
+        /// its guard was disarmed: the guard's "interrupted" doesn't undo
+        /// it (SME-86).
+        #[sqlx::test]
+        async fn test_a_guard_firing_after_ready_leaves_the_clone_ready(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let repo = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
+                .await
+                .expect("repo");
+            let guard = CloneGuard::new(&pool, &repo, conversation.id);
+            db::set_repo_ready(&pool, repo.id, repo.attempt, "main", Some("abc"), &[], None)
+                .await
+                .expect("ready");
+            drop(guard);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let row = db::get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
+            assert_eq!((row.status.as_str(), row.error.as_deref()), ("ready", None));
+        }
+
+        /// A retry that loses the race to another retry of the same failed
+        /// clone is refused, saying why (SME-86).
+        #[sqlx::test]
+        async fn test_a_retry_racing_another_is_refused(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let repo = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
+                .await
+                .expect("repo");
+            db::set_repo_failed(&pool, repo.id, repo.attempt, "fatal: nope").await.expect("fail");
+            record_clone(&pool, conversation.id, "u", None, "k", "r", Some(repo.id))
+                .await
+                .expect("the first retry");
+            let refused = record_clone(&pool, conversation.id, "u", None, "k", "r", Some(repo.id))
+                .await
+                .expect_err("the second retry");
+            assert!(refused.contains("already being cloned again"), "{refused}");
+        }
+
+        /// An attempt that a retry has replaced can't record its clone as
+        /// the repo's, and says so (SME-86).
+        #[sqlx::test]
+        async fn test_a_superseded_attempt_doesnt_record_its_clone(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let stale = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
+                .await
+                .expect("repo");
+            db::set_repo_failed(&pool, stale.id, stale.attempt, "fatal: nope").await.expect("fail");
+            let current = db::retry_repo_clone(&pool, stale.id, "u", "k", None)
+                .await
+                .expect("retry")
+                .expect("it was failed");
+            let cloned = ClonedRepo { commit: Some("abc".to_string()), branch: "main".to_string() };
+            let guard = CloneGuard::new(&pool, &stale, conversation.id);
+            let refused = record_cloned(&pool, &stale, &cloned, Ok(vec![]), guard)
+                .await
+                .expect_err("superseded");
+            assert!(refused.contains("superseded"), "{refused}");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let row = db::get_conversation_repo(&pool, stale.id).await.expect("get").expect("exists");
+            assert_eq!((row.status.as_str(), row.attempt), ("cloning", current.attempt));
         }
 
         /// A repo is ready only once its AGENTS.md files are listed, so a
@@ -1958,15 +2035,15 @@ mod server {
             let cloned = ClonedRepo { commit: Some("abc".to_string()), branch: "main".to_string() };
 
             let listed = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "listed").await.expect("repo");
-            let guard = CloneGuard::new(&pool, listed.id, conversation.id);
+            let guard = CloneGuard::new(&pool, &listed, conversation.id);
             let files = vec!["AGENTS.md".to_string(), "api/AGENTS.md".to_string()];
-            record_cloned(&pool, listed.id, &cloned, Ok(files.clone()), guard).await.expect("record");
+            record_cloned(&pool, &listed, &cloned, Ok(files.clone()), guard).await.expect("record");
             let row = db::get_conversation_repo(&pool, listed.id).await.expect("get").expect("exists");
             assert_eq!((row.status.as_str(), row.error.as_deref(), row.agents_files), ("ready", None, files));
 
             let unlisted = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "unlisted").await.expect("repo");
-            let guard = CloneGuard::new(&pool, unlisted.id, conversation.id);
-            record_cloned(&pool, unlisted.id, &cloned, Err("exec failed".to_string()), guard).await.expect("record");
+            let guard = CloneGuard::new(&pool, &unlisted, conversation.id);
+            record_cloned(&pool, &unlisted, &cloned, Err("exec failed".to_string()), guard).await.expect("record");
             let row = db::get_conversation_repo(&pool, unlisted.id).await.expect("get").expect("exists");
             assert_eq!(row.status, "ready", "the clone itself is good");
             assert_eq!(row.error.as_deref(), Some("Couldn't list its AGENTS.md files: exec failed"));
@@ -2087,6 +2164,7 @@ mod server {
                 created_at: chrono::DateTime::from_timestamp(0, 0).expect("epoch").naive_utc(),
                 updated_at: chrono::DateTime::from_timestamp(0, 0).expect("epoch").naive_utc(),
                 agents_files: vec![],
+                attempt: 1,
             }
         }
 

@@ -5557,7 +5557,7 @@ mod tests {
                 .expect("the mywork repo");
             // Even marked interrupted: that directory held work before any
             // clone, so a retry leaves it (SME-32 code review 3).
-            db::set_repo_failed(&pool, mywork.id, crate::git::CLONE_INTERRUPTED).await.expect("mark interrupted");
+            db::set_repo_failed(&pool, mywork.id, mywork.attempt, crate::git::CLONE_INTERRUPTED).await.expect("mark interrupted");
             let refused = crate::git::clone_repo(&pool, conversation_a.id, "file:///tmp/origin.git", None, Some("mywork"))
                 .await
                 .expect_err("the directory still holds work");

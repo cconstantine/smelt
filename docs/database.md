@@ -99,7 +99,7 @@ The tables after every migration has run. All `id`s are `BIGINT GENERATED ALWAYS
 
 | Table | What it holds | Notes |
 |---|---|---|
-| `conversation_repos` | A repo a conversation works on: `url`, `remote_key`, `branch`, `dir`, `status`, `error`, `checked_out_branch`, `commit_sha`, `agents_files` (`TEXT[]`) | `UNIQUE (conversation_id, dir)`. `status` `CHECK`ed to `cloning`/`ready`/`failed`. FK → `conversations` cascade. |
+| `conversation_repos` | A repo a conversation works on: `url`, `remote_key`, `branch`, `dir`, `status`, `error`, `checked_out_branch`, `commit_sha`, `agents_files` (`TEXT[]`), `attempt` | `UNIQUE (conversation_id, dir)`. `status` `CHECK`ed to `cloning`/`ready`/`failed`. Only a `failed` row is retried, which increments `attempt`; ready/failed are written only for the current attempt while `cloning` (SME-86). FK → `conversations` cascade. |
 | `loaded_instructions` | An AGENTS.md the model loaded: `path`, `content`, `file_bytes`, `hash`, `commit_sha`, `loaded_at` | `UNIQUE (repo_id, path)`. FKs → `conversations` and `conversation_repos`, both cascade. |
 | `instruction_requests` | An AGENTS.md load waiting on the user's trust decision; same columns as `loaded_instructions` | `UNIQUE (repo_id, path)`. FKs → `conversations` and `conversation_repos`, both cascade. |
 | `repo_trust` | Whether a remote's AGENTS.md is trusted: `remote_key`, `trusted`, `decided_at` | PK is `remote_key`. No row: not asked yet. No FKs, so it outlives conversations. |
