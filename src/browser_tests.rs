@@ -1676,6 +1676,31 @@ async fn test_end_to_end_browser_scenarios() {
         )
         .await
         .expect("write the container's page");
+        // SME-90: Chrome sends a container's plain-http address no
+        // Sec-Fetch-*, so the egress proxy goes by Referer. The page's own
+        // script carries one and loads; one fetched with no referrer arrives
+        // with nothing to tell it from another site's, and is refused.
+        for (path, content) in [
+            (
+                "/workspace/site/scripts.html",
+                "<html><body><p id=out>scripts:</p>\
+                 <script src=\"own.js\" onload=\"out.append(' own-loaded')\" onerror=\"out.append(' own-refused')\"></script>\
+                 <script src=\"anon.js\" referrerpolicy=\"no-referrer\" onload=\"out.append(' anon-loaded')\" \
+                 onerror=\"out.append(' anon-refused')\"></script></body></html>",
+            ),
+            ("/workspace/site/own.js", "1;"),
+            ("/workspace/site/anon.js", "1;"),
+        ] {
+            anthropic::tools::execute(
+                pool,
+                serving.id,
+                &unique_id("write"),
+                "write_file",
+                &serde_json::json!({"path": path, "content": content}),
+            )
+            .await
+            .expect("write the container's script page");
+        }
         let docker_terminal = sandbox::create_terminal(pool, serving.id).await.expect("create_terminal");
         anthropic::tools::execute(
             pool,
@@ -1729,9 +1754,16 @@ async fn test_end_to_end_browser_scenarios() {
             .await
             .expect("open a browsing session");
         let seen = crate::browsing::navigate(serving.id, &format!("http://{container}:8001/")).await;
+        let scripts = crate::browsing::navigate(serving.id, &format!("http://{container}:8001/scripts.html")).await;
         crate::browsing::close_session(serving.id).await.expect("close the browsing session");
         let seen = seen.expect("the model's browser should load the container's server");
         assert!(seen.text.contains("Hello from a Docker container"), "got {:?}", seen.text);
+        let scripts = scripts.expect("the model's browser should load the container's script page");
+        assert!(
+            scripts.text.contains("own-loaded") && scripts.text.contains("anon-refused"),
+            "the page's own script should load and an unidentified one be refused: {:?}",
+            scripts.text
+        );
 
         // The user's side: a preview of the container, in the panel and in a tab.
         let shared = anthropic::tools::execute(
