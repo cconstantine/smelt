@@ -86,14 +86,28 @@ pub fn suggest(package_yaml: &str, languages_toml: &str) -> Result<Suggestion, S
     })
 }
 
+/// Mason's registry, unless `SMELT_MASON_REGISTRY_URL` says otherwise.
+pub const DEFAULT_MASON_REGISTRY_URL: &str = "https://raw.githubusercontent.com/mason-org/mason-registry/main";
+
+/// Helix's `languages.toml`, unless `SMELT_HELIX_LANGUAGES_URL` says
+/// otherwise.
+pub const DEFAULT_HELIX_LANGUAGES_URL: &str =
+    "https://raw.githubusercontent.com/helix-editor/helix/master/languages.toml";
+
 /// Where the catalog's two files come from. `SMELT_MASON_REGISTRY_URL` and
 /// `SMELT_HELIX_LANGUAGES_URL` point elsewhere (tests use a stand-in).
 pub fn sources_from_env() -> (String, String) {
-    let registry = std::env::var("SMELT_MASON_REGISTRY_URL")
-        .unwrap_or_else(|_| "https://raw.githubusercontent.com/mason-org/mason-registry/main".to_string());
-    let helix = std::env::var("SMELT_HELIX_LANGUAGES_URL")
-        .unwrap_or_else(|_| "https://raw.githubusercontent.com/helix-editor/helix/master/languages.toml".to_string());
-    (registry, helix)
+    sources(
+        std::env::var("SMELT_MASON_REGISTRY_URL").ok().as_deref(),
+        std::env::var("SMELT_HELIX_LANGUAGES_URL").ok().as_deref(),
+    )
+}
+
+/// `sources_from_env` on given values, with set-but-empty treated as unset
+/// (as everywhere else in smelt).
+fn sources(registry: Option<&str>, helix: Option<&str>) -> (String, String) {
+    let given = |v: Option<&str>, default: &str| v.filter(|v| !v.is_empty()).unwrap_or(default).to_string();
+    (given(registry, DEFAULT_MASON_REGISTRY_URL), given(helix, DEFAULT_HELIX_LANGUAGES_URL))
 }
 
 /// Looks `package` up in mason's registry at `registry` and suggests a
@@ -375,6 +389,30 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move { axum::serve(listener, router).await.expect("serve") });
         format!("http://{addr}")
+    }
+
+    #[test]
+    fn test_empty_source_urls_fall_back_to_the_defaults() {
+        assert_eq!(
+            sources(Some(""), Some("")),
+            (DEFAULT_MASON_REGISTRY_URL.to_string(), DEFAULT_HELIX_LANGUAGES_URL.to_string())
+        );
+    }
+
+    #[test]
+    fn test_unset_source_urls_are_the_defaults() {
+        assert_eq!(
+            sources(None, None),
+            (DEFAULT_MASON_REGISTRY_URL.to_string(), DEFAULT_HELIX_LANGUAGES_URL.to_string())
+        );
+    }
+
+    #[test]
+    fn test_set_source_urls_are_used_as_given() {
+        assert_eq!(
+            sources(Some("http://registry.test"), Some("http://helix.test/languages.toml")),
+            ("http://registry.test".to_string(), "http://helix.test/languages.toml".to_string())
+        );
     }
 
     #[tokio::test]
