@@ -240,14 +240,15 @@ mod server {
         };
         tracing::info!("sandbox previews on {addr}");
         let dial_for: DialFor = Arc::new(move |conversation| crate::egress_proxy::sandbox_dial(pool.clone(), conversation));
-        tokio::spawn(serve(listener, template, dial_for));
+        tokio::spawn(serve(listener, template, dial_for, crate::mcp_oauth::smelt_base_url()));
     }
 
     /// Serves previews on `listener` for as long as it's open: each
     /// request's `Host` picks the conversation and port (`template`), and
     /// the request goes to that port in that conversation's sandbox.
-    pub async fn serve(listener: TcpListener, template: PreviewTemplate, dial_for: DialFor) {
+    pub async fn serve(listener: TcpListener, template: PreviewTemplate, dial_for: DialFor, smelt_url: Option<String>) {
         let template = Arc::new(template);
+        let smelt_url = Arc::new(smelt_url);
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(accepted) => accepted,
@@ -257,15 +258,17 @@ mod server {
                     continue;
                 }
             };
-            let (template, dial_for) = (template.clone(), dial_for.clone());
+            let (template, dial_for, smelt_url) = (template.clone(), dial_for.clone(), smelt_url.clone());
             tokio::spawn(async move {
                 // One upstream connection per browser connection, kept for
                 // the requests that follow on it.
                 let upstream: CachedUpstream = Arc::default();
                 let service = hyper::service::service_fn(move |request| {
                     let (template, dial_for, upstream) = (template.clone(), dial_for.clone(), upstream.clone());
+                    let smelt_url = smelt_url.clone();
                     async move {
-                        Ok::<_, std::convert::Infallible>(handle(request, &template, &dial_for, &upstream).await)
+                        let preview = Preview { template: &template, dial_for: &dial_for, smelt_url: smelt_url.as_deref() };
+                        Ok::<_, std::convert::Infallible>(handle(request, &preview, &upstream).await)
                     }
                 });
                 if let Err(e) = hyper::server::conn::http1::Builder::new()
@@ -290,12 +293,16 @@ mod server {
 
     type CachedUpstream = Arc<tokio::sync::Mutex<Option<Upstream>>>;
 
-    async fn handle(
-        mut request: Request<Incoming>,
-        template: &PreviewTemplate,
-        dial_for: &DialFor,
-        cached: &CachedUpstream,
-    ) -> Response<Body> {
+    /// What every preview request is served with.
+    struct Preview<'a> {
+        template: &'a PreviewTemplate,
+        dial_for: &'a DialFor,
+        /// smelt's own address (`SMELT_BASE_URL`), for links back to it.
+        smelt_url: Option<&'a str>,
+    }
+
+    async fn handle(mut request: Request<Incoming>, preview: &Preview<'_>, cached: &CachedUpstream) -> Response<Body> {
+        let template = preview.template;
         let host = request.headers().get(HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
         let Some((conversation, pod_host, port)) = template.match_host(host) else {
             return text_response(StatusCode::NOT_FOUND, "This isn't a sandbox preview address.");
@@ -355,13 +362,13 @@ mod server {
             });
         let (mut sender, mut reused) = match reusable {
             Some(up) => (up.sender, true),
-            None => match connect(dial_for, conversation, pod_host, port).await {
+            None => match connect(preview, conversation, pod_host, port).await {
                 Ok(sender) => (sender, false),
                 Err(response) => return response,
             },
         };
         if reused && sender.ready().await.is_err() {
-            sender = match connect(dial_for, conversation, pod_host, port).await {
+            sender = match connect(preview, conversation, pod_host, port).await {
                 Ok(sender) => sender,
                 Err(response) => return response,
             };
@@ -371,7 +378,7 @@ mod server {
         let first_try = match (first_try, retry) {
             (Err(e), Some(retry)) if reused => {
                 tracing::debug!(conversation, port, "preview: reused connection gone, retrying: {e}");
-                sender = match connect(dial_for, conversation, pod_host, port).await {
+                sender = match connect(preview, conversation, pod_host, port).await {
                     Ok(sender) => sender,
                     Err(response) => return response,
                 };
@@ -424,14 +431,18 @@ mod server {
     /// A fresh connection to `port` in `conversation`'s sandbox, or the
     /// response saying why there isn't one.
     async fn connect(
-        dial_for: &DialFor,
+        preview: &Preview<'_>,
         conversation: i64,
         host: PodHost,
         port: u16,
     ) -> Result<SendRequest<Body>, Response<Body>> {
-        let stream = dial_for(conversation)(host, port)
-            .await
-            .map_err(|message| text_response(StatusCode::BAD_GATEWAY, &message))?;
+        let stream = (preview.dial_for)(conversation)(host, port).await.map_err(|e| {
+            if e.no_sandbox {
+                no_sandbox_page(conversation, host, port, preview.smelt_url)
+            } else {
+                text_response(StatusCode::BAD_GATEWAY, &e.message)
+            }
+        })?;
         let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|e| {
@@ -486,12 +497,55 @@ mod server {
         }
     }
 
+    /// The page a preview link shows when its conversation has no running
+    /// sandbox: what's wrong and how to get the preview back, in the user's
+    /// terms rather than the model's message (SME-46). Links back to the
+    /// conversation when smelt's own address is known.
+    fn no_sandbox_page(conversation: i64, host: PodHost, port: u16, smelt_url: Option<&str>) -> Response<Body> {
+        let open = match smelt_url {
+            Some(base) => format!(
+                r#"<a href="{}/conversation/{conversation}">Open the conversation</a>"#,
+                escape_html(base.trim_end_matches('/'))
+            ),
+            None => format!("Open conversation {conversation} in smelt"),
+        };
+        let page = format!(
+            r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sandbox not running</title>
+<style>
+body {{ font-family: system-ui, sans-serif; max-width: 36rem; margin: 4rem auto; padding: 0 1rem; line-height: 1.5; color: #1f2328; background: #fff; }}
+@media (prefers-color-scheme: dark) {{ body {{ color: #e6edf3; background: #0d1117; }} a {{ color: #4493f8; }} }}
+</style>
+</head>
+<body>
+<h1>This preview's sandbox isn't running</h1>
+<p>This link shows {what} in the sandbox of conversation {conversation}, and that sandbox isn't running right now, so there's nothing to show.</p>
+<p>{open} and ask for the sandbox and the dev server to be started again, then reload this page.</p>
+</body>
+</html>
+"#,
+            what = what(host, port),
+        );
+        response(StatusCode::SERVICE_UNAVAILABLE, "text/html; charset=utf-8", page)
+    }
+
+    fn escape_html(text: &str) -> String {
+        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    }
+
     fn text_response(status: StatusCode, text: &str) -> Response<Body> {
-        Response::builder()
-            .status(status)
-            .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(Body::from(text.to_string()))
-            .expect("a valid response")
+        response(status, "text/plain; charset=utf-8", text.to_string())
+    }
+
+    fn response(status: StatusCode, content_type: &'static str, body: String) -> Response<Body> {
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = status;
+        response.headers_mut().insert(hyper::header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+        response
     }
 
     #[cfg(test)]
@@ -503,7 +557,7 @@ mod server {
         use tokio::net::TcpStream;
 
         use super::*;
-        use crate::egress_proxy::DialFuture;
+        use crate::egress_proxy::{DialError, DialFuture};
         use crate::sandbox::PodIo;
 
         /// A dev server stand-in: echoes the `Host` it was sent, redirects
@@ -581,6 +635,11 @@ mod server {
         /// Starts the preview server; returns its address and the template
         /// it answers to (`http://{port}-{conversation}.preview.localhost:<its port>`).
         async fn start_preview(dial_for: DialFor) -> (SocketAddr, PreviewTemplate) {
+            start_preview_linking_to(dial_for, None).await
+        }
+
+        /// `start_preview`, with smelt's own address for links back to it.
+        async fn start_preview_linking_to(dial_for: DialFor, smelt_url: Option<&str>) -> (SocketAddr, PreviewTemplate) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let template = PreviewTemplate::parse(&format!(
@@ -588,7 +647,7 @@ mod server {
                 addr.port()
             ))
             .unwrap();
-            tokio::spawn(serve(listener, template.clone(), dial_for));
+            tokio::spawn(serve(listener, template.clone(), dial_for, smelt_url.map(str::to_string)));
             (addr, template)
         }
 
@@ -689,18 +748,75 @@ mod server {
             }
         }
 
-        #[tokio::test]
-        async fn test_a_conversation_without_a_sandbox_says_so() {
-            let dial_for: DialFor = Arc::new(|_| {
-                Arc::new(|_, _| {
-                    Box::pin(async { Err("This conversation has no running sandbox.".to_string()) }) as DialFuture
+        /// Every dial fails with `error`.
+        fn dial_failing_with(error: DialError) -> DialFor {
+            Arc::new(move |_| {
+                let error = error.clone();
+                Arc::new(move |_, _| {
+                    let error = error.clone();
+                    Box::pin(async move { Err(error) }) as DialFuture
                 }) as SandboxDial
-            });
-            let (preview, template) = start_preview(dial_for).await;
+            })
+        }
+
+        /// What `egress_proxy::sandbox_dial` fails with when the conversation
+        /// has no sandbox: a message meant for the model.
+        fn no_sandbox() -> DialError {
+            DialError {
+                message: "This conversation has no running sandbox, so there's nothing at port 3000. Start one \
+                          with create_pod and run the server there."
+                    .to_string(),
+                no_sandbox: true,
+            }
+        }
+
+        #[tokio::test]
+        async fn test_a_conversation_without_a_sandbox_gets_a_page_linking_back_to_it() {
+            let (preview, template) =
+                start_preview_linking_to(dial_failing_with(no_sandbox()), Some("http://smelt.test:8180")).await;
+            let client = client_for(preview, &["3000-42.preview.localhost"]);
+            let response = client.get(format!("{}/", template.url_for(42, PodHost::Localhost, 3000))).send().await.unwrap();
+            assert_eq!(response.status(), 503);
+            let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            assert!(content_type.starts_with("text/html"), "got {content_type:?}");
+            let body = response.text().await.unwrap();
+            assert!(body.contains("sandbox isn't running"), "says what's wrong: {body}");
+            assert!(body.contains("port 3000"), "names what the link was for: {body}");
+            assert!(body.contains(r#"href="http://smelt.test:8180/conversation/42""#), "links to the conversation: {body}");
+            assert!(!body.contains("create_pod"), "a tool name is for the model, not the user: {body}");
+        }
+
+        #[tokio::test]
+        async fn test_without_smelts_address_the_page_names_the_conversation_instead_of_linking() {
+            let (preview, template) = start_preview(dial_failing_with(no_sandbox())).await;
+            let client = client_for(preview, &["3000-42.preview.localhost"]);
+            let response = client.get(format!("{}/", template.url_for(42, PodHost::Localhost, 3000))).send().await.unwrap();
+            assert_eq!(response.status(), 503);
+            let body = response.text().await.unwrap();
+            assert!(body.contains("sandbox isn't running"), "says what's wrong: {body}");
+            assert!(body.contains("conversation 42"), "names the conversation: {body}");
+            assert!(!body.contains("href="), "no address to link to: {body}");
+        }
+
+        #[tokio::test]
+        async fn test_the_pages_link_escapes_smelts_address() {
+            let (preview, template) =
+                start_preview_linking_to(dial_failing_with(no_sandbox()), Some(r#"http://smelt.test/"><script>"#)).await;
+            let client = client_for(preview, &["3000-42.preview.localhost"]);
+            let response = client.get(format!("{}/", template.url_for(42, PodHost::Localhost, 3000))).send().await.unwrap();
+            let body = response.text().await.unwrap();
+            assert!(!body.contains("<script>"), "got {body}");
+            assert!(body.contains("&quot;&gt;&lt;script&gt;/conversation/42"), "got {body}");
+        }
+
+        #[tokio::test]
+        async fn test_another_dial_failure_still_says_what_went_wrong_as_text() {
+            let failure = DialError::from("Timed out connecting to port 3000 in the sandbox.".to_string());
+            let (preview, template) = start_preview_linking_to(dial_failing_with(failure), Some("http://smelt.test")).await;
             let client = client_for(preview, &["3000-42.preview.localhost"]);
             let response = client.get(format!("{}/", template.url_for(42, PodHost::Localhost, 3000))).send().await.unwrap();
             assert_eq!(response.status(), 502);
-            assert_eq!(response.text().await.unwrap(), "This conversation has no running sandbox.");
+            assert_eq!(response.text().await.unwrap(), "Timed out connecting to port 3000 in the sandbox.");
         }
 
         #[tokio::test]

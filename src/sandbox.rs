@@ -4395,11 +4395,11 @@ mod tests {
                     Box::pin(async move {
                         open_pod_port_with(&pool, conversation, PodHost::Localhost, port, move || client)
                             .await
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| crate::egress_proxy::DialError::from(e.to_string()))
                     }) as DialFuture
                 }) as SandboxDial
             });
-            let server = tokio::spawn(crate::preview::serve(listener, template.clone(), dial_for));
+            let server = tokio::spawn(crate::preview::serve(listener, template.clone(), dial_for, None));
             let http = reqwest::Client::builder()
                 .resolve(&format!("8000-{}.preview.localhost", with_pod.id), preview_addr)
                 .build()
