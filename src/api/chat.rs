@@ -1003,14 +1003,17 @@ async fn drain_unnotified_terminal_commands(
             )
         };
         let notification_content = vec![anthropic::ContentBlock::Text { text }];
-        let saved = db::create_message(pool, conversation_id, "user", &notification_content)
-            .await
-            .map_err(ServerFnError::new)?;
+        // The notice and the command's mark together, so a Stop between
+        // them can't leave a notice the next drain saves again (SME-91).
+        let Some(saved) =
+            db::save_command_notice(pool, conversation_id, &command.command_id, &notification_content)
+                .await
+                .map_err(ServerFnError::new)?
+        else {
+            continue;
+        };
         pending_new_content.extend(notification_content);
         record_saved(conversation_id, persisted, saved);
-        db::mark_terminal_command_notified(pool, &command.command_id)
-            .await
-            .map_err(ServerFnError::new)?;
     }
     Ok(())
 }

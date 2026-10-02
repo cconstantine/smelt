@@ -106,6 +106,18 @@ pub async fn create_message(
     role: &str,
     content: &[ContentBlock],
 ) -> Result<Message, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    create_message_on(&mut conn, conversation_id, role, content).await
+}
+
+/// `create_message` on a given connection, so a caller can make it part
+/// of a transaction of its own (`save_command_notice`).
+async fn create_message_on(
+    conn: &mut sqlx::PgConnection,
+    conversation_id: i64,
+    role: &str,
+    content: &[ContentBlock],
+) -> Result<Message, sqlx::Error> {
     let content_json = serde_json::to_string(content)
         .expect("ContentBlock always serializes: no non-string map keys, no floats");
 
@@ -115,7 +127,7 @@ pub async fn create_message(
     .bind(conversation_id)
     .bind(role)
     .bind(&content_json)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     // Bump updated_at so the sidebar can sort by recency; auto-title the
@@ -134,7 +146,7 @@ pub async fn create_message(
     .bind(role)
     .bind(title_candidate(content))
     .bind(conversation_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     Ok(message)
@@ -731,6 +743,9 @@ pub async fn unnotified_finished_terminal_commands(
     .await
 }
 
+/// Only tests mark a command without its notice; a turn uses
+/// `save_command_notice`, which does both at once.
+#[cfg(test)]
 pub async fn mark_terminal_command_notified(
     pool: &PgPool,
     command_id: &str,
@@ -740,6 +755,35 @@ pub async fn mark_terminal_command_notified(
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Saves `content` as `command_id`'s notice in `conversation_id` and marks
+/// the command notified, in one transaction: a turn stopped part-way
+/// leaves both or neither, so the next drain can't save the notice again
+/// (SME-91). `None`, with nothing saved, when the command was already
+/// notified or doesn't exist.
+pub async fn save_command_notice(
+    pool: &PgPool,
+    conversation_id: i64,
+    command_id: &str,
+    content: &[ContentBlock],
+) -> Result<Option<Message>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let marked = sqlx::query(
+        "UPDATE terminal_commands SET notified_at = now()
+         WHERE command_id = $1 AND notified_at IS NULL",
+    )
+    .bind(command_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if marked == 0 {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let saved = create_message_on(&mut tx, conversation_id, "user", content).await?;
+    tx.commit().await?;
+    Ok(Some(saved))
 }
 
 /// Backs `list_commands` — most-recent-first, bounded the same way
@@ -2858,6 +2902,49 @@ mod tests {
             .await
             .expect("query should succeed");
         assert!(result.is_none());
+    }
+
+    /// SME-91: a command's notice and its mark are one step, so a command
+    /// already notified (a stopped drain that got as far as the mark, or
+    /// another drain) never gets a second notice.
+    #[sqlx::test]
+    async fn test_a_command_already_notified_gets_no_second_notice(pool: PgPool) {
+        let conversation = test_conversation(&pool).await;
+        let terminal_id = test_terminal(&pool, conversation.id).await;
+        let command = create_terminal_command(&pool, conversation.id, terminal_id, "cmd-n1", "true")
+            .await
+            .expect("create");
+        mark_terminal_command_finished(&pool, &command.command_id, 0)
+            .await
+            .expect("mark finished");
+        let notice = [ContentBlock::Text { text: "cmd-n1 finished".to_string() }];
+
+        let first = save_command_notice(&pool, conversation.id, "cmd-n1", &notice)
+            .await
+            .expect("first notice");
+        assert!(first.is_some(), "the first notice is saved");
+        let second = save_command_notice(&pool, conversation.id, "cmd-n1", &notice)
+            .await
+            .expect("second notice");
+        assert!(second.is_none(), "a notified command gets no second notice");
+
+        let messages = list_messages(&pool, conversation.id).await.expect("list");
+        let notices = messages.iter().filter(|m| m.content.contains("cmd-n1 finished")).count();
+        assert_eq!(notices, 1);
+    }
+
+    /// SME-91: the notice and the mark commit together: a command that
+    /// doesn't exist (nothing to mark) leaves no notice behind.
+    #[sqlx::test]
+    async fn test_a_notice_without_its_mark_isnt_saved(pool: PgPool) {
+        let conversation = test_conversation(&pool).await;
+        let notice = [ContentBlock::Text { text: "nobody's notice".to_string() }];
+        let saved = save_command_notice(&pool, conversation.id, "no-such-command", &notice)
+            .await
+            .expect("save");
+        assert!(saved.is_none());
+        let messages = list_messages(&pool, conversation.id).await.expect("list");
+        assert!(messages.is_empty(), "no notice without its mark: {messages:?}");
     }
 
     #[sqlx::test]
