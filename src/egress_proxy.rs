@@ -58,7 +58,29 @@ pub async fn start(is_addr_allowed: fn(IpAddr) -> bool) -> std::io::Result<Socke
 pub type SandboxDial = Arc<dyn Fn(PodHost, u16) -> DialFuture + Send + Sync>;
 
 /// What a `SandboxDial` returns.
-pub type DialFuture = Pin<Box<dyn Future<Output = Result<Box<dyn PodIo>, String>> + Send>>;
+pub type DialFuture = Pin<Box<dyn Future<Output = Result<Box<dyn PodIo>, DialError>> + Send>>;
+
+/// Why a `SandboxDial` couldn't connect: a message for whoever asked (the
+/// model, through the egress proxy), and whether it's because the
+/// conversation has no running sandbox, which a preview link explains to
+/// the user its own way (SME-46).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialError {
+    pub message: String,
+    pub no_sandbox: bool,
+}
+
+impl From<String> for DialError {
+    fn from(message: String) -> Self {
+        Self { message, no_sandbox: false }
+    }
+}
+
+impl std::fmt::Display for DialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 
 /// The real `SandboxDial` for `conversation_id`: `sandbox::open_pod_target`,
 /// with its failures turned into sentences the model (or the user, in the
@@ -70,12 +92,15 @@ pub fn sandbox_dial(pool: PgPool, conversation_id: i64) -> SandboxDial {
             crate::sandbox::open_pod_target(&pool, conversation_id, host, port)
                 .await
                 .map_err(|e| match e {
-                    crate::sandbox::TerminalError::NoPod => format!(
-                        "This conversation has no running sandbox, so there's nothing at \
-                         {}. Start one with create_pod and run the server there.",
-                        describe(host, port)
-                    ),
-                    other => format!("Couldn't reach {} in the sandbox: {other}", describe(host, port)),
+                    crate::sandbox::TerminalError::NoPod => DialError {
+                        message: format!(
+                            "This conversation has no running sandbox, so there's nothing at \
+                             {}. Start one with create_pod and run the server there.",
+                            describe(host, port)
+                        ),
+                        no_sandbox: true,
+                    },
+                    other => DialError::from(format!("Couldn't reach {} in the sandbox: {other}", describe(host, port))),
                 })
         })
     });
@@ -90,7 +115,7 @@ pub fn with_timeout(dial: SandboxDial, limit: Duration) -> SandboxDial {
         let opening = dial(host, port);
         Box::pin(async move {
             tokio::time::timeout(limit, opening).await.unwrap_or_else(|_| {
-                Err(format!("Timed out connecting to {} in the sandbox.", describe(host, port)))
+                Err(DialError::from(format!("Timed out connecting to {} in the sandbox.", describe(host, port))))
             })
         })
     })
@@ -275,9 +300,9 @@ async fn handle_sandbox(
     // `sandbox_dial` bounds opening the port-forward (`with_timeout`).
     let upstream = match dial(host, request.port).await {
         Ok(upstream) => upstream,
-        Err(message) => {
-            respond_with_body(&mut client, "502 Bad Gateway", &message).await;
-            return Err(message);
+        Err(e) => {
+            respond_with_body(&mut client, "502 Bad Gateway", &e.message).await;
+            return Err(e.message);
         }
     };
     let (mut from_page, mut to_page) = client.into_split();
@@ -821,7 +846,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_sandbox_route_that_cannot_connect_says_why() {
         let dial: SandboxDial = Arc::new(|_, _| {
-            Box::pin(async { Err("This conversation has no running sandbox.".to_string()) })
+            Box::pin(async { Err(DialError::from("This conversation has no running sandbox.".to_string())) })
         });
         let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial).await.unwrap();
         let response = client_via(proxy.addr).get("http://localhost:3000/").send().await.unwrap();
@@ -858,8 +883,9 @@ mod tests {
             Ok(_) => panic!("a conversation without a pod has nothing to connect to"),
             Err(e) => e,
         };
-        assert!(error.contains("no running sandbox"), "got {error:?}");
-        assert!(error.contains("create_pod"), "should say how to get one: {error:?}");
+        assert!(error.message.contains("no running sandbox"), "got {error:?}");
+        assert!(error.message.contains("create_pod"), "should say how to get one: {error:?}");
+        assert!(error.no_sandbox, "a preview tells this case apart from other failures: {error:?}");
     }
 
     #[tokio::test]
@@ -873,7 +899,7 @@ mod tests {
             Ok(_) => panic!("a dial that never opens can't succeed"),
             Err(e) => e,
         };
-        assert!(error.contains("localhost:3000") && error.contains("Timed out"), "got {error:?}");
+        assert!(error.message.contains("localhost:3000") && error.message.contains("Timed out"), "got {error:?}");
     }
 
     #[sqlx::test]
@@ -884,7 +910,7 @@ mod tests {
             Ok(_) => panic!("the sandbox agent's port must never be reachable"),
             Err(e) => e,
         };
-        assert!(error.contains("sandbox agent"), "got {error:?}");
+        assert!(error.message.contains("sandbox agent"), "got {error:?}");
     }
 
     #[tokio::test]

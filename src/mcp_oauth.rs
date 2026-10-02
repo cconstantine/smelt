@@ -189,13 +189,14 @@ pub async fn disconnect(pool: &PgPool, config: &McpServerConfig) -> Result<(), S
         .map_err(|e| format!("failed to disconnect MCP server {:?}: {e}", config.name))
 }
 
-/// `SMELT_BASE_URL`, if set to a non-blank value — an explicit override for
-/// when the `Host`/`X-Forwarded-Proto`-derived guess below is wrong (e.g.
-/// smelt reachable through a tunnel or proxy that doesn't forward a usable
-/// `Host`). Set-but-empty is treated as unset, same rule every other env
+/// `SMELT_BASE_URL`, if set to a non-blank value: smelt's own address. For
+/// OAuth it overrides the `Host`/`X-Forwarded-Proto`-derived guess below
+/// when that's wrong (e.g. smelt reachable through a tunnel or proxy that
+/// doesn't forward a usable `Host`); a preview page links back to smelt
+/// with it (SME-46). Set-but-empty is treated as unset, same rule every other env
 /// var in this codebase follows. Trims a trailing
 /// slash so callers can always append `/oauth/mcp-callback/{id}` directly.
-fn oauth_base_url_override() -> Option<String> {
+pub(crate) fn smelt_base_url() -> Option<String> {
     let value = std::env::var("SMELT_BASE_URL").ok()?;
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.trim_end_matches('/').to_string())
@@ -208,7 +209,7 @@ fn oauth_base_url_override() -> Option<String> {
 /// deployment this matters for) decides `https` vs. `http`, defaulting to
 /// `http` when absent (e.g. plain local dev).
 pub async fn request_base_url() -> Result<String, dioxus::prelude::ServerFnError> {
-    if let Some(base_url) = oauth_base_url_override() {
+    if let Some(base_url) = smelt_base_url() {
         return Ok(base_url);
     }
     let headers =
@@ -344,28 +345,28 @@ mod tests {
     /// so a run order that puts another test after this one never sees a
     /// value this test set.
     #[test]
-    fn test_oauth_base_url_override_treats_unset_and_blank_as_none_and_trims_a_trailing_slash() {
+    fn test_smelt_base_url_treats_unset_and_blank_as_none_and_trims_a_trailing_slash() {
         let original = std::env::var("SMELT_BASE_URL").ok();
 
         unsafe { std::env::remove_var("SMELT_BASE_URL") };
-        assert_eq!(oauth_base_url_override(), None);
+        assert_eq!(smelt_base_url(), None);
 
         unsafe { std::env::set_var("SMELT_BASE_URL", "") };
         assert_eq!(
-            oauth_base_url_override(),
+            smelt_base_url(),
             None,
             "set-but-empty should be treated as unset, same as every other env var here"
         );
 
         unsafe { std::env::set_var("SMELT_BASE_URL", "https://smelt.example.com") };
         assert_eq!(
-            oauth_base_url_override(),
+            smelt_base_url(),
             Some("https://smelt.example.com".to_string())
         );
 
         unsafe { std::env::set_var("SMELT_BASE_URL", "https://smelt.example.com/") };
         assert_eq!(
-            oauth_base_url_override(),
+            smelt_base_url(),
             Some("https://smelt.example.com".to_string()),
             "a trailing slash must be stripped so callers can always append /oauth/mcp-callback/{{id}} directly"
         );

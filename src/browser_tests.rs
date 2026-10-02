@@ -84,6 +84,7 @@ impl BrowserTestHarness {
             preview_listener,
             preview_template,
             std::sync::Arc::new(|conversation| crate::egress_proxy::sandbox_dial(db::get().clone(), conversation)),
+            None,
         ));
 
         // A plain `cargo test` build doesn't bundle assets: `asset!()`
