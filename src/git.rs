@@ -1071,9 +1071,9 @@ mod server {
             Ok(pod_id) => pod_id,
             Err(e) => {
                 guard.finish();
-                let _ = db::set_repo_failed(pool, repo.id, repo.attempt, &e).await;
+                let told = fail_attempt(pool, &repo, &e).await;
                 publish_repos(pool, conversation_id).await;
-                return Err(e);
+                return Err(told);
             }
         };
         run_clone(pool, conversation_id, pod_id, repo, guard).await
@@ -1141,6 +1141,20 @@ mod server {
         }
     }
 
+    /// Records `repo`'s attempt as failed with `error`, and returns what
+    /// to tell the caller: `error`, or `CLONE_SUPERSEDED` when a newer
+    /// attempt owns the repo now.
+    async fn fail_attempt(pool: &PgPool, repo: &db::ConversationRepo, error: &str) -> String {
+        match db::set_repo_failed(pool, repo.id, repo.attempt, error).await {
+            Ok(false) => CLONE_SUPERSEDED.to_string(),
+            Ok(true) => error.to_string(),
+            Err(e) => {
+                tracing::warn!(repo_id = repo.id, error = %e, "couldn't mark a failed clone failed");
+                error.to_string()
+            }
+        }
+    }
+
     /// Clones one recorded repo into pod `pod_id` and records how it went.
     /// Records a finished clone, and disarms its guard: whatever runs
     /// afterwards (reading its AGENTS.md) being cut off doesn't make the
@@ -1192,9 +1206,9 @@ mod server {
                 record_cloned(pool, repo, &cloned, files, guard).await
             }
             Err(e) => {
-                let _ = db::set_repo_failed(pool, repo.id, repo.attempt, &e).await;
+                let told = fail_attempt(pool, repo, &e).await;
                 guard.finish();
-                Err(e)
+                Err(told)
             }
         }
     }
@@ -1982,6 +1996,24 @@ mod server {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let row = db::get_conversation_repo(&pool, repo.id).await.expect("get").expect("exists");
             assert_eq!((row.status.as_str(), row.error.as_deref()), ("ready", None));
+        }
+
+        /// A replaced attempt whose clone (or pod start) fails is told it
+        /// was superseded, not that the repo failed (SME-86 code review).
+        #[sqlx::test]
+        async fn test_a_superseded_attempt_that_fails_is_told_so(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let stale = db::create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
+                .await
+                .expect("repo");
+            assert_eq!(fail_attempt(&pool, &stale, "fatal: nope").await, "fatal: nope");
+            db::retry_repo_clone(&pool, stale.id, "u", "k", None)
+                .await
+                .expect("retry")
+                .expect("it was failed");
+            assert_eq!(fail_attempt(&pool, &stale, "fatal: again").await, CLONE_SUPERSEDED);
+            let row = db::get_conversation_repo(&pool, stale.id).await.expect("get").expect("exists");
+            assert_eq!(row.status, "cloning");
         }
 
         /// A retry that loses the race to another retry of the same failed
