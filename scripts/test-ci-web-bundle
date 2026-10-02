@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Checks scripts/ci-web-bundle's watchdog (SME-67) against fake dx commands,
+# with short time limits. Run by hand after changing that script; needs no
+# cluster or database.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+failures=0
+fail() {
+    echo "FAIL: $*" >&2
+    failures=$((failures + 1))
+}
+
+# Runs ci-web-bundle with $1 as dx, a 3 s silence limit, and a 20 s cap on
+# the whole run so a missing watchdog fails here instead of hanging.
+# Sets $out and $rc.
+run() {
+    out=$(CI_WEB_BUNDLE_DX="$1" CI_WEB_BUNDLE_SILENCE_SECS=3 timeout 20 scripts/ci-web-bundle 2>&1)
+    rc=$?
+}
+
+client_done='echo "  12.74s  INFO Client build completed successfully! 🚀 path=\"/app/target/dx/smelt/debug/web/public\""'
+
+# dx finishes normally: its status, no warning.
+run "bash -c '$client_done; echo Server build completed successfully; exit 0'"
+[ "$rc" -eq 0 ] || fail "a normal build: exit $rc, want 0"
+case "$out" in *"::warning::"*) fail "a normal build printed a warning" ;; esac
+
+# dx fails: its status comes through.
+run "bash -c 'echo error: build failed; exit 3'"
+[ "$rc" -eq 3 ] || fail "a failed build: exit $rc, want 3"
+
+# The client completes, then dx hangs: stopped, with a warning and the
+# process list, and the step passes.
+start=$SECONDS
+run "bash -c '$client_done; exec -a sme67-fake-dx sleep 1000'"
+took=$((SECONDS - start))
+[ "$rc" -eq 0 ] || fail "a hang after the client: exit $rc, want 0 (124 means the watchdog never fired)"
+case "$out" in *"::warning::"*) ;; *) fail "a hang after the client: no ::warning:: line" ;; esac
+case "$out" in *"sme67-fake-dx"*) ;; *) fail "a hang after the client: the process list doesn't show the hung process" ;; esac
+[ "$took" -lt 15 ] || fail "a hang after the client took ${took}s to stop"
+pgrep -f "^sme67-fake-dx" >/dev/null && fail "the hung process is still running after the script exited"
+
+# dx keeps logging after the client completes: not stopped while it does.
+run "bash -c '$client_done; for i in 1 2 3 4 5 6; do echo Compiled \$i; sleep 1; done; exit 0'"
+[ "$rc" -eq 0 ] || fail "a server build still logging: exit $rc, want 0"
+case "$out" in *"::warning::"*) fail "a server build still logging was treated as a hang" ;; esac
+
+# Silence before the client completes isn't this hang: left to the step's
+# own timeout. Run in a process group of its own, stopped by its id.
+setsid env CI_WEB_BUNDLE_DX="bash -c 'exec -a sme67-fake-dx sleep 1000'" CI_WEB_BUNDLE_SILENCE_SECS=2 \
+    scripts/ci-web-bundle >/dev/null 2>&1 &
+group=$!
+sleep 6
+kill -0 "$group" 2>/dev/null || fail "silence before the client completes: the script stopped on its own"
+kill -- -"$group" 2>/dev/null
+wait "$group" 2>/dev/null
+sleep 1
+pgrep -f "^sme67-fake-dx" >/dev/null && fail "stopping the script left dx running"
+
+if [ "$failures" -eq 0 ]; then
+    echo "ci-web-bundle: all checks passed"
+fi
+exit "$failures"
