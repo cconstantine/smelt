@@ -3415,8 +3415,8 @@ mod tests {
         // A ready clone isn't retried either.
         assert!(retry_repo_clone(&pool, repo.id, "u", "k", None).await.expect("retry").is_none());
 
-        // A failed attempt 2 is retried as attempt 3; attempt 2's late
-        // writes don't touch it.
+        // Another clone's failed attempt 1 is retried as attempt 2;
+        // attempt 1's late writes don't touch it.
         let failed = create_conversation_repo(&pool, conversation.id, "u", "k", None, "f")
             .await
             .expect("create repo");
