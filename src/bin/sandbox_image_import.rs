@@ -260,13 +260,17 @@ async fn settled_loader_state(pods: &Api<Pod>, name: &str) -> LoaderState {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let state = match pods.get_opt(name).await {
-            Ok(Some(pod)) => LoaderState::Phase(
-                pod.status.and_then(|s| s.phase).unwrap_or_else(|| "Unknown".to_string()),
-            ),
+            Ok(Some(pod)) => {
+                let status = pod.status.unwrap_or_default();
+                LoaderState::Phase {
+                    phase: status.phase.unwrap_or_else(|| "Unknown".to_string()),
+                    reason: status.reason,
+                }
+            }
             Ok(None) => LoaderState::Gone,
             Err(_) => LoaderState::Unknown,
         };
-        let running = matches!(&state, LoaderState::Phase(p) if p == "Running");
+        let running = matches!(&state, LoaderState::Phase { phase, .. } if phase == "Running");
         if !running || tokio::time::Instant::now() >= deadline {
             return state;
         }
@@ -277,7 +281,8 @@ async fn settled_loader_state(pods: &Api<Pod>, name: &str) -> LoaderState {
 /// What a loader pod looked like once a stream into it failed.
 #[derive(Debug)]
 enum LoaderState {
-    Phase(String),
+    /// The pod's phase, and its status's reason (`Evicted`, say) if any.
+    Phase { phase: String, reason: Option<String> },
     Gone,
     Unknown,
 }
@@ -295,13 +300,17 @@ fn stream_failure(
 ) -> String {
     let progress = format!("{}s and {sent} bytes into streaming the tarball", elapsed.as_secs());
     match loader {
-        LoaderState::Phase(phase) if phase == "Running" || phase == "Pending" => {
+        LoaderState::Phase { phase, .. } if phase == "Running" || phase == "Pending" => {
             format!("streaming the tarball into loader pod {name} failed {progress}, with the pod still {phase}: {error}")
         }
-        LoaderState::Phase(phase) => format!(
+        LoaderState::Phase { phase, .. } if phase == "Succeeded" => format!(
             "loader pod {name} stopped ({phase}) {progress}; it runs for at most {}s, so the stream outlasted it: {error}",
             lifetime.as_secs()
         ),
+        LoaderState::Phase { phase, reason } => {
+            let why = reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
+            format!("loader pod {name} stopped ({phase}{why}) {progress}: {error}")
+        }
         LoaderState::Gone => format!("loader pod {name} stopped (it no longer exists) {progress}: {error}"),
         LoaderState::Unknown => {
             format!("streaming the tarball into loader pod {name} failed {progress} (couldn't read the pod's state): {error}")
@@ -483,15 +492,32 @@ mod tests {
     #[test]
     fn test_a_stream_failure_says_whether_the_loader_stopped() {
         let t = Duration::from_secs(300);
-        let ended = stream_failure("l", &LoaderState::Phase("Succeeded".to_string()), t, t, 42, "broken pipe");
+        let ended = stream_failure("l", &phase("Succeeded", None), t, t, 42, "broken pipe");
         assert!(ended.starts_with("loader pod l stopped (Succeeded) 300s and 42 bytes into"), "{ended}");
         assert!(ended.contains("at most 300s") && ended.ends_with(": broken pipe"), "{ended}");
         let gone = stream_failure("l", &LoaderState::Gone, t, t, 42, "broken pipe");
         assert!(gone.starts_with("loader pod l stopped (it no longer exists)"), "{gone}");
-        let running = stream_failure("l", &LoaderState::Phase("Running".to_string()), t, t, 42, "broken pipe");
+        let running = stream_failure("l", &phase("Running", None), t, t, 42, "broken pipe");
         assert!(running.contains("with the pod still Running") && !running.contains("stopped"), "{running}");
         let unknown = stream_failure("l", &LoaderState::Unknown, t, t, 42, "broken pipe");
         assert!(unknown.contains("couldn't read the pod's state") && !unknown.contains("stopped"), "{unknown}");
+    }
+
+    fn phase(phase: &str, reason: Option<&str>) -> LoaderState {
+        LoaderState::Phase { phase: phase.to_string(), reason: reason.map(str::to_string) }
+    }
+
+    /// Only a loader whose `sleep` ran out (Succeeded) was outlasted; one
+    /// that Failed was killed for some other reason, an eviction say, and
+    /// is reported with that reason instead (SME-89 code review).
+    #[test]
+    fn test_a_failed_loader_is_reported_with_its_reason_not_as_outlasted() {
+        let t = Duration::from_secs(3600);
+        let evicted = stream_failure("l", &phase("Failed", Some("Evicted")), t, Duration::from_secs(60), 42, "broken pipe");
+        assert!(evicted.starts_with("loader pod l stopped (Failed: Evicted) 60s and 42 bytes into"), "{evicted}");
+        assert!(!evicted.contains("outlasted"), "{evicted}");
+        let failed = stream_failure("l", &phase("Failed", None), t, Duration::from_secs(60), 42, "broken pipe");
+        assert!(failed.starts_with("loader pod l stopped (Failed) 60s") && !failed.contains("outlasted"), "{failed}");
     }
 
     /// A tag that only starts like a wanted one isn't it.
