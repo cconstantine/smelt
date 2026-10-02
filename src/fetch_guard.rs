@@ -159,6 +159,23 @@ pub struct RequestSource {
     pub origin: Option<String>,
     pub sec_fetch_site: Option<String>,
     pub sec_fetch_mode: Option<String>,
+    pub referer: Option<String>,
+    /// `Upgrade-Insecure-Requests: 1`, which browsers send on page loads
+    /// only and which a page can't add to its own requests.
+    pub upgrade_insecure_requests: bool,
+}
+
+/// Whether a browser sends `Sec-Fetch-*` headers to `host` over plain
+/// http: only to an address it counts as "potentially trustworthy", which
+/// for http means `localhost`, a `*.localhost` name, or a loopback address.
+/// A container's address isn't one, so requests to it carry none (SME-90).
+pub fn browser_sends_sec_fetch(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Whether a request to a sandbox server came from somewhere allowed to
@@ -171,22 +188,37 @@ pub struct RequestSource {
 /// something and on every WebSocket handshake (which carries no
 /// `Sec-Fetch-*`), so a present `Origin` must be home. Otherwise
 /// `Sec-Fetch-Site` decides: only a cross-site GET/HEAD page load (a link
-/// someone followed) gets through. A request with neither header isn't
-/// from a browser page at all.
-pub fn allows_request_from(source: &RequestSource, is_home: impl Fn(&str, Option<u16>) -> bool) -> bool {
-    if let Some(origin) = &source.origin {
-        // "null" (an opaque origin) and anything unparseable aren't home.
-        return url::Url::parse(origin)
+/// someone followed) gets through.
+///
+/// `sends_sec_fetch` says whether the browser sends `Sec-Fetch-*` to the
+/// address it used (`browser_sends_sec_fetch`). Where it does, a request
+/// with neither header isn't from a browser page at all. Where it doesn't
+/// (a container's plain-http address), another site's `<img>` arrives with
+/// neither, so only a GET/HEAD page load (`Upgrade-Insecure-Requests`) or
+/// a request whose `Referer` is home gets through (SME-90).
+pub fn allows_request_from(
+    source: &RequestSource,
+    sends_sec_fetch: bool,
+    is_home: impl Fn(&str, Option<u16>) -> bool,
+) -> bool {
+    // "null" (an opaque origin) and anything unparseable aren't home.
+    let url_is_home = |url: &str| {
+        url::Url::parse(url)
             .ok()
             .and_then(|url| url.host_str().map(|host| is_home(host, url.port())))
-            .unwrap_or(false);
+            .unwrap_or(false)
+    };
+    if let Some(origin) = &source.origin {
+        return url_is_home(origin);
     }
+    let get_or_head = matches!(source.method.to_ascii_uppercase().as_str(), "GET" | "HEAD");
     match source.sec_fetch_site.as_deref() {
-        Some("cross-site") => {
-            source.sec_fetch_mode.as_deref() == Some("navigate")
-                && matches!(source.method.to_ascii_uppercase().as_str(), "GET" | "HEAD")
+        Some("cross-site") => source.sec_fetch_mode.as_deref() == Some("navigate") && get_or_head,
+        Some(_) => true,
+        None if sends_sec_fetch => true,
+        None => {
+            get_or_head && (source.upgrade_insecure_requests || source.referer.as_deref().is_some_and(url_is_home))
         }
-        _ => true,
     }
 }
 
@@ -550,11 +582,30 @@ mod tests {
             origin: origin.map(str::to_string),
             sec_fetch_site: site.map(str::to_string),
             sec_fetch_mode: mode.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// What Chrome sends to a plain-http private address (a container's),
+    /// where it sends no `Sec-Fetch-*`: a spike with the real
+    /// chrome-headless-shell (SME-90).
+    fn plain(method: &str, referer: Option<&str>, page_load: bool) -> RequestSource {
+        RequestSource {
+            method: method.to_string(),
+            referer: referer.map(str::to_string),
+            upgrade_insecure_requests: page_load,
+            ..Default::default()
         }
     }
 
     fn sandbox_home(host: &str, _port: Option<u16>) -> bool {
         is_sandbox_host(host)
+    }
+
+    /// Home as the egress proxy's sandbox route judges it: the pod's
+    /// localhost or one of its containers.
+    fn sandbox_or_container(host: &str, _port: Option<u16>) -> bool {
+        sandbox_host(host).is_some()
     }
 
     /// The header combinations Chrome really sent through the sandbox
@@ -570,7 +621,7 @@ mod tests {
             ("a link from another site", source("GET", None, Some("cross-site"), Some("navigate"))),
             ("not a browser", source("POST", None, None, None)),
         ] {
-            assert!(allows_request_from(&s, sandbox_home), "{what} should be allowed");
+            assert!(allows_request_from(&s, true, sandbox_home), "{what} should be allowed");
         }
     }
 
@@ -584,7 +635,48 @@ mod tests {
             ("a cross-site POST page load", source("POST", None, Some("cross-site"), Some("navigate"))),
             ("an opaque origin", source("POST", Some("null"), Some("cross-site"), Some("cors"))),
         ] {
-            assert!(!allows_request_from(&s, sandbox_home), "{what} should be refused");
+            assert!(!allows_request_from(&s, true, sandbox_home), "{what} should be refused");
+        }
+    }
+
+    #[test]
+    fn test_browsers_send_sec_fetch_only_to_localhost_and_loopback() {
+        for host in ["localhost", "LOCALHOST", "3000-42.preview.localhost", "localhost.", "127.0.0.1", "127.1.2.3", "::1", "[::1]"] {
+            assert!(browser_sends_sec_fetch(host), "{host}");
+        }
+        for host in ["172.20.0.2", "10.0.0.1", "evil.example", "3000-42.preview.example.com", "notlocalhost", "::ffff:172.20.0.2", "[fd00::1]"] {
+            assert!(!browser_sends_sec_fetch(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn test_without_sec_fetch_a_page_load_or_the_sandboxs_own_page_is_allowed() {
+        let home = "http://172.20.0.2:8080/page";
+        for (what, s) in [
+            ("the model's navigation", plain("GET", None, true)),
+            ("a page load's HEAD", plain("HEAD", None, true)),
+            ("a link from another site", plain("GET", Some("http://evil.test:8703/"), true)),
+            ("the page's own image", plain("GET", Some(home), false)),
+            ("the page's own fetch", plain("GET", Some(home), false)),
+            ("a page on localhost", plain("GET", Some("http://localhost:5173/"), false)),
+            ("the page's own POST", source("POST", Some("http://172.20.0.2:8080"), None, None)),
+        ] {
+            assert!(allows_request_from(&s, false, sandbox_or_container), "{what} should be allowed");
+        }
+    }
+
+    #[test]
+    fn test_without_sec_fetch_other_sites_requests_are_refused() {
+        for (what, s) in [
+            ("another site's image", plain("GET", Some("http://evil.test:8703/"), false)),
+            ("another site's image with no referrer", plain("GET", None, false)),
+            ("another site's no-cors HEAD", plain("HEAD", None, false)),
+            ("a POST claiming to be a page load", plain("POST", None, true)),
+            ("a POST with only a home referrer", plain("POST", Some("http://172.20.0.2:8080/"), false)),
+            ("an unparseable referrer", plain("GET", Some("not a url"), false)),
+            ("another site's POST", source("POST", Some("http://evil.test:8703"), None, None)),
+        ] {
+            assert!(!allows_request_from(&s, false, sandbox_or_container), "{what} should be refused");
         }
     }
 }
