@@ -4133,6 +4133,10 @@ fn ChatPanel(
                                     role: "dialog",
                                     aria_modal: "true",
                                     aria_label: "Context",
+                                    // Focusable (not in the tab order), so a
+                                    // click on the view's text keeps focus in
+                                    // it and Escape still reaches the overlay.
+                                    tabindex: "-1",
                                     onclick: move |evt| evt.stop_propagation(),
                                     button {
                                         r#type: "button",
