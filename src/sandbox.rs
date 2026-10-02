@@ -900,17 +900,21 @@ pub async fn sweep_orphaned_conversation_claims(pool: &PgPool) {
     }
 }
 
-/// Whether the pod's Docker sidecar restarted since `last_reported`
-/// restarts, and if so its new restart count and the reason Kubernetes
-/// gave for the last exit (e.g. `OOMKilled`).
-fn docker_restart_to_report(pod: &Pod, last_reported: i32) -> Option<(i32, Option<String>)> {
-    let docker = pod
-        .status
+/// The pod's Docker sidecar's status, if it has one yet.
+fn docker_status(pod: &Pod) -> Option<&k8s_openapi::api::core::v1::ContainerStatus> {
+    pod.status
         .as_ref()?
         .init_container_statuses
         .as_ref()?
         .iter()
-        .find(|c| c.name == "docker")?;
+        .find(|c| c.name == "docker")
+}
+
+/// Whether the pod's Docker sidecar restarted since `last_reported`
+/// restarts, and if so its new restart count and the reason Kubernetes
+/// gave for the last exit (e.g. `OOMKilled`).
+fn docker_restart_to_report(pod: &Pod, last_reported: i32) -> Option<(i32, Option<String>)> {
+    let docker = docker_status(pod)?;
     if docker.restart_count <= last_reported {
         return None;
     }
@@ -922,21 +926,74 @@ fn docker_restart_to_report(pod: &Pod, last_reported: i32) -> Option<(i32, Optio
     Some((docker.restart_count, reason))
 }
 
+/// What `watch_pods` knows of a pod's Docker sidecar: the restart count
+/// it last saw, and the reason of the last exit it saw (`state.terminated`
+/// in the update before a restart; SME-85).
+#[derive(Debug, Default, Clone, PartialEq)]
+struct DockerSeen {
+    restarts: i32,
+    exit_reason: Option<String>,
+}
+
+/// A Docker sidecar restart for `watch_pods` to report.
+#[derive(Debug, PartialEq)]
+enum DockerRestart {
+    /// Report it now, with this reason.
+    Report { pod_id: i64, reason: String },
+    /// No update has said why yet: re-read the pod after
+    /// `DOCKER_REASON_WAIT` and report it then.
+    Recheck { pod_id: i64 },
+}
+
 /// `watch_pods`' bookkeeping for Docker sidecar restarts: remembers each
-/// pod's restart count in `seen`, and returns the pod id and reason for a
+/// pod's restart count and last exit reason in `seen`, and returns a
 /// restart to report. A pod's first listing (`initial`, after smelt starts
 /// or the watch reconnects) is only remembered, so a restart from before
 /// isn't reported again.
 fn note_docker_restarts(
-    seen: &mut HashMap<i64, i32>,
+    seen: &mut HashMap<i64, DockerSeen>,
     pod: &Pod,
     initial: bool,
-) -> Option<(i64, Option<String>)> {
+) -> Option<DockerRestart> {
     let pod_id = watched_pod_id(pod)?;
-    let last = seen.get(&pod_id).copied().unwrap_or(0);
-    let (count, reason) = docker_restart_to_report(pod, last)?;
-    seen.insert(pod_id, count);
-    (!initial).then_some((pod_id, reason))
+    let entry = seen.entry(pod_id).or_default();
+    let exited = docker_status(pod)
+        .and_then(|c| c.state.as_ref()?.terminated.as_ref()?.reason.clone());
+    if exited.is_some() {
+        entry.exit_reason = exited;
+    }
+    let (count, reason) = docker_restart_to_report(pod, entry.restarts)?;
+    entry.restarts = count;
+    // The exit seen before this restart explains only this one.
+    let remembered = entry.exit_reason.take();
+    if initial {
+        return None;
+    }
+    Some(match reason.or(remembered) {
+        Some(reason) => DockerRestart::Report { pod_id, reason },
+        None => DockerRestart::Recheck { pod_id },
+    })
+}
+
+/// How long `watch_pods` waits before re-reading a pod whose Docker
+/// sidecar restarted with no reason given yet (SME-85).
+const DOCKER_REASON_WAIT: Duration = Duration::from_secs(3);
+
+/// Reports `pod_id`'s Docker restart after `DOCKER_REASON_WAIT`, with the
+/// reason the pod's status gives by then, if any.
+fn recheck_docker_restart(pool: PgPool, client: kube::Client, pod_id: i64) {
+    tokio::spawn(async move {
+        tokio::time::sleep(DOCKER_REASON_WAIT).await;
+        let reason = match pods_api(&client).get_opt(&pod_name(pod_id)).await {
+            Ok(Some(pod)) => docker_restart_to_report(&pod, 0).and_then(|(_, reason)| reason),
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(pod_id, error = %e, "couldn't re-read a pod whose Docker restarted");
+                None
+            }
+        };
+        report_docker_restart(&pool, pod_id, reason).await;
+    });
 }
 
 /// Tells the pod's conversation that its Docker sidecar restarted, then
@@ -3120,7 +3177,7 @@ pub async fn watch_pods(pool: PgPool) {
     futures_util::pin_mut!(events);
     // Pods listed since the last `Init`, until `InitDone` completes the set.
     let mut listed = std::collections::HashSet::new();
-    // Each pod's Docker sidecar restart count, see `note_docker_restarts`.
+    // Each pod's Docker sidecar, see `note_docker_restarts`.
     let mut docker_restarts = HashMap::new();
     // Server pods whose stop was seen, see `lsp::pods::note_server_stop`.
     let mut stopped_servers = std::collections::HashSet::new();
@@ -3157,11 +3214,15 @@ pub async fn watch_pods(pool: PgPool) {
                     close_after_grace(pool.clone(), pod_id);
                 }
             }
-            Ok(watcher::Event::Apply(pod)) => {
-                if let Some((pod_id, reason)) = note_docker_restarts(&mut docker_restarts, &pod, false) {
-                    report_docker_restart(&pool, pod_id, reason).await;
+            Ok(watcher::Event::Apply(pod)) => match note_docker_restarts(&mut docker_restarts, &pod, false) {
+                Some(DockerRestart::Report { pod_id, reason }) => {
+                    report_docker_restart(&pool, pod_id, Some(reason)).await;
                 }
-            }
+                Some(DockerRestart::Recheck { pod_id }) => {
+                    recheck_docker_restart(pool.clone(), get().client.clone(), pod_id);
+                }
+                None => {}
+            },
             Ok(watcher::Event::Delete(pod)) => {
                 if let Some(pod_id) = watched_pod_id(&pod) {
                     docker_restarts.remove(&pod_id);
@@ -3832,13 +3893,82 @@ mod tests {
         let again = named(pod_with_docker_status(3, Some("OOMKilled")), "sandbox-7");
         assert_eq!(
             note_docker_restarts(&mut seen, &again, false),
-            Some((7, Some("OOMKilled".to_string())))
+            Some(DockerRestart::Report { pod_id: 7, reason: "OOMKilled".to_string() })
         );
         assert_eq!(note_docker_restarts(&mut seen, &again, false), None, "reported once");
 
         // Not smelt's pod.
         let other = named(pod_with_docker_status(1, Some("OOMKilled")), "something-else");
         assert_eq!(note_docker_restarts(&mut seen, &other, false), None);
+    }
+
+    /// A pod whose Docker sidecar has stopped but not restarted yet: the
+    /// update the kubelet publishes before the restart (SME-85's spike).
+    fn pod_with_docker_exited(restarts: i32, reason: &str) -> Pod {
+        use k8s_openapi::api::core::v1::{ContainerState, ContainerStateTerminated};
+        let mut pod = pod_with_docker_status(restarts, None);
+        if let Some(status) = pod
+            .status
+            .as_mut()
+            .and_then(|s| s.init_container_statuses.as_mut())
+            .and_then(|c| c.first_mut())
+        {
+            status.state = Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    reason: Some(reason.to_string()),
+                    exit_code: 137,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        pod
+    }
+
+    /// The update that raises the count can lack `lastState`'s reason
+    /// (SME-85); the exit seen just before the restart still says why.
+    #[test]
+    fn test_a_restart_without_a_last_state_reason_takes_the_exit_seen_before_it() {
+        let mut seen = HashMap::new();
+        let running = named(pod_with_docker_status(0, None), "sandbox-7");
+        assert_eq!(note_docker_restarts(&mut seen, &running, true), None);
+        let exited = named(pod_with_docker_exited(0, "OOMKilled"), "sandbox-7");
+        assert_eq!(note_docker_restarts(&mut seen, &exited, false), None, "not restarted yet");
+        let restarted = named(pod_with_docker_status(1, None), "sandbox-7");
+        assert_eq!(
+            note_docker_restarts(&mut seen, &restarted, false),
+            Some(DockerRestart::Report { pod_id: 7, reason: "OOMKilled".to_string() })
+        );
+    }
+
+    /// With no update saying why, the restart is still reported, once,
+    /// after a re-read of the pod.
+    #[test]
+    fn test_a_restart_with_no_reason_anywhere_is_rechecked_once() {
+        let mut seen = HashMap::new();
+        let running = named(pod_with_docker_status(0, None), "sandbox-7");
+        assert_eq!(note_docker_restarts(&mut seen, &running, true), None);
+        let restarted = named(pod_with_docker_status(1, None), "sandbox-7");
+        assert_eq!(
+            note_docker_restarts(&mut seen, &restarted, false),
+            Some(DockerRestart::Recheck { pod_id: 7 })
+        );
+        let later = named(pod_with_docker_status(1, Some("OOMKilled")), "sandbox-7");
+        assert_eq!(note_docker_restarts(&mut seen, &later, false), None, "the re-read reports it");
+    }
+
+    /// An exit remembered for one restart doesn't explain the next.
+    #[test]
+    fn test_a_remembered_exit_reason_explains_only_the_restart_after_it() {
+        let mut seen = HashMap::new();
+        let running = named(pod_with_docker_status(0, None), "sandbox-7");
+        note_docker_restarts(&mut seen, &running, true);
+        note_docker_restarts(&mut seen, &named(pod_with_docker_exited(0, "OOMKilled"), "sandbox-7"), false);
+        note_docker_restarts(&mut seen, &named(pod_with_docker_status(1, None), "sandbox-7"), false);
+        assert_eq!(
+            note_docker_restarts(&mut seen, &named(pod_with_docker_status(2, None), "sandbox-7"), false),
+            Some(DockerRestart::Recheck { pod_id: 7 })
+        );
     }
 
     /// DB-only: the notice lands in the pod's conversation, saying what
@@ -5057,10 +5187,25 @@ mod tests {
                 .expect("exec docker run");
             let container = started.stdout.trim().to_string();
 
+            // Read as `watch_pods` reads it: every poll goes through
+            // `note_docker_restarts`, and a restart no update explains yet
+            // is re-read after `DOCKER_REASON_WAIT` (SME-85). The test pod
+            // isn't named like a smelt pod, so it's watched as one here.
+            let as_watched = |pod: Pod| named(pod, "sandbox-1");
+            let mut seen = HashMap::new();
+            let first = pods.get(&name).await.expect("get pod");
+            note_docker_restarts(&mut seen, &as_watched(first), true);
             let restarted = loop {
                 let pod = pods.get(&name).await.expect("get pod");
-                if let Some(report) = docker_restart_to_report(&pod, 0) {
-                    break (pod, report);
+                match note_docker_restarts(&mut seen, &as_watched(pod.clone()), false) {
+                    Some(DockerRestart::Report { reason, .. }) => break (pod, (1, Some(reason))),
+                    Some(DockerRestart::Recheck { .. }) => {
+                        tokio::time::sleep(DOCKER_REASON_WAIT).await;
+                        let pod = pods.get(&name).await.expect("re-read pod");
+                        let reason = docker_restart_to_report(&pod, 0).and_then(|(_, reason)| reason);
+                        break (pod, (1, reason));
+                    }
+                    None => {}
                 }
                 // A workload that exits on its own never reaches the limit:
                 // say why now rather than at the timeout. Exit code 255 is
