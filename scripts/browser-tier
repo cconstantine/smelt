@@ -11,8 +11,9 @@
 # again, pass or fail. It also:
 # - builds the web bundle first (`dx build --platform web`): the tier serves
 #   a separately built one that `cargo test` never rebuilds;
-# - links the main checkout's .browser-check-cache (headless Chrome) into a
-#   worktree that lacks one (SME-51).
+# - points BROWSER_CHECK_CACHE at the main checkout's .browser-check-cache
+#   (headless Chrome) in a worktree that lacks one and with the variable
+#   unset (SME-51, SME-69).
 #
 # Exits with the tests' status. CI runs the same tests on its own stack
 # (.github/workflows/ci.yml) and doesn't use this.
@@ -31,11 +32,11 @@ case "$url" in *\?*) query="?${url#*\?}"; url=${url%%\?*} ;; esac
 name=smelt_browser_tier_$(basename "$PWD" | tr -c 'a-zA-Z0-9\n' '_')
 scratch="${url%/*}/$name$query"
 
-if [ ! -e .browser-check-cache ]; then
+if [ -z "${BROWSER_CHECK_CACHE:-}" ] && [ ! -e .browser-check-cache ]; then
     main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
     if [ -d "$main/.browser-check-cache" ]; then
-        ln -s "$main/.browser-check-cache" .browser-check-cache
-        echo "linked $main/.browser-check-cache"
+        export BROWSER_CHECK_CACHE="$main/.browser-check-cache"
+        echo "using $BROWSER_CHECK_CACHE"
     else
         echo "no .browser-check-cache: run scripts/browser-check/setup.sh first" >&2
         exit 1

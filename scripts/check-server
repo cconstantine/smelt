@@ -71,6 +71,32 @@ drop_scratch_db() {
     echo "dropped the scratch database"
 }
 
+# NAME's value in the worktree's .env, as dotenvy reads it: the last line
+# setting it, with or without `export`, unquoted.
+env_file_value() {
+    local value
+    value=$(sed -En "s/^(export[[:space:]]+)?$1=//p" "$worktree/.env" 2>/dev/null | tail -n 1)
+    case "$value" in
+        \"*\") value=${value#\"}; value=${value%\"} ;;
+        \'*\') value=${value#\'}; value=${value%\'} ;;
+    esac
+    echo "$value"
+}
+
+# Headless Chrome's cache directory: this checkout's, or else the main
+# checkout's (a worktree has none of its own).
+browser_check_cache() {
+    local main
+    main=$(dirname "$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)")
+    for dir in "$repo/.browser-check-cache" "$main/.browser-check-cache"; do
+        if [ -d "$dir" ]; then
+            (cd "$dir" && pwd -P)
+            return 0
+        fi
+    done
+    return 1
+}
+
 running_pgid() {
     local file
     file=$(pid_file)
@@ -126,11 +152,17 @@ start() {
         git -C "$repo" worktree add -q --detach "$worktree" "$commit"
     fi
     # The dev .env (never printed), and headless Chrome for webfetch and
-    # browsing sessions: headless_chrome.rs finds it under the checkout it
-    # was built from, and a fresh worktree has none (SME-51).
+    # browsing sessions: without BROWSER_CHECK_CACHE, headless_chrome.rs
+    # looks under the checkout it was built from, and a fresh worktree has
+    # none (SME-51, SME-69).
     [ -f "$worktree/.env" ] || { [ -f "$repo/.env" ] && cp "$repo/.env" "$worktree/.env"; }
-    if [ ! -e "$worktree/.browser-check-cache" ] && [ -d "$repo/.browser-check-cache" ]; then
-        ln -s "$repo/.browser-check-cache" "$worktree/.browser-check-cache"
+    # One already set (environment, else .env) is kept only when absolute:
+    # the server runs from the worktree, where a relative one finds nothing.
+    local cache given
+    given=${BROWSER_CHECK_CACHE:-$(env_file_value BROWSER_CHECK_CACHE)}
+    if [[ "$given" != /* ]] && cache=$(browser_check_cache); then
+        # Before the caller's overrides, so an explicit one still wins.
+        overrides=("BROWSER_CHECK_CACHE=$cache" "${overrides[@]}")
     fi
     if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
         local db_url
