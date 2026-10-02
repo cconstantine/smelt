@@ -194,7 +194,10 @@ scripts/check.sh                              # the per-commit gate (see below)
 cargo test --features server                 # the real (server-gated) tests
 cargo test --features server -- --nocapture   # show println! output
 cargo test --features server test_name        # a single test by name
+cargo test --features server -- --exact sandbox::tests::test_name   # exactly one test
 ```
+
+A name filter matches every test whose path contains it, and several filters are OR'd, so a filter meant for one unit test can also pick up real-cluster tests (on SME-85, `test_a_` matched a claims test that creates pods). To run one test, name it with `--exact` and its full path.
 
 Most logic lives behind the `server` feature; plain `cargo test` compiles but skips it.
 
