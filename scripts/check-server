@@ -144,9 +144,11 @@ start() {
     # looks under the checkout it was built from, and a fresh worktree has
     # none (SME-51, SME-69).
     [ -f "$worktree/.env" ] || { [ -f "$repo/.env" ] && cp "$repo/.env" "$worktree/.env"; }
-    local cache
-    if [ -z "${BROWSER_CHECK_CACHE:-}" ] && ! grep -qs '^BROWSER_CHECK_CACHE=.' "$worktree/.env" \
-        && cache=$(browser_check_cache); then
+    # One already set (environment, else .env) is kept only when absolute:
+    # the server runs from the worktree, where a relative one finds nothing.
+    local cache given
+    given=${BROWSER_CHECK_CACHE:-$(sed -n 's/^BROWSER_CHECK_CACHE=//p' "$worktree/.env" 2>/dev/null | tail -n 1)}
+    if [[ "$given" != /* ]] && cache=$(browser_check_cache); then
         # Before the caller's overrides, so an explicit one still wins.
         overrides=("BROWSER_CHECK_CACHE=$cache" "${overrides[@]}")
     fi
