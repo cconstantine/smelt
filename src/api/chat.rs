@@ -51,6 +51,15 @@ pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
     stop_turn_now(id);
     let _ = crate::browsing::close_session(id).await;
     anthropic::tools::forget_conversation_tasks(id);
+    // Read before the delete cascades them away: teardown deletes the pods
+    // they name too, labelled or not (SME-88). Best-effort, like teardown.
+    let pod_ids: Vec<i64> = match db::list_sandbox_pods(db::get(), id).await {
+        Ok(rows) => rows.into_iter().map(|row| row.id).collect(),
+        Err(e) => {
+            tracing::warn!(conversation_id = id, error = %e, "couldn't list a conversation's pods before deleting it");
+            Vec::new()
+        }
+    };
     db::delete_conversation(db::get(), id)
         .await
         .map_err(ServerFnError::new)?;
@@ -58,7 +67,7 @@ pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
     // one still starting sees the conversation gone (`create_pod`).
     // Best-effort, unconditional (unlike terminate_pod, which the model
     // calls and which is guarded).
-    crate::sandbox::teardown_conversation(id).await;
+    crate::sandbox::teardown_conversation(id, &pod_ids).await;
     crate::events::forget(id);
     forget_conversation_lock(id);
     // After the delete, so a listener refetching sees the pod rows gone.

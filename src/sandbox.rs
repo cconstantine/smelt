@@ -947,15 +947,19 @@ enum DockerRestart {
 
 /// `watch_pods`' bookkeeping for Docker sidecar restarts: remembers each
 /// pod's restart count and last exit reason in `seen`, and returns a
-/// restart to report. A pod's first listing (`initial`, after smelt starts
-/// or the watch reconnects) is only remembered, so a restart from before
-/// isn't reported again.
+/// restart to report. A pod first seen in a listing (`initial`, after
+/// smelt starts or the watch reconnects) is only remembered: there's
+/// nothing to compare its count with. A known pod's re-listing is compared
+/// like any update.
 fn note_docker_restarts(
     seen: &mut HashMap<i64, DockerSeen>,
     pod: &Pod,
     initial: bool,
 ) -> Option<DockerRestart> {
     let pod_id = watched_pod_id(pod)?;
+    // In a listing, a pod already known is one re-listed after the watch
+    // reconnected: a restart since is one missed while disconnected (SME-88).
+    let known = seen.contains_key(&pod_id);
     let entry = seen.entry(pod_id).or_default();
     let exited = docker_status(pod)
         .and_then(|c| c.state.as_ref()?.terminated.as_ref()?.reason.clone());
@@ -966,7 +970,7 @@ fn note_docker_restarts(
     entry.restarts = count;
     // The exit seen before this restart explains only this one.
     let remembered = entry.exit_reason.take();
-    if initial {
+    if initial && !known {
         return None;
     }
     Some(match reason.or(remembered) {
@@ -1000,6 +1004,14 @@ fn recheck_docker_restart(pool: PgPool, client: kube::Client, pod_id: i64) {
         };
         report_docker_restart(&pool, pod_id, reason).await;
     });
+}
+
+/// Reports `restart` now, or after a re-read when no update said why.
+async fn handle_docker_restart(pool: &PgPool, restart: DockerRestart) {
+    match restart {
+        DockerRestart::Report { pod_id, reason } => report_docker_restart(pool, pod_id, Some(reason)).await,
+        DockerRestart::Recheck { pod_id } => recheck_docker_restart(pool.clone(), get().client.clone(), pod_id),
+    }
 }
 
 /// Tells the pod's conversation that its Docker sidecar restarted, then
@@ -2014,7 +2026,7 @@ where
 /// id its pods and claims are labelled with (the same, outside tests).
 async fn clean_up_after_failed_start(pool: &PgPool, client: &kube::Client, conversation_id: i64, label_id: i64) {
     if !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
-        teardown_conversation_with(client, label_id).await;
+        teardown_conversation_with(client, label_id, &[]).await;
     }
 }
 
@@ -2094,7 +2106,7 @@ async fn create_pod_attempt(
             // The conversation may have been deleted while this pod was
             // starting; its teardown had nothing to find yet (SME-51 B5).
             if !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
-                teardown_conversation_with(&manager.client, conversation_id).await;
+                teardown_conversation_with(&manager.client, conversation_id, &[]).await;
                 return Err(SandboxError::StartFailed(
                     "the conversation was deleted while its sandbox was starting".to_string(),
                 ));
@@ -2733,20 +2745,31 @@ pub(crate) async fn pod_exists(pod_id: i64) -> bool {
     )
 }
 
-pub async fn teardown_conversation(conversation_id: i64) {
-    teardown_conversation_with(&get().client, conversation_id).await;
+pub async fn teardown_conversation(conversation_id: i64, pod_ids: &[i64]) {
+    teardown_conversation_with(&get().client, conversation_id, pod_ids).await;
 }
 
 /// `teardown_conversation` on `client`. Pods are found by their
-/// conversation label, not by their records: a `create_pod` racing the
-/// conversation's deletion makes a pod whose record the delete then
-/// cascades away (SME-51 B5).
-async fn teardown_conversation_with(client: &kube::Client, conversation_id: i64) {
+/// conversation label: a `create_pod` racing the conversation's deletion
+/// makes a pod whose record the delete then cascades away (SME-51 B5).
+/// `pod_ids`, the conversation's live pod records read before the delete,
+/// name the rest (SME-88).
+async fn teardown_conversation_with(client: &kube::Client, conversation_id: i64, pod_ids: &[i64]) {
     let pods = pods_api(client);
     // Its sandbox pods, and its language server pods (SME-35).
     for label in [CONVERSATION_LABEL, crate::lsp::pods::LSP_OF_LABEL] {
         let selector = ListParams::default().labels(&format!("{label}={conversation_id}"));
         delete_listed(&pods, &selector, conversation_id).await;
+    }
+    // And the pods its records name, labelled or not (one from before
+    // SME-33 has no label; SME-88). A pod deleted above is already gone.
+    for &pod_id in pod_ids {
+        deregister(pod_id);
+        match pods.delete(&pod_name(pod_id), &pod_delete_params()).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => tracing::warn!(pod_id, error = %e, "failed to delete pod during conversation teardown"),
+        }
     }
     // After the pods: Kubernetes holds a claim until no pod mounts it.
     delete_conversation_pvcs(client, conversation_id).await;
@@ -3191,7 +3214,9 @@ pub async fn watch_pods(pool: PgPool) {
         match event {
             Ok(watcher::Event::Init) => listed.clear(),
             Ok(watcher::Event::InitApply(pod)) => {
-                note_docker_restarts(&mut docker_restarts, &pod, true);
+                if let Some(restart) = note_docker_restarts(&mut docker_restarts, &pod, true) {
+                    handle_docker_restart(&pool, restart).await;
+                }
                 crate::lsp::pods::note_server_stop(&mut stopped_servers, &pod, true);
                 if let Some(pod_id) = watched_pod_id(&pod) {
                     if !pod_has_finished(&pod) {
@@ -3221,15 +3246,11 @@ pub async fn watch_pods(pool: PgPool) {
                     close_after_grace(pool.clone(), pod_id);
                 }
             }
-            Ok(watcher::Event::Apply(pod)) => match note_docker_restarts(&mut docker_restarts, &pod, false) {
-                Some(DockerRestart::Report { pod_id, reason }) => {
-                    report_docker_restart(&pool, pod_id, Some(reason)).await;
+            Ok(watcher::Event::Apply(pod)) => {
+                if let Some(restart) = note_docker_restarts(&mut docker_restarts, &pod, false) {
+                    handle_docker_restart(&pool, restart).await;
                 }
-                Some(DockerRestart::Recheck { pod_id }) => {
-                    recheck_docker_restart(pool.clone(), get().client.clone(), pod_id);
-                }
-                None => {}
-            },
+            }
             Ok(watcher::Event::Delete(pod)) => {
                 if let Some(pod_id) = watched_pod_id(&pod) {
                     docker_restarts.remove(&pod_id);
@@ -3973,6 +3994,32 @@ mod tests {
         note_docker_restarts(&mut seen, &named(pod_with_docker_status(0, None), "sandbox-8"), true);
         forget_unlisted_docker(&mut seen, &[8].into_iter().collect());
         assert_eq!(seen.keys().copied().collect::<Vec<_>>(), vec![8]);
+    }
+
+    /// SME-88: a restart that happened while the watch was disconnected
+    /// shows up in the re-listing after it reconnects, and is reported.
+    #[test]
+    fn test_a_restart_missed_while_disconnected_is_reported_from_the_relisting() {
+        let mut seen = HashMap::new();
+        let running = named(pod_with_docker_status(0, None), "sandbox-7");
+        assert_eq!(note_docker_restarts(&mut seen, &running, true), None);
+        let relisted = named(pod_with_docker_status(1, Some("OOMKilled")), "sandbox-7");
+        assert_eq!(
+            note_docker_restarts(&mut seen, &relisted, true),
+            Some(DockerRestart::Report { pod_id: 7, reason: "OOMKilled".to_string() })
+        );
+        assert_eq!(note_docker_restarts(&mut seen, &relisted, false), None, "reported once");
+    }
+
+    /// A pod first seen in a listing, before smelt started or while it was
+    /// disconnected, has nothing to compare with: only remembered.
+    #[test]
+    fn test_a_pod_first_seen_in_a_listing_is_only_remembered() {
+        let mut seen = HashMap::new();
+        let known = named(pod_with_docker_status(0, None), "sandbox-7");
+        note_docker_restarts(&mut seen, &known, true);
+        let new_pod = named(pod_with_docker_status(2, Some("OOMKilled")), "sandbox-8");
+        assert_eq!(note_docker_restarts(&mut seen, &new_pod, true), None);
     }
 
     /// An exit remembered for one restart doesn't explain the next.
@@ -5434,7 +5481,7 @@ mod tests {
         .expect("pod");
         pods.create(&PostParams::default(), &server_pod).await.expect("create server pod");
 
-        teardown_conversation_with(&client, conversation_id).await;
+        teardown_conversation_with(&client, conversation_id, &[]).await;
         let gone = tokio::time::timeout(Duration::from_secs(60), async {
             while pods.get_opt(&name).await.ok().flatten().is_some()
                 || pods.get_opt(&server).await.ok().flatten().is_some()
@@ -5448,6 +5495,36 @@ mod tests {
         pods.delete(&name, &immediate_delete_params()).await.ok();
         pods.delete(&server, &immediate_delete_params()).await.ok();
         assert!(gone, "{name} or {server} survived its conversation's teardown");
+    }
+
+    /// SME-88: a pod without the conversation label (one from before
+    /// SME-33) is still deleted, found by its record's id.
+    #[tokio::test]
+    async fn test_teardown_deletes_an_unlabelled_pod_named_by_its_record() {
+        let client = test_client().await;
+        let pods = pods_api(&client);
+        let conversation_id = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64
+            + 1_000_000_000;
+        let pod_id = conversation_id + 1;
+        let name = pod_name(pod_id);
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": name},
+            "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
+        }))
+        .expect("pod");
+        pods.create(&PostParams::default(), &pod).await.expect("create pod");
+
+        teardown_conversation_with(&client, conversation_id, &[pod_id]).await;
+        let gone = tokio::time::timeout(Duration::from_secs(60), async {
+            while pods.get_opt(&name).await.ok().flatten().is_some() {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .is_ok();
+
+        pods.delete(&name, &immediate_delete_params()).await.ok();
+        assert!(gone, "{name} survived its conversation's teardown");
     }
 
     /// A conversation's Docker claim is created once and reused, and
@@ -6644,7 +6721,7 @@ mod tests {
                 .map(|c| c.claim_name);
             assert_eq!(mounted_workspace.as_deref(), Some(workspace_claim.as_str()), "pod j's /workspace is its conversation's claim");
 
-            teardown_conversation(conversation_j.id).await;
+            teardown_conversation(conversation_j.id, &[]).await;
             // The claim's `pvc-protection` finalizer holds it until the pod
             // is really gone.
             let docker_claim_gone = tokio::time::timeout(Duration::from_secs(60), async {
@@ -6684,7 +6761,7 @@ mod tests {
                 }
             })
             .await;
-            teardown_conversation(conversation_k.id).await;
+            teardown_conversation(conversation_k.id, &[]).await;
             assert!(announced.is_ok(), "a create_pod whose caller went away never finished");
 
             // --- Generic volumes: create_volume/delete_volume manage a
