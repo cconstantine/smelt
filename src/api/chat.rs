@@ -1468,13 +1468,28 @@ fn keep_turn_error(conversation_id: i64, generation: u64, error: String) {
     }
 }
 
+/// Shows `message` as `conversation_id`'s error, as a failed turn's is
+/// (`TurnError`, and kept for a reconnecting tab until the user writes),
+/// for something that failed outside a turn: a "Work on a repo" that
+/// couldn't start the sandbox (SME-91).
+#[cfg(feature = "server")]
+pub(crate) fn show_conversation_error(conversation_id: i64, message: String) {
+    TURN_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(conversation_id)
+        .or_default()
+        .error = Some(message.clone());
+    crate::events::publish(conversation_id, crate::events::ConversationEvent::TurnError { message });
+}
+
 #[cfg(test)]
 fn remember_turn_error(conversation_id: i64, error: Option<String>) {
     TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).entry(conversation_id).or_default().error = error;
 }
 
 #[cfg(feature = "server")]
-fn last_turn_error(conversation_id: i64) -> Option<String> {
+pub(crate) fn last_turn_error(conversation_id: i64) -> Option<String> {
     TURN_ERRORS
         .lock()
         .unwrap_or_else(|e| e.into_inner())

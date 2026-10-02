@@ -83,12 +83,27 @@ pub async fn attach_repo(id: i64, url: String, branch: String, dir: String) -> S
             crate::api::chat::deliver_notice(pool, conversation_id, notice).await;
         });
     }
+    let nothing_to_clone = pending.is_none();
     tokio::spawn(async move {
         if let Err(e) = git::finish_attach(pool, id, pending).await {
             tracing::warn!(conversation_id = id, error = %e, "\"Work on a repo\" failed");
+            report_attach_failure(id, nothing_to_clone, &e);
         }
     });
     Ok(shown)
+}
+
+/// A failed "Work on a repo", shown in the conversation when the repo was
+/// already checked out: there's no repo row to mark failed then, and the
+/// failure was only logged (SME-91). With a clone, the repo's row says it.
+#[cfg(feature = "server")]
+fn report_attach_failure(conversation_id: i64, nothing_to_clone: bool, error: &str) {
+    if nothing_to_clone {
+        crate::api::chat::show_conversation_error(
+            conversation_id,
+            format!("\"Work on a repo\" couldn't start the sandbox: {error}"),
+        );
+    }
 }
 
 #[post("/api/git/identity")]
@@ -117,4 +132,32 @@ pub async fn delete_ssh_key(id: i64) -> ServerFnResult<()> {
     git::delete_key(db::get(), id)
         .await
         .map_err(ServerFnError::new)
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    /// SME-91: when the repo was already checked out there's no repo row
+    /// to mark failed, so a sandbox that couldn't start was only logged.
+    /// It shows in the conversation instead; with a clone, the repo's own
+    /// row says it (the panel), so it isn't shown twice.
+    #[tokio::test]
+    async fn test_a_failed_attach_with_nothing_to_clone_shows_in_the_conversation() {
+        let shown = 9_100_000_095;
+        let mut rx = crate::events::subscribe(shown);
+        report_attach_failure(shown, true, "the sandbox didn't start");
+        let error = crate::api::chat::last_turn_error(shown).expect("the error is kept for a reload");
+        assert!(error.contains("the sandbox didn't start"), "got: {error}");
+        match rx.try_recv() {
+            Ok(crate::events::ConversationEvent::TurnError { message }) => {
+                assert!(message.contains("the sandbox didn't start"), "got: {message}")
+            }
+            other => panic!("no TurnError published: {other:?}"),
+        }
+
+        let with_clone = 9_100_000_096;
+        report_attach_failure(with_clone, false, "the sandbox didn't start");
+        assert_eq!(crate::api::chat::last_turn_error(with_clone), None);
+    }
 }
