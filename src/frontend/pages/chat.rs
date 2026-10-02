@@ -3139,6 +3139,13 @@ fn ChatPanel(
     // `ConversationEvent::BrowsingUrlUpdate`.
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut browsing_url: Signal<Option<String>> = use_signal(|| None);
+    // Set while this tab is live on the conversation: subscribed to its
+    // events and done with the snapshot pull that follows. The id, and how
+    // many times this page has connected and pulled (more than one means a
+    // reconnect). Shown as `data-live`/`data-live-pulls` on the panel, which
+    // the browser tests wait for (SME-59).
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut live: Signal<Option<(i64, u32)>> = use_signal(|| None);
     // The address bar's own state: what's typed, whether the viewer is
     // typing (so incoming URL changes don't clobber it), an in-flight
     // navigation, and the last navigation error.
@@ -3257,6 +3264,7 @@ fn ChatPanel(
             if let Some(task) = event_task.write().take() {
                 task.cancel();
             }
+            live.set(None);
             let Some(id) = selected() else { return };
             tasks.set(Vec::new());
             todos.set(Vec::new());
@@ -3296,6 +3304,7 @@ fn ChatPanel(
             address_draft.set(String::new());
 
             let handle = spawn(async move {
+                let mut pulls = 0u32;
                 loop {
                     if let Ok(mut events) = subscribe_conversation_events(id).await {
                         // One-shot reconciliation pull: a `broadcast`
@@ -3338,12 +3347,12 @@ fn ChatPanel(
                             stream_errors.write().insert(id, error);
                         }
                         crate::frontend::check_build_id().await;
-                        // Kept last: the browser tests take this request
-                        // completing as the sign the client is live.
                         if let Ok(state) = get_browsing_state(id).await {
                             browsing_session_open.set(state.session_open);
                             browsing_url.set(state.url);
                         }
+                        pulls += 1;
+                        live.set(Some((id, pulls)));
 
                         loop {
                             match events.recv().await {
@@ -3500,6 +3509,7 @@ fn ChatPanel(
                                 Some(Err(_)) | None => break,
                             }
                         }
+                        live.set(None);
                     }
                     // Stream ended or failed to open — reconnect after a
                     // short fixed delay (a guessed default, like `MAX_TURNS`
@@ -3709,7 +3719,10 @@ fn ChatPanel(
     });
 
     rsx! {
-        section { class: "chat-panel",
+        section {
+            class: "chat-panel",
+            "data-live": live().map(|(id, _)| id.to_string()),
+            "data-live-pulls": live().map(|(_, pulls)| pulls.to_string()),
             match selected() {
                 None => rsx! {
                     div { class: "empty-state", "Select or start a conversation" }
