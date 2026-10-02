@@ -47,7 +47,7 @@ pub async fn open_pod_target(
     host: PodHost,
     port: u16,
 ) -> Result<Box<dyn PodIo>, TerminalError> {
-    open_pod_port_with(pool, conversation_id, host, port, || get().client.clone()).await
+    open_pod_port_with(pool, conversation_id, host, port, || Ok(get()?.client.clone())).await
 }
 
 /// `open_pod_target` with the Kubernetes client supplied — a test's own, so
@@ -60,13 +60,13 @@ pub(super) async fn open_pod_port_with(
     conversation_id: i64,
     host: PodHost,
     port: u16,
-    client: impl FnOnce() -> kube::Client,
+    client: impl FnOnce() -> Result<kube::Client, SandboxError>,
 ) -> Result<Box<dyn PodIo>, TerminalError> {
     if host == PodHost::Localhost {
         check_reachable_port(port)?;
     }
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
-    dial_pod(&client(), &pod_name(pod_id), host, port).await
+    dial_pod(&client()?, &pod_name(pod_id), host, port).await
 }
 
 /// Opens a connection to `host:port` in the pod named `pod`: a
@@ -126,7 +126,7 @@ pub async fn pod_port_is_listening(
     host: PodHost,
     port: u16,
 ) -> Result<bool, TerminalError> {
-    pod_port_is_listening_with(pool, conversation_id, host, port, || get().client.clone()).await
+    pod_port_is_listening_with(pool, conversation_id, host, port, || Ok(get()?.client.clone())).await
 }
 
 pub(super) const LISTEN_PROBE: Duration = Duration::from_millis(500);
@@ -139,7 +139,7 @@ pub(super) async fn pod_port_is_listening_with(
     conversation_id: i64,
     host: PodHost,
     port: u16,
-    client: impl FnOnce() -> kube::Client,
+    client: impl FnOnce() -> Result<kube::Client, SandboxError>,
 ) -> Result<bool, TerminalError> {
     // A port-forward that doesn't open in time says as much as one that's
     // refused: nothing is serving there yet (SME-51 B8).

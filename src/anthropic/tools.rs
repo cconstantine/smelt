@@ -2270,7 +2270,7 @@ mod server {
     }
 
     async fn lsp_servers_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
-        let client = sandbox::kube_client();
+        let client = sandbox::kube_client().map_err(|e| e.to_string())?;
         let sandbox = crate::lsp::manager::sandbox_ref(pool, &client, conversation_id).await.ok();
         crate::lsp::manager::servers_summary(pool, &client, sandbox.as_ref()).await
     }
@@ -2281,7 +2281,7 @@ mod server {
         input: &Value,
     ) -> Result<String, String> {
         let name = required_str(input, "name")?;
-        let client = sandbox::kube_client();
+        let client = sandbox::kube_client().map_err(|e| e.to_string())?;
         let sandbox = crate::lsp::manager::sandbox_ref(pool, &client, conversation_id).await?;
         crate::lsp::manager::start(pool, &client, &sandbox, &name).await
     }
@@ -2297,7 +2297,7 @@ mod server {
             query: text("query"),
             new_name: text("new_name"),
         };
-        let client = sandbox::kube_client();
+        let client = sandbox::kube_client().map_err(|e| e.to_string())?;
         let sandbox = crate::lsp::manager::sandbox_ref(pool, &client, conversation_id).await?;
         crate::lsp::manager::operate(pool, &client, &sandbox, operation, &request).await
     }

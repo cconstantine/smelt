@@ -951,7 +951,7 @@ async fn test_open_pod_port_reaches_the_conversations_own_pod(pool: PgPool) {
         .expect("create the pod");
     let open = |conversation_id: i64, port: u16| {
         let (client, pool) = (client.clone(), pool.clone());
-        async move { open_pod_port_with(&pool, conversation_id, PodHost::Localhost, port, move || client).await }
+        async move { open_pod_port_with(&pool, conversation_id, PodHost::Localhost, port, move || Ok(client)).await }
     };
     // Python's server speaks HTTP/1.0 and closes after every response,
     // so the preview below also meets an upstream that's gone between
@@ -993,7 +993,7 @@ async fn test_open_pod_port_reaches_the_conversations_own_pod(pool: PgPool) {
             Arc::new(move |_host, port| {
                 let (client, pool) = (client.clone(), pool.clone());
                 Box::pin(async move {
-                    open_pod_port_with(&pool, conversation, PodHost::Localhost, port, move || client)
+                    open_pod_port_with(&pool, conversation, PodHost::Localhost, port, move || Ok(client))
                         .await
                         .map_err(|e| crate::egress_proxy::DialError::from(e.to_string()))
                 }) as DialFuture
@@ -1017,9 +1017,9 @@ async fn test_open_pod_port_reaches_the_conversations_own_pod(pool: PgPool) {
     };
     let (probe_client, probe_pool) = (client.clone(), pool.clone());
     let server_listening =
-        pod_port_is_listening_with(&probe_pool, with_pod.id, PodHost::Localhost, 8000, || probe_client.clone()).await;
+        pod_port_is_listening_with(&probe_pool, with_pod.id, PodHost::Localhost, 8000, || Ok(probe_client.clone())).await;
     let agent_port_result = open(with_pod.id, AGENT_PORT).await;
-    let unused_listening = pod_port_is_listening_with(&probe_pool, with_pod.id, PodHost::Localhost, 9, || probe_client.clone()).await;
+    let unused_listening = pod_port_is_listening_with(&probe_pool, with_pod.id, PodHost::Localhost, 9, || Ok(probe_client.clone())).await;
     let without_pod_result = open(without_pod.id, 8000).await;
     let closed_reply = match open(with_pod.id, 9).await {
         Ok(mut stream) => Ok(http_get_over(&mut stream, "/").await),
@@ -1100,6 +1100,16 @@ async fn test_conversation_pod_id_resolves_the_live_pod_and_errors_with_no_pod_o
         .await
         .expect("should resolve");
     assert_eq!(resolved, pod.id);
+}
+
+/// The manager before `init()`: an error saying so, not a panic (SME-56).
+/// Read from a cell of the test's own, since
+/// `test_terminal_lifecycle_end_to_end` sets the process-wide one.
+#[test]
+fn test_the_manager_before_init_is_not_initialized() {
+    let cell = OnceLock::new();
+    let result = manager_in(&cell);
+    assert!(matches!(result, Err(SandboxError::NotInitialized)), "expected NotInitialized");
 }
 
 fn unique_session_id(label: &str) -> String {
@@ -1795,7 +1805,7 @@ async fn test_the_listening_probe_gives_up_on_a_hanging_cluster(pool: PgPool) {
     let client = kube::Client::try_from(config).expect("client");
     let probed = tokio::time::timeout(
         LISTEN_OPEN_TIMEOUT + Duration::from_secs(5),
-        pod_port_is_listening_with(&pool, conversation.id, PodHost::Localhost, 8000, || client),
+        pod_port_is_listening_with(&pool, conversation.id, PodHost::Localhost, 8000, || Ok(client)),
     )
     .await;
     assert!(matches!(probed, Ok(Ok(false))), "the probe should give up and say nothing's listening: {probed:?}");
@@ -2615,7 +2625,7 @@ async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
         let pod_c = create_pod(&pool, conversation_c.id, PodLimitOverrides::default()).await.expect("create_pod (c) should succeed");
         let terminal_c1 = create_terminal(&pool, conversation_c.id).await.expect("create_terminal (c1) should succeed");
 
-        let pods = pods_api(&get().client);
+        let pods = pods_api(&get().expect("set above").client);
         pods.delete(&pod_name(pod_c), &immediate_delete_params()).await.expect("delete pod_c directly");
         deregister(pod_c);
 
@@ -3186,7 +3196,7 @@ async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
         let volumes = db::list_sandbox_volumes(&pool).await.expect("list_sandbox_volumes");
         let volume_session_id = unique_session_id(VOLUME_MOUNT_SESSION_LABEL);
         let volume_sandbox =
-            get().create(&volume_session_id, "128Mi", &volumes).await.expect("create with a volume should succeed");
+            get().expect("set above").create(&volume_session_id, "128Mi", &volumes).await.expect("create with a volume should succeed");
         let write =
             volume_sandbox.exec(&["sh", "-c", "echo hello > /data/testvol/marker.txt"]).await.expect("exec should succeed");
         assert_eq!(write.exit_code, 0, "writing into the mounted volume should succeed");
@@ -3222,14 +3232,14 @@ async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
 
     // Best-effort cleanup regardless of pass/fail, matching this file's
     // existing convention (real-cluster tests, no automatic isolation).
-    let pods = pods_api(&get().client);
+    let pods = pods_api(&get().expect("set above").client);
     for n in 1..=20i64 {
         pods.delete(&pod_name(n), &immediate_delete_params())
             .await
             .ok();
     }
     // Each conversation's docker data claim (SME-33); ids are small here.
-    let pvcs = pvc_api(&get().client);
+    let pvcs = pvc_api(&get().expect("set above").client);
     for n in 1..=30i64 {
         pvcs.delete(&docker_pvc_name(n), &DeleteParams::default()).await.ok();
     }

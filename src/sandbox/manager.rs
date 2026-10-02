@@ -27,8 +27,8 @@ pub(super) async fn ensure_volume_claims(
 }
 
 /// The Kubernetes client every sandbox operation uses.
-pub(crate) fn kube_client() -> kube::Client {
-    get().client.clone()
+pub(crate) fn kube_client() -> Result<kube::Client, SandboxError> {
+    Ok(get()?.client.clone())
 }
 
 pub struct SandboxManager {
@@ -223,7 +223,9 @@ pub(super) async fn drain_cleanup_queue(client: kube::Client, mut rx: mpsc::Unbo
 
 pub(super) static MANAGER: OnceLock<SandboxManager> = OnceLock::new();
 
-pub async fn init() -> &'static SandboxManager {
+/// Builds the process-wide manager from the environment's Kubernetes
+/// config (`KUBECONFIG`), or returns the one already built.
+pub async fn init() -> Result<&'static SandboxManager, SandboxError> {
     // `main()` already calls this before `init()` — but `init()` is also
     // called directly by `browser_tests.rs`'s in-process test harness,
     // which never runs through `main()` at all. Idempotent (`let _ = ...`
@@ -232,20 +234,23 @@ pub async fn init() -> &'static SandboxManager {
     // "why ring, not aws-lc-rs" explanation.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let client = kube::Client::try_default()
-        .await
-        .unwrap_or_else(|e| panic!("failed to build kube client (check KUBECONFIG): {e}"));
-    MANAGER
-        .set(SandboxManager::new(client))
-        .ok()
-        .expect("sandbox already initialized");
-    MANAGER.get().unwrap()
+    if let Some(manager) = MANAGER.get() {
+        return Ok(manager);
+    }
+    let client = kube::Client::try_default().await?;
+    // Two first calls at once: the loser's manager is dropped unused.
+    let _ = MANAGER.set(SandboxManager::new(client));
+    get()
 }
 
-pub fn get() -> &'static SandboxManager {
-    MANAGER
-        .get()
-        .expect("sandbox not initialized; call sandbox::init() first")
+/// The process-wide manager, or `NotInitialized` before `init()`.
+pub fn get() -> Result<&'static SandboxManager, SandboxError> {
+    manager_in(&MANAGER)
+}
+
+/// `get` on a given cell, so a test can read one of its own.
+pub(super) fn manager_in(cell: &OnceLock<SandboxManager>) -> Result<&SandboxManager, SandboxError> {
+    cell.get().ok_or(SandboxError::NotInitialized)
 }
 
 // --- Pod ---
@@ -403,7 +408,9 @@ pub(super) async fn create_pod_now(
     // Only a deleted conversation needs the cluster touched; a refused
     // start for a live one (a pod already exists, say) doesn't.
     if result.is_err() && !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
-        clean_up_after_failed_start(pool, &get().client, conversation_id, conversation_id).await;
+        if let Ok(manager) = get() {
+            clean_up_after_failed_start(pool, &manager.client, conversation_id, conversation_id).await;
+        }
     }
     result
 }
@@ -420,7 +427,7 @@ pub(super) async fn create_pod_attempt(
 
     let (memory, docker) = limits.resolve(conversation_id);
 
-    let manager = get();
+    let manager = get()?;
     // The database's own one-live-pod rule backs up the check above.
     let row = db::create_sandbox_pod(pool, conversation_id).await.map_err(|e| {
         if e.as_database_error().is_some_and(|d| d.is_unique_violation()) {
@@ -543,7 +550,7 @@ pub(super) async fn force_terminate_pod(
     pod_id: i64,
 ) -> Result<Option<db::SandboxPod>, SandboxError> {
     terminate_pod_with(pool, pod_id, async {
-        let pods = pods_api(&get().client);
+        let pods = pods_api(&get()?.client);
         let name = pod_name(pod_id);
         if pods.get_opt(&name).await?.is_some() {
             pods.delete(&name, &pod_delete_params()).await?;
@@ -599,7 +606,7 @@ pub struct PodDetails {
 
 /// `pod_id`'s phase and limits, or `None` if Kubernetes has no such pod.
 pub async fn pod_details(pod_id: i64) -> Result<Option<PodDetails>, SandboxError> {
-    let pods = pods_api(&get().client);
+    let pods = pods_api(&get()?.client);
     let Some(pod) = pods.get_opt(&pod_name(pod_id)).await? else {
         return Ok(None);
     };
@@ -621,11 +628,11 @@ pub async fn pod_metrics_list() -> Result<serde_json::Value, SandboxError> {
     ))
     .body(Vec::new())
     .expect("a static, well-formed request");
-    Ok(get().client.request::<serde_json::Value>(request).await?)
+    Ok(get()?.client.request::<serde_json::Value>(request).await?)
 }
 
 pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInfo>, SandboxError> {
-    let manager = get();
+    let manager = get()?;
     let pods = pods_api(&manager.client);
     let rows = db::list_sandbox_pods(pool, conversation_id)
         .await
@@ -662,11 +669,12 @@ pub async fn create_volume(
 ) -> Result<i64, SandboxError> {
     let resolved_path = resolve_mount_path(mount_path);
     validate_mount_path(&resolved_path).map_err(SandboxError::InvalidMountPath)?;
+    // Before the row, so a missing manager leaves nothing behind.
+    let manager = get()?;
     let row = db::create_sandbox_volume(pool, name, &resolved_path)
         .await
         .map_err(SandboxError::Db)?;
 
-    let manager = get();
     let pvcs = pvc_api(&manager.client);
     if let Err(e) = pvcs
         .create(&PostParams::default(), &build_volume_pvc_spec(row.id))
@@ -682,7 +690,7 @@ pub async fn create_volume(
 /// missing PVC (already gone) is not an error — same "delete if it's still
 /// there" tolerance `force_terminate_pod` already has for its own pod.
 pub async fn delete_volume(pool: &PgPool, id: i64) -> Result<(), SandboxError> {
-    let manager = get();
+    let manager = get()?;
     let pvcs = pvc_api(&manager.client);
     let pvc_name = sandbox_volume_pvc_name(id);
     if pvcs.get_opt(&pvc_name).await?.is_some() {
@@ -698,8 +706,11 @@ pub async fn delete_volume(pool: &PgPool, id: i64) -> Result<(), SandboxError> {
 /// counts as existing).
 #[cfg(all(test, feature = "browser-test"))]
 pub(crate) async fn pod_exists(pod_id: i64) -> bool {
+    let Ok(manager) = get() else {
+        return false;
+    };
     matches!(
-        pods_api(&get().client).get_opt(&pod_name(pod_id)).await,
+        pods_api(&manager.client).get_opt(&pod_name(pod_id)).await,
         Ok(Some(_))
     )
 }
@@ -712,7 +723,10 @@ pub(crate) async fn pod_exists(pod_id: i64) -> bool {
 /// `sandbox_pods`/`sandbox_terminals`/`terminal_commands` for real right
 /// after this runs.
 pub async fn teardown_conversation(conversation_id: i64, pod_ids: &[i64]) {
-    teardown_conversation_with(&get().client, conversation_id, pod_ids).await;
+    match get() {
+        Ok(manager) => teardown_conversation_with(&manager.client, conversation_id, pod_ids).await,
+        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't tear down the conversation's sandbox"),
+    }
 }
 
 /// `teardown_conversation` on `client`. Pods are found by their

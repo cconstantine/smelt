@@ -33,7 +33,14 @@ pub async fn watch_pods(pool: PgPool) {
     use futures_util::StreamExt;
     use kube::runtime::{WatchStreamExt, watcher};
 
-    let events = watcher(pods_api(&get().client), watcher::Config::default()).default_backoff();
+    let client = match get() {
+        Ok(manager) => manager.client.clone(),
+        Err(e) => {
+            tracing::error!(error = %e, "can't watch pods");
+            return;
+        }
+    };
+    let events = watcher(pods_api(&client), watcher::Config::default()).default_backoff();
     futures_util::pin_mut!(events);
     // Pods listed since the last `Init`, until `InitDone` completes the set.
     let mut listed = std::collections::HashSet::new();
@@ -137,7 +144,11 @@ pub(super) async fn close_if_gone(pool: &PgPool, pod_id: i64) {
     if registry_get(pod_id).is_some() {
         return;
     }
-    match pods_api(&get().client).get_opt(&pod_name(pod_id)).await {
+    let Ok(manager) = get() else {
+        tracing::warn!(pod_id, "couldn't check a pod in Kubernetes: the sandbox isn't set up");
+        return;
+    };
+    match pods_api(&manager.client).get_opt(&pod_name(pod_id)).await {
         Ok(Some(pod)) if !pod_has_finished(&pod) => return,
         Ok(_) => {}
         Err(e) => {

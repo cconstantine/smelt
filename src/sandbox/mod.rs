@@ -104,6 +104,8 @@ pub enum SandboxError {
     /// Reaching the sandbox agent (port-forward, WebSocket handshake and
     /// hello) took longer than `AGENT_CONNECT_TIMEOUT`.
     AgentConnectTimeout,
+    /// A sandbox call before `init()` built the manager (SME-56).
+    NotInitialized,
 }
 
 impl std::fmt::Display for SandboxError {
@@ -136,6 +138,9 @@ impl std::fmt::Display for SandboxError {
             SandboxError::InvalidMountPath(reason) => write!(f, "invalid mount path: {reason}"),
             SandboxError::StartFailed(reason) => write!(f, "sandbox pod failed to start: {reason}"),
             SandboxError::GitSetup(reason) => write!(f, "couldn't set up git in the pod: {reason}"),
+            SandboxError::NotInitialized => {
+                write!(f, "the sandbox isn't set up yet (sandbox::init() hasn't run)")
+            }
         }
     }
 }

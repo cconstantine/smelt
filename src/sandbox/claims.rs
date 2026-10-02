@@ -24,7 +24,13 @@ pub(super) fn orphaned_docker_claims(
 /// the namespace but each has its own database, so from a test every
 /// other test's claim would look orphaned.
 pub async fn sweep_orphaned_conversation_claims(pool: &PgPool) {
-    let client = &get().client;
+    let client = match get() {
+        Ok(manager) => &manager.client,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't sweep orphaned conversation claims");
+            return;
+        }
+    };
     let selector = ListParams::default().labels(CONVERSATION_LABEL);
     // Claims first, then conversations: a claim only exists for a
     // conversation that already did, so none can be missed in between.
@@ -165,7 +171,10 @@ pub(super) fn recheck_docker_restart(pool: PgPool, client: kube::Client, pod_id:
 pub(super) async fn handle_docker_restart(pool: &PgPool, restart: DockerRestart) {
     match restart {
         DockerRestart::Report { pod_id, reason } => report_docker_restart(pool, pod_id, Some(reason)).await,
-        DockerRestart::Recheck { pod_id } => recheck_docker_restart(pool.clone(), get().client.clone(), pod_id),
+        DockerRestart::Recheck { pod_id } => match get() {
+            Ok(manager) => recheck_docker_restart(pool.clone(), manager.client.clone(), pod_id),
+            Err(e) => tracing::warn!(pod_id, error = %e, "couldn't re-read a Docker restart"),
+        },
     }
 }
 

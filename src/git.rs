@@ -1206,16 +1206,14 @@ mod server {
         repo: &db::ConversationRepo,
         guard: CloneGuard,
     ) -> Result<(), String> {
-        let shell = sandbox::PodShell::for_pod(pod_id);
-        let outcome = clone_into_pod(
-            &shell,
-            &repo.url,
-            repo.branch.as_deref(),
-            &repo.dir,
-        )
-        .await;
+        let outcome = match sandbox::PodShell::for_pod(pod_id) {
+            Ok(shell) => clone_into_pod(&shell, &repo.url, repo.branch.as_deref(), &repo.dir)
+                .await
+                .map(|cloned| (shell, cloned)),
+            Err(e) => Err(e.to_string()),
+        };
         match outcome {
-            Ok(cloned) => {
+            Ok((shell, cloned)) => {
                 // What the model can load with load_instructions.
                 let files = list_agents_files(&shell, &repo.dir).await.map_err(|e| {
                     tracing::warn!(repo = %repo.url, error = %e, "couldn't list AGENTS.md files");
@@ -1484,10 +1482,8 @@ mod server {
             let keys: Vec<(String, String)> = keys.into_iter().map(|k| (k.name, k.private_key)).collect();
             // Bounded: every install waits on this lock, so a stalled exec
             // mustn't hold it.
-            tokio::time::timeout(
-                INSTALL_TIMEOUT,
-                install_git_files(&sandbox::PodShell::for_pod(pod_id), &pod_git_files(&keys, &identity)),
-            )
+            let shell = sandbox::PodShell::for_pod(pod_id).map_err(|e| e.to_string())?;
+            tokio::time::timeout(INSTALL_TIMEOUT, install_git_files(&shell, &pod_git_files(&keys, &identity)))
             .await
             .map_err(|_| format!("writing git files into the pod took over {}s", INSTALL_TIMEOUT.as_secs()))?
             .map_err(|e| e.to_string())

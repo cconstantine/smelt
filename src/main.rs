@@ -98,7 +98,10 @@ async fn main() {
 
     mcp::ensure_default_servers(pool).await;
 
-    sandbox::init().await;
+    if let Err(e) = sandbox::init().await {
+        tracing::error!(error = %e, "couldn't set up the sandbox manager (check KUBECONFIG)");
+        std::process::exit(1);
+    }
     tracing::info!("sandbox manager initialized");
 
     // Keeps pod records in step with the cluster, so the sidebar's dots

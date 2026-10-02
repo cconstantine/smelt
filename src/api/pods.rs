@@ -256,7 +256,14 @@ async fn server_overviews(
     usage: &std::collections::HashMap<String, PodUsage>,
 ) -> Vec<ServerPodOverview> {
     use crate::lsp::pods::{self, ServerState};
-    let servers = match pods::list_with(&crate::sandbox::kube_client(), conversation_id).await {
+    let client = match crate::sandbox::kube_client() {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't list language server pods");
+            return Vec::new();
+        }
+    };
+    let servers = match pods::list_with(&client, conversation_id).await {
         Ok(servers) => servers,
         Err(e) => {
             tracing::warn!(pod_id, error = %e, "couldn't list language server pods");

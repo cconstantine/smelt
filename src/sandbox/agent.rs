@@ -53,12 +53,12 @@ impl AgentDialer for ClusterDialer {
 /// The dialer for `pod_id`: the cluster, unless a test put a fake agent in
 /// for that pod.
 #[cfg_attr(not(test), allow(unused_variables))] // only a test puts a fake in
-pub(super) fn dialer_for(pod_id: i64) -> Arc<dyn AgentDialer> {
+pub(super) fn dialer_for(pod_id: i64) -> Result<Arc<dyn AgentDialer>, SandboxError> {
     #[cfg(test)]
     if let Some(dialer) = test_dialers().lock().unwrap_or_else(|e| e.into_inner()).get(&pod_id) {
-        return dialer.clone();
+        return Ok(dialer.clone());
     }
-    Arc::new(ClusterDialer(get().client.clone()))
+    Ok(Arc::new(ClusterDialer(get()?.client.clone())))
 }
 
 /// Fake agents, by the pod id each test owns. Keyed by pod so tests running
@@ -401,7 +401,7 @@ pub(super) fn connect_with_retry(
             return Err(TerminalError::AgentOutdated { found });
         }
 
-        let dialer = dialer_for(pod_id);
+        let dialer = dialer_for(pod_id)?;
         if mode == ConnectMode::First && !dialer.is_running(pod_id).await? {
             return Err(TerminalError::NoPod);
         }

@@ -63,13 +63,13 @@ impl PodShell {
     }
 
     /// A shell into smelt's pod `pod_id`.
-    pub fn for_pod(pod_id: i64) -> Self {
-        Self::new(kube_client(), pod_name(pod_id))
+    pub fn for_pod(pod_id: i64) -> Result<Self, SandboxError> {
+        Ok(Self::new(kube_client()?, pod_name(pod_id)))
     }
 
     /// A shell into `conversation_id`'s live pod.
     pub async fn for_conversation(pool: &PgPool, conversation_id: i64) -> Result<Self, TerminalError> {
-        Ok(Self::for_pod(live_pod_id(pool, conversation_id).await?))
+        Ok(Self::for_pod(live_pod_id(pool, conversation_id).await?)?)
     }
 
     /// Runs `command` in the sandbox container, with `stdin` written and

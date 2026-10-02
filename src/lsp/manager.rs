@@ -588,7 +588,7 @@ pub async fn diagnostics_after_edit(pool: &PgPool, conversation_id: i64, path: &
     if !config_list.iter().any(|c| c.enabled && c.file_types.contains_key(extension)) {
         return None;
     }
-    let client = crate::sandbox::kube_client();
+    let client = crate::sandbox::kube_client().ok()?;
     let sandbox = sandbox_ref(pool, &client, conversation_id).await.ok()?;
     edit_diagnostics(&config_list, &client, &sandbox, path).await
 }

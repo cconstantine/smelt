@@ -500,7 +500,7 @@ async fn test_a_failed_teardown_leaves_the_pod_usable(pool: PgPool) {
 async fn test_a_connection_that_already_ended_is_not_registered(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
     let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
-    let conn = connect(pool.clone(), pod_id, dialer_for(pod_id)).await.expect("connects");
+    let conn = connect(pool.clone(), pod_id, dialer_for(pod_id).expect("the test's fake dialer")).await.expect("connects");
     let fake = agent.next_connection().await;
     let _ = fake.send.send(Out::Close);
     tokio::time::timeout(Duration::from_secs(3), async {
