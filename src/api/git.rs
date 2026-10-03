@@ -101,7 +101,8 @@ fn report_attach_failure(conversation_id: i64, nothing_to_clone: bool, error: &s
     if nothing_to_clone {
         crate::api::chat::show_conversation_error(
             conversation_id,
-            format!("\"Work on a repo\" couldn't start the sandbox: {error}"),
+            // `error` says what failed ("Couldn't start the sandbox: …").
+            format!("\"Work on a repo\" failed. {error}"),
         );
     }
 }
@@ -146,9 +147,16 @@ mod tests {
     async fn test_a_failed_attach_with_nothing_to_clone_shows_in_the_conversation() {
         let shown = 9_100_000_095;
         let mut rx = crate::events::subscribe(shown);
-        report_attach_failure(shown, true, "the sandbox didn't start");
+        // What `finish_attach` fails with when there's nothing to clone:
+        // `ensure_sandbox`'s error, which says what failed already.
+        report_attach_failure(shown, true, "Couldn't start the sandbox: the sandbox didn't start");
         let error = crate::api::chat::last_turn_error(shown).expect("the error is kept for a reload");
         assert!(error.contains("the sandbox didn't start"), "got: {error}");
+        assert_eq!(
+            error.to_lowercase().matches("couldn't start the sandbox").count(),
+            1,
+            "says it once: {error}"
+        );
         match rx.try_recv() {
             Ok(crate::events::ConversationEvent::TurnError { message }) => {
                 assert!(message.contains("the sandbox didn't start"), "got: {message}")
