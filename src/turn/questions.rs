@@ -56,13 +56,32 @@ fn question_result(question: &db::StoredQuestion) -> anthropic::ContentBlock {
     }
 }
 
-/// Whether `conversation_id` is waiting on an unanswered question: a turn
-/// then saves what it has and doesn't call the model.
-pub(super) async fn question_waiting(pool: &PgPool, conversation_id: i64) -> ServerFnResult<bool> {
-    let question = db::get_pending_question(pool, conversation_id)
-        .await
-        .map_err(ServerFnError::new)?;
-    Ok(question.is_some_and(|q| q.answer.is_none()))
+/// Run by a turn right before it calls the model, holding the turn lock:
+/// takes an answered question (saving the call's result as a message of
+/// its own, which `move_late_results` puts after the call), and says
+/// whether a question still waits, in which case the turn stops there.
+/// Repeats until no row is left or one is waiting, since an answer can be
+/// recorded between the take and the check.
+pub(super) async fn take_answer_or_wait(
+    pool: &PgPool,
+    conversation_id: i64,
+    pending_new_content: &mut Vec<anthropic::ContentBlock>,
+    persisted: &mut Vec<Message>,
+) -> ServerFnResult<bool> {
+    loop {
+        if let Some((saved, content)) = save_turn_message(pool, conversation_id, None, false).await? {
+            pending_new_content.extend(content);
+            record_saved(conversation_id, persisted, saved);
+        }
+        match db::get_pending_question(pool, conversation_id)
+            .await
+            .map_err(ServerFnError::new)?
+        {
+            None => return Ok(false),
+            Some(question) if question.answer.is_none() => return Ok(true),
+            Some(_) => continue,
+        }
+    }
 }
 
 /// Records the model's `ask_user` call `tool_use_id`: the conversation now

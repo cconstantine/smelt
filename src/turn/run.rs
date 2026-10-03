@@ -377,10 +377,13 @@ pub(super) fn run_turn_body<'a>(
             )
             .await?;
 
-            // Waiting on the user's answer to `ask_user` (SME-34): what
-            // this turn brought (a notice, a finished command) is saved,
-            // and the model hears it with the answer.
-            if question_waiting(pool, conversation_id).await? {
+            // The model's `ask_user` (SME-34): an answer recorded since
+            // this turn saved its own message is taken now, so the model
+            // never sees the call unanswered; a question still waiting
+            // means this turn's notice is saved and the model hears it with
+            // the answer. No row left means none can be answered until this
+            // turn asks again (code review 1).
+            if take_answer_or_wait(pool, conversation_id, &mut pending_new_content, &mut persisted).await? {
                 return Ok(persisted);
             }
 

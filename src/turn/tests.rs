@@ -3212,3 +3212,34 @@ async fn test_a_question_takes_one_valid_answer(pool: PgPool) {
     let request = requests.lock().expect("requests")[1].clone();
     assert_eq!(message_after_call(&request, "toolu_ask")["content"][0]["content"], "The user answered:\n1. Delete: No");
 }
+
+/// Code review 1 (high): an answer recorded while a turn that already
+/// saved its own message is running (a notice's turn, paused here right
+/// after its save) is taken by that turn before it calls the model, not
+/// left behind with the call answered "unfinished".
+#[sqlx::test]
+async fn test_an_answer_landing_mid_turn_is_taken_before_the_model_call(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_307).await.expect("conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![ask_body(), text_reply_body("Deleting.")]).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("asks");
+
+    let (reached, release) = test_hooks::pause_after_message_saved(conversation.id);
+    let notice_turn = {
+        let pool = pool.clone();
+        tokio::spawn(async move { run_turn(&pool, conversation.id, notice("a notice")).await })
+    };
+    reached.await.expect("the notice's turn saved its message");
+    let answers = vec![crate::questions::QuestionAnswer { selected: vec!["No".to_string()], other: None }];
+    answer_question(pool.clone(), conversation.id, "toolu_ask".to_string(), answers)
+        .await
+        .expect("the answer is recorded");
+    release.send(()).expect("let the notice's turn go on");
+    notice_turn.await.expect("join").expect("the notice's turn");
+
+    wait_for_requests(&requests, 2).await;
+    let request = requests.lock().expect("requests")[1].clone();
+    let after = message_after_call(&request, "toolu_ask");
+    assert_eq!(after["content"][0]["content"], "The user answered:\n1. Delete: No", "{after}");
+    assert_eq!(db::get_pending_question(&pool, conversation.id).await.expect("read"), None);
+}
