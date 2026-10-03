@@ -36,6 +36,7 @@ pub fn SandboxVolumesIndex() -> Element {
             spawn(async move {
                 match delete_sandbox_volume(id).await {
                     Ok(()) => {
+                        delete_error.set(None);
                         volumes.write().retain(|v| v.id != id);
                         pending_delete.set(None);
                     }
@@ -72,7 +73,7 @@ pub fn SandboxVolumesIndex() -> Element {
             } else {
                 div { class: "sandbox-volume-list",
                     for volume in volumes() {
-                        div { key: "{volume.id}", class: "sandbox-volume-row",
+                        div { key: "{volume.id}", "data-volume-id": "{volume.id}", class: "sandbox-volume-row",
                             div { class: "sandbox-volume-summary",
                                 span { class: "sandbox-volume-name", "{volume.name}" }
                                 span { class: "sandbox-volume-path", "{volume.mount_path}" }

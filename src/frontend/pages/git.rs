@@ -87,6 +87,7 @@ pub fn GitSettingsPage() -> Element {
             spawn(async move {
                 match delete_ssh_key(id).await {
                     Ok(()) => {
+                        key_error.set(None);
                         keys.write().retain(|k| k.id != id);
                         pending_delete.set(None);
                     }
@@ -179,7 +180,10 @@ pub fn GitSettingsPage() -> Element {
                                                 let remote = remote.clone();
                                                 spawn(async move {
                                                     match forget_repo_trust(remote.clone()).await {
-                                                        Ok(()) => trust.write().retain(|t| t.remote != remote),
+                                                        Ok(()) => {
+                                                            trust_error.set(None);
+                                                            trust.write().retain(|t| t.remote != remote);
+                                                        }
                                                         Err(e) => trust_error.set(Some(super::server_error_message(&e))),
                                                     }
                                                 });

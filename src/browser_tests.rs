@@ -2526,6 +2526,14 @@ static MOCK_PROVIDER: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
 /// The model `MOCK_PROVIDER` serves (any name does: the mock ignores it).
 const MOCK_MODEL: &str = "mock-model";
 
+/// Makes the page's next DELETE request fail as a server error would;
+/// every other request goes through.
+const FAIL_NEXT_DELETE: &str = "(() => { const real = window.fetch; let armed = true; \
+     window.fetch = function (input, init) { \
+       const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase(); \
+       if (armed && method === 'DELETE') { armed = false; return Promise.resolve(new Response('refused by the browser tier', { status: 500 })); } \
+       return real.apply(this, arguments); }; })()";
+
 /// Scenario 30 (SME-81): an error says what went wrong, not dioxus's
 /// "error running server function: … (details: None)" wrapper, and the
 /// sidebar's error goes once a later sidebar action succeeds.
@@ -2571,16 +2579,7 @@ async fn scenario_error_text(t: &Scenario<'_>) {
     wait_for_stable(&sidebar, &delete_button(refused.id), tokio::time::Instant::now() + Duration::from_secs(10)).await;
     // The next DELETE (the first conversation delete) fails as a server
     // error would; everything else goes through.
-    sidebar
-        .evaluate(
-            "(() => { const real = window.fetch; let armed = true; \
-             window.fetch = function (input, init) { \
-               const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase(); \
-               if (armed && method === 'DELETE') { armed = false; return Promise.resolve(new Response('scenario 30 refused this', { status: 500 })); } \
-               return real.apply(this, arguments); }; })()",
-        )
-        .await
-        .expect("make the next DELETE fail");
+    sidebar.evaluate(FAIL_NEXT_DELETE).await.expect("make the next DELETE fail");
     click_when_present(&sidebar, &delete_button(refused.id), Duration::from_secs(5)).await;
     click_when_present(&sidebar, &format!("{}.confirm", delete_button(refused.id)), Duration::from_secs(5)).await;
     wait_for_element(&sidebar, ".sidebar-body > .error", Duration::from_secs(10)).await;
@@ -2628,6 +2627,39 @@ async fn scenario_error_text(t: &Scenario<'_>) {
         .into_value()
         .expect("bool");
     assert!(!still_shown, "a later success should clear the sidebar's error");
+
+    // The same on a settings page: a failed volume delete's error goes once
+    // another delete succeeds (SME-81 review 2).
+    let refused_volume = db::create_sandbox_volume(t.pool, &unique_id("refused"), "/home/sandbox/refused")
+        .await
+        .expect("create a volume")
+        .id;
+    let deleted_volume = db::create_sandbox_volume(t.pool, &unique_id("deleted"), "/home/sandbox/deleted")
+        .await
+        .expect("create a volume")
+        .id;
+    let volumes = t.tab(t.url("sandbox-volumes")).await;
+    wait_for_resource(&volumes, "/api/sandbox-volumes").await;
+    let volume_delete = |id: i64| format!(".sandbox-volume-row[data-volume-id='{id}'] .sandbox-volume-delete");
+    wait_for_stable(&volumes, &volume_delete(refused_volume), tokio::time::Instant::now() + Duration::from_secs(10)).await;
+    volumes.evaluate(FAIL_NEXT_DELETE).await.expect("make the next DELETE fail");
+    click_when_present(&volumes, &volume_delete(refused_volume), Duration::from_secs(5)).await;
+    click_when_present(&volumes, &format!("{}.confirm", volume_delete(refused_volume)), Duration::from_secs(5)).await;
+    wait_for_element(&volumes, ".sandbox-volumes-page .error", Duration::from_secs(10)).await;
+    click_when_present(&volumes, &volume_delete(deleted_volume), Duration::from_secs(5)).await;
+    click_when_present(&volumes, &format!("{}.confirm", volume_delete(deleted_volume)), Duration::from_secs(5)).await;
+    assert!(
+        wait_for_count(&volumes, &format!(".sandbox-volume-row[data-volume-id='{deleted_volume}']"), 0, Duration::from_secs(10)).await,
+        "the second volume delete should go through"
+    );
+    let still_shown: bool = volumes
+        .evaluate("!!document.querySelector('.sandbox-volumes-page .error')")
+        .await
+        .expect("look for the volume error")
+        .into_value()
+        .expect("bool");
+    let _ = db::delete_sandbox_volume(t.pool, refused_volume).await;
+    assert!(!still_shown, "a later volume delete succeeding should clear the failed one's error");
 }
 
 /// How many times `page` has fetched the conversation list.
