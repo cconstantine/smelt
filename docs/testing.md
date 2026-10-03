@@ -179,7 +179,7 @@ When testing a code path that could plausibly deadlock (a lock re-acquired somew
 
 ## Tests that touch per-conversation state
 
-Some state is process-wide and keyed by conversation id: the turn lock, a stop, the pause after a stop, and whether a turn is running (`api::chat`'s `CONVERSATION_LOCKS`, `TURN_STOPS`, `PAUSED`, `TURNS_IN_FLIGHT`), and the event channels. But every `#[sqlx::test]` database numbers conversations from 1, and tests run in parallel, so two tests' "conversation 1" are the same key.
+Some state is process-wide and keyed by conversation id: the turn lock, a stop, the pause after a stop, and whether a turn is running (`api::chat`'s `CONVERSATION_LOCKS`, `TURN_STOPS`, `PAUSED`, `TURNS_IN_FLIGHT`), and the event channels. The locks, stop counters and channels are freed when unused (SME-91), so a test checking one is gone has to drop its own handles first (a `conversation_lock`, an `events::subscribe`). But every `#[sqlx::test]` database numbers conversations from 1, and tests run in parallel, so two tests' "conversation 1" are the same key.
 - **A test that stops or pauses a conversation, or asserts on its events,** creates it with `db::create_conversation_with_id(pool, <a unique high id>)`. On `pod-management`, before this, one test's stop paused every other test's conversation 1, and five unrelated wake and notice tests failed.
 - **Tests that wait for one kind of event** skip the others: turns now publish `TurnState` too.
 

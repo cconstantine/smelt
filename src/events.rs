@@ -239,30 +239,78 @@ mod server {
     static BUSES: LazyLock<Mutex<HashMap<i64, broadcast::Sender<ConversationEvent>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
-    fn sender_for(conversation_id: i64) -> broadcast::Sender<ConversationEvent> {
-        let mut buses = BUSES.lock().unwrap_or_else(|e| e.into_inner());
-        buses
-            .entry(conversation_id)
-            .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
-            .clone()
-    }
-
     /// Publishes `event` to every current subscriber of `conversation_id`.
-    /// Creates the underlying channel if this is the first event for that
-    /// id. A no-op, cost-wise, if nobody's subscribed —
-    /// `broadcast::Sender::send` on a channel with zero receivers just
-    /// drops the value, which is why its `Result` is deliberately ignored.
+    /// With nobody subscribed there's no channel, and the event goes
+    /// nowhere, as it would have anyway: a channel exists only while a tab
+    /// (or a test) listens, so a deleted conversation's late events make
+    /// none (SME-91). Sent under the map's lock, so it can't reach a
+    /// channel being replaced.
     pub fn publish(conversation_id: i64, event: ConversationEvent) {
-        let _ = sender_for(conversation_id).send(event);
+        let buses = BUSES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sender) = buses.get(&conversation_id) {
+            let _ = sender.send(event);
+        }
     }
 
     /// Subscribes to `conversation_id`'s event stream from this point
     /// forward — `broadcast` has no replay, so events published before this
-    /// call are never seen by this receiver. Creates the underlying channel
-    /// if this is the first subscriber for that id (either side may be
-    /// first).
-    pub fn subscribe(conversation_id: i64) -> broadcast::Receiver<ConversationEvent> {
-        sender_for(conversation_id).subscribe()
+    /// call are never seen by this receiver. Creates the channel if this is
+    /// the first subscriber; the last one to go takes it away again
+    /// (`Subscription`'s drop).
+    pub fn subscribe(conversation_id: i64) -> Subscription {
+        let mut buses = BUSES.lock().unwrap_or_else(|e| e.into_inner());
+        let sender = buses
+            .entry(conversation_id)
+            .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0);
+        Subscription {
+            conversation_id,
+            channel: sender.downgrade(),
+            receiver: sender.subscribe(),
+        }
+    }
+
+    /// A subscription to one conversation's events: a `broadcast::Receiver`
+    /// (it derefs to one) that frees the conversation's channel when it's
+    /// the last to go.
+    pub struct Subscription {
+        conversation_id: i64,
+        /// Weak, so a deleted conversation's channel still closes
+        /// (`forget`) while this lives.
+        channel: broadcast::WeakSender<ConversationEvent>,
+        receiver: broadcast::Receiver<ConversationEvent>,
+    }
+
+    impl std::ops::Deref for Subscription {
+        type Target = broadcast::Receiver<ConversationEvent>;
+        fn deref(&self) -> &Self::Target {
+            &self.receiver
+        }
+    }
+
+    impl std::ops::DerefMut for Subscription {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.receiver
+        }
+    }
+
+    impl Drop for Subscription {
+        fn drop(&mut self) {
+            // Under the map's lock, which subscribing also takes, so no one
+            // can join the channel between the count and the removal. This
+            // receiver is let go first, inside the lock: counted while it
+            // lived, two subscribers leaving at once each saw the other and
+            // left the channel behind (SME-91 review). A spare receiver of
+            // a tiny channel takes its place for the rest of the drop.
+            let mut buses = BUSES.lock().unwrap_or_else(|e| e.into_inner());
+            drop(std::mem::replace(&mut self.receiver, broadcast::channel(1).1));
+            let last_on_this_channel = match (buses.get(&self.conversation_id), self.channel.upgrade()) {
+                (Some(current), Some(own)) => current.same_channel(&own) && current.receiver_count() == 0,
+                _ => false,
+            };
+            if last_on_this_channel {
+                buses.remove(&self.conversation_id);
+            }
+        }
     }
 
     /// Drops `conversation_id`'s channel, for when the conversation is
@@ -299,13 +347,69 @@ mod server {
     /// How many live subscriptions `conversation_id` has.
     #[cfg(test)]
     pub fn subscriber_count(conversation_id: i64) -> usize {
-        sender_for(conversation_id).receiver_count()
+        BUSES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&conversation_id)
+            .map_or(0, |sender| sender.receiver_count())
+    }
+
+    /// Whether `conversation_id` has a channel at all.
+    #[cfg(test)]
+    pub fn has_channel(conversation_id: i64) -> bool {
+        BUSES.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&conversation_id)
     }
 
     #[cfg(test)]
     mod tests {
         use super::super::TokenUsage;
         use super::*;
+
+        /// SME-91: a conversation's channel (about 150 KB) goes with its
+        /// last subscriber, rather than staying for good.
+        #[test]
+        fn test_a_channel_is_freed_with_its_last_subscriber() {
+            let conversation_id = 9_100_000_097;
+            let first = subscribe(conversation_id);
+            let second = subscribe(conversation_id);
+            drop(first);
+            assert!(has_channel(conversation_id), "one subscriber is left");
+            drop(second);
+            assert!(!has_channel(conversation_id), "the last subscriber took the channel with it");
+        }
+
+        /// SME-91 review: two subscribers leaving at the same moment (two
+        /// tabs closing) still free the channel: each counted the other's
+        /// receiver, which went only after its own count.
+        #[test]
+        fn test_two_subscribers_leaving_at_once_free_the_channel() {
+            for round in 0..2000 {
+                let conversation_id = 9_100_010_000 + round;
+                let first = subscribe(conversation_id);
+                let second = subscribe(conversation_id);
+                let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+                let other = std::thread::spawn({
+                    let barrier = barrier.clone();
+                    move || {
+                        barrier.wait();
+                        drop(first);
+                    }
+                });
+                barrier.wait();
+                drop(second);
+                other.join().expect("join");
+                assert!(!has_channel(conversation_id), "round {round}: the channel was left behind");
+            }
+        }
+
+        /// SME-91: publishing with nobody listening (a deleted
+        /// conversation's late events, say) makes no channel.
+        #[test]
+        fn test_a_publish_with_no_subscriber_makes_no_channel() {
+            let conversation_id = 9_100_000_098;
+            publish(conversation_id, ConversationEvent::TurnState { running: false });
+            assert!(!has_channel(conversation_id));
+        }
 
         /// A reply streams as many small deltas; a tab that's a moment
         /// behind shouldn't lose any of them.
@@ -523,7 +627,7 @@ mod server {
 #[cfg(feature = "server")]
 pub use server::{forget, publish, publish_app, subscribe, subscribe_app};
 #[cfg(all(feature = "server", test))]
-pub use server::{app_subscriber_count, subscriber_count};
+pub use server::{app_subscriber_count, has_channel, subscriber_count};
 
 #[cfg(test)]
 mod wire_tests {

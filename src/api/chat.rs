@@ -797,15 +797,16 @@ pub(crate) async fn save_notice_between_turns(
     conversation_id: i64,
     text: String,
 ) -> Result<Message, sqlx::Error> {
-    let lock = conversation_lock(conversation_id);
-    let _turn = lock.lock().await;
-    let saved = db::create_message(
-        pool,
-        conversation_id,
-        "user",
-        &[anthropic::ContentBlock::Text { text }],
-    )
-    .await?;
+    let saved = {
+        let lock = conversation_lock(conversation_id);
+        let _turn = lock.lock().await;
+        db::create_message(pool, conversation_id, "user", &[anthropic::ContentBlock::Text { text }]).await
+    };
+    // Unless a turn is in flight, whose end does it.
+    if !turn_running(conversation_id) {
+        release_idle_turn_state(conversation_id);
+    }
+    let saved = saved?;
     crate::events::publish(
         conversation_id,
         crate::events::ConversationEvent::MessagesAppended {
@@ -871,7 +872,7 @@ pub(crate) fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<
 /// fresh lock and then fails, since the conversation no longer exists.
 #[cfg(feature = "server")]
 fn forget_conversation_lock(conversation_id: i64) {
-    remember_turn_error(conversation_id, None);
+    TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).remove(&conversation_id);
     CONVERSATION_LOCKS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -915,6 +916,7 @@ pub(crate) fn run_turn<'a>(
         Some(new_message),
         on_delta,
         MAX_TURNS,
+        false,
     )
 }
 
@@ -946,7 +948,7 @@ pub(crate) async fn wake_conversation(
     if is_paused(conversation_id) {
         return Ok(Vec::new());
     }
-    let result = run_turn_bounded(pool, conversation_id, None, None, MAX_TURNS).await;
+    let result = run_turn_bounded(pool, conversation_id, None, None, MAX_TURNS, false).await;
     // A stop is the user's doing, not a failure to reach the model.
     if let Err(e) = &result
         && chat_error_text(e) != TURN_STOPPED
@@ -1003,14 +1005,17 @@ async fn drain_unnotified_terminal_commands(
             )
         };
         let notification_content = vec![anthropic::ContentBlock::Text { text }];
-        let saved = db::create_message(pool, conversation_id, "user", &notification_content)
-            .await
-            .map_err(ServerFnError::new)?;
+        // The notice and the command's mark together, so a Stop between
+        // them can't leave a notice the next drain saves again (SME-91).
+        let Some(saved) =
+            db::save_command_notice(pool, conversation_id, &command.command_id, &notification_content)
+                .await
+                .map_err(ServerFnError::new)?
+        else {
+            continue;
+        };
         pending_new_content.extend(notification_content);
         record_saved(conversation_id, persisted, saved);
-        db::mark_terminal_command_notified(pool, &command.command_id)
-            .await
-            .map_err(ServerFnError::new)?;
     }
     Ok(())
 }
@@ -1063,18 +1068,30 @@ fn record_saved(conversation_id: i64, persisted: &mut Vec<Message>, saved: Messa
 /// lock) and ends as soon as it changes, so a stop ends the running turn
 /// and any queued behind it, but not turns that start afterwards.
 #[cfg(feature = "server")]
-static TURN_STOPS: LazyLock<Mutex<HashMap<i64, tokio::sync::watch::Sender<u64>>>> =
+static TURN_STOPS: LazyLock<Mutex<HashMap<i64, TurnStops>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A conversation's stop counter, and the last stop already noted in it
+/// (`record_stop`), so one stop is noted once however many turns it ends.
+#[cfg(feature = "server")]
+struct TurnStops {
+    counter: tokio::sync::watch::Sender<u64>,
+    noted: u64,
+}
+
+#[cfg(feature = "server")]
+impl Default for TurnStops {
+    fn default() -> Self {
+        TurnStops { counter: tokio::sync::watch::channel(0).0, noted: 0 }
+    }
+}
 
 /// A receiver for `conversation_id`'s stop counter, with its current value
 /// already seen, so only a later stop wakes it.
 #[cfg(feature = "server")]
 fn stop_receiver(conversation_id: i64) -> tokio::sync::watch::Receiver<u64> {
     let mut stops = TURN_STOPS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut receiver = stops
-        .entry(conversation_id)
-        .or_insert_with(|| tokio::sync::watch::channel(0).0)
-        .subscribe();
+    let mut receiver = stops.entry(conversation_id).or_default().counter.subscribe();
     receiver.borrow_and_update();
     receiver
 }
@@ -1092,7 +1109,7 @@ pub(crate) fn stop_turn_now(conversation_id: i64) {
         .insert(conversation_id);
     let stops = TURN_STOPS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(stop) = stops.get(&conversation_id) {
-        stop.send_modify(|count| *count += 1);
+        stop.counter.send_modify(|count| *count += 1);
     }
 }
 
@@ -1174,12 +1191,35 @@ impl Drop for TurnInFlight {
         if last {
             // A stopped or failed turn leaves no reply in progress.
             clear_reply_in_progress(self.0);
+            release_idle_turn_state(self.0);
             crate::events::publish(
                 self.0,
                 crate::events::ConversationEvent::TurnState { running: false },
             );
             crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
         }
+    }
+}
+
+/// Frees `conversation_id`'s turn lock and stop counter once no one has
+/// them (SME-91): the lock only when the map's is the last handle, so one
+/// in use is never replaced by a fresh one, and the stop counter when no
+/// turn listens to it (a stop with nothing running only pauses). Each is
+/// made again on next use. Under each map's lock, which handing one out
+/// also takes. Not the kept error's entry: a turn starting meanwhile has
+/// its generation there already (SME-91 review); it's a few bytes per
+/// conversation, freed on delete.
+#[cfg(feature = "server")]
+fn release_idle_turn_state(conversation_id: i64) {
+    {
+        let mut locks = CONVERSATION_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        if locks.get(&conversation_id).is_some_and(|lock| Arc::strong_count(lock) == 1) {
+            locks.remove(&conversation_id);
+        }
+    }
+    let mut stops = TURN_STOPS.lock().unwrap_or_else(|e| e.into_inner());
+    if stops.get(&conversation_id).is_some_and(|stops| stops.counter.receiver_count() == 0) {
+        stops.remove(&conversation_id);
     }
 }
 
@@ -1223,35 +1263,89 @@ fn run_turn_bounded<'a>(
     new_message: Option<anthropic::AnthropicMessage>,
     on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
     max_turns: usize,
+    keep_error: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
 {
     Box::pin(async move {
-        let mut stop = stop_receiver(conversation_id);
+        // Before the stop receiver, so it's dropped after it: the last turn
+        // ending frees the stop counter once nothing listens to it.
         let _in_flight = TurnInFlight::start(conversation_id);
+        let mut stop = stop_receiver(conversation_id);
         // Any new turn replaces the last failure (SME-51 code review 1).
-        remember_turn_error(conversation_id, None);
-        let unsaved = new_message.clone();
-        let saved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let generation = new_turn_generation(conversation_id);
+        let result = run_turn_stoppable(pool, conversation_id, new_message, on_delta, max_turns, &mut stop).await;
+        // Kept for a tab that reconnects, unless a newer turn has started
+        // since this one did: its outcome is the one to show (SME-91).
+        if keep_error
+            && let Err(e) = &result
+            && chat_error_text(e) != TURN_STOPPED
+        {
+            keep_turn_error(conversation_id, generation, chat_error_text(e));
+        }
+        result
+    })
+}
+
+/// `run_turn_bounded`'s turn: waits for the turn lock, saves the turn's
+/// message, and runs it, ending early on a stop (`stop`).
+#[cfg(feature = "server")]
+fn run_turn_stoppable<'a: 'b, 'b>(
+    pool: &'a PgPool,
+    conversation_id: i64,
+    new_message: Option<anthropic::AnthropicMessage>,
+    on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
+    max_turns: usize,
+    stop: &'b mut tokio::sync::watch::Receiver<u64>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'b>>
+{
+    Box::pin(async move {
+        let lock = conversation_lock(conversation_id);
+        // Queued behind another turn until the lock is free. Stopped while
+        // queued: keep the message anyway (a finished command's notice,
+        // say), without running a turn for it; the conversation is paused,
+        // so the model sees it next time the user writes (SME-40 F4).
+        let guard = tokio::select! {
+            guard = lock.clone().lock_owned() => guard,
+            _ = stop.changed() => {
+                let stopped_by = *stop.borrow_and_update();
+                let _turn = lock.lock().await;
+                if let Some(message) = &new_message {
+                    match db::create_message(pool, conversation_id, &message.role, &message.content).await {
+                        Ok(saved) => record_saved(conversation_id, &mut Vec::new(), saved),
+                        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't keep a stopped turn's message"),
+                    }
+                }
+                end_stopped_turn(pool, conversation_id, stopped_by).await;
+                return Err(ServerFnError::new(TURN_STOPPED));
+            }
+        };
+        if !db::conversation_exists(pool, conversation_id)
+            .await
+            .map_err(ServerFnError::new)?
+        {
+            return Err(ServerFnError::new("conversation not found"));
+        }
+        // Saved holding the lock and outside the stop's `select!`, so a
+        // Stop can't land between the INSERT and the turn knowing it's
+        // saved, which made the stop path save it again (SME-91).
+        let mut persisted = Vec::new();
+        if let Some(message) = &new_message {
+            let saved = db::create_message(pool, conversation_id, &message.role, &message.content)
+                .await
+                .map_err(ServerFnError::new)?;
+            #[cfg(test)]
+            test_hooks::after_message_saved(conversation_id).await;
+            record_saved(conversation_id, &mut persisted, saved);
+        }
+        let new_content = new_message.map(|message| message.content);
         tokio::select! {
-            result = run_turn_body(pool, conversation_id, new_message, on_delta, max_turns, saved.clone()) => return result,
+            result = run_turn_body(pool, conversation_id, guard, persisted, new_content, on_delta, max_turns) => return result,
             _ = stop.changed() => {}
         }
-        // Stopped before this turn saved its own message: it was queued
-        // behind the turn the user stopped. Keep the message anyway (a
-        // finished command's notice, say), without running a turn for it;
-        // the conversation is paused, so the model sees it next time the
-        // user writes (SME-40 F4).
-        let lock = conversation_lock(conversation_id);
+        // Stopped mid-turn: the body, and its hold on the lock, is gone.
+        let stopped_by = *stop.borrow_and_update();
         let _turn = lock.lock().await;
-        if let Some(message) = unsaved
-            && !saved.load(std::sync::atomic::Ordering::SeqCst)
-        {
-            match db::create_message(pool, conversation_id, &message.role, &message.content).await {
-                Ok(saved) => record_saved(conversation_id, &mut Vec::new(), saved),
-                Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't keep a stopped turn's message"),
-            }
-        }
-        record_stop(pool, conversation_id).await;
+        end_stopped_turn(pool, conversation_id, stopped_by).await;
         Err(ServerFnError::new(TURN_STOPPED))
     })
 }
@@ -1275,10 +1369,35 @@ fn relay_reply_delta(conversation_id: i64, delta: &str) {
     );
 }
 
-/// Notes in the conversation that the user stopped it (`STOP_NOTICE`),
-/// once however many turns the stop ended. Call holding the turn lock.
+/// What a stopped turn leaves: no reply in progress, on the server or in
+/// any tab, even while another turn is still in flight (the last turn
+/// ending clears it too, but a queued one may not end soon; SME-91), and
+/// stop `stopped_by` noted (`record_stop`). Call holding the turn lock:
+/// replies only stream under it, so this can't clear another turn's.
 #[cfg(feature = "server")]
-async fn record_stop(pool: &PgPool, conversation_id: i64) {
+async fn end_stopped_turn(pool: &PgPool, conversation_id: i64, stopped_by: u64) {
+    clear_reply_in_progress(conversation_id);
+    crate::events::publish(conversation_id, crate::events::ConversationEvent::ReplyReset {});
+    record_stop(pool, conversation_id, stopped_by).await;
+}
+
+/// Notes in the conversation that the user stopped it (`STOP_NOTICE`),
+/// once however many turns the stop (`stopped_by`, the stop counter's
+/// value) ended: the turns it ended each come here, and a queued one's
+/// own message can land after the first note (SME-91). Also not when the
+/// last message already is the note. Call holding the turn lock.
+#[cfg(feature = "server")]
+async fn record_stop(pool: &PgPool, conversation_id: i64, stopped_by: u64) {
+    let first_for_this_stop = {
+        let mut stops = TURN_STOPS.lock().unwrap_or_else(|e| e.into_inner());
+        let stops = stops.entry(conversation_id).or_default();
+        let first = stopped_by > stops.noted;
+        stops.noted = stops.noted.max(stopped_by);
+        first
+    };
+    if !first_for_this_stop {
+        return;
+    }
     let already = db::list_messages(pool, conversation_id)
         .await
         .ok()
@@ -1320,18 +1439,17 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     }
     // The user writing again ends any pause from an earlier stop.
     resume_turns(id);
-    // At once, not only when the turn starts: it may queue behind another.
-    remember_turn_error(id, None);
+    // At once, not only when the turn starts: it may queue behind another,
+    // and a turn already running mustn't keep its error over this one.
+    new_turn_generation(id);
     let new_message = anthropic::AnthropicMessage {
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text: content }],
     };
     tokio::spawn(async move {
-        if let Err(e) = run_turn(&pool, id, new_message, None).await {
+        // Its failure is kept for a reconnecting tab (`keep_error`).
+        if let Err(e) = run_turn_bounded(&pool, id, Some(new_message), None, MAX_TURNS, true).await {
             let message = chat_error_text(&e);
-            if message != TURN_STOPPED {
-                remember_turn_error(id, Some(message.clone()));
-            }
             crate::events::publish(id, crate::events::ConversationEvent::TurnError { message });
         }
     });
@@ -1341,20 +1459,68 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
 /// Each conversation's last failed turn's error, until the user writes
 /// again, for a tab that connects after the `TurnError` event (SME-51 B11).
 #[cfg(feature = "server")]
-static TURN_ERRORS: LazyLock<Mutex<HashMap<i64, String>>> = LazyLock::new(Default::default);
+static TURN_ERRORS: LazyLock<Mutex<HashMap<i64, KeptTurnError>>> = LazyLock::new(Default::default);
 
+/// A conversation's kept error, and its turn generation: bumped by the
+/// user sending and by every turn starting, so a turn's failure is kept
+/// only if no newer turn has started since it did (SME-91).
 #[cfg(feature = "server")]
-fn remember_turn_error(conversation_id: i64, error: Option<String>) {
+#[derive(Default)]
+struct KeptTurnError {
+    generation: u64,
+    error: Option<String>,
+}
+
+/// Starts a new turn generation for `conversation_id`, clearing its kept
+/// error, and returns the new generation.
+#[cfg(feature = "server")]
+fn new_turn_generation(conversation_id: i64) -> u64 {
     let mut errors = TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
-    match error {
-        Some(error) => errors.insert(conversation_id, error),
-        None => errors.remove(&conversation_id),
-    };
+    let kept = errors.entry(conversation_id).or_default();
+    kept.generation += 1;
+    kept.error = None;
+    kept.generation
+}
+
+/// Keeps `error` as `conversation_id`'s, if `generation` is still its
+/// latest turn generation.
+#[cfg(feature = "server")]
+fn keep_turn_error(conversation_id: i64, generation: u64, error: String) {
+    let mut errors = TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(kept) = errors.get_mut(&conversation_id)
+        && kept.generation == generation
+    {
+        kept.error = Some(error);
+    }
+}
+
+/// Shows `message` as `conversation_id`'s error, as a failed turn's is
+/// (`TurnError`, and kept for a reconnecting tab until the user writes),
+/// for something that failed outside a turn: a "Work on a repo" that
+/// couldn't start the sandbox (SME-91).
+#[cfg(feature = "server")]
+pub(crate) fn show_conversation_error(conversation_id: i64, message: String) {
+    TURN_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(conversation_id)
+        .or_default()
+        .error = Some(message.clone());
+    crate::events::publish(conversation_id, crate::events::ConversationEvent::TurnError { message });
+}
+
+#[cfg(test)]
+fn remember_turn_error(conversation_id: i64, error: Option<String>) {
+    TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).entry(conversation_id).or_default().error = error;
 }
 
 #[cfg(feature = "server")]
-fn last_turn_error(conversation_id: i64) -> Option<String> {
-    TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner()).get(&conversation_id).cloned()
+pub(crate) fn last_turn_error(conversation_id: i64) -> Option<String> {
+    TURN_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&conversation_id)
+        .and_then(|kept| kept.error.clone())
 }
 
 /// The conversation's last failed turn's error, if the user hasn't written
@@ -1380,28 +1546,23 @@ pub async fn get_turn_state(id: i64) -> ServerFnResult<bool> {
     Ok(turn_running(id))
 }
 
+/// The turn itself, holding the turn lock (`turn_lock`): `persisted` starts
+/// with the turn's own message, already saved by `run_turn_bounded`, and
+/// `new_content` is that message's content (`None` for a wake).
 #[cfg(feature = "server")]
 fn run_turn_body<'a>(
     pool: &'a PgPool,
     conversation_id: i64,
-    new_message: Option<anthropic::AnthropicMessage>,
+    turn_lock: tokio::sync::OwnedMutexGuard<()>,
+    mut persisted: Vec<Message>,
+    new_content: Option<Vec<anthropic::ContentBlock>>,
     mut on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
     max_turns: usize,
-    new_message_saved: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
 {
     Box::pin(async move {
-        let lock = conversation_lock(conversation_id);
-        let _guard = lock.lock().await;
-
-        if !db::conversation_exists(pool, conversation_id)
-            .await
-            .map_err(ServerFnError::new)?
-        {
-            return Err(ServerFnError::new("conversation not found"));
-        }
-
-        let mut persisted = Vec::new();
+        // Moved in, so the lock is held for as long as the turn runs.
+        let _turn = turn_lock;
         // Tracks what's been persisted since the last *real* Anthropic
         // response — the compaction trigger's cheap size estimate (see
         // `should_compact`) is computed over exactly this, added to that
@@ -1413,19 +1574,8 @@ fn run_turn_body<'a>(
         let mut last_known_usage = db::get_conversation_usage(pool, conversation_id)
             .await
             .map_err(ServerFnError::new)?;
-        if let Some(new_message) = &new_message {
-            let saved = db::create_message(
-                pool,
-                conversation_id,
-                &new_message.role,
-                &new_message.content,
-            )
-            .await
-            .map_err(ServerFnError::new)?;
-            new_message_saved.store(true, std::sync::atomic::Ordering::SeqCst);
-            pending_new_content.extend(new_message.content.clone());
-            record_saved(conversation_id, &mut persisted, saved);
-        }
+        let is_wake = new_content.is_none();
+        pending_new_content.extend(new_content.into_iter().flatten());
 
         // The model this turn runs on, read the first time it's needed
         // (after the new message and any pending notices are saved, so
@@ -1463,7 +1613,7 @@ fn run_turn_body<'a>(
             // returns before ever building a request. Only possible on the
             // very first iteration: every later one already has a real
             // tool_use turn's results to send regardless.
-            if new_message.is_none() && persisted.is_empty() {
+            if is_wake && persisted.is_empty() {
                 return Ok(persisted);
             }
 
@@ -1977,7 +2127,28 @@ pub async fn subscribe_conversation_events(
     // page load or reconnect used to leave a subscriber behind for good.
     // Here the response pulls events as it sends them, and dropping it
     // (the tab going away) drops the subscription.
-    Ok(ServerEvents::from_stream(conversation_event_stream(id)))
+    Ok(ServerEvents::from_stream(open_conversation_events(db::get(), id).await?))
+}
+
+/// `id`'s event stream (`conversation_event_stream`), refused for a
+/// conversation that doesn't exist: a tab still reconnecting to a deleted
+/// one would otherwise make it a channel again, for good (SME-91).
+/// Checked again once subscribed, for a delete landing in between; the
+/// refused stream's subscription frees the channel it made.
+#[cfg(feature = "server")]
+async fn open_conversation_events(
+    pool: &PgPool,
+    id: i64,
+) -> ServerFnResult<impl futures_util::Stream<Item = Result<events::ConversationEvent, axum::BoxError>> + use<>> {
+    let exists = || async { db::conversation_exists(pool, id).await.map_err(ServerFnError::new) };
+    if !exists().await? {
+        return Err(ServerFnError::new("conversation not found"));
+    }
+    let stream = conversation_event_stream(id);
+    if !exists().await? {
+        return Err(ServerFnError::new("conversation not found"));
+    }
+    Ok(stream)
 }
 
 /// Everything a tab watching `id` hears: that conversation's events, plus
@@ -2030,6 +2201,41 @@ fn conversation_event_stream(
             }
         }
     })
+}
+
+/// Points where a test can pause a turn, to land a Stop exactly there.
+#[cfg(test)]
+mod test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use tokio::sync::oneshot;
+
+    type Pause = (oneshot::Sender<()>, oneshot::Receiver<()>);
+    static AFTER_MESSAGE_SAVED: LazyLock<Mutex<HashMap<i64, Pause>>> = LazyLock::new(Default::default);
+
+    /// Pauses `conversation_id`'s next turn right after it saves its own
+    /// message. The first receiver fires once it's paused there; sending
+    /// on the second lets it go on.
+    pub fn pause_after_message_saved(conversation_id: i64) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        AFTER_MESSAGE_SAVED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(conversation_id, (reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    pub async fn after_message_saved(conversation_id: i64) {
+        let pause = AFTER_MESSAGE_SAVED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&conversation_id);
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2622,12 +2828,13 @@ mod tests {
     /// A subscription belongs to its connection: once the response is
     /// dropped (the tab closed or reloaded), nothing should still be
     /// listening on the conversation's channel.
-    #[tokio::test]
-    async fn test_a_dropped_event_subscription_stops_listening() {
-        let conversation_id = 9_000_000_007;
-        let subscription = subscribe_conversation_events(conversation_id)
-            .await
-            .expect("subscribe");
+    #[sqlx::test]
+    async fn test_a_dropped_event_subscription_stops_listening(pool: PgPool) {
+        let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+        // What `subscribe_conversation_events` answers, on this test's pool.
+        let subscription = ServerEvents::from_stream(
+            open_conversation_events(&pool, conversation_id).await.expect("subscribe"),
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(events::subscriber_count(conversation_id), 1);
         drop(subscription);
@@ -3478,6 +3685,131 @@ mod tests {
         assert_eq!(later.lock().expect("log").len(), 1);
     }
 
+    /// SME-91: a Stop landing just after the turn saved its own message
+    /// (the INSERT committed, the turn not yet told) doesn't save the
+    /// message a second time.
+    #[sqlx::test]
+    async fn test_a_stop_just_after_the_message_is_saved_keeps_it_once(pool: PgPool) {
+        let _guard = lock_turn_tests();
+        let conversation = db::create_conversation_with_id(&pool, 9100000091)
+            .await
+            .expect("create conversation");
+        start_hanging_mock_upstream(&pool).await;
+        let (reached, release) = test_hooks::pause_after_message_saved(conversation.id);
+
+        let turn = tokio::spawn({
+            let pool = pool.clone();
+            async move { run_turn(&pool, conversation.id, hello(), None).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached)
+            .await
+            .expect("the turn saves its message")
+            .expect("hook");
+        stop_turn_now(conversation.id);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = release.send(());
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), turn)
+            .await
+            .expect("the turn ends after the stop")
+            .expect("join");
+        assert_eq!(result.err().map(|e| chat_error_text(&e)).as_deref(), Some(TURN_STOPPED));
+        let saved = db::list_messages(&pool, conversation.id).await.expect("list");
+        let copies = saved.iter().filter(|m| m.content.contains("\"hello\"")).count();
+        assert_eq!(copies, 1, "the user's message is saved once: {saved:?}");
+        resume_turns(conversation.id);
+    }
+
+    /// SME-91: a stopped reply doesn't stay on screen while another turn
+    /// is still in flight: the stop clears it and tells every tab.
+    #[sqlx::test]
+    async fn test_a_stop_clears_the_reply_even_with_another_turn_in_flight(pool: PgPool) {
+        let _guard = lock_turn_tests();
+        let conversation = db::create_conversation_with_id(&pool, 9100000092)
+            .await
+            .expect("create conversation");
+        start_hanging_mock_upstream(&pool).await;
+
+        let turn = tokio::spawn({
+            let pool = pool.clone();
+            async move { run_turn(&pool, conversation.id, hello(), None).await }
+        });
+        // The turn is waiting on the model by now; its reply has begun.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        relay_reply_delta(conversation.id, "Once upon a ");
+        let _another = TurnInFlight::start(conversation.id);
+        let mut rx = events::subscribe(conversation.id);
+
+        stop_turn_now(conversation.id);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), turn)
+            .await
+            .expect("the turn ends after the stop");
+
+        assert_eq!(reply_in_progress(conversation.id), None, "the stopped reply is cleared");
+        let reset = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match rx.recv().await {
+                    Ok(events::ConversationEvent::ReplyReset {}) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(reset, "tabs are told to drop the stopped reply");
+        resume_turns(conversation.id);
+    }
+
+    /// SME-91: a tab still reconnecting to a deleted conversation (or any
+    /// that doesn't exist) is refused, and makes no channel for it.
+    #[sqlx::test]
+    async fn test_subscribing_to_a_missing_conversation_is_refused(pool: PgPool) {
+        let missing = 9_100_000_099;
+        assert!(open_conversation_events(&pool, missing).await.is_err());
+        assert!(!events::has_channel(missing), "a refused subscription leaves no channel");
+
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let stream = open_conversation_events(&pool, conversation.id).await;
+        assert!(stream.is_ok(), "an existing conversation's events open");
+    }
+
+    /// SME-91 review: an idle release landing between a turn starting
+    /// (its generation recorded) and failing mustn't lose that failure.
+    #[test]
+    fn test_an_idle_release_keeps_a_starting_turns_generation() {
+        let conversation_id = 9_100_000_192;
+        let generation = new_turn_generation(conversation_id);
+        release_idle_turn_state(conversation_id);
+        keep_turn_error(conversation_id, generation, "it failed".to_string());
+        assert_eq!(last_turn_error(conversation_id).as_deref(), Some("it failed"));
+    }
+
+    /// SME-91: a conversation's turn lock and stop counter go once its
+    /// turns are done, but not while someone still holds the lock.
+    #[sqlx::test]
+    async fn test_a_conversations_turn_state_is_freed_after_its_turns(pool: PgPool) {
+        let _guard = lock_turn_tests();
+        let conversation = db::create_conversation_with_id(&pool, 9100000191)
+            .await
+            .expect("create conversation");
+        start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
+        let turn_state_kept = |id: i64| {
+            (
+                CONVERSATION_LOCKS.lock().expect("locks").contains_key(&id),
+                TURN_STOPS.lock().expect("stops").contains_key(&id),
+            )
+        };
+
+        run_turn(&pool, conversation.id, hello(), None).await.expect("a turn");
+        assert_eq!(turn_state_kept(conversation.id), (false, false), "freed after the turn");
+
+        let held = conversation_lock(conversation.id);
+        run_turn(&pool, conversation.id, hello(), None).await.expect("a turn");
+        assert!(turn_state_kept(conversation.id).0, "a lock someone holds isn't replaced");
+        drop(held);
+    }
+
     /// Every tab can tell a turn is running, including one a background
     /// notice started, and when it ends.
     #[sqlx::test]
@@ -3633,6 +3965,116 @@ mod tests {
         .await;
         assert!(saved.is_ok(), "the queued notice was lost when the turn was stopped");
         resume_turns(conversation.id);
+    }
+
+    /// SME-91: one Stop is noted once, however many turns it ended, even
+    /// when the queued turns' own messages land after the first note.
+    #[sqlx::test]
+    async fn test_one_stop_is_noted_once(pool: PgPool) {
+        let _guard = lock_turn_tests();
+        let conversation = db::create_conversation_with_id(&pool, 9100000093)
+            .await
+            .expect("create conversation");
+        let lock = conversation_lock(conversation.id);
+        let running = lock.lock().await;
+
+        let queued = |text: &'static str| {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let message = anthropic::AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![anthropic::ContentBlock::Text { text: text.to_string() }],
+                };
+                run_turn(&pool, conversation.id, message, None).await
+            })
+        };
+        let first = queued("first notice");
+        let second = queued("second notice");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        stop_turn_now(conversation.id);
+        drop(running);
+        for turn in [first, second] {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), turn)
+                .await
+                .expect("a stopped turn ends")
+                .expect("join");
+            assert_eq!(result.err().map(|e| chat_error_text(&e)).as_deref(), Some(TURN_STOPPED));
+        }
+
+        let saved = db::list_messages(&pool, conversation.id).await.expect("list");
+        let notes = saved.iter().filter(|m| m.content.contains(STOP_NOTICE)).count();
+        assert_eq!(notes, 1, "one stop, one note: {saved:?}");
+        assert!(saved.iter().any(|m| m.content.contains("first notice")));
+        assert!(saved.iter().any(|m| m.content.contains("second notice")));
+        resume_turns(conversation.id);
+    }
+
+    /// SME-91 (SME-51 code review 2): a turn that fails after the user
+    /// already sent the next message doesn't leave its error behind once
+    /// that next turn succeeds.
+    #[sqlx::test]
+    async fn test_an_older_turns_failure_isnt_kept_after_a_newer_turn(pool: PgPool) {
+        let _guard = lock_turn_tests();
+        let conversation = db::create_conversation_with_id(&pool, 9100000094)
+            .await
+            .expect("create conversation");
+        // The first request waits for `release`, then fails; later ones
+        // answer.
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let gate = Arc::new(tokio::sync::Mutex::new(Some((reached_tx, release_rx))));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let gate = gate.clone();
+                async move {
+                    if let Some((reached, release)) = gate.lock().await.take() {
+                        let _ = reached.send(());
+                        let _ = release.await;
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            r#"{"type":"error","error":{"type":"invalid_request_error","message":"turn A failed"}}"#.to_string(),
+                        )
+                            .into_response();
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        text_reply_body("B answered"),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        crate::providers::test_support::add_mock_provider(&pool, addr).await;
+
+        start_turn(pool.clone(), conversation.id, "A".to_string()).await.expect("send A");
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached_rx)
+            .await
+            .expect("A reaches the model")
+            .expect("gate");
+        start_turn(pool.clone(), conversation.id, "B".to_string()).await.expect("send B");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = release_tx.send(());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let messages = db::list_messages(&pool, conversation.id).await.expect("list");
+                if messages.iter().any(|m| m.content.contains("B answered")) && !turn_running(conversation.id) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("B finishes");
+        assert_eq!(last_turn_error(conversation.id), None, "A's error outlived B's success");
     }
 
     /// A notice waits for a running turn to end before it's saved, and
@@ -4601,7 +5043,7 @@ mod tests {
         // than run_turn (which would replay the mock upstream the real
         // MAX_TURNS — 10,000 — times just to prove the same "give up and
         // error" behavior).
-        let result = run_turn_bounded(&pool, conversation.id, Some(new_message), None, 3).await;
+        let result = run_turn_bounded(&pool, conversation.id, Some(new_message), None, 3, false).await;
         assert!(result.is_err(), "expected an error, got {result:?}");
     }
 

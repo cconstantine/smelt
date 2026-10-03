@@ -125,6 +125,8 @@ Sending is an ordinary request: `send()` adds an optimistic copy of the message 
 - `TurnError` sets the conversation's error, except for a stop (`TURN_STOPPED`), which shows as its saved notice instead (see above).
 - The message box is disabled while a turn runs in the conversation (`TurnState`), whoever started it, and Stop is offered instead.
 
+**A refused stream doesn't say why.** When a `ServerEvents` subscription fails (the server function returned an error before streaming), the page's side gets a transport error, not the server function's own error text, unlike an ordinary server function call. A page that needs the reason asks a plain server function: the reconnect loop calls `get_messages` when the stream fails, and stops on "conversation not found" (SME-91; its first fix matched the stream's error text and never fired).
+
 Loading a conversation's messages on open goes through `apply_loaded_messages`, not a plain replace. The live subscription's reconciliation merge can land first with a message saved after the load's snapshot, and a replace would wipe it.
 
 ## The live browsing panel

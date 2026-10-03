@@ -3039,7 +3039,19 @@ fn ChatPanel(
             let handle = spawn(async move {
                 let mut pulls = 0u32;
                 loop {
-                    if let Ok(mut events) = subscribe_conversation_events(id).await {
+                    let subscribed = subscribe_conversation_events(id).await;
+                    // Deleted (from another tab, say): the server refuses
+                    // to stream it, so say so instead of retrying for good
+                    // (SME-91). A refused stream doesn't carry the
+                    // server's reason, so ask the way a page load does.
+                    if subscribed.is_err()
+                        && let Err(e) = get_messages(id).await
+                        && server_error_message(&e) == "conversation not found"
+                    {
+                        load_error.set(Some(server_error_message(&e)));
+                        break;
+                    }
+                    if let Ok(mut events) = subscribed {
                         // One-shot reconciliation pull: a `broadcast`
                         // channel has no replay, so anything published
                         // before this subscription connected would
@@ -3882,7 +3894,7 @@ fn ChatPanel(
                             // A new conversation says what smelt does and offers a
                             // few asks to start from, instead of a blank screen
                             // (SME-41 D12). Picking one fills the message box.
-                            if messages().is_empty() && !turn_running() && matches!(initial_messages(), Some(Some(Ok(_)))) {
+                            if messages().is_empty() && !turn_running() && !conversation_missing() && matches!(initial_messages(), Some(Some(Ok(_)))) {
                                 div { class: "conversation-empty",
                                     h2 { "What should smelt work on?" }
                                     p { "It works in a sandbox of its own: it writes and runs code, uses a terminal, reads the web, and shows you each step." }
