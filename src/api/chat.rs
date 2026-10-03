@@ -3606,17 +3606,17 @@ mod tests {
 
     #[sqlx::test]
     async fn test_a_notice_queued_behind_a_stopped_turn_is_still_saved(pool: PgPool) {
-        // SME-40 F4: a background task finishing during a turn queues its
-        // notice as a turn of its own, behind the running one. Stop ended
-        // both before the queued one had saved anything, so the notice was
-        // lost and the model never learned the task finished.
+        // SME-40 F4: a notice arriving during a turn (a command finishing,
+        // say) queues as a turn of its own, behind the running one. Stop
+        // ended both before the queued one had saved anything, so the notice
+        // was lost and the model never learned the command finished.
         let conversation = db::create_conversation_with_id(&pool, 9100000040)
             .await
             .expect("create conversation");
         let lock = conversation_lock(conversation.id);
         let running = lock.lock().await;
 
-        let notice = r#"<task-notification task_id="t1" tool="count">finished: Counted to 2</task-notification>"#;
+        let notice = "Command `make` in terminal 1 finished with exit code 0.";
         let queued = tokio::spawn({
             let pool = pool.clone();
             async move {
@@ -3640,7 +3640,7 @@ mod tests {
         let saved = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let messages = db::list_messages(&pool, conversation.id).await.expect("list");
-                if messages.iter().any(|m| m.content.contains("Counted to 2")) {
+                if messages.iter().any(|m| m.content.contains("finished with exit code 0")) {
                     return messages;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;

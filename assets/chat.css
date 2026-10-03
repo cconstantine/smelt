@@ -202,7 +202,7 @@ body {
 }
 
 /* Below WIDE_LAYOUT_BREAKPOINT (see the media query further down): the
-   side-panels row (background tasks, sandbox terminals) and chat (messages
+   side-panels row (todos, the live browser, sandbox terminals) and chat (messages
    + composer) stack vertically, each taking the full width left over from
    .sidebar — not side by side. A narrow window makes a side-by-side
    terminal cramped; stacking gives both regions the whole width instead of
@@ -232,7 +232,7 @@ body {
     border-top: 1px solid var(--border);
 }
 
-/* The stacked region above chat (narrow layout): background tasks and/or
+/* The stacked region above chat (narrow layout): the todo panel and/or
    the sandbox panel, side by side with each other (still a row between
    just the two of them) but full-width and taking roughly the other half
    of the viewport's height, independently scrollable from the transcript
@@ -270,7 +270,7 @@ body {
     /* The side panels stack in a column, each the column's full width,
        instead of sitting side by side: three of them in a row shared
        ~450px, so the live browser was tiny and the terminal pushed out of
-       sight (SME-41 D16). Small panels (todos, background tasks) size to
+       sight (SME-41 D16). Small panels (todos) size to
        their content; the sandbox takes the rest; the column scrolls if it
        must. With a browsing session open the column widens to half. */
     .side-panels-row {
@@ -476,7 +476,7 @@ body {
 }
 
 /* Something that happened, not something anyone said (SME-41 D3): a
-   command finishing, the sandbox stopping, a background task ending. */
+   command finishing, the sandbox stopping. */
 .system-notice {
     align-self: center;
     display: flex;
@@ -1001,10 +1001,8 @@ body {
     content: " \2197";
 }
 
-/* Each background task gets its own terminal-window-styled widget — the
-   same visual language a real shell session will use once async tasks grow
-   into one, not just a status list. Stacked vertically since the panel is
-   a narrow sidebar rather than the full-width strip it used to be. */
+/* Each sandbox terminal gets its own terminal-window-styled widget,
+   stacked vertically. */
 .task-terminal-stack {
     display: flex;
     flex-direction: column;

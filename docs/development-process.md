@@ -289,7 +289,7 @@ At each project's close-out, check how many projects have completed since the la
 
 Every six completed projects or so, alternating with bug bashes so one kind of review happens about every three projects, run a design review as its own ticket. The Feature checklist says what should work; a design review asks whether it's good to use. Everything goes through the web UI with a real model, at a laptop width and a phone width, in five passes:
 
-1. **Visual craft**, page by page: type hierarchy, colour and what it means, consistency of repeated elements, spacing, empty states, focus, phone width. Include a **busy session**: every side panel open at once (todos, background tasks, live browser, sandbox with a terminal), at both widths. Panels are rarely alone in real use; SME-41 reviewed them one at a time and missed that together they squeezed the browser to 100px and the terminal off screen.
+1. **Visual craft**, page by page: type hierarchy, colour and what it means, consistency of repeated elements, spacing, empty states, focus, phone width. Include a **busy session**: every side panel open at once (todos, live browser, sandbox with a terminal), at both widths. Panels are rarely alone in real use; SME-41 reviewed them one at a time and missed that together they squeezed the browser to 100px and the terminal off screen.
 2. **Copy**: things named from the user's side, not the system's; buttons that say what happens; errors that say what went wrong and how to fix it.
 3. **Information design**: summary before detail, state shown in form and not only in text, interactive things that look interactive.
 4. **Workflows**, walked end to end: starting a task, following a long one, stepping in, coming back later, setting up, browsing together, housekeeping.
