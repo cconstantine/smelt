@@ -82,21 +82,17 @@ pub fn GitSettingsPage() -> Element {
     };
 
     let mut pending_delete: Signal<Option<i64>> = use_signal(|| None);
-    let mut request_delete = move |id: i64| {
-        if pending_delete() == Some(id) {
-            spawn(async move {
-                match delete_ssh_key(id).await {
-                    Ok(()) => {
-                        key_error.set(None);
-                        keys.write().retain(|k| k.id != id);
-                        pending_delete.set(None);
-                    }
-                    Err(e) => key_error.set(Some(super::server_error_message(&e))),
+    let confirm_delete = move |id: i64| {
+        spawn(async move {
+            match delete_ssh_key(id).await {
+                Ok(()) => {
+                    key_error.set(None);
+                    keys.write().retain(|k| k.id != id);
+                    pending_delete.set(None);
                 }
-            });
-        } else {
-            pending_delete.set(Some(id));
-        }
+                Err(e) => key_error.set(Some(super::server_error_message(&e))),
+            }
+        });
     };
 
     let mut copied: Signal<Option<i64>> = use_signal(|| None);
@@ -121,9 +117,7 @@ pub fn GitSettingsPage() -> Element {
                     "Every sandbox gets these keys and this name and email, so the model can clone and push. Changes reach running sandboxes straight away."
                 }
             }
-            if let Some(err) = load_error() {
-                p { class: "error", "{err}" }
-            }
+            super::ErrorText { message: load_error() }
             if !loaded() {
                 p { class: "muted", "Loading..." }
             } else {
@@ -146,7 +140,7 @@ pub fn GitSettingsPage() -> Element {
                         }
                         match identity_status() {
                             Some(Ok(())) => rsx! { p { class: "muted git-saved", "Saved." } },
-                            Some(Err(err)) => rsx! { p { class: "error", "{err}" } },
+                            Some(Err(err)) => rsx! { super::ErrorText { message: Some(err) } },
                             None => rsx! {},
                         }
                         button { r#type: "submit", "Save" }
@@ -158,9 +152,7 @@ pub fn GitSettingsPage() -> Element {
                     p { class: "muted",
                         "The model loads a repo's AGENTS.md into its instructions when it asks to; you're asked the first time for each repo. Forget a decision to be asked again."
                     }
-                    if let Some(err) = trust_error() {
-                        p { class: "error", "{err}" }
-                    }
+                    super::ErrorText { message: trust_error() }
                     if trust().is_empty() {
                         p { class: "muted", "None yet. You're asked the first time the model wants to load a repo's AGENTS.md; repos you open with Work on a repo are trusted." }
                     } else {
@@ -223,11 +215,13 @@ pub fn GitSettingsPage() -> Element {
                                             },
                                             if copied() == Some(key.id) { "Copied" } else { "Copy public key" }
                                         }
-                                        button {
-                                            class: if pending_delete() == Some(key.id) { "sandbox-volume-delete confirm" } else { "sandbox-volume-delete" },
-                                            r#type: "button",
-                                            onclick: move |_| request_delete(key.id),
-                                            super::TwoStepLabel { armed: pending_delete() == Some(key.id), idle: "Delete", confirm: "Confirm delete?" }
+                                        super::TwoStepButton {
+                                            armed: pending_delete() == Some(key.id),
+                                            class: "sandbox-volume-delete",
+                                            idle: "Delete",
+                                            confirm: "Confirm delete?",
+                                            on_arm: move |_| pending_delete.set(Some(key.id)),
+                                            on_confirm: move |_| confirm_delete(key.id),
                                         }
                                     }
                                 }
@@ -260,9 +254,7 @@ pub fn GitSettingsPage() -> Element {
                                 oninput: move |e| private_key.set(e.value()),
                             }
                         }
-                        if let Some(err) = key_error() {
-                            p { class: "error", "{err}" }
-                        }
+                        super::ErrorText { message: key_error() }
                         div { class: "git-key-form-buttons",
                             button {
                                 r#type: "submit",

@@ -369,15 +369,13 @@ pub fn ProvidersIndex() -> Element {
                             }
                         }
                     }
-                    if let Some(err) = default_error() {
-                        p { class: "error", "{err}" }
-                    }
+                    super::ErrorText { message: default_error() }
                 }
             }
 
             match providers() {
                 None => rsx! { p { class: "muted", "Loading..." } },
-                Some(Err(e)) => rsx! { p { class: "error", "{server_error_message(&e)}" } },
+                Some(Err(e)) => rsx! { super::ErrorText { message: Some(super::server_error_message(&e)) } },
                 Some(Ok(list)) if list.is_empty() => rsx! {
                     p { class: "muted providers-empty", "No providers yet. Add one to start chatting." }
                 },
@@ -524,9 +522,7 @@ fn ProviderFields(
                 "Stays on the server: pages only ever show its last four characters. A local Ollama needs one but ignores it, so any value does."
             }
 
-            if let Some(err) = error {
-                p { class: "error", "{err}" }
-            }
+            super::ErrorText { message: error }
             button { r#type: "submit", "{save_label}" }
         }
     }
@@ -597,10 +593,6 @@ pub fn ProviderEdit(id: i64) -> Element {
         });
     };
     let delete = move |_| {
-        if !armed() {
-            armed.set(true);
-            return;
-        }
         spawn(async move {
             match delete_provider(id).await {
                 Ok(()) => {
@@ -619,18 +611,20 @@ pub fn ProviderEdit(id: i64) -> Element {
             }
             match provider() {
                 None => rsx! { p { class: "muted", "Loading..." } },
-                Some(Err(e)) => rsx! { p { class: "error", "{server_error_message(&e)}" } },
+                Some(Err(e)) => rsx! { super::ErrorText { message: Some(super::server_error_message(&e)) } },
                 Some(Ok(_)) => rsx! {
                     ProviderFields { form, is_new: false, secret_hint: secret_hint(), save_label: "Save", error: error(), on_save: save }
                     if saved() {
                         p { class: "muted provider-saved", "Saved." }
                     }
                     ProviderModelsSection { id, refresh: models_refresh }
-                    button {
-                        class: if armed() { "mcp-delete-server confirm" } else { "mcp-delete-server" },
-                        r#type: "button",
-                        onclick: delete,
-                        super::TwoStepLabel { armed: armed(), idle: "Delete provider", confirm: "Confirm delete? Its conversations take the default at their next turn, if there's still one" }
+                    super::TwoStepButton {
+                        armed: armed(),
+                        class: "mcp-delete-server",
+                        idle: "Delete provider",
+                        confirm: "Confirm delete? Its conversations take the default at their next turn, if there's still one",
+                        on_arm: move |_| armed.set(true),
+                        on_confirm: delete,
                     }
                 },
             }
@@ -658,7 +652,7 @@ fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
             }
             match listing() {
                 None => rsx! { p { class: "muted", "Asking the provider\u{2026}" } },
-                Some(Err(e)) => rsx! { p { class: "error", "{server_error_message(&e)}" } },
+                Some(Err(e)) => rsx! { super::ErrorText { message: Some(super::server_error_message(&e)) } },
                 Some(Ok(listing)) => rsx! {
                     if let Some(err) = listing.listing_error {
                         p { class: "error", "Couldn't list this provider's models: {err}" }

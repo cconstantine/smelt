@@ -31,21 +31,17 @@ pub fn SandboxVolumesIndex() -> Element {
     let mut pending_delete: Signal<Option<i64>> = use_signal(|| None);
     let mut delete_error: Signal<Option<String>> = use_signal(|| None);
 
-    let mut request_delete = move |id: i64| {
-        if pending_delete() == Some(id) {
-            spawn(async move {
-                match delete_sandbox_volume(id).await {
-                    Ok(()) => {
-                        delete_error.set(None);
-                        volumes.write().retain(|v| v.id != id);
-                        pending_delete.set(None);
-                    }
-                    Err(e) => delete_error.set(Some(super::server_error_message(&e))),
+    let confirm_delete = move |id: i64| {
+        spawn(async move {
+            match delete_sandbox_volume(id).await {
+                Ok(()) => {
+                    delete_error.set(None);
+                    volumes.write().retain(|v| v.id != id);
+                    pending_delete.set(None);
                 }
-            });
-        } else {
-            pending_delete.set(Some(id));
-        }
+                Err(e) => delete_error.set(Some(super::server_error_message(&e))),
+            }
+        });
     };
 
     rsx! {
@@ -59,12 +55,8 @@ pub fn SandboxVolumesIndex() -> Element {
                 Link { to: Route::SandboxVolumeNewRoute {}, class: "sandbox-volumes-new-link", "+ Add a volume" }
             }
 
-            if let Some(err) = list_error() {
-                p { class: "error", "{err}" }
-            }
-            if let Some(err) = delete_error() {
-                p { class: "error", "{err}" }
-            }
+            super::ErrorText { message: list_error() }
+            super::ErrorText { message: delete_error() }
 
             if !loaded() {
                 p { class: "muted", "Loading..." }
@@ -78,11 +70,13 @@ pub fn SandboxVolumesIndex() -> Element {
                                 span { class: "sandbox-volume-name", "{volume.name}" }
                                 span { class: "sandbox-volume-path", "{volume.mount_path}" }
                             }
-                            button {
-                                class: if pending_delete() == Some(volume.id) { "sandbox-volume-delete confirm" } else { "sandbox-volume-delete" },
-                                r#type: "button",
-                                onclick: move |_| request_delete(volume.id),
-                                super::TwoStepLabel { armed: pending_delete() == Some(volume.id), idle: "Delete", confirm: "Confirm delete?" }
+                            super::TwoStepButton {
+                                armed: pending_delete() == Some(volume.id),
+                                class: "sandbox-volume-delete",
+                                idle: "Delete",
+                                confirm: "Confirm delete?",
+                                on_arm: move |_| pending_delete.set(Some(volume.id)),
+                                on_confirm: move |_| confirm_delete(volume.id),
                             }
                         }
                     }
@@ -148,9 +142,7 @@ pub fn SandboxVolumeNew() -> Element {
                     oninput: move |e| mount_path.set(e.value()),
                 }
                 p { class: "muted", "A leading ~ is expanded to the sandbox user's home directory." }
-                if let Some(err) = submit_error() {
-                    p { class: "error", "{err}" }
-                }
+                super::ErrorText { message: submit_error() }
                 button {
                     r#type: "submit",
                     disabled: submitting(),

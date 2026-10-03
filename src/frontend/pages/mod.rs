@@ -27,6 +27,43 @@ pub(crate) fn server_error_message(error: &ServerFnError) -> String {
     }
 }
 
+/// A server function's error, or nothing: `p.error`, announced to screen
+/// readers when it appears.
+#[component]
+pub(crate) fn ErrorText(message: Option<String>) -> Element {
+    rsx! {
+        if let Some(message) = message {
+            p { class: "error", role: "alert", "{message}" }
+        }
+    }
+}
+
+/// A two-step button: the first click arms it (`on_arm`), a click while
+/// it's armed confirms (`on_confirm`). The caller keeps the state, so one
+/// armed row out of many and a lone button both fit: `armed` says whether
+/// this one is. Armed, it carries the `confirm` class too.
+#[component]
+pub(crate) fn TwoStepButton(
+    armed: bool,
+    class: &'static str,
+    idle: &'static str,
+    confirm: &'static str,
+    on_arm: EventHandler<()>,
+    on_confirm: EventHandler<()>,
+) -> Element {
+    rsx! {
+        button {
+            class: if armed { "{class} confirm" } else { "{class}" },
+            r#type: "button",
+            onclick: move |evt: Event<MouseData>| {
+                evt.stop_propagation();
+                if armed { on_confirm.call(()) } else { on_arm.call(()) }
+            },
+            TwoStepLabel { armed, idle, confirm }
+        }
+    }
+}
+
 /// The label of a two-step button (click once to arm, again to confirm).
 /// Both labels sit in the same spot and the inactive one is hidden, so the
 /// button is always as wide as the longer label: arming it doesn't resize
