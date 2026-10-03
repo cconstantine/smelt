@@ -777,13 +777,15 @@ const TRANSCRIPT_ANCHOR_SETUP: &str = "const m = document.querySelector('.messag
 
 /// After a layout change with the pointer over the transcript: scrolls it
 /// by however far the remembered element moved, so what's under the
-/// pointer stays where it was, whichever way the layout moved it. Returns
-/// whether there was such an element.
+/// pointer stays where it was, whichever way the layout moved it. Says
+/// `none` when there was no such element, `bottom` when the transcript is
+/// at its bottom afterwards (nothing left to snap), else `kept`.
 const TRANSCRIPT_KEEP_ANCHOR: &str = "const m = document.querySelector('.messages'); \
     const a = window.__smeltTranscriptAnchor; \
-    if (!(m && a && a.el.isConnected)) { return false; } \
+    if (!(m && a && a.el.isConnected)) { return 'none'; } \
     const d = a.el.getBoundingClientRect().top - a.top; \
-    if (d) { m.scrollTop += d; } a.top = a.el.getBoundingClientRect().top; return true;";
+    if (d) { m.scrollTop += d; } a.top = a.el.getBoundingClientRect().top; \
+    return m.scrollHeight - m.scrollTop - m.clientHeight <= 1 ? 'bottom' : 'kept';";
 
 /// After a layout change with the pointer over the transcript: keeps what's
 /// under the pointer in place (see `TRANSCRIPT_KEEP_ANCHOR`), or, when
@@ -791,13 +793,14 @@ const TRANSCRIPT_KEEP_ANCHOR: &str = "const m = document.querySelector('.message
 /// to the bottom as if the pointer weren't there. Either way the pending
 /// snap is settled here or on the pointer leaving.
 async fn keep_transcript_anchor(el: MountedEvent, mut pending: Signal<bool>) {
-    let kept = matches!(
-        document::eval(TRANSCRIPT_KEEP_ANCHOR).await.map(|v| v.as_bool()),
-        Ok(Some(true))
-    );
-    if !kept {
-        pending.set(false);
-        scroll_to_bottom(el).await;
+    let outcome = document::eval(TRANSCRIPT_KEEP_ANCHOR).await.ok();
+    match outcome.as_ref().and_then(|v| v.as_str()) {
+        Some("kept") => {}
+        Some("bottom") => pending.set(false),
+        _ => {
+            pending.set(false);
+            scroll_to_bottom(el).await;
+        }
     }
 }
 
@@ -3970,6 +3973,9 @@ fn ChatPanel(
                             // gives up the snap, so the scroll that follows
                             // decides whether they're still at the bottom.
                             onwheel: move |_| layout_snap_pending.set(false),
+                            // A press starts a scrollbar or selection drag,
+                            // or focuses text the keys then scroll.
+                            onpointerdown: move |_| layout_snap_pending.set(false),
                             ontouchmove: move |_| layout_snap_pending.set(false),
                             onkeydown: move |_| layout_snap_pending.set(false),
                             onscroll: move |evt: Event<ScrollData>| {

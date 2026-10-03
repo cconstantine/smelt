@@ -2440,14 +2440,18 @@ async fn scenario_pointer_keeps_text_still(t: &Scenario<'_>) {
             (after - before).abs() <= 2.0,
             "at {width}px the text under the pointer moved when the sandbox panel appeared: top {before} -> {after}"
         );
-        // A scroll that isn't the user's (no wheel, touch or key: the
-        // transcript keeping the text under the pointer still, which can
-        // leave it well short of its bottom when long lines re-wrap) mustn't
-        // count as the user leaving the bottom (SME-75 code review).
-        page.evaluate("(() => { document.querySelector('.messages').scrollTop -= 100; })()")
-            .await
-            .expect("scroll the transcript");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Short of its bottom with the text held still means a snap is
+        // pending. Then a scroll that isn't the user's (no wheel, touch,
+        // key or press: the transcript keeping the text under the pointer
+        // still) mustn't count as the user leaving the bottom (SME-75 code
+        // review). Where holding the text still ended at the bottom (the
+        // panel above, in a narrow window), nothing is pending.
+        if transcript_distance_from_bottom(&page).await > 1.0 {
+            page.evaluate("(() => { document.querySelector('.messages').scrollTop -= 100; })()")
+                .await
+                .expect("scroll the transcript");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
         page.move_mouse(chromiumoxide::layout::Point::new(5.0, 5.0))
             .await
             .expect("move the mouse off the transcript");
@@ -2456,6 +2460,34 @@ async fn scenario_pointer_keeps_text_still(t: &Scenario<'_>) {
         assert!(
             distance <= 1.0,
             "at {width}px, once the pointer left, the transcript should catch up to its bottom, but it's {distance}px away"
+        );
+
+        // But a scroll the user makes with a pending snap (a scrollbar
+        // drag, or keys after clicking the text: neither is a wheel, touch
+        // or key event on the transcript) is theirs: a press on the
+        // transcript gives up the pending snap, so leaving doesn't pull
+        // them back (SME-75 code review 2). A new terminal card grows the
+        // sandbox panel, a layout change that arms the snap.
+        page.move_mouse(chromiumoxide::layout::Point::new(centre[0], centre[1]))
+            .await
+            .expect("move the mouse back over the transcript");
+        sandbox::create_terminal(t.pool, conversation.id).await.expect("create_terminal");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        page.click(chromiumoxide::layout::Point::new(centre[0], centre[1]))
+            .await
+            .expect("click the transcript's text");
+        page.evaluate("(() => { document.querySelector('.messages').scrollTop -= 100; })()")
+            .await
+            .expect("scroll the transcript up");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        page.move_mouse(chromiumoxide::layout::Point::new(5.0, 5.0))
+            .await
+            .expect("move the mouse off the transcript");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let distance = transcript_distance_from_bottom(&page).await;
+        assert!(
+            distance >= 90.0,
+            "at {width}px, a scroll after clicking the text should stay where the user put it, but the transcript is {distance}px from its bottom"
         );
     }
 }
