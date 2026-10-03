@@ -362,6 +362,12 @@ fn is_binding_mismatch(body: &str) -> bool {
     provider_error_message(body).contains("bound to a different conversation")
 }
 
+/// Whether a 400's body refuses the controls beta: its `block_binding`
+/// field, or the beta value in the `anthropic-beta` header.
+fn refuses_binding_controls(body: &str) -> bool {
+    body.contains("block_binding") || body.contains(BINDING_BETA)
+}
+
 /// The next form to try after `binding` was refused with a 400 whose body
 /// is `body`, or `None` when another try won't help. `tried` lists the
 /// forms already sent for this request; each is sent at most once.
@@ -373,11 +379,11 @@ fn next_binding(binding: Binding, tried: &[Binding], request: &CreateMessageRequ
         }
         Binding::AsIs if is_binding_mismatch(body) => untried(Binding::Strip),
         // A route that doesn't know the controls beta refuses the field
-        // itself ("block_binding: Extra inputs are not permitted"); one that
-        // doesn't run the check may take the request as built. Any other
-        // 400 isn't about the replayed thinking, and retrying would only
-        // hide the real error.
-        Binding::DropBlock if is_binding_mismatch(body) || body.contains("block_binding") => {
+        // ("block_binding: Extra inputs are not permitted") or the beta
+        // value itself; one that doesn't run the check may take the
+        // request as built. Any other 400 isn't about the replayed
+        // thinking, and retrying would only hide the real error.
+        Binding::DropBlock if is_binding_mismatch(body) || refuses_binding_controls(body) => {
             untried(Binding::AsIs).or_else(|| untried(Binding::Strip))
         }
         _ => None,
@@ -1245,6 +1251,30 @@ mod tests {
         assert_eq!(seen[2].drop_block(), Some("drop_block"), "the remembered form goes first");
         assert_eq!(seen[3].thinking_blocks(), 1, "then the request as built, not stripped");
         assert!(!seen[3].has_binding_beta() && seen[3].drop_block().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_a_refused_beta_header_counts_as_refusing_drop_block() {
+        let beta_refused = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Unexpected value(s) `thinking-binding-controls-2026-08-01` for the `anthropic-beta` header. Please consult our documentation at docs.anthropic.com or try again without the header."}}"#;
+        let (endpoint, record) = recording_upstream(vec![
+            (400, BINDING_BODY),
+            (200, OK_BODY),
+            (400, beta_refused),
+            (200, OK_BODY),
+            (200, OK_BODY),
+        ])
+        .await;
+        let request = request_replaying_thinking(Some(super::super::types::ThinkingConfig::Adaptive));
+        stream_anthropic_message(&endpoint, &request, |_| {}).await.expect("learns drop_block");
+        stream_anthropic_message(&endpoint, &request, |_| {})
+            .await
+            .expect("a route that refuses the beta takes the request as built");
+        stream_anthropic_message(&endpoint, &request, |_| {}).await.expect("next turn");
+        let seen = requests_seen(&record);
+        assert_eq!(seen.len(), 5);
+        assert_eq!(seen[3].thinking_blocks(), 1, "retried as built");
+        assert!(!seen[3].has_binding_beta());
+        assert!(!seen[4].has_binding_beta(), "and drop_block is no longer remembered");
     }
 
     #[tokio::test]
