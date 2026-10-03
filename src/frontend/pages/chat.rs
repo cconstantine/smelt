@@ -3009,9 +3009,7 @@ fn QuestionCard(conversation_id: i64, question: PendingQuestion) -> Element {
                     }
                 }
             }
-            if let Some(message) = error() {
-                p { class: "error", role: "alert", "{message}" }
-            }
+            super::ErrorText { message: error() }
             button {
                 r#type: "button",
                 class: "question-card-submit",
