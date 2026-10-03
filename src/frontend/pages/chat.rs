@@ -763,6 +763,68 @@ const FOCUS_LAST_IN_CONTEXT_DETAIL: &str = "const p = document.querySelector('.c
      if (p) { const f = p.querySelectorAll('button, summary, a[href], input, select, textarea, [tabindex=\"0\"]'); \
      (f[f.length - 1] || p).focus(); }";
 
+/// Installed on the transcript once it mounts: remembers the element under
+/// the pointer and where it was on screen, kept current as the pointer
+/// moves and the transcript scrolls (SME-75).
+const TRANSCRIPT_ANCHOR_SETUP: &str = "const m = document.querySelector('.messages'); \
+    if (m && !m.__smeltAnchor) { m.__smeltAnchor = true; \
+      const remember = (x, y) => { const e = document.elementFromPoint(x, y); \
+        window.__smeltTranscriptAnchor = e && e !== m && m.contains(e) \
+          ? { el: e, top: e.getBoundingClientRect().top, x, y } : null; }; \
+      m.addEventListener('pointermove', ev => remember(ev.clientX, ev.clientY)); \
+      m.addEventListener('scroll', () => { const a = window.__smeltTranscriptAnchor; if (a) remember(a.x, a.y); }); \
+      m.addEventListener('pointerleave', () => { window.__smeltTranscriptAnchor = null; }); }";
+
+/// After a layout change with the pointer over the transcript: scrolls it
+/// by however far the remembered element moved, so what's under the
+/// pointer stays where it was, whichever way the layout moved it. Says
+/// `none` when there was no such element, `bottom` when the transcript is
+/// at its bottom afterwards (nothing left to snap), else `kept`.
+const TRANSCRIPT_KEEP_ANCHOR: &str = "const m = document.querySelector('.messages'); \
+    const a = window.__smeltTranscriptAnchor; \
+    if (!(m && a && a.el.isConnected)) { return 'none'; } \
+    const d = a.el.getBoundingClientRect().top - a.top; \
+    if (d) { m.scrollTop += d; } a.top = a.el.getBoundingClientRect().top; \
+    return m.scrollHeight - m.scrollTop - m.clientHeight <= 1 ? 'bottom' : 'kept';";
+
+/// A snap to the bottom for new content: the remembered element's position
+/// is forgotten first, so a layout change handled in the same render
+/// doesn't scroll back by the snap's own movement (SME-75 code review 2).
+const TRANSCRIPT_FORGET_ANCHOR: &str = "window.__smeltTranscriptAnchor = null;";
+
+/// After a layout change with the pointer over the transcript: keeps what's
+/// under the pointer in place (see `TRANSCRIPT_KEEP_ANCHOR`), or, when
+/// there was nothing under it (the messages had only just arrived), snaps
+/// to the bottom as if the pointer weren't there. Either way the pending
+/// snap is settled here or on the pointer leaving.
+async fn keep_transcript_anchor(el: MountedEvent, mut pending: Signal<bool>) {
+    let outcome = document::eval(TRANSCRIPT_KEEP_ANCHOR).await.ok();
+    match outcome.as_ref().and_then(|v| v.as_str()) {
+        Some("kept") => {}
+        Some("bottom") => pending.set(false),
+        _ => {
+            pending.set(false);
+            scroll_to_bottom(el).await;
+        }
+    }
+}
+
+/// The content effect's snap: forgets the anchor, then scrolls to the
+/// bottom (see `TRANSCRIPT_FORGET_ANCHOR`).
+async fn snap_transcript_for_content(el: MountedEvent) {
+    let _ = document::eval(TRANSCRIPT_FORGET_ANCHOR).await;
+    scroll_to_bottom(el).await;
+}
+
+/// Scrolls `el` to its bottom at once.
+async fn scroll_to_bottom(el: MountedEvent) {
+    if let Ok(size) = el.get_scroll_size().await {
+        let _ = el
+            .scroll(PixelsVector2D::new(0.0, size.height), ScrollBehavior::Instant)
+            .await;
+    }
+}
+
 /// How full the model's context window is, as a whole-number percent — the
 /// always-visible indicator's own number. `None` if `usage` hasn't arrived
 /// yet (a brand-new conversation). Clamped to 100 — a conversation caught
@@ -2933,6 +2995,18 @@ fn ChatPanel(
     // rather than the reactive-render cycle.
     let mut messages_el: Signal<Option<MountedEvent>> = use_signal(|| None);
     let mut messages_stuck_to_bottom = use_signal(|| true);
+    // Whether the pointer is over the transcript, and whether a snap to
+    // the bottom that a layout change asked for is waiting for it to
+    // leave (SME-75): a side panel appearing mustn't move what the user is
+    // about to click. While it waits, the transcript is scrolled to keep
+    // the element under the pointer where it was.
+    let mut pointer_over_transcript = use_signal(|| false);
+    let mut layout_snap_pending = use_signal(|| false);
+    // What the transcript held when the effect below last ran: the message
+    // count, the last message's id and the streaming reply's length. Only
+    // a change in it is new content; a write that changes nothing (the
+    // connect-time pull sets the messages again) is not.
+    let mut last_content: Signal<Option<(usize, Option<i64>, Option<usize>)>> = use_signal(|| None);
 
     // Same idea, per sandbox terminal — each terminal's own
     // `.task-terminal-body` scrolls independently, like `tail -f` on its own
@@ -3006,6 +3080,7 @@ fn ChatPanel(
             repo_attaching.set(false);
             repo_attach_error.set(None);
             repo_action_error.set(None);
+            layout_snap_pending.set(false);
             sandbox_pods.set(Vec::new());
             sandbox_terminals.set(Vec::new());
             terminal_body_els.write().clear();
@@ -3359,36 +3434,62 @@ fn ChatPanel(
     // the value is unchanged), so reading it reactively reran this on each
     // one and pulled a scroll that stayed within the slack back to the
     // bottom (SME-83).
-    //
-    // Also reads `sandbox_pods()`/`sandbox_terminals()`: those
-    // panels render below the transcript in `.side-panels-row`, which is
-    // conditionally present at all — it only starts rendering once one of
-    // them arrives (see the `if !sandbox_pods().is_empty()...`
-    // gate further down). That first appearance shrinks `.chat-main` (they
-    // split the column's height via flex), which happens *after* the
-    // scroll-to-bottom already ran off of `messages()`/`streaming_reply()`
-    // alone — leaving `.messages` scrolled to what used to be the bottom
-    // but, now that the container is shorter, isn't anymore. Re-running
-    // this effect on their arrival re-snaps to the new true bottom.
     use_effect(move || {
-        let _ = messages();
-        let _ = streaming_reply();
-        let _ = sandbox_pods();
-        let _ = sandbox_terminals();
+        let content = {
+            let list = messages();
+            let reply = streaming_reply();
+            (list.len(), list.last().map(|m| m.id), reply.as_ref().map(String::len))
+        };
+        let changed = *last_content.peek() != Some(content);
+        last_content.set(Some(content));
         if !*messages_stuck_to_bottom.peek() {
             return;
         }
         let Some(el) = messages_el() else { return };
-        spawn(async move {
-            if let Ok(size) = el.get_scroll_size().await {
-                let _ = el
-                    .scroll(
-                        PixelsVector2D::new(0.0, size.height),
-                        ScrollBehavior::Instant,
-                    )
-                    .await;
-            }
-        });
+        // Rerun with nothing new (an unchanged write): only a layout change
+        // can have moved the bottom, so it waits on the pointer like one.
+        if !changed && *pointer_over_transcript.peek() {
+            layout_snap_pending.set(true);
+            spawn(keep_transcript_anchor(el, layout_snap_pending));
+            return;
+        }
+        // This reaches the bottom too, so a snap waiting on the pointer
+        // has nothing left to do.
+        layout_snap_pending.set(false);
+        spawn(snap_transcript_for_content(el));
+    });
+
+    // The side panels (the sandbox, repos, todos, the browser)
+    // render below the transcript in `.side-panels-row`, and appearing or
+    // growing shrinks `.chat-main`, after the snap above already ran —
+    // leaving `.messages` scrolled to what used to be its bottom. This
+    // re-snaps to the new bottom, except while the pointer is over the
+    // transcript: there the shift would move whatever the user is about to
+    // click (SME-75), so the transcript is scrolled to keep the element
+    // under the pointer still, and the snap waits until the pointer leaves
+    // (see `onpointerleave` below). Panels beside the chat (a wide window)
+    // narrow it; panels above it (a narrow one) push its top edge down, so
+    // neither "stay put" nor "snap" alone would keep that element still.
+    // New content still follows the bottom with the pointer over it; a
+    // growing reply is expected to move.
+    use_effect(move || {
+        let _ = sandbox_pods();
+        let _ = sandbox_terminals();
+        let _ = repos();
+        let _ = todos();
+        let _ = browsing_session_open();
+        // The context bar above the transcript appears with the first usage.
+        let _ = context_usage();
+        if !*messages_stuck_to_bottom.peek() {
+            return;
+        }
+        let Some(el) = messages_el.peek().clone() else { return };
+        if *pointer_over_transcript.peek() {
+            layout_snap_pending.set(true);
+            spawn(keep_transcript_anchor(el, layout_snap_pending));
+            return;
+        }
+        spawn(scroll_to_bottom(el));
     });
 
     // Same sticky-bottom behavior, per sandbox terminal — each terminal's
@@ -3748,6 +3849,14 @@ fn ChatPanel(
                                     span { class: "context-usage-label", "No usage yet" }
                                 }
                             }
+                        } else {
+                            // The bar's space, kept until the usage arrives: it
+                            // always shows once it has, and appearing above the
+                            // transcript would push it down under the pointer
+                            // (SME-75).
+                            div { class: "context-usage-bar context-usage-bar-pending", aria_hidden: "true",
+                                span { class: "context-usage-label", "\u{a0}" }
+                            }
                         }
                         if context_detail_open() {
                             div { class: "context-detail-overlay",
@@ -3847,8 +3956,49 @@ fn ChatPanel(
                         }
                         div {
                             class: "messages",
-                            onmounted: move |evt| messages_el.set(Some(evt)),
+                            onmounted: move |evt| {
+                                messages_el.set(Some(evt));
+                                spawn(async move {
+                                    let _ = document::eval(TRANSCRIPT_ANCHOR_SETUP).await;
+                                });
+                            },
+                            onpointerenter: move |_| pointer_over_transcript.set(true),
+                            // Also on a move, in case the transcript appeared
+                            // under a pointer that was already there.
+                            onpointermove: move |_| {
+                                if !*pointer_over_transcript.peek() {
+                                    pointer_over_transcript.set(true);
+                                }
+                            },
+                            onpointerleave: move |_| {
+                                pointer_over_transcript.set(false);
+                                if *layout_snap_pending.peek() {
+                                    layout_snap_pending.set(false);
+                                    if *messages_stuck_to_bottom.peek()
+                                        && let Some(el) = messages_el.peek().clone()
+                                    {
+                                        spawn(scroll_to_bottom(el));
+                                    }
+                                }
+                            },
+                            // A scroll the user starts while a snap is pending
+                            // gives up the snap, so the scroll that follows
+                            // decides whether they're still at the bottom.
+                            onwheel: move |_| layout_snap_pending.set(false),
+                            // A press starts a scrollbar or selection drag,
+                            // or focuses text the keys then scroll.
+                            onpointerdown: move |_| layout_snap_pending.set(false),
+                            ontouchmove: move |_| layout_snap_pending.set(false),
+                            onkeydown: move |_| layout_snap_pending.set(false),
                             onscroll: move |evt: Event<ScrollData>| {
+                                // While a snap is pending, the scrolls are the
+                                // transcript keeping the text under the pointer
+                                // still, not the user leaving the bottom: the
+                                // snap still owes them the bottom (SME-75 code
+                                // review).
+                                if *layout_snap_pending.peek() {
+                                    return;
+                                }
                                 let d = evt.data();
                                 messages_stuck_to_bottom
                                     .set(
