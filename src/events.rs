@@ -36,7 +36,7 @@ impl SandboxPreview {
 /// `MessagesAppended` carries no new data of its own; it's a live-delivery
 /// notification for rows `db::create_message` already persisted. The
 /// `Sandbox*` variants are ephemeral UI telemetry, never persisted and
-/// regenerable at any time from `api::chat::get_sandbox_state` — see
+/// regenerable at any time from `api::sandbox::get_sandbox_state` — see
 /// SME-10.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
@@ -91,7 +91,7 @@ pub enum ConversationEvent {
         /// snapshot already has (SME-51 B3). `None` when there's no line.
         position: Option<i64>,
     },
-    /// Published when `api::chat::wake_conversation` (fired when a terminal
+    /// Published when a `turn::notify` wake or delivery (fired when a terminal
     /// command finishes, to notify the model with no further tool call
     /// needed) fails to actually reach the model — e.g. no model provider
     /// set up, a transient Anthropic API error. The underlying notification

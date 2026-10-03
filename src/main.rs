@@ -33,6 +33,8 @@ mod request_guard;
 #[cfg(feature = "server")]
 mod sandbox;
 #[cfg(feature = "server")]
+mod turn;
+#[cfg(feature = "server")]
 mod webfetch;
 
 #[cfg(all(test, feature = "browser-test"))]

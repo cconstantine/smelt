@@ -54,9 +54,7 @@ pub async fn decide_repo_trust(id: i64, request_id: i64, shown_hash: String, tru
         .map_err(ServerFnError::new)?;
     // In the background: each waits for its conversation's turn to end.
     for (conversation_id, notice) in notices {
-        tokio::spawn(async move {
-            crate::api::chat::deliver_notice(pool, conversation_id, notice).await;
-        });
+        crate::turn::notify(pool, conversation_id, vec![crate::turn::Notice::Deliver(notice)]);
     }
     Ok(())
 }
@@ -79,9 +77,7 @@ pub async fn attach_repo(id: i64, url: String, branch: String, dir: String) -> S
         .await
         .map_err(ServerFnError::new)?;
     for (conversation_id, notice) in notices {
-        tokio::spawn(async move {
-            crate::api::chat::deliver_notice(pool, conversation_id, notice).await;
-        });
+        crate::turn::notify(pool, conversation_id, vec![crate::turn::Notice::Deliver(notice)]);
     }
     let nothing_to_clone = pending.is_none();
     tokio::spawn(async move {
@@ -99,7 +95,7 @@ pub async fn attach_repo(id: i64, url: String, branch: String, dir: String) -> S
 #[cfg(feature = "server")]
 fn report_attach_failure(conversation_id: i64, nothing_to_clone: bool, error: &str) {
     if nothing_to_clone {
-        crate::api::chat::show_conversation_error(
+        crate::turn::show_conversation_error(
             conversation_id,
             // `error` says what failed ("Couldn't start the sandbox: …").
             format!("\"Work on a repo\" failed. {error}"),
@@ -150,7 +146,7 @@ mod tests {
         // What `finish_attach` fails with when there's nothing to clone:
         // `ensure_sandbox`'s error, which says what failed already.
         report_attach_failure(shown, true, "Couldn't start the sandbox: the sandbox didn't start");
-        let error = crate::api::chat::last_turn_error(shown).expect("the error is kept for a reload");
+        let error = crate::turn::last_turn_error(shown).expect("the error is kept for a reload");
         assert!(error.contains("the sandbox didn't start"), "got: {error}");
         assert_eq!(
             error.to_lowercase().matches("couldn't start the sandbox").count(),
@@ -166,6 +162,6 @@ mod tests {
 
         let with_clone = 9_100_000_096;
         report_attach_failure(with_clone, false, "the sandbox didn't start");
-        assert_eq!(crate::api::chat::last_turn_error(with_clone), None);
+        assert_eq!(crate::turn::last_turn_error(with_clone), None);
     }
 }

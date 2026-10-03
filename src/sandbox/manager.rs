@@ -788,12 +788,7 @@ pub async fn stop_pod_for_user(pool: &PgPool, pod_id: i64) -> Result<(), Termina
         let notice = format!(
             "The user stopped sandbox pod {pod_id}. Its terminals, and any files outside /workspace and mounted volumes, are gone. Create a new pod if you need one."
         );
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::api::chat::save_notice_between_turns(&pool, conversation_id, notice).await {
-                tracing::warn!(conversation_id, pod_id, error = %e, "couldn't save the pod stop notice");
-            }
-        });
+        crate::turn::notify(pool, conversation_id, vec![crate::turn::Notice::Save(notice)]);
     }
     Ok(())
 }

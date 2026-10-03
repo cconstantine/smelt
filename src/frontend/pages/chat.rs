@@ -11,7 +11,7 @@ use crate::anthropic::{ContentBlock, TokenUsage};
 // renders in the shared SSR body, not gated behind `web`).
 use crate::anthropic::tools::{TodoItem, TodoStatus};
 #[cfg(any(feature = "web", test))]
-use crate::api::chat::SandboxSnapshot;
+use crate::api::sandbox::SandboxSnapshot;
 use crate::api::browsing::{navigate_browser, send_browser_input};
 use crate::api::chat::{
     ContextDetailSnapshot, ContextUsageSnapshot, create_conversation,
@@ -22,9 +22,11 @@ use crate::api::chat::{
 // reaches them.
 #[cfg(feature = "web")]
 use crate::api::chat::{
-    get_context_usage, get_reply_in_progress, get_sandbox_state, get_todos,
+    get_context_usage, get_reply_in_progress, get_todos,
     get_turn_error, get_turn_state, subscribe_conversation_events,
 };
+#[cfg(feature = "web")]
+use crate::api::sandbox::get_sandbox_state;
 #[cfg(feature = "web")]
 use crate::api::browsing::{get_browsing_state, subscribe_browser_frames};
 #[cfg(feature = "web")]
@@ -35,7 +37,7 @@ use crate::browsing::BrowserInputEvent;
 // Only referenced by this module's own tests, which build their own
 // `SandboxSnapshot`s by hand rather than through `get_sandbox_state`.
 #[cfg(test)]
-use crate::api::chat::{
+use crate::api::sandbox::{
     SandboxCommandSummary, SandboxOutputLine, SandboxPodSummary, SandboxTerminalSummary,
 };
 #[cfg(feature = "web")]

@@ -1870,7 +1870,7 @@ mod server {
             let repo = cloned_repo(&pool, conversation.id).await;
             request_or_load(&pool, conversation.id, &repo, "AGENTS.md", &file("x")).await.expect("ask");
             let shown = only_repo(&pool, conversation.id).await.trust_requests.remove(0);
-            let lock = crate::api::chat::conversation_lock(conversation.id);
+            let lock = crate::turn::conversation_lock(conversation.id);
             let _running_turn = lock.lock().await;
             let decided = tokio::time::timeout(
                 std::time::Duration::from_secs(2),

@@ -569,7 +569,7 @@ pub struct TerminalLine {
     pub data: String,
     /// Global order across *both* streams for one command — a caller that
     /// fetches stdout and stderr as two separate calls (e.g. to cap each
-    /// stream's tail independently, see `api::chat::fetch_command_summary`)
+    /// stream's tail independently, see `api::sandbox::fetch_command_summary`)
     /// needs this to merge them back into the order they actually
     /// happened in, rather than showing "all stdout, then all stderr."
     pub seq: i64,

@@ -36,7 +36,7 @@ pub enum ContentBlock {
     /// output, never something Anthropic itself sends or accepts. Persisted
     /// as an ordinary new message (nothing earlier is rewritten or
     /// deleted), but replayed to Anthropic as a plain `Text` block — see
-    /// `api::chat::history_for_request` — since Anthropic has no concept of
+    /// `turn::history_for_request` — since Anthropic has no concept of
     /// this block type. See SME-18.
     CompactionSummary {
         summary: String,
@@ -44,7 +44,7 @@ pub enum ContentBlock {
     },
     /// A fixed, structural message auto-compaction inserts immediately
     /// before and after a `CompactionSummary` block (see
-    /// `api::chat::compaction_messages`) — carries no real conversational
+    /// `turn::compaction_messages`) — carries no real conversational
     /// content, just makes that synthetic exchange valid for Anthropic's
     /// own message-shape rules (`messages` must start with `user` and
     /// strictly alternate). Replayed to Anthropic as a plain `Text` block,

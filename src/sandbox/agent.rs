@@ -707,17 +707,10 @@ pub(super) async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConne
             }
             // Actively wake the model rather than leaving it to the
             // passive backlog drain (which only runs the next time
-            // something *else* triggers a turn) — see
-            // SME-13. Detached:
-            // this runs inside the per-pod WebSocket reader loop, and
-            // awaiting a full model round trip here would block it from
-            // processing any further output/exit events, this pod's or
-            // a sibling terminal's, until the turn finishes.
-            let pool = pool.clone();
-            let conversation_id = conn.conversation_id;
-            tokio::spawn(async move {
-                let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
-            });
+            // something *else* triggers a turn) — see SME-13. `notify`
+            // runs it in a task of its own: this is the per-pod WebSocket
+            // reader loop, which a model round trip mustn't hold up.
+            crate::turn::notify(pool, conn.conversation_id, vec![crate::turn::Notice::Wake]);
         }
         AgentMessage::Reply { request_id, result } => conn.resolve(request_id, result),
         AgentMessage::ProtocolError { request_id: Some(request_id), message } => conn.resolve(
