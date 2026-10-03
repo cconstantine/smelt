@@ -17,6 +17,7 @@ frontend/
       composer.rs      # Composer (the message box), EXAMPLE_ASKS
       repo_attach.rs   # RepoAttach ("Work on a repo")
       trust_card.rs    # TrustCards (AGENTS.md waiting for trust)
+      question_card.rs # QuestionCard (the model's `ask_user` question)
       model_setup.rs   # ModelNotes (turn and notification errors)
       state.rs         # the pure merges of loaded and live messages and sandbox entries
       sticky.rs        # stick-to-bottom and pointer-hold scrolling helpers
