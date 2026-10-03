@@ -1,41 +1,38 @@
 #!/usr/bin/env bash
 # Checks the cluster the tests use before they run (SME-53's retrospective),
-# so a missing or stale sandbox image is one clear message instead of every
-# real-cluster test failing with ErrImageNeverPull:
+# so a missing sandbox image is one clear message instead of every
+# real-cluster test failing with ErrImageNeverPull: the node must have the
+# image the tests will use and the Docker sidecar's, via the read-only
+# `sandbox_image_import --check`. The kubelet deletes unused images once
+# its disk is over 85% full.
 #
-# - the node still has both sandbox images (the kubelet deletes unused ones
-#   once its disk is over 85% full), via `sandbox_image_import --check`;
-# - the imported agent was built from this working tree's agent sources, as
-#   recorded by scripts/build-sandbox-image.sh. The record is per checkout;
-#   a worktree without one takes the main checkout's when the agent sources
-#   match (SME-43).
+# The image is SANDBOX_IMAGE when set (scripts/check.sh sets it), else this
+# working tree's own (`scripts/sandbox-image-ref`): named after the agent
+# sources it was built from, so whichever checkout built it, it's this
+# tree's agent (SME-102, SME-84). No record file.
 #
-# Run by scripts/check.sh before the server tests; exits non-zero with what
-# to do.
+# Run by scripts/check.sh and scripts/browser-tier before their tests;
+# exits non-zero with what to do. SANDBOX_IMAGE_IMPORT replaces the import
+# tool (scripts/test-cluster-doctor's stub).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-record=target/sandbox-image/agent-sources.sha256
+own=$(scripts/sandbox-image-ref)
+image=${SANDBOX_IMAGE:-$own}
+docker_image=${SANDBOX_DOCKER_IMAGE:-docker.io/library/docker:29-dind}
 
-cargo run -q --bin sandbox_image_import --features server -- --check
+if [ -n "${SANDBOX_IMAGE_IMPORT:-}" ]; then
+    check=("$SANDBOX_IMAGE_IMPORT")
+else
+    check=(cargo run -q --bin sandbox_image_import --features server --)
+fi
 
-current=$(scripts/agent-sources-hash)
-# A new worktree has no record of its own. The main checkout's counts when
-# it was built from the same agent sources: then it's this tree's image too.
-if [ ! -f "$record" ]; then
-    main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
-    if [ "$main" != "$PWD" ] && [ -f "$main/$record" ] && [ "$(cat "$main/$record")" = "$current" ]; then
-        mkdir -p "$(dirname "$record")"
-        cp "$main/$record" "$record"
-        echo "cluster-doctor: took $main's record of the cluster's sandbox image (same agent sources)"
+if ! "${check[@]}" --check "$image" "$docker_image"; then
+    if [ "$image" = "$own" ]; then
+        echo "cluster-doctor: the cluster has no $image (this working tree's agent sources) or no $docker_image; run scripts/build-sandbox-image.sh" >&2
+    else
+        echo "cluster-doctor: the cluster has no $image (SANDBOX_IMAGE) or no $docker_image; build that image, or unset SANDBOX_IMAGE and run scripts/build-sandbox-image.sh" >&2
     fi
-fi
-if [ ! -f "$record" ]; then
-    echo "cluster-doctor: no record of which agent the cluster's image was built from; run scripts/build-sandbox-image.sh" >&2
     exit 1
 fi
-if [ "$(cat "$record")" != "$current" ]; then
-    echo "cluster-doctor: the cluster's sandbox image was built from other agent sources than this working tree's (src/bin/sandbox_agent.rs, src/agent_protocol.rs, src/docker_net.rs or docker/sandbox/Dockerfile changed); run scripts/build-sandbox-image.sh" >&2
-    exit 1
-fi
-echo "cluster-doctor: the cluster's sandbox image matches this working tree"
+echo "cluster-doctor: the cluster has $image"
