@@ -8,8 +8,11 @@ use super::*;
 /// never across an `.await`.
 static RUNTIMES: LazyLock<Mutex<HashMap<i64, ConversationRuntime>>> = LazyLock::new(Default::default);
 
-/// A conversation's turn state. An entry is made on first use and removed
-/// once every part of it is idle.
+/// A conversation's turn state. An entry is made on first use. Its lock,
+/// stop counter and reply are freed when idle (`release_idle_turn_state`);
+/// the entry itself goes only when nothing in it is in use, which, once a
+/// turn has run (its generation), is when the conversation is deleted: a
+/// few bytes per conversation, as the separate kept-error map was.
 #[derive(Default)]
 pub(super) struct ConversationRuntime {
     /// The turn lock. A live `send_message` call and a notice's `run_turn`
