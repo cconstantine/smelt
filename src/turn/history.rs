@@ -138,8 +138,6 @@ pub(super) fn answer_unfinished_tool_calls(
     history
 }
 
-/// The error result a tool call gets when its turn ended before it
-/// finished (the user stopped the turn, or the server restarted).
 /// Moves a result for one of `calls` (the tool calls in `history[i]`) that
 /// sits in a later user message of the same run (before the next assistant
 /// message) to the front of `history[i + 1]`, and drops a message the move
@@ -173,6 +171,8 @@ fn move_late_results(history: &mut Vec<anthropic::AnthropicMessage>, i: usize, c
     }
 }
 
+/// The error result a tool call gets when its turn ended before it
+/// finished (the user stopped the turn, or the server restarted).
 #[cfg(feature = "server")]
 pub(super) const UNFINISHED_TOOL_CALL: &str = "This tool call didn't finish: the turn was stopped (by the user, or by a server restart) before it returned. Its effects, if any, are unknown.";
 
