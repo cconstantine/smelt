@@ -597,12 +597,12 @@ const COMPACTION_SYSTEM_PROMPT: &str = "You are compacting an AI coding agent's 
 conversation history to free up context window space. Write a concise summary \
 of the conversation so far: the user's original goal, key decisions made, the \
 current state of any files or code changed, and any unresolved next steps. You \
-MUST explicitly mention, by its exact id, every sandbox pod, terminal, and \
-background task listed below as currently live — never omit or paraphrase an \
+MUST explicitly mention, by its exact id, every sandbox pod and terminal \
+listed below as currently live — never omit or paraphrase an \
 id, since later tool calls still need a working reference to it. Write the \
 summary as plain prose.";
 
-/// A plain-text listing of every currently-live pod/terminal/task for
+/// A plain-text listing of every currently-live pod/terminal for
 /// `conversation_id`, handed to the summarization call so it can be told
 /// directly what must survive — see `COMPACTION_SYSTEM_PROMPT` and
 /// SME-18's "Interaction with live/
@@ -863,8 +863,8 @@ pub(crate) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: St
     }
 }
 
-/// A live `send_message` call and a background task's push-triggered
-/// `run_turn` call (or two different tasks' pushes) can race for the same
+/// A live `send_message` call and a notice's `run_turn` call (a finished
+/// command waking the model, say, or two notices at once) can race for the same
 /// conversation — Anthropic's strict user/assistant alternation breaks if
 /// two writers persist a turn at once. Keyed by conversation id; which
 /// caller acquires a given conversation's lock first when several are ready
@@ -1113,7 +1113,7 @@ pub(crate) fn stop_turn_now(conversation_id: i64) {
 }
 
 /// Conversations the user has stopped and not written in since. While
-/// paused, a finished command or background task doesn't wake the model:
+/// paused, a finished command or another notice doesn't wake the model:
 /// its notice is still saved, and the model sees it on the user's next
 /// message. Otherwise a stop would be undone seconds later by whatever was
 /// still running. In memory: a restart un-pauses, which is harmless.
@@ -1254,7 +1254,7 @@ fn run_turn_bounded<'a>(
         }
         // Stopped before this turn saved its own message: it was queued
         // behind the turn the user stopped. Keep the message anyway (a
-        // background task's notice, say), without running a turn for it;
+        // finished command's notice, say), without running a turn for it;
         // the conversation is paused, so the model sees it next time the
         // user writes (SME-40 F4).
         let lock = conversation_lock(conversation_id);

@@ -996,10 +996,7 @@ mod context_usage_tests {
 
 /// Renders one content block, keyed by `{message_id}-{index}` for the
 /// enclosing `for` loop. `Text` renders as an ordinary chat bubble, same as
-/// always (including synthetic pushed `<task-output>`/`<task-notification>`
-/// -tagged messages a background task writes — still indistinguishable from
-/// something a human typed at this stage, flagged as a known gap in the
-/// SME-8's retrospective, not solved here). `ToolUse`/
+/// always. `ToolUse`/
 /// `ToolResult` render as their own centered cards, distinct from both the
 /// Whether an assistant message is thinking and nothing else: no text,
 /// no tool call. A model sometimes puts its whole answer in its thinking;
@@ -1042,7 +1039,7 @@ fn format_elapsed(seconds: u64) -> String {
 }
 
 /// A notice smelt saved into the conversation for the model (a command
-/// finishing, the sandbox stopping, a background task finishing), as the
+/// finishing, the sandbox stopping), as the
 /// short sentence the chat shows in place of a user bubble, without
 /// internal ids. `None` for anything the user actually wrote. They used
 /// to look like the user talking (SME-41 D3). `commands` maps a terminal
@@ -1108,11 +1105,11 @@ fn terminal_commands_by_id(messages: &[Message]) -> HashMap<String, String> {
         .collect()
 }
 
-/// A message's text as shown in the chat. A background task's notices
-/// are saved in a tagged form the model reads
+/// A message's text as shown in the chat. The removed background-task
+/// suite (SME-54) saved its notices in a tagged form the model reads
 /// (`<task-notification task_id=".." tool="count">finished: ..</task-notification>`);
-/// shown raw, that's markup (SME-40 F13), so they read as a sentence
-/// instead. Everything else is shown as written.
+/// shown raw, that's markup (SME-40 F13), so old conversations' notices
+/// still read as a sentence. Everything else is shown as written.
 fn display_text(text: &str) -> String {
     task_notice_sentence(text).unwrap_or_else(|| text.to_string())
 }

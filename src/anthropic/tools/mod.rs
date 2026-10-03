@@ -217,7 +217,6 @@ mod server {
         definitions
     }
 
-    /// Validates `input` against a JSON Schema `schema`, generically for
     pub(super) fn required_str(input: &Value, field: &str) -> Result<String, String> {
         input
             .get(field)
