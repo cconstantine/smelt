@@ -363,8 +363,10 @@ fn next_binding(binding: Binding, request: &CreateMessageRequest, body: &str) ->
         Binding::AsIs if is_binding_mismatch(body) && request.thinking.is_some() => Some(Binding::DropBlock),
         Binding::AsIs if is_binding_mismatch(body) => Some(Binding::Strip),
         // A server that doesn't know the controls beta refuses the field
-        // itself ("Extra inputs are not permitted") in its own words.
-        Binding::DropBlock => Some(Binding::Strip),
+        // itself ("block_binding: Extra inputs are not permitted"). Any
+        // other 400 isn't about the replayed thinking, and stripping it
+        // would only hide the real error.
+        Binding::DropBlock if is_binding_mismatch(body) || body.contains("block_binding") => Some(Binding::Strip),
         _ => None,
     }
 }
@@ -1186,6 +1188,23 @@ mod tests {
             assert_eq!(retry.thinking_blocks(), 0);
             assert!(!retry.has_binding_beta() && retry.drop_block().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn test_an_unrelated_400_under_drop_block_is_not_retried() {
+        let too_long = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1200000 tokens > 1000000 maximum"}}"#;
+        let (endpoint, record) =
+            recording_upstream(vec![(400, BINDING_BODY), (200, OK_BODY), (400, too_long), (200, OK_BODY)]).await;
+        let request = request_replaying_thinking(Some(super::super::types::ThinkingConfig::Adaptive));
+        stream_anthropic_message(&endpoint, &request, |_| {}).await.expect("learns drop_block");
+        let error = stream_anthropic_message(&endpoint, &request, |_| {})
+            .await
+            .expect_err("an unrelated 400 is returned");
+        assert!(error.contains("prompt is too long"), "the real cause is shown: {error}");
+        assert_eq!(requests_seen(&record).len(), 3, "not retried stripped");
+        stream_anthropic_message(&endpoint, &request, |_| {}).await.expect("next turn");
+        let seen = requests_seen(&record);
+        assert_eq!(seen[3].drop_block(), Some("drop_block"), "the provider still gets drop_block");
     }
 
     #[tokio::test]
