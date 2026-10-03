@@ -751,6 +751,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "oauth_headers", 30, Box::pin(scenario_oauth_headers(&t))).await;
     run_scenario(&t, only, r, k, "stale_bundle", 60, Box::pin(scenario_stale_bundle(&t))).await;
     run_scenario(&t, only, r, k, "transcript_scroll", 60, Box::pin(scenario_transcript_scroll(&t))).await;
+    run_scenario(&t, only, r, k, "context_from_the_keyboard", 60, Box::pin(scenario_context_from_the_keyboard(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -2363,6 +2364,150 @@ async fn scenario_transcript_scroll(t: &Scenario<'_>) {
         (8.0..=12.0).contains(&distance),
         "a 10px scroll up should stay where it was put, but the transcript is {distance}px from its bottom"
     );
+}
+
+/// SME-82: the context bar and its detail view work from the
+/// keyboard. The bar was a clickable div (no focus), the view had no dialog
+/// role and ignored Escape, and its "×" had no name.
+async fn scenario_context_from_the_keyboard(t: &Scenario<'_>) {
+    let keyboard_conversation = t.conversation().await;
+    db::create_message(
+        t.pool,
+        keyboard_conversation.id,
+        "user",
+        &[anthropic::ContentBlock::Text { text: "hello".to_string() }],
+    )
+    .await
+    .expect("seed a message");
+    db::upsert_conversation_usage(
+        t.pool,
+        keyboard_conversation.id,
+        &anthropic::TokenUsage {
+            input_tokens: 40_000,
+            output_tokens: 10_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+    )
+    .await
+    .expect("seed usage");
+    let keyboard_page = t.tab(t.url(&format!("conversation/{}", keyboard_conversation.id))).await;
+    assert!(
+        wait_for_text(&keyboard_page, "25% of context", Duration::from_secs(10)).await,
+        "the context bar should show"
+    );
+    wait_for_live_client(&keyboard_page, keyboard_conversation.id).await;
+    let focused_is = |selector: &str| format!("document.activeElement === document.querySelector({selector:?})");
+    let bar = wait_for_element(&keyboard_page, ".context-usage-bar", Duration::from_secs(5)).await;
+    bar.focus().await.expect("focus the context bar");
+    let bar_focused: bool = keyboard_page
+        .evaluate(focused_is(".context-usage-bar"))
+        .await
+        .expect("read the focus")
+        .into_value()
+        .expect("a bool");
+    assert!(bar_focused, "the context bar should take keyboard focus");
+    bar.press_key("Enter").await.expect("press Enter on the bar");
+    assert!(
+        wait_for_count(&keyboard_page, ".context-detail-overlay [role=dialog]", 1, Duration::from_secs(5)).await,
+        "Enter on the bar should open the detail view as a dialog"
+    );
+    // Focus moves in a task the page spawns, so wait for it.
+    assert!(
+        wait_for_focus(&keyboard_page, ".context-detail-close", Duration::from_secs(5)).await,
+        "opening the detail view should focus its close button"
+    );
+    let close_name: String = keyboard_page
+        .evaluate("document.querySelector('.context-detail-close').getAttribute('aria-label') || ''")
+        .await
+        .expect("read the close button")
+        .into_value()
+        .expect("a string");
+    assert_eq!(close_name, "Close", "the close button should be named Close");
+    let close = wait_for_element(&keyboard_page, ".context-detail-close", Duration::from_secs(5)).await;
+    close.press_key("Escape").await.expect("press Escape");
+    assert!(
+        wait_for_count(&keyboard_page, ".context-detail-overlay", 0, Duration::from_secs(5)).await,
+        "Escape should close the detail view"
+    );
+    assert!(
+        wait_for_focus(&keyboard_page, ".context-usage-bar", Duration::from_secs(5)).await,
+        "closing the detail view should put focus back on the bar"
+    );
+
+    // Escape still closes the view after a click on its own text, which
+    // moved focus to the page body, outside the view's key handler
+    // (SME-82 code review).
+    bar.press_key("Enter").await.expect("press Enter on the bar");
+    assert!(
+        wait_for_text(&keyboard_page, "Tools (", Duration::from_secs(10)).await,
+        "the detail view should load"
+    );
+    click_when_present(&keyboard_page, ".context-detail-panel h3", Duration::from_secs(5)).await;
+    bar.press_key("Escape").await.expect("press Escape");
+    assert!(
+        wait_for_count(&keyboard_page, ".context-detail-overlay", 0, Duration::from_secs(3)).await,
+        "Escape should close the detail view after a click on its text"
+    );
+    // Enter goes to whatever has focus, and focus returns to the bar in
+    // a task the page spawns.
+    assert!(
+        wait_for_focus(&keyboard_page, ".context-usage-bar", Duration::from_secs(5)).await,
+        "closing the detail view should put focus back on the bar"
+    );
+
+    // Tab doesn't walk out of a view that says it's modal (SME-82 code
+    // review).
+    bar.press_key("Enter").await.expect("press Enter on the bar");
+    assert!(
+        wait_for_focus(&keyboard_page, ".context-detail-close", Duration::from_secs(5)).await,
+        "opening the detail view again should focus its close button"
+    );
+    let mut tabbed_out = None;
+    for step in 1..=20 {
+        bar.press_key("Tab").await.expect("press Tab");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let inside: bool = keyboard_page
+            .evaluate("(() => { const o = document.querySelector('.context-detail-overlay'); return !!o && o.contains(document.activeElement); })()")
+            .await
+            .expect("read the focus")
+            .into_value()
+            .expect("a bool");
+        if !inside {
+            let on: String = keyboard_page
+                .evaluate("(document.activeElement && (document.activeElement.className || document.activeElement.tagName)) || 'nothing'")
+                .await
+                .expect("read the focus")
+                .into_value()
+                .unwrap_or_default();
+            tabbed_out = Some(format!("Tab {step} moved focus to {on}"));
+            break;
+        }
+    }
+    assert!(tabbed_out.is_none(), "Tab should stay in the detail view: {}", tabbed_out.unwrap_or_default());
+}
+
+/// Waits up to `timeout` for `selector`'s element to have focus. Focus
+/// moves the page makes in a spawned task land a moment after the change
+/// that asked for them.
+async fn wait_for_focus(page: &chromiumoxide::Page, selector: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let probe = format!("document.activeElement === document.querySelector({selector:?})");
+    loop {
+        let focused: bool = page
+            .evaluate(probe.as_str())
+            .await
+            .ok()
+            .and_then(|value| value.into_value().ok())
+            .unwrap_or(false);
+        if focused {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// How far `.messages` is scrolled from its bottom, in pixels.

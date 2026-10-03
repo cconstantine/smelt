@@ -2018,12 +2018,21 @@ div.mcp-status-not-connected::before {
     display: flex;
     align-items: center;
     gap: 10px;
+    width: 100%;
     padding: 8px 24px;
+    border: none;
     border-bottom: 1px solid var(--border);
     background: var(--surface);
     cursor: pointer;
+    font: inherit;
     font-size: 12px;
+    text-align: left;
     color: var(--text-2);
+}
+
+.context-usage-bar:focus-visible {
+    outline: 2px solid var(--ink);
+    outline-offset: -2px;
 }
 
 .context-usage-bar:hover {
@@ -2068,6 +2077,14 @@ div.mcp-status-not-connected::before {
     background: var(--surface);
     border-radius: 12px;
     padding: 24px;
+}
+
+/* Zero-size stops at the context view's edges that wrap Tab around. */
+.focus-sentinel {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
 }
 
 .context-detail-close {

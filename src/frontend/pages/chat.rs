@@ -879,6 +879,13 @@ fn is_scrolled_to_bottom(scroll_top: f64, scroll_height: f64, client_height: f64
     scroll_height - scroll_top - client_height <= SCROLL_BOTTOM_SLACK_PX
 }
 
+/// Focus the context view's first and last controls, for the sentinels
+/// that keep Tab inside it.
+const FOCUS_FIRST_IN_CONTEXT_DETAIL: &str = "document.querySelector('.context-detail-close')?.focus();";
+const FOCUS_LAST_IN_CONTEXT_DETAIL: &str = "const p = document.querySelector('.context-detail-panel'); \
+     if (p) { const f = p.querySelectorAll('button, summary, a[href], input, select, textarea, [tabindex=\"0\"]'); \
+     (f[f.length - 1] || p).focus(); }";
+
 /// How full the model's context window is, as a whole-number percent — the
 /// always-visible indicator's own number. `None` if `usage` hasn't arrived
 /// yet (a brand-new conversation). Clamped to 100 — a conversation caught
@@ -3188,6 +3195,8 @@ fn ChatPanel(
     // (not kept live) the moment it's opened — see `open_context_detail`.
     let mut context_detail: Signal<Option<ContextDetailSnapshot>> = use_signal(|| None);
     let mut context_detail_open = use_signal(|| false);
+    // The context bar, so closing its detail view can give it focus back.
+    let mut context_bar_el: Signal<Option<MountedEvent>> = use_signal(|| None);
 
     // Sticky-bottom auto-scroll state for the message transcript: the
     // mounted `.messages` element (so an effect can query/set its scroll
@@ -3565,6 +3574,17 @@ fn ChatPanel(
             frame_task.set(Some(handle));
         });
     }
+
+    // Closes the detail view from inside it (its ×, Escape, a click
+    // outside) and puts focus back on the bar that opened it.
+    let mut close_context_detail = move || {
+        context_detail_open.set(false);
+        if let Some(bar) = context_bar_el.peek().clone() {
+            spawn(async move {
+                let _ = bar.set_focus(true).await;
+            });
+        }
+    };
 
     // Fetches a fresh detail snapshot every time it's opened, rather than
     // caching — matches the idea's "most recently sent request" decision;
@@ -4089,8 +4109,10 @@ fn ChatPanel(
                     }
                     div { class: "chat-main",
                         if let Some(snapshot) = context_usage() {
-                            div {
+                            button {
+                                r#type: "button",
                                 class: "context-usage-bar",
+                                onmounted: move |evt| context_bar_el.set(Some(evt)),
                                 onclick: move |_| open_context_detail(),
                                 if let Some(percent) = context_usage_percent(&snapshot) {
                                     div { class: "context-usage-track",
@@ -4107,13 +4129,42 @@ fn ChatPanel(
                         }
                         if context_detail_open() {
                             div { class: "context-detail-overlay",
-                                onclick: move |_| context_detail_open.set(false),
+                                onclick: move |_| close_context_detail(),
+                                onkeydown: move |e: Event<KeyboardData>| {
+                                    if e.data().key() == keyboard_types::Key::Escape {
+                                        close_context_detail();
+                                    }
+                                },
+                                // The view is modal, so Tab cycles inside it:
+                                // focus reaching either sentinel wraps around
+                                // to the view's other end.
+                                div {
+                                    class: "focus-sentinel",
+                                    tabindex: "0",
+                                    onfocus: move |_| {
+                                        spawn(async move {
+                                            let _ = document::eval(FOCUS_LAST_IN_CONTEXT_DETAIL).await;
+                                        });
+                                    },
+                                }
                                 div {
                                     class: "context-detail-panel",
+                                    role: "dialog",
+                                    aria_modal: "true",
+                                    aria_label: "Context",
+                                    // Focusable (not in the tab order), so a
+                                    // click on the view's text keeps focus in
+                                    // it and Escape still reaches the overlay.
+                                    tabindex: "-1",
                                     onclick: move |evt| evt.stop_propagation(),
                                     button {
+                                        r#type: "button",
                                         class: "context-detail-close",
-                                        onclick: move |_| context_detail_open.set(false),
+                                        aria_label: "Close",
+                                        onmounted: move |evt: MountedEvent| async move {
+                                            let _ = evt.set_focus(true).await;
+                                        },
+                                        onclick: move |_| close_context_detail(),
                                         "×"
                                     }
                                     match context_detail() {
@@ -4160,6 +4211,15 @@ fn ChatPanel(
                                             }
                                         },
                                     }
+                                }
+                                div {
+                                    class: "focus-sentinel",
+                                    tabindex: "0",
+                                    onfocus: move |_| {
+                                        spawn(async move {
+                                            let _ = document::eval(FOCUS_FIRST_IN_CONTEXT_DETAIL).await;
+                                        });
+                                    },
                                 }
                             }
                         }
