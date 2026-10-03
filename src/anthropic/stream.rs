@@ -343,6 +343,12 @@ fn binding_for(endpoint: &Endpoint, request: &CreateMessageRequest) -> Binding {
     }
 }
 
+fn forget_binding(endpoint: &Endpoint) {
+    if let Ok(mut known) = RECOVERY.lock() {
+        known.remove(&provider_key(endpoint));
+    }
+}
+
 fn remember_binding(endpoint: &Endpoint, binding: Binding) {
     if let Ok(mut known) = RECOVERY.lock() {
         known.insert(provider_key(endpoint), binding);
@@ -357,17 +363,23 @@ fn is_binding_mismatch(body: &str) -> bool {
 }
 
 /// The next form to try after `binding` was refused with a 400 whose body
-/// is `body`, or `None` when another try won't help. Each step is tried
-/// once: as built, then drop-block (with thinking on), then stripped.
-fn next_binding(binding: Binding, request: &CreateMessageRequest, body: &str) -> Option<Binding> {
+/// is `body`, or `None` when another try won't help. `tried` lists the
+/// forms already sent for this request; each is sent at most once.
+fn next_binding(binding: Binding, tried: &[Binding], request: &CreateMessageRequest, body: &str) -> Option<Binding> {
+    let untried = |b: Binding| (!tried.contains(&b)).then_some(b);
     match binding {
-        Binding::AsIs if is_binding_mismatch(body) && request.thinking.is_some() => Some(Binding::DropBlock),
-        Binding::AsIs if is_binding_mismatch(body) => Some(Binding::Strip),
-        // A server that doesn't know the controls beta refuses the field
-        // itself ("block_binding: Extra inputs are not permitted"). Any
-        // other 400 isn't about the replayed thinking, and stripping it
-        // would only hide the real error.
-        Binding::DropBlock if is_binding_mismatch(body) || body.contains("block_binding") => Some(Binding::Strip),
+        Binding::AsIs if is_binding_mismatch(body) && request.thinking.is_some() => {
+            untried(Binding::DropBlock).or_else(|| untried(Binding::Strip))
+        }
+        Binding::AsIs if is_binding_mismatch(body) => untried(Binding::Strip),
+        // A route that doesn't know the controls beta refuses the field
+        // itself ("block_binding: Extra inputs are not permitted"); one that
+        // doesn't run the check may take the request as built. Any other
+        // 400 isn't about the replayed thinking, and retrying would only
+        // hide the real error.
+        Binding::DropBlock if is_binding_mismatch(body) || body.contains("block_binding") => {
+            untried(Binding::AsIs).or_else(|| untried(Binding::Strip))
+        }
         _ => None,
     }
 }
@@ -483,6 +495,7 @@ pub async fn stream_anthropic_message(
     // shown to the viewer yet, so a retry is invisible to them.
     let mut attempt = 0;
     let mut binding = binding_for(endpoint, request);
+    let mut tried = vec![binding];
     let response = loop {
         let response = send_and_await_response(endpoint, request, binding, RESPONSE_TIMEOUT).await?;
         let status = response.status();
@@ -505,8 +518,12 @@ pub async fn stream_anthropic_message(
         }
         let body = response.text().await.unwrap_or_default();
         if status == reqwest::StatusCode::BAD_REQUEST
-            && let Some(next) = next_binding(binding, request, &body)
+            && let Some(next) = next_binding(binding, &tried, request, &body)
         {
+            if binding == Binding::DropBlock {
+                forget_binding(endpoint);
+            }
+            tried.push(next);
             tracing::warn!(
                 from = ?binding,
                 to = ?next,
@@ -1207,6 +1224,27 @@ mod tests {
         assert_eq!(seen[2].thinking_blocks(), 1, "a thinking-on request goes out as built first");
         assert!(!seen[2].has_binding_beta());
         assert_eq!(seen[3].drop_block(), Some("drop_block"), "and is retried with drop_block, not stripped");
+    }
+
+    #[tokio::test]
+    async fn test_a_remembered_drop_block_that_is_refused_tries_as_built_first() {
+        let (endpoint, record) = recording_upstream(vec![
+            (400, BINDING_BODY),
+            (200, OK_BODY),
+            (400, EXTRA_INPUTS_BODY),
+            (200, OK_BODY),
+        ])
+        .await;
+        let request = request_replaying_thinking(Some(super::super::types::ThinkingConfig::Adaptive));
+        stream_anthropic_message(&endpoint, &request, |_| {}).await.expect("learns drop_block");
+        stream_anthropic_message(&endpoint, &request, |_| {})
+            .await
+            .expect("a route that refuses the field but not the history works as built");
+        let seen = requests_seen(&record);
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[2].drop_block(), Some("drop_block"), "the remembered form goes first");
+        assert_eq!(seen[3].thinking_blocks(), 1, "then the request as built, not stripped");
+        assert!(!seen[3].has_binding_beta() && seen[3].drop_block().is_none());
     }
 
     #[tokio::test]
