@@ -4053,4 +4053,59 @@ mod tests {
         );
         assert_eq!(list_provider_models(&pool, provider.id).await.expect("list"), vec![row]);
     }
+
+    /// SME-99: the browser tier's ids start clear of every other run's,
+    /// for each table whose ids name cluster objects.
+    #[sqlx::test]
+    async fn test_ids_start_clear_of_other_runs(pool: PgPool) {
+        let base = test_support::start_ids_clear_of_other_runs(&pool).await.expect("move the id sequences");
+        assert!(base >= 2_000_000_000, "base {base} is in the range other runs use");
+
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let pod = create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+        let volume = create_sandbox_volume(&pool, "sme-99-volume", "/data").await.expect("volume row");
+        for (what, id) in [("conversation", conversation.id), ("sandbox pod", pod.id), ("sandbox volume", volume.id)] {
+            assert!(id > base, "the next {what} id is {id}, not above the base {base}");
+        }
+
+        let again = test_support::start_ids_clear_of_other_runs(&pool).await.expect("move them again");
+        assert_ne!(again, base, "two runs got the same base");
+    }
+}
+
+/// Database helpers for tests.
+#[cfg(all(test, feature = "server"))]
+pub(crate) mod test_support {
+    use sqlx::PgPool;
+
+    /// Where `start_ids_clear_of_other_runs` puts the id sequences: far
+    /// above the low ids every fresh `#[sqlx::test]` database starts at,
+    /// and above the 1,000,000+ range some unit tests move their own pod
+    /// ids to.
+    const CLEAR_IDS_BASE: i64 = 2_000_000_000;
+
+    /// Moves the conversation, sandbox pod and sandbox volume id
+    /// sequences to a base of their own, different on every call, and
+    /// returns it. Cluster objects are named after these ids (pod labels
+    /// and claims after the conversation, `sandbox-{id}` pods, volume
+    /// claims), and the browser tier shares its namespace with the
+    /// real-cluster unit tests, whose databases also count from 1: a run
+    /// that met a pod an earlier run was still stopping waited it out
+    /// and failed (SME-99).
+    pub(crate) async fn start_ids_clear_of_other_runs(pool: &PgPool) -> Result<i64, sqlx::Error> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        // Nanoseconds since the epoch, folded into a billion-wide window
+        // above the base: a fresh base every call, and still far inside
+        // BIGINT and anything a name or a browser's number can hold.
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
+        let base = CLEAR_IDS_BASE + i64::try_from(nanos % 1_000_000_000).unwrap_or_default();
+        for table in ["conversations", "sandbox_pods", "sandbox_volumes"] {
+            sqlx::query("SELECT setval(pg_get_serial_sequence($1, 'id'), $2)")
+                .bind(table)
+                .bind(base)
+                .execute(pool)
+                .await?;
+        }
+        Ok(base)
+    }
 }
