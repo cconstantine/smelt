@@ -1211,6 +1211,26 @@ fn task_notice_sentence(text: &str) -> Option<String> {
     None
 }
 
+/// How an `ask_user` call shows in the transcript (SME-34).
+#[derive(Debug, PartialEq)]
+enum QuestionCall {
+    /// No result yet: the card below the transcript asks it.
+    Waiting,
+    /// The answer lines the model got.
+    Answered(Vec<String>),
+    /// Refused (bad input, a second call in one reply): shown as the
+    /// ordinary failed tool row, with its error.
+    Refused,
+}
+
+fn question_call(result: Option<&(String, bool)>) -> QuestionCall {
+    match result {
+        None => QuestionCall::Waiting,
+        Some((_, true)) => QuestionCall::Refused,
+        Some((content, false)) => QuestionCall::Answered(answered_lines(content)),
+    }
+}
+
 /// The answer lines of an `ask_user` result, as the model got them:
 /// "1. Delete: Yes", or what it was told when the user wrote instead.
 fn answered_lines(result: &str) -> Vec<String> {
@@ -1311,32 +1331,35 @@ fn render_block_element(
         // The model's question (SME-34): while it waits, the card below
         // the transcript asks it; once answered, a compact row with each
         // question and the answer the model got.
-        ContentBlock::ToolUse { id, name, input } if name == ASK_USER => match tool_results.get(id) {
-            Some((result, _)) => {
-                let questions: Vec<String> = input
-                    .get("questions")
-                    .and_then(|q| q.as_array())
-                    .map(|qs| qs.iter().filter_map(|q| q.get("question").and_then(|t| t.as_str()).map(str::to_string)).collect())
-                    .unwrap_or_default();
-                let answer = answered_lines(result);
-                rsx! {
-                    div { key: "{key}", class: "question-answered",
-                        div { class: "question-answered-header",
-                            span { class: "question-answered-icon", "?" }
-                            span { "Asked" }
-                            span { class: "timestamp", "{timestamp}" }
-                        }
-                        for (i , question) in questions.iter().enumerate() {
-                            p { key: "q{i}", class: "question-answered-question", "{question}" }
-                        }
-                        for (i , line) in answer.iter().enumerate() {
-                            p { key: "a{i}", class: "question-answered-answer", "{line}" }
+        ContentBlock::ToolUse { id, name, input }
+            if name == ASK_USER && question_call(tool_results.get(id)) != QuestionCall::Refused =>
+        {
+            match question_call(tool_results.get(id)) {
+                QuestionCall::Answered(answer) => {
+                    let questions: Vec<String> = input
+                        .get("questions")
+                        .and_then(|q| q.as_array())
+                        .map(|qs| qs.iter().filter_map(|q| q.get("question").and_then(|t| t.as_str()).map(str::to_string)).collect())
+                        .unwrap_or_default();
+                    rsx! {
+                        div { key: "{key}", class: "question-answered",
+                            div { class: "question-answered-header",
+                                span { class: "question-answered-icon", "?" }
+                                span { "Asked" }
+                                span { class: "timestamp", "{timestamp}" }
+                            }
+                            for (i , question) in questions.iter().enumerate() {
+                                p { key: "q{i}", class: "question-answered-question", "{question}" }
+                            }
+                            for (i , line) in answer.iter().enumerate() {
+                                p { key: "a{i}", class: "question-answered-answer", "{line}" }
+                            }
                         }
                     }
                 }
+                QuestionCall::Waiting | QuestionCall::Refused => rsx! {},
             }
-            None => rsx! {},
-        },
+        }
         // One compact line per call, saying what it did, with its result
         // folded in: the raw input and result are one click away, and a
         // failed call starts open (SME-41 D2).
@@ -1722,6 +1745,22 @@ mod tests {
         accept_saved_messages(&mut existing, vec![saved]);
         let ids: Vec<i64> = existing.iter().map(|m| m.id).collect();
         assert_eq!(ids, vec![9], "the copy is replaced, not shown twice");
+    }
+
+    /// Code review 1 (SME-34): a refused `ask_user` call shows its error
+    /// as a failed tool row, not as "you wrote a message instead".
+    #[test]
+    fn test_question_call_tells_waiting_answered_and_refused_apart() {
+        assert_eq!(question_call(None), QuestionCall::Waiting);
+        let answered = ("The user answered:\n1. Delete: No".to_string(), false);
+        assert_eq!(question_call(Some(&answered)), QuestionCall::Answered(vec!["1. Delete: No".to_string()]));
+        let dismissed = ("The user didn't answer these questions. Their message follows.".to_string(), false);
+        assert_eq!(
+            question_call(Some(&dismissed)),
+            QuestionCall::Answered(vec!["Not answered: you wrote a message instead.".to_string()])
+        );
+        let refused = ("ask 1 to 4 questions in one call (got 0)".to_string(), true);
+        assert_eq!(question_call(Some(&refused)), QuestionCall::Refused);
     }
 
     #[test]
