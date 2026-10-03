@@ -752,6 +752,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "stale_bundle", 60, Box::pin(scenario_stale_bundle(&t))).await;
     run_scenario(&t, only, r, k, "transcript_scroll", 60, Box::pin(scenario_transcript_scroll(&t))).await;
     run_scenario(&t, only, r, k, "context_from_the_keyboard", 60, Box::pin(scenario_context_from_the_keyboard(&t))).await;
+    run_scenario(&t, only, r, k, "error_text", 60, Box::pin(scenario_error_text(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -2524,6 +2525,151 @@ static MOCK_PROVIDER: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
 
 /// The model `MOCK_PROVIDER` serves (any name does: the mock ignores it).
 const MOCK_MODEL: &str = "mock-model";
+
+/// Makes the page's next DELETE request fail as a server error would;
+/// every other request goes through.
+const FAIL_NEXT_DELETE: &str = "(() => { const real = window.fetch; let armed = true; \
+     window.fetch = function (input, init) { \
+       const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase(); \
+       if (armed && method === 'DELETE') { armed = false; return Promise.resolve(new Response('refused by the browser tier', { status: 500 })); } \
+       return real.apply(this, arguments); }; })()";
+
+/// Scenario 30 (SME-81): an error says what went wrong, not dioxus's
+/// "error running server function: … (details: None)" wrapper, and the
+/// sidebar's error goes once a later sidebar action succeeds.
+async fn scenario_error_text(t: &Scenario<'_>) {
+    // Through the list, whose own fetch shows the page is hydrated: typed
+    // into the server-rendered form before that, the text never reaches
+    // the form's state.
+    let volume_page = t.tab(t.url("sandbox-volumes")).await;
+    wait_for_resource(&volume_page, "/api/sandbox-volumes").await;
+    click_when_present(&volume_page, ".sandbox-volumes-new-link", Duration::from_secs(5)).await;
+    let name_field = wait_for_element(&volume_page, "#sandbox-volume-new-name", Duration::from_secs(10)).await;
+    name_field.focus().await.expect("focus the volume name");
+    name_field.type_str("scenario-30-root").await.expect("type the volume name");
+    let path_field = wait_for_element(&volume_page, "#sandbox-volume-new-mount-path", Duration::from_secs(5)).await;
+    path_field.focus().await.expect("focus the mount path");
+    path_field.type_str("/").await.expect("type the mount path");
+    click_when_present(&volume_page, ".sandbox-volume-add-form button[type=submit]", Duration::from_secs(5)).await;
+    assert!(
+        wait_for_text(&volume_page, "can't be mounted over the root directory", Duration::from_secs(10)).await,
+        "the volume form should say why `/` was refused"
+    );
+    let shown: String = volume_page
+        .evaluate("document.querySelector('.sandbox-volume-add-form .error').innerText")
+        .await
+        .expect("read the error")
+        .into_value()
+        .expect("text");
+    assert!(
+        !shown.contains("error running server function") && !shown.contains("details:"),
+        "the error should be the server's message alone: {shown:?}"
+    );
+
+    // Two conversations to delete from the sidebar: the first delete fails,
+    // the second succeeds. A success that navigates (New conversation)
+    // remounts the sidebar and hides the bug; deleting a row that isn't
+    // open stays on the page.
+    let refused = t.conversation().await;
+    let deleted = t.conversation().await;
+    let watched = t.conversation().await;
+    let sidebar = t.tab(t.url(&format!("conversation/{}", watched.id))).await;
+    wait_for_live_client(&sidebar, watched.id).await;
+    let delete_button = |id: i64| format!(".conversation-item[data-conversation-id='{id}'] .delete-conversation");
+    wait_for_stable(&sidebar, &delete_button(refused.id), tokio::time::Instant::now() + Duration::from_secs(10)).await;
+    // The next DELETE (the first conversation delete) fails as a server
+    // error would; everything else goes through.
+    sidebar.evaluate(FAIL_NEXT_DELETE).await.expect("make the next DELETE fail");
+    click_when_present(&sidebar, &delete_button(refused.id), Duration::from_secs(5)).await;
+    click_when_present(&sidebar, &format!("{}.confirm", delete_button(refused.id)), Duration::from_secs(5)).await;
+    wait_for_element(&sidebar, ".sidebar-body > .error", Duration::from_secs(10)).await;
+    // A message arriving in the open conversation reloads the list (as a
+    // running turn's every reply does); that reload succeeding isn't the
+    // failed Delete succeeding, so the error stays (SME-81 review).
+    let lists_before = list_requests(&sidebar).await;
+    let arrived = db::create_message(
+        t.pool,
+        watched.id,
+        "assistant",
+        &[anthropic::ContentBlock::Text { text: "scenario 30 reload".to_string() }],
+    )
+    .await
+    .expect("save a message");
+    crate::events::publish(watched.id, crate::events::ConversationEvent::MessagesAppended { messages: vec![arrived] });
+    assert!(
+        wait_for_text(&sidebar, "scenario 30 reload", Duration::from_secs(10)).await,
+        "the open conversation should show the new message"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while list_requests(&sidebar).await <= lists_before {
+        assert!(tokio::time::Instant::now() < deadline, "the new message should reload the conversation list");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The reload's result is applied by an effect after the request ends.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let kept: bool = sidebar
+        .evaluate("!!document.querySelector('.sidebar-body > .error')")
+        .await
+        .expect("look for the sidebar error")
+        .into_value()
+        .expect("bool");
+    assert!(kept, "a list reload shouldn't clear a failed Delete's error");
+    click_when_present(&sidebar, &delete_button(deleted.id), Duration::from_secs(5)).await;
+    click_when_present(&sidebar, &format!("{}.confirm", delete_button(deleted.id)), Duration::from_secs(5)).await;
+    assert!(
+        wait_for_count(&sidebar, &format!(".conversation-item[data-conversation-id='{}']", deleted.id), 0, Duration::from_secs(10)).await,
+        "the second delete should go through"
+    );
+    let still_shown: bool = sidebar
+        .evaluate("!!document.querySelector('.sidebar-body > .error')")
+        .await
+        .expect("look for the sidebar error")
+        .into_value()
+        .expect("bool");
+    assert!(!still_shown, "a later success should clear the sidebar's error");
+
+    // The same on a settings page: a failed volume delete's error goes once
+    // another delete succeeds (SME-81 review 2).
+    let refused_volume = db::create_sandbox_volume(t.pool, &unique_id("refused"), "/home/sandbox/refused")
+        .await
+        .expect("create a volume")
+        .id;
+    let deleted_volume = db::create_sandbox_volume(t.pool, &unique_id("deleted"), "/home/sandbox/deleted")
+        .await
+        .expect("create a volume")
+        .id;
+    let volumes = t.tab(t.url("sandbox-volumes")).await;
+    wait_for_resource(&volumes, "/api/sandbox-volumes").await;
+    let volume_delete = |id: i64| format!(".sandbox-volume-row[data-volume-id='{id}'] .sandbox-volume-delete");
+    wait_for_stable(&volumes, &volume_delete(refused_volume), tokio::time::Instant::now() + Duration::from_secs(10)).await;
+    volumes.evaluate(FAIL_NEXT_DELETE).await.expect("make the next DELETE fail");
+    click_when_present(&volumes, &volume_delete(refused_volume), Duration::from_secs(5)).await;
+    click_when_present(&volumes, &format!("{}.confirm", volume_delete(refused_volume)), Duration::from_secs(5)).await;
+    wait_for_element(&volumes, ".sandbox-volumes-page .error", Duration::from_secs(10)).await;
+    click_when_present(&volumes, &volume_delete(deleted_volume), Duration::from_secs(5)).await;
+    click_when_present(&volumes, &format!("{}.confirm", volume_delete(deleted_volume)), Duration::from_secs(5)).await;
+    assert!(
+        wait_for_count(&volumes, &format!(".sandbox-volume-row[data-volume-id='{deleted_volume}']"), 0, Duration::from_secs(10)).await,
+        "the second volume delete should go through"
+    );
+    let still_shown: bool = volumes
+        .evaluate("!!document.querySelector('.sandbox-volumes-page .error')")
+        .await
+        .expect("look for the volume error")
+        .into_value()
+        .expect("bool");
+    let _ = db::delete_sandbox_volume(t.pool, refused_volume).await;
+    assert!(!still_shown, "a later volume delete succeeding should clear the failed one's error");
+}
+
+/// How many times `page` has fetched the conversation list.
+async fn list_requests(page: &chromiumoxide::Page) -> usize {
+    page.evaluate("performance.getEntriesByType('resource').filter(e => e.name.endsWith('/api/conversations')).length")
+        .await
+        .expect("read resource timings")
+        .into_value()
+        .expect("a count")
+}
 
 async fn new_conversation(
     pool: &sqlx::PgPool,

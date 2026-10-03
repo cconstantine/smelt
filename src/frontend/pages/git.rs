@@ -29,7 +29,7 @@ pub fn GitSettingsPage() -> Element {
                     keys.set(settings.keys);
                     trust.set(settings.trust);
                 }
-                Err(e) => load_error.set(Some(e.to_string())),
+                Err(e) => load_error.set(Some(super::server_error_message(&e))),
             }
             loaded.set(true);
         }
@@ -44,7 +44,7 @@ pub fn GitSettingsPage() -> Element {
         };
         spawn(async move {
             identity_status.set(Some(
-                save_git_identity(identity).await.map_err(|e| e.to_string()),
+                save_git_identity(identity).await.map_err(|e| super::server_error_message(&e)),
             ));
         });
     };
@@ -75,7 +75,7 @@ pub fn GitSettingsPage() -> Element {
                     private_key.set(String::new());
                     key_error.set(None);
                 }
-                Err(e) => key_error.set(Some(e.to_string())),
+                Err(e) => key_error.set(Some(super::server_error_message(&e))),
             }
             busy.set(false);
         });
@@ -87,10 +87,11 @@ pub fn GitSettingsPage() -> Element {
             spawn(async move {
                 match delete_ssh_key(id).await {
                     Ok(()) => {
+                        key_error.set(None);
                         keys.write().retain(|k| k.id != id);
                         pending_delete.set(None);
                     }
-                    Err(e) => key_error.set(Some(e.to_string())),
+                    Err(e) => key_error.set(Some(super::server_error_message(&e))),
                 }
             });
         } else {
@@ -179,8 +180,11 @@ pub fn GitSettingsPage() -> Element {
                                                 let remote = remote.clone();
                                                 spawn(async move {
                                                     match forget_repo_trust(remote.clone()).await {
-                                                        Ok(()) => trust.write().retain(|t| t.remote != remote),
-                                                        Err(e) => trust_error.set(Some(e.to_string())),
+                                                        Ok(()) => {
+                                                            trust_error.set(None);
+                                                            trust.write().retain(|t| t.remote != remote);
+                                                        }
+                                                        Err(e) => trust_error.set(Some(super::server_error_message(&e))),
                                                     }
                                                 });
                                             }

@@ -22,7 +22,7 @@ pub fn SandboxVolumesIndex() -> Element {
         if let Some(result) = initial_volumes() {
             match result {
                 Ok(list) => volumes.set(list),
-                Err(e) => list_error.set(Some(e.to_string())),
+                Err(e) => list_error.set(Some(super::server_error_message(&e))),
             }
             loaded.set(true);
         }
@@ -36,10 +36,11 @@ pub fn SandboxVolumesIndex() -> Element {
             spawn(async move {
                 match delete_sandbox_volume(id).await {
                     Ok(()) => {
+                        delete_error.set(None);
                         volumes.write().retain(|v| v.id != id);
                         pending_delete.set(None);
                     }
-                    Err(e) => delete_error.set(Some(e.to_string())),
+                    Err(e) => delete_error.set(Some(super::server_error_message(&e))),
                 }
             });
         } else {
@@ -72,7 +73,7 @@ pub fn SandboxVolumesIndex() -> Element {
             } else {
                 div { class: "sandbox-volume-list",
                     for volume in volumes() {
-                        div { key: "{volume.id}", class: "sandbox-volume-row",
+                        div { key: "{volume.id}", "data-volume-id": "{volume.id}", class: "sandbox-volume-row",
                             div { class: "sandbox-volume-summary",
                                 span { class: "sandbox-volume-name", "{volume.name}" }
                                 span { class: "sandbox-volume-path", "{volume.mount_path}" }
@@ -114,7 +115,7 @@ pub fn SandboxVolumeNew() -> Element {
                     navigator.push(Route::SandboxVolumesRoute {});
                 }
                 Err(e) => {
-                    submit_error.set(Some(e.to_string()));
+                    submit_error.set(Some(super::server_error_message(&e)));
                     submitting.set(false);
                 }
             }

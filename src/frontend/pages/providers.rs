@@ -14,7 +14,7 @@ use crate::providers::{
     ASSUMED_CONTEXT_WINDOW,
 };
 
-use super::chat::server_error_message;
+use super::server_error_message;
 
 /// "Provider · model", as the picker and the default show a choice.
 pub(crate) fn choice_label(choice: &ModelChoice) -> String {
