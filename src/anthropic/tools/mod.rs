@@ -921,7 +921,7 @@ mod server {
 
 #[cfg(feature = "server")]
 pub use server::execute;
-// Test-only: `api::chat`'s tests read the native tool names.
+// Test-only: `turn`'s tests read the native tool names.
 #[cfg(all(feature = "server", test))]
 pub use server::native_tool_definitions;
 #[cfg(feature = "server")]

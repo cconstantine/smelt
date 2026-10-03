@@ -1991,7 +1991,7 @@ async fn test_ensure_docker_pvc_creates_once_and_delete_removes_it() {
 #[sqlx::test]
 async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
     // Every terminal command that finishes during this test triggers a
-    // detached `chat::wake_conversation` call (see SME-13). This
+    // detached `turn::wake_conversation` call (see SME-13). This
     // test's database has no model provider (SME-72), so each one
     // fails at once without reaching any model.
     // Those wakes touch process-wide turn state keyed by conversation

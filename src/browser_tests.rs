@@ -27,7 +27,7 @@
 //! needs the model, the model is a slow local mock upstream — this tier
 //! verifies the browser/live-event pipeline and DOM rendering, not
 //! tool-selection or compaction-trigger *logic* (already covered by
-//! `api::chat`'s own mock-upstream tests), and this test environment (like
+//! `turn`'s own mock-upstream tests), and this test environment (like
 //! CI) has no real Anthropic credentials to make a live call with anyway.
 
 use std::path::PathBuf;
@@ -990,7 +990,7 @@ async fn scenario_context_usage(t: &Scenario<'_>) {
 /// Scenario 6: a compaction event renders as a distinct, collapsed-by-default
 /// divider — not an ordinary chat bubble — and expands to reveal the real
 /// summary text on click. Seeded directly (a real trigger/summarization
-/// round trip is already covered by api::chat's own mock-upstream
+/// round trip is already covered by turn's own mock-upstream
 /// integration test; this tier's job is the DOM, not the backend logic).
 async fn scenario_compaction_divider(t: &Scenario<'_>) {
     let pool = t.pool;
@@ -1231,7 +1231,7 @@ async fn scenario_unrequested_reply(t: &Scenario<'_>) {
     let conversation = t.conversation().await;
     let watcher = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
     wait_for_live_client(&watcher, conversation.id).await;
-    crate::api::chat::run_turn(
+    crate::turn::run_turn(
         t.pool,
         conversation.id,
         anthropic::AnthropicMessage {

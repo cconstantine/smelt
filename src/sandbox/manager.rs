@@ -790,7 +790,7 @@ pub async fn stop_pod_for_user(pool: &PgPool, pod_id: i64) -> Result<(), Termina
         );
         let pool = pool.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::api::chat::save_notice_between_turns(&pool, conversation_id, notice).await {
+            if let Err(e) = crate::turn::save_notice_between_turns(&pool, conversation_id, notice).await {
                 tracing::warn!(conversation_id, pod_id, error = %e, "couldn't save the pod stop notice");
             }
         });

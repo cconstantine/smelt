@@ -716,7 +716,7 @@ pub(super) async fn handle_agent_message(pool: &PgPool, conn: &Arc<TerminalConne
             let pool = pool.clone();
             let conversation_id = conn.conversation_id;
             tokio::spawn(async move {
-                let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
+                let _ = crate::turn::wake_conversation(&pool, conversation_id).await;
             });
         }
         AgentMessage::Reply { request_id, result } => conn.resolve(request_id, result),

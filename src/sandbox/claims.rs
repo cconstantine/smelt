@@ -199,7 +199,7 @@ pub(super) async fn report_docker_restart(pool: &PgPool, pod_id: i64, reason: Op
     );
     let pool = pool.clone();
     tokio::spawn(async move {
-        crate::api::chat::deliver_notice(&pool, conversation_id, notice).await;
+        crate::turn::deliver_notice(&pool, conversation_id, notice).await;
     });
 }
 

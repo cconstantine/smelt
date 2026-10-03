@@ -77,7 +77,7 @@ pub async fn watch_pods(pool: PgPool) {
                 if let Some(stopped) = crate::lsp::pods::note_server_stop(&mut stopped_servers, &pod, false) {
                     let pool = pool.clone();
                     tokio::spawn(async move {
-                        crate::api::chat::deliver_notice(&pool, stopped.conversation_id, stopped.notice).await;
+                        crate::turn::deliver_notice(&pool, stopped.conversation_id, stopped.notice).await;
                     });
                 }
                 if let Some(pod_id) = watched_pod_id(&pod) {
@@ -204,11 +204,11 @@ pub(super) async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64, reason: Opt
         let pool = pool.clone();
         tokio::spawn(async move {
             if let Some(notice) = notice {
-                if let Err(e) = crate::api::chat::save_notice_between_turns(&pool, conversation_id, notice).await {
+                if let Err(e) = crate::turn::save_notice_between_turns(&pool, conversation_id, notice).await {
                     tracing::warn!(conversation_id, pod_id, error = %e, "couldn't save the pod crash notice");
                 }
             }
-            let _ = crate::api::chat::wake_conversation(&pool, conversation_id).await;
+            let _ = crate::turn::wake_conversation(&pool, conversation_id).await;
         });
     }
     deregister(pod_id);
