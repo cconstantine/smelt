@@ -91,7 +91,7 @@ pub(super) async fn wake_conversation(
     if is_paused(conversation_id) {
         return Ok(Vec::new());
     }
-    let result = run_turn_bounded(pool, conversation_id, None, MAX_TURNS, false).await;
+    let result = run_turn_bounded(pool, conversation_id, None, MAX_TURNS, false, false).await;
     // A stop is the user's doing, not a failure to reach the model.
     if let Err(TurnFailure::Failed(e)) = &result {
         tracing::warn!(conversation_id, error = %e, "wake_conversation failed to notify the model");

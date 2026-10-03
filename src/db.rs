@@ -261,6 +261,157 @@ pub async fn set_conversation_todos(
     Ok(())
 }
 
+// --- Pending questions (the model's ask_user, SME-34) ---
+
+/// A conversation's `pending_questions` row: the question it waits on, and
+/// the user's answer once given (`None` while waiting).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredQuestion {
+    pub tool_use_id: String,
+    pub questions: Vec<crate::questions::Question>,
+    pub answer: Option<Vec<crate::questions::QuestionAnswer>>,
+}
+
+/// Records the question `conversation_id` now waits on, replacing any
+/// earlier one (there is none: a turn only runs once the last is taken).
+pub async fn create_pending_question(
+    pool: &PgPool,
+    conversation_id: i64,
+    tool_use_id: &str,
+    questions: &[crate::questions::Question],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO pending_questions (conversation_id, tool_use_id, questions)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (conversation_id) DO UPDATE SET
+             tool_use_id = EXCLUDED.tool_use_id,
+             questions = EXCLUDED.questions,
+             answer = NULL,
+             created_at = now()",
+    )
+    .bind(conversation_id)
+    .bind(tool_use_id)
+    .bind(sqlx::types::Json(questions))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+type StoredQuestionRow = (
+    String,
+    sqlx::types::Json<Vec<crate::questions::Question>>,
+    Option<sqlx::types::Json<Vec<crate::questions::QuestionAnswer>>>,
+);
+
+fn stored_question((tool_use_id, questions, answer): StoredQuestionRow) -> StoredQuestion {
+    StoredQuestion {
+        tool_use_id,
+        questions: questions.0,
+        answer: answer.map(|a| a.0),
+    }
+}
+
+/// The question `conversation_id` waits on or has an answer for, if any.
+pub async fn get_pending_question(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<Option<StoredQuestion>, sqlx::Error> {
+    let row = sqlx::query_as::<_, StoredQuestionRow>(
+        "SELECT tool_use_id, questions, answer FROM pending_questions WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(stored_question))
+}
+
+/// Records `answer` for the waiting question `tool_use_id`. False when
+/// there's no such question or it was already answered (another tab got
+/// there first): exactly one answer is ever recorded.
+pub async fn answer_pending_question(
+    pool: &PgPool,
+    conversation_id: i64,
+    tool_use_id: &str,
+    answer: &[crate::questions::QuestionAnswer],
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE pending_questions SET answer = $3
+         WHERE conversation_id = $1 AND tool_use_id = $2 AND answer IS NULL",
+    )
+    .bind(conversation_id)
+    .bind(tool_use_id)
+    .bind(sqlx::types::Json(answer))
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Removes and returns `conversation_id`'s question if it has an answer,
+/// or (`include_waiting`) if it's still waiting. A turn does this through
+/// `create_message_taking_question`, in the transaction that saves the
+/// call's result; the tests check the rule on its own here.
+#[cfg(test)]
+pub async fn take_pending_question(
+    pool: &PgPool,
+    conversation_id: i64,
+    include_waiting: bool,
+) -> Result<Option<StoredQuestion>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    take_pending_question_on(&mut conn, conversation_id, include_waiting).await
+}
+
+async fn take_pending_question_on(
+    conn: &mut sqlx::PgConnection,
+    conversation_id: i64,
+    include_waiting: bool,
+) -> Result<Option<StoredQuestion>, sqlx::Error> {
+    let row = sqlx::query_as::<_, StoredQuestionRow>(
+        "DELETE FROM pending_questions
+         WHERE conversation_id = $1 AND (answer IS NOT NULL OR $2)
+         RETURNING tool_use_id, questions, answer",
+    )
+    .bind(conversation_id)
+    .bind(include_waiting)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.map(stored_question))
+}
+
+/// Saves a turn's message (`content`, empty for a wake with nothing of its
+/// own) after taking the conversation's question as `take_pending_question`
+/// does, with `result_for(question)` put first: both in one transaction, so
+/// an answer is never lost (taken, message not saved) or sent twice (saved,
+/// row left). `None` when there's nothing to save.
+pub async fn create_message_taking_question(
+    pool: &PgPool,
+    conversation_id: i64,
+    role: &str,
+    content: Vec<ContentBlock>,
+    include_waiting: bool,
+    result_for: impl FnOnce(&StoredQuestion) -> ContentBlock,
+) -> Result<Option<(Message, Option<StoredQuestion>)>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let question = take_pending_question_on(&mut tx, conversation_id, include_waiting).await?;
+    let mut blocks = Vec::with_capacity(content.len() + 1);
+    blocks.extend(question.as_ref().map(result_for));
+    blocks.extend(content);
+    if blocks.is_empty() {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let saved = create_message_on(&mut tx, conversation_id, role, &blocks).await?;
+    tx.commit().await?;
+    Ok(Some((saved, question)))
+}
+
+/// Conversations with a question still waiting for an answer, for the
+/// sidebar's waiting mark.
+pub async fn list_waiting_conversations(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar("SELECT conversation_id FROM pending_questions WHERE answer IS NULL ORDER BY conversation_id")
+        .fetch_all(pool)
+        .await
+}
+
 // --- Terminal (pod/terminal/command lifecycle) ---
 // Server-only, no client/server boundary to cross (no UI yet) — unlike
 // Conversation/Message, these don't need to live in models.rs or derive
@@ -2217,6 +2368,61 @@ mod tests {
                 .expect("lookup"),
             Some(second)
         );
+    }
+
+    fn sample_questions() -> Vec<crate::questions::Question> {
+        crate::questions::parse_questions(&serde_json::json!({"questions": [
+            {"question": "Delete it?", "header": "Delete", "options": [{"label": "Yes"}, {"label": "No"}]}
+        ]}))
+        .expect("valid questions")
+    }
+
+    fn sample_answer(label: &str) -> Vec<crate::questions::QuestionAnswer> {
+        vec![crate::questions::QuestionAnswer { selected: vec![label.to_string()], other: None }]
+    }
+
+    #[sqlx::test]
+    async fn test_a_pending_question_is_answered_once_then_taken(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let id = conversation.id;
+        assert_eq!(get_pending_question(&pool, id).await.expect("get"), None);
+        create_pending_question(&pool, id, "toolu_q", &sample_questions()).await.expect("create");
+        let waiting = get_pending_question(&pool, id).await.expect("get").expect("a question");
+        assert_eq!(waiting.tool_use_id, "toolu_q");
+        assert_eq!(waiting.questions, sample_questions());
+        assert_eq!(waiting.answer, None);
+        assert_eq!(list_waiting_conversations(&pool).await.expect("list"), vec![id]);
+
+        // A waiting question stays unless the take includes waiting ones.
+        assert_eq!(take_pending_question(&pool, id, false).await.expect("take"), None);
+        assert!(!answer_pending_question(&pool, id, "toolu_other", &sample_answer("Yes")).await.expect("answer"));
+        assert!(answer_pending_question(&pool, id, "toolu_q", &sample_answer("Yes")).await.expect("answer"));
+        assert!(
+            !answer_pending_question(&pool, id, "toolu_q", &sample_answer("No")).await.expect("answer"),
+            "a second answer must not replace the first"
+        );
+        assert!(list_waiting_conversations(&pool).await.expect("list").is_empty());
+
+        let taken = take_pending_question(&pool, id, false).await.expect("take").expect("the answered question");
+        assert_eq!(taken.answer, Some(sample_answer("Yes")));
+        assert_eq!(get_pending_question(&pool, id).await.expect("get"), None);
+    }
+
+    #[sqlx::test]
+    async fn test_a_waiting_question_is_taken_only_when_asked_for(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        create_pending_question(&pool, conversation.id, "toolu_q", &sample_questions()).await.expect("create");
+        let taken = take_pending_question(&pool, conversation.id, true).await.expect("take").expect("the waiting question");
+        assert_eq!(taken.answer, None);
+        assert_eq!(get_pending_question(&pool, conversation.id).await.expect("get"), None);
+    }
+
+    #[sqlx::test]
+    async fn test_a_pending_question_goes_with_its_conversation(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        create_pending_question(&pool, conversation.id, "toolu_q", &sample_questions()).await.expect("create");
+        delete_conversation(&pool, conversation.id).await.expect("delete");
+        assert!(list_waiting_conversations(&pool).await.expect("list").is_empty());
     }
 
     #[sqlx::test]

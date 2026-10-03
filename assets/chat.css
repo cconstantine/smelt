@@ -2704,6 +2704,161 @@ div.mcp-status-not-connected::before {
     color: var(--ink);
 }
 
+/* SME-34: the model's question, waiting on the user, and the row it
+   becomes once answered. Shaped like the trust card: both are the model
+   asking the user to decide something. */
+.question-card {
+    margin: 12px 0;
+    padding: 14px 16px;
+    border: 1px solid var(--border-strong);
+    border-left: 3px solid var(--accent);
+    border-radius: 12px;
+    background: var(--surface);
+}
+
+.question-card-question {
+    margin: 0 0 12px;
+    padding: 0;
+    border: none;
+    min-width: 0;
+}
+
+.question-card-header {
+    padding: 0;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.question-card-text {
+    margin: 2px 0 8px;
+    color: var(--ink);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.question-card-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.question-option {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    max-width: 100%;
+    padding: 8px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--ink);
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+}
+
+.question-option:hover:not(:disabled) {
+    border-color: var(--accent);
+}
+
+.question-option.chosen {
+    border-color: var(--accent);
+    background: var(--subtle);
+    box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.question-option-label {
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.question-option-description {
+    color: var(--text-2);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
+.question-card-other {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+}
+
+.question-card-submit {
+    padding: 8px 16px;
+    border: 1px solid var(--ink);
+    border-radius: 8px;
+    background: var(--ink);
+    color: var(--surface);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.question-card-submit:disabled,
+.question-option:disabled {
+    opacity: 0.55;
+    cursor: default;
+}
+
+.question-answered {
+    margin: 6px 0;
+    padding: 8px 12px;
+    border-left: 2px solid var(--accent);
+    color: var(--text-2);
+    font-size: 13px;
+}
+
+.question-answered-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--muted);
+}
+
+.question-answered-icon {
+    font-weight: 700;
+    color: var(--accent);
+}
+
+.question-answered-question {
+    margin: 4px 0 0;
+    color: var(--text);
+    overflow-wrap: anywhere;
+}
+
+.question-answered-answer {
+    margin: 2px 0 0;
+    color: var(--ink);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+/* The sidebar's mark for a conversation waiting on the user's answer. */
+.conversation-waiting {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--surface);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+}
+
 /* SME-35: the language server page's catalog lookup. */
 .language-server-lookup-row {
   display: flex;
