@@ -297,10 +297,14 @@ mod server {
         fn drop(&mut self) {
             // Under the map's lock, which subscribing also takes, so no one
             // can join the channel between the count and the removal. This
-            // receiver still counts until the drop finishes.
+            // receiver is let go first, inside the lock: counted while it
+            // lived, two subscribers leaving at once each saw the other and
+            // left the channel behind (SME-91 review). A spare receiver of
+            // a tiny channel takes its place for the rest of the drop.
             let mut buses = BUSES.lock().unwrap_or_else(|e| e.into_inner());
+            drop(std::mem::replace(&mut self.receiver, broadcast::channel(1).1));
             let last_on_this_channel = match (buses.get(&self.conversation_id), self.channel.upgrade()) {
-                (Some(current), Some(own)) => current.same_channel(&own) && current.receiver_count() <= 1,
+                (Some(current), Some(own)) => current.same_channel(&own) && current.receiver_count() == 0,
                 _ => false,
             };
             if last_on_this_channel {
@@ -372,6 +376,30 @@ mod server {
             assert!(has_channel(conversation_id), "one subscriber is left");
             drop(second);
             assert!(!has_channel(conversation_id), "the last subscriber took the channel with it");
+        }
+
+        /// SME-91 review: two subscribers leaving at the same moment (two
+        /// tabs closing) still free the channel: each counted the other's
+        /// receiver, which went only after its own count.
+        #[test]
+        fn test_two_subscribers_leaving_at_once_free_the_channel() {
+            for round in 0..2000 {
+                let conversation_id = 9_100_010_000 + round;
+                let first = subscribe(conversation_id);
+                let second = subscribe(conversation_id);
+                let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+                let other = std::thread::spawn({
+                    let barrier = barrier.clone();
+                    move || {
+                        barrier.wait();
+                        drop(first);
+                    }
+                });
+                barrier.wait();
+                drop(second);
+                other.join().expect("join");
+                assert!(!has_channel(conversation_id), "round {round}: the channel was left behind");
+            }
         }
 
         /// SME-91: publishing with nobody listening (a deleted
