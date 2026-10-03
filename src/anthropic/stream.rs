@@ -308,8 +308,8 @@ enum Binding {
 /// The beta that lets a request set `block_binding`.
 const BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 
-/// The form each provider was last seen to accept after refusing a request
-/// as built, keyed by `provider_key`. Enforcement is per account, so one
+/// Providers that accepted drop-block after refusing a request as built,
+/// keyed by `provider_key`. Enforcement is per account, so one
 /// provider's answer holds for all its conversations; a restart forgets it
 /// and costs one more refused request per provider.
 static RECOVERY: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, Binding>>> =
@@ -328,8 +328,9 @@ fn provider_key(endpoint: &Endpoint) -> u64 {
     hasher.finish()
 }
 
-/// The form to send `request` in, given what `endpoint` accepted before:
-/// drop-block needs thinking on, so a request without it is stripped.
+/// The form to send `request` in first: drop-block when `endpoint` took it
+/// before and the request has thinking on (it needs a `thinking` object),
+/// otherwise as built.
 fn binding_for(endpoint: &Endpoint, request: &CreateMessageRequest) -> Binding {
     let remembered = RECOVERY
         .lock()
@@ -337,8 +338,8 @@ fn binding_for(endpoint: &Endpoint, request: &CreateMessageRequest) -> Binding {
         .unwrap_or(None)
         .unwrap_or(Binding::AsIs);
     match remembered {
-        Binding::DropBlock if request.thinking.is_none() => Binding::Strip,
-        other => other,
+        Binding::DropBlock if request.thinking.is_some() => Binding::DropBlock,
+        _ => Binding::AsIs,
     }
 }
 
@@ -486,7 +487,12 @@ pub async fn stream_anthropic_message(
         let response = send_and_await_response(endpoint, request, binding, RESPONSE_TIMEOUT).await?;
         let status = response.status();
         if status.is_success() {
-            if binding != Binding::AsIs {
+            // Only drop-block is remembered. A stripped request is sent only
+            // after the API's own binding refusal, never ahead of one: the
+            // memory covers every model on the provider, and a model that
+            // doesn't run the check may require the last assistant turn's
+            // thinking block.
+            if binding == Binding::DropBlock {
                 remember_binding(endpoint, binding);
             }
             break response;
@@ -1175,19 +1181,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_strip_for_a_thinking_off_request_isnt_kept_for_thinking_on_ones() {
+        let (endpoint, record) = recording_upstream(vec![
+            (400, BINDING_BODY),
+            (200, OK_BODY),
+            (400, BINDING_BODY),
+            (200, OK_BODY),
+        ])
+        .await;
+        stream_anthropic_message(&endpoint, &request_replaying_thinking(None), |_| {})
+            .await
+            .expect("thinking off recovers by stripping");
+        let thinking_on = request_replaying_thinking(Some(super::super::types::ThinkingConfig::Adaptive));
+        stream_anthropic_message(&endpoint, &thinking_on, |_| {}).await.expect("thinking on recovers");
+        let seen = requests_seen(&record);
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[2].thinking_blocks(), 1, "a thinking-on request goes out as built first");
+        assert!(!seen[2].has_binding_beta());
+        assert_eq!(seen[3].drop_block(), Some("drop_block"), "and is retried with drop_block, not stripped");
+    }
+
+    #[tokio::test]
     async fn test_a_refused_drop_block_falls_back_to_stripping() {
         let (endpoint, record) =
             recording_upstream(vec![(400, BINDING_BODY), (400, EXTRA_INPUTS_BODY), (200, OK_BODY)]).await;
         let request = request_replaying_thinking(Some(super::super::types::ThinkingConfig::Adaptive));
         let result = stream_anthropic_message(&endpoint, &request, |_| {}).await;
         assert!(result.is_ok(), "should recover by stripping: {result:?}");
+        let seen = requests_seen(&record);
+        assert_eq!(seen[2].thinking_blocks(), 0);
+        assert!(!seen[2].has_binding_beta() && seen[2].drop_block().is_none());
         stream_anthropic_message(&endpoint, &request, |_| {}).await.expect("next turn");
         let seen = requests_seen(&record);
-        assert_eq!(seen.len(), 4, "the next turn goes straight to stripping");
-        for retry in &seen[2..] {
-            assert_eq!(retry.thinking_blocks(), 0);
-            assert!(!retry.has_binding_beta() && retry.drop_block().is_none());
-        }
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[3].thinking_blocks(), 1, "the next turn isn't stripped ahead of a refusal");
     }
 
     #[tokio::test]
