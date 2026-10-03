@@ -3042,11 +3042,13 @@ fn ChatPanel(
                     let subscribed = subscribe_conversation_events(id).await;
                     // Deleted (from another tab, say): the server refuses
                     // to stream it, so say so instead of retrying for good
-                    // (SME-91).
-                    if let Err(e) = &subscribed
-                        && server_error_message(e) == "conversation not found"
+                    // (SME-91). A refused stream doesn't carry the
+                    // server's reason, so ask the way a page load does.
+                    if subscribed.is_err()
+                        && let Err(e) = get_messages(id).await
+                        && server_error_message(&e) == "conversation not found"
                     {
-                        load_error.set(Some(server_error_message(e)));
+                        load_error.set(Some(server_error_message(&e)));
                         break;
                     }
                     if let Ok(mut events) = subscribed {
