@@ -376,27 +376,11 @@ fn history_for_request(
     Ok(answer_unfinished_tool_calls(history))
 }
 
-/// `blocks` without their thinking blocks when `strip` is set. A message
-/// that was nothing but thinking keeps its reasoning as plain text instead:
-/// the API rejects a message with no content, and a made-up stand-in would
-/// be text the model might imitate (SME-72 review 3).
+/// `blocks` without their thinking blocks when `strip` is set (see
+/// `anthropic::types::strip_thinking`).
 #[cfg(feature = "server")]
 fn strip_foreign_thinking(blocks: Vec<anthropic::ContentBlock>, strip: bool) -> Vec<anthropic::ContentBlock> {
-    if !strip {
-        return blocks;
-    }
-    let only_thinking = blocks
-        .iter()
-        .all(|block| matches!(block, anthropic::ContentBlock::Thinking { .. }));
-    blocks
-        .into_iter()
-        .filter_map(|block| match block {
-            anthropic::ContentBlock::Thinking { thinking, .. } => {
-                only_thinking.then_some(anthropic::ContentBlock::Text { text: thinking })
-            }
-            other => Some(other),
-        })
-        .collect()
+    if strip { anthropic::types::strip_thinking(blocks) } else { blocks }
 }
 
 /// Gives every tool call that has no result an error result

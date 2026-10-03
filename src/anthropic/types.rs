@@ -92,6 +92,35 @@ pub struct AnthropicMessage {
     pub content: Vec<ContentBlock>,
 }
 
+/// Stands in for a message that was only thinking with no text to keep.
+#[cfg(feature = "server")]
+pub const THINKING_NOT_SHOWN: &str = "(reasoning not shown)";
+
+/// `blocks` without their thinking blocks. A message that was nothing but
+/// thinking keeps its reasoning as plain text instead: the API rejects a
+/// message with no content, and a made-up stand-in would be text the model
+/// might imitate (SME-72 review 3). The API rejects an empty text block
+/// too, and current models return thinking with empty text by default, so
+/// one with nothing to keep gets `THINKING_NOT_SHOWN` (SME-93 review 2).
+#[cfg(feature = "server")]
+pub fn strip_thinking(blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
+    let only_thinking = blocks.iter().all(|block| matches!(block, ContentBlock::Thinking { .. }));
+    let stripped: Vec<ContentBlock> = blocks
+        .into_iter()
+        .filter_map(|block| match block {
+            ContentBlock::Thinking { thinking, .. } => {
+                (only_thinking && !thinking.trim().is_empty()).then_some(ContentBlock::Text { text: thinking })
+            }
+            other => Some(other),
+        })
+        .collect();
+    if stripped.is_empty() {
+        vec![ContentBlock::Text { text: THINKING_NOT_SHOWN.to_string() }]
+    } else {
+        stripped
+    }
+}
+
 /// Ungated, unlike `AnthropicMessage`/`CreateMessageRequest` above —
 /// `api::chat::get_context_detail`'s context-visibility view sends every
 /// available tool's full definition to the browser (see
@@ -135,6 +164,25 @@ pub struct CreateMessageRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_strip_thinking_never_leaves_an_empty_text_block() {
+        let only_empty = strip_thinking(vec![ContentBlock::Thinking {
+            thinking: String::new(),
+            signature: "sig".to_string(),
+        }]);
+        assert!(!only_empty.is_empty(), "a message can't be left with no content");
+        for block in &only_empty {
+            if let ContentBlock::Text { text } = block {
+                assert!(!text.trim().is_empty(), "the API rejects an empty text block: {only_empty:?}");
+            }
+        }
+        let mixed = strip_thinking(vec![
+            ContentBlock::Thinking { thinking: String::new(), signature: "a".to_string() },
+            ContentBlock::Thinking { thinking: "an idea".to_string(), signature: "b".to_string() },
+        ]);
+        assert_eq!(mixed, vec![ContentBlock::Text { text: "an idea".to_string() }]);
+    }
 
     #[test]
     fn test_token_usage_deserializes_a_full_message_start_usage_object() {
