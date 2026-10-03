@@ -1240,7 +1240,6 @@ async fn scenario_unrequested_reply(t: &Scenario<'_>) {
                 text: "sent from somewhere else".to_string(),
             }],
         },
-        None,
     )
     .await
     .expect("a turn run outside the watching tab should succeed");

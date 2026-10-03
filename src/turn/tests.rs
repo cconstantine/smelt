@@ -771,7 +771,7 @@ async fn test_a_bearer_providers_turn_sends_its_token_as_a_bearer_header(pool: P
         .await
         .expect("set default");
 
-    let messages = run_turn(&pool, conversation.id, hello(), None)
+    let messages = run_turn(&pool, conversation.id, hello())
         .await
         .expect("the turn should run on the bearer provider");
 
@@ -1248,7 +1248,7 @@ async fn test_run_turn_sends_the_system_prompt(pool: PgPool) {
         .expect("create volume");
     let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
 
-    run_turn(&pool, conversation.id, hello(), None)
+    run_turn(&pool, conversation.id, hello())
         .await
         .expect("run_turn should succeed");
 
@@ -1299,7 +1299,7 @@ async fn test_compaction_keeps_its_own_system_prompt(pool: PgPool) {
     ])
     .await;
 
-    run_turn(&pool, conversation.id, hello(), None)
+    run_turn(&pool, conversation.id, hello())
         .await
         .expect("run_turn should succeed");
 
@@ -1413,7 +1413,7 @@ async fn test_stop_turn_ends_a_turn_in_flight(pool: PgPool) {
 
     let turn = tokio::spawn({
         let pool = pool.clone();
-        async move { run_turn(&pool, conversation.id, hello(), None).await }
+        async move { run_turn(&pool, conversation.id, hello()).await }
     });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     stop_turn_now(conversation.id);
@@ -1440,7 +1440,7 @@ async fn test_stop_turn_ends_a_turn_in_flight(pool: PgPool) {
 
     // A turn started after the stop isn't affected by it.
     let later = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
-    run_turn(&pool, conversation.id, hello(), None)
+    run_turn(&pool, conversation.id, hello())
         .await
         .expect("a later turn runs normally");
     assert_eq!(later.lock().expect("log").len(), 1);
@@ -1460,7 +1460,7 @@ async fn test_a_stop_just_after_the_message_is_saved_keeps_it_once(pool: PgPool)
 
     let turn = tokio::spawn({
         let pool = pool.clone();
-        async move { run_turn(&pool, conversation.id, hello(), None).await }
+        async move { run_turn(&pool, conversation.id, hello()).await }
     });
     tokio::time::timeout(std::time::Duration::from_secs(5), reached)
         .await
@@ -1493,7 +1493,7 @@ async fn test_a_stop_clears_the_reply_even_with_another_turn_in_flight(pool: PgP
 
     let turn = tokio::spawn({
         let pool = pool.clone();
-        async move { run_turn(&pool, conversation.id, hello(), None).await }
+        async move { run_turn(&pool, conversation.id, hello()).await }
     });
     // The turn is waiting on the model by now; its reply has begun.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1562,11 +1562,11 @@ async fn test_a_conversations_turn_state_is_freed_after_its_turns(pool: PgPool) 
         )
     };
 
-    run_turn(&pool, conversation.id, hello(), None).await.expect("a turn");
+    run_turn(&pool, conversation.id, hello()).await.expect("a turn");
     assert_eq!(turn_state_kept(conversation.id), (false, false), "freed after the turn");
 
     let held = conversation_lock(conversation.id);
-    run_turn(&pool, conversation.id, hello(), None).await.expect("a turn");
+    run_turn(&pool, conversation.id, hello()).await.expect("a turn");
     assert!(turn_state_kept(conversation.id).0, "a lock someone holds isn't replaced");
     drop(held);
 }
@@ -1585,7 +1585,7 @@ async fn test_turn_state_is_published_while_a_turn_runs(pool: PgPool) {
 
     let turn = tokio::spawn({
         let pool = pool.clone();
-        async move { run_turn(&pool, conversation.id, hello(), None).await }
+        async move { run_turn(&pool, conversation.id, hello()).await }
     });
     let started = next_turn_state(&mut rx).await;
     assert_eq!(started, Some(true), "a turn starting should say so");
@@ -1645,7 +1645,7 @@ async fn test_a_stopped_conversation_waits_for_the_user_before_waking(pool: PgPo
 
     resume_turns(conversation.id);
     assert!(!is_paused(conversation.id));
-    run_turn(&pool, conversation.id, hello(), None)
+    run_turn(&pool, conversation.id, hello())
         .await
         .expect("the user's next turn runs");
     let requests = requests.lock().expect("log");
@@ -1701,7 +1701,7 @@ async fn test_a_notice_queued_behind_a_stopped_turn_is_still_saved(pool: PgPool)
                 role: "user".to_string(),
                 content: vec![anthropic::ContentBlock::Text { text: notice.to_string() }],
             };
-            run_turn(&pool, conversation.id, message, None).await
+            run_turn(&pool, conversation.id, message).await
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1746,7 +1746,7 @@ async fn test_one_stop_is_noted_once(pool: PgPool) {
                 role: "user".to_string(),
                 content: vec![anthropic::ContentBlock::Text { text: text.to_string() }],
             };
-            run_turn(&pool, conversation.id, message, None).await
+            run_turn(&pool, conversation.id, message).await
         })
     };
     let first = queued("first notice");
@@ -1895,7 +1895,7 @@ fn hello() -> anthropic::AnthropicMessage {
 async fn test_run_turn_for_a_missing_conversation_says_so(pool: PgPool) {
     let _guard = lock_turn_tests();
     start_mock_upstream(&pool, vec![String::new()]).await;
-    let error = run_turn(&pool, 987_654_321, hello(), None)
+    let error = run_turn(&pool, 987_654_321, hello())
         .await
         .expect_err("a turn for a conversation that doesn't exist should fail")
         .to_string();
@@ -1911,7 +1911,7 @@ async fn test_run_turn_without_a_model_still_saves_the_message(pool: PgPool) {
     let conversation = db::create_conversation(&pool)
         .await
         .expect("create conversation");
-    let error = run_turn(&pool, conversation.id, hello(), None)
+    let error = run_turn(&pool, conversation.id, hello())
         .await
         .expect_err("no provider should fail the turn");
     assert_eq!(chat_error_text(&error), crate::providers::NO_MODEL_CONFIGURED);
@@ -1954,7 +1954,7 @@ async fn test_run_turn_persists_user_and_assistant_messages_for_text_only_reply(
         }],
     };
 
-    let messages = run_turn(&pool, conversation.id, new_message, None)
+    let messages = run_turn(&pool, conversation.id, new_message)
         .await
         .expect("run_turn should succeed");
 
@@ -2014,7 +2014,7 @@ async fn test_run_turn_retries_without_thinking_after_ollama_tool_call_corruptio
         }],
     };
 
-    let messages = run_turn(&pool, conversation.id, new_message, None)
+    let messages = run_turn(&pool, conversation.id, new_message)
         .await
         .expect("run_turn should recover from the failed first attempt and succeed");
 
@@ -2066,7 +2066,7 @@ async fn test_run_turn_recovers_after_two_ollama_tool_call_failures(pool: PgPool
         }],
     };
 
-    let messages = run_turn(&pool, conversation.id, new_message, None)
+    let messages = run_turn(&pool, conversation.id, new_message)
         .await
         .expect(
             "run_turn should recover after exhausting the thinking-drop and one plain retry",
@@ -2101,7 +2101,7 @@ async fn test_run_turn_gives_up_after_exhausting_tool_call_parse_retries(pool: P
         }],
     };
 
-    let err = run_turn(&pool, conversation.id, new_message, None)
+    let err = run_turn(&pool, conversation.id, new_message)
         .await
         .expect_err("should give up and surface the error once retries are exhausted");
     assert!(
@@ -2160,7 +2160,7 @@ async fn test_a_turn_streams_its_reply_to_every_tab(pool: PgPool) {
     start_mock_upstream(&pool, text_tool_then_text_bodies()).await;
     let mut rx = events::subscribe(conversation.id);
 
-    run_turn(&pool, conversation.id, hello(), None)
+    run_turn(&pool, conversation.id, hello())
         .await
         .expect("run_turn should succeed");
 
@@ -2219,7 +2219,7 @@ async fn test_the_reply_so_far_is_available_mid_turn(pool: PgPool) {
 
     let turn = tokio::spawn({
         let pool = pool.clone();
-        async move { run_turn(&pool, conversation.id, hello(), None).await }
+        async move { run_turn(&pool, conversation.id, hello()).await }
     });
     let seen = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
@@ -2338,7 +2338,7 @@ async fn test_any_new_turn_clears_the_kept_error(pool: PgPool) {
         .expect("create conversation");
     remember_turn_error(conversation.id, Some("an earlier failure".to_string()));
     start_recording_mock_upstream(&pool, vec![text_reply_body("Done.")]).await;
-    run_turn(&pool, conversation.id, hello(), None).await.expect("a background turn");
+    run_turn(&pool, conversation.id, hello()).await.expect("a background turn");
     assert_eq!(last_turn_error(conversation.id), None);
 }
 
@@ -2397,7 +2397,7 @@ async fn test_a_turn_publishes_each_message_as_it_is_saved(pool: PgPool) {
     start_mock_upstream(&pool, text_tool_then_text_bodies()).await;
     let mut rx = events::subscribe(conversation.id);
 
-    run_turn(&pool, conversation.id, hello(), None)
+    run_turn(&pool, conversation.id, hello())
         .await
         .expect("run_turn should succeed");
 
@@ -2475,7 +2475,7 @@ async fn test_run_turn_executes_tool_and_persists_full_round_trip(pool: PgPool) 
         }],
     };
 
-    let messages = run_turn(&pool, conversation.id, new_message, None)
+    let messages = run_turn(&pool, conversation.id, new_message)
         .await
         .expect("run_turn should succeed");
 
@@ -2685,7 +2685,7 @@ async fn test_run_turn_compacts_before_sending_when_usage_is_near_the_ceiling(po
     };
 
     let mut events = events::subscribe(conversation.id);
-    let messages = run_turn(&pool, conversation.id, new_message, None)
+    let messages = run_turn(&pool, conversation.id, new_message)
         .await
         .expect("run_turn should succeed");
 
@@ -2804,7 +2804,7 @@ async fn test_run_turn_errors_when_max_turns_exceeded(pool: PgPool) {
     // than run_turn (which would replay the mock upstream the real
     // MAX_TURNS — 10,000 — times just to prove the same "give up and
     // error" behavior).
-    let result = run_turn_bounded(&pool, conversation.id, Some(new_message), None, 3, false).await;
+    let result = run_turn_bounded(&pool, conversation.id, Some(new_message), 3, false).await;
     assert!(result.is_err(), "expected an error, got {result:?}");
 }
 
@@ -2859,7 +2859,7 @@ async fn test_run_turn_serializes_concurrent_calls_for_the_same_conversation(poo
                 text: "first".to_string(),
             }],
         };
-        run_turn(&pool_a, conversation_id, message, None).await
+        run_turn(&pool_a, conversation_id, message).await
     });
     let task_b = tokio::spawn(async move {
         let message = anthropic::AnthropicMessage {
@@ -2868,7 +2868,7 @@ async fn test_run_turn_serializes_concurrent_calls_for_the_same_conversation(poo
                 text: "second".to_string(),
             }],
         };
-        run_turn(&pool_b, conversation_id, message, None).await
+        run_turn(&pool_b, conversation_id, message).await
     });
 
     let (result_a, result_b) = tokio::join!(task_a, task_b);

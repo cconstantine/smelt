@@ -52,7 +52,7 @@ pub(crate) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: St
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text }],
     };
-    if let Err(e) = run_turn(pool, conversation_id, message, None).await
+    if let Err(e) = run_turn(pool, conversation_id, message).await
         && chat_error_text(&e) != TURN_STOPPED
     {
         tracing::warn!(conversation_id, error = %e, "a notice didn't reach the model");
@@ -93,7 +93,7 @@ pub(crate) async fn wake_conversation(
     if is_paused(conversation_id) {
         return Ok(Vec::new());
     }
-    let result = run_turn_bounded(pool, conversation_id, None, None, MAX_TURNS, false).await;
+    let result = run_turn_bounded(pool, conversation_id, None, MAX_TURNS, false).await;
     // A stop is the user's doing, not a failure to reach the model.
     if let Err(e) = &result
         && chat_error_text(e) != TURN_STOPPED

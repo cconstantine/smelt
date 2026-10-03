@@ -52,9 +52,8 @@ pub(super) const MAX_TOKENS: u32 = 16_384;
 /// tool the model asks for and persisting its result — until the model
 /// produces a non-`tool_use` turn or `MAX_TURNS` is exceeded. Returns every
 /// message persisted along the way, in order, starting with `new_message`
-/// itself. `send_message` wires a live `on_delta` into the browser's SSE
-/// stream for the token-by-token typing effect; a notice that wakes the
-/// model calls this with `on_delta = None`.
+/// itself. Its reply streams to every tab through the conversation's
+/// events (`relay_reply_delta`).
 /// Returns a boxed, type-erased future rather than using plain `async fn`
 /// sugar: `run_turn` calls `anthropic::tools::execute`, and a tool's
 /// spawned work can wake the model, calling back into `run_turn` (a
@@ -67,14 +66,12 @@ pub(crate) fn run_turn<'a>(
     pool: &'a PgPool,
     conversation_id: i64,
     new_message: anthropic::AnthropicMessage,
-    on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
 {
     run_turn_bounded(
         pool,
         conversation_id,
         Some(new_message),
-        on_delta,
         MAX_TURNS,
         false,
     )
@@ -105,7 +102,6 @@ pub(super) fn run_turn_bounded<'a>(
     pool: &'a PgPool,
     conversation_id: i64,
     new_message: Option<anthropic::AnthropicMessage>,
-    on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
     max_turns: usize,
     keep_error: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
@@ -117,7 +113,7 @@ pub(super) fn run_turn_bounded<'a>(
         let mut stop = stop_receiver(conversation_id);
         // Any new turn replaces the last failure (SME-51 code review 1).
         let generation = new_turn_generation(conversation_id);
-        let result = run_turn_stoppable(pool, conversation_id, new_message, on_delta, max_turns, &mut stop).await;
+        let result = run_turn_stoppable(pool, conversation_id, new_message, max_turns, &mut stop).await;
         // Kept for a tab that reconnects, unless a newer turn has started
         // since this one did: its outcome is the one to show (SME-91).
         if keep_error
@@ -137,7 +133,6 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
     pool: &'a PgPool,
     conversation_id: i64,
     new_message: Option<anthropic::AnthropicMessage>,
-    on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
     max_turns: usize,
     stop: &'b mut tokio::sync::watch::Receiver<u64>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'b>>
@@ -183,7 +178,7 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
         }
         let new_content = new_message.map(|message| message.content);
         tokio::select! {
-            result = run_turn_body(pool, conversation_id, guard, persisted, new_content, on_delta, max_turns) => return result,
+            result = run_turn_body(pool, conversation_id, guard, persisted, new_content, max_turns) => return result,
             _ = stop.changed() => {}
         }
         // Stopped mid-turn: the body, and its hold on the lock, is gone.
@@ -282,7 +277,7 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     };
     tokio::spawn(async move {
         // Its failure is kept for a reconnecting tab (`keep_error`).
-        if let Err(e) = run_turn_bounded(&pool, id, Some(new_message), None, MAX_TURNS, true).await {
+        if let Err(e) = run_turn_bounded(&pool, id, Some(new_message), MAX_TURNS, true).await {
             let message = chat_error_text(&e);
             crate::events::publish(id, crate::events::ConversationEvent::TurnError { message });
         }
@@ -300,7 +295,6 @@ pub(super) fn run_turn_body<'a>(
     turn_lock: tokio::sync::OwnedMutexGuard<()>,
     mut persisted: Vec<Message>,
     new_content: Option<Vec<anthropic::ContentBlock>>,
-    mut on_delta: Option<&'a mut (dyn FnMut(&str) + Send)>,
     max_turns: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
 {
@@ -409,12 +403,7 @@ pub(super) fn run_turn_body<'a>(
 
             // Every tab watching streams the reply: the text so far is kept
             // for a tab that connects mid-reply, and each delta published.
-            let mut relay = |delta: &str| {
-                relay_reply_delta(conversation_id, delta);
-                if let Some(cb) = on_delta.as_deref_mut() {
-                    cb(delta);
-                }
-            };
+            let mut relay = |delta: &str| relay_reply_delta(conversation_id, delta);
 
             // See `is_ollama_thinking_tool_call_corruption` — not always
             // caused by thinking specifically (a local model can just
