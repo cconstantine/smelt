@@ -29,6 +29,22 @@ ref=$(scripts/sandbox-image-ref)
 hash=$(scripts/agent-sources-hash)
 [ "$ref" = "docker.io/library/smelt-sandbox:src-${hash:0:16}" ] || fail "sandbox-image-ref printed $ref for sources $hash"
 
+# The hash covers what the agent binary is built from, its dependencies
+# included: a dependency bump changes the image's name (SME-102 review).
+copy="$tmp/copy"
+mkdir -p "$copy/scripts" "$copy/src/bin" "$copy/docker/sandbox"
+cp scripts/agent-sources-hash "$copy/scripts/"
+cp src/bin/sandbox_agent.rs "$copy/src/bin/"
+cp src/agent_protocol.rs src/docker_net.rs "$copy/src/"
+cp docker/sandbox/Dockerfile "$copy/docker/sandbox/"
+cp Cargo.lock Cargo.toml "$copy/"
+before=$("$copy/scripts/agent-sources-hash")
+echo "# changed" >>"$copy/Cargo.lock"
+[ "$("$copy/scripts/agent-sources-hash")" != "$before" ] || fail "changing Cargo.lock didn't change the agent-sources hash"
+cp Cargo.lock "$copy/Cargo.lock"
+echo "# changed" >>"$copy/Cargo.toml"
+[ "$("$copy/scripts/agent-sources-hash")" != "$before" ] || fail "changing Cargo.toml didn't change the agent-sources hash"
+
 # With no SANDBOX_IMAGE, the doctor checks that reference and the sidecar's.
 rm -f "$STUB_ARGS"
 if ! out=$(env -u SANDBOX_IMAGE SANDBOX_IMAGE_IMPORT="$stub" scripts/cluster-doctor 2>&1); then
