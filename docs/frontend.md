@@ -133,6 +133,8 @@ The `use_resource` + `use_effect`-into-a-plain-signal pairing (rather than readi
 
 **Showing an error:** pass a server function's error through `pages::server_error_message` (`src/frontend/pages/mod.rs`), never `e.to_string()` or `"{e}"`: `ServerFnError`'s `Display` wraps the server's message as "error running server function: … (details: None)" (SME-81). An error signal that a later action can succeed after is cleared on that success, as the sidebar's is.
 
+**A request lives in a component that outlives it.** Dioxus cancels a component's tasks when the component unmounts, so a request `spawn`ed in a conditionally rendered child is dropped if its own result, or anything else, hides that child before it finishes, and whatever it was going to clear or set stays as it was. Spawn such requests in the page component (`ChatPanel`) and pass them down as an `EventHandler` (`on_navigate`, `on_stop_pod`, `on_attach`). On SME-57's split, the browsing panel's address bar stayed disabled after its session closed mid-navigation, until the navigation moved back to `ChatPanel`.
+
 ## Streaming into the UI
 
 Sending is an ordinary request: `send()` adds an optimistic copy of the message (a negative id), calls `send_message`, and shows an error only if the request itself fails. Everything else arrives on the conversation's event stream, the same way in every tab watching the conversation:

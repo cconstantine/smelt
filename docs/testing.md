@@ -235,6 +235,8 @@ Start from `scripts/ui-check/smelt_ui.py`: a `Tab` wrapper that starts and delet
 
 Then view the screenshot (the `Read` tool renders images directly). This is a plain Python script per check, not a fixed CLI (navigating to a conversation, clicking a sidebar entry, reading back `scrollTop`/`scrollHeight` via `page.eval_on_selector`, etc.).
 
+**Before/after comparisons serve each ref from its own check worktree** (`CHECK_WORKTREE=../smelt-check-main scripts/check-server start main`, and another for the branch), not one worktree stopped and restarted on the other ref: `dx` can hand the second run the first one's bundle. Reproduce any difference once before investigating it; a race in a mock (a notice landing mid-turn in one run and after it in the other) looks like a regression too. On SME-57 both happened, and each cost a rerun.
+
 ### `scripts/browser-check/` (fallback)
 
 Before Playwright was added to the image, UI verification in this sandbox had no browser, no Node, and no Python `pip` available at all (see SME-5's and SME-8's retrospectives) — `scripts/browser-check/` is a from-scratch, pure-stdlib driver built to cover that gap, and is kept as the fallback for an environment that still lacks Docker-rebuild/root access:
