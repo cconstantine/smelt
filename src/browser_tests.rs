@@ -694,6 +694,13 @@ async fn test_end_to_end_browser_scenarios() {
         .run(pool)
         .await
         .expect("migrations should apply");
+    // Pods and claims are named after conversation, pod and volume ids,
+    // and the scratch database would count them from 1 like every
+    // real-cluster unit test's, in the same namespace: a pod another run
+    // was still stopping held up this run's first sandbox (SME-99).
+    db::test_support::start_ids_clear_of_other_runs(pool)
+        .await
+        .expect("start the ids clear of other runs");
     sandbox::init().await.expect("sandbox manager");
 
     let harness = BrowserTestHarness::start().await;

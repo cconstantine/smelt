@@ -1784,6 +1784,105 @@ async fn test_wait_for_conversation_pods_gone_waits_out_a_stopping_pod() {
     assert!(!still_there, "the wait returned while {name} was still stopping");
 }
 
+/// The pod `test_a_stopping_pod_from_another_run_doesnt_hold_up_the_tier`
+/// holds in Terminating. A fixed name, so a stopped run's leftover is easy
+/// to find, and the next run clears it first.
+const HELD_POD: &str = "sme-99-held-stopping-pod";
+const HELD_POD_FINALIZER: &str = "smelt.test/hold";
+
+/// A pod labelled as conversation 1's, which a finalizer keeps in
+/// Terminating once deleted. It never needs to run.
+fn held_pod_spec() -> Result<Pod, serde_json::Error> {
+    serde_json::from_value(serde_json::json!({
+        "metadata": {
+            "name": HELD_POD,
+            "labels": { CONVERSATION_LABEL: "1" },
+            "finalizers": [HELD_POD_FINALIZER],
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "terminationGracePeriodSeconds": 0,
+            "containers": [{
+                "name": "held",
+                "image": "docker.io/library/smelt-sandbox:latest",
+                "imagePullPolicy": "Never",
+                "command": ["sleep", "3600"],
+                "resources": {
+                    "requests": { "cpu": "10m", "memory": "16Mi" },
+                    "limits": { "cpu": "100m", "memory": "64Mi" },
+                },
+            }],
+        },
+    }))
+}
+
+/// Lets the held pod go: drops its finalizer, deletes it, and waits (up
+/// to a minute) for it to be gone. Errors are only logged: this runs on
+/// every exit path, including before a run, for a previous run's leftover.
+async fn release_held_pod(pods: &Api<Pod>) {
+    let patch = serde_json::json!({ "metadata": { "finalizers": null } });
+    let params = kube::api::PatchParams::default();
+    if let Err(e) = pods.patch(HELD_POD, &params, &kube::api::Patch::Merge(&patch)).await {
+        if !matches!(&e, kube::Error::Api(response) if response.code == 404) {
+            eprintln!("couldn't drop {HELD_POD}'s finalizer: {e}");
+        }
+    }
+    let _ = pods.delete(HELD_POD, &immediate_delete_params()).await;
+    for _ in 0..120 {
+        match pods.get_opt(HELD_POD).await {
+            Ok(None) => return,
+            Ok(Some(_)) => tokio::time::sleep(Duration::from_millis(500)).await,
+            Err(e) => {
+                eprintln!("couldn't check {HELD_POD} is gone: {e}");
+                return;
+            }
+        }
+    }
+    eprintln!("{HELD_POD} is still there after a minute");
+}
+
+/// SME-99: the browser tier's scratch database counted conversations from
+/// 1, like every real-cluster test's, so its first sandbox waited out any
+/// pod for conversation 1 another run was still stopping, and failed after
+/// the wait's limit. Holds such a pod in Terminating on purpose, then
+/// takes the tier's first conversation the way the tier does: its pod
+/// must not wait on the held one. Its own client, never the process-global
+/// manager (see `test_open_pod_port_reaches_the_conversations_own_pod`).
+/// `#[ignore]`d so it runs with the browser tier and CI's ignored tests,
+/// not alongside the unit tests that use conversation 1 for real.
+#[sqlx::test]
+#[ignore]
+async fn test_a_stopping_pod_from_another_run_doesnt_hold_up_the_tier(pool: PgPool) {
+    let client = test_client().await;
+    let pods = pods_api(&client);
+    release_held_pod(&pods).await;
+    let spec = held_pod_spec().expect("the held pod's spec");
+    pods.create(&PostParams::default(), &spec).await.expect("create the held pod");
+
+    let outcome: Result<i64, String> = async {
+        pods.delete(HELD_POD, &DeleteParams::default())
+            .await
+            .map_err(|e| format!("start deleting the held pod: {e}"))?;
+        let held = pods.get_opt(HELD_POD).await.map_err(|e| format!("read the held pod: {e}"))?;
+        if !held.is_some_and(|pod| pod.metadata.deletion_timestamp.is_some()) {
+            return Err("the held pod isn't held in Terminating".to_string());
+        }
+        db::test_support::start_ids_clear_of_other_runs(&pool)
+            .await
+            .map_err(|e| format!("move the id sequences: {e}"))?;
+        let conversation = db::create_conversation(&pool).await.map_err(|e| format!("conversation: {e}"))?;
+        wait_for_conversation_pods_gone(&client, conversation.id, Duration::from_secs(10))
+            .await
+            .map_err(|e| format!("conversation {}'s pod would wait: {e:?}", conversation.id))?;
+        Ok(conversation.id)
+    }
+    .await;
+    release_held_pod(&pods).await;
+
+    let conversation = outcome.expect("the tier's first conversation shouldn't meet another run's stopping pod");
+    assert_ne!(conversation, 1);
+}
+
 /// SME-51 B8: the listening probe (`sandbox_preview_url`) waited as
 /// long as the Kubernetes client would for a port-forward to open,
 /// minutes when the API server hangs, holding the turn.
