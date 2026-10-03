@@ -128,3 +128,159 @@ pub(in super::super) fn coalesce_mouse_moves(batch: Vec<(i64, BrowserInputEvent)
     }
     out
 }
+
+/// The live browsing panel: the address bar and the session's frames,
+/// with mouse, wheel and key input on a frame forwarded to the page.
+#[component]
+pub(in super::super) fn BrowsingPanel(
+    selected: Memo<Option<i64>>,
+    browsing_url: Signal<Option<String>>,
+    browsing_frame: Signal<Option<String>>,
+    mut address_draft: Signal<String>,
+    mut address_editing: Signal<bool>,
+    mut address_pending: Signal<bool>,
+    mut address_error: Signal<Option<String>>,
+    mut frame_shown_width: Signal<f64>,
+    browser_input: Coroutine<(i64, BrowserInputEvent)>,
+) -> Element {
+    rsx! {
+        aside { class: "browsing-panel",
+            h3 { "Live Browser" }
+            form {
+                class: "browsing-address-bar",
+                onsubmit: move |event| {
+                    event.prevent_default();
+                    let Some(id) = selected() else { return };
+                    if address_pending() {
+                        return;
+                    }
+                    let address = address_draft();
+                    address_pending.set(true);
+                    address_error.set(None);
+                    spawn(async move {
+                        let result = navigate_browser(id, address).await;
+                        // Not onto another conversation's bar (SME-51 B11).
+                        if selected() != Some(id) {
+                            return;
+                        }
+                        match result {
+                            Ok(()) => address_editing.set(false),
+                            Err(e) => address_error.set(Some(server_error_message(&e))),
+                        }
+                        address_pending.set(false);
+                    });
+                },
+                input {
+                    class: "browsing-address-input",
+                    r#type: "text",
+                    spellcheck: "false",
+                    autocomplete: "off",
+                    aria_label: "Address",
+                    placeholder: "Enter an address",
+                    disabled: address_pending(),
+                    value: address_bar_value(
+                        address_editing(),
+                        &address_draft(),
+                        browsing_url().as_deref(),
+                    ),
+                    onfocus: move |_| {
+                        if !address_editing() {
+                            address_draft.set(browsing_url().unwrap_or_default());
+                            address_editing.set(true);
+                        }
+                    },
+                    oninput: move |e| {
+                        address_draft.set(e.value());
+                        address_editing.set(true);
+                    },
+                    onblur: move |_| {
+                        if !address_pending() {
+                            address_editing.set(false);
+                        }
+                    },
+                    onkeydown: move |e: Event<KeyboardData>| {
+                        if e.data().key() == keyboard_types::Key::Escape {
+                            address_editing.set(false);
+                            address_error.set(None);
+                        }
+                    },
+                }
+            }
+            if let Some(error) = address_error() {
+                p { class: "browsing-address-error", role: "alert", "{error}" }
+            }
+            div {
+                class: "browsing-panel-frame-wrap",
+                tabindex: "0",
+                oncontextmenu: move |evt| evt.prevent_default(),
+                onresize: move |evt: Event<ResizeData>| {
+                    if let Ok(size) = evt.data().get_content_box_size() {
+                        frame_shown_width.set(size.width);
+                    }
+                },
+                onmousemove: move |evt: Event<MouseData>| {
+                    let Some(id) = selected() else { return };
+                    let p = evt.data().element_coordinates();
+                    let (x, y) = frame_point(p.x, p.y, frame_shown_width());
+                    let left_held = evt.data().held_buttons().contains(MouseButton::Primary);
+                    browser_input.send((id, BrowserInputEvent::MouseMove { x, y, left_held }));
+                },
+                onmousedown: move |evt: Event<MouseData>| {
+                    if evt.data().trigger_button() != Some(MouseButton::Primary) {
+                        return;
+                    }
+                    let Some(id) = selected() else { return };
+                    let p = evt.data().element_coordinates();
+                    let (x, y) = frame_point(p.x, p.y, frame_shown_width());
+                    browser_input.send((id, BrowserInputEvent::MouseDown { x, y }));
+                },
+                onmouseup: move |evt: Event<MouseData>| {
+                    if evt.data().trigger_button() != Some(MouseButton::Primary) {
+                        return;
+                    }
+                    let Some(id) = selected() else { return };
+                    let p = evt.data().element_coordinates();
+                    let (x, y) = frame_point(p.x, p.y, frame_shown_width());
+                    browser_input.send((id, BrowserInputEvent::MouseUp { x, y }));
+                },
+                onwheel: move |evt: Event<WheelData>| {
+                    let Some(id) = selected() else { return };
+                    let p = evt.data().element_coordinates();
+                    let (x, y) = frame_point(p.x, p.y, frame_shown_width());
+                    let (delta_x, delta_y) = wheel_delta_pixels(evt.data().delta());
+                    browser_input.send((
+                        id,
+                        BrowserInputEvent::Wheel {
+                            x,
+                            y,
+                            delta_x,
+                            delta_y,
+                        },
+                    ));
+                },
+                onkeydown: move |evt: Event<KeyboardData>| {
+                    let Some(id) = selected() else { return };
+                    let Some(input_event) = browser_input_event_for_key(
+                        evt.data().key(),
+                        evt.data().modifiers(),
+                    ) else {
+                        // Not ours to handle (a shortcut, a bare
+                        // modifier) — leave it to the viewer's browser.
+                        return;
+                    };
+                    evt.prevent_default();
+                    browser_input.send((id, input_event));
+                },
+                if let Some(data) = browsing_frame() {
+                    img {
+                        class: "browsing-panel-frame",
+                        src: "data:image/jpeg;base64,{data}",
+                        alt: "Live browsing session",
+                    }
+                } else {
+                    div { class: "browsing-panel-empty", "Waiting for the first frame…" }
+                }
+            }
+        }
+    }
+}
