@@ -153,6 +153,15 @@ pub enum ConversationEvent {
     /// some conversation), relayed like `PodsChanged` so the sidebar can
     /// mark which conversations are busy (SME-41 D9).
     TurnsChanged {},
+    /// The question this conversation waits on (SME-34): the model asked
+    /// one (`Some`), or it was answered or dismissed (`None`). Regenerable
+    /// from `api::questions::get_pending_question`.
+    QuestionUpdate {
+        question: Option<crate::questions::PendingQuestion>,
+    },
+    /// An app-wide `AppEvent::QuestionsChanged`, relayed like `TurnsChanged`
+    /// so the sidebar can mark conversations waiting on an answer.
+    QuestionsChanged {},
     /// The conversation's provider or model changed (the user chose
     /// another, or a turn took the default). Carries nothing: the tab
     /// refetches `api::chat::get_conversation_model` (SME-72).
@@ -211,6 +220,10 @@ pub enum AppEvent {
     /// A model turn started or ended in some conversation. Carries
     /// nothing: listeners refetch `api::chat::get_busy_conversations`.
     TurnsChanged,
+    /// A conversation started or stopped waiting on an answer to the
+    /// model's question (SME-34). Carries nothing: listeners refetch
+    /// `api::questions::get_waiting_conversations`.
+    QuestionsChanged,
     /// A model provider or the default model was added, edited or
     /// removed. Carries nothing: listeners refetch (SME-72).
     ProvidersChanged,
@@ -650,7 +663,7 @@ mod wire_tests {
         let json = serde_json::to_string(&event).expect("serialize");
         assert_eq!(json, r#"{"type":"PodsChanged"}"#);
         assert_eq!(serde_json::from_str::<AppEvent>(&json).expect("deserialize"), event);
-        for event in [AppEvent::TurnsChanged, AppEvent::ProvidersChanged] {
+        for event in [AppEvent::TurnsChanged, AppEvent::ProvidersChanged, AppEvent::QuestionsChanged] {
             let json = serde_json::to_string(&event).expect("serialize");
             assert_eq!(serde_json::from_str::<AppEvent>(&json).expect("deserialize"), event);
         }
@@ -682,6 +695,22 @@ mod wire_tests {
             ConversationEvent::TurnState { running: true },
             ConversationEvent::PodsChanged {},
             ConversationEvent::TurnsChanged {},
+            ConversationEvent::QuestionsChanged {},
+            ConversationEvent::QuestionUpdate { question: None },
+            ConversationEvent::QuestionUpdate {
+                question: Some(crate::questions::PendingQuestion {
+                    tool_use_id: "toolu_q".to_string(),
+                    questions: vec![crate::questions::Question {
+                        question: "Delete it?".to_string(),
+                        header: "Delete".to_string(),
+                        options: vec![
+                            crate::questions::QuestionOption { label: "Yes".to_string(), description: None },
+                            crate::questions::QuestionOption { label: "No".to_string(), description: Some("keep it".to_string()) },
+                        ],
+                        multi_select: false,
+                    }],
+                }),
+            },
             ConversationEvent::ModelChanged {},
             ConversationEvent::ProvidersChanged {},
             ConversationEvent::MessagesAppended { messages: vec![Message {

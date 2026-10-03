@@ -283,7 +283,7 @@ pub(crate) async fn open_conversation_events(
 }
 
 /// Everything a tab watching `id` hears: that conversation's events, plus
-/// the app-wide `PodsChanged`, `TurnsChanged` and `ProvidersChanged`, relayed as their
+/// the app-wide `PodsChanged`, `TurnsChanged`, `QuestionsChanged` and `ProvidersChanged`, relayed as their
 /// `ConversationEvent` namesakes for the sidebar.
 /// Ends when the conversation's channel closes (it was deleted).
 #[cfg(feature = "server")]
@@ -320,6 +320,10 @@ pub(crate) fn conversation_event_stream(
                     }
                     Ok(events::AppEvent::ProvidersChanged) => {
                         let event = events::ConversationEvent::ProvidersChanged {};
+                        return Some((Ok(event), (conversation, app)));
+                    }
+                    Ok(events::AppEvent::QuestionsChanged) => {
+                        let event = events::ConversationEvent::QuestionsChanged {};
                         return Some((Ok(event), (conversation, app)));
                     }
                     // Only ever decoded, never published.

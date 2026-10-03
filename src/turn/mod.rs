@@ -15,6 +15,7 @@ use crate::{anthropic, db};
 mod compaction;
 mod history;
 mod notify;
+mod questions;
 mod run;
 mod state;
 #[cfg(test)]
@@ -25,5 +26,6 @@ mod tests;
 use self::compaction::*;
 pub(crate) use self::history::*;
 pub(crate) use self::notify::*;
+pub(crate) use self::questions::*;
 pub(crate) use self::run::*;
 pub(crate) use self::state::*;

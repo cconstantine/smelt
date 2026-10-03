@@ -44,6 +44,10 @@ use crate::api::sandbox::{
 };
 #[cfg(feature = "web")]
 use crate::events::ConversationEvent;
+use crate::questions::{PendingQuestion, QuestionAnswer, ASK_USER};
+use crate::api::questions::{answer_question, get_waiting_conversations};
+#[cfg(feature = "web")]
+use crate::api::questions::get_pending_question;
 use crate::events::SandboxPreview;
 use crate::frontend::Route;
 use crate::models::{Conversation, Message};
@@ -1192,6 +1196,15 @@ fn task_notice_sentence(text: &str) -> Option<String> {
     None
 }
 
+/// The answer lines of an `ask_user` result, as the model got them:
+/// "1. Delete: Yes", or what it was told when the user wrote instead.
+fn answered_lines(result: &str) -> Vec<String> {
+    match result.strip_prefix("The user answered:") {
+        Some(rest) => rest.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect(),
+        None => vec!["Not answered: you wrote a message instead.".to_string()],
+    }
+}
+
 /// user- and assistant-aligned bubbles, so a tool call/result reads as
 /// "the agent doing something" rather than "someone said something."
 fn render_block_element(
@@ -1280,6 +1293,35 @@ fn render_block_element(
                 }
             }
         }
+        // The model's question (SME-34): while it waits, the card below
+        // the transcript asks it; once answered, a compact row with each
+        // question and the answer the model got.
+        ContentBlock::ToolUse { id, name, input } if name == ASK_USER => match tool_results.get(id) {
+            Some((result, _)) => {
+                let questions: Vec<String> = input
+                    .get("questions")
+                    .and_then(|q| q.as_array())
+                    .map(|qs| qs.iter().filter_map(|q| q.get("question").and_then(|t| t.as_str()).map(str::to_string)).collect())
+                    .unwrap_or_default();
+                let answer = answered_lines(result);
+                rsx! {
+                    div { key: "{key}", class: "question-answered",
+                        div { class: "question-answered-header",
+                            span { class: "question-answered-icon", "?" }
+                            span { "Asked" }
+                            span { class: "timestamp", "{timestamp}" }
+                        }
+                        for (i , question) in questions.iter().enumerate() {
+                            p { key: "q{i}", class: "question-answered-question", "{question}" }
+                        }
+                        for (i , line) in answer.iter().enumerate() {
+                            p { key: "a{i}", class: "question-answered-answer", "{line}" }
+                        }
+                    }
+                }
+            }
+            None => rsx! {},
+        },
         // One compact line per call, saying what it did, with its result
         // folded in: the raw input and result are one click away, and a
         // failed call starts open (SME-41 D2).
@@ -2603,11 +2645,14 @@ pub fn Chat() -> Element {
     // Bumped the same way when a turn starts or ends in any conversation
     // (`ConversationEvent::TurnsChanged`), for the sidebar's busy marks.
     let turns_changed = use_signal(|| 0u64);
+    // Bumped when a conversation starts or stops waiting on an answer to
+    // the model's question (`ConversationEvent::QuestionsChanged`, SME-34).
+    let questions_changed = use_signal(|| 0u64);
 
     rsx! {
         div { class: "chat-layout",
-            ConversationSidebar { selected, conversations_changed, pods_changed, turns_changed }
-            ChatPanel { selected, conversations_changed, pods_changed, turns_changed }
+            ConversationSidebar { selected, conversations_changed, pods_changed, turns_changed, questions_changed }
+            ChatPanel { selected, conversations_changed, pods_changed, turns_changed, questions_changed }
         }
     }
 }
@@ -2618,6 +2663,7 @@ fn ConversationSidebar(
     conversations_changed: Signal<u64>,
     pods_changed: Signal<u64>,
     turns_changed: Signal<u64>,
+    questions_changed: Signal<u64>,
 ) -> Element {
     let navigator = use_navigator();
     // Which conversations have a live pod, for the dot next to their title.
@@ -2635,6 +2681,13 @@ fn ConversationSidebar(
         crate::api::chat::get_busy_conversations()
     });
     let is_busy = move |id: i64| matches!(&*busy.read(), Some(Ok(ids)) if ids.contains(&id));
+    // Which conversations wait on the user's answer to the model's question
+    // (SME-34).
+    let waiting = use_resource(move || {
+        let _ = questions_changed();
+        get_waiting_conversations()
+    });
+    let is_waiting = move |id: i64| matches!(&*waiting.read(), Some(Ok(ids)) if ids.contains(&id));
     let initial_conversations = use_resource(move || {
         let _ = conversations_changed();
         get_conversations()
@@ -2764,6 +2817,9 @@ fn ConversationSidebar(
                             if is_busy(conversation.id) {
                                 span { class: "conversation-busy", title: "Working" }
                             }
+                            if is_waiting(conversation.id) {
+                                span { class: "conversation-waiting", title: "Waiting for your answer", "?" }
+                            }
                             if has_live_pod(conversation.id) {
                                 span { class: "live-pod-dot", title: "sandbox pod running" }
                             }
@@ -2787,12 +2843,118 @@ fn ConversationSidebar(
     }
 }
 
+/// The card for the question conversation `conversation_id` waits on
+/// (SME-34): each question with its options (buttons, toggles when
+/// multi-select) and an "Other" field, then Submit. A single question with
+/// single-choice options answers on the click. The card goes when every tab
+/// hears the question is answered (`QuestionUpdate { question: None }`);
+/// another tab's answer first makes this one's fail with "already answered".
+#[component]
+fn QuestionCard(conversation_id: i64, question: PendingQuestion) -> Element {
+    let count = question.questions.len();
+    let mut chosen: Signal<Vec<Vec<String>>> = use_signal(|| vec![Vec::new(); count]);
+    let mut others: Signal<Vec<String>> = use_signal(|| vec![String::new(); count]);
+    let mut error: Signal<Option<String>> = use_signal(|| None);
+    let mut sending = use_signal(|| false);
+    let answers = move || -> Vec<QuestionAnswer> {
+        chosen()
+            .into_iter()
+            .zip(others())
+            .map(|(selected, other)| QuestionAnswer {
+                selected,
+                other: Some(other.trim().to_string()).filter(|t| !t.is_empty()),
+            })
+            .collect()
+    };
+    let complete = move || answers().iter().all(|a| !a.selected.is_empty() || a.other.is_some());
+    let tool_use_id = question.tool_use_id.clone();
+    let submit = use_callback(move |answers: Vec<QuestionAnswer>| {
+        let tool_use_id = tool_use_id.clone();
+        sending.set(true);
+        error.set(None);
+        spawn(async move {
+            if let Err(e) = answer_question(conversation_id, tool_use_id, answers).await {
+                error.set(Some(server_error_message(&e)));
+                sending.set(false);
+            }
+        });
+    });
+    let one_click = count == 1 && !question.questions[0].multi_select && !question.questions[0].options.is_empty();
+    rsx! {
+        div { class: "question-card", role: "group", aria_label: "The model asks",
+            for (qi , q) in question.questions.iter().cloned().enumerate() {
+                fieldset { key: "{qi}", class: "question-card-question",
+                    legend { class: "question-card-header", "{q.header}" }
+                    p { class: "question-card-text", "{q.question}" }
+                    if !q.options.is_empty() {
+                        div { class: "question-card-options",
+                            for (oi , option) in q.options.iter().cloned().enumerate() {
+                                button {
+                                    key: "{oi}",
+                                    r#type: "button",
+                                    class: if chosen()[qi].contains(&option.label) { "question-option chosen" } else { "question-option" },
+                                    aria_pressed: "{chosen()[qi].contains(&option.label)}",
+                                    disabled: sending(),
+                                    onclick: {
+                                        let label = option.label.clone();
+                                        let multi = q.multi_select;
+                                        move |_| {
+                                            {
+                                                let mut all = chosen.write();
+                                                let picked = &mut all[qi];
+                                                if !multi {
+                                                    *picked = vec![label.clone()];
+                                                } else if let Some(at) = picked.iter().position(|l| *l == label) {
+                                                    picked.remove(at);
+                                                } else {
+                                                    picked.push(label.clone());
+                                                }
+                                            }
+                                            if one_click {
+                                                submit(answers());
+                                            }
+                                        }
+                                    },
+                                    span { class: "question-option-label", "{option.label}" }
+                                    if let Some(description) = option.description.clone() {
+                                        span { class: "question-option-description", "{description}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    input {
+                        r#type: "text",
+                        class: "question-card-other",
+                        aria_label: "Your own answer to {q.header}",
+                        placeholder: if q.options.is_empty() { "Your answer" } else { "Or write your own answer" },
+                        value: "{others()[qi]}",
+                        disabled: sending(),
+                        oninput: move |e| others.write()[qi] = e.value(),
+                    }
+                }
+            }
+            if let Some(message) = error() {
+                p { class: "error", role: "alert", "{message}" }
+            }
+            button {
+                r#type: "button",
+                class: "question-card-submit",
+                disabled: sending() || !complete(),
+                onclick: move |_| submit(answers()),
+                if sending() { "Sending…" } else { "Submit" }
+            }
+        }
+    }
+}
+
 #[component]
 fn ChatPanel(
     selected: Memo<Option<i64>>,
     conversations_changed: Signal<u64>,
     pods_changed: Signal<u64>,
     turns_changed: Signal<u64>,
+    questions_changed: Signal<u64>,
 ) -> Element {
     let initial_messages = use_resource(move || {
         let id = selected();
@@ -2885,6 +3047,9 @@ fn ChatPanel(
     let mut next_temp_id = use_signal(|| -1i64);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut todos: Signal<Vec<TodoItem>> = use_signal(Vec::new);
+    // The question this conversation waits on, for its card (SME-34).
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut pending_question: Signal<Option<PendingQuestion>> = use_signal(|| None);
     // "Work on a repo" in a new conversation.
     let mut repo_url = use_signal(String::new);
     let mut repo_branch = use_signal(String::new);
@@ -3102,6 +3267,7 @@ fn ChatPanel(
             pod_stop_error.set(None);
             context_detail.set(None);
             context_detail_open.set(false);
+            pending_question.set(None);
             address_pending.set(false);
             address_draft.set(String::new());
 
@@ -3142,6 +3308,9 @@ fn ChatPanel(
                         }
                         if let Ok(snapshot) = get_todos(id).await {
                             todos.set(snapshot);
+                        }
+                        if let Ok(snapshot) = get_pending_question(id).await {
+                            pending_question.set(snapshot);
                         }
                         if let Ok(snapshot) = list_conversation_repos(id).await {
                             repos.set(snapshot);
@@ -3259,6 +3428,12 @@ fn ChatPanel(
                                 }
                                 Some(Ok(ConversationEvent::TurnsChanged {})) => {
                                     *turns_changed.write() += 1;
+                                }
+                                Some(Ok(ConversationEvent::QuestionUpdate { question })) => {
+                                    pending_question.set(question);
+                                }
+                                Some(Ok(ConversationEvent::QuestionsChanged {})) => {
+                                    *questions_changed.write() += 1;
                                 }
                                 Some(Ok(ConversationEvent::ModelChanged {} | ConversationEvent::ProvidersChanged {})) => {
                                     *model_changed.write() += 1;
@@ -4219,6 +4394,10 @@ fn ChatPanel(
                             if let Some(err) = repo_action_error() {
                                 p { class: "error", "{err}" }
                             }
+                            // The model's question, waiting on the user (SME-34).
+                            if let (Some(id), Some(question)) = (selected(), pending_question()) {
+                                QuestionCard { key: "{question.tool_use_id}", conversation_id: id, question }
+                            }
                         }
                         if !conversation_missing() {
                         if let Some(id) = selected() {
@@ -4234,7 +4413,7 @@ fn ChatPanel(
                                 r#type: "text",
                                 value: "{input}",
                                 disabled: is_streaming(),
-                                placeholder: "Type a message...",
+                                placeholder: if pending_question().is_some() { "Answer the question above, or write a reply instead" } else { "Type a message..." },
                                 oninput: move |e| input.set(e.value()),
                             }
                             button {

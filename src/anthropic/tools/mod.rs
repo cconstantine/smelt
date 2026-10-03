@@ -93,6 +93,8 @@ mod lsp;
 #[cfg(feature = "server")]
 mod pods;
 #[cfg(feature = "server")]
+mod questions;
+#[cfg(feature = "server")]
 mod todos;
 #[cfg(feature = "server")]
 mod web;
@@ -102,7 +104,16 @@ mod web;
 /// request like adding or removing a tool would.
 #[cfg(feature = "server")]
 static REGISTRY: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(|| {
-    [pods::tools(), files::tools(), todos::tools(), git::tools(), web::tools(), browser::tools(), lsp::tools()]
+    [
+        pods::tools(),
+        files::tools(),
+        todos::tools(),
+        git::tools(),
+        web::tools(),
+        browser::tools(),
+        lsp::tools(),
+        questions::tools(),
+    ]
         .into_iter()
         .flatten()
         .collect()
