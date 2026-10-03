@@ -754,6 +754,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "context_from_the_keyboard", 60, Box::pin(scenario_context_from_the_keyboard(&t))).await;
     run_scenario(&t, only, r, k, "error_text", 60, Box::pin(scenario_error_text(&t))).await;
     run_scenario(&t, only, r, k, "settings_two_step", 60, Box::pin(scenario_settings_two_step(&t))).await;
+    run_scenario(&t, only, r, k, "pointer_keeps_text_still", 120, Box::pin(scenario_pointer_keeps_text_still(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -2365,6 +2366,109 @@ async fn scenario_transcript_scroll(t: &Scenario<'_>) {
         (8.0..=12.0).contains(&distance),
         "a 10px scroll up should stay where it was put, but the transcript is {distance}px from its bottom"
     );
+}
+
+/// SME-75: with the pointer over the transcript, a side panel appearing
+/// doesn't move what's under it. In a wide window the panel sits beside the
+/// chat and narrows it, which re-wraps long messages; in a narrow one it
+/// sits above the chat and pushes the transcript's top edge down. The
+/// transcript used to snap to its new bottom either way. After the pointer
+/// leaves, it catches up to its bottom.
+async fn scenario_pointer_keeps_text_still(t: &Scenario<'_>) {
+    // Where the pointer rests, as a fraction of the transcript's height: high
+    // up in the wide window, so a lot of text below it re-wraps when the
+    // panel narrows the chat; low in the narrow one, where the panel takes
+    // the top of the window.
+    for (width, height, aim) in [(1400, 900, 0.25), (800, 900, 0.75)] {
+        let conversation = t.conversation().await;
+        for i in 0..30 {
+            db::create_message(
+                t.pool,
+                conversation.id,
+                if i % 2 == 0 { "user" } else { "assistant" },
+                &[anthropic::ContentBlock::Text {
+                    text: format!("message {i}: {}", "a long line that wraps across the width of the chat column ".repeat(6)),
+                }],
+            )
+            .await
+            .expect("seed a message");
+        }
+        let page = t.tab("about:blank").await;
+        page.execute(
+            chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(width, height, 1.0, false),
+        )
+        .await
+        .expect("set the window size");
+        page.goto(t.url(&format!("conversation/{}", conversation.id)))
+            .await
+            .expect("open the conversation");
+        wait_for_live_client(&page, conversation.id).await;
+        wait_for_transcript_at_bottom(&page).await;
+        let centre: Vec<f64> = page
+            .evaluate(format!("(() => {{ const r = document.querySelector('.messages').getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height * {aim}]; }})()"))
+            .await
+            .expect("read the transcript's box")
+            .into_value()
+            .expect("two numbers");
+        // Two moves, so the page sees the pointer move over the transcript.
+        for dx in [0.0, 1.0] {
+            page.move_mouse(chromiumoxide::layout::Point::new(centre[0] + dx, centre[1]))
+                .await
+                .expect("move the mouse over the transcript");
+        }
+        let watch = format!(
+            "(() => {{ window.__sme75 = document.elementFromPoint({}, {}); return window.__sme75 ? window.__sme75.getBoundingClientRect().top : null; }})()",
+            centre[0] + 1.0,
+            centre[1]
+        );
+        let before: f64 = page
+            .evaluate(watch.as_str())
+            .await
+            .expect("read what's under the pointer")
+            .into_value()
+            .expect("an element under the pointer");
+        sandbox::create_pod(t.pool, conversation.id, Default::default()).await.expect("create_pod");
+        wait_for_element(&page, ".sandbox-panel", Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let after: f64 = page
+            .evaluate("window.__sme75.getBoundingClientRect().top")
+            .await
+            .expect("read where it is now")
+            .into_value()
+            .expect("a number");
+        assert!(
+            (after - before).abs() <= 2.0,
+            "at {width}px the text under the pointer moved when the sandbox panel appeared: top {before} -> {after}"
+        );
+        page.move_mouse(chromiumoxide::layout::Point::new(5.0, 5.0))
+            .await
+            .expect("move the mouse off the transcript");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let distance = transcript_distance_from_bottom(&page).await;
+        assert!(
+            distance <= 1.0,
+            "at {width}px, once the pointer left, the transcript should catch up to its bottom, but it's {distance}px away"
+        );
+    }
+}
+
+/// Waits until `.messages` has settled at its bottom: the same distance,
+/// within a pixel of it, on two reads 300 ms apart.
+async fn wait_for_transcript_at_bottom(page: &chromiumoxide::Page) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last = f64::NAN;
+    loop {
+        let distance = transcript_distance_from_bottom(page).await;
+        if distance <= 1.0 && distance == last {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the transcript never settled at its bottom: {distance}px away"
+        );
+        last = distance;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 }
 
 /// SME-82: the context bar and its detail view work from the

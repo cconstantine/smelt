@@ -1898,6 +1898,11 @@ div.mcp-status-not-connected::before {
     background: var(--canvas);
 }
 
+/* Holds the bar's space until the usage loads (SME-75). */
+.context-usage-bar-pending {
+    visibility: hidden;
+}
+
 .context-usage-track {
     flex: 1;
     max-width: 200px;
