@@ -63,7 +63,7 @@ async fn main() -> Result<(), BoxError> {
     let client = kube::Client::try_default().await?;
     let pods: Api<Pod> = Api::namespaced(client, NAMESPACE);
 
-    let loader = loader_name(std::process::id());
+    let loader = loader_name(std::process::id(), run_nonce());
     let result = if arg == "--check" {
         let refs: Vec<String> = std::env::args().skip(2).collect();
         check(&pods, &loader, &check_targets(&refs)).await
@@ -99,25 +99,45 @@ async fn import(pods: &Api<Pod>, loader: &str, tar_path: &str) -> Result<(), Box
     Ok(())
 }
 
-/// This run's loader pod: `sandbox-image-import-<run>`, `run` being the
-/// process id. A run used to share one fixed name with every other, and
+/// This run's loader pod: `sandbox-image-import-<run>-<nonce>`, `run` being
+/// the process id and `nonce` a per-run number, since process ids repeat
+/// across containers. A run used to share one fixed name with every other, and
 /// creating its loader deleted whichever was there, so a cluster check in
 /// one worktree could kill another's import mid-stream (SME-102 review).
-fn loader_name(run: u32) -> String {
-    format!("{LOADER_POD_NAME}-{run}")
+fn loader_name(run: u32, nonce: u32) -> String {
+    format!("{LOADER_POD_NAME}-{run}-{nonce:08x}")
 }
 
-/// The loaders in `listed` that have finished (their `sleep` ran out, or
-/// they failed): safe to delete, unlike a live one, which belongs to a run
-/// still going.
-fn finished_loaders(listed: &[Pod]) -> Vec<String> {
+/// A per-run number to go with the process id, which is only unique
+/// within one container: two `docker compose run`s can both be pid 7
+/// (SME-102 review 2).
+fn run_nonce() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
+        .unwrap_or(0)
+}
+
+/// The loaders in `listed` no run can still be using: those whose `sleep`
+/// ran out, and failed ones older than a loader's lifetime. A live one
+/// belongs to a run still going, and so may a failed one that's younger:
+/// its run reads why it failed to report it (SME-89; SME-102 review 2).
+fn finished_loaders(listed: &[Pod], now: k8s_openapi::jiff::Timestamp) -> Vec<String> {
+    let older_than_a_lifetime = |pod: &Pod| {
+        pod.metadata
+            .creation_timestamp
+            .as_ref()
+            .is_some_and(|t| now.duration_since(t.0).as_secs() > LOADER_LIFETIME.as_secs() as i64)
+    };
     listed
         .iter()
-        .filter(|pod| {
-            matches!(
-                pod.status.as_ref().and_then(|s| s.phase.as_deref()),
-                Some("Succeeded") | Some("Failed")
-            )
+        .filter(|pod| match pod.status.as_ref().and_then(|s| s.phase.as_deref()) {
+            // Its `sleep` ran out: no run can still be using it.
+            Some("Succeeded") => true,
+            // Evicted, say: its run may still be reading why, so only once
+            // that run has certainly ended.
+            Some("Failed") => older_than_a_lifetime(pod),
+            _ => false,
         })
         .filter_map(|pod| pod.metadata.name.clone())
         .collect()
@@ -130,7 +150,7 @@ async fn start_loader(pods: &Api<Pod>, name: &str, lifetime: Duration) -> Result
     // which another run is still using.
     let selector = format!("{}={}", LOADER_LABEL.0, LOADER_LABEL.1);
     if let Ok(listed) = pods.list(&ListParams::default().labels(&selector)).await {
-        for finished in finished_loaders(&listed.items) {
+        for finished in finished_loaders(&listed.items, k8s_openapi::jiff::Timestamp::now()) {
             let _ = pods.delete(&finished, &immediate_delete()).await;
         }
     }
@@ -550,13 +570,14 @@ mod tests {
         Ok(())
     }
 
-    /// The loader outlives any import CI can run: the job's own limit is
-    /// 60 minutes (`.github/workflows/ci.yml`), and a slow runner once
-    /// took longer than the old 300 s just to stream the tarball (SME-89).
+    /// Each run's loader has a name of its own, so one run can't delete
+    /// another's (SME-102 review), even when their process ids match.
     #[test]
     fn test_each_run_gets_a_loader_of_its_own() {
-        let (a, b) = (loader_name(1234), loader_name(5678));
+        let (a, b) = (loader_name(1234, 1), loader_name(5678, 1));
         assert_ne!(a, b);
+        // Two containers' runs can share a process id.
+        assert_ne!(loader_name(7, 1), loader_name(7, 2));
         assert!(a.starts_with("sandbox-image-import-") && b.starts_with("sandbox-image-import-"), "{a} {b}");
         let labels = loader_pod_spec(&a, LOADER_LIFETIME).metadata.labels.unwrap_or_default();
         assert_eq!(labels.get(LOADER_LABEL.0).map(String::as_str), Some(LOADER_LABEL.1));
@@ -564,21 +585,34 @@ mod tests {
 
     #[test]
     fn test_only_finished_loaders_are_cleaned_up() {
-        let pod = |name: &str, phase: Option<&str>| Pod {
-            metadata: ObjectMeta { name: Some(name.to_string()), ..Default::default() },
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use k8s_openapi::jiff::Timestamp;
+        let now = Timestamp::from_second(1_000_000).expect("a timestamp");
+        let pod = |name: &str, phase: Option<&str>, age_secs: i64| Pod {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                creation_timestamp: Some(Time(Timestamp::from_second(1_000_000 - age_secs).expect("a timestamp"))),
+                ..Default::default()
+            },
             status: phase.map(|p| k8s_openapi::api::core::v1::PodStatus { phase: Some(p.to_string()), ..Default::default() }),
             ..Default::default()
         };
+        let old = LOADER_LIFETIME.as_secs() as i64 + 60;
         let listed = vec![
-            pod("done", Some("Succeeded")),
-            pod("evicted", Some("Failed")),
-            pod("live", Some("Running")),
-            pod("starting", Some("Pending")),
-            pod("unknown", None),
+            pod("done", Some("Succeeded"), 10),
+            pod("evicted-long-ago", Some("Failed"), old),
+            // Its run may still be reading why it failed (SME-89's reason).
+            pod("evicted-just-now", Some("Failed"), 10),
+            pod("live", Some("Running"), old),
+            pod("starting", Some("Pending"), 10),
+            pod("unknown", None, old),
         ];
-        assert_eq!(finished_loaders(&listed), vec!["done".to_string(), "evicted".to_string()]);
+        assert_eq!(finished_loaders(&listed, now), vec!["done".to_string(), "evicted-long-ago".to_string()]);
     }
 
+    /// The loader outlives any import CI can run: the job's own limit is
+    /// 60 minutes (`.github/workflows/ci.yml`), and a slow runner once
+    /// took longer than the old 300 s just to stream the tarball (SME-89).
     #[test]
     fn test_the_loader_lives_as_long_as_the_ci_job() {
         let spec = loader_pod_spec(LOADER_POD_NAME, LOADER_LIFETIME);
