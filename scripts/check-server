@@ -178,8 +178,11 @@ start() {
         image=$("$worktree/scripts/sandbox-image-ref")
         overrides=("SANDBOX_IMAGE=$image" "${overrides[@]}")
     fi
-    if [ -n "$image" ]; then
-        SANDBOX_IMAGE=$image "$repo/scripts/cluster-doctor"
+    if [ -n "$image" ] && ! SANDBOX_IMAGE=$image "$repo/scripts/cluster-doctor"; then
+        # The doctor's own advice is for this checkout; the image it wants is
+        # the served ref's, built from the check worktree (SME-102 review).
+        echo "check-server: build $image from the served ref: (cd $worktree && scripts/build-sandbox-image.sh)" >&2
+        exit 1
     fi
     if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
         local db_url
