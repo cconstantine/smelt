@@ -955,7 +955,7 @@ async fn test_a_wake_with_no_model_still_saves_the_notice(pool: PgPool) {
         .await
         .expect_err("no model to deliver to");
 
-    assert_eq!(chat_error_text(&error), crate::providers::NO_MODEL_CONFIGURED);
+    assert_eq!(error.message(), crate::providers::NO_MODEL_CONFIGURED);
     let saved = db::list_messages(&pool, conversation.id).await.expect("list messages");
     assert_eq!(saved.len(), 1, "the notice is saved: {saved:?}");
     let failure = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1474,7 +1474,7 @@ async fn test_a_stop_just_after_the_message_is_saved_keeps_it_once(pool: PgPool)
         .await
         .expect("the turn ends after the stop")
         .expect("join");
-    assert_eq!(result.err().map(|e| chat_error_text(&e)).as_deref(), Some(TURN_STOPPED));
+    assert!(matches!(result, Err(TurnFailure::Stopped)), "{result:?}");
     let saved = db::list_messages(&pool, conversation.id).await.expect("list");
     let copies = saved.iter().filter(|m| m.content.contains("\"hello\"")).count();
     assert_eq!(copies, 1, "the user's message is saved once: {saved:?}");
@@ -1709,10 +1709,7 @@ async fn test_a_notice_queued_behind_a_stopped_turn_is_still_saved(pool: PgPool)
     // The running turn ends on the stop too, releasing the lock.
     drop(running);
     let result = queued.await.expect("join");
-    assert_eq!(
-        result.err().map(|e| chat_error_text(&e)).as_deref(),
-        Some(TURN_STOPPED)
-    );
+    assert!(matches!(result, Err(TurnFailure::Stopped)), "{result:?}");
 
     let saved = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -1759,7 +1756,7 @@ async fn test_one_stop_is_noted_once(pool: PgPool) {
             .await
             .expect("a stopped turn ends")
             .expect("join");
-        assert_eq!(result.err().map(|e| chat_error_text(&e)).as_deref(), Some(TURN_STOPPED));
+        assert!(matches!(result, Err(TurnFailure::Stopped)), "{result:?}");
     }
 
     let saved = db::list_messages(&pool, conversation.id).await.expect("list");
@@ -1914,7 +1911,7 @@ async fn test_run_turn_without_a_model_still_saves_the_message(pool: PgPool) {
     let error = run_turn(&pool, conversation.id, hello())
         .await
         .expect_err("no provider should fail the turn");
-    assert_eq!(chat_error_text(&error), crate::providers::NO_MODEL_CONFIGURED);
+    assert_eq!(error.message(), crate::providers::NO_MODEL_CONFIGURED);
     let saved = db::list_messages(&pool, conversation.id)
         .await
         .expect("list messages");

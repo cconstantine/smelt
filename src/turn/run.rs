@@ -66,7 +66,7 @@ pub(crate) fn run_turn<'a>(
     pool: &'a PgPool,
     conversation_id: i64,
     new_message: anthropic::AnthropicMessage,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = TurnResult> + Send + 'a>>
 {
     run_turn_bounded(
         pool,
@@ -76,6 +76,43 @@ pub(crate) fn run_turn<'a>(
         false,
     )
 }
+
+/// How a turn that didn't finish ended: the user stopped it, or it
+/// failed.
+#[derive(Debug)]
+pub(crate) enum TurnFailure {
+    Stopped,
+    Failed(ServerFnError),
+}
+
+impl TurnFailure {
+    /// The text a tab is shown (`TurnError`): `TURN_STOPPED` for a stop,
+    /// which the page shows as "Stopped.".
+    pub(crate) fn message(&self) -> String {
+        match self {
+            TurnFailure::Stopped => TURN_STOPPED.to_string(),
+            TurnFailure::Failed(e) => chat_error_text(e),
+        }
+    }
+}
+
+impl std::fmt::Display for TurnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TurnFailure::Stopped => f.write_str(TURN_STOPPED),
+            TurnFailure::Failed(e) => e.fmt(f),
+        }
+    }
+}
+
+impl From<ServerFnError> for TurnFailure {
+    fn from(e: ServerFnError) -> Self {
+        TurnFailure::Failed(e)
+    }
+}
+
+/// A turn's messages, saved in order, or how it ended early.
+pub(crate) type TurnResult = Result<Vec<Message>, TurnFailure>;
 
 /// Adds a message the turn just saved to `persisted` and tells every tab
 /// watching the conversation, right away: the user's own message first,
@@ -104,7 +141,7 @@ pub(super) fn run_turn_bounded<'a>(
     new_message: Option<anthropic::AnthropicMessage>,
     max_turns: usize,
     keep_error: bool,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = TurnResult> + Send + 'a>>
 {
     Box::pin(async move {
         // Before the stop receiver, so it's dropped after it: the last turn
@@ -116,10 +153,7 @@ pub(super) fn run_turn_bounded<'a>(
         let result = run_turn_stoppable(pool, conversation_id, new_message, max_turns, &mut stop).await;
         // Kept for a tab that reconnects, unless a newer turn has started
         // since this one did: its outcome is the one to show (SME-91).
-        if keep_error
-            && let Err(e) = &result
-            && chat_error_text(e) != TURN_STOPPED
-        {
+        if keep_error && let Err(TurnFailure::Failed(e)) = &result {
             keep_turn_error(conversation_id, generation, chat_error_text(e));
         }
         result
@@ -135,7 +169,7 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
     new_message: Option<anthropic::AnthropicMessage>,
     max_turns: usize,
     stop: &'b mut tokio::sync::watch::Receiver<u64>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'b>>
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = TurnResult> + Send + 'b>>
 {
     Box::pin(async move {
         let lock = conversation_lock(conversation_id);
@@ -155,14 +189,14 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
                     }
                 }
                 end_stopped_turn(pool, conversation_id, stopped_by).await;
-                return Err(ServerFnError::new(TURN_STOPPED));
+                return Err(TurnFailure::Stopped);
             }
         };
         if !db::conversation_exists(pool, conversation_id)
             .await
             .map_err(ServerFnError::new)?
         {
-            return Err(ServerFnError::new("conversation not found"));
+            return Err(ServerFnError::new("conversation not found").into());
         }
         // Saved holding the lock and outside the stop's `select!`, so a
         // Stop can't land between the INSERT and the turn knowing it's
@@ -178,14 +212,14 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
         }
         let new_content = new_message.map(|message| message.content);
         tokio::select! {
-            result = run_turn_body(pool, conversation_id, guard, persisted, new_content, max_turns) => return result,
+            result = run_turn_body(pool, conversation_id, guard, persisted, new_content, max_turns) => return result.map_err(TurnFailure::Failed),
             _ = stop.changed() => {}
         }
         // Stopped mid-turn: the body, and its hold on the lock, is gone.
         let stopped_by = *stop.borrow_and_update();
         let _turn = lock.lock().await;
         end_stopped_turn(pool, conversation_id, stopped_by).await;
-        Err(ServerFnError::new(TURN_STOPPED))
+        Err(TurnFailure::Stopped)
     })
 }
 
@@ -278,7 +312,7 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     tokio::spawn(async move {
         // Its failure is kept for a reconnecting tab (`keep_error`).
         if let Err(e) = run_turn_bounded(&pool, id, Some(new_message), MAX_TURNS, true).await {
-            let message = chat_error_text(&e);
+            let message = e.message();
             crate::events::publish(id, crate::events::ConversationEvent::TurnError { message });
         }
     });

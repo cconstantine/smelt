@@ -52,9 +52,7 @@ pub(crate) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: St
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text }],
     };
-    if let Err(e) = run_turn(pool, conversation_id, message).await
-        && chat_error_text(&e) != TURN_STOPPED
-    {
+    if let Err(TurnFailure::Failed(e)) = run_turn(pool, conversation_id, message).await {
         tracing::warn!(conversation_id, error = %e, "a notice didn't reach the model");
         crate::events::publish(
             conversation_id,
@@ -87,7 +85,7 @@ pub(crate) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: St
 pub(crate) async fn wake_conversation(
     pool: &PgPool,
     conversation_id: i64,
-) -> ServerFnResult<Vec<Message>> {
+) -> TurnResult {
     // After the user stopped this conversation, pending notices wait for
     // their next message, which drains them the same way (see `PAUSED`).
     if is_paused(conversation_id) {
@@ -95,9 +93,7 @@ pub(crate) async fn wake_conversation(
     }
     let result = run_turn_bounded(pool, conversation_id, None, MAX_TURNS, false).await;
     // A stop is the user's doing, not a failure to reach the model.
-    if let Err(e) = &result
-        && chat_error_text(e) != TURN_STOPPED
-    {
+    if let Err(TurnFailure::Failed(e)) = &result {
         tracing::warn!(conversation_id, error = %e, "wake_conversation failed to notify the model");
         crate::events::publish(
             conversation_id,
