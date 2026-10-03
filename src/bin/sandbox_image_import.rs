@@ -3,9 +3,10 @@
 //! custom sandbox image (see
 //! SME-17's Phase 1). Run by
 //! `scripts/build-sandbox-image.sh` after `docker build`/`docker save`,
-//! never by the main `smelt` server process at runtime. With `--check`
-//! instead of a tarball, it only checks that the node still has every
-//! sandbox image (`scripts/cluster-doctor`).
+//! never by the main `smelt` server process at runtime. With `--check
+//! [reference...]` instead of a tarball, it only checks that the node has
+//! those images (default: `SANDBOX_IMAGES`), with the read-only
+//! `ctr images ls -q` (`scripts/cluster-doctor`, SME-102).
 //!
 //! A short-lived pod gets the node's containerd socket hostPath-mounted
 //! (`/run/k3s/containerd` — the path this project's own `rancher/k3s`
@@ -50,7 +51,7 @@ const LOADER_LIFETIME: Duration = Duration::from_secs(3600);
 async fn main() -> Result<(), BoxError> {
     let arg = std::env::args()
         .nth(1)
-        .ok_or("usage: sandbox_image_import <path-to-docker-save-tarball> | --check")?;
+        .ok_or("usage: sandbox_image_import <path-to-docker-save-tarball> | --check [image-reference...]")?;
 
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -58,7 +59,12 @@ async fn main() -> Result<(), BoxError> {
     let client = kube::Client::try_default().await?;
     let pods: Api<Pod> = Api::namespaced(client, NAMESPACE);
 
-    let result = if arg == "--check" { check(&pods).await } else { import(&pods, &arg).await };
+    let result = if arg == "--check" {
+        let refs: Vec<String> = std::env::args().skip(2).collect();
+        check(&pods, &check_targets(&refs)).await
+    } else {
+        import(&pods, &arg).await
+    };
     // Best-effort cleanup regardless of how `import` above went — this is
     // a one-shot CLI tool, not a long-lived process with its own cleanup
     // queue, so a plain delete-on-the-way-out is enough (same "disposable,
@@ -412,19 +418,31 @@ const SANDBOX_IMAGES: &[&str] = &[
     "docker.io/library/docker:29-dind",
 ];
 
+/// The references `--check` looks for: the ones given after it, or
+/// `SANDBOX_IMAGES` when none are (SME-102: `scripts/cluster-doctor` passes
+/// the working tree's own `smelt-sandbox:src-<hash>`).
+fn check_targets(given: &[String]) -> Vec<String> {
+    if given.is_empty() {
+        SANDBOX_IMAGES.iter().map(|s| s.to_string()).collect()
+    } else {
+        given.to_vec()
+    }
+}
+
 /// Which of `wanted` aren't in `listed`, the output of `ctr images ls -q`
 /// (one image reference per line).
-fn missing_images(listed: &str, wanted: &[&str]) -> Vec<String> {
+fn missing_images<S: AsRef<str>>(listed: &str, wanted: &[S]) -> Vec<String> {
     let listed: std::collections::HashSet<&str> = listed.lines().map(str::trim).collect();
     wanted
         .iter()
-        .filter(|image| !listed.contains(**image))
-        .map(|image| image.to_string())
+        .map(AsRef::as_ref)
+        .filter(|image| !listed.contains(image))
+        .map(str::to_string)
         .collect()
 }
 
-/// `--check`: fails, naming them, if the node lacks any of `SANDBOX_IMAGES`.
-async fn check(pods: &Api<Pod>) -> Result<(), BoxError> {
+/// `--check`: fails, naming them, if the node lacks any of `wanted`.
+async fn check(pods: &Api<Pod>, wanted: &[String]) -> Result<(), BoxError> {
     start_loader(pods, LOADER_POD_NAME, LOADER_LIFETIME).await?;
     let listed = exec_capture(
         pods,
@@ -432,9 +450,9 @@ async fn check(pods: &Api<Pod>) -> Result<(), BoxError> {
         &["ctr", "--address", CONTAINERD_SOCKET, "--namespace", "k8s.io", "images", "ls", "-q"],
     )
     .await?;
-    let missing = missing_images(&listed, SANDBOX_IMAGES);
+    let missing = missing_images(&listed, wanted);
     if missing.is_empty() {
-        println!("sandbox_image_import: the node has every sandbox image");
+        println!("sandbox_image_import: the node has {}", wanted.join(" and "));
         Ok(())
     } else {
         Err(format!(
@@ -550,6 +568,13 @@ mod tests {
         assert!(!evicted.contains("outlasted"), "{evicted}");
         let failed = stream_failure("l", &phase("Failed", None), t, Duration::from_secs(60), 42, "broken pipe");
         assert!(failed.starts_with("loader pod l stopped (Failed) 60s") && !failed.contains("outlasted"), "{failed}");
+    }
+
+    #[test]
+    fn test_check_looks_for_the_references_given_or_the_defaults() {
+        let given = vec!["docker.io/library/smelt-sandbox:src-0123456789abcdef".to_string()];
+        assert_eq!(check_targets(&given), given);
+        assert_eq!(check_targets(&[]), SANDBOX_IMAGES.iter().map(|s| s.to_string()).collect::<Vec<_>>());
     }
 
     /// A tag that only starts like a wanted one isn't it.

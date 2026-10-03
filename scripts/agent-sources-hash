@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Prints one hash of everything the sandbox image is built from: the agent's
 # sources (with the protocol and docker_net.rs it compiles in) and the
-# Dockerfile. build-sandbox-image.sh records it after an import, and
-# cluster-doctor compares it with the working tree's.
+# Dockerfile. scripts/sandbox-image-ref names the sandbox image after it
+# (`smelt-sandbox:src-<first 16 hex>`), so the image in the cluster says
+# which sources built it (SME-102).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cat src/bin/sandbox_agent.rs src/agent_protocol.rs src/docker_net.rs docker/sandbox/Dockerfile \

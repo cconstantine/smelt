@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Tests scripts/sandbox-image-ref and scripts/cluster-doctor (SME-102)
+# without a cluster: SANDBOX_IMAGE_IMPORT points cluster-doctor at a stub
+# that records the references it was asked to check and succeeds or fails
+# on demand.
+#
+#   scripts/test-cluster-doctor
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+failures=0
+fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
+
+stub="$tmp/import-stub"
+cat >"$stub" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >"$STUB_ARGS"
+[ "${STUB_FAIL:-}" = 1 ] && { echo "missing $2" >&2; exit 1; }
+exit 0
+EOF
+chmod +x "$stub"
+export STUB_ARGS="$tmp/args"
+dind=docker.io/library/docker:29-dind
+
+# The reference names the working tree's agent sources.
+ref=$(scripts/sandbox-image-ref)
+hash=$(scripts/agent-sources-hash)
+[ "$ref" = "docker.io/library/smelt-sandbox:src-${hash:0:16}" ] || fail "sandbox-image-ref printed $ref for sources $hash"
+
+# With no SANDBOX_IMAGE, the doctor checks that reference and the sidecar's.
+rm -f "$STUB_ARGS"
+if ! out=$(env -u SANDBOX_IMAGE SANDBOX_IMAGE_IMPORT="$stub" scripts/cluster-doctor 2>&1); then
+    fail "the doctor failed with the image present: $out"
+fi
+[ "$(cat "$STUB_ARGS" 2>/dev/null)" = "--check $ref $dind" ] || fail "checked '$(cat "$STUB_ARGS" 2>/dev/null)', wanted '--check $ref $dind'"
+
+# SANDBOX_IMAGE picks the image to check.
+rm -f "$STUB_ARGS"
+SANDBOX_IMAGE=docker.io/library/smelt-sandbox:mine SANDBOX_IMAGE_IMPORT="$stub" scripts/cluster-doctor >/dev/null 2>&1 \
+    || fail "the doctor failed with SANDBOX_IMAGE present"
+[ "$(cat "$STUB_ARGS" 2>/dev/null)" = "--check docker.io/library/smelt-sandbox:mine $dind" ] \
+    || fail "with SANDBOX_IMAGE set, checked '$(cat "$STUB_ARGS" 2>/dev/null)'"
+
+# Missing: fails, naming the reference and how to build it.
+if out=$(env -u SANDBOX_IMAGE STUB_FAIL=1 SANDBOX_IMAGE_IMPORT="$stub" scripts/cluster-doctor 2>&1); then
+    fail "the doctor passed with the image missing"
+fi
+grep -q "$ref" <<<"$out" || fail "the failure doesn't name $ref: $out"
+grep -q "scripts/build-sandbox-image.sh" <<<"$out" || fail "the failure doesn't say how to build it: $out"
+
+if [ "$failures" -gt 0 ]; then
+    echo "$failures failure(s)"
+    exit 1
+fi
+echo "all cluster-doctor tests passed"
