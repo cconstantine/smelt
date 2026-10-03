@@ -762,6 +762,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "error_text", 60, Box::pin(scenario_error_text(&t))).await;
     run_scenario(&t, only, r, k, "settings_two_step", 60, Box::pin(scenario_settings_two_step(&t))).await;
     run_scenario(&t, only, r, k, "pointer_keeps_text_still", 120, Box::pin(scenario_pointer_keeps_text_still(&t))).await;
+    run_scenario(&t, only, r, k, "ask_user_card", 60, Box::pin(scenario_ask_user_card(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -2112,6 +2113,63 @@ async fn scenario_agents_md_trust(t: &Scenario<'_>) {
         crate::git::project_instructions(pool, trusting.id).await.expect("loaded")[0].content,
         "Browser tier rule: always run the linter.\n"
     );
+}
+
+/// SME-34: the model's question waits on a card. It shows in every tab and
+/// survives a reload, the sidebar marks the conversation, and choosing an
+/// option answers it: the card goes from every tab, the mark clears, and
+/// the call becomes a row with the answer the model got.
+async fn scenario_ask_user_card(t: &Scenario<'_>) {
+    let pool = t.pool;
+    let asking = t.conversation().await;
+    seed_user_message(pool, asking.id, "clean up the build").await;
+    let input = serde_json::json!({"questions": [
+        {"question": "Delete the build directory?", "header": "Delete",
+         "options": [{"label": "Yes (Recommended)"}, {"label": "No", "description": "keep it"}]}
+    ]});
+    let tool_use_id = unique_id("toolu_ask");
+    db::create_message(
+        pool,
+        asking.id,
+        "assistant",
+        &[anthropic::ContentBlock::ToolUse { id: tool_use_id.clone(), name: crate::questions::ASK_USER.to_string(), input: input.clone() }],
+    )
+    .await
+    .expect("seed the call");
+    let questions = crate::questions::parse_questions(&input).expect("valid questions");
+    db::create_pending_question(pool, asking.id, &tool_use_id, &questions).await.expect("seed the question");
+
+    let url = t.url(&format!("conversation/{}", asking.id));
+    let first = t.tab(url.clone()).await;
+    let second = t.tab(url.clone()).await;
+    for page in [&first, &second] {
+        assert!(
+            wait_for_text(page, "Delete the build directory?", Duration::from_secs(10)).await,
+            "every tab shows the question"
+        );
+        assert!(wait_for_count(page, ".question-option", 2, Duration::from_secs(5)).await, "with its two options");
+    }
+    let mark = format!("[data-conversation-id='{}'] .conversation-waiting", asking.id);
+    assert!(wait_for_count(&first, &mark, 1, Duration::from_secs(10)).await, "the sidebar marks it waiting");
+
+    first.goto(url.as_str()).await.expect("reload");
+    assert!(
+        wait_for_count(&first, ".question-card", 1, Duration::from_secs(10)).await,
+        "the card survives a reload"
+    );
+
+    click_when_present(&first, ".question-option", Duration::from_secs(5)).await;
+    for page in [&first, &second] {
+        assert!(
+            wait_for_count(page, ".question-card", 0, Duration::from_secs(10)).await,
+            "answering takes the card away from every tab"
+        );
+        assert!(
+            wait_for_text(page, "1. Delete: Yes (Recommended)", Duration::from_secs(10)).await,
+            "the call shows the answer the model got"
+        );
+    }
+    assert!(wait_for_count(&first, &mark, 0, Duration::from_secs(10)).await, "the mark clears");
 }
 
 /// SME-51 B11: switching conversations resets what belonged to the one

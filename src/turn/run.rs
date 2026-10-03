@@ -74,6 +74,7 @@ pub(crate) fn run_turn<'a>(
         Some(new_message),
         MAX_TURNS,
         false,
+        false,
     )
 }
 
@@ -134,6 +135,8 @@ pub(super) fn record_saved(conversation_id: i64, persisted: &mut Vec<Message>, s
 /// tool call, a compaction), which releases the turn lock. What it leaves
 /// behind: a streaming reply isn't saved, and tool calls without results
 /// get answered on the next request (`answer_unfinished_tool_calls`).
+/// `from_user` says `new_message` is the user's own (`start_turn`): only
+/// that dismisses a question the conversation waits on (SME-34).
 #[cfg(feature = "server")]
 pub(super) fn run_turn_bounded<'a>(
     pool: &'a PgPool,
@@ -141,6 +144,7 @@ pub(super) fn run_turn_bounded<'a>(
     new_message: Option<anthropic::AnthropicMessage>,
     max_turns: usize,
     keep_error: bool,
+    from_user: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TurnResult> + Send + 'a>>
 {
     Box::pin(async move {
@@ -150,7 +154,7 @@ pub(super) fn run_turn_bounded<'a>(
         let mut stop = stop_receiver(conversation_id);
         // Any new turn replaces the last failure (SME-51 code review 1).
         let generation = new_turn_generation(conversation_id);
-        let result = run_turn_stoppable(pool, conversation_id, new_message, max_turns, &mut stop).await;
+        let result = run_turn_stoppable(pool, conversation_id, new_message, max_turns, from_user, &mut stop).await;
         // Kept for a tab that reconnects, unless a newer turn has started
         // since this one did: its outcome is the one to show (SME-91).
         if keep_error && let Err(TurnFailure::Failed(e)) = &result {
@@ -168,6 +172,7 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
     conversation_id: i64,
     new_message: Option<anthropic::AnthropicMessage>,
     max_turns: usize,
+    from_user: bool,
     stop: &'b mut tokio::sync::watch::Receiver<u64>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TurnResult> + Send + 'b>>
 {
@@ -201,16 +206,20 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
         // Saved holding the lock and outside the stop's `select!`, so a
         // Stop can't land between the INSERT and the turn knowing it's
         // saved, which made the stop path save it again (SME-91).
+        // A question the conversation waits on is taken here, under the
+        // lock, together with saving the message (SME-34): an answer from
+        // the card goes first in this turn's message whoever's turn it is,
+        // and the user's own message dismisses a question still waiting.
         let mut persisted = Vec::new();
-        if let Some(message) = &new_message {
-            let saved = db::create_message(pool, conversation_id, &message.role, &message.content)
-                .await
-                .map_err(ServerFnError::new)?;
-            #[cfg(test)]
-            test_hooks::after_message_saved(conversation_id).await;
-            record_saved(conversation_id, &mut persisted, saved);
-        }
-        let new_content = new_message.map(|message| message.content);
+        let new_content = match save_turn_message(pool, conversation_id, new_message, from_user).await? {
+            Some((saved, content)) => {
+                #[cfg(test)]
+                test_hooks::after_message_saved(conversation_id).await;
+                record_saved(conversation_id, &mut persisted, saved);
+                Some(content)
+            }
+            None => None,
+        };
         tokio::select! {
             result = run_turn_body(pool, conversation_id, guard, persisted, new_content, max_turns) => return result.map_err(TurnFailure::Failed),
             _ = stop.changed() => {}
@@ -302,7 +311,7 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     };
     tokio::spawn(async move {
         // Its failure is kept for a reconnecting tab (`keep_error`).
-        if let Err(e) = run_turn_bounded(&pool, id, Some(new_message), MAX_TURNS, true).await {
+        if let Err(e) = run_turn_bounded(&pool, id, Some(new_message), MAX_TURNS, true, true).await {
             let message = e.message();
             crate::events::publish(id, crate::events::ConversationEvent::TurnError { message });
         }
@@ -367,6 +376,16 @@ pub(super) fn run_turn_body<'a>(
                 &mut persisted,
             )
             .await?;
+
+            // The model's `ask_user` (SME-34): an answer recorded since
+            // this turn saved its own message is taken now, so the model
+            // never sees the call unanswered; a question still waiting
+            // means this turn's notice is saved and the model hears it with
+            // the answer. No row left means none can be answered until this
+            // turn asks again (code review 1).
+            if take_answer_or_wait(pool, conversation_id, &mut pending_new_content, &mut persisted).await? {
+                return Ok(persisted);
+            }
 
             // Nothing to do: `new_message` was `None` (a pure "check for a
             // backlog" wake-up, see `wake_conversation`) and the drain
@@ -507,8 +526,37 @@ pub(super) fn run_turn_body<'a>(
             }
 
             let mut result_blocks = Vec::new();
+            // The model's `ask_user` (SME-34): one per reply; it gets no
+            // result now, and the turn ends waiting on it. Recorded before
+            // the reply's other tools run, so a Stop or restart while they
+            // run leaves the question on its card (code review 2).
+            let mut asked = false;
             for block in &turn.content {
-                if let anthropic::ContentBlock::ToolUse { id, name, input } = block {
+                if let anthropic::ContentBlock::ToolUse { id, name, input } = block
+                    && name == crate::questions::ASK_USER
+                {
+                    let refused = match crate::questions::parse_questions(input) {
+                        Ok(_) if asked => {
+                            "ask one set of questions at a time: put them all in one ask_user call".to_string()
+                        }
+                        Ok(questions) => {
+                            ask(pool, conversation_id, id, questions).await?;
+                            asked = true;
+                            continue;
+                        }
+                        Err(e) => e,
+                    };
+                    result_blocks.push(anthropic::ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: refused,
+                        is_error: Some(true),
+                    });
+                }
+            }
+            for block in &turn.content {
+                if let anthropic::ContentBlock::ToolUse { id, name, input } = block
+                    && name != crate::questions::ASK_USER
+                {
                     let result =
                         anthropic::tools::execute(pool, conversation_id, id, name, input).await;
                     let (content, is_error) = match result {
@@ -521,6 +569,16 @@ pub(super) fn run_turn_body<'a>(
                         is_error,
                     });
                 }
+            }
+
+            if asked {
+                if !result_blocks.is_empty() {
+                    let saved = db::create_message(pool, conversation_id, "user", &result_blocks)
+                        .await
+                        .map_err(ServerFnError::new)?;
+                    record_saved(conversation_id, &mut persisted, saved);
+                }
+                return Ok(persisted);
             }
 
             let saved = db::create_message(pool, conversation_id, "user", &result_blocks)

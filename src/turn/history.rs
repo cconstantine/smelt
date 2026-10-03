@@ -95,6 +95,9 @@ pub(super) fn answer_unfinished_tool_calls(
                 })
                 .collect();
             let next_is_user = history.get(i + 1).is_some_and(|m| m.role == "user");
+            if next_is_user {
+                move_late_results(&mut history, i, &calls);
+            }
             let answered: Vec<&String> = if next_is_user {
                 history[i + 1]
                     .content
@@ -133,6 +136,39 @@ pub(super) fn answer_unfinished_tool_calls(
         i += 1;
     }
     history
+}
+
+/// Moves a result for one of `calls` (the tool calls in `history[i]`) that
+/// sits in a later user message of the same run (before the next assistant
+/// message) to the front of `history[i + 1]`, and drops a message the move
+/// leaves empty. An `ask_user` call is answered after any notices saved
+/// while it waited (SME-34); the API wants every result in the message
+/// right after the call. Storage keeps the order things happened in.
+#[cfg(feature = "server")]
+fn move_late_results(history: &mut Vec<anthropic::AnthropicMessage>, i: usize, calls: &[String]) {
+    let is_late = |block: &anthropic::ContentBlock, history: &[anthropic::AnthropicMessage]| {
+        matches!(block, anthropic::ContentBlock::ToolResult { tool_use_id, .. }
+            if calls.contains(tool_use_id)
+                && !history[i + 1].content.iter().any(|b| matches!(b,
+                    anthropic::ContentBlock::ToolResult { tool_use_id: answered, .. } if answered == tool_use_id)))
+    };
+    let mut moved = Vec::new();
+    let mut j = i + 2;
+    while j < history.len() && history[j].role == "user" {
+        let (late, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut history[j].content)
+            .into_iter()
+            .partition(|block| is_late(block, history));
+        moved.extend(late);
+        if kept.is_empty() {
+            history.remove(j);
+        } else {
+            history[j].content = kept;
+            j += 1;
+        }
+    }
+    if !moved.is_empty() {
+        history[i + 1].content.splice(0..0, moved);
+    }
 }
 
 /// The error result a tool call gets when its turn ended before it
