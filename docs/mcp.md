@@ -37,6 +37,7 @@ At startup `mcp::ensure_default_servers` inserts each of `DEFAULT_MCP_SERVERS` t
 - **Already connected and not stale:** nothing to do.
 - **Stale** (the server sent `tools/list_changed`, which `SmeltClientHandler` turns into setting the flag): re-list the tools on the same connection. If listing fails, the connection is taken as broken, dropped and reconnected. Every other server notification uses `rmcp`'s no-op defaults.
 - **Not connected:** connect under a per-server lock (`CONNECTING`), so two callers don't both connect and a slow server holds up only callers that want it, not the whole registry (SME-40). `connect` builds the transport with the headers (OAuth adds a bearer token, below), runs the `initialize` handshake and lists all tools. `retry_once` tries once more on failure, since a first connect is the one most likely to hit a one-off problem.
+- **TLS.** `rmcp`'s HTTP client is reqwest 0.13 built without a crypto provider of its own (`reqwest-tls-no-provider`), so rustls uses the process-wide one: ring, the only backend in the binary (SME-60). reqwest panics if a client is built before one is installed, so `install_crypto_provider` installs ring (idempotently) before `connect`, `oauth_headers` and `mcp_oauth::start` build one, not relying on `main` having done it first.
 
 Limits (SME-51); the three timeouts are 1s under `cfg(test)`. A tool result's size is capped for every tool, MCP or native, by `anthropic::tools::execute` (`MAX_TOOL_RESULT_CHARS`, SME-76; see [api.md](api.md)).
 

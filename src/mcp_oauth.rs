@@ -105,6 +105,7 @@ pub async fn start(
     config: &McpServerConfig,
     redirect_uri: String,
 ) -> Result<String, String> {
+    crate::mcp::install_crypto_provider();
     let mut manager = AuthorizationManager::new(config.url.as_str())
         .await
         .map_err(|e| {
