@@ -130,7 +130,8 @@ pub(in super::super) fn coalesce_mouse_moves(batch: Vec<(i64, BrowserInputEvent)
 }
 
 /// The live browsing panel: the address bar and the session's frames,
-/// with mouse, wheel and key input on a frame forwarded to the page.
+/// with mouse, wheel and key input on a frame forwarded to the page. Going
+/// to an address is the panel's (`on_navigate`).
 #[component]
 pub(in super::super) fn BrowsingPanel(
     selected: Memo<Option<i64>>,
@@ -138,10 +139,11 @@ pub(in super::super) fn BrowsingPanel(
     browsing_frame: Signal<Option<String>>,
     mut address_draft: Signal<String>,
     mut address_editing: Signal<bool>,
-    mut address_pending: Signal<bool>,
+    address_pending: Signal<bool>,
     mut address_error: Signal<Option<String>>,
     mut frame_shown_width: Signal<f64>,
     browser_input: Coroutine<(i64, BrowserInputEvent)>,
+    on_navigate: EventHandler<()>,
 ) -> Element {
     rsx! {
         aside { class: "browsing-panel",
@@ -150,25 +152,7 @@ pub(in super::super) fn BrowsingPanel(
                 class: "browsing-address-bar",
                 onsubmit: move |event| {
                     event.prevent_default();
-                    let Some(id) = selected() else { return };
-                    if address_pending() {
-                        return;
-                    }
-                    let address = address_draft();
-                    address_pending.set(true);
-                    address_error.set(None);
-                    spawn(async move {
-                        let result = navigate_browser(id, address).await;
-                        // Not onto another conversation's bar (SME-51 B11).
-                        if selected() != Some(id) {
-                            return;
-                        }
-                        match result {
-                            Ok(()) => address_editing.set(false),
-                            Err(e) => address_error.set(Some(server_error_message(&e))),
-                        }
-                        address_pending.set(false);
-                    });
+                    on_navigate.call(());
                 },
                 input {
                     class: "browsing-address-input",

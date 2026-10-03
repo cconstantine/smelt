@@ -217,7 +217,7 @@ mod server {
     /// variant in tests, while the real `open_session` above always uses
     /// the strict guard.
     #[cfg(all(test, feature = "browser-test"))]
-    async fn open_session_with_guard(
+    pub(crate) async fn open_session_with_guard(
         conversation_id: i64,
         is_addr_allowed: fn(IpAddr) -> bool,
     ) -> Result<(), String> {
@@ -2388,3 +2388,8 @@ pub use server::{
 
 #[cfg(all(test, feature = "browser-test"))]
 pub(crate) use server::browser_tests;
+
+/// The relaxed-guard opener, for the app's browser tier (a page it serves
+/// itself on loopback).
+#[cfg(all(test, feature = "browser-test"))]
+pub(crate) use server::open_session_with_guard;

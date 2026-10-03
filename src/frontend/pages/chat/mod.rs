@@ -293,15 +293,37 @@ fn ChatPanel(
     // navigation, and the last navigation error.
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut address_draft = use_signal(String::new);
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut address_editing = use_signal(|| false);
     // The live frame's width as shown; it scales to fit the panel, and
     // clicks on it are scaled back up to the page's own pixels.
     let frame_shown_width = use_signal(|| FRAME_WIDTH);
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut address_pending = use_signal(|| false);
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut address_error: Signal<Option<String>> = use_signal(|| None);
+    // Goes to the address typed in the browsing panel's address bar.
+    // Spawned here, not in `BrowsingPanel`: the panel unmounts when the
+    // session closes, which would drop a navigation still loading and
+    // leave the address bar disabled (SME-57 code review).
+    let mut navigate_address = move || {
+        let Some(id) = selected() else { return };
+        if address_pending() {
+            return;
+        }
+        let address = address_draft();
+        address_pending.set(true);
+        address_error.set(None);
+        spawn(async move {
+            let result = navigate_browser(id, address).await;
+            // Not onto another conversation's bar (SME-51 B11).
+            if selected() != Some(id) {
+                return;
+            }
+            match result {
+                Ok(()) => address_editing.set(false),
+                Err(e) => address_error.set(Some(server_error_message(&e))),
+            }
+            address_pending.set(false);
+        });
+    };
     // Forwards the live panel's input one request at a time, in the order
     // it happened — separately spawned requests can overtake each other (a
     // mouse-up reaching the page before its mouse-down). Moves that queued
@@ -881,6 +903,7 @@ fn ChatPanel(
                                     address_error,
                                     frame_shown_width,
                                     browser_input,
+                                    on_navigate: move |_| navigate_address(),
                                 }
                             }
                             if !todos().is_empty() {

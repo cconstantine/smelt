@@ -759,6 +759,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "stale_bundle", 60, Box::pin(scenario_stale_bundle(&t))).await;
     run_scenario(&t, only, r, k, "transcript_scroll", 60, Box::pin(scenario_transcript_scroll(&t))).await;
     run_scenario(&t, only, r, k, "context_from_the_keyboard", 60, Box::pin(scenario_context_from_the_keyboard(&t))).await;
+    run_scenario(&t, only, r, k, "address_bar_after_session_closes", 60, Box::pin(scenario_address_bar_after_session_closes(&t))).await;
     run_scenario(&t, only, r, k, "error_text", 60, Box::pin(scenario_error_text(&t))).await;
     run_scenario(&t, only, r, k, "settings_two_step", 60, Box::pin(scenario_settings_two_step(&t))).await;
     run_scenario(&t, only, r, k, "pointer_keeps_text_still", 120, Box::pin(scenario_pointer_keeps_text_still(&t))).await;
@@ -2574,6 +2575,63 @@ async fn wait_for_transcript_at_bottom(page: &chromiumoxide::Page) {
         last = distance;
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
+}
+
+/// SME-57 code review: the address bar's navigation belongs to the chat
+/// panel, not to the browsing panel. A session that closes while a
+/// navigation is loading unmounts the panel; when the browser opens again
+/// in that conversation, its address bar must still take an address.
+async fn scenario_address_bar_after_session_closes(t: &Scenario<'_>) {
+    let conversation = t.conversation().await;
+    crate::browsing::open_session_with_guard(conversation.id, |_| true)
+        .await
+        .expect("open a browsing session");
+    // A page that answers after 3 s: the navigation is still loading when
+    // the session closes.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a slow page");
+    let address = format!("http://{}/", listener.local_addr().expect("the slow page's address"));
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let _ = tokio::io::AsyncWriteExt::write_all(
+                    &mut socket,
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: 11\r\n\r\n<p>slow</p>",
+                )
+                .await;
+            });
+        }
+    });
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    let input = wait_for_element(&page, ".browsing-address-input", Duration::from_secs(10)).await;
+    input.focus().await.expect("focus the address bar");
+    input.type_str(&address).await.expect("type the slow page's address");
+    input.press_key("Enter").await.expect("go");
+    let loading = wait_for_count(&page, ".browsing-address-input[disabled]", 1, Duration::from_secs(5)).await;
+    crate::browsing::close_session(conversation.id).await.expect("close the browsing session");
+    let closed = wait_for_count(&page, ".browsing-panel", 0, Duration::from_secs(5)).await;
+    // Past the slow page's answer: the navigation has ended either way.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    crate::browsing::open_session_with_guard(conversation.id, |_| true)
+        .await
+        .expect("open the browsing session again");
+    let reopened = wait_for_count(&page, ".browsing-address-input", 1, Duration::from_secs(10)).await;
+    let disabled: bool = page
+        .evaluate("document.querySelector('.browsing-address-input')?.disabled ?? true")
+        .await
+        .expect("read the address bar")
+        .into_value()
+        .expect("a bool");
+    // Closed before the checks, so a failing one doesn't leave the session open.
+    crate::browsing::close_session(conversation.id).await.expect("close the browsing session");
+    server.abort();
+    assert!(loading, "the address bar should show the navigation loading");
+    assert!(closed, "the browsing panel should go when the session closes");
+    assert!(reopened, "the browsing panel should come back when the session reopens");
+    assert!(!disabled, "the address bar is still disabled after the session closed mid-navigation and reopened");
 }
 
 /// SME-82: the context bar and its detail view work from the
