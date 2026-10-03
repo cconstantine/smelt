@@ -94,7 +94,7 @@ pub fn McpServersIndex() -> Element {
         if let Some(result) = initial_servers() {
             match result {
                 Ok(list) => servers.set(list),
-                Err(e) => list_error.set(Some(e.to_string())),
+                Err(e) => list_error.set(Some(super::server_error_message(&e))),
             }
             loaded.set(true);
         }
@@ -158,7 +158,7 @@ fn McpServerStatusBadge(id: i64) -> Element {
             span { class: "mcp-status mcp-status-not-connected", "Not connected" }
         },
         Some(Err(e)) => rsx! {
-            span { class: "mcp-status mcp-status-unreachable", title: "{e}", "Error" }
+            span { class: "mcp-status mcp-status-unreachable", title: "{super::server_error_message(&e)}", "Error" }
         },
     }
 }
@@ -212,7 +212,7 @@ pub fn McpServerNew() -> Element {
                 Ok(summary) => {
                     navigator.push(Route::McpServerEditRoute { id: summary.id });
                 }
-                Err(e) => submit_error.set(Some(e.to_string())),
+                Err(e) => submit_error.set(Some(super::server_error_message(&e))),
             }
         });
     };
@@ -358,7 +358,7 @@ pub fn McpServerEdit(id: i64) -> Element {
                             .collect(),
                     );
                 }
-                Err(e) => load_error.set(Some(e.to_string())),
+                Err(e) => load_error.set(Some(super::server_error_message(&e))),
             }
             loaded.set(true);
         }
@@ -463,7 +463,7 @@ pub fn McpServerEdit(id: i64) -> Element {
                     save_error.set(None);
                     status_reload.set(status_reload() + 1);
                 }
-                Err(e) => save_error.set(Some(e.to_string())),
+                Err(e) => save_error.set(Some(super::server_error_message(&e))),
             }
             saving.set(false);
         });
@@ -497,7 +497,7 @@ pub fn McpServerEdit(id: i64) -> Element {
                     }
                 }
                 Err(e) => {
-                    oauth_error.set(Some(e.to_string()));
+                    oauth_error.set(Some(super::server_error_message(&e)));
                     oauth_connecting.set(false);
                 }
             }
@@ -512,7 +512,7 @@ pub fn McpServerEdit(id: i64) -> Element {
                     disconnect_error.set(None);
                     status_reload.set(status_reload() + 1);
                 }
-                Err(e) => disconnect_error.set(Some(e.to_string())),
+                Err(e) => disconnect_error.set(Some(super::server_error_message(&e))),
             }
         });
     };
@@ -528,7 +528,7 @@ pub fn McpServerEdit(id: i64) -> Element {
                     Ok(()) => {
                         navigator.push(Route::McpServersRoute {});
                     }
-                    Err(e) => delete_error.set(Some(e.to_string())),
+                    Err(e) => delete_error.set(Some(super::server_error_message(&e))),
                 }
             });
         } else {
@@ -577,7 +577,7 @@ pub fn McpServerEdit(id: i64) -> Element {
                         },
                         Some(Err(e)) => rsx! {
                             div { class: "mcp-status mcp-status-unreachable",
-                                p { class: "error", "{e}" }
+                                p { class: "error", "{super::server_error_message(&e)}" }
                             }
                         },
                     }}

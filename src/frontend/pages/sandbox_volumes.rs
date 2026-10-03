@@ -22,7 +22,7 @@ pub fn SandboxVolumesIndex() -> Element {
         if let Some(result) = initial_volumes() {
             match result {
                 Ok(list) => volumes.set(list),
-                Err(e) => list_error.set(Some(e.to_string())),
+                Err(e) => list_error.set(Some(super::server_error_message(&e))),
             }
             loaded.set(true);
         }
@@ -39,7 +39,7 @@ pub fn SandboxVolumesIndex() -> Element {
                         volumes.write().retain(|v| v.id != id);
                         pending_delete.set(None);
                     }
-                    Err(e) => delete_error.set(Some(e.to_string())),
+                    Err(e) => delete_error.set(Some(super::server_error_message(&e))),
                 }
             });
         } else {
@@ -114,7 +114,7 @@ pub fn SandboxVolumeNew() -> Element {
                     navigator.push(Route::SandboxVolumesRoute {});
                 }
                 Err(e) => {
-                    submit_error.set(Some(e.to_string()));
+                    submit_error.set(Some(super::server_error_message(&e)));
                     submitting.set(false);
                 }
             }

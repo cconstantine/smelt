@@ -67,7 +67,7 @@ pub fn PodsIndex() -> Element {
             pending_stop.set(None);
             spawn(async move {
                 if let Err(e) = stop_pod(pod_id).await {
-                    stop_error.set(Some(super::chat::server_error_message(&e)));
+                    stop_error.set(Some(super::server_error_message(&e)));
                 }
             });
         } else {
@@ -89,7 +89,7 @@ pub fn PodsIndex() -> Element {
             }
             match fetched() {
                 None => rsx! { p { class: "muted", "Loading..." } },
-                Some(Err(e)) => rsx! { p { class: "error", "{super::chat::server_error_message(&e)}" } },
+                Some(Err(e)) => rsx! { p { class: "error", "{super::server_error_message(&e)}" } },
                 Some(Ok(pods)) if pods.is_empty() => rsx! { p { class: "muted", "No pods are running." } },
                 Some(Ok(pods)) => rsx! {
                     table { class: "pods-table",

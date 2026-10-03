@@ -6,6 +6,8 @@ use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::dioxus_core::Task;
 use dioxus::prelude::*;
 
+use super::server_error_message;
+
 use crate::anthropic::{ContentBlock, TokenUsage};
 // `TodoItem`/`TodoStatus` are used unconditionally (the todo panel itself
 // renders in the shared SSR body, not gated behind `web`).
@@ -188,16 +190,6 @@ fn address_bar_value(editing: bool, draft: &str, url: Option<&str>) -> String {
         draft.to_string()
     } else {
         url.unwrap_or_default().to_string()
-    }
-}
-
-/// A server function's error as the viewer should read it — the server's
-/// own message, without the wrapper `ServerFnError`'s `Display` adds around
-/// it ("error running server function: … (details: None)").
-pub(crate) fn server_error_message(error: &ServerFnError) -> String {
-    match error {
-        ServerFnError::ServerError { message, .. } => message.clone(),
-        other => other.to_string(),
     }
 }
 
@@ -1973,19 +1965,6 @@ mod tests {
         assert_eq!(address_bar_value(true, "exam", Some("https://a.example/")), "exam");
     }
 
-    #[test]
-    fn test_server_error_message_shows_just_the_server_message() {
-        let error = ServerFnError::ServerError {
-            message: "failed to load https://x/: net::ERR_BLOCKED_BY_CLIENT".to_string(),
-            code: 500,
-            details: None,
-        };
-        assert_eq!(
-            server_error_message(&error),
-            "failed to load https://x/: net::ERR_BLOCKED_BY_CLIENT"
-        );
-    }
-
     fn mv(x: f64) -> BrowserInputEvent {
         BrowserInputEvent::MouseMove { x, y: 0.0, left_held: false }
     }
@@ -2600,6 +2579,8 @@ fn ConversationSidebar(
     });
     let mut conversations: Signal<Vec<Conversation>> = use_signal(Vec::new);
     let mut loaded = use_signal(|| false);
+    // The last sidebar action's outcome: the list load, New conversation
+    // and Delete each set it, a success clearing it (SME-81).
     let mut error: Signal<Option<String>> = use_signal(|| None);
     let mut pending_delete: Signal<Option<i64>> = use_signal(|| None);
     // Whether the conversation list is open on a phone, where it folds
@@ -2626,8 +2607,11 @@ fn ConversationSidebar(
     use_effect(move || {
         if let Some(result) = initial_conversations() {
             match result {
-                Ok(list) => conversations.set(list),
-                Err(e) => error.set(Some(e.to_string())),
+                Ok(list) => {
+                    conversations.set(list);
+                    error.set(None);
+                }
+                Err(e) => error.set(Some(server_error_message(&e))),
             }
             loaded.set(true);
         }
@@ -2637,11 +2621,12 @@ fn ConversationSidebar(
         spawn(async move {
             match create_conversation().await {
                 Ok(conversation) => {
+                    error.set(None);
                     let id = conversation.id;
                     conversations.write().insert(0, conversation);
                     navigator.push(Route::ConversationRoute { id });
                 }
-                Err(e) => error.set(Some(e.to_string())),
+                Err(e) => error.set(Some(server_error_message(&e))),
             }
         });
     };
@@ -2655,12 +2640,13 @@ fn ConversationSidebar(
             spawn(async move {
                 match delete_conversation(id).await {
                     Ok(()) => {
+                        error.set(None);
                         conversations.write().retain(|c| c.id != id);
                         if selected() == Some(id) {
                             navigator.push(Route::Home {});
                         }
                     }
-                    Err(e) => error.set(Some(e.to_string())),
+                    Err(e) => error.set(Some(server_error_message(&e))),
                 }
             });
         } else {
@@ -3925,7 +3911,7 @@ fn ChatPanel(
                                                         repo_branch.set(String::new());
                                                         repo_dir.set(String::new());
                                                     }
-                                                    Err(e) => repo_attach_error.set(Some(e.to_string())),
+                                                    Err(e) => repo_attach_error.set(Some(server_error_message(&e))),
                                                 }
                                                 repo_attaching.set(false);
                                             });
@@ -4042,7 +4028,7 @@ fn ChatPanel(
                                                             // Not if the user has moved on to another conversation.
                                                             && selected() == Some(id)
                                                         {
-                                                            repo_action_error.set(Some(e.to_string()));
+                                                            repo_action_error.set(Some(server_error_message(&e)));
                                                         }
                                                     });
                                                 }
@@ -4064,7 +4050,7 @@ fn ChatPanel(
                                                             // Not if the user has moved on to another conversation.
                                                             && selected() == Some(id)
                                                         {
-                                                            repo_action_error.set(Some(e.to_string()));
+                                                            repo_action_error.set(Some(server_error_message(&e)));
                                                         }
                                                     });
                                                 }

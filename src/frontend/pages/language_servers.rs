@@ -125,7 +125,7 @@ pub fn LanguageServersIndex() -> Element {
             }
             match servers() {
                 None => rsx! { p { class: "muted", "Loading..." } },
-                Some(Err(e)) => rsx! { p { class: "error", "{e}" } },
+                Some(Err(e)) => rsx! { p { class: "error", "{super::server_error_message(&e)}" } },
                 Some(Ok(list)) if list.is_empty() => rsx! {
                     p { class: "muted", "None yet. Add one, or look one up in the catalog when adding." }
                 },
@@ -182,7 +182,7 @@ pub fn LanguageServerNew() -> Element {
                     initial.set(suggestion.config);
                     notes.set(suggestion.notes);
                 }
-                Err(e) => lookup_error.set(Some(super::chat::server_error_message(&e))),
+                Err(e) => lookup_error.set(Some(super::server_error_message(&e))),
             }
             looking_up.set(false);
         });
@@ -193,7 +193,7 @@ pub fn LanguageServerNew() -> Element {
                 Ok(server) => {
                     navigator.push(Route::LanguageServerEditRoute { id: server.id });
                 }
-                Err(e) => error.set(Some(super::chat::server_error_message(&e))),
+                Err(e) => error.set(Some(super::server_error_message(&e))),
             }
         });
     };
@@ -241,7 +241,7 @@ pub fn LanguageServerEdit(id: i64) -> Element {
                     error.set(None);
                     saved.set(true);
                 }
-                Err(e) => error.set(Some(super::chat::server_error_message(&e))),
+                Err(e) => error.set(Some(super::server_error_message(&e))),
             }
         });
     };
@@ -255,7 +255,7 @@ pub fn LanguageServerEdit(id: i64) -> Element {
                 Ok(()) => {
                     navigator.push(Route::LanguageServersRoute {});
                 }
-                Err(e) => error.set(Some(super::chat::server_error_message(&e))),
+                Err(e) => error.set(Some(super::server_error_message(&e))),
             }
         });
     };
@@ -268,7 +268,7 @@ pub fn LanguageServerEdit(id: i64) -> Element {
             }
             match server() {
                 None => rsx! { p { class: "muted", "Loading..." } },
-                Some(Err(e)) => rsx! { p { class: "error", "{super::chat::server_error_message(&e)}" } },
+                Some(Err(e)) => rsx! { p { class: "error", "{super::server_error_message(&e)}" } },
                 Some(Ok(LanguageServer { config, .. })) => rsx! {
                     LanguageServerForm { initial: config, save_label: "Save", error: error(), on_save: save }
                     if saved() {
