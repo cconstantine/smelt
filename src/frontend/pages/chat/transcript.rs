@@ -539,6 +539,7 @@ pub(super) fn Transcript(
     repo_dir: Signal<String>,
     repo_attaching: Signal<bool>,
     repo_attach_error: Signal<Option<String>>,
+    on_attach: EventHandler<()>,
     stream_errors: Signal<HashMap<i64, String>>,
     notification_delivery_error: Signal<Option<String>>,
     repos: Signal<Vec<RepoSummary>>,
@@ -644,12 +645,12 @@ pub(super) fn Transcript(
                     h2 { "What should smelt work on?" }
                     p { "It works in a sandbox of its own: it writes and runs code, uses a terminal, reads the web, and shows you each step." }
                     RepoAttach {
-                        selected,
                         repo_url,
                         repo_branch,
                         repo_dir,
                         repo_attaching,
                         repo_attach_error,
+                        on_attach,
                     }
                     div { class: "example-asks",
                         for example in EXAMPLE_ASKS {

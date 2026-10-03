@@ -244,16 +244,42 @@ fn ChatPanel(
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut pending_question: Signal<Option<PendingQuestion>> = use_signal(|| None);
     // "Work on a repo" in a new conversation.
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut repo_url = use_signal(String::new);
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut repo_branch = use_signal(String::new);
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut repo_dir = use_signal(String::new);
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut repo_attaching = use_signal(|| false);
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut repo_attach_error: Signal<Option<String>> = use_signal(|| None);
+    // Clones the repo typed into a new conversation's "Work on a repo".
+    // Here, not in `RepoAttach`: the form goes as soon as the first message
+    // shows, which would drop a clone request still in flight with its
+    // reset and its error (SME-57 code review).
+    let mut attach_repo_now = move || {
+        let Some(id) = selected() else { return };
+        if repo_attaching() {
+            return;
+        }
+        let url = repo_url();
+        let branch = repo_branch();
+        let dir = repo_dir();
+        repo_attaching.set(true);
+        repo_attach_error.set(None);
+        spawn(async move {
+            let result = attach_repo(id, url, branch, dir).await;
+            // The user may have moved on to another conversation.
+            if selected() != Some(id) {
+                return;
+            }
+            match result {
+                Ok(_) => {
+                    repo_url.set(String::new());
+                    repo_branch.set(String::new());
+                    repo_dir.set(String::new());
+                }
+                Err(e) => repo_attach_error.set(Some(server_error_message(&e))),
+            }
+            repo_attaching.set(false);
+        });
+    };
     // The last Trust / Don't trust / Reload failure.
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut repo_action_error: Signal<Option<String>> = use_signal(|| None);
@@ -968,6 +994,7 @@ fn ChatPanel(
                             repo_dir,
                             repo_attaching,
                             repo_attach_error,
+                            on_attach: move |_| attach_repo_now(),
                             stream_errors,
                             notification_delivery_error,
                             repos,

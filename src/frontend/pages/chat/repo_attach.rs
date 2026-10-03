@@ -4,46 +4,22 @@ use super::*;
 
 /// The "Work on a repo" form a new conversation offers: clones the repo
 /// (starting the sandbox if need be) while the user writes their first
-/// message (SME-32, SME-49).
+/// message (SME-32, SME-49). Cloning is the panel's (`on_attach`).
 #[component]
 pub(super) fn RepoAttach(
-    selected: Memo<Option<i64>>,
     mut repo_url: Signal<String>,
     mut repo_branch: Signal<String>,
     mut repo_dir: Signal<String>,
-    mut repo_attaching: Signal<bool>,
-    mut repo_attach_error: Signal<Option<String>>,
+    repo_attaching: Signal<bool>,
+    repo_attach_error: Signal<Option<String>>,
+    on_attach: EventHandler<()>,
 ) -> Element {
     rsx! {
         form {
             class: "repo-attach",
             onsubmit: move |event| {
                 event.prevent_default();
-                let Some(id) = selected() else { return };
-                if repo_attaching() {
-                    return;
-                }
-                let url = repo_url();
-                let branch = repo_branch();
-                let dir = repo_dir();
-                repo_attaching.set(true);
-                repo_attach_error.set(None);
-                spawn(async move {
-                    let result = attach_repo(id, url, branch, dir).await;
-                    // The user may have moved on to another conversation.
-                    if selected() != Some(id) {
-                        return;
-                    }
-                    match result {
-                        Ok(_) => {
-                            repo_url.set(String::new());
-                            repo_branch.set(String::new());
-                            repo_dir.set(String::new());
-                        }
-                        Err(e) => repo_attach_error.set(Some(server_error_message(&e))),
-                    }
-                    repo_attaching.set(false);
-                });
+                on_attach.call(());
             },
             label { r#for: "repo-attach-url", "Work on a repo" }
             div { class: "repo-attach-fields",
