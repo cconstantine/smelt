@@ -787,6 +787,11 @@ const TRANSCRIPT_KEEP_ANCHOR: &str = "const m = document.querySelector('.message
     if (d) { m.scrollTop += d; } a.top = a.el.getBoundingClientRect().top; \
     return m.scrollHeight - m.scrollTop - m.clientHeight <= 1 ? 'bottom' : 'kept';";
 
+/// A snap to the bottom for new content: the remembered element's position
+/// is forgotten first, so a layout change handled in the same render
+/// doesn't scroll back by the snap's own movement (SME-75 code review 2).
+const TRANSCRIPT_FORGET_ANCHOR: &str = "window.__smeltTranscriptAnchor = null;";
+
 /// After a layout change with the pointer over the transcript: keeps what's
 /// under the pointer in place (see `TRANSCRIPT_KEEP_ANCHOR`), or, when
 /// there was nothing under it (the messages had only just arrived), snaps
@@ -802,6 +807,13 @@ async fn keep_transcript_anchor(el: MountedEvent, mut pending: Signal<bool>) {
             scroll_to_bottom(el).await;
         }
     }
+}
+
+/// The content effect's snap: forgets the anchor, then scrolls to the
+/// bottom (see `TRANSCRIPT_FORGET_ANCHOR`).
+async fn snap_transcript_for_content(el: MountedEvent) {
+    let _ = document::eval(TRANSCRIPT_FORGET_ANCHOR).await;
+    scroll_to_bottom(el).await;
 }
 
 /// Scrolls `el` to its bottom at once.
@@ -3444,7 +3456,7 @@ fn ChatPanel(
         // This reaches the bottom too, so a snap waiting on the pointer
         // has nothing left to do.
         layout_snap_pending.set(false);
-        spawn(scroll_to_bottom(el));
+        spawn(snap_transcript_for_content(el));
     });
 
     // The side panels (the sandbox, repos, todos, the browser)
