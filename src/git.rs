@@ -629,6 +629,15 @@ mod server {
         }
     }
 
+    /// What `load_instructions` tells the model when it can't reach the
+    /// conversation's pod: to start one only when there's none.
+    fn no_shell_message(e: sandbox::TerminalError) -> String {
+        match e {
+            sandbox::TerminalError::NoPod => "This conversation has no sandbox yet: call create_pod first.".to_string(),
+            other => format!("Couldn't reach the conversation's sandbox: {other}"),
+        }
+    }
+
     /// The model's `load_instructions` tool: reads the `AGENTS.md` at
     /// `path` in the conversation's pod and loads it, or asks the user.
     /// Returns what to tell the model.
@@ -640,9 +649,9 @@ mod server {
         if repo.status != "ready" {
             return Err(format!("{} isn't cloned yet (it's {}).", repo.url, repo.status));
         }
-        let shell = sandbox::PodShell::for_conversation(pool, conversation_id).await.map_err(|_| {
-            "This conversation has no sandbox yet: call create_pod first.".to_string()
-        })?;
+        let shell = sandbox::PodShell::for_conversation(pool, conversation_id)
+            .await
+            .map_err(no_shell_message)?;
         let full = format!("{}/{}/{rel_path}", crate::sandbox::WORKSPACE_DIR, repo.dir);
         let checkout = format!("{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir);
         let mut file = read_instructions_file(&shell, &checkout, &full)
@@ -2244,6 +2253,20 @@ mod server {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Only a missing pod is "no sandbox yet"; anything else says what
+        /// it is, so the model isn't sent to create_pod for nothing (SME-56
+        /// code review 1).
+        #[test]
+        fn test_no_shell_message_names_the_error_unless_there_is_no_pod() {
+            assert_eq!(
+                no_shell_message(sandbox::TerminalError::NoPod),
+                "This conversation has no sandbox yet: call create_pod first."
+            );
+            let not_set_up = no_shell_message(sandbox::TerminalError::Sandbox(sandbox::SandboxError::NotInitialized));
+            assert!(!not_set_up.contains("create_pod"), "{not_set_up}");
+            assert!(not_set_up.contains("isn't set up"), "{not_set_up}");
+        }
 
         #[tokio::test]
         async fn test_an_install_that_read_old_keys_cant_write_over_a_newer_one() {
