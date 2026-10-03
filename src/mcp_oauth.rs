@@ -82,8 +82,8 @@ impl CredentialStore for PgCredentialStore {
 /// and expected issuer for this attempt) between `start` and the callback,
 /// which ends it whatever the outcome. In-memory only: a
 /// restart mid-login just means starting over, the same class of accepted
-/// limitation as `mcp.rs`'s connection registry and `run_async`'s task
-/// registry — see SME-16's "Key discovery."
+/// limitation as `mcp.rs`'s connection registry — see SME-16's "Key
+/// discovery."
 static PENDING: LazyLock<AsyncMutex<HashMap<i64, PendingAttempt>>> =
     LazyLock::new(|| AsyncMutex::new(HashMap::new()));
 

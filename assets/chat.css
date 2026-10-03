@@ -202,7 +202,7 @@ body {
 }
 
 /* Below WIDE_LAYOUT_BREAKPOINT (see the media query further down): the
-   side-panels row (background tasks, sandbox terminals) and chat (messages
+   side-panels row (todos, the live browser, sandbox terminals) and chat (messages
    + composer) stack vertically, each taking the full width left over from
    .sidebar — not side by side. A narrow window makes a side-by-side
    terminal cramped; stacking gives both regions the whole width instead of
@@ -232,7 +232,7 @@ body {
     border-top: 1px solid var(--border);
 }
 
-/* The stacked region above chat (narrow layout): background tasks and/or
+/* The stacked region above chat (narrow layout): the todo panel and/or
    the sandbox panel, side by side with each other (still a row between
    just the two of them) but full-width and taking roughly the other half
    of the viewport's height, independently scrollable from the transcript
@@ -270,7 +270,7 @@ body {
     /* The side panels stack in a column, each the column's full width,
        instead of sitting side by side: three of them in a row shared
        ~450px, so the live browser was tiny and the terminal pushed out of
-       sight (SME-41 D16). Small panels (todos, background tasks) size to
+       sight (SME-41 D16). Small panels (todos) size to
        their content; the sandbox takes the rest; the column scrolls if it
        must. With a browsing session open the column widens to half. */
     .side-panels-row {
@@ -285,8 +285,7 @@ body {
 }
 
 @media (min-width: 1024px), (max-width: 720px) {
-    .side-panels-row > .todo-panel,
-    .side-panels-row > .tasks-panel {
+    .side-panels-row > .todo-panel {
         width: auto;
         flex: 0 0 auto;
         max-height: 30vh;
@@ -477,7 +476,7 @@ body {
 }
 
 /* Something that happened, not something anyone said (SME-41 D3): a
-   command finishing, the sandbox stopping, a background task ending. */
+   command finishing, the sandbox stopping. */
 .system-notice {
     align-self: center;
     display: flex;
@@ -627,73 +626,9 @@ body {
     color: var(--ok);
 }
 
-/* `run_async` gets a single collapsed line instead of the full tool-call
-   card — the tasks sidebar is where its progress actually shows up, so
-   this only needs to mark that it happened. Its raw call is available on
-   demand via the native <details> disclosure rather than always shown. */
-.tool-async-start {
-    align-self: center;
-    width: 100%;
-    max-width: 65ch;
-}
-
-.tool-async-start-summary {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 3px 4px;
-    font-size: 12.5px;
-    color: var(--muted);
-    cursor: pointer;
-    list-style: none;
-    user-select: none;
-}
-
-.tool-async-start-summary::-webkit-details-marker {
-    display: none;
-}
-
-.tool-async-start-summary::before {
-    content: "▸";
-    font-size: 9px;
-    color: var(--muted);
-    transition: transform 100ms ease;
-}
-
-.tool-async-start[open] > .tool-async-start-summary::before {
-    transform: rotate(90deg);
-}
-
-.tool-async-start-icon {
-    font-size: 11px;
-}
-
-.tool-async-start-tool {
-    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-    font-size: 11.5px;
-    background: var(--subtle);
-    padding: 1px 6px;
-    border-radius: 4px;
-    color: var(--ink);
-}
-
-.tool-async-start-summary .timestamp {
-    margin-left: auto;
-}
-
-.tool-async-start-input {
-    margin: 2px 0 6px 17px;
-    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-    font-size: 11.5px;
-    line-height: 1.5;
-    white-space: pre-wrap;
-    word-break: break-word;
-    color: var(--text-2);
-}
-
-/* A model's reasoning, when present — same collapsed-by-default <details>
-   pattern as .tool-async-start above, so it costs one quiet line rather
-   than a wall of text on every single turn. */
+/* A model's reasoning, when present — a collapsed-by-default <details>,
+   so it costs one quiet line rather than a wall of text on every single
+   turn. */
 .thinking-block {
     align-self: center;
     width: 100%;
@@ -866,8 +801,8 @@ body {
     font-size: 13px;
 }
 
-/* Todo panel — lives in .side-panels-row, same fixed-width-sidebar
-   treatment as .tasks-panel (border-right, scrolls independently). */
+/* Todo panel — lives in .side-panels-row as a fixed-width sidebar
+   (border-right, scrolls independently). */
 .todo-panel {
     width: 280px;
     flex-shrink: 0;
@@ -951,35 +886,8 @@ body {
     text-decoration: line-through;
 }
 
-/* Background tasks panel — lives in .side-panels-row (below the
-   transcript, not beside it — see .chat-panel), independently scrollable
-   from both the transcript above and .sandbox-panel next to it. Only
-   .sandbox-panel gets flex: 1 (see below) — when both panels are present,
-   tasks stays a fixed width so the terminal (the one that was too small)
-   gets the rest, rather than splitting evenly. */
-.tasks-panel {
-    width: 320px;
-    flex-shrink: 0;
-    border-right: 1px solid var(--border);
-    background: var(--canvas);
-    padding: 16px;
-    overflow-y: auto;
-}
-
-.tasks-panel h3 {
-    margin: 0 0 12px;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-}
-
-/* Sandbox panel — takes whatever width .side-panels-row has left over
-   after .tasks-panel (usually all of it, since tasks-panel only renders
-   when there's a background task to show). Each pod groups its terminals,
-   which reuse .task-terminal/.task-terminal-* wholesale — no separate
-   "fake terminal" styling needed for these.
+/* Sandbox panel — takes whatever width .side-panels-row has left over.
+   Each pod groups its terminals, styled by .task-terminal/.task-terminal-*.
 
    Neither this panel nor .sandbox-pod/.task-terminal-stack/.task-terminal
    scroll or overflow on their own — they're a chain of flex columns that
@@ -1093,10 +1001,8 @@ body {
     content: " \2197";
 }
 
-/* Each background task gets its own terminal-window-styled widget — the
-   same visual language a real shell session will use once async tasks grow
-   into one, not just a status list. Stacked vertically since the panel is
-   a narrow sidebar rather than the full-width strip it used to be. */
+/* Each sandbox terminal gets its own terminal-window-styled widget,
+   stacked vertically. */
 .task-terminal-stack {
     display: flex;
     flex-direction: column;
@@ -1145,14 +1051,6 @@ body {
     background: #27c93f;
 }
 
-.task-terminal-tool {
-    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-    font-size: 12px;
-    font-weight: 600;
-    color: #eee;
-    background: transparent;
-}
-
 .task-terminal-id {
     color: #888;
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
@@ -1173,22 +1071,6 @@ body {
     background: #444;
     color: #ddd;
     flex-shrink: 0;
-}
-
-.task-terminal-status-running .task-terminal-status {
-    background: #4a3c00;
-    color: #ffd166;
-}
-
-.task-terminal-status-finished .task-terminal-status {
-    background: #123d1f;
-    color: #6fd68f;
-}
-
-.task-terminal-status-failed .task-terminal-status,
-.task-terminal-status-cancelled .task-terminal-status {
-    background: #4a1712;
-    color: #ff8a75;
 }
 
 .task-terminal-body {

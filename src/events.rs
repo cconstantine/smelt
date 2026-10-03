@@ -1,7 +1,7 @@
 //! Per-conversation live event bus — the shared home for pushing updates
-//! that happen with no `send_message` request in flight (a background
-//! task's tick or completion), so neither `anthropic::tools` nor `api::chat`
-//! has to depend on the other to publish or read these. `tools.rs` calls
+//! that happen with no `send_message` request in flight (a command's
+//! output or completion), so neither `anthropic::tools` nor `api::chat`
+//! has to depend on the other to publish or read these. The tools call
 //! `publish`; `chat.rs` calls both `publish` (after persisting a batch of
 //! rows) and `subscribe` (to relay everything to a browser tab).
 
@@ -33,30 +33,14 @@ impl SandboxPreview {
     }
 }
 
-/// `TaskUpdate` is ephemeral UI telemetry, regenerable at any time from the
-/// task registry (`anthropic::tools::snapshot_tasks`) — never persisted.
 /// `MessagesAppended` carries no new data of its own; it's a live-delivery
-/// notification for rows `db::create_message` already persisted. The three
-/// `Sandbox*` variants are the same kind of ephemeral UI telemetry as
-/// `TaskUpdate`, regenerable at any time from `api::chat::get_sandbox_state`
-/// — see SME-10.
+/// notification for rows `db::create_message` already persisted. The
+/// `Sandbox*` variants are ephemeral UI telemetry, never persisted and
+/// regenerable at any time from `api::chat::get_sandbox_state` — see
+/// SME-10.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ConversationEvent {
-    TaskUpdate {
-        task_id: String,
-        tool: String,
-        status: String,
-        /// Which stream `latest_output` came from — `"stdout"`/`"stderr"`,
-        /// or `None` for a pure status transition (started/finished/...)
-        /// that doesn't carry a line at all.
-        stream: Option<String>,
-        latest_output: Option<String>,
-        /// Where `latest_output` goes in its stream: the number of lines
-        /// before it. A tab that reconnects skips a line its snapshot
-        /// already has (SME-51 B3). `None` when there's no line.
-        position: Option<i64>,
-    },
     /// A struct variant, not `MessagesAppended(Vec<Message>)`: this enum
     /// is internally tagged, and serde can't write a tuple variant holding
     /// a list that way — every send failed, silently.
@@ -83,9 +67,9 @@ pub enum ConversationEvent {
         status: String,
         terminated: bool,
     },
-    /// Same shape/pattern as `TaskUpdate` — one variant covering "started",
-    /// "one new output line", and "finished", distinguished by which
-    /// optional fields are set. Deliberately doesn't carry `pod_id`: the
+    /// One variant covering "started", "one new output line", and
+    /// "finished", distinguished by which optional fields are set. `stream`
+    /// is `"stdout"`/`"stderr"`, or `None` for a pure status transition. Deliberately doesn't carry `pod_id`: the
     /// frontend already knows a terminal's pod from `SandboxTerminalUpdate`,
     /// so a command update only ever needs to find an already-known
     /// terminal by `terminal_id`. `command` is only `Some` on the "started"
@@ -119,7 +103,7 @@ pub enum ConversationEvent {
         detail: String,
     },
     /// Published after every real turn completes — ephemeral UI telemetry,
-    /// same category as `TaskUpdate`/`Sandbox*Update`, regenerable at any
+    /// same category as `Sandbox*Update`, regenerable at any
     /// time from `api::chat::get_context_usage`. See
     /// SME-18.
     ContextUsageUpdate {
@@ -129,7 +113,7 @@ pub enum ConversationEvent {
     /// Published by `todowrite` on every call — carries the *complete*
     /// list (never a partial diff, matching `todowrite`'s own whole-list-
     /// replace semantics), so the frontend panel can just overwrite its
-    /// signal wholesale rather than merging like `TaskUpdate` requires.
+    /// signal wholesale rather than merging line by line.
     /// Ephemeral UI telemetry, regenerable at any time from
     /// `db::get_conversation_todos`. See
     /// SME-20.
@@ -369,10 +353,12 @@ mod server {
         async fn test_publish_with_no_subscribers_is_a_noop() {
             publish(
                 1,
-                ConversationEvent::TaskUpdate {
-                    task_id: "t1".to_string(),
-                    tool: "count".to_string(),
+                ConversationEvent::SandboxCommandUpdate {
+                    terminal_id: 1,
+                    command_id: "t1".to_string(),
+                    command: None,
                     status: "running".to_string(),
+                    exit_code: None,
                     stream: None,
                     latest_output: None,
                     position: None,
@@ -385,10 +371,12 @@ mod server {
         #[tokio::test]
         async fn test_subscribe_then_publish_delivers_event() {
             let mut rx = subscribe(2);
-            let event = ConversationEvent::TaskUpdate {
-                task_id: "t1".to_string(),
-                tool: "count".to_string(),
+            let event = ConversationEvent::SandboxCommandUpdate {
+                terminal_id: 1,
+                command_id: "t1".to_string(),
+                command: None,
                 status: "running".to_string(),
+                exit_code: None,
                 stream: Some("stdout".to_string()),
                 latest_output: Some("count: 1/5".to_string()),
                 position: None,
@@ -402,10 +390,12 @@ mod server {
         async fn test_two_subscribers_both_receive_same_event() {
             let mut rx1 = subscribe(3);
             let mut rx2 = subscribe(3);
-            let event = ConversationEvent::TaskUpdate {
-                task_id: "t1".to_string(),
-                tool: "add".to_string(),
+            let event = ConversationEvent::SandboxCommandUpdate {
+                terminal_id: 1,
+                command_id: "t1".to_string(),
+                command: None,
                 status: "finished".to_string(),
+                exit_code: None,
                 stream: None,
                 latest_output: None,
                 position: None,
@@ -419,20 +409,24 @@ mod server {
         #[tokio::test]
         async fn test_events_are_scoped_per_conversation() {
             let mut rx_a = subscribe(4);
-            let rx_b_event = ConversationEvent::TaskUpdate {
-                task_id: "t1".to_string(),
-                tool: "add".to_string(),
+            let rx_b_event = ConversationEvent::SandboxCommandUpdate {
+                terminal_id: 1,
+                command_id: "t1".to_string(),
+                command: None,
                 status: "finished".to_string(),
+                exit_code: None,
                 stream: None,
                 latest_output: None,
                 position: None,
             };
             publish(5, rx_b_event);
 
-            let a_event = ConversationEvent::TaskUpdate {
-                task_id: "t2".to_string(),
-                tool: "count".to_string(),
+            let a_event = ConversationEvent::SandboxCommandUpdate {
+                terminal_id: 1,
+                command_id: "t2".to_string(),
+                command: None,
                 status: "running".to_string(),
+                exit_code: None,
                 stream: None,
                 latest_output: None,
                 position: None,
@@ -447,13 +441,11 @@ mod server {
             );
         }
 
-        /// Characterization test, not test-first: the three `Sandbox*`
-        /// variants are a mechanical mirror of `TaskUpdate`'s already-tested
-        /// shape on this same bus — see
+        /// Characterization test, not test-first: the `Sandbox*` variants
+        /// are a mechanical mirror of each other on this same bus — see
         /// `docs/development-process.md`'s TDD exception for near-verbatim
         /// mirrors. Proves each variant round-trips (serializes, publishes,
-        /// and is delivered back equal to what was sent), the same property
-        /// the `TaskUpdate` tests above already establish for this bus.
+        /// and is delivered back equal to what was sent).
         #[tokio::test]
         async fn test_sandbox_variants_round_trip_the_bus() {
             let mut rx = subscribe(6);
@@ -588,14 +580,6 @@ mod wire_tests {
             ConversationEvent::TurnsChanged {},
             ConversationEvent::ModelChanged {},
             ConversationEvent::ProvidersChanged {},
-            ConversationEvent::TaskUpdate {
-                task_id: "t1".to_string(),
-                tool: "count".to_string(),
-                status: "running".to_string(),
-                stream: Some("stdout".to_string()),
-                latest_output: Some("1".to_string()),
-                position: None,
-            },
             ConversationEvent::MessagesAppended { messages: vec![Message {
                 id: 7,
                 conversation_id: 3,

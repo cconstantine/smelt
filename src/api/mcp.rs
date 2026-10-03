@@ -10,8 +10,7 @@ use crate::db;
 /// SME-15). Defined outside
 /// any server-gated module since this type itself crosses
 /// the client/server boundary as a server-function return value — the same
-/// placement `anthropic::tools::TaskSummary` already uses for the same
-/// reason.
+/// placement `anthropic::tools::TodoItem` uses for the same reason.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct McpServerSummary {
     pub id: i64,

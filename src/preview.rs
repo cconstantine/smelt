@@ -56,6 +56,60 @@ pub fn preview_links(
         .collect()
 }
 
+/// Why `share` didn't record a preview.
+#[derive(Debug)]
+pub enum ShareError {
+    /// The conversation has no running sandbox.
+    NoSandbox,
+    /// `SMELT_PREVIEW_URL` is unusable, so previews are off.
+    PreviewsOff(String),
+    Other(String),
+}
+
+/// A preview `share` recorded.
+pub struct SharedPreview {
+    pub url: String,
+    /// Whether anything listens on the port yet; the link is recorded
+    /// either way.
+    pub listening: bool,
+}
+
+/// Records a preview of `port` on `host` in `conversation_id`'s running
+/// sandbox, so the sandbox panel shows it: saves it on the pod and
+/// publishes the pod's whole preview list (SME-42).
+pub async fn share(
+    pool: &sqlx::PgPool,
+    conversation_id: i64,
+    host: PodHost,
+    port: u16,
+) -> Result<SharedPreview, ShareError> {
+    let pod_id = crate::sandbox::live_pod_id(pool, conversation_id)
+        .await
+        .map_err(|e| match e {
+            crate::sandbox::TerminalError::NoPod => ShareError::NoSandbox,
+            other => ShareError::Other(other.to_string()),
+        })?;
+    let template = configured_template().map_err(ShareError::PreviewsOff)?;
+    let listening = crate::sandbox::pod_port_is_listening(pool, conversation_id, host, port)
+        .await
+        .map_err(|e| ShareError::Other(e.to_string()))?;
+    let stored_host = match host {
+        PodHost::Localhost => String::new(),
+        PodHost::Container(ip) => ip.to_string(),
+    };
+    let ports = crate::db::add_pod_preview(pool, pod_id, &stored_host, port)
+        .await
+        .map_err(|e| ShareError::Other(e.to_string()))?;
+    crate::events::publish(
+        conversation_id,
+        crate::events::ConversationEvent::SandboxPreviewUpdate {
+            pod_id,
+            previews: preview_links(&template, conversation_id, &stored_previews(&ports)),
+        },
+    );
+    Ok(SharedPreview { url: template.url_for(conversation_id, host, port), listening })
+}
+
 /// Previews as `db::list_pod_previews` stores them — `""` for the pod's
 /// localhost, or a container's address — as hosts in the pod.
 pub fn stored_previews(rows: &[(String, u16)]) -> Vec<(PodHost, u16)> {

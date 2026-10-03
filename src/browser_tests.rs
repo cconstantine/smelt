@@ -1224,9 +1224,9 @@ async fn scenario_reply_stays_in_its_conversation(t: &Scenario<'_>) {
     }
 }
 
-/// Scenario 9: a reply the watching tab didn't ask for — a background
-/// task's notification, another tab's send — still reaches it live, with
-/// no reload.
+/// Scenario 9: a reply the watching tab didn't ask for — a finished
+/// command's notice, another tab's send — still reaches it live, with no
+/// reload.
 async fn scenario_unrequested_reply(t: &Scenario<'_>) {
     let conversation = t.conversation().await;
     let watcher = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
