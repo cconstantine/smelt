@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The checks every commit must pass (docs/development-process.md, "Every
 # commit builds for both targets"): the web build and the server build,
-# each with no warnings, and the server tests. Exits non-zero on any
-# failure, so it can gate a commit:
+# each with no warnings, and the server tests, run against this working
+# tree's own sandbox image (SANDBOX_IMAGE, see scripts/sandbox-image-ref).
+# Exits non-zero on any failure, so it can gate a commit:
 #
 #   scripts/check.sh && git commit ...
 #
@@ -38,9 +39,14 @@ if grep -qE '^(warning|error)' <<<"$server_output"; then
     exit 1
 fi
 
+# The tests' pods run this working tree's own agent, from the image named
+# after its sources (SME-102), not the shared `:latest` the dev server uses.
+SANDBOX_IMAGE=${SANDBOX_IMAGE:-$(scripts/sandbox-image-ref)}
+export SANDBOX_IMAGE
+
 # Before the tests: the real-cluster ones all fail the same way on a
-# missing or stale sandbox image, and this says so once (SME-53).
-echo "== cluster"
+# missing sandbox image, and this says so once (SME-53).
+echo "== cluster ($SANDBOX_IMAGE)"
 scripts/cluster-doctor
 
 echo "== server tests"

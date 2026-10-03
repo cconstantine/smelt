@@ -174,8 +174,12 @@ pub(super) fn default_memory_limit() -> String {
 /// the pod's real PID 1 rather than something injected and launched after
 /// the fact. The fully-qualified default (not just `smelt-sandbox:latest`)
 /// matches exactly what `ctr images import` registers the image as —
-/// confirmed by spike, not assumed.
-pub(super) fn default_sandbox_image() -> String {
+/// confirmed by spike, not assumed. `:latest` is what a server with no
+/// setting (the dev server) runs; `scripts/check.sh`, `browser-tier`,
+/// `check-server` and CI set `SANDBOX_IMAGE` to the image named after the
+/// working tree's agent sources (`scripts/sandbox-image-ref`, SME-102), and
+/// tests that build their own pod specs read it here too.
+pub(crate) fn default_sandbox_image() -> String {
     std::env::var("SANDBOX_IMAGE")
         .ok()
         .filter(|s| !s.is_empty())

@@ -11,6 +11,8 @@
 # again, pass or fail. It also:
 # - builds the web bundle first (`dx build --platform web`): the tier serves
 #   a separately built one that `cargo test` never rebuilds;
+# - runs against this working tree's own sandbox image (SANDBOX_IMAGE, see
+#   scripts/sandbox-image-ref), checked by scripts/cluster-doctor first;
 # - points BROWSER_CHECK_CACHE at the main checkout's .browser-check-cache
 #   (headless Chrome) in a worktree that lacks one and with the variable
 #   unset (SME-51, SME-69).
@@ -42,6 +44,13 @@ if [ -z "${BROWSER_CHECK_CACHE:-}" ] && [ ! -e .browser-check-cache ]; then
         exit 1
     fi
 fi
+
+# The tier's pods run this working tree's own agent (SME-102), and a missing
+# image is one clear message rather than a failed scenario.
+SANDBOX_IMAGE=${SANDBOX_IMAGE:-$(scripts/sandbox-image-ref)}
+export SANDBOX_IMAGE
+echo "== cluster ($SANDBOX_IMAGE)"
+scripts/cluster-doctor || exit 1
 
 echo "== web bundle"
 log=$(mktemp)

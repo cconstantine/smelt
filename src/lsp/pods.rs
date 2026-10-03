@@ -598,7 +598,7 @@ pub(crate) mod tests {
         /// A sandbox stand-in for conversation `id`, with its workspace
         /// claim. Deleted by `tear_down`.
         pub(crate) async fn stand_in_sandbox(client: &kube::Client, id: i64) -> Result<SandboxRef, String> {
-            stand_in_sandbox_with(client, id, "docker.io/library/smelt-sandbox:latest", Duration::from_secs(120)).await
+            stand_in_sandbox_with(client, id, &crate::sandbox::default_sandbox_image(), Duration::from_secs(120)).await
         }
 
         async fn stand_in_sandbox_with(
