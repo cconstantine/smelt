@@ -518,3 +518,166 @@ pub(super) fn render_block_element(
         ContentBlock::CompactionPlaceholder { .. } => rsx! {},
     }
 }
+
+/// The transcript: the conversation's messages, a new conversation's
+/// first steps, the reply as it streams, the working line, errors, trust
+/// cards and the model's waiting question. Scrolling it keeps the panel's stick-to-bottom and
+/// pointer-hold state (SME-83, SME-75) current.
+#[component]
+pub(super) fn Transcript(
+    selected: Memo<Option<i64>>,
+    messages: Signal<Vec<Message>>,
+    load_error: Signal<Option<String>>,
+    initial_messages: Resource<Option<Result<Vec<Message>, ServerFnError>>>,
+    turn_running: Signal<bool>,
+    turn_elapsed: Signal<u64>,
+    streaming_reply: Signal<Option<String>>,
+    tz_offset_minutes: Signal<i32>,
+    mut input: Signal<String>,
+    repo_url: Signal<String>,
+    repo_branch: Signal<String>,
+    repo_dir: Signal<String>,
+    repo_attaching: Signal<bool>,
+    repo_attach_error: Signal<Option<String>>,
+    stream_errors: Signal<HashMap<i64, String>>,
+    notification_delivery_error: Signal<Option<String>>,
+    repos: Signal<Vec<RepoSummary>>,
+    repo_action_error: Signal<Option<String>>,
+    pending_question: Signal<Option<PendingQuestion>>,
+    mut messages_el: Signal<Option<MountedEvent>>,
+    mut messages_stuck_to_bottom: Signal<bool>,
+    mut pointer_over_transcript: Signal<bool>,
+    mut layout_snap_pending: Signal<bool>,
+) -> Element {
+    let conversation_missing = move || load_error().as_deref() == Some("conversation not found");
+    let streaming_text = move || streaming_reply().filter(|text| !text.is_empty());
+    let tool_names = tool_use_names_by_id(&messages());
+    let tool_results = tool_results_by_id(&messages());
+    let commands = terminal_commands_by_id(&messages());
+    rsx! {
+        div {
+            class: "messages",
+            onmounted: move |evt| {
+                messages_el.set(Some(evt));
+                spawn(async move {
+                    let _ = document::eval(TRANSCRIPT_ANCHOR_SETUP).await;
+                });
+            },
+            onpointerenter: move |_| pointer_over_transcript.set(true),
+            // Also on a move, in case the transcript appeared
+            // under a pointer that was already there.
+            onpointermove: move |_| {
+                if !*pointer_over_transcript.peek() {
+                    pointer_over_transcript.set(true);
+                }
+            },
+            onpointerleave: move |_| {
+                pointer_over_transcript.set(false);
+                if *layout_snap_pending.peek() {
+                    layout_snap_pending.set(false);
+                    if *messages_stuck_to_bottom.peek()
+                        && let Some(el) = messages_el.peek().clone()
+                    {
+                        spawn(scroll_to_bottom(el));
+                    }
+                }
+            },
+            // A scroll the user starts while a snap is pending
+            // gives up the snap, so the scroll that follows
+            // decides whether they're still at the bottom.
+            onwheel: move |_| layout_snap_pending.set(false),
+            // A press starts a scrollbar or selection drag,
+            // or focuses text the keys then scroll.
+            onpointerdown: move |_| layout_snap_pending.set(false),
+            ontouchmove: move |_| layout_snap_pending.set(false),
+            onkeydown: move |_| layout_snap_pending.set(false),
+            onscroll: move |evt: Event<ScrollData>| {
+                // While a snap is pending, the scrolls are the
+                // transcript keeping the text under the pointer
+                // still, not the user leaving the bottom: the
+                // snap still owes them the bottom (SME-75 code
+                // review).
+                if *layout_snap_pending.peek() {
+                    return;
+                }
+                let d = evt.data();
+                messages_stuck_to_bottom
+                    .set(
+                        is_scrolled_to_bottom(
+                            d.scroll_top(),
+                            d.scroll_height() as f64,
+                            d.client_height() as f64,
+                        ),
+                    );
+            },
+            if conversation_missing() {
+                p { class: "conversation-missing",
+                    "This conversation doesn't exist. It may have been deleted."
+                }
+            } else if let Some(err) = load_error() {
+                p { class: "error", "Error loading messages: {err}" }
+            }
+            for message in messages() {
+                match message.blocks() {
+                    Ok(blocks) => {
+                        let thinking_open = reply_is_only_thinking(&message.role, &blocks);
+                        rsx! {
+                            for (i , block) in blocks.iter().enumerate() {
+                                {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names, &tool_results, &commands, thinking_open)}
+                            }
+                        }
+                    },
+                    Err(e) => rsx! {
+                        div {
+                            key: "{message.id}",
+                            class: "message message-{message.role} message-error",
+                            "Error rendering message: {e}"
+                        }
+                    },
+                }
+            }
+            // A new conversation says what smelt does and offers a
+            // few asks to start from, instead of a blank screen
+            // (SME-41 D12). Picking one fills the message box.
+            if messages().is_empty() && !turn_running() && !conversation_missing() && matches!(initial_messages(), Some(Some(Ok(_)))) {
+                div { class: "conversation-empty",
+                    h2 { "What should smelt work on?" }
+                    p { "It works in a sandbox of its own: it writes and runs code, uses a terminal, reads the web, and shows you each step." }
+                    RepoAttach {
+                        selected,
+                        repo_url,
+                        repo_branch,
+                        repo_dir,
+                        repo_attaching,
+                        repo_attach_error,
+                    }
+                    div { class: "example-asks",
+                        for example in EXAMPLE_ASKS {
+                            button {
+                                class: "example-ask",
+                                r#type: "button",
+                                onclick: move |_| input.set(example.to_string()),
+                                "{example}"
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(reply) = streaming_text() {
+                div { class: "message message-assistant message-streaming", "{reply}" }
+            }
+            if turn_running() {
+                div { class: "turn-working", role: "status",
+                    span { class: "turn-working-dot" }
+                    span { "Working… {format_elapsed(turn_elapsed())}" }
+                }
+            }
+            ModelNotes { selected, stream_errors, notification_delivery_error }
+            TrustCards { selected, repos, repo_action_error }
+            // The model's question, waiting on the user (SME-34).
+            if let (Some(id), Some(question)) = (selected(), pending_question()) {
+                QuestionCard { key: "{question.tool_use_id}", conversation_id: id, question }
+            }
+        }
+    }
+}

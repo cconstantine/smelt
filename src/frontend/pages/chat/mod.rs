@@ -178,7 +178,6 @@ fn ChatPanel(
     // Every tab watching the conversation shows it, whoever started the turn.
     #[allow(unused_mut)]
     let mut streaming_reply: Signal<Option<String>> = use_signal(|| None);
-    let streaming_text = move || streaming_reply().filter(|text| !text.is_empty());
     // The last turn error, by conversation (`TurnError`, or a send the
     // server refused).
     let mut stream_errors: Signal<HashMap<i64, String>> = use_signal(HashMap::new);
@@ -347,14 +346,14 @@ fn ChatPanel(
     // written only by the `onscroll` handler on the element itself, so it
     // always reflects a real user (or auto-scroll-induced) scroll position
     // rather than the reactive-render cycle.
-    let mut messages_el: Signal<Option<MountedEvent>> = use_signal(|| None);
+    let messages_el: Signal<Option<MountedEvent>> = use_signal(|| None);
     let mut messages_stuck_to_bottom = use_signal(|| true);
     // Whether the pointer is over the transcript, and whether a snap to
     // the bottom that a layout change asked for is waiting for it to
     // leave (SME-75): a side panel appearing mustn't move what the user is
     // about to click. While it waits, the transcript is scrolled to keep
     // the element under the pointer where it was.
-    let mut pointer_over_transcript = use_signal(|| false);
+    let pointer_over_transcript = use_signal(|| false);
     let mut layout_snap_pending = use_signal(|| false);
     // What the transcript held when the effect below last ran: the message
     // count, the last message's id and the streaming reply's length. Only
@@ -868,9 +867,6 @@ fn ChatPanel(
                     div { class: "empty-state", "Select or start a conversation" }
                 },
                 Some(_) => {
-                    let tool_names = tool_use_names_by_id(&messages());
-                    let tool_results = tool_results_by_id(&messages());
-                    let commands = terminal_commands_by_id(&messages());
                     rsx! {
                     if !sandbox_pods().is_empty() || !repos().is_empty() || !todos().is_empty() || browsing_session_open() {
                         div { class: "side-panels-row",
@@ -912,129 +908,30 @@ fn ChatPanel(
                             context_detail_open,
                             context_bar_el,
                         }
-                        div {
-                            class: "messages",
-                            onmounted: move |evt| {
-                                messages_el.set(Some(evt));
-                                spawn(async move {
-                                    let _ = document::eval(TRANSCRIPT_ANCHOR_SETUP).await;
-                                });
-                            },
-                            onpointerenter: move |_| pointer_over_transcript.set(true),
-                            // Also on a move, in case the transcript appeared
-                            // under a pointer that was already there.
-                            onpointermove: move |_| {
-                                if !*pointer_over_transcript.peek() {
-                                    pointer_over_transcript.set(true);
-                                }
-                            },
-                            onpointerleave: move |_| {
-                                pointer_over_transcript.set(false);
-                                if *layout_snap_pending.peek() {
-                                    layout_snap_pending.set(false);
-                                    if *messages_stuck_to_bottom.peek()
-                                        && let Some(el) = messages_el.peek().clone()
-                                    {
-                                        spawn(scroll_to_bottom(el));
-                                    }
-                                }
-                            },
-                            // A scroll the user starts while a snap is pending
-                            // gives up the snap, so the scroll that follows
-                            // decides whether they're still at the bottom.
-                            onwheel: move |_| layout_snap_pending.set(false),
-                            // A press starts a scrollbar or selection drag,
-                            // or focuses text the keys then scroll.
-                            onpointerdown: move |_| layout_snap_pending.set(false),
-                            ontouchmove: move |_| layout_snap_pending.set(false),
-                            onkeydown: move |_| layout_snap_pending.set(false),
-                            onscroll: move |evt: Event<ScrollData>| {
-                                // While a snap is pending, the scrolls are the
-                                // transcript keeping the text under the pointer
-                                // still, not the user leaving the bottom: the
-                                // snap still owes them the bottom (SME-75 code
-                                // review).
-                                if *layout_snap_pending.peek() {
-                                    return;
-                                }
-                                let d = evt.data();
-                                messages_stuck_to_bottom
-                                    .set(
-                                        is_scrolled_to_bottom(
-                                            d.scroll_top(),
-                                            d.scroll_height() as f64,
-                                            d.client_height() as f64,
-                                        ),
-                                    );
-                            },
-                            if conversation_missing() {
-                                p { class: "conversation-missing",
-                                    "This conversation doesn't exist. It may have been deleted."
-                                }
-                            } else if let Some(err) = load_error() {
-                                p { class: "error", "Error loading messages: {err}" }
-                            }
-                            for message in messages() {
-                                match message.blocks() {
-                                    Ok(blocks) => {
-                                        let thinking_open = reply_is_only_thinking(&message.role, &blocks);
-                                        rsx! {
-                                            for (i , block) in blocks.iter().enumerate() {
-                                                {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names, &tool_results, &commands, thinking_open)}
-                                            }
-                                        }
-                                    },
-                                    Err(e) => rsx! {
-                                        div {
-                                            key: "{message.id}",
-                                            class: "message message-{message.role} message-error",
-                                            "Error rendering message: {e}"
-                                        }
-                                    },
-                                }
-                            }
-                            // A new conversation says what smelt does and offers a
-                            // few asks to start from, instead of a blank screen
-                            // (SME-41 D12). Picking one fills the message box.
-                            if messages().is_empty() && !turn_running() && !conversation_missing() && matches!(initial_messages(), Some(Some(Ok(_)))) {
-                                div { class: "conversation-empty",
-                                    h2 { "What should smelt work on?" }
-                                    p { "It works in a sandbox of its own: it writes and runs code, uses a terminal, reads the web, and shows you each step." }
-                                    RepoAttach {
-                                        selected,
-                                        repo_url,
-                                        repo_branch,
-                                        repo_dir,
-                                        repo_attaching,
-                                        repo_attach_error,
-                                    }
-                                    div { class: "example-asks",
-                                        for example in EXAMPLE_ASKS {
-                                            button {
-                                                class: "example-ask",
-                                                r#type: "button",
-                                                onclick: move |_| input.set(example.to_string()),
-                                                "{example}"
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(reply) = streaming_text() {
-                                div { class: "message message-assistant message-streaming", "{reply}" }
-                            }
-                            if turn_running() {
-                                div { class: "turn-working", role: "status",
-                                    span { class: "turn-working-dot" }
-                                    span { "Working… {format_elapsed(turn_elapsed())}" }
-                                }
-                            }
-                            ModelNotes { selected, stream_errors, notification_delivery_error }
-                            TrustCards { selected, repos, repo_action_error }
-                            // The model's question, waiting on the user (SME-34).
-                            if let (Some(id), Some(question)) = (selected(), pending_question()) {
-                                QuestionCard { key: "{question.tool_use_id}", conversation_id: id, question }
-                            }
+                        Transcript {
+                            selected,
+                            messages,
+                            load_error,
+                            initial_messages,
+                            turn_running,
+                            turn_elapsed,
+                            streaming_reply,
+                            tz_offset_minutes,
+                            input,
+                            repo_url,
+                            repo_branch,
+                            repo_dir,
+                            repo_attaching,
+                            repo_attach_error,
+                            stream_errors,
+                            notification_delivery_error,
+                            repos,
+                            repo_action_error,
+                            pending_question,
+                            messages_el,
+                            messages_stuck_to_bottom,
+                            pointer_over_transcript,
+                            layout_snap_pending,
                         }
                         if !conversation_missing() {
                         if let Some(id) = selected() {
