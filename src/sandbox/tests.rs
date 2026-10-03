@@ -1798,13 +1798,23 @@ const HELD_POD: &str = "sme-99-held-stopping-pod";
 /// unit test that uses conversation 1 (SME-99's code review).
 const HELD_POD_GRACE_SECS: i64 = 30;
 
-/// A pod labelled as conversation 1's that stays in Terminating for
-/// `HELD_POD_GRACE_SECS` once deleted.
+/// The held pod's conversation label until it's already deleting: no
+/// conversation's, so nothing waits on the pod while it starts.
+const HELD_POD_PLACEHOLDER_LABEL: &str = "sme-99-not-yet";
+
+/// A pod that stays in Terminating for `HELD_POD_GRACE_SECS` once deleted.
+/// It's created under `HELD_POD_PLACEHOLDER_LABEL` and only relabelled as
+/// conversation 1's once its delete has started, so a run killed at any
+/// point leaves nothing that blocks conversation 1 for longer than the
+/// grace period: before the delete the pod is no conversation's, and
+/// after it the kubelet ends it within the grace (SME-99's second code
+/// review: a run killed while waiting for it to start had left a running
+/// pod labelled as conversation 1's for good).
 fn held_pod_spec() -> Result<Pod, serde_json::Error> {
     serde_json::from_value(serde_json::json!({
         "metadata": {
             "name": HELD_POD,
-            "labels": { CONVERSATION_LABEL: "1" },
+            "labels": { CONVERSATION_LABEL: HELD_POD_PLACEHOLDER_LABEL },
         },
         "spec": {
             "restartPolicy": "Never",
@@ -1878,9 +1888,17 @@ async fn test_a_stopping_pod_from_another_run_doesnt_hold_up_the_tier(pool: PgPo
         pods.delete(HELD_POD, &DeleteParams::default())
             .await
             .map_err(|e| format!("start deleting the held pod: {e}"))?;
+        let relabel = serde_json::json!({ "metadata": { "labels": { CONVERSATION_LABEL: "1" } } });
+        pods.patch(HELD_POD, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&relabel))
+            .await
+            .map_err(|e| format!("label the stopping pod as conversation 1's: {e}"))?;
         let held = pods.get_opt(HELD_POD).await.map_err(|e| format!("read the held pod: {e}"))?;
-        if !held.is_some_and(|pod| pod.metadata.deletion_timestamp.is_some()) {
-            return Err("the held pod isn't held in Terminating".to_string());
+        let stopping_as_1 = held.is_some_and(|pod| {
+            pod.metadata.deletion_timestamp.is_some()
+                && pod.metadata.labels.and_then(|l| l.get(CONVERSATION_LABEL).cloned()).as_deref() == Some("1")
+        });
+        if !stopping_as_1 {
+            return Err("the held pod isn't held in Terminating as conversation 1's".to_string());
         }
         db::test_support::start_ids_clear_of_other_runs(&pool)
             .await
