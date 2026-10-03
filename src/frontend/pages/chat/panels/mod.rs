@@ -1,5 +1,7 @@
 //! The chat page's side panels.
 
+use super::TwoStepLabel;
+
 mod browsing;
 mod sandbox;
 mod todos;
