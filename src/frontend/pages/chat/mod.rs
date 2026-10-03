@@ -56,6 +56,7 @@ use crate::models::{Conversation, Message};
 
 mod composer;
 mod context;
+mod model_setup;
 mod panels;
 mod question_card;
 mod repo_attach;
@@ -68,6 +69,7 @@ mod trust_card;
 
 use composer::*;
 use context::*;
+use model_setup::*;
 use panels::*;
 use question_card::*;
 use repo_attach::*;
@@ -180,7 +182,6 @@ fn ChatPanel(
     // The last turn error, by conversation (`TurnError`, or a send the
     // server refused).
     let mut stream_errors: Signal<HashMap<i64, String>> = use_signal(HashMap::new);
-    let stream_error = move || selected().and_then(|id| stream_errors.read().get(&id).cloned());
     // Whether the server has a turn running (or queued) in the selected
     // conversation, from `ConversationEvent::TurnState`: covers turns this
     // tab didn't start (another tab, a finished command waking the model).
@@ -1032,26 +1033,7 @@ fn ChatPanel(
                                     span { "Working… {format_elapsed(turn_elapsed())}" }
                                 }
                             }
-                            if let Some(err) = stream_error() {
-                                if err == crate::providers::NO_MODEL_CONFIGURED {
-                                    p { class: "model-picker-setup", role: "status",
-                                        "{err} "
-                                        Link { to: Route::ProvidersRoute {}, "Model providers" }
-                                    }
-                                } else {
-                                    p { class: "error", "{err}" }
-                                }
-                            }
-                            if let Some(err) = notification_delivery_error() {
-                                if err == crate::providers::NO_MODEL_CONFIGURED {
-                                    p { class: "model-picker-setup", role: "status",
-                                        "A finished command or task is waiting for the model, but there's no model to send it to. "
-                                        Link { to: Route::ProvidersRoute {}, "Model providers" }
-                                    }
-                                } else {
-                                    p { class: "error", "A background notification failed to reach the model: {err}" }
-                                }
-                            }
+                            ModelNotes { selected, stream_errors, notification_delivery_error }
                             TrustCards { selected, repos, repo_action_error }
                             // The model's question, waiting on the user (SME-34).
                             if let (Some(id), Some(question)) = (selected(), pending_question()) {
