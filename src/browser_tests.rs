@@ -2564,7 +2564,9 @@ async fn scenario_error_text(t: &Scenario<'_>) {
     // open stays on the page.
     let refused = t.conversation().await;
     let deleted = t.conversation().await;
-    let sidebar = t.tab(t.url("")).await;
+    let watched = t.conversation().await;
+    let sidebar = t.tab(t.url(&format!("conversation/{}", watched.id))).await;
+    wait_for_live_client(&sidebar, watched.id).await;
     let delete_button = |id: i64| format!(".conversation-item[data-conversation-id='{id}'] .delete-conversation");
     wait_for_stable(&sidebar, &delete_button(refused.id), tokio::time::Instant::now() + Duration::from_secs(10)).await;
     // The next DELETE (the first conversation delete) fails as a server
@@ -2582,6 +2584,37 @@ async fn scenario_error_text(t: &Scenario<'_>) {
     click_when_present(&sidebar, &delete_button(refused.id), Duration::from_secs(5)).await;
     click_when_present(&sidebar, &format!("{}.confirm", delete_button(refused.id)), Duration::from_secs(5)).await;
     wait_for_element(&sidebar, ".sidebar-body > .error", Duration::from_secs(10)).await;
+    // A message arriving in the open conversation reloads the list (as a
+    // running turn's every reply does); that reload succeeding isn't the
+    // failed Delete succeeding, so the error stays (SME-81 review).
+    let lists_before = list_requests(&sidebar).await;
+    let arrived = db::create_message(
+        t.pool,
+        watched.id,
+        "assistant",
+        &[anthropic::ContentBlock::Text { text: "scenario 30 reload".to_string() }],
+    )
+    .await
+    .expect("save a message");
+    crate::events::publish(watched.id, crate::events::ConversationEvent::MessagesAppended { messages: vec![arrived] });
+    assert!(
+        wait_for_text(&sidebar, "scenario 30 reload", Duration::from_secs(10)).await,
+        "the open conversation should show the new message"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while list_requests(&sidebar).await <= lists_before {
+        assert!(tokio::time::Instant::now() < deadline, "the new message should reload the conversation list");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The reload's result is applied by an effect after the request ends.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let kept: bool = sidebar
+        .evaluate("!!document.querySelector('.sidebar-body > .error')")
+        .await
+        .expect("look for the sidebar error")
+        .into_value()
+        .expect("bool");
+    assert!(kept, "a list reload shouldn't clear a failed Delete's error");
     click_when_present(&sidebar, &delete_button(deleted.id), Duration::from_secs(5)).await;
     click_when_present(&sidebar, &format!("{}.confirm", delete_button(deleted.id)), Duration::from_secs(5)).await;
     assert!(
@@ -2595,6 +2628,15 @@ async fn scenario_error_text(t: &Scenario<'_>) {
         .into_value()
         .expect("bool");
     assert!(!still_shown, "a later success should clear the sidebar's error");
+}
+
+/// How many times `page` has fetched the conversation list.
+async fn list_requests(page: &chromiumoxide::Page) -> usize {
+    page.evaluate("performance.getEntriesByType('resource').filter(e => e.name.endsWith('/api/conversations')).length")
+        .await
+        .expect("read resource timings")
+        .into_value()
+        .expect("a count")
 }
 
 async fn new_conversation(

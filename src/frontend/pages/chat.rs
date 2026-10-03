@@ -2579,9 +2579,12 @@ fn ConversationSidebar(
     });
     let mut conversations: Signal<Vec<Conversation>> = use_signal(Vec::new);
     let mut loaded = use_signal(|| false);
-    // The last sidebar action's outcome: the list load, New conversation
-    // and Delete each set it, a success clearing it (SME-81).
-    let mut error: Signal<Option<String>> = use_signal(|| None);
+    // Why the list couldn't load, and why the last New conversation or
+    // Delete failed. Each is cleared by its own next success: the list
+    // reloads on every new message, which says nothing about a failed
+    // Delete (SME-81).
+    let mut list_error: Signal<Option<String>> = use_signal(|| None);
+    let mut action_error: Signal<Option<String>> = use_signal(|| None);
     let mut pending_delete: Signal<Option<i64>> = use_signal(|| None);
     // Whether the conversation list is open on a phone, where it folds
     // behind a button (SME-41 D4). Ignored at wider widths.
@@ -2609,9 +2612,9 @@ fn ConversationSidebar(
             match result {
                 Ok(list) => {
                     conversations.set(list);
-                    error.set(None);
+                    list_error.set(None);
                 }
-                Err(e) => error.set(Some(server_error_message(&e))),
+                Err(e) => list_error.set(Some(server_error_message(&e))),
             }
             loaded.set(true);
         }
@@ -2621,12 +2624,12 @@ fn ConversationSidebar(
         spawn(async move {
             match create_conversation().await {
                 Ok(conversation) => {
-                    error.set(None);
+                    action_error.set(None);
                     let id = conversation.id;
                     conversations.write().insert(0, conversation);
                     navigator.push(Route::ConversationRoute { id });
                 }
-                Err(e) => error.set(Some(server_error_message(&e))),
+                Err(e) => action_error.set(Some(server_error_message(&e))),
             }
         });
     };
@@ -2640,13 +2643,13 @@ fn ConversationSidebar(
             spawn(async move {
                 match delete_conversation(id).await {
                     Ok(()) => {
-                        error.set(None);
+                        action_error.set(None);
                         conversations.write().retain(|c| c.id != id);
                         if selected() == Some(id) {
                             navigator.push(Route::Home {});
                         }
                     }
-                    Err(e) => error.set(Some(server_error_message(&e))),
+                    Err(e) => action_error.set(Some(server_error_message(&e))),
                 }
             });
         } else {
@@ -2673,7 +2676,10 @@ fn ConversationSidebar(
             Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
             Link { to: Route::GitRoute {}, class: "sandbox-volumes-link git-link", "Git" }
             Link { to: Route::LanguageServersRoute {}, class: "sandbox-volumes-link language-servers-link", "Language servers" }
-            if let Some(err) = error() {
+            if let Some(err) = list_error() {
+                p { class: "error", "{err}" }
+            }
+            if let Some(err) = action_error() {
                 p { class: "error", "{err}" }
             }
             if !loaded() {
