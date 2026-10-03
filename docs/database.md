@@ -83,6 +83,7 @@ The tables after every migration has run. All `id`s are `BIGINT GENERATED ALWAYS
 | `messages` | `conversation_id`, `role`, `content` (JSON-serialized content blocks as `TEXT`, see [models.md](models.md)) | `role` `CHECK`ed to `user`/`assistant`. FK → `conversations` cascade. |
 | `conversation_context_usage` | The last turn's four token counts | PK is `conversation_id` (one row per conversation). FK → `conversations` cascade. |
 | `conversation_todos` | `items` JSONB, the todo list | PK is `conversation_id`. FK → `conversations` cascade. |
+| `pending_questions` | `tool_use_id`, `questions` JSONB (the model's `ask_user` input), `answer` JSONB (null while waiting) | PK is `conversation_id`: at most one per conversation. FK → `conversations` cascade. The card's answer is written once (`WHERE answer IS NULL`); the next turn deletes the row in the same transaction that saves the call's result (SME-34). |
 
 ### Sandbox
 
@@ -125,6 +126,7 @@ conversations
 ├── messages
 ├── conversation_context_usage
 ├── conversation_todos
+├── pending_questions
 ├── sandbox_pods
 │   ├── sandbox_pod_previews
 │   └── sandbox_terminals

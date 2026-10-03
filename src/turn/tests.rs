@@ -253,6 +253,40 @@ fn test_history_for_request_answers_only_the_missing_calls_of_several() {
     assert_eq!(history[2].content, vec![unfinished("t2"), tool_result("t1")]);
 }
 
+/// An `ask_user` call is answered after notices saved while it waited
+/// (SME-34): its result moves to the front of the message right after
+/// the call, and a message left empty by the move is dropped.
+#[test]
+fn test_history_for_request_moves_a_late_result_to_just_after_its_call() {
+    let history = history_for_request_all(vec![
+        text_message(1, "user", "go"),
+        message_with_blocks(2, "assistant", vec![tool_use("t1")]),
+        text_message(3, "user", "notice"),
+        message_with_blocks(4, "user", vec![tool_result("t1")]),
+        message_with_blocks(5, "user", vec![tool_result("t9"), text_block("and also")]),
+    ])
+    .expect("history");
+    assert_eq!(history.len(), 4, "{history:?}");
+    assert_eq!(history[2].content, vec![tool_result("t1"), text_block("notice")]);
+    assert_eq!(history[3].content, vec![tool_result("t9"), text_block("and also")]);
+}
+
+#[test]
+fn test_history_for_request_joins_a_late_result_to_the_others_from_its_reply() {
+    let history = history_for_request_all(vec![
+        text_message(1, "user", "go"),
+        message_with_blocks(2, "assistant", vec![tool_use("t1"), tool_use("t2")]),
+        message_with_blocks(3, "user", vec![tool_result("t1")]),
+        text_message(4, "user", "notice"),
+        message_with_blocks(5, "user", vec![tool_result("t2"), text_block("answered")]),
+    ])
+    .expect("history");
+    assert_eq!(history.len(), 5, "{history:?}");
+    assert_eq!(history[2].content, vec![tool_result("t2"), tool_result("t1")]);
+    assert_eq!(history[3].content, vec![text_block("notice")]);
+    assert_eq!(history[4].content, vec![text_block("answered")]);
+}
+
 #[test]
 fn test_history_for_request_adds_a_message_for_calls_left_at_the_end() {
     let history = history_for_request_all(vec![
@@ -2834,7 +2868,7 @@ async fn test_run_turn_errors_when_max_turns_exceeded(pool: PgPool) {
     // than run_turn (which would replay the mock upstream the real
     // MAX_TURNS — 10,000 — times just to prove the same "give up and
     // error" behavior).
-    let result = run_turn_bounded(&pool, conversation.id, Some(new_message), 3, false).await;
+    let result = run_turn_bounded(&pool, conversation.id, Some(new_message), 3, false, false).await;
     assert!(result.is_err(), "expected an error, got {result:?}");
 }
 
@@ -2920,4 +2954,324 @@ async fn test_run_turn_serializes_concurrent_calls_for_the_same_conversation(poo
         "the per-conversation lock should serialize the two calls into two complete \
          (user, assistant) pairs, never interleaved"
     );
+}
+
+// --- ask_user (SME-34) ---
+
+/// A reply that calls each of `calls` (id, tool name, input) and stops for
+/// their results.
+fn tool_calls_body(calls: &[(&str, &str, serde_json::Value)]) -> String {
+    let mut events: Vec<(String, String)> = vec![("message_start".into(), r#"{"type":"message_start"}"#.into())];
+    for (index, (id, name, input)) in calls.iter().enumerate() {
+        events.push((
+            "content_block_start".into(),
+            serde_json::json!({"type": "content_block_start", "index": index,
+                "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}})
+            .to_string(),
+        ));
+        events.push((
+            "content_block_delta".into(),
+            serde_json::json!({"type": "content_block_delta", "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": input.to_string()}})
+            .to_string(),
+        ));
+        events.push((
+            "content_block_stop".into(),
+            serde_json::json!({"type": "content_block_stop", "index": index}).to_string(),
+        ));
+    }
+    events.push(("message_delta".into(), r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#.into()));
+    events.push(("message_stop".into(), r#"{"type":"message_stop"}"#.into()));
+    let borrowed: Vec<(&str, &str)> = events.iter().map(|(e, d)| (e.as_str(), d.as_str())).collect();
+    sse_body(&borrowed)
+}
+
+fn ask_input() -> serde_json::Value {
+    serde_json::json!({"questions": [
+        {"question": "Delete the build directory?", "header": "Delete",
+         "options": [{"label": "Yes (Recommended)"}, {"label": "No"}]}
+    ]})
+}
+
+fn ask_body() -> String {
+    tool_calls_body(&[("toolu_ask", crate::questions::ASK_USER, ask_input())])
+}
+
+fn notice(text: &str) -> anthropic::AnthropicMessage {
+    anthropic::AnthropicMessage {
+        role: "user".to_string(),
+        content: vec![anthropic::ContentBlock::Text { text: text.to_string() }],
+    }
+}
+
+/// Each saved message's blocks, in order.
+async fn saved_blocks(pool: &PgPool, conversation_id: i64) -> Vec<(String, Vec<anthropic::ContentBlock>)> {
+    db::list_messages(pool, conversation_id)
+        .await
+        .expect("messages")
+        .into_iter()
+        .map(|m| {
+            let blocks = m.blocks().expect("blocks");
+            (m.role, blocks)
+        })
+        .collect()
+}
+
+/// Waits (up to 10 s) until the recording upstream has had `count`
+/// requests.
+async fn wait_for_requests(requests: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>, count: usize) {
+    for _ in 0..200 {
+        if requests.lock().expect("requests").len() >= count {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("expected {count} requests, got {}", requests.lock().expect("requests").len());
+}
+
+/// The user message right after the assistant message that called
+/// `tool_use_id`, in a request body.
+fn message_after_call(request: &serde_json::Value, tool_use_id: &str) -> serde_json::Value {
+    let messages = request["messages"].as_array().expect("messages");
+    let call = messages
+        .iter()
+        .position(|m| m["content"].as_array().is_some_and(|c| c.iter().any(|b| b["id"] == tool_use_id)))
+        .expect("the call is in the request");
+    messages[call + 1].clone()
+}
+
+#[sqlx::test]
+async fn test_ask_user_ends_the_turn_and_waits(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_300).await.expect("conversation");
+    let calls = start_mock_upstream(&pool, vec![ask_body(), text_reply_body("unreached")]).await;
+    let mut rx = events::subscribe(conversation.id);
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn ends cleanly");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no model call after the question");
+    let saved = saved_blocks(&pool, conversation.id).await;
+    assert_eq!(saved.len(), 2, "the user's message and the call, no result: {saved:?}");
+    let pending = pending_question(&pool, conversation.id).await.expect("read").expect("a question waits");
+    assert_eq!(pending.tool_use_id, "toolu_ask");
+    assert_eq!(pending.questions[0].header, "Delete");
+    let seen = drain_events(&mut rx).await;
+    assert!(
+        seen.iter().any(|e| matches!(e, events::ConversationEvent::QuestionUpdate { question: Some(q) } if q.tool_use_id == "toolu_ask")),
+        "every tab hears of the question: {seen:?}"
+    );
+}
+
+#[sqlx::test]
+async fn test_ask_user_with_another_tool_saves_its_result_and_waits(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_301).await.expect("conversation");
+    let body = tool_calls_body(&[
+        ("toolu_read", "todoread", serde_json::json!({})),
+        ("toolu_ask", crate::questions::ASK_USER, ask_input()),
+    ]);
+    let calls = start_mock_upstream(&pool, vec![body, text_reply_body("unreached")]).await;
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn ends cleanly");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let saved = saved_blocks(&pool, conversation.id).await;
+    assert_eq!(saved.len(), 3, "{saved:?}");
+    let results: Vec<&String> = saved[2]
+        .1
+        .iter()
+        .filter_map(|b| match b {
+            anthropic::ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results, vec!["toolu_read"], "only the other tool's result is saved");
+    assert!(pending_question(&pool, conversation.id).await.expect("read").is_some());
+}
+
+#[sqlx::test]
+async fn test_a_bad_or_second_ask_user_is_an_error_result(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_302).await.expect("conversation");
+    let body = tool_calls_body(&[
+        ("toolu_ask", crate::questions::ASK_USER, ask_input()),
+        ("toolu_ask2", crate::questions::ASK_USER, ask_input()),
+        ("toolu_bad", crate::questions::ASK_USER, serde_json::json!({"questions": []})),
+    ]);
+    start_mock_upstream(&pool, vec![body, text_reply_body("unreached")]).await;
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn ends cleanly");
+
+    let saved = saved_blocks(&pool, conversation.id).await;
+    let errors: Vec<(String, String)> = saved
+        .last()
+        .expect("a results message")
+        .1
+        .iter()
+        .filter_map(|b| match b {
+            anthropic::ContentBlock::ToolResult { tool_use_id, content, is_error: Some(true) } => {
+                Some((tool_use_id.clone(), content.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 2, "{saved:?}");
+    assert_eq!(errors[0].0, "toolu_ask2");
+    assert!(errors[0].1.contains("one"), "{errors:?}");
+    assert_eq!(errors[1].0, "toolu_bad");
+    assert_eq!(
+        pending_question(&pool, conversation.id).await.expect("read").expect("waits").tool_use_id,
+        "toolu_ask"
+    );
+}
+
+#[sqlx::test]
+async fn test_a_notice_while_a_question_waits_is_saved_without_calling_the_model(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_303).await.expect("conversation");
+    let calls = start_mock_upstream(&pool, vec![ask_body(), text_reply_body("unreached")]).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("asks");
+
+    run_turn(&pool, conversation.id, notice("Terminal command c1 finished: exit code 0."))
+        .await
+        .expect("the notice's turn ends cleanly");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the notice doesn't reach the model yet");
+    let saved = saved_blocks(&pool, conversation.id).await;
+    assert_eq!(saved.last().expect("saved").1, notice("Terminal command c1 finished: exit code 0.").content);
+    assert!(pending_question(&pool, conversation.id).await.expect("read").is_some(), "still waiting");
+}
+
+#[sqlx::test]
+async fn test_answering_sends_the_result_right_after_the_call(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_304).await.expect("conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![ask_body(), text_reply_body("Deleting.")]).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("asks");
+    run_turn(&pool, conversation.id, notice("a notice")).await.expect("notice saved");
+
+    let answers = vec![crate::questions::QuestionAnswer { selected: vec!["Yes (Recommended)".to_string()], other: None }];
+    answer_question(pool.clone(), conversation.id, "toolu_ask".to_string(), answers)
+        .await
+        .expect("the answer is taken");
+
+    wait_for_requests(&requests, 2).await;
+    let request = requests.lock().expect("requests")[1].clone();
+    let after = message_after_call(&request, "toolu_ask");
+    assert_eq!(after["role"], "user");
+    assert_eq!(after["content"][0]["type"], "tool_result", "{after}");
+    assert_eq!(after["content"][0]["tool_use_id"], "toolu_ask");
+    assert_eq!(after["content"][0]["content"], "The user answered:\n1. Delete: Yes (Recommended)");
+    assert_eq!(after["content"][1]["text"], "a notice", "the notice follows the result: {after}");
+    assert_eq!(db::get_pending_question(&pool, conversation.id).await.expect("read"), None);
+}
+
+#[sqlx::test]
+async fn test_a_message_instead_of_an_answer_dismisses_the_question(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_305).await.expect("conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![ask_body(), text_reply_body("OK.")]).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("asks");
+
+    start_turn(pool.clone(), conversation.id, "keep it, and do X instead".to_string())
+        .await
+        .expect("the message is sent");
+
+    wait_for_requests(&requests, 2).await;
+    let request = requests.lock().expect("requests")[1].clone();
+    let after = message_after_call(&request, "toolu_ask");
+    assert_eq!(after["content"][0]["tool_use_id"], "toolu_ask", "{after}");
+    assert_eq!(after["content"][0]["content"], crate::questions::NOT_ANSWERED);
+    assert_eq!(after["content"][1]["text"], "keep it, and do X instead");
+    assert_eq!(db::get_pending_question(&pool, conversation.id).await.expect("read"), None);
+}
+
+#[sqlx::test]
+async fn test_a_question_takes_one_valid_answer(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_306).await.expect("conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![ask_body(), text_reply_body("OK.")]).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("asks");
+    let answer = |label: &str| vec![crate::questions::QuestionAnswer { selected: vec![label.to_string()], other: None }];
+
+    let err = answer_question(pool.clone(), conversation.id, "toolu_ask".to_string(), answer("Maybe"))
+        .await
+        .expect_err("a choice that wasn't offered");
+    assert!(err.to_string().contains("Maybe"), "{err}");
+    assert!(pending_question(&pool, conversation.id).await.expect("read").is_some(), "still waiting");
+
+    answer_question(pool.clone(), conversation.id, "toolu_ask".to_string(), answer("No"))
+        .await
+        .expect("the first answer");
+    let err = answer_question(pool.clone(), conversation.id, "toolu_ask".to_string(), answer("Yes (Recommended)"))
+        .await
+        .expect_err("a second answer");
+    assert!(err.to_string().contains(ALREADY_ANSWERED), "{err}");
+
+    wait_for_requests(&requests, 2).await;
+    let request = requests.lock().expect("requests")[1].clone();
+    assert_eq!(message_after_call(&request, "toolu_ask")["content"][0]["content"], "The user answered:\n1. Delete: No");
+}
+
+/// Code review 1 (high): an answer recorded while a turn that already
+/// saved its own message is running (a notice's turn, paused here right
+/// after its save) is taken by that turn before it calls the model, not
+/// left behind with the call answered "unfinished".
+#[sqlx::test]
+async fn test_an_answer_landing_mid_turn_is_taken_before_the_model_call(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_307).await.expect("conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![ask_body(), text_reply_body("Deleting.")]).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("asks");
+
+    let (reached, release) = test_hooks::pause_after_message_saved(conversation.id);
+    let notice_turn = {
+        let pool = pool.clone();
+        tokio::spawn(async move { run_turn(&pool, conversation.id, notice("a notice")).await })
+    };
+    reached.await.expect("the notice's turn saved its message");
+    let answers = vec![crate::questions::QuestionAnswer { selected: vec!["No".to_string()], other: None }];
+    answer_question(pool.clone(), conversation.id, "toolu_ask".to_string(), answers)
+        .await
+        .expect("the answer is recorded");
+    release.send(()).expect("let the notice's turn go on");
+    notice_turn.await.expect("join").expect("the notice's turn");
+
+    wait_for_requests(&requests, 2).await;
+    let request = requests.lock().expect("requests")[1].clone();
+    let after = message_after_call(&request, "toolu_ask");
+    assert_eq!(after["content"][0]["content"], "The user answered:\n1. Delete: No", "{after}");
+    assert_eq!(db::get_pending_question(&pool, conversation.id).await.expect("read"), None);
+}
+
+/// Code review 2: the question is recorded before the reply's other
+/// tools run, so a Stop (or restart) while they run leaves it on its card
+/// rather than losing it.
+#[sqlx::test]
+async fn test_the_question_is_recorded_before_the_replys_other_tools_run(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_308).await.expect("conversation");
+    let body = tool_calls_body(&[
+        ("toolu_read", "todoread", serde_json::json!({})),
+        ("toolu_ask", crate::questions::ASK_USER, ask_input()),
+    ]);
+    start_mock_upstream(&pool, vec![body, text_reply_body("unreached")]).await;
+    let mut rx = events::subscribe(conversation.id);
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn ends cleanly");
+
+    let order: Vec<&str> = drain_events(&mut rx)
+        .await
+        .iter()
+        .filter_map(|e| match e {
+            events::ConversationEvent::QuestionUpdate { question: Some(_) } => Some("question"),
+            events::ConversationEvent::MessagesAppended { messages }
+                if messages.iter().any(|m| m.content.contains("toolu_read") && m.role == "user") =>
+            {
+                Some("results")
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, vec!["question", "results"]);
 }
