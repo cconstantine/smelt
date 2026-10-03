@@ -3,9 +3,10 @@
 //! custom sandbox image (see
 //! SME-17's Phase 1). Run by
 //! `scripts/build-sandbox-image.sh` after `docker build`/`docker save`,
-//! never by the main `smelt` server process at runtime. With `--check`
-//! instead of a tarball, it only checks that the node still has every
-//! sandbox image (`scripts/cluster-doctor`).
+//! never by the main `smelt` server process at runtime. With `--check
+//! [reference...]` instead of a tarball, it only checks that the node has
+//! those images (default: `SANDBOX_IMAGES`), with the read-only
+//! `ctr images ls -q` (`scripts/cluster-doctor`, SME-102).
 //!
 //! A short-lived pod gets the node's containerd socket hostPath-mounted
 //! (`/run/k3s/containerd` — the path this project's own `rancher/k3s`
@@ -27,13 +28,16 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{Api, AttachParams, DeleteParams, PostParams};
+use kube::api::{Api, AttachParams, DeleteParams, ListParams, PostParams};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
 const NAMESPACE: &str = "smelt-park";
 const LOADER_POD_NAME: &str = "sandbox-image-import";
+/// Every loader pod carries this label, so a run can find finished ones
+/// to clean up without touching another run's live loader.
+const LOADER_LABEL: (&str, &str) = ("smelt/role", "sandbox-image-loader");
 /// Pinned to match `docker-compose.yml`'s `k3s` service image — keep the
 /// two in sync; this is only the loader pod's own image (needs a `ctr`
 /// binary matching the cluster's containerd), not the sandbox image itself.
@@ -43,14 +47,15 @@ const REMOTE_TAR_PATH: &str = "/tmp/sandbox-image.tar";
 /// How long the loader pod runs unless the tool deletes it first, as it
 /// does on the way out: an hour, the CI job's own limit, so a slow runner's
 /// stream can't outlast it (SME-89: 300 s once did). A run that's killed
-/// leaves the pod until then, or until the next run deletes it.
+/// leaves its pod until then; the first run after it has finished deletes
+/// it (`finished_loaders`).
 const LOADER_LIFETIME: Duration = Duration::from_secs(3600);
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     let arg = std::env::args()
         .nth(1)
-        .ok_or("usage: sandbox_image_import <path-to-docker-save-tarball> | --check")?;
+        .ok_or("usage: sandbox_image_import <path-to-docker-save-tarball> | --check [image-reference...]")?;
 
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -58,39 +63,97 @@ async fn main() -> Result<(), BoxError> {
     let client = kube::Client::try_default().await?;
     let pods: Api<Pod> = Api::namespaced(client, NAMESPACE);
 
-    let result = if arg == "--check" { check(&pods).await } else { import(&pods, &arg).await };
+    let loader = loader_name(std::process::id(), run_nonce());
+    let result = if arg == "--check" {
+        let refs: Vec<String> = std::env::args().skip(2).collect();
+        check(&pods, &loader, &check_targets(&refs)).await
+    } else {
+        import(&pods, &loader, &arg).await
+    };
     // Best-effort cleanup regardless of how `import` above went — this is
     // a one-shot CLI tool, not a long-lived process with its own cleanup
     // queue, so a plain delete-on-the-way-out is enough (same "disposable,
     // no graceful shutdown needed" posture `sandbox.rs`'s own
     // `immediate_delete_params` already documents).
-    let _ = pods.delete(LOADER_POD_NAME, &immediate_delete()).await;
+    let _ = pods.delete(&loader, &immediate_delete()).await;
     result
 }
 
-async fn import(pods: &Api<Pod>, tar_path: &str) -> Result<(), BoxError> {
+async fn import(pods: &Api<Pod>, loader: &str, tar_path: &str) -> Result<(), BoxError> {
     let tar_bytes = std::fs::read(tar_path).map_err(|e| format!("reading {tar_path}: {e}"))?;
     println!(
         "sandbox_image_import: read {} bytes from {tar_path}",
         tar_bytes.len()
     );
 
-    start_loader(pods, LOADER_POD_NAME, LOADER_LIFETIME).await?;
+    start_loader(pods, loader, LOADER_LIFETIME).await?;
     let started = std::time::Instant::now();
-    let sent = stream_tarball(pods, LOADER_POD_NAME, LOADER_LIFETIME, tar_bytes.as_slice()).await?;
+    let sent = stream_tarball(pods, loader, LOADER_LIFETIME, tar_bytes.as_slice()).await?;
     let secs = started.elapsed().as_secs_f64().max(0.001);
     println!(
         "sandbox_image_import: streamed {sent} bytes in {secs:.1}s ({:.1} MB/s)",
         sent as f64 / secs / 1_000_000.0
     );
-    run_import(pods).await?;
+    run_import(pods, loader).await?;
     println!("sandbox_image_import: done");
     Ok(())
+}
+
+/// This run's loader pod: `sandbox-image-import-<run>-<nonce>`, `run` being
+/// the process id and `nonce` a per-run number, since process ids repeat
+/// across containers. A run used to share one fixed name with every other, and
+/// creating its loader deleted whichever was there, so a cluster check in
+/// one worktree could kill another's import mid-stream (SME-102 review).
+fn loader_name(run: u32, nonce: u32) -> String {
+    format!("{LOADER_POD_NAME}-{run}-{nonce:08x}")
+}
+
+/// A per-run number to go with the process id, which is only unique
+/// within one container: two `docker compose run`s can both be pid 7
+/// (SME-102 review 2).
+fn run_nonce() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
+        .unwrap_or(0)
+}
+
+/// The loaders in `listed` no run can still be using: those whose `sleep`
+/// ran out, and failed ones older than a loader's lifetime. A live one
+/// belongs to a run still going, and so may a failed one that's younger:
+/// its run reads why it failed to report it (SME-89; SME-102 review 2).
+fn finished_loaders(listed: &[Pod], now: k8s_openapi::jiff::Timestamp) -> Vec<String> {
+    let older_than_a_lifetime = |pod: &Pod| {
+        pod.metadata
+            .creation_timestamp
+            .as_ref()
+            .is_some_and(|t| now.duration_since(t.0).as_secs() > LOADER_LIFETIME.as_secs() as i64)
+    };
+    listed
+        .iter()
+        .filter(|pod| match pod.status.as_ref().and_then(|s| s.phase.as_deref()) {
+            // Its `sleep` ran out: no run can still be using it.
+            Some("Succeeded") => true,
+            // Evicted, say: its run may still be reading why, so only once
+            // that run has certainly ended.
+            Some("Failed") => older_than_a_lifetime(pod),
+            _ => false,
+        })
+        .filter_map(|pod| pod.metadata.name.clone())
+        .collect()
 }
 
 /// A fresh loader pod named `name`, Running, that ends on its own after
 /// `lifetime`.
 async fn start_loader(pods: &Api<Pod>, name: &str, lifetime: Duration) -> Result<(), BoxError> {
+    // Finished loaders left by runs that were killed; never a live one,
+    // which another run is still using.
+    let selector = format!("{}={}", LOADER_LABEL.0, LOADER_LABEL.1);
+    if let Ok(listed) = pods.list(&ListParams::default().labels(&selector)).await {
+        for finished in finished_loaders(&listed.items, k8s_openapi::jiff::Timestamp::now()) {
+            let _ = pods.delete(&finished, &immediate_delete()).await;
+        }
+    }
     let _ = pods.delete(name, &immediate_delete()).await;
     wait_gone(pods, name).await;
     pods.create(&PostParams::default(), &loader_pod_spec(name, lifetime)).await?;
@@ -117,6 +180,7 @@ fn loader_pod_spec(name: &str, lifetime: Duration) -> Pod {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(NAMESPACE.to_string()),
+            labels: Some([(LOADER_LABEL.0.to_string(), LOADER_LABEL.1.to_string())].into()),
             ..Default::default()
         },
         spec: Some(PodSpec {
@@ -382,11 +446,11 @@ fn remote_write_finished(stdout: &str) -> Result<(), String> {
 }
 
 /// `ctr images import`s the streamed tarball.
-async fn run_import(pods: &Api<Pod>) -> Result<(), BoxError> {
+async fn run_import(pods: &Api<Pod>, loader: &str) -> Result<(), BoxError> {
     println!("sandbox_image_import: tarball streamed, running ctr images import");
     let import_out = exec_capture(
         pods,
-        LOADER_POD_NAME,
+        loader,
         &[
             "ctr",
             "--address",
@@ -412,29 +476,41 @@ const SANDBOX_IMAGES: &[&str] = &[
     "docker.io/library/docker:29-dind",
 ];
 
+/// The references `--check` looks for: the ones given after it, or
+/// `SANDBOX_IMAGES` when none are (SME-102: `scripts/cluster-doctor` passes
+/// the working tree's own `smelt-sandbox:src-<hash>`).
+fn check_targets(given: &[String]) -> Vec<String> {
+    if given.is_empty() {
+        SANDBOX_IMAGES.iter().map(|s| s.to_string()).collect()
+    } else {
+        given.to_vec()
+    }
+}
+
 /// Which of `wanted` aren't in `listed`, the output of `ctr images ls -q`
 /// (one image reference per line).
-fn missing_images(listed: &str, wanted: &[&str]) -> Vec<String> {
+fn missing_images<S: AsRef<str>>(listed: &str, wanted: &[S]) -> Vec<String> {
     let listed: std::collections::HashSet<&str> = listed.lines().map(str::trim).collect();
     wanted
         .iter()
-        .filter(|image| !listed.contains(**image))
-        .map(|image| image.to_string())
+        .map(AsRef::as_ref)
+        .filter(|image| !listed.contains(image))
+        .map(str::to_string)
         .collect()
 }
 
-/// `--check`: fails, naming them, if the node lacks any of `SANDBOX_IMAGES`.
-async fn check(pods: &Api<Pod>) -> Result<(), BoxError> {
-    start_loader(pods, LOADER_POD_NAME, LOADER_LIFETIME).await?;
+/// `--check`: fails, naming them, if the node lacks any of `wanted`.
+async fn check(pods: &Api<Pod>, loader: &str, wanted: &[String]) -> Result<(), BoxError> {
+    start_loader(pods, loader, LOADER_LIFETIME).await?;
     let listed = exec_capture(
         pods,
-        LOADER_POD_NAME,
+        loader,
         &["ctr", "--address", CONTAINERD_SOCKET, "--namespace", "k8s.io", "images", "ls", "-q"],
     )
     .await?;
-    let missing = missing_images(&listed, SANDBOX_IMAGES);
+    let missing = missing_images(&listed, wanted);
     if missing.is_empty() {
-        println!("sandbox_image_import: the node has every sandbox image");
+        println!("sandbox_image_import: the node has {}", wanted.join(" and "));
         Ok(())
     } else {
         Err(format!(
@@ -494,6 +570,46 @@ mod tests {
         Ok(())
     }
 
+    /// Each run's loader has a name of its own, so one run can't delete
+    /// another's (SME-102 review), even when their process ids match.
+    #[test]
+    fn test_each_run_gets_a_loader_of_its_own() {
+        let (a, b) = (loader_name(1234, 1), loader_name(5678, 1));
+        assert_ne!(a, b);
+        // Two containers' runs can share a process id.
+        assert_ne!(loader_name(7, 1), loader_name(7, 2));
+        assert!(a.starts_with("sandbox-image-import-") && b.starts_with("sandbox-image-import-"), "{a} {b}");
+        let labels = loader_pod_spec(&a, LOADER_LIFETIME).metadata.labels.unwrap_or_default();
+        assert_eq!(labels.get(LOADER_LABEL.0).map(String::as_str), Some(LOADER_LABEL.1));
+    }
+
+    #[test]
+    fn test_only_finished_loaders_are_cleaned_up() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use k8s_openapi::jiff::Timestamp;
+        let now = Timestamp::from_second(1_000_000).expect("a timestamp");
+        let pod = |name: &str, phase: Option<&str>, age_secs: i64| Pod {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                creation_timestamp: Some(Time(Timestamp::from_second(1_000_000 - age_secs).expect("a timestamp"))),
+                ..Default::default()
+            },
+            status: phase.map(|p| k8s_openapi::api::core::v1::PodStatus { phase: Some(p.to_string()), ..Default::default() }),
+            ..Default::default()
+        };
+        let old = LOADER_LIFETIME.as_secs() as i64 + 60;
+        let listed = vec![
+            pod("done", Some("Succeeded"), 10),
+            pod("evicted-long-ago", Some("Failed"), old),
+            // Its run may still be reading why it failed (SME-89's reason).
+            pod("evicted-just-now", Some("Failed"), 10),
+            pod("live", Some("Running"), old),
+            pod("starting", Some("Pending"), 10),
+            pod("unknown", None, old),
+        ];
+        assert_eq!(finished_loaders(&listed, now), vec!["done".to_string(), "evicted-long-ago".to_string()]);
+    }
+
     /// The loader outlives any import CI can run: the job's own limit is
     /// 60 minutes (`.github/workflows/ci.yml`), and a slow runner once
     /// took longer than the old 300 s just to stream the tarball (SME-89).
@@ -550,6 +666,13 @@ mod tests {
         assert!(!evicted.contains("outlasted"), "{evicted}");
         let failed = stream_failure("l", &phase("Failed", None), t, Duration::from_secs(60), 42, "broken pipe");
         assert!(failed.starts_with("loader pod l stopped (Failed) 60s") && !failed.contains("outlasted"), "{failed}");
+    }
+
+    #[test]
+    fn test_check_looks_for_the_references_given_or_the_defaults() {
+        let given = vec!["docker.io/library/smelt-sandbox:src-0123456789abcdef".to_string()];
+        assert_eq!(check_targets(&given), given);
+        assert_eq!(check_targets(&[]), SANDBOX_IMAGES.iter().map(|s| s.to_string()).collect::<Vec<_>>());
     }
 
     /// A tag that only starts like a wanted one isn't it.

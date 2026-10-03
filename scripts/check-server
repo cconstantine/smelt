@@ -164,6 +164,30 @@ start() {
         # Before the caller's overrides, so an explicit one still wins.
         overrides=("BROWSER_CHECK_CACHE=$cache" "${overrides[@]}")
     fi
+    # Pods run the served ref's own agent, from the image named after its
+    # sources (SME-102), unless one is given (environment, .env or an
+    # override). A ref from before SME-102 has no scripts/sandbox-image-ref
+    # and keeps `:latest`. The caller's cluster-doctor checks the node has
+    # it before anything is built.
+    local image="" override derived=""
+    for override in "${overrides[@]}"; do
+        [[ "$override" == SANDBOX_IMAGE=* ]] && image=${override#SANDBOX_IMAGE=}
+    done
+    [ -n "$image" ] || image=${SANDBOX_IMAGE:-$(env_file_value SANDBOX_IMAGE)}
+    if [ -z "$image" ] && [ -x "$worktree/scripts/sandbox-image-ref" ]; then
+        image=$("$worktree/scripts/sandbox-image-ref")
+        derived=1
+        overrides=("SANDBOX_IMAGE=$image" "${overrides[@]}")
+    fi
+    if [ -n "$image" ] && ! SANDBOX_IMAGE=$image "$repo/scripts/cluster-doctor"; then
+        # The doctor's own advice is for this checkout. An image named after
+        # the served ref's sources is built from the check worktree (SME-102
+        # review); one that was given is the giver's to build.
+        if [ -n "$derived" ]; then
+            echo "check-server: build $image from the served ref: (cd $worktree && scripts/build-sandbox-image.sh)" >&2
+        fi
+        exit 1
+    fi
     if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
         local db_url
         db_url=$(scratch_db_url)

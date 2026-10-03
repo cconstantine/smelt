@@ -82,6 +82,13 @@ jobs:
       # k3s always starts with nothing imported. Needs `docker`/`k3s`/
       # `k3s-bootstrap` already up, which the two steps above this one
       # provide.
+      # The image is named after this commit's agent sources
+      # (scripts/sandbox-image-ref, SME-102), and the test steps below run
+      # their pods from it through SANDBOX_IMAGE, as scripts/check.sh does
+      # locally. `:latest` isn't imported: nothing here uses it.
+      - name: Sandbox image for this commit
+        run: echo "SANDBOX_IMAGE=$(scripts/sandbox-image-ref)" >> "$GITHUB_ENV"
+
       - name: Build and deliver the sandbox image
         run: |
           docker compose run --rm \
@@ -112,6 +119,7 @@ jobs:
             -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
             -e SANDBOX_MEMORY_LIMIT=128Mi \
             -e SANDBOX_DOCKER_MEMORY_LIMIT=256Mi \
+            -e SANDBOX_IMAGE \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo test --features server
 
@@ -170,6 +178,7 @@ jobs:
             -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \
             -e SANDBOX_MEMORY_LIMIT=128Mi \
             -e SANDBOX_DOCKER_MEMORY_LIMIT=256Mi \
+            -e SANDBOX_IMAGE \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo test --features "server browser-test" -- --ignored --test-threads=1
 
