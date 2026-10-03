@@ -1788,20 +1788,27 @@ async fn test_wait_for_conversation_pods_gone_waits_out_a_stopping_pod() {
 /// holds in Terminating. A fixed name, so a stopped run's leftover is easy
 /// to find, and the next run clears it first.
 const HELD_POD: &str = "sme-99-held-stopping-pod";
-const HELD_POD_FINALIZER: &str = "smelt.test/hold";
 
-/// A pod labelled as conversation 1's, which a finalizer keeps in
-/// Terminating once deleted. It never needs to run.
+/// How long the held pod stays in Terminating once deleted: `sleep` as
+/// PID 1 ignores SIGTERM, so the kubelet waits out the whole grace period
+/// before killing it. Longer than the test's 10 s wait, so the wait meets
+/// a stopping pod; short, so a run killed mid-test (no cleanup) leaves a
+/// pod that goes by itself within this. A finalizer held it at first, and
+/// a killed run would have left it Terminating for good, failing every
+/// unit test that uses conversation 1 (SME-99's code review).
+const HELD_POD_GRACE_SECS: i64 = 30;
+
+/// A pod labelled as conversation 1's that stays in Terminating for
+/// `HELD_POD_GRACE_SECS` once deleted.
 fn held_pod_spec() -> Result<Pod, serde_json::Error> {
     serde_json::from_value(serde_json::json!({
         "metadata": {
             "name": HELD_POD,
             "labels": { CONVERSATION_LABEL: "1" },
-            "finalizers": [HELD_POD_FINALIZER],
         },
         "spec": {
             "restartPolicy": "Never",
-            "terminationGracePeriodSeconds": 0,
+            "terminationGracePeriodSeconds": HELD_POD_GRACE_SECS,
             "containers": [{
                 "name": "held",
                 "image": "docker.io/library/smelt-sandbox:latest",
@@ -1816,17 +1823,10 @@ fn held_pod_spec() -> Result<Pod, serde_json::Error> {
     }))
 }
 
-/// Lets the held pod go: drops its finalizer, deletes it, and waits (up
-/// to a minute) for it to be gone. Errors are only logged: this runs on
-/// every exit path, including before a run, for a previous run's leftover.
+/// Removes the held pod at once (grace 0) and waits, up to a minute, for
+/// it to be gone. Errors are only logged: this runs on every exit path,
+/// and before a run, for a previous run's leftover.
 async fn release_held_pod(pods: &Api<Pod>) {
-    let patch = serde_json::json!({ "metadata": { "finalizers": null } });
-    let params = kube::api::PatchParams::default();
-    if let Err(e) = pods.patch(HELD_POD, &params, &kube::api::Patch::Merge(&patch)).await {
-        if !matches!(&e, kube::Error::Api(response) if response.code == 404) {
-            eprintln!("couldn't drop {HELD_POD}'s finalizer: {e}");
-        }
-    }
     let _ = pods.delete(HELD_POD, &immediate_delete_params()).await;
     for _ in 0..120 {
         match pods.get_opt(HELD_POD).await {
@@ -1839,6 +1839,20 @@ async fn release_held_pod(pods: &Api<Pod>) {
         }
     }
     eprintln!("{HELD_POD} is still there after a minute");
+}
+
+/// Waits up to a minute for the held pod to run: a pod deleted before its
+/// container starts goes at once, with nothing to wait out.
+async fn wait_held_pod_running(pods: &Api<Pod>) -> Result<(), String> {
+    for _ in 0..120 {
+        let pod = pods.get_opt(HELD_POD).await.map_err(|e| format!("read the held pod: {e}"))?;
+        let phase = pod.and_then(|p| p.status).and_then(|s| s.phase);
+        if phase.as_deref() == Some("Running") {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err("the held pod didn't start running within a minute".to_string())
 }
 
 /// SME-99: the browser tier's scratch database counted conversations from
@@ -1860,6 +1874,7 @@ async fn test_a_stopping_pod_from_another_run_doesnt_hold_up_the_tier(pool: PgPo
     pods.create(&PostParams::default(), &spec).await.expect("create the held pod");
 
     let outcome: Result<i64, String> = async {
+        wait_held_pod_running(&pods).await?;
         pods.delete(HELD_POD, &DeleteParams::default())
             .await
             .map_err(|e| format!("start deleting the held pod: {e}"))?;
