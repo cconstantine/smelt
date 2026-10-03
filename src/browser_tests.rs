@@ -1144,6 +1144,13 @@ async fn scenario_reply_stays_in_its_conversation(t: &Scenario<'_>) {
         wait_for_text(&chat, "seeded message in B", Duration::from_secs(5)).await,
         "should now be showing B"
     );
+    // A's sidebar row says it's working. Its going away below is how this
+    // tab shows it has had the events after A's turn ended.
+    let a_busy = format!(".conversation-item[data-conversation-id='{}'] .conversation-busy", streaming.id);
+    assert!(
+        wait_for_count(&chat, &a_busy, 1, Duration::from_secs(5)).await,
+        "the sidebar should mark A as working while its reply streams"
+    );
     for moment in ["right after switching", "a second later"] {
         let b = view_state(&chat).await;
         assert!(b.input_enabled, "B's message box is disabled {moment}: {b:?}");
@@ -1167,6 +1174,14 @@ async fn scenario_reply_stays_in_its_conversation(t: &Scenario<'_>) {
         assert!(tokio::time::Instant::now() < deadline, "A's finished reply was never saved");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // Saved isn't shown: the turn's events still have to reach this tab. A
+    // turn ends after its reply is saved, and this tab hears of it on B's
+    // own stream (the sidebar's busy mark), so once the mark is gone,
+    // anything of A's that was going to land in B has had its chance.
+    assert!(
+        wait_for_count(&chat, &a_busy, 0, Duration::from_secs(10)).await,
+        "A's busy mark never went away after its turn ended"
+    );
     let b = view_state(&chat).await;
     assert!(!b.shows_reply, "A's finished reply landed in B: {b:?}");
     assert!(b.input_enabled, "B's message box is disabled after A finished: {b:?}");
