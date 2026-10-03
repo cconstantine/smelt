@@ -1821,7 +1821,7 @@ fn held_pod_spec() -> Result<Pod, serde_json::Error> {
             "terminationGracePeriodSeconds": HELD_POD_GRACE_SECS,
             "containers": [{
                 "name": "held",
-                "image": "docker.io/library/smelt-sandbox:latest",
+                "image": default_sandbox_image(),
                 "imagePullPolicy": "Never",
                 "command": ["sleep", "3600"],
                 "resources": {
