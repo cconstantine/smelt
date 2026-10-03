@@ -2440,6 +2440,14 @@ async fn scenario_pointer_keeps_text_still(t: &Scenario<'_>) {
             (after - before).abs() <= 2.0,
             "at {width}px the text under the pointer moved when the sandbox panel appeared: top {before} -> {after}"
         );
+        // A scroll that isn't the user's (no wheel, touch or key: the
+        // transcript keeping the text under the pointer still, which can
+        // leave it well short of its bottom when long lines re-wrap) mustn't
+        // count as the user leaving the bottom (SME-75 code review).
+        page.evaluate("(() => { document.querySelector('.messages').scrollTop -= 100; })()")
+            .await
+            .expect("scroll the transcript");
+        tokio::time::sleep(Duration::from_millis(300)).await;
         page.move_mouse(chromiumoxide::layout::Point::new(5.0, 5.0))
             .await
             .expect("move the mouse off the transcript");

@@ -3966,7 +3966,21 @@ fn ChatPanel(
                                     }
                                 }
                             },
+                            // A scroll the user starts while a snap is pending
+                            // gives up the snap, so the scroll that follows
+                            // decides whether they're still at the bottom.
+                            onwheel: move |_| layout_snap_pending.set(false),
+                            ontouchmove: move |_| layout_snap_pending.set(false),
+                            onkeydown: move |_| layout_snap_pending.set(false),
                             onscroll: move |evt: Event<ScrollData>| {
+                                // While a snap is pending, the scrolls are the
+                                // transcript keeping the text under the pointer
+                                // still, not the user leaving the bottom: the
+                                // snap still owes them the bottom (SME-75 code
+                                // review).
+                                if *layout_snap_pending.peek() {
+                                    return;
+                                }
                                 let d = evt.data();
                                 messages_stuck_to_bottom
                                     .set(
