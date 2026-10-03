@@ -253,6 +253,7 @@ async fn oauth_headers(
         ));
     }
 
+    install_crypto_provider();
     let mut manager = rmcp::transport::auth::AuthorizationManager::new(config.url.as_str())
         .await
         .map_err(|e| {
@@ -283,7 +284,17 @@ async fn oauth_headers(
     Ok(headers)
 }
 
+/// Installs ring as rustls's process-wide default provider, if none is yet.
+/// rmcp's reqwest client is built with `rustls-no-provider` (one crypto
+/// backend in the binary, SME-60), and building it with no default installed
+/// panics. `main` installs ring at startup; calling this where rmcp builds a
+/// client keeps the MCP paths safe without depending on that order.
+pub(crate) fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connection, String> {
+    install_crypto_provider();
     let extra_headers = if config.auth_mode == "oauth" {
         oauth_headers(pool, config).await?
     } else {

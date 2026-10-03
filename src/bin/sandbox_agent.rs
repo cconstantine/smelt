@@ -1810,11 +1810,11 @@ mod socket_tests {
 
     async fn send(client: &mut Client, message: &ClientMessage) {
         let text = serde_json::to_string(message).expect("serializes");
-        client.send(WsMessage::Text(text)).await.expect("send");
+        client.send(WsMessage::Text(text.into())).await.expect("send");
     }
 
     async fn send_raw(client: &mut Client, text: &str) {
-        client.send(WsMessage::Text(text.to_string())).await.expect("send");
+        client.send(WsMessage::Text(text.into())).await.expect("send");
     }
 
     async fn next(client: &mut Client) -> AgentMessage {

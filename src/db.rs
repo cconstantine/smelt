@@ -1347,7 +1347,9 @@ pub async fn set_repo_failed(pool: &PgPool, id: i64, attempt: i32, error: &str) 
 // live external resource like a sandbox pod. See
 // SME-15.
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, sqlx::FromRow)]
+/// Holds header values and OAuth secrets, so it has no `Serialize` and its
+/// `Debug` hides them (SME-60): the UI gets `api::mcp::McpServerSummary`.
+#[derive(Clone, PartialEq, sqlx::FromRow)]
 pub struct McpServerConfig {
     pub id: i64,
     pub name: String,
@@ -1378,6 +1380,58 @@ pub struct McpServerConfig {
     pub oauth_client_secret: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
+}
+
+impl std::fmt::Debug for McpServerConfig {
+    /// Header names, the client id and whether credentials are stored, but
+    /// no header value, credential or client secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut header_names: Vec<&String> = self.extra_headers.0.keys().collect();
+        header_names.sort();
+        f.debug_struct("McpServerConfig")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("extra_headers", &header_names)
+            .field("auth_mode", &self.auth_mode)
+            .field("oauth_credentials", &self.oauth_credentials.as_ref().map(|_| "<stored>"))
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field("oauth_client_secret", &self.oauth_client_secret.as_ref().map(|_| "<set>"))
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod mcp_server_config_debug_tests {
+    use super::*;
+
+    #[test]
+    fn test_an_mcp_server_configs_debug_output_hides_its_secrets() {
+        let config = McpServerConfig {
+            id: 7,
+            name: "github".to_string(),
+            url: "https://api.githubcopilot.com/mcp/".to_string(),
+            extra_headers: sqlx::types::Json(HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer header-secret-123".to_string(),
+            )])),
+            auth_mode: "oauth".to_string(),
+            oauth_credentials: Some(sqlx::types::Json(serde_json::json!({"access_token": "token-secret-456"}))),
+            oauth_client_id: Some("Iv1.public-client-id".to_string()),
+            oauth_client_secret: Some("client-secret-789".to_string()),
+            created_at: NaiveDateTime::default(),
+            updated_at: NaiveDateTime::default(),
+        };
+        let shown = format!("{config:?}");
+        for secret in ["header-secret-123", "token-secret-456", "client-secret-789"] {
+            assert!(!shown.contains(secret), "Debug output shows {secret}: {shown}");
+        }
+        for kept in ["github", "Authorization", "Iv1.public-client-id", "oauth"] {
+            assert!(shown.contains(kept), "Debug output should still show {kept}: {shown}");
+        }
+    }
 }
 
 pub async fn create_mcp_server_config(
