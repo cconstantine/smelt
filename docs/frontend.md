@@ -9,7 +9,20 @@ frontend/
   mod.rs               # App (router root), Route enum, a small wrapper component per route, NotFound
   pages/
     mod.rs             # TwoStepLabel
-    chat.rs            # Chat, ConversationSidebar, ChatPanel
+    chat/              # the chat page (SME-57)
+      mod.rs           # Chat, ChatPanel (its state, effects and event stream)
+      sidebar.rs       # ConversationSidebar
+      transcript.rs    # Transcript, render_block_element and the tool/diff/notice helpers
+      context.rs       # ContextUsage: the usage bar and its detail dialog
+      composer.rs      # Composer (the message box), EXAMPLE_ASKS
+      repo_attach.rs   # RepoAttach ("Work on a repo")
+      trust_card.rs    # TrustCards (AGENTS.md waiting for trust)
+      model_setup.rs   # ModelNotes (turn and notification errors)
+      state.rs         # the pure merges of loaded and live messages and sandbox entries
+      sticky.rs        # stick-to-bottom and pointer-hold scrolling helpers
+      streaming.rs     # format_elapsed (the working line)
+      panels/          # BrowsingPanel, TodoPanel, SandboxPanel
+      tests.rs         # the page's unit tests
     git.rs             # GitSettingsPage
     language_servers.rs # LanguageServersIndex, LanguageServerNew, LanguageServerEdit
     mcp_servers.rs     # McpServersIndex, McpServerNew, McpServerEdit
