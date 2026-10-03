@@ -125,7 +125,7 @@ pub fn LanguageServersIndex() -> Element {
             }
             match servers() {
                 None => rsx! { p { class: "muted", "Loading..." } },
-                Some(Err(e)) => rsx! { p { class: "error", "{super::server_error_message(&e)}" } },
+                Some(Err(e)) => rsx! { super::ErrorText { message: Some(super::server_error_message(&e)) } },
                 Some(Ok(list)) if list.is_empty() => rsx! {
                     p { class: "muted", "None yet. Add one, or look one up in the catalog when adding." }
                 },
@@ -215,9 +215,7 @@ pub fn LanguageServerNew() -> Element {
                     a { href: "https://mason-registry.dev/registry/list", target: "_blank", rel: "noopener", "mason's registry" }
                     ". smelt fills in the form from it and Helix's language list; check it before adding."
                 }
-                if let Some(err) = lookup_error() {
-                    p { class: "error", "{err}" }
-                }
+                super::ErrorText { message: lookup_error() }
                 for note in notes() {
                     p { class: "language-server-note", "{note}" }
                 }
@@ -246,10 +244,6 @@ pub fn LanguageServerEdit(id: i64) -> Element {
         });
     };
     let delete = move |_| {
-        if !armed() {
-            armed.set(true);
-            return;
-        }
         spawn(async move {
             match delete_language_server(id).await {
                 Ok(()) => {
@@ -268,17 +262,19 @@ pub fn LanguageServerEdit(id: i64) -> Element {
             }
             match server() {
                 None => rsx! { p { class: "muted", "Loading..." } },
-                Some(Err(e)) => rsx! { p { class: "error", "{super::server_error_message(&e)}" } },
+                Some(Err(e)) => rsx! { super::ErrorText { message: Some(super::server_error_message(&e)) } },
                 Some(Ok(LanguageServer { config, .. })) => rsx! {
                     LanguageServerForm { initial: config, save_label: "Save", error: error(), on_save: save }
                     if saved() {
                         p { class: "muted language-server-saved", "Saved." }
                     }
-                    button {
-                        class: if armed() { "mcp-delete-server confirm" } else { "mcp-delete-server" },
-                        r#type: "button",
-                        onclick: delete,
-                        super::TwoStepLabel { armed: armed(), idle: "Delete language server", confirm: "Confirm delete?" }
+                    super::TwoStepButton {
+                        armed: armed(),
+                        class: "mcp-delete-server",
+                        idle: "Delete language server",
+                        confirm: "Confirm delete?",
+                        on_arm: move |_| armed.set(true),
+                        on_confirm: delete,
                     }
                 },
             }
@@ -362,9 +358,7 @@ fn LanguageServerForm(
                 " Enabled (the model can start it)"
             }
 
-            if let Some(err) = shown_error {
-                p { class: "error", "{err}" }
-            }
+            super::ErrorText { message: shown_error }
             button { r#type: "submit", "{save_label}" }
         }
     }

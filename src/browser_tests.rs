@@ -753,6 +753,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "transcript_scroll", 60, Box::pin(scenario_transcript_scroll(&t))).await;
     run_scenario(&t, only, r, k, "context_from_the_keyboard", 60, Box::pin(scenario_context_from_the_keyboard(&t))).await;
     run_scenario(&t, only, r, k, "error_text", 60, Box::pin(scenario_error_text(&t))).await;
+    run_scenario(&t, only, r, k, "settings_two_step", 60, Box::pin(scenario_settings_two_step(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -2533,6 +2534,113 @@ const FAIL_NEXT_DELETE: &str = "(() => { const real = window.fetch; let armed = 
        const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase(); \
        if (armed && method === 'DELETE') { armed = false; return Promise.resolve(new Response('refused by the browser tier', { status: 500 })); } \
        return real.apply(this, arguments); }; })()";
+
+/// Scenario 31 (SME-58): each settings page's two-step delete arms on the
+/// first click and deletes on the second (they share `TwoStepButton`), and
+/// the MCP header inputs say what they are to a screen reader, not only in
+/// a placeholder.
+async fn scenario_settings_two_step(t: &Scenario<'_>) {
+    let pool = t.pool;
+    let mcp = db::create_mcp_server_config(
+        pool,
+        &unique_id("two-step"),
+        "http://127.0.0.1:9/mcp",
+        &[("X-Existing".to_string(), "v".to_string())].into_iter().collect(),
+        "static_headers",
+        None,
+        None,
+    )
+    .await
+    .expect("create an MCP server");
+    let page = t.tab(t.url(&format!("mcp-servers/{}", mcp.id))).await;
+    wait_for_resource(&page, &format!("/api/mcp-servers/{}", mcp.id)).await;
+    click_when_present(&page, ".mcp-add-header", Duration::from_secs(5)).await;
+    wait_for_element(&page, ".mcp-header-name", Duration::from_secs(5)).await;
+    let labels: Vec<String> = page
+        .evaluate(
+            "Array.from(document.querySelectorAll('.mcp-header-row input')).map(i => i.getAttribute('aria-label') || '')",
+        )
+        .await
+        .expect("read the header inputs' labels")
+        .into_value()
+        .expect("strings");
+    assert!(
+        labels.len() >= 3 && labels.iter().all(|label| !label.is_empty()),
+        "every header input should have an aria-label: {labels:?}"
+    );
+    two_step_delete(&page, ".mcp-delete").await;
+    assert!(
+        wait_until(|| async { matches!(db::get_mcp_server_config(pool, mcp.id).await, Ok(None)) }, Duration::from_secs(10)).await,
+        "the MCP server should be deleted"
+    );
+
+    let server = db::create_language_server(
+        pool,
+        &crate::models::LanguageServerConfig {
+            name: unique_id("two-step"),
+            image: "rust:1".to_string(),
+            command: "true".to_string(),
+            memory_limit: "1Gi".to_string(),
+            cpu_limit: "1".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create a language server");
+    let page = t.tab(t.url(&format!("language-servers/{}", server.id))).await;
+    wait_for_resource(&page, &format!("/api/language-servers/{}", server.id)).await;
+    two_step_delete(&page, ".mcp-delete-server").await;
+    assert!(
+        wait_until(|| async { matches!(db::get_language_server(pool, server.id).await, Ok(None)) }, Duration::from_secs(10)).await,
+        "the language server should be deleted"
+    );
+
+    let provider = db::create_inference_provider(pool, &unique_id("two-step"), "anthropic", "http://127.0.0.1:9", "api_key", "key")
+        .await
+        .expect("create a provider");
+    let page = t.tab(t.url(&format!("providers/{}", provider.id))).await;
+    wait_for_resource(&page, &format!("/api/providers/{}", provider.id)).await;
+    two_step_delete(&page, ".mcp-delete-server").await;
+    assert!(
+        wait_until(|| async { matches!(db::get_inference_provider(pool, provider.id).await, Ok(None)) }, Duration::from_secs(10)).await,
+        "the provider should be deleted"
+    );
+}
+
+/// Clicks a two-step button at `selector` once (it must arm: `confirm`
+/// class, a "Confirm" label) and again (to confirm).
+async fn two_step_delete(page: &chromiumoxide::Page, selector: &str) {
+    wait_for_stable(page, selector, tokio::time::Instant::now() + Duration::from_secs(10)).await;
+    click_when_present(page, selector, Duration::from_secs(5)).await;
+    let armed = format!("{selector}.confirm");
+    wait_for_element(page, &armed, Duration::from_secs(5)).await;
+    let label: String = page
+        .evaluate(format!("document.querySelector({armed:?}).innerText"))
+        .await
+        .expect("read the armed label")
+        .into_value()
+        .expect("text");
+    assert!(label.starts_with("Confirm"), "an armed button should ask to confirm: {label:?}");
+    click_when_present(page, &armed, Duration::from_secs(5)).await;
+}
+
+/// Polls `check` every 200ms until it holds or `timeout` passes.
+async fn wait_until<F, Fut>(check: F, timeout: Duration) -> bool
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if check().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
 
 /// Scenario 30 (SME-81): an error says what went wrong, not dioxus's
 /// "error running server function: … (details: None)" wrapper, and the

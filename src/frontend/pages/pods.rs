@@ -62,15 +62,11 @@ pub fn PodsIndex() -> Element {
     let mut pending_stop: Signal<Option<i64>> = use_signal(|| None);
     let mut stop_error: Signal<Option<String>> = use_signal(|| None);
 
-    let mut request_stop = move |pod_id: i64| {
-        if pending_stop() == Some(pod_id) {
-            pending_stop.set(None);
-            spawn(async move {
-                stop_error.set(stop_pod(pod_id).await.err().map(|e| super::server_error_message(&e)));
-            });
-        } else {
-            pending_stop.set(Some(pod_id));
-        }
+    let mut confirm_stop = move |pod_id: i64| {
+        pending_stop.set(None);
+        spawn(async move {
+            stop_error.set(stop_pod(pod_id).await.err().map(|e| super::server_error_message(&e)));
+        });
     };
 
     rsx! {
@@ -82,12 +78,10 @@ pub fn PodsIndex() -> Element {
                     "Every sandbox that's running, in any conversation. Stopping one loses its terminals and any files outside /workspace and mounted volumes; the model is told, and starts a new one when it needs to."
                 }
             }
-            if let Some(err) = stop_error() {
-                p { class: "error", "{err}" }
-            }
+            super::ErrorText { message: stop_error() }
             match fetched() {
                 None => rsx! { p { class: "muted", "Loading..." } },
-                Some(Err(e)) => rsx! { p { class: "error", "{super::server_error_message(&e)}" } },
+                Some(Err(e)) => rsx! { super::ErrorText { message: Some(super::server_error_message(&e)) } },
                 Some(Ok(pods)) if pods.is_empty() => rsx! { p { class: "muted", "No pods are running." } },
                 Some(Ok(pods)) => rsx! {
                     table { class: "pods-table",
@@ -117,11 +111,13 @@ pub fn PodsIndex() -> Element {
                                     td { "{cpu_text(pod.usage.as_ref(), pod.cpu_limit.as_deref())}" }
                                     td { "{pod.terminals}" }
                                     td {
-                                        button {
-                                            class: if pending_stop() == Some(pod.pod_id) { "pod-stop confirm" } else { "pod-stop" },
-                                            r#type: "button",
-                                            onclick: move |_| request_stop(pod.pod_id),
-                                            super::TwoStepLabel { armed: pending_stop() == Some(pod.pod_id), idle: "Stop", confirm: "Confirm stop?" }
+                                        super::TwoStepButton {
+                                            armed: pending_stop() == Some(pod.pod_id),
+                                            class: "pod-stop",
+                                            idle: "Stop",
+                                            confirm: "Confirm stop?",
+                                            on_arm: move |_| pending_stop.set(Some(pod.pod_id)),
+                                            on_confirm: move |_| confirm_stop(pod.pod_id),
                                         }
                                     }
                                 }

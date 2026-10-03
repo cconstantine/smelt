@@ -433,7 +433,6 @@ body {
     color: var(--ink);
 }
 
-.tool-call-input,
 .tool-result-content {
     margin: 6px 0 0;
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
@@ -911,10 +910,6 @@ body {
     padding: 16px;
 }
 
-.sandbox-panel h3 {
-    flex-shrink: 0;
-}
-
 .sandbox-panel .sandbox-pod {
     flex: 1;
     display: flex;
@@ -948,6 +943,7 @@ body {
 }
 
 .sandbox-panel h3 {
+    flex-shrink: 0;
     margin: 0 0 12px;
     font-size: 12px;
     font-weight: 600;
@@ -1360,8 +1356,7 @@ body {
 }
 
 .mcp-add-form button[type="submit"],
-.mcp-edit-form button[type="submit"],
-.mcp-server-actions button {
+.mcp-edit-form button[type="submit"] {
     align-self: flex-start;
     padding: 8px 16px;
     border: 1px solid var(--ink);
@@ -1374,8 +1369,7 @@ body {
 }
 
 .mcp-add-form button[type="submit"]:hover,
-.mcp-edit-form button[type="submit"]:hover,
-.mcp-server-actions button:hover {
+.mcp-edit-form button[type="submit"]:hover {
     background: var(--ink-hover);
 }
 
@@ -1489,21 +1483,6 @@ body {
     word-break: break-all;
 }
 
-.mcp-server-actions {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-}
-
-.mcp-server-actions button {
-    background: var(--surface);
-    color: var(--ink);
-}
-
-.mcp-server-actions button:hover {
-    background: var(--subtle);
-}
-
 /* The destructive action: the same shape as every other button, in red
    outline (SME-41 D6). */
 .mcp-delete {
@@ -1601,13 +1580,11 @@ div.mcp-status-unreachable::before {
 }
 
 .mcp-status-section,
-.mcp-headers-section,
 .mcp-danger-section {
     margin-bottom: 24px;
 }
 
 .mcp-status-section h2,
-.mcp-headers-section h2,
 .mcp-danger-section h2 {
     font-size: 14px;
     margin-bottom: 8px;

@@ -27,6 +27,7 @@ fn header_rows(
                     input {
                         r#type: "text",
                         class: "mcp-header-name",
+                        "aria-label": "Header name",
                         placeholder: "Header name (e.g. Authorization)",
                         value: "{name}",
                         oninput: move |e| headers.write()[index].0 = e.value(),
@@ -34,6 +35,7 @@ fn header_rows(
                     input {
                         r#type: "text",
                         class: "mcp-header-value",
+                        "aria-label": "Header value",
                         placeholder: value_placeholder,
                         value: "{value}",
                         oninput: move |e| headers.write()[index].1 = e.value(),
@@ -111,9 +113,7 @@ pub fn McpServersIndex() -> Element {
                 Link { to: Route::McpServerNewRoute {}, class: "mcp-new-server-link", "+ Add a server" }
             }
 
-            if let Some(err) = list_error() {
-                p { class: "error", "{err}" }
-            }
+            super::ErrorText { message: list_error() }
 
             if !loaded() {
                 p { class: "muted", "Loading..." }
@@ -290,9 +290,7 @@ pub fn McpServerNew() -> Element {
                         "Save the server first, then connect it to its OAuth provider from its own page."
                     }
                 }
-                if let Some(err) = submit_error() {
-                    p { class: "error", "{err}" }
-                }
+                super::ErrorText { message: submit_error() }
                 button { r#type: "submit", "Add server" }
             }
         }
@@ -521,19 +519,15 @@ pub fn McpServerEdit(id: i64) -> Element {
     let mut pending_delete = use_signal(|| false);
     let mut delete_error: Signal<Option<String>> = use_signal(|| None);
 
-    let request_delete = move |_| {
-        if pending_delete() {
-            spawn(async move {
-                match delete_mcp_server(id).await {
-                    Ok(()) => {
-                        navigator.push(Route::McpServersRoute {});
-                    }
-                    Err(e) => delete_error.set(Some(super::server_error_message(&e))),
+    let confirm_delete = move |_| {
+        spawn(async move {
+            match delete_mcp_server(id).await {
+                Ok(()) => {
+                    navigator.push(Route::McpServersRoute {});
                 }
-            });
-        } else {
-            pending_delete.set(true);
-        }
+                Err(e) => delete_error.set(Some(super::server_error_message(&e))),
+            }
+        });
     };
 
     rsx! {
@@ -543,9 +537,7 @@ pub fn McpServerEdit(id: i64) -> Element {
                 h1 { "Edit MCP server" }
             }
 
-            if let Some(err) = load_error() {
-                p { class: "error", "{err}" }
-            }
+            super::ErrorText { message: load_error() }
 
             if !loaded() {
                 p { class: "muted", "Loading..." }
@@ -577,7 +569,7 @@ pub fn McpServerEdit(id: i64) -> Element {
                         },
                         Some(Err(e)) => rsx! {
                             div { class: "mcp-status mcp-status-unreachable",
-                                p { class: "error", "{super::server_error_message(&e)}" }
+                                super::ErrorText { message: Some(super::server_error_message(&e)) }
                             }
                         },
                     }}
@@ -630,6 +622,7 @@ pub fn McpServerEdit(id: i64) -> Element {
                                     input {
                                         r#type: "text",
                                         class: "mcp-header-value",
+                                        "aria-label": "New value for {name}",
                                         placeholder: "(unchanged)",
                                         value: "{value}",
                                         oninput: move |e| existing_header_edits.write()[index].1 = e.value(),
@@ -649,9 +642,7 @@ pub fn McpServerEdit(id: i64) -> Element {
                     }
                     {header_rows(new_header_rows, "Header value")}
 
-                    if let Some(err) = save_error() {
-                        p { class: "error", "{err}" }
-                    }
+                    super::ErrorText { message: save_error() }
                     button {
                         class: if saving() { "mcp-save-edit saving" } else { "mcp-save-edit" },
                         r#type: "submit",
@@ -678,12 +669,8 @@ pub fn McpServerEdit(id: i64) -> Element {
                                 "Using dynamic client registration \u{2014} no pre-registered client."
                             }
                         }
-                        if let Some(err) = oauth_error() {
-                            p { class: "error", "{err}" }
-                        }
-                        if let Some(err) = disconnect_error() {
-                            p { class: "error", "{err}" }
-                        }
+                        super::ErrorText { message: oauth_error() }
+                        super::ErrorText { message: disconnect_error() }
                         div { class: "mcp-oauth-actions",
                             button {
                                 class: "mcp-oauth-connect",
@@ -710,14 +697,14 @@ pub fn McpServerEdit(id: i64) -> Element {
 
                 div { class: "mcp-danger-section",
                     h2 { "Delete" }
-                    if let Some(err) = delete_error() {
-                        p { class: "error", "{err}" }
-                    }
-                    button {
-                        class: if pending_delete() { "mcp-delete confirm" } else { "mcp-delete" },
-                        r#type: "button",
-                        onclick: request_delete,
-                        super::TwoStepLabel { armed: pending_delete(), idle: "Delete server", confirm: "Confirm delete?" }
+                    super::ErrorText { message: delete_error() }
+                    super::TwoStepButton {
+                        armed: pending_delete(),
+                        class: "mcp-delete",
+                        idle: "Delete server",
+                        confirm: "Confirm delete?",
+                        on_arm: move |_| pending_delete.set(true),
+                        on_confirm: confirm_delete,
                     }
                 }
             }
