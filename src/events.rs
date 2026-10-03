@@ -91,7 +91,7 @@ pub enum ConversationEvent {
         /// snapshot already has (SME-51 B3). `None` when there's no line.
         position: Option<i64>,
     },
-    /// Published when `turn::wake_conversation` (fired when a terminal
+    /// Published when a `turn::notify` wake or delivery (fired when a terminal
     /// command finishes, to notify the model with no further tool call
     /// needed) fails to actually reach the model — e.g. no model provider
     /// set up, a transient Anthropic API error. The underlying notification

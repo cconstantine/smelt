@@ -54,9 +54,7 @@ pub async fn decide_repo_trust(id: i64, request_id: i64, shown_hash: String, tru
         .map_err(ServerFnError::new)?;
     // In the background: each waits for its conversation's turn to end.
     for (conversation_id, notice) in notices {
-        tokio::spawn(async move {
-            crate::turn::deliver_notice(pool, conversation_id, notice).await;
-        });
+        crate::turn::notify(pool, conversation_id, vec![crate::turn::Notice::Deliver(notice)]);
     }
     Ok(())
 }
@@ -79,9 +77,7 @@ pub async fn attach_repo(id: i64, url: String, branch: String, dir: String) -> S
         .await
         .map_err(ServerFnError::new)?;
     for (conversation_id, notice) in notices {
-        tokio::spawn(async move {
-            crate::turn::deliver_notice(pool, conversation_id, notice).await;
-        });
+        crate::turn::notify(pool, conversation_id, vec![crate::turn::Notice::Deliver(notice)]);
     }
     let nothing_to_clone = pending.is_none();
     tokio::spawn(async move {

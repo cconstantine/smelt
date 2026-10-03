@@ -9,7 +9,7 @@ use super::*;
 /// should learn about: its pod crashing, or the user stopping it. Waits
 /// for a running turn to end, so call it from a spawned task.
 #[cfg(feature = "server")]
-pub(crate) async fn save_notice_between_turns(
+pub(super) async fn save_notice_between_turns(
     pool: &PgPool,
     conversation_id: i64,
     text: String,
@@ -39,7 +39,7 @@ pub(crate) async fn save_notice_between_turns(
 /// After the user stopped the conversation, it's only saved, for their
 /// next message. Call it from a spawned task: it waits for a running turn.
 #[cfg(feature = "server")]
-pub(crate) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: String) {
+pub(super) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: String) {
     if is_paused(conversation_id) {
         if let Err(e) = save_notice_between_turns(pool, conversation_id, text).await {
             tracing::warn!(conversation_id, error = %e, "couldn't save a notice");
@@ -82,7 +82,7 @@ pub(crate) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: St
 /// commits *before* the API call that might fail, so this only means the
 /// model hasn't been prompted with it yet, not that it's lost.
 #[cfg(feature = "server")]
-pub(crate) async fn wake_conversation(
+pub(super) async fn wake_conversation(
     pool: &PgPool,
     conversation_id: i64,
 ) -> TurnResult {
@@ -159,4 +159,46 @@ pub(super) async fn drain_unnotified_terminal_commands(
         record_saved(conversation_id, persisted, saved);
     }
     Ok(())
+}
+
+/// What `notify` does with one notice.
+#[derive(Debug)]
+pub(crate) enum Notice {
+    /// Saved between turns, without waking the model: it reads it on its
+    /// next turn (the user stopping a pod).
+    Save(String),
+    /// Saved and answered: a turn runs for it, unless the user has stopped
+    /// the conversation, when it's only saved (Docker restarting, the
+    /// user's trust decision).
+    Deliver(String),
+    /// Saves finished commands' notices and wakes the model for them; a
+    /// no-op when none is pending or the conversation is stopped.
+    Wake,
+}
+
+/// Tells `conversation_id`'s model about things that happened outside a
+/// turn, in order, in a task of its own: each notice waits for a running
+/// turn, and the turn lock isn't re-entrant, so a caller inside a turn
+/// (a tool reaching a crashed pod, say) can't wait for it. Returns at
+/// once. Failures are logged; a delivery or wake that fails is also
+/// published (`NotificationDeliveryFailed`). The one way anything outside
+/// a turn reaches the model (SME-52).
+pub(crate) fn notify(pool: &PgPool, conversation_id: i64, notices: Vec<Notice>) -> tokio::task::JoinHandle<()> {
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        for notice in notices {
+            match notice {
+                Notice::Save(text) => {
+                    if let Err(e) = save_notice_between_turns(&pool, conversation_id, text).await {
+                        tracing::warn!(conversation_id, error = %e, "couldn't save a notice");
+                    }
+                }
+                Notice::Deliver(text) => deliver_notice(&pool, conversation_id, text).await,
+                Notice::Wake => {
+                    // A failure is already reported inside.
+                    let _ = wake_conversation(&pool, conversation_id).await;
+                }
+            }
+        }
+    })
 }

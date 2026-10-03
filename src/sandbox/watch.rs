@@ -75,10 +75,11 @@ pub async fn watch_pods(pool: PgPool) {
             }
             Ok(watcher::Event::Apply(pod)) if pod_has_finished(&pod) => {
                 if let Some(stopped) = crate::lsp::pods::note_server_stop(&mut stopped_servers, &pod, false) {
-                    let pool = pool.clone();
-                    tokio::spawn(async move {
-                        crate::turn::deliver_notice(&pool, stopped.conversation_id, stopped.notice).await;
-                    });
+                    crate::turn::notify(
+                        &pool,
+                        stopped.conversation_id,
+                        vec![crate::turn::Notice::Deliver(stopped.notice)],
+                    );
                 }
                 if let Some(pod_id) = watched_pod_id(&pod) {
                     close_after_grace(pool.clone(), pod_id);
@@ -191,25 +192,15 @@ pub(super) async fn handle_crash_cleanup(pool: &PgPool, pod_id: i64, reason: Opt
         // `handle_agent_message`'s "exit" branch) — a crash can leave a
         // command marked 'lost' with nobody proactively telling the model,
         // the identical gap. One wake covers whatever this pass just
-        // marked lost; `wake_conversation`'s own no-op-when-nothing-
-        // pending behavior makes this cheap even when nothing actually
-        // changed. Detached, notice included: this can run synchronously
-        // from *inside* an already-in-progress `run_turn`/`execute()` call
-        // that's already holding `conversation_id`'s lock (e.g.
+        // marked lost, and is a no-op when nothing is pending. The notice
+        // is saved, not delivered: it reaches the model with that wake, if
+        // any. `notify` runs both in a task of its own: this can run from
+        // inside a turn holding the conversation's lock (e.g.
         // `run_terminal_command_tool` → `sandbox::send_command` →
-        // `reconnect_if_needed` → here), and both the notice (saved only
-        // between turns, see `save_notice_between_turns`) and the wake
-        // take that same non-reentrant lock. See
-        // SME-13.
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            if let Some(notice) = notice {
-                if let Err(e) = crate::turn::save_notice_between_turns(&pool, conversation_id, notice).await {
-                    tracing::warn!(conversation_id, pod_id, error = %e, "couldn't save the pod crash notice");
-                }
-            }
-            let _ = crate::turn::wake_conversation(&pool, conversation_id).await;
-        });
+        // `reconnect_if_needed` → here). See SME-13.
+        let mut notices: Vec<crate::turn::Notice> = notice.into_iter().map(crate::turn::Notice::Save).collect();
+        notices.push(crate::turn::Notice::Wake);
+        crate::turn::notify(pool, conversation_id, notices);
     }
     deregister(pod_id);
 }

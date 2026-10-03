@@ -1837,6 +1837,44 @@ async fn test_an_older_turns_failure_isnt_kept_after_a_newer_turn(pool: PgPool) 
 
 /// A notice waits for a running turn to end before it's saved, and
 /// tells a watching tab once it is.
+/// `notify` returns at once, even with a turn holding the lock (a caller
+/// inside a turn can't wait for it), and its notices land in order once
+/// the turn ends (SME-52).
+#[sqlx::test]
+async fn test_notify_returns_at_once_and_saves_in_order(pool: PgPool) {
+    let conversation = db::create_conversation_with_id(&pool, 9100000052)
+        .await
+        .expect("create conversation");
+    let lock = conversation_lock(conversation.id);
+    let turn = lock.lock().await;
+    let notifying = notify(
+        &pool,
+        conversation.id,
+        vec![Notice::Save("first".to_string()), Notice::Save("second".to_string())],
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        db::list_messages(&pool, conversation.id).await.expect("list").is_empty(),
+        "a notice was saved while a turn held the lock"
+    );
+    drop(turn);
+    tokio::time::timeout(std::time::Duration::from_secs(5), notifying)
+        .await
+        .expect("the notices are saved once the turn ends")
+        .expect("join");
+    let texts: Vec<String> = db::list_messages(&pool, conversation.id)
+        .await
+        .expect("list")
+        .iter()
+        .flat_map(|m| m.blocks().expect("blocks"))
+        .filter_map(|block| match block {
+            anthropic::ContentBlock::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["first".to_string(), "second".to_string()]);
+}
+
 #[sqlx::test]
 async fn test_save_notice_between_turns_waits_for_the_turn_lock(pool: PgPool) {
     let conversation = db::create_conversation_with_id(&pool, 9100000004)

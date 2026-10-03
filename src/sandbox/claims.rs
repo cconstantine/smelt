@@ -197,10 +197,7 @@ pub(super) async fn report_docker_restart(pool: &PgPool, pod_id: i64, reason: Op
          have stopped. Images, terminals and /workspace are unaffected. Every container shares \
          Docker's memory limit; a pod created with a larger docker_memory_limit gives them more."
     );
-    let pool = pool.clone();
-    tokio::spawn(async move {
-        crate::turn::deliver_notice(&pool, conversation_id, notice).await;
-    });
+    crate::turn::notify(pool, conversation_id, vec![crate::turn::Notice::Deliver(notice)]);
 }
 
 /// Waits until no pod labelled with `conversation_id` is left in the
