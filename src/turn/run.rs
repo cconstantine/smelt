@@ -527,28 +527,36 @@ pub(super) fn run_turn_body<'a>(
 
             let mut result_blocks = Vec::new();
             // The model's `ask_user` (SME-34): one per reply; it gets no
-            // result now, and the turn ends waiting on it.
-            let mut asked: Option<(String, Vec<crate::questions::Question>)> = None;
+            // result now, and the turn ends waiting on it. Recorded before
+            // the reply's other tools run, so a Stop or restart while they
+            // run leaves the question on its card (code review 2).
+            let mut asked = false;
             for block in &turn.content {
-                if let anthropic::ContentBlock::ToolUse { id, name, input } = block {
-                    if name == crate::questions::ASK_USER {
-                        let refused = match crate::questions::parse_questions(input) {
-                            Ok(_) if asked.is_some() => {
-                                "ask one set of questions at a time: put them all in one ask_user call".to_string()
-                            }
-                            Ok(questions) => {
-                                asked = Some((id.clone(), questions));
-                                continue;
-                            }
-                            Err(e) => e,
-                        };
-                        result_blocks.push(anthropic::ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: refused,
-                            is_error: Some(true),
-                        });
-                        continue;
-                    }
+                if let anthropic::ContentBlock::ToolUse { id, name, input } = block
+                    && name == crate::questions::ASK_USER
+                {
+                    let refused = match crate::questions::parse_questions(input) {
+                        Ok(_) if asked => {
+                            "ask one set of questions at a time: put them all in one ask_user call".to_string()
+                        }
+                        Ok(questions) => {
+                            ask(pool, conversation_id, id, questions).await?;
+                            asked = true;
+                            continue;
+                        }
+                        Err(e) => e,
+                    };
+                    result_blocks.push(anthropic::ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: refused,
+                        is_error: Some(true),
+                    });
+                }
+            }
+            for block in &turn.content {
+                if let anthropic::ContentBlock::ToolUse { id, name, input } = block
+                    && name != crate::questions::ASK_USER
+                {
                     let result =
                         anthropic::tools::execute(pool, conversation_id, id, name, input).await;
                     let (content, is_error) = match result {
@@ -563,14 +571,13 @@ pub(super) fn run_turn_body<'a>(
                 }
             }
 
-            if let Some((tool_use_id, questions)) = asked {
+            if asked {
                 if !result_blocks.is_empty() {
                     let saved = db::create_message(pool, conversation_id, "user", &result_blocks)
                         .await
                         .map_err(ServerFnError::new)?;
                     record_saved(conversation_id, &mut persisted, saved);
                 }
-                ask(pool, conversation_id, &tool_use_id, questions).await?;
                 return Ok(persisted);
             }
 

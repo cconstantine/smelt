@@ -3243,3 +3243,35 @@ async fn test_an_answer_landing_mid_turn_is_taken_before_the_model_call(pool: Pg
     assert_eq!(after["content"][0]["content"], "The user answered:\n1. Delete: No", "{after}");
     assert_eq!(db::get_pending_question(&pool, conversation.id).await.expect("read"), None);
 }
+
+/// Code review 2: the question is recorded before the reply's other
+/// tools run, so a Stop (or restart) while they run leaves it on its card
+/// rather than losing it.
+#[sqlx::test]
+async fn test_the_question_is_recorded_before_the_replys_other_tools_run(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_308).await.expect("conversation");
+    let body = tool_calls_body(&[
+        ("toolu_read", "todoread", serde_json::json!({})),
+        ("toolu_ask", crate::questions::ASK_USER, ask_input()),
+    ]);
+    start_mock_upstream(&pool, vec![body, text_reply_body("unreached")]).await;
+    let mut rx = events::subscribe(conversation.id);
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the turn ends cleanly");
+
+    let order: Vec<&str> = drain_events(&mut rx)
+        .await
+        .iter()
+        .filter_map(|e| match e {
+            events::ConversationEvent::QuestionUpdate { question: Some(_) } => Some("question"),
+            events::ConversationEvent::MessagesAppended { messages }
+                if messages.iter().any(|m| m.content.contains("toolu_read") && m.role == "user") =>
+            {
+                Some("results")
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, vec!["question", "results"]);
+}
