@@ -923,19 +923,7 @@ fn ChatPanel(
                                 }
                             }
                             if !todos().is_empty() {
-                                aside { class: "todo-panel",
-                                    h3 { "Todos" }
-                                    ul { class: "todo-list",
-                                        for (i , todo) in todos().into_iter().enumerate() {
-                                            li {
-                                                key: "{i}",
-                                                class: "todo-item todo-item-{todo_status_class(todo.status)}",
-                                                span { class: "todo-item-marker" }
-                                                span { class: "todo-item-content", "{todo.content}" }
-                                            }
-                                        }
-                                    }
-                                }
+                                TodoPanel { todos }
                             }
                             if !sandbox_pods().is_empty() || !repos().is_empty() {
                                 aside { class: "sandbox-panel",
