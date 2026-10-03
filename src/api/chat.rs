@@ -612,11 +612,9 @@ summary as plain prose.";
 #[cfg(feature = "server")]
 async fn describe_live_state(pool: &PgPool, conversation_id: i64) -> String {
     // Deliberately the plain `db::` row queries, not `sandbox::list_pods`/
-    // `list_terminals` — those also reach through the process-global
-    // sandbox manager to check live connection status, which panics if
-    // `sandbox::init()` was never called (true of most tests, and not
-    // otherwise relevant here: a summarization prompt just needs which
-    // ids exist and aren't terminated, not real-time connection health).
+    // `list_terminals` — those also reach the cluster to check live
+    // connection status, which a summarization prompt doesn't need: just
+    // which ids exist and aren't terminated.
     let mut lines = Vec::new();
     if let Ok(pods) = db::list_sandbox_pods(pool, conversation_id).await {
         for pod in pods {

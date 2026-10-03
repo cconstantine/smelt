@@ -276,11 +276,10 @@ mod server {
         pub branch: String,
     }
 
-    /// Clones `url` into `/workspace/<dir>` in pod `pod_name`, at `branch`
+    /// Clones `url` into `/workspace/<dir>` in the pod, at `branch`
     /// or the remote's default. The error is git's own output.
     pub async fn clone_into_pod(
-        client: &kube::Client,
-        pod_name: &str,
+        shell: &sandbox::PodShell,
         url: &str,
         branch: Option<&str>,
         dir: &str,
@@ -296,7 +295,7 @@ mod server {
         // longer, in case the connection itself stalls.
         let clone = tokio::time::timeout(
             CLONE_TIMEOUT + std::time::Duration::from_secs(30),
-            crate::sandbox::exec_with(client, pod_name, "sandbox", &command, None),
+            shell.run(&command, None),
         )
         .await
         .map_err(|_| timed_out())?
@@ -306,20 +305,18 @@ mod server {
         }
         // The branch from HEAD itself, and the commit only if there is
         // one: a brand-new empty repo has a branch but no commit yet.
-        let head = crate::sandbox::exec_with(
-            client,
-            pod_name,
-            "sandbox",
-            &[
-                "sh",
-                "-c",
-                r#"cd "$1" && git symbolic-ref --short -q HEAD || git rev-parse --abbrev-ref HEAD; git rev-parse --verify -q HEAD || true"#,
-                "sh",
-                &path,
-            ],
-            None,
-        )
-        .await
+        let head = shell
+            .run(
+                &[
+                    "sh",
+                    "-c",
+                    r#"cd "$1" && git symbolic-ref --short -q HEAD || git rev-parse --abbrev-ref HEAD; git rev-parse --verify -q HEAD || true"#,
+                    "sh",
+                    &path,
+                ],
+                None,
+            )
+            .await
         .map_err(|e| e.to_string())?;
         let mut lines = head.stdout.lines();
         match (head.exit_code, lines.next()) {
@@ -333,18 +330,16 @@ mod server {
 
     /// The checkout's tracked `AGENTS.md` files, relative to it, top-level
     /// first (at most 50).
-    pub async fn list_agents_files(client: &kube::Client, pod_name: &str, dir: &str) -> Result<Vec<String>, String> {
+    pub async fn list_agents_files(shell: &sandbox::PodShell, dir: &str) -> Result<Vec<String>, String> {
         let path = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
-        let listed = crate::sandbox::exec_with(
-            client,
-            pod_name,
-            "sandbox",
-            // -z: paths as they are, NUL-separated; otherwise git quotes
-            // non-ASCII ones ("\303\251/AGENTS.md"), which can't be loaded.
-            &["git", "-C", &path, "ls-files", "-z", "--", "AGENTS.md", "*/AGENTS.md"],
-            None,
-        )
-        .await
+        let listed = shell
+            .run(
+                // -z: paths as they are, NUL-separated; otherwise git quotes
+                // non-ASCII ones ("\303\251/AGENTS.md"), which can't be loaded.
+                &["git", "-C", &path, "ls-files", "-z", "--", "AGENTS.md", "*/AGENTS.md"],
+                None,
+            )
+            .await
         .map_err(|e| e.to_string())?;
         if listed.exit_code != 0 {
             return Err(format!("couldn't list {path}'s AGENTS.md files: {}", listed.stderr.trim()));
@@ -355,12 +350,11 @@ mod server {
         Ok(files)
     }
 
-    /// Reads a file in pod `pod_name` for loading: the first
+    /// Reads a file in the pod for loading: the first
     /// `INSTRUCTIONS_MAX_BYTES` of it, the whole file's size, and a hash.
     /// `None` when there's no such file.
     pub async fn read_instructions_file(
-        client: &kube::Client,
-        pod_name: &str,
+        shell: &sandbox::PodShell,
         checkout: &str,
         path: &str,
     ) -> Result<Option<db::InstructionsFile>, String> {
@@ -376,14 +370,9 @@ mod server {
             real=$(realpath -e -- "$f") && top=$(realpath -e -- "$root") || { echo !; exit 0; }
             case "$real" in "$top"/*) ;; *) echo !; exit 0;; esac
             wc -c < "$real" && head -c "$max" -- "$real""#;
-        let read = crate::sandbox::exec_with(
-            client,
-            pod_name,
-            "sandbox",
-            &["sh", "-c", script, "sh", path, checkout, &INSTRUCTIONS_MAX_BYTES.to_string()],
-            None,
-        )
-        .await
+        let read = shell
+            .run(&["sh", "-c", script, "sh", path, checkout, &INSTRUCTIONS_MAX_BYTES.to_string()], None)
+            .await
         .map_err(|e| e.to_string())?;
         if read.exit_code != 0 {
             return Err(format!("couldn't read {path}: {}", read.stderr.trim()));
@@ -640,6 +629,15 @@ mod server {
         }
     }
 
+    /// What `load_instructions` tells the model when it can't reach the
+    /// conversation's pod: to start one only when there's none.
+    fn no_shell_message(e: sandbox::TerminalError) -> String {
+        match e {
+            sandbox::TerminalError::NoPod => "This conversation has no sandbox yet: call create_pod first.".to_string(),
+            other => format!("Couldn't reach the conversation's sandbox: {other}"),
+        }
+    }
+
     /// The model's `load_instructions` tool: reads the `AGENTS.md` at
     /// `path` in the conversation's pod and loads it, or asks the user.
     /// Returns what to tell the model.
@@ -651,17 +649,15 @@ mod server {
         if repo.status != "ready" {
             return Err(format!("{} isn't cloned yet (it's {}).", repo.url, repo.status));
         }
-        let pod_id = sandbox::live_pod_id(pool, conversation_id).await.map_err(|_| {
-            "This conversation has no sandbox yet: call create_pod first.".to_string()
-        })?;
-        let client = sandbox::kube_client();
-        let pod_name = sandbox::kubernetes_pod_name(pod_id);
+        let shell = sandbox::PodShell::for_conversation(pool, conversation_id)
+            .await
+            .map_err(no_shell_message)?;
         let full = format!("{}/{}/{rel_path}", crate::sandbox::WORKSPACE_DIR, repo.dir);
         let checkout = format!("{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir);
-        let mut file = read_instructions_file(&client, &pod_name, &checkout, &full)
+        let mut file = read_instructions_file(&shell, &checkout, &full)
             .await?
             .ok_or_else(|| format!("There's no file at {full}."))?;
-        file.commit = head_commit(&client, &pod_name, &repo.dir).await;
+        file.commit = head_commit(&shell, &repo.dir).await;
         let outcome = request_or_load(pool, conversation_id, repo, &rel_path, &file).await?;
         publish_repos(pool, conversation_id).await;
         Ok(match outcome {
@@ -822,9 +818,9 @@ mod server {
     }
 
     /// The checkout's current commit, for labelling a loaded AGENTS.md.
-    async fn head_commit(client: &kube::Client, pod_name: &str, dir: &str) -> Option<String> {
+    async fn head_commit(shell: &sandbox::PodShell, dir: &str) -> Option<String> {
         let path = format!("{}/{dir}", crate::sandbox::WORKSPACE_DIR);
-        let head = crate::sandbox::exec_with(client, pod_name, "sandbox", &["git", "-C", &path, "rev-parse", "--verify", "-q", "HEAD"], None)
+        let head = shell.run(&["git", "-C", &path, "rev-parse", "--verify", "-q", "HEAD"], None)
             .await
             .ok()?;
         (head.exit_code == 0).then(|| head.stdout.trim().to_string())
@@ -1219,20 +1215,16 @@ mod server {
         repo: &db::ConversationRepo,
         guard: CloneGuard,
     ) -> Result<(), String> {
-        let client = sandbox::kube_client();
-        let pod_name = sandbox::kubernetes_pod_name(pod_id);
-        let outcome = clone_into_pod(
-            &client,
-            &pod_name,
-            &repo.url,
-            repo.branch.as_deref(),
-            &repo.dir,
-        )
-        .await;
+        let outcome = match sandbox::PodShell::for_pod(pod_id) {
+            Ok(shell) => clone_into_pod(&shell, &repo.url, repo.branch.as_deref(), &repo.dir)
+                .await
+                .map(|cloned| (shell, cloned)),
+            Err(e) => Err(e.to_string()),
+        };
         match outcome {
-            Ok(cloned) => {
+            Ok((shell, cloned)) => {
                 // What the model can load with load_instructions.
-                let files = list_agents_files(&client, &pod_name, &repo.dir).await.map_err(|e| {
+                let files = list_agents_files(&shell, &repo.dir).await.map_err(|e| {
                     tracing::warn!(repo = %repo.url, error = %e, "couldn't list AGENTS.md files");
                     e.to_string()
                 });
@@ -1414,6 +1406,74 @@ mod server {
         format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
     }
 
+    /// Writes git's files (`pod_git_files`) into the pod's sandbox
+    /// container. The keys directory is replaced wholesale, so a key
+    /// deleted since the last install goes too.
+    pub async fn install_git_files(shell: &sandbox::PodShell, files: &[PodFile]) -> Result<(), sandbox::SandboxError> {
+        use sandbox::SandboxError;
+        // Never emptied: a clone or push running during a reinstall must
+        // still find its key. Keys are written over in place, and only the
+        // ones no longer in `files` removed afterwards.
+        let keys_dir = format!("{POD_GIT_DIR}/keys");
+        let made = shell.run(&["sh", "-c", r#"mkdir -p -m 700 "$1""#, "sh", &keys_dir], None).await?;
+        if made.exit_code != 0 {
+            return Err(SandboxError::GitSetup(format!(
+                "couldn't make {keys_dir}: {}",
+                made.stderr.trim()
+            )));
+        }
+        for file in files {
+            // Written beside the target and renamed over it, so ssh or git
+            // never reads half a file; umask keeps a key private from its
+            // first byte.
+            let mode = format!("{:o}", file.mode);
+            let written = shell
+                .run(
+                    &[
+                        "sh",
+                        "-c",
+                        r#"umask 077 && cat > "$1.new" && chmod "$2" "$1.new" && mv "$1.new" "$1""#,
+                        "sh",
+                        &file.path,
+                        &mode,
+                    ],
+                    Some(file.content.as_bytes()),
+                )
+                .await?;
+            if written.exit_code != 0 {
+                return Err(SandboxError::GitSetup(format!(
+                    "couldn't write {}: {}",
+                    file.path,
+                    written.stderr.trim()
+                )));
+            }
+        }
+        let keep: Vec<&str> = files
+            .iter()
+            .filter_map(|f| f.path.strip_prefix(&format!("{keys_dir}/")))
+            .collect();
+        let mut prune = vec![
+            "sh",
+            "-c",
+            r#"cd "$1" && shift && for f in * .[!.]*; do
+               [ -e "$f" ] || continue
+               keep=; for k in "$@"; do [ "$f" = "$k" ] && keep=1; done
+               [ -n "$keep" ] || rm -f -- "$f"
+           done"#,
+            "sh",
+            &keys_dir,
+        ];
+        prune.extend(keep);
+        let pruned = shell.run(&prune, None).await?;
+        if pruned.exit_code != 0 {
+            return Err(SandboxError::GitSetup(format!(
+                "couldn't remove deleted keys from {keys_dir}: {}",
+                pruned.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
     /// Runs `install` (read the keys, then write them into a pod) with no
     /// other install in between, so an install that read the keys before a
     /// change can't write them over one that read them after.
@@ -1431,10 +1491,8 @@ mod server {
             let keys: Vec<(String, String)> = keys.into_iter().map(|k| (k.name, k.private_key)).collect();
             // Bounded: every install waits on this lock, so a stalled exec
             // mustn't hold it.
-            tokio::time::timeout(
-                INSTALL_TIMEOUT,
-                sandbox::install_git_files_in_pod(pod_id, &pod_git_files(&keys, &identity)),
-            )
+            let shell = sandbox::PodShell::for_pod(pod_id).map_err(|e| e.to_string())?;
+            tokio::time::timeout(INSTALL_TIMEOUT, install_git_files(&shell, &pod_git_files(&keys, &identity)))
             .await
             .map_err(|_| format!("writing git files into the pod took over {}s", INSTALL_TIMEOUT.as_secs()))?
             .map_err(|e| e.to_string())
@@ -2195,6 +2253,20 @@ mod server {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Only a missing pod is "no sandbox yet"; anything else says what
+        /// it is, so the model isn't sent to create_pod for nothing (SME-56
+        /// code review 1).
+        #[test]
+        fn test_no_shell_message_names_the_error_unless_there_is_no_pod() {
+            assert_eq!(
+                no_shell_message(sandbox::TerminalError::NoPod),
+                "This conversation has no sandbox yet: call create_pod first."
+            );
+            let not_set_up = no_shell_message(sandbox::TerminalError::Sandbox(sandbox::SandboxError::NotInitialized));
+            assert!(!not_set_up.contains("create_pod"), "{not_set_up}");
+            assert!(not_set_up.contains("isn't set up"), "{not_set_up}");
+        }
 
         #[tokio::test]
         async fn test_an_install_that_read_old_keys_cant_write_over_a_newer_one() {

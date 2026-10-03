@@ -237,7 +237,7 @@ pub(crate) async fn pod_overviews(pool: &sqlx::PgPool) -> Result<Vec<PodOverview
             activity: pod_activity(&row),
             memory_limit: sum_memory_limits(&details.memory_limits),
             cpu_limit: sum_cpu_limits(&details.cpu_limits),
-            usage: usage.get(&crate::sandbox::kubernetes_pod_name(row.pod_id)).cloned(),
+            usage: usage.get(&crate::sandbox::pod_name(row.pod_id)).cloned(),
             terminals: row.live_terminals,
             agent: crate::sandbox::agent_status(row.pod_id),
             language_servers: server_overviews(row.conversation_id, row.pod_id, &usage).await,
@@ -256,7 +256,14 @@ async fn server_overviews(
     usage: &std::collections::HashMap<String, PodUsage>,
 ) -> Vec<ServerPodOverview> {
     use crate::lsp::pods::{self, ServerState};
-    let servers = match pods::list_with(&crate::sandbox::kube_client(), conversation_id).await {
+    let client = match crate::sandbox::kube_client() {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't list language server pods");
+            return Vec::new();
+        }
+    };
+    let servers = match pods::list_with(&client, conversation_id).await {
         Ok(servers) => servers,
         Err(e) => {
             tracing::warn!(pod_id, error = %e, "couldn't list language server pods");

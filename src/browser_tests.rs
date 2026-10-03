@@ -694,7 +694,7 @@ async fn test_end_to_end_browser_scenarios() {
         .run(pool)
         .await
         .expect("migrations should apply");
-    sandbox::init().await;
+    sandbox::init().await.expect("sandbox manager");
 
     let harness = BrowserTestHarness::start().await;
     // The model every conversation the test creates runs on: a provider of
