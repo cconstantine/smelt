@@ -194,10 +194,6 @@ fn ChatPanel(
     // Whether the conversation has a model to send to, from the picker:
     // Send waits for one (SME-72). True until the picker knows otherwise.
     let model_ready = use_signal(|| true);
-    // The message box waits while the model works in this conversation,
-    // whoever started the turn; Stop is offered instead.
-    let is_streaming = move || turn_running();
-    let can_stop = move || turn_running();
     // Seconds this tab has seen the current turn running, for the
     // "Working…" line (SME-41 D1). Ticks once a second while a turn runs,
     // and resets when it ends. Web only.
@@ -1044,34 +1040,13 @@ fn ChatPanel(
                         if let Some(id) = selected() {
                             super::ModelPicker { key: "{id}", conversation_id: id, refresh: model_changed, ready: model_ready }
                         }
-                        form {
-                            class: "composer",
-                            onsubmit: move |event| {
-                                event.prevent_default();
-                                send();
-                            },
-                            input {
-                                r#type: "text",
-                                value: "{input}",
-                                disabled: is_streaming(),
-                                placeholder: if pending_question().is_some() { "Answer the question above, or write a reply instead" } else { "Type a message..." },
-                                oninput: move |e| input.set(e.value()),
-                            }
-                            button {
-                                r#type: "submit",
-                                disabled: is_streaming() || !model_ready(),
-                                title: if model_ready() { "" } else { "Choose a model first" },
-                                "Send"
-                            }
-                            if can_stop() {
-                                button {
-                                    r#type: "button",
-                                    class: "stop-turn",
-                                    title: "Stop the model's current turn. Its sandbox, terminals and running commands keep going.",
-                                    onclick: stop,
-                                    "Stop"
-                                }
-                            }
+                        Composer {
+                            input,
+                            turn_running,
+                            model_ready,
+                            pending_question,
+                            on_send: move |_| send(),
+                            on_stop: stop,
                         }
                         }
                     }
