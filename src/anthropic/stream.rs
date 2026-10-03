@@ -1083,7 +1083,15 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
         });
-        (test_endpoint(addr), seen)
+        // A credential of its own: `RECOVERY` outlives the test, and a later
+        // test can be handed the same port.
+        static UPSTREAMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = UPSTREAMS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let endpoint = Endpoint {
+            base_url: format!("http://{addr}"),
+            auth: Auth::ApiKey(format!("recording-upstream-{n}")),
+        };
+        (endpoint, seen)
     }
 
     /// A request replaying an earlier turn's thinking block.
