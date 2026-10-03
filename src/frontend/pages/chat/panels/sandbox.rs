@@ -40,36 +40,19 @@ pub(in super::super) fn repo_detail(repo: &RepoSummary) -> String {
 
 /// The sandbox panel: the conversation's repos, its pod with a Stop
 /// button and preview links, and each terminal's commands and output.
+/// Stopping a pod is the panel's (`on_stop_pod`).
 #[component]
 pub(in super::super) fn SandboxPanel(
     selected: Memo<Option<i64>>,
     repos: Signal<Vec<RepoSummary>>,
     sandbox_pods: Signal<Vec<SandboxPodPanelEntry>>,
     sandbox_terminals: Signal<Vec<SandboxTerminalPanelEntry>>,
-    mut pending_pod_stop: Signal<Option<i64>>,
-    mut pod_stop_error: Signal<Option<String>>,
+    pending_pod_stop: Signal<Option<i64>>,
+    pod_stop_error: Signal<Option<String>>,
     mut terminal_body_els: Signal<HashMap<i64, MountedEvent>>,
     mut terminal_body_stuck: Signal<HashMap<i64, bool>>,
+    on_stop_pod: EventHandler<i64>,
 ) -> Element {
-    let mut request_pod_stop = move |pod_id: i64| {
-        if pending_pod_stop() == Some(pod_id) {
-            pending_pod_stop.set(None);
-            let conversation = selected();
-            spawn(async move {
-                let result = crate::api::pods::stop_pod(pod_id).await;
-                // Not onto another conversation's panel (SME-51 B11).
-                if selected() != conversation {
-                    return;
-                }
-                match result {
-                    Ok(()) => pod_stop_error.set(None),
-                    Err(e) => pod_stop_error.set(Some(server_error_message(&e))),
-                }
-            });
-        } else {
-            pending_pod_stop.set(Some(pod_id));
-        }
-    };
     rsx! {
         aside { class: "sandbox-panel",
             h3 { "Sandbox" }
@@ -111,7 +94,7 @@ pub(in super::super) fn SandboxPanel(
                             class: if pending_pod_stop() == Some(pod.pod_id) { "pod-stop confirm" } else { "pod-stop" },
                             r#type: "button",
                             title: "Stop this pod. Its terminals and any files outside /workspace and mounted volumes are lost.",
-                            onclick: move |_| request_pod_stop(pod.pod_id),
+                            onclick: move |_| on_stop_pod.call(pod.pod_id),
                             super::TwoStepLabel { armed: pending_pod_stop() == Some(pod.pod_id), idle: "Stop sandbox", confirm: "Confirm stop?" }
                         }
                     }

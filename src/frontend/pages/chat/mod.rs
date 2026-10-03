@@ -265,10 +265,31 @@ fn ChatPanel(
     // The panel's Stop button: the pod armed for stopping (click once to
     // arm, again to confirm), and the last stop's error. The pod itself
     // disappears through the usual `SandboxPodUpdate` event.
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut pending_pod_stop: Signal<Option<i64>> = use_signal(|| None);
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut pod_stop_error: Signal<Option<String>> = use_signal(|| None);
+    // The sandbox panel's Stop button: click once to arm, again to stop.
+    // Here, not in `SandboxPanel`: the panel unmounts once the pod is gone
+    // and nothing else shows, which would drop the stop's task before it
+    // clears or sets the stop error (SME-57 code review).
+    let mut request_pod_stop = move |pod_id: i64| {
+        if pending_pod_stop() == Some(pod_id) {
+            pending_pod_stop.set(None);
+            let conversation = selected();
+            spawn(async move {
+                let result = crate::api::pods::stop_pod(pod_id).await;
+                // Not onto another conversation's panel (SME-51 B11).
+                if selected() != conversation {
+                    return;
+                }
+                match result {
+                    Ok(()) => pod_stop_error.set(None),
+                    Err(e) => pod_stop_error.set(Some(server_error_message(&e))),
+                }
+            });
+        } else {
+            pending_pod_stop.set(Some(pod_id));
+        }
+    };
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut sandbox_terminals: Signal<Vec<SandboxTerminalPanelEntry>> = use_signal(Vec::new);
     // Whether the model currently has a browsing session open — drives
@@ -919,6 +940,7 @@ fn ChatPanel(
                                     pod_stop_error,
                                     terminal_body_els,
                                     terminal_body_stuck,
+                                    on_stop_pod: move |pod_id| request_pod_stop(pod_id),
                                 }
                             }
                         }
