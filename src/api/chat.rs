@@ -1204,9 +1204,11 @@ impl Drop for TurnInFlight {
 /// Frees `conversation_id`'s turn lock and stop counter once no one has
 /// them (SME-91): the lock only when the map's is the last handle, so one
 /// in use is never replaced by a fresh one, and the stop counter when no
-/// turn listens to it (a stop with nothing running only pauses). Its kept
-/// error's entry too when it holds no error. Each is made again on next
-/// use. Under each map's lock, which handing one out also takes.
+/// turn listens to it (a stop with nothing running only pauses). Each is
+/// made again on next use. Under each map's lock, which handing one out
+/// also takes. Not the kept error's entry: a turn starting meanwhile has
+/// its generation there already (SME-91 review); it's a few bytes per
+/// conversation, freed on delete.
 #[cfg(feature = "server")]
 fn release_idle_turn_state(conversation_id: i64) {
     {
@@ -1215,15 +1217,9 @@ fn release_idle_turn_state(conversation_id: i64) {
             locks.remove(&conversation_id);
         }
     }
-    {
-        let mut stops = TURN_STOPS.lock().unwrap_or_else(|e| e.into_inner());
-        if stops.get(&conversation_id).is_some_and(|stops| stops.counter.receiver_count() == 0) {
-            stops.remove(&conversation_id);
-        }
-    }
-    let mut errors = TURN_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
-    if errors.get(&conversation_id).is_some_and(|kept| kept.error.is_none()) {
-        errors.remove(&conversation_id);
+    let mut stops = TURN_STOPS.lock().unwrap_or_else(|e| e.into_inner());
+    if stops.get(&conversation_id).is_some_and(|stops| stops.counter.receiver_count() == 0) {
+        stops.remove(&conversation_id);
     }
 }
 
@@ -3776,6 +3772,17 @@ mod tests {
         let conversation = db::create_conversation(&pool).await.expect("create conversation");
         let stream = open_conversation_events(&pool, conversation.id).await;
         assert!(stream.is_ok(), "an existing conversation's events open");
+    }
+
+    /// SME-91 review: an idle release landing between a turn starting
+    /// (its generation recorded) and failing mustn't lose that failure.
+    #[test]
+    fn test_an_idle_release_keeps_a_starting_turns_generation() {
+        let conversation_id = 9_100_000_192;
+        let generation = new_turn_generation(conversation_id);
+        release_idle_turn_state(conversation_id);
+        keep_turn_error(conversation_id, generation, "it failed".to_string());
+        assert_eq!(last_turn_error(conversation_id).as_deref(), Some("it failed"));
     }
 
     /// SME-91: a conversation's turn lock and stop counter go once its
