@@ -95,14 +95,29 @@ fn accept_saved_messages(existing: &mut Vec<Message>, incoming: Vec<Message>) {
         if saved.role != "user" || existing.iter().any(|m| m.id == saved.id) {
             continue;
         }
+        let sent = sent_part(saved);
         if let Some(copy) = existing
             .iter()
-            .position(|m| m.id < 0 && m.role == saved.role && m.content == saved.content)
+            .position(|m| m.id < 0 && m.role == saved.role && sent_part(m) == sent)
         {
             existing.remove(copy);
         }
     }
     merge_messages_by_id(existing, incoming);
+}
+
+/// What the user sent in `message`: its blocks without a tool result the
+/// server put in front (a question's answer or dismissal, SME-34), which
+/// the optimistic copy doesn't have. Unparseable content compares whole.
+#[cfg(any(feature = "web", test))]
+fn sent_part(message: &Message) -> Result<Vec<ContentBlock>, String> {
+    match message.blocks() {
+        Ok(blocks) => Ok(blocks
+            .into_iter()
+            .filter(|b| !matches!(b, ContentBlock::ToolResult { .. }))
+            .collect()),
+        Err(_) => Err(message.content.clone()),
+    }
 }
 
 #[cfg(any(feature = "web", test))]
@@ -1686,6 +1701,27 @@ mod tests {
         assert_eq!(ids, vec![-2, 7], "two identical sends: one replaced so far");
         accept_saved_messages(&mut existing, vec![user_text(7, "yes")]);
         assert_eq!(existing.len(), 2, "a repeat of an already shown message changes nothing");
+    }
+
+    /// Code review 1 (SME-34): a message sent while a question waits is
+    /// saved with the question's result in front of the user's text. Its
+    /// optimistic copy (just the text) is still replaced.
+    #[test]
+    fn test_accept_saved_messages_matches_a_copy_saved_behind_a_tool_result() {
+        let mut existing = vec![user_text(-1, "keep it")];
+        let mut saved = user_text(9, "keep it");
+        saved.content = serde_json::to_string(&[
+            ContentBlock::ToolResult {
+                tool_use_id: "toolu_ask".to_string(),
+                content: "The user didn't answer these questions. Their message follows.".to_string(),
+                is_error: None,
+            },
+            ContentBlock::Text { text: "keep it".to_string() },
+        ])
+        .expect("serializes");
+        accept_saved_messages(&mut existing, vec![saved]);
+        let ids: Vec<i64> = existing.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![9], "the copy is replaced, not shown twice");
     }
 
     #[test]
