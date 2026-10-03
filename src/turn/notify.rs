@@ -87,7 +87,7 @@ pub(super) async fn wake_conversation(
     conversation_id: i64,
 ) -> TurnResult {
     // After the user stopped this conversation, pending notices wait for
-    // their next message, which drains them the same way (see `PAUSED`).
+    // their next message, which drains them the same way (see `ConversationRuntime::paused`).
     if is_paused(conversation_id) {
         return Ok(Vec::new());
     }

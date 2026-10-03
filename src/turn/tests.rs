@@ -461,7 +461,7 @@ fn test_forget_conversation_lock_drops_it() {
     let _ = stop_receiver(conversation_id);
     forget_conversation_lock(conversation_id);
     assert!(
-        !TURN_STOPS.lock().expect("stops").contains_key(&conversation_id),
+        !holds_lock_and_stops(conversation_id).1,
         "the deleted conversation's stop signal is still registered"
     );
     let second = conversation_lock(conversation_id);
@@ -1555,12 +1555,7 @@ async fn test_a_conversations_turn_state_is_freed_after_its_turns(pool: PgPool) 
         .await
         .expect("create conversation");
     start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
-    let turn_state_kept = |id: i64| {
-        (
-            CONVERSATION_LOCKS.lock().expect("locks").contains_key(&id),
-            TURN_STOPS.lock().expect("stops").contains_key(&id),
-        )
-    };
+    let turn_state_kept = holds_lock_and_stops;
 
     run_turn(&pool, conversation.id, hello()).await.expect("a turn");
     assert_eq!(turn_state_kept(conversation.id), (false, false), "freed after the turn");

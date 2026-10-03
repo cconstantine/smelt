@@ -129,7 +129,7 @@ pub(super) fn record_saved(conversation_id: i64, persisted: &mut Vec<Message>, s
     persisted.push(saved);
 }
 
-/// A turn, ended early if the user stops it (see `TURN_STOPS`). Stopping
+/// A turn, ended early if the user stops it (see `TurnStops`). Stopping
 /// drops `run_turn_body` wherever it's waiting (the model's stream, a
 /// tool call, a compaction), which releases the turn lock. What it leaves
 /// behind: a streaming reply isn't saved, and tool calls without results
@@ -229,17 +229,15 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
 /// agree (SME-51 B3).
 #[cfg(feature = "server")]
 pub(super) fn relay_reply_delta(conversation_id: i64, delta: &str) {
-    let mut replies = REPLIES_IN_PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
-    let reply = replies.entry(conversation_id).or_default();
-    let offset = reply.len();
-    reply.push_str(delta);
-    crate::events::publish(
-        conversation_id,
-        crate::events::ConversationEvent::ReplyDelta {
-            text: delta.to_string(),
-            offset,
-        },
-    );
+    append_reply(conversation_id, delta, |offset| {
+        crate::events::publish(
+            conversation_id,
+            crate::events::ConversationEvent::ReplyDelta {
+                text: delta.to_string(),
+                offset,
+            },
+        );
+    });
 }
 
 /// What a stopped turn leaves: no reply in progress, on the server or in
@@ -261,14 +259,7 @@ pub(super) async fn end_stopped_turn(pool: &PgPool, conversation_id: i64, stoppe
 /// last message already is the note. Call holding the turn lock.
 #[cfg(feature = "server")]
 pub(super) async fn record_stop(pool: &PgPool, conversation_id: i64, stopped_by: u64) {
-    let first_for_this_stop = {
-        let mut stops = TURN_STOPS.lock().unwrap_or_else(|e| e.into_inner());
-        let stops = stops.entry(conversation_id).or_default();
-        let first = stopped_by > stops.noted;
-        stops.noted = stops.noted.max(stopped_by);
-        first
-    };
-    if !first_for_this_stop {
+    if !note_stop(conversation_id, stopped_by) {
         return;
     }
     let already = db::list_messages(pool, conversation_id)
