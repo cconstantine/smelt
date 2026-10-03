@@ -3894,7 +3894,7 @@ fn ChatPanel(
                             // A new conversation says what smelt does and offers a
                             // few asks to start from, instead of a blank screen
                             // (SME-41 D12). Picking one fills the message box.
-                            if messages().is_empty() && !turn_running() && matches!(initial_messages(), Some(Some(Ok(_)))) {
+                            if messages().is_empty() && !turn_running() && !conversation_missing() && matches!(initial_messages(), Some(Some(Ok(_)))) {
                                 div { class: "conversation-empty",
                                     h2 { "What should smelt work on?" }
                                     p { "It works in a sandbox of its own: it writes and runs code, uses a terminal, reads the web, and shows you each step." }
