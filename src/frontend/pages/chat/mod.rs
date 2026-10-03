@@ -326,10 +326,12 @@ fn ChatPanel(
     let mut context_usage: Signal<Option<ContextUsageSnapshot>> = use_signal(|| None);
     // The click-through detail view: closed by default, fetched on demand
     // (not kept live) the moment it's opened — see `open_context_detail`.
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut context_detail: Signal<Option<ContextDetailSnapshot>> = use_signal(|| None);
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut context_detail_open = use_signal(|| false);
     // The context bar, so closing its detail view can give it focus back.
-    let mut context_bar_el: Signal<Option<MountedEvent>> = use_signal(|| None);
+    let context_bar_el: Signal<Option<MountedEvent>> = use_signal(|| None);
 
     // Sticky-bottom auto-scroll state for the message transcript: the
     // mounted `.messages` element (so an effect can query/set its scroll
@@ -716,35 +718,6 @@ fn ChatPanel(
         });
     }
 
-    // Closes the detail view from inside it (its ×, Escape, a click
-    // outside) and puts focus back on the bar that opened it.
-    let mut close_context_detail = move || {
-        context_detail_open.set(false);
-        if let Some(bar) = context_bar_el.peek().clone() {
-            spawn(async move {
-                let _ = bar.set_focus(true).await;
-            });
-        }
-    };
-
-    // Fetches a fresh detail snapshot every time it's opened, rather than
-    // caching — matches the idea's "most recently sent request" decision;
-    // reopening after a new turn should show that turn's numbers, not a
-    // stale first-open snapshot.
-    let mut open_context_detail = move || {
-        let Some(id) = selected() else { return };
-        context_detail_open.set(true);
-        // Not the last snapshot, possibly another conversation's (SME-51 B11).
-        context_detail.set(None);
-        spawn(async move {
-            if let Ok(detail) = get_context_detail(id).await
-                && selected() == Some(id)
-            {
-                context_detail.set(Some(detail));
-            }
-        });
-    };
-
     let mut send = move || {
         let Some(id) = selected() else { return };
         let content = input();
@@ -925,128 +898,12 @@ fn ChatPanel(
                         }
                     }
                     div { class: "chat-main",
-                        if let Some(snapshot) = context_usage() {
-                            button {
-                                r#type: "button",
-                                class: "context-usage-bar",
-                                onmounted: move |evt| context_bar_el.set(Some(evt)),
-                                onclick: move |_| open_context_detail(),
-                                if let Some(percent) = context_usage_percent(&snapshot) {
-                                    div { class: "context-usage-track",
-                                        div {
-                                            class: "context-usage-fill",
-                                            style: "width: {percent}%",
-                                        }
-                                    }
-                                    span { class: "context-usage-label", "{percent}% of context" }
-                                } else {
-                                    span { class: "context-usage-label", "No usage yet" }
-                                }
-                            }
-                        } else {
-                            // The bar's space, kept until the usage arrives: it
-                            // always shows once it has, and appearing above the
-                            // transcript would push it down under the pointer
-                            // (SME-75).
-                            div { class: "context-usage-bar context-usage-bar-pending", aria_hidden: "true",
-                                span { class: "context-usage-label", "\u{a0}" }
-                            }
-                        }
-                        if context_detail_open() {
-                            div { class: "context-detail-overlay",
-                                onclick: move |_| close_context_detail(),
-                                onkeydown: move |e: Event<KeyboardData>| {
-                                    if e.data().key() == keyboard_types::Key::Escape {
-                                        close_context_detail();
-                                    }
-                                },
-                                // The view is modal, so Tab cycles inside it:
-                                // focus reaching either sentinel wraps around
-                                // to the view's other end.
-                                div {
-                                    class: "focus-sentinel",
-                                    tabindex: "0",
-                                    onfocus: move |_| {
-                                        spawn(async move {
-                                            let _ = document::eval(FOCUS_LAST_IN_CONTEXT_DETAIL).await;
-                                        });
-                                    },
-                                }
-                                div {
-                                    class: "context-detail-panel",
-                                    role: "dialog",
-                                    aria_modal: "true",
-                                    aria_label: "Context",
-                                    // Focusable (not in the tab order), so a
-                                    // click on the view's text keeps focus in
-                                    // it and Escape still reaches the overlay.
-                                    tabindex: "-1",
-                                    onclick: move |evt| evt.stop_propagation(),
-                                    button {
-                                        r#type: "button",
-                                        class: "context-detail-close",
-                                        aria_label: "Close",
-                                        onmounted: move |evt: MountedEvent| async move {
-                                            let _ = evt.set_focus(true).await;
-                                        },
-                                        onclick: move |_| close_context_detail(),
-                                        "×"
-                                    }
-                                    match context_detail() {
-                                        None => rsx! { p { "Loading…" } },
-                                        Some(detail) => rsx! {
-                                            h3 { "Context" }
-                                            if !detail.instructions.is_empty() {
-                                                h4 { class: "context-detail-heading", "Project instructions ({detail.instructions.len()})" }
-                                                p { class: "muted", "AGENTS.md files from this conversation's repos, sent with every turn as part of the system prompt below." }
-                                                for doc in &detail.instructions {
-                                                    details { class: "context-detail-instructions",
-                                                        summary {
-                                                            code { "{doc.path}" }
-                                                            span { class: "muted", " {instructions_source(doc)}" }
-                                                        }
-                                                        pre { class: "context-detail-prompt", "{doc.content}" }
-                                                    }
-                                                }
-                                            }
-                                            h4 { class: "context-detail-heading", "System prompt" }
-                                            if let Some(system) = &detail.system {
-                                                // Its own line breaks and headings, not one
-                                                // run-together paragraph (SME-41 D7).
-                                                pre { class: "context-detail-prompt", "{system}" }
-                                            } else {
-                                                p { class: "muted", "None set." }
-                                            }
-                                            p { "Messages: {detail.message_count}" }
-                                            if let Some(usage) = &detail.usage {
-                                                p {
-                                                    "Tokens — input: {usage.input_tokens}, output: {usage.output_tokens}, "
-                                                    "cache creation: {usage.cache_creation_input_tokens}, cache read: {usage.cache_read_input_tokens}"
-                                                }
-                                                {render_context_meter(&context_usage_breakdown(usage, detail.context_window))}
-                                            }
-                                            p { "Context window: {detail.context_window}" }
-                                            h4 { "Tools ({detail.tools.len()})" }
-                                            for tool in &detail.tools {
-                                                div { class: "context-detail-tool",
-                                                    strong { "{tool.name}" }
-                                                    p { "{tool.description}" }
-                                                    pre { "{tool.input_schema}" }
-                                                }
-                                            }
-                                        },
-                                    }
-                                }
-                                div {
-                                    class: "focus-sentinel",
-                                    tabindex: "0",
-                                    onfocus: move |_| {
-                                        spawn(async move {
-                                            let _ = document::eval(FOCUS_FIRST_IN_CONTEXT_DETAIL).await;
-                                        });
-                                    },
-                                }
-                            }
+                        ContextUsage {
+                            selected,
+                            context_usage,
+                            context_detail,
+                            context_detail_open,
+                            context_bar_el,
                         }
                         div {
                             class: "messages",
