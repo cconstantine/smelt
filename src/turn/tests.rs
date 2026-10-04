@@ -1132,6 +1132,15 @@ fn test_system_prompt_lists_repos_and_ends_with_their_instructions() {
     );
 }
 
+/// SME-30: replies render as markdown now, so the prompt stops telling
+/// the model to avoid it.
+#[test]
+fn test_system_prompt_says_markdown_renders() {
+    assert!(!BASE_SYSTEM_PROMPT.contains("Markdown is not rendered"), "the prompt still says markdown doesn't render");
+    assert!(!BASE_SYSTEM_PROMPT.contains("Don't use tables, headings"), "the prompt still rules out tables and headings");
+    assert!(BASE_SYSTEM_PROMPT.contains("rendered as Markdown"), "the prompt should say replies are rendered as Markdown");
+}
+
 #[test]
 fn test_system_prompt_starts_with_the_base_prompt() {
     let prompt = system_prompt(&prompt_env());

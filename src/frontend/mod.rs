@@ -147,6 +147,8 @@ pub fn App() -> Element {
         // shrinks it to fit (SME-40 F8).
         document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
         document::Stylesheet { href: asset!("/assets/chat.css") }
+        // Code highlighting in the model's replies (SME-30).
+        document::Stylesheet { href: asset!("/assets/highlight.css") }
         StaleBundleBanner {}
         Router::<Route> {}
     }

@@ -16,8 +16,10 @@ mod frontend;
 mod git;
 #[cfg(feature = "server")]
 mod headless_chrome;
+mod highlight;
 #[cfg(feature = "server")]
 mod lsp;
+mod markdown;
 #[cfg(feature = "server")]
 mod http_request;
 #[cfg(feature = "server")]

@@ -356,6 +356,178 @@ body {
     opacity: 0.85;
 }
 
+/* The model's replies render as markdown (SME-30): the bubble's
+   pre-wrap is for plain text, so rendered replies use normal wrapping and
+   their own block spacing. Wide tables and code scroll inside the bubble
+   rather than widening it, at every window width. */
+.message-markdown,
+.message-streaming {
+    white-space: normal;
+    min-width: 0;
+}
+
+.markdown {
+    overflow-wrap: anywhere;
+}
+
+.markdown p,
+.markdown ul,
+.markdown ol,
+.markdown blockquote,
+.markdown .md-table-wrap,
+.markdown .md-code,
+.markdown .md-html {
+    margin: 0 0 10px;
+}
+
+.markdown .md-html {
+    white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    color: var(--text-2);
+}
+
+.markdown .md-heading {
+    margin: 14px 0 6px;
+    line-height: 1.3;
+    color: var(--ink);
+}
+
+.markdown h1.md-heading { font-size: 1.3em; }
+.markdown h2.md-heading { font-size: 1.18em; }
+.markdown h3.md-heading { font-size: 1.06em; }
+.markdown h4.md-heading,
+.markdown h5.md-heading,
+.markdown h6.md-heading { font-size: 1em; }
+
+.markdown ul,
+.markdown ol {
+    padding-left: 22px;
+}
+
+.markdown li > ul,
+.markdown li > ol {
+    margin: 2px 0;
+}
+
+/* A task item's checkbox takes its bullet's place; its text and any
+   nested list stay at the normal indent. */
+.markdown li.md-task {
+    list-style: none;
+}
+
+.markdown li.md-task > input {
+    margin: 0 6px 0 -20px;
+    vertical-align: -1px;
+}
+
+.markdown blockquote {
+    padding: 2px 0 2px 12px;
+    border-left: 3px solid var(--border-strong);
+    color: var(--text-2);
+}
+
+.markdown hr {
+    border: 0;
+    border-top: 1px solid var(--border-strong);
+    margin: 12px 0;
+}
+
+.markdown a {
+    color: var(--accent);
+}
+
+.markdown .md-inline-code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.9em;
+    padding: 1px 4px;
+    border-radius: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+}
+
+.markdown .md-image {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    border-radius: 8px;
+}
+
+.markdown .md-table-wrap {
+    overflow-x: auto;
+    max-width: 100%;
+}
+
+.markdown table {
+    border-collapse: collapse;
+    font-size: 14px;
+}
+
+.markdown th,
+.markdown td {
+    border: 1px solid var(--border-strong);
+    padding: 4px 8px;
+    text-align: left;
+    vertical-align: top;
+}
+
+.markdown th {
+    background: var(--surface);
+}
+
+.markdown .md-code {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--surface);
+}
+
+.markdown .md-code-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 2px 4px 2px 10px;
+    font-size: 12px;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+}
+
+.markdown .md-code-copy {
+    border: 0;
+    background: none;
+    color: var(--text-2);
+    font-size: 12px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.markdown .md-code-copy:hover,
+.markdown .md-code-copy:focus-visible {
+    background: var(--subtle);
+    color: var(--ink);
+}
+
+/* After the block rules above, so a reply that starts with a heading
+   doesn't open with a gap. */
+.markdown > :first-child {
+    margin-top: 0;
+}
+
+.markdown > :last-child {
+    margin-bottom: 0;
+}
+
+.markdown .md-pre {
+    margin: 0;
+    padding: 8px 10px;
+    overflow-x: auto;
+    white-space: pre;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    line-height: 1.45;
+}
+
 /* Subtle timestamp on every rendered block — small and low-contrast so it
    reads as a detail, not competing with the actual content. */
 .timestamp {

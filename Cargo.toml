@@ -23,6 +23,15 @@ similar = "2.7"
 # in this file. Compiles on both targets (pure Rust, no OS-specific
 # pieces), same as `similar` above, so not feature-gated either.
 keyboard-types = "0.7"
+# For src/markdown.rs and src/highlight.rs: the model's replies render as
+# markdown (SME-30). pulldown-cmark is an event parser (no HTML output
+# used: smelt builds its own node tree and renders Dioxus elements, so raw
+# HTML in a reply stays text); syntect + two-face highlight code blocks
+# into class-named spans with the pure-Rust regex engine. All three build
+# for wasm32-unknown-unknown, so not feature-gated.
+pulldown-cmark = { version = "0.13.4", default-features = false }
+syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 
 # Server-only dependencies (not WASM-compatible)
 dotenvy = { version = "0.15", optional = true }
@@ -208,6 +217,9 @@ rmcp = { version = "3.1.2", default-features = false, features = ["server"] }
 # Paused time in tests (`#[tokio::test(start_paused = true)]`), for timeouts
 # too long to wait out (SME-35's 120 s `initialize`).
 tokio = { version = "1", features = ["test-util"] }
+# syntect's CSS generation, for the test in src/highlight.rs that checks
+# assets/highlight.css still matches the themes (SME-30): tests only.
+syntect = { version = "5.3", default-features = false, features = ["html"] }
 
 [build-dependencies]
 # `build.rs` hashes the sources into `SMELT_BUILD_ID` (SME-43).

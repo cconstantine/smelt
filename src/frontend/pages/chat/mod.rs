@@ -424,6 +424,9 @@ fn ChatPanel(
     // the element under the pointer where it was.
     let pointer_over_transcript = use_signal(|| false);
     let mut layout_snap_pending = use_signal(|| false);
+    // Bumped when an image in a reply finishes loading and grows it, a
+    // layout change like a panel appearing (SME-30).
+    let media_loaded: Signal<u64> = use_signal(|| 0);
     // What the transcript held when the effect below last ran: the message
     // count, the last message's id and the streaming reply's length. Only
     // a change in it is new content; a write that changes nothing (the
@@ -885,6 +888,8 @@ fn ChatPanel(
         let _ = browsing_session_open();
         // The context bar above the transcript appears with the first usage.
         let _ = context_usage();
+        // An image in a reply loaded and grew it (SME-30).
+        let _ = media_loaded();
         if !*messages_stuck_to_bottom.peek() {
             return;
         }
@@ -1004,6 +1009,7 @@ fn ChatPanel(
                             messages_stuck_to_bottom,
                             pointer_over_transcript,
                             layout_snap_pending,
+                            media_loaded,
                         }
                         if !conversation_missing() {
                         if let Some(id) = selected() {

@@ -1,6 +1,7 @@
 //! Rendering the transcript: content blocks, tool calls and results, diffs, notices.
 
 use super::*;
+use crate::markdown::Markdown;
 
 /// Pretty-prints a `ToolUse` block's `input` for display. Falls back to the
 /// compact form on the (practically impossible, since `Value` always
@@ -334,6 +335,7 @@ pub(super) fn render_block_element(
     tool_results: &HashMap<String, (String, bool)>,
     commands: &HashMap<String, String>,
     thinking_open: bool,
+    on_media_load: EventHandler<()>,
 ) -> Element {
     let key = format!("{message_id}-{index}");
     let timestamp = format_timestamp(created_at, tz_offset_minutes);
@@ -347,6 +349,16 @@ pub(super) fn render_block_element(
                 }
             }
         }
+        // The model's replies render as markdown (SME-30); everything
+        // else stays plain text.
+        ContentBlock::Text { text } if role == "assistant" => rsx! {
+            div { key: "{key}", class: "message message-{role}",
+                div { class: "message-text message-markdown",
+                    Markdown { source: text.clone(), on_media_load }
+                }
+                span { class: "timestamp", "{timestamp}" }
+            }
+        },
         ContentBlock::Text { text } => rsx! {
             div { key: "{key}", class: "message message-{role}",
                 div { class: "message-text", "{display_text(text)}" }
@@ -549,7 +561,10 @@ pub(super) fn Transcript(
     mut messages_stuck_to_bottom: Signal<bool>,
     mut pointer_over_transcript: Signal<bool>,
     mut layout_snap_pending: Signal<bool>,
+    mut media_loaded: Signal<u64>,
 ) -> Element {
+    // An image in a reply loaded: a layout change for the sticky scroll.
+    let on_media_load = use_callback(move |()| *media_loaded.write() += 1);
     let conversation_missing = move || load_error().as_deref() == Some("conversation not found");
     let streaming_text = move || streaming_reply().filter(|text| !text.is_empty());
     let tool_names = tool_use_names_by_id(&messages());
@@ -624,7 +639,7 @@ pub(super) fn Transcript(
                         let thinking_open = reply_is_only_thinking(&message.role, &blocks);
                         rsx! {
                             for (i , block) in blocks.iter().enumerate() {
-                                {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names, &tool_results, &commands, thinking_open)}
+                                {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names, &tool_results, &commands, thinking_open, on_media_load)}
                             }
                         }
                     },
@@ -665,7 +680,9 @@ pub(super) fn Transcript(
                 }
             }
             if let Some(reply) = streaming_text() {
-                div { class: "message message-assistant message-streaming", "{reply}" }
+                div { class: "message message-assistant message-streaming",
+                    Markdown { source: reply, on_media_load }
+                }
             }
             if turn_running() {
                 div { class: "turn-working", role: "status",

