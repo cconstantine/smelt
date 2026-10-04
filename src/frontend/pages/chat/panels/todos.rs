@@ -15,7 +15,10 @@ pub(in super::super) fn todo_status_class(status: TodoStatus) -> &'static str {
 
 /// The model's todo list, as `todowrite` last left it.
 #[component]
-pub(in super::super) fn TodoPanel(todos: Signal<Vec<TodoItem>>) -> Element {
+pub(in super::super) fn TodoPanel(
+    state: Store<ConversationState>,
+) -> Element {
+    let todos = state.todos();
     rsx! {
         aside { class: "todo-panel",
             h3 { "Todos" }

@@ -10,7 +10,7 @@ frontend/
   pages/
     mod.rs             # TwoStepLabel
     chat/              # the chat page (SME-57)
-      mod.rs           # Chat, ChatPanel (its state, effects and event stream)
+      mod.rs           # Chat, ChatPanel (its effects, actions and event stream)
       sidebar.rs       # ConversationSidebar
       transcript.rs    # Transcript, render_block_element and the tool/diff/notice helpers
       context.rs       # ContextUsage: the usage bar and its detail dialog
@@ -19,7 +19,7 @@ frontend/
       trust_card.rs    # TrustCards (AGENTS.md waiting for trust)
       question_card.rs # QuestionCard (the model's `ask_user` question)
       model_setup.rs   # ModelNotes (turn and notification errors)
-      state.rs         # the pure merges of loaded and live messages and sandbox entries
+      state.rs         # ConversationState (the store), apply_event, and the merges onto them
       sticky.rs        # stick-to-bottom and pointer-hold scrolling helpers
       streaming.rs     # format_elapsed (the working line)
       panels/          # BrowsingPanel, TodoPanel, SandboxPanel
@@ -82,7 +82,9 @@ This isn't just style — a plain prop threaded down from `Home`/`ConversationRo
 
 `PodsChanged` and `TurnsChanged` arrive on the open conversation's own stream rather than a second connection (see [api.md](api.md#live-conversation-events)). So on `/`, with no conversation open, the dots and busy marks only refresh on navigation.
 
-On a switch, `ChatPanel` resets every per-conversation signal before subscribing to the new conversation's events: messages and load error, todos, repos and the repo form, sandbox state, browsing state and the address bar, the background-notification error, the turn state and streaming reply, the context-usage meter and its detail view. Anything missed here shows the previous conversation's state until something replaces it (SME-51 B11 was the context detail view staying open over the next conversation).
+**The open conversation's state is one store** (SME-57). `ConversationState` (`chat/state.rs`, `#[derive(Store)]`) holds everything the panel shows that belongs to the open conversation: its messages and load error, the streaming reply and turn state, todos, repos and the repo form, the sandbox panel, the browsing panel and its address bar, the context meter and its detail view, the waiting question, the errors that belong to it. On a switch, `ChatPanel` replaces it in one write (the default, with `conversation` set to the new id) before subscribing to the new conversation's events, so nothing can be missed the way per-signal resets were (SME-51 B11 was the context detail view staying open over the next conversation). **Effects rerun on a switch in no set order**, so one can run before the reset, with the fields still holding the previous conversation's: an effect that acts on a field for `selected` checks `conversation` first, as the browsing panel's frame subscription does (on SME-57 (b) it asked for frames for a conversation with no session). A new per-conversation field goes in the struct, and `test_conversation_state_starts_empty` won't compile until it's checked. What outlives a switch on purpose stays outside: the message box's draft, the turn errors (kept by conversation), the model picker, the time zone and the transcript's scroll bookkeeping.
+
+Components take the store (`state: Store<ConversationState>`) and read the fields they show through its lenses (`state.todos()`), so a write to one field re-renders only that field's readers: a streamed delta re-renders the transcript, not the panels. **The store lends out one write at a time:** two lenses' `write()` guards held at once panic at runtime (`AlreadyBorrowedMut`), even for different fields, since both borrow the one store. Change the sandbox pods and terminals together through `change_sandbox_panel`; anywhere else, take one guard at a time.
 
 The sidebar links to the other pages: "MCP servers", "Sandboxes" (`/pods`), "Sandbox volumes", "Git" and "Language servers". The route and code say pods; the link and the page's heading say "Sandboxes". The Sandboxes page (`pages/pods.rs`):
 - lists every live sandbox with its conversation, status, uptime, activity (busy, or idle for how long), memory and CPU use against their limits, and terminal count, plus a line under the row for its language servers, if any;
@@ -142,6 +144,8 @@ Sending is an ordinary request: `send()` adds an optimistic copy of the message 
 - `MessagesAppended` goes through `accept_saved_messages`: each saved user message replaces one optimistic copy of itself (same text), then anything new is added. Without that the sender saw its own message twice.
 - `TurnError` sets the conversation's error, except for a stop (`TURN_STOPPED`), which shows as its saved notice instead (see above).
 - The message box is disabled while a turn runs in the conversation (`TurnState`), whoever started it, and Stop is offered instead.
+
+Each event goes through `apply_event(state, event)` (`chat/state.rs`), which updates the open conversation's state and returns an `EventEffect` for what lies outside it: a sidebar or model-picker counter, a turn error, or a stale bundle. The event loop in `ChatPanel` only does those. Each event has a test of its own there (`test_apply_event_*`), run against a store hosted in a `VirtualDom` (`with_state`); a new event gets one.
 
 **A refused stream doesn't say why.** When a `ServerEvents` subscription fails (the server function returned an error before streaming), the page's side gets a transport error, not the server function's own error text, unlike an ordinary server function call. A page that needs the reason asks a plain server function: the reconnect loop calls `get_messages` when the stream fails, and stops on "conversation not found" (SME-91; its first fix matched the stream's error text and never fired).
 

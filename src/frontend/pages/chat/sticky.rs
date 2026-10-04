@@ -53,7 +53,7 @@ pub(super) const TRANSCRIPT_FORGET_ANCHOR: &str = "window.__smeltTranscriptAncho
 /// there was nothing under it (the messages had only just arrived), snaps
 /// to the bottom as if the pointer weren't there. Either way the pending
 /// snap is settled here or on the pointer leaving.
-pub(super) async fn keep_transcript_anchor(el: MountedEvent, mut pending: Signal<bool>) {
+pub(super) async fn keep_transcript_anchor(el: MountedEvent, mut pending: impl Writable<Target = bool> + 'static) {
     let outcome = document::eval(TRANSCRIPT_KEEP_ANCHOR).await.ok();
     match outcome.as_ref().and_then(|v| v.as_str()) {
         Some("kept") => {}

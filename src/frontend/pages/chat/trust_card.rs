@@ -7,9 +7,10 @@ use super::*;
 #[component]
 pub(super) fn TrustCards(
     selected: Memo<Option<i64>>,
-    repos: Signal<Vec<RepoSummary>>,
-    mut repo_action_error: Signal<Option<String>>,
+    state: Store<ConversationState>,
 ) -> Element {
+    let repos = state.repos();
+    let mut repo_action_error = state.repo_action_error();
     rsx! {
         // A repo's AGENTS.md waits for the user's trust before it
         // becomes instructions the model follows (SME-32).

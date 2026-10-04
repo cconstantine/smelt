@@ -7,13 +7,14 @@ use super::*;
 /// message (SME-32, SME-49). Cloning is the panel's (`on_attach`).
 #[component]
 pub(super) fn RepoAttach(
-    mut repo_url: Signal<String>,
-    mut repo_branch: Signal<String>,
-    mut repo_dir: Signal<String>,
-    repo_attaching: Signal<bool>,
-    repo_attach_error: Signal<Option<String>>,
+    state: Store<ConversationState>,
     on_attach: EventHandler<()>,
 ) -> Element {
+    let mut repo_url = state.repo_url();
+    let mut repo_branch = state.repo_branch();
+    let mut repo_dir = state.repo_dir();
+    let repo_attaching = state.repo_attaching();
+    let repo_attach_error = state.repo_attach_error();
     rsx! {
         form {
             class: "repo-attach",
