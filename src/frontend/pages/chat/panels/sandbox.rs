@@ -89,12 +89,14 @@ pub(in super::super) fn SandboxPanel(
                 div { key: "{pod.pod_id}", class: "sandbox-pod",
                     div { class: "sandbox-pod-header",
                         span { class: "sandbox-pod-status", "{pod.status}" }
-                        button {
-                            class: if pending_pod_stop() == Some(pod.pod_id) { "pod-stop confirm" } else { "pod-stop" },
-                            r#type: "button",
+                        super::TwoStepButton {
+                            armed: pending_pod_stop() == Some(pod.pod_id),
+                            class: "pod-stop",
+                            idle: "Stop sandbox",
+                            confirm: "Confirm stop?",
                             title: "Stop this pod. Its terminals and any files outside /workspace and mounted volumes are lost.",
-                            onclick: move |_| on_stop_pod.call(pod.pod_id),
-                            super::TwoStepLabel { armed: pending_pod_stop() == Some(pod.pod_id), idle: "Stop sandbox", confirm: "Confirm stop?" }
+                            on_arm: move |_| on_stop_pod.call(pod.pod_id),
+                            on_confirm: move |_| on_stop_pod.call(pod.pod_id),
                         }
                     }
                     if let Some(err) = pod_stop_error() {

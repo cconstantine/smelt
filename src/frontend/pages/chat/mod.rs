@@ -7,7 +7,7 @@ use dioxus::prelude::dioxus_core::Task;
 use dioxus::prelude::*;
 
 use super::server_error_message;
-use super::TwoStepLabel;
+use super::TwoStepButton;
 use super::ErrorText;
 
 use crate::anthropic::{ContentBlock, TokenUsage};

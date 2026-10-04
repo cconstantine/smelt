@@ -183,13 +183,13 @@ pub(super) fn ConversationSidebar(
                             if let Some(now) = now_utc() {
                                 span { class: "conversation-age", {short_age((now - conversation.updated_at).num_seconds())} }
                             }
-                            button {
-                                class: if pending_delete() == Some(conversation.id) { "delete-conversation confirm" } else { "delete-conversation" },
-                                onclick: move |evt: Event<MouseData>| {
-                                    evt.stop_propagation();
-                                    request_delete(conversation.id);
-                                },
-                                super::TwoStepLabel { armed: pending_delete() == Some(conversation.id), idle: "Delete", confirm: "Confirm?" }
+                            super::TwoStepButton {
+                                armed: pending_delete() == Some(conversation.id),
+                                class: "delete-conversation",
+                                idle: "Delete",
+                                confirm: "Confirm?",
+                                on_arm: move |_| request_delete(conversation.id),
+                                on_confirm: move |_| request_delete(conversation.id),
                             }
                         }
                     }
