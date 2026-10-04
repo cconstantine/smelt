@@ -21,6 +21,8 @@ pub(super) struct ConversationState {
     pub(super) load_error: Option<String>,
     /// The reply as it streams: `ReplyReset` starts it, `ReplyDelta` adds
     /// to it, and the reply being saved or the turn ending clears it.
+    /// Restored on (re)connect from `get_reply_in_progress`; every tab
+    /// watching the conversation shows it, whoever started the turn.
     pub(super) streaming_reply: Option<String>,
     /// Whether the server has a turn running (or queued) here, whoever
     /// started it (`ConversationEvent::TurnState`).
@@ -29,7 +31,8 @@ pub(super) struct ConversationState {
     /// "Working…" line (SME-41 D1).
     pub(super) turn_elapsed: u64,
     /// A background wake-up that failed to reach the model
-    /// (`ConversationEvent::NotificationDeliveryFailed`).
+    /// (`ConversationEvent::NotificationDeliveryFailed`). Kept apart from
+    /// the turn errors, which a send clears: this can arrive at any time.
     pub(super) notification_delivery_error: Option<String>,
     pub(super) todos: Vec<TodoItem>,
     /// The question this conversation waits on, for its card (SME-34).
@@ -55,8 +58,9 @@ pub(super) struct ConversationState {
     /// its bottom, so its output can follow along like `tail -f`.
     pub(super) terminal_body_els: HashMap<i64, MountedEvent>,
     pub(super) terminal_body_stuck: HashMap<i64, bool>,
-    /// Whether the model has a browsing session open, the page's URL, and
-    /// the latest frame (base64 JPEG).
+    /// Whether the model has a browsing session open (it shows the panel
+    /// and runs the frame subscription), the page's URL, and the latest
+    /// frame (base64 JPEG, `None` until the first one arrives).
     pub(super) browsing_session_open: bool,
     pub(super) browsing_url: Option<String>,
     pub(super) browsing_frame: Option<String>,
@@ -68,7 +72,7 @@ pub(super) struct ConversationState {
     pub(super) address_pending: bool,
     pub(super) address_error: Option<String>,
     /// `None` until the first `ContextUsageUpdate`/`get_context_usage`
-    /// pull (SME-18).
+    /// pull: a new conversation has no turn yet to report on (SME-18).
     pub(super) context_usage: Option<ContextUsageSnapshot>,
     /// The context bar's detail view, fetched when it opens.
     pub(super) context_detail: Option<ContextDetailSnapshot>,
@@ -76,8 +80,11 @@ pub(super) struct ConversationState {
     /// A snap to the bottom that a layout change asked for, waiting for the
     /// pointer to leave the transcript (SME-75).
     pub(super) layout_snap_pending: bool,
-    /// Set while this tab is live on the conversation: the id, and how many
-    /// times it has connected and pulled (SME-59's `data-live`).
+    /// Set while this tab is live on the conversation (subscribed, and done
+    /// with the pull that follows): the id, and how many times it has
+    /// connected and pulled, more than once meaning a reconnect. Shown as
+    /// `data-live`/`data-live-pulls`, which the browser tests wait for
+    /// (SME-59).
     pub(super) live: Option<(i64, u32)>,
 }
 
@@ -94,6 +101,121 @@ pub(super) fn change_sandbox_panel<R>(
     let result = change(&mut state.sandbox_pods().write(), &mut terminals);
     state.sandbox_terminals().set(terminals);
     result
+}
+
+/// What an event asks of the page beyond the open conversation's state,
+/// which `apply_event` has already updated: a counter for the sidebar or
+/// the model picker, a turn error (kept by conversation, outside the
+/// state), or the bundle being out of date.
+#[cfg(any(feature = "web", test))]
+#[derive(Debug, PartialEq)]
+pub(super) enum EventEffect {
+    None,
+    ConversationsChanged,
+    PodsChanged,
+    TurnsChanged,
+    QuestionsChanged,
+    /// The conversation's model or the providers changed: the model picker
+    /// refetches, and so does the context meter, which measures against
+    /// the model's window.
+    ModelChanged,
+    TurnError(String),
+    /// A type added since this page loaded: the server is newer than this
+    /// bundle.
+    StaleBundle,
+}
+
+/// Applies one live event from the open conversation's stream onto its
+/// state, and says what else it asks for.
+#[cfg(any(feature = "web", test))]
+pub(super) fn apply_event(state: Store<ConversationState>, event: ConversationEvent) -> EventEffect {
+    match event {
+        ConversationEvent::MessagesAppended { messages: rows } => {
+            // A saved reply replaces its streaming copy.
+            if rows.iter().any(|m| m.role == "assistant") {
+                state.streaming_reply().set(None);
+            }
+            accept_saved_messages(&mut state.messages().write(), rows);
+            return EventEffect::ConversationsChanged;
+        }
+        ConversationEvent::SandboxPodUpdate { pod_id, status, terminated } => {
+            change_sandbox_panel(state, |pods, terminals| {
+                apply_sandbox_pod_update(pods, terminals, pod_id, status, terminated)
+            });
+        }
+        ConversationEvent::SandboxPreviewUpdate { pod_id, previews } => {
+            apply_sandbox_preview_update(&mut state.sandbox_pods().write(), pod_id, previews);
+        }
+        ConversationEvent::SandboxTerminalUpdate { pod_id, terminal_id, status, terminated } => {
+            apply_sandbox_terminal_update(&mut state.sandbox_terminals().write(), pod_id, terminal_id, status, terminated);
+        }
+        ConversationEvent::SandboxCommandUpdate {
+            terminal_id,
+            command_id,
+            command,
+            status,
+            exit_code,
+            stream,
+            latest_output,
+            position,
+        } => {
+            apply_sandbox_command_update(
+                &mut state.sandbox_terminals().write(),
+                terminal_id,
+                command_id,
+                command,
+                status,
+                exit_code,
+                stream,
+                latest_output,
+                position,
+            );
+        }
+        ConversationEvent::NotificationDeliveryFailed { detail } => {
+            state.notification_delivery_error().set(Some(detail));
+        }
+        ConversationEvent::ContextUsageUpdate { usage, context_window } => {
+            state.context_usage().set(Some(ContextUsageSnapshot { usage: Some(usage), context_window }));
+        }
+        ConversationEvent::TodoListUpdate { items } => state.todos().set(items),
+        ConversationEvent::BrowsingSessionUpdate { open } => {
+            state.browsing_session_open().set(open);
+            if !open {
+                state.browsing_frame().set(None);
+                state.browsing_url().set(None);
+            }
+        }
+        ConversationEvent::BrowsingUrlUpdate { url } => state.browsing_url().set(Some(url)),
+        ConversationEvent::ReposUpdate { repos } => state.repos().set(repos),
+        ConversationEvent::QuestionUpdate { question } => state.pending_question().set(question),
+        ConversationEvent::TurnState { running } => {
+            state.turn_running().set(running);
+            if !running {
+                state.streaming_reply().set(None);
+            }
+        }
+        ConversationEvent::ReplyReset {} => state.streaming_reply().set(Some(String::new())),
+        ConversationEvent::ReplyDelta { text, offset } => {
+            apply_reply_delta(&mut state.streaming_reply().write(), offset, &text);
+        }
+        // A stop shows as its saved notice instead.
+        ConversationEvent::TurnError { message } if message != crate::api::chat::TURN_STOPPED => {
+            return EventEffect::TurnError(message);
+        }
+        ConversationEvent::TurnError { .. } => {}
+        ConversationEvent::PodsChanged {} => return EventEffect::PodsChanged,
+        ConversationEvent::TurnsChanged {} => return EventEffect::TurnsChanged,
+        ConversationEvent::QuestionsChanged {} => return EventEffect::QuestionsChanged,
+        ConversationEvent::ModelChanged {} | ConversationEvent::ProvidersChanged {} => {
+            return EventEffect::ModelChanged;
+        }
+        ConversationEvent::Unknown => return EventEffect::StaleBundle,
+        // Only the browser tier's server sends it, to a page that should
+        // take it for a type it doesn't know.
+        #[cfg(feature = "browser-test")]
+        ConversationEvent::BrowserTestAddedLater {} => return EventEffect::StaleBundle,
+    }
+    EventEffect::None
 }
 
 /// Appends every message in `incoming` whose id isn't already present in

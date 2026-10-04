@@ -44,7 +44,7 @@ use crate::browsing::BrowserInputEvent;
 use crate::api::sandbox::{
     SandboxCommandSummary, SandboxOutputLine, SandboxPodSummary, SandboxTerminalSummary,
 };
-#[cfg(feature = "web")]
+#[cfg(any(feature = "web", test))]
 use crate::events::ConversationEvent;
 use crate::questions::{PendingQuestion, QuestionAnswer, ASK_USER};
 use crate::api::questions::{answer_question, get_waiting_conversations};
@@ -168,27 +168,54 @@ fn ChatPanel(
     // The open conversation's state, reset as a whole on a switch.
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut state = use_store(ConversationState::default);
+    // Its fields, under the names the code below uses.
     let mut messages = state.messages();
     let mut load_error = state.load_error();
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut streaming_reply = state.streaming_reply();
+    #[cfg(feature = "web")]
+    let mut turn_running = state.turn_running();
+    #[cfg(feature = "web")]
+    let mut turn_elapsed = state.turn_elapsed();
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut todos = state.todos();
+    #[cfg(feature = "web")]
+    let mut pending_question = state.pending_question();
+    let mut repo_url = state.repo_url();
+    let mut repo_branch = state.repo_branch();
+    let mut repo_dir = state.repo_dir();
+    let mut repo_attaching = state.repo_attaching();
+    let mut repo_attach_error = state.repo_attach_error();
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut repos = state.repos();
+    let sandbox_pods = state.sandbox_pods();
+    let sandbox_terminals = state.sandbox_terminals();
+    let mut pending_pod_stop = state.pending_pod_stop();
+    let mut pod_stop_error = state.pod_stop_error();
+    let terminal_body_els = state.terminal_body_els();
+    let terminal_body_stuck = state.terminal_body_stuck();
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut browsing_session_open = state.browsing_session_open();
+    #[cfg(feature = "web")]
+    let mut browsing_url = state.browsing_url();
+    #[cfg(feature = "web")]
+    let mut browsing_frame = state.browsing_frame();
+    let address_draft = state.address_draft();
+    let mut address_editing = state.address_editing();
+    let mut address_pending = state.address_pending();
+    let mut address_error = state.address_error();
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut context_usage = state.context_usage();
+    let mut layout_snap_pending = state.layout_snap_pending();
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut live = state.live();
     // The server's own "not found", distinct from a failed load: the page
     // says so and offers no message box, instead of a send that can only
     // fail.
     let conversation_missing = move || load_error().as_deref() == Some("conversation not found");
-    // The open conversation's reply as it streams, from its event stream:
-    // `ReplyReset` starts it, `ReplyDelta` adds to it, and the reply being
-    // saved (`MessagesAppended`) or the turn ending clears it. Reset on a
-    // switch, and restored on (re)connect from `get_reply_in_progress`.
-    // Every tab watching the conversation shows it, whoever started the turn.
-    #[allow(unused_mut)]
-    let mut streaming_reply = state.streaming_reply();
     // The last turn error, by conversation (`TurnError`, or a send the
     // server refused).
     let mut stream_errors: Signal<HashMap<i64, String>> = use_signal(HashMap::new);
-    // Whether the server has a turn running (or queued) in the selected
-    // conversation, from `ConversationEvent::TurnState`: covers turns this
-    // tab didn't start (another tab, a finished command waking the model).
-    #[cfg(feature = "web")]
-    let mut turn_running = state.turn_running();
     // Bumped when the conversation's model or the providers change, so the
     // model picker refetches (SME-72).
     #[allow(unused_mut)]
@@ -196,11 +223,6 @@ fn ChatPanel(
     // Whether the conversation has a model to send to, from the picker:
     // Send waits for one (SME-72). True until the picker knows otherwise.
     let model_ready = use_signal(|| true);
-    // Seconds this tab has seen the current turn running, for the
-    // "Working…" line (SME-41 D1). Ticks once a second while a turn runs,
-    // and resets when it ends. Web only.
-    #[cfg(feature = "web")]
-    let mut turn_elapsed = state.turn_elapsed();
     #[cfg(feature = "web")]
     use_hook(move || {
         spawn(async move {
@@ -228,26 +250,8 @@ fn ChatPanel(
             }
         });
     };
-    // Set when a background wake-up (a terminal command finishing with no
-    // `send_message` call in flight) fails to actually reach the model —
-    // see `ConversationEvent::NotificationDeliveryFailed`. Separate from
-    // `stream_errors` since that one's reset at the start of every `send()`
-    // call; this can arrive at any time, not tied to a live send.
-    #[cfg(feature = "web")]
-    let mut notification_delivery_error = state.notification_delivery_error();
     let mut input = use_signal(String::new);
     let mut next_temp_id = use_signal(|| -1i64);
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut todos = state.todos();
-    // The question this conversation waits on, for its card (SME-34).
-    #[cfg(feature = "web")]
-    let mut pending_question = state.pending_question();
-    // "Work on a repo" in a new conversation.
-    let mut repo_url = state.repo_url();
-    let mut repo_branch = state.repo_branch();
-    let mut repo_dir = state.repo_dir();
-    let mut repo_attaching = state.repo_attaching();
-    let mut repo_attach_error = state.repo_attach_error();
     // Clones the repo typed into a new conversation's "Work on a repo".
     // Here, not in `RepoAttach`: the form goes as soon as the first message
     // shows, which would drop a clone request still in flight with its
@@ -279,16 +283,6 @@ fn ChatPanel(
             repo_attaching.set(false);
         });
     };
-    // The conversation's git repos (SME-32), from `ReposUpdate`.
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut repos = state.repos();
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut sandbox_pods = state.sandbox_pods();
-    // The panel's Stop button: the pod armed for stopping (click once to
-    // arm, again to confirm), and the last stop's error. The pod itself
-    // disappears through the usual `SandboxPodUpdate` event.
-    let mut pending_pod_stop = state.pending_pod_stop();
-    let mut pod_stop_error = state.pod_stop_error();
     // The sandbox panel's Stop button: click once to arm, again to stop.
     // Here, not in `SandboxPanel`: the panel unmounts once the pod is gone
     // and nothing else shows, which would drop the stop's task before it
@@ -312,35 +306,9 @@ fn ChatPanel(
             pending_pod_stop.set(Some(pod_id));
         }
     };
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut sandbox_terminals = state.sandbox_terminals();
-    // Whether the model currently has a browsing session open — drives
-    // both the panel's visibility and (via the separate effect below)
-    // the live frame subscription. Updated by the initial
-    // `get_browsing_state` pull and by `ConversationEvent::BrowsingSessionUpdate`.
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut browsing_session_open = state.browsing_session_open();
-    // The session page's current URL, from `get_browsing_state` and
-    // `ConversationEvent::BrowsingUrlUpdate`.
-    #[cfg(feature = "web")]
-    let mut browsing_url = state.browsing_url();
-    // Set while this tab is live on the conversation: subscribed to its
-    // events and done with the snapshot pull that follows. The id, and how
-    // many times this page has connected and pulled (more than one means a
-    // reconnect). Shown as `data-live`/`data-live-pulls` on the panel, which
-    // the browser tests wait for (SME-59).
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut live = state.live();
-    // The address bar's own state: what's typed, whether the viewer is
-    // typing (so incoming URL changes don't clobber it), an in-flight
-    // navigation, and the last navigation error.
-    let address_draft = state.address_draft();
-    let mut address_editing = state.address_editing();
     // The live frame's width as shown; it scales to fit the panel, and
     // clicks on it are scaled back up to the page's own pixels.
     let frame_shown_width = use_signal(|| FRAME_WIDTH);
-    let mut address_pending = state.address_pending();
-    let mut address_error = state.address_error();
     // Goes to the address typed in the browsing panel's address bar.
     // Spawned here, not in `BrowsingPanel`: the panel unmounts when the
     // session closes, which would drop a navigation still loading and
@@ -383,17 +351,8 @@ fn ChatPanel(
             }
         },
     );
-    // The latest live-panel frame (base64 JPEG), `None` until the first
-    // one arrives after subscribing.
-    #[cfg(feature = "web")]
-    let mut browsing_frame = state.browsing_frame();
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut tz_offset_minutes: Signal<i32> = use_signal(|| 0);
-    // `None` until the first `ContextUsageUpdate`/`get_context_usage` pull
-    // — a brand-new conversation has no turn yet to report usage for. See
-    // SME-18.
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut context_usage = state.context_usage();
     // The context bar, so closing its detail view can give it focus back.
     let context_bar_el: Signal<Option<MountedEvent>> = use_signal(|| None);
 
@@ -412,7 +371,6 @@ fn ChatPanel(
     // about to click. While it waits, the transcript is scrolled to keep
     // the element under the pointer where it was.
     let pointer_over_transcript = use_signal(|| false);
-    let mut layout_snap_pending = state.layout_snap_pending();
     // Bumped when an image in a reply finishes loading and grows it, a
     // layout change like a panel appearing (SME-30).
     let media_loaded: Signal<u64> = use_signal(|| 0);
@@ -422,11 +380,6 @@ fn ChatPanel(
     // connect-time pull sets the messages again) is not.
     let mut last_content: Signal<Option<(usize, Option<i64>, Option<usize>)>> = use_signal(|| None);
 
-    // Same idea, per sandbox terminal — each terminal's own
-    // `.task-terminal-body` scrolls independently, like `tail -f` on its own
-    // log, so each needs its own mounted handle and stuck flag.
-    let terminal_body_els = state.terminal_body_els();
-    let terminal_body_stuck = state.terminal_body_stuck();
 
     // Fetched once per page load (this effect reads no reactive signal, so
     // it never re-runs), not per message — timestamps are stored as
@@ -551,106 +504,20 @@ fn ChatPanel(
                         live.set(Some((id, pulls)));
 
                         loop {
-                            match events.recv().await {
-                                Some(Ok(ConversationEvent::MessagesAppended { messages: rows })) => {
-                                    *conversations_changed.write() += 1;
-                                    // A saved reply replaces its streaming copy.
-                                    if rows.iter().any(|m| m.role == "assistant") {
-                                        streaming_reply.set(None);
-                                    }
-                                    accept_saved_messages(&mut messages.write(), rows);
-                                }
-                                Some(Ok(ConversationEvent::SandboxPodUpdate {
-                                    pod_id,
-                                    status,
-                                    terminated,
-                                })) => {
-                                    change_sandbox_panel(state, |pods, terminals| {
-                                        apply_sandbox_pod_update(pods, terminals, pod_id, status, terminated)
-                                    });
-                                }
-                                Some(Ok(ConversationEvent::SandboxPreviewUpdate { pod_id, previews })) => {
-                                    apply_sandbox_preview_update(&mut sandbox_pods.write(), pod_id, previews);
-                                }
-                                Some(Ok(ConversationEvent::SandboxTerminalUpdate {
-                                    pod_id,
-                                    terminal_id,
-                                    status,
-                                    terminated,
-                                })) => {
-                                    apply_sandbox_terminal_update(
-                                        &mut sandbox_terminals.write(),
-                                        pod_id,
-                                        terminal_id,
-                                        status,
-                                        terminated,
-                                    );
-                                }
-                                Some(Ok(ConversationEvent::SandboxCommandUpdate {
-                                    terminal_id,
-                                    command_id,
-                                    command,
-                                    status,
-                                    exit_code,
-                                    stream,
-                                    latest_output,
-                                    position,
-                                })) => {
-                                    apply_sandbox_command_update(
-                                        &mut sandbox_terminals.write(),
-                                        terminal_id,
-                                        command_id,
-                                        command,
-                                        status,
-                                        exit_code,
-                                        stream,
-                                        latest_output,
-                                        position,
-                                    );
-                                }
-                                Some(Ok(ConversationEvent::NotificationDeliveryFailed {
-                                    detail,
-                                })) => {
-                                    notification_delivery_error.set(Some(detail));
-                                }
-                                Some(Ok(ConversationEvent::ContextUsageUpdate {
-                                    usage,
-                                    context_window,
-                                })) => {
-                                    context_usage.set(Some(ContextUsageSnapshot {
-                                        usage: Some(usage),
-                                        context_window,
-                                    }));
-                                }
-                                Some(Ok(ConversationEvent::TodoListUpdate { items })) => {
-                                    todos.set(items);
-                                }
-                                Some(Ok(ConversationEvent::BrowsingSessionUpdate { open })) => {
-                                    browsing_session_open.set(open);
-                                    if !open {
-                                        browsing_frame.set(None);
-                                        browsing_url.set(None);
-                                    }
-                                }
-                                Some(Ok(ConversationEvent::BrowsingUrlUpdate { url })) => {
-                                    browsing_url.set(Some(url));
-                                }
-                                Some(Ok(ConversationEvent::PodsChanged {})) => {
-                                    *pods_changed.write() += 1;
-                                }
-                                Some(Ok(ConversationEvent::TurnsChanged {})) => {
-                                    *turns_changed.write() += 1;
-                                }
-                                Some(Ok(ConversationEvent::QuestionUpdate { question })) => {
-                                    pending_question.set(question);
-                                }
-                                Some(Ok(ConversationEvent::QuestionsChanged {})) => {
-                                    *questions_changed.write() += 1;
-                                }
-                                Some(Ok(ConversationEvent::ModelChanged {} | ConversationEvent::ProvidersChanged {})) => {
+                            let event = match events.recv().await {
+                                Some(Ok(event)) => event,
+                                Some(Err(_)) | None => break,
+                            };
+                            match apply_event(state, event) {
+                                EventEffect::None => {}
+                                EventEffect::ConversationsChanged => *conversations_changed.write() += 1,
+                                EventEffect::PodsChanged => *pods_changed.write() += 1,
+                                EventEffect::TurnsChanged => *turns_changed.write() += 1,
+                                EventEffect::QuestionsChanged => *questions_changed.write() += 1,
+                                EventEffect::ModelChanged => {
                                     *model_changed.write() += 1;
-                                    // Another model can mean another context
-                                    // window: the meter measures against it.
+                                    // Another model can mean another context window: the
+                                    // meter measures against it.
                                     spawn(async move {
                                         if let Ok(snapshot) = get_context_usage(id).await
                                             && selected() == Some(id)
@@ -659,34 +526,10 @@ fn ChatPanel(
                                         }
                                     });
                                 }
-                                Some(Ok(ConversationEvent::TurnState { running })) => {
-                                    turn_running.set(running);
-                                    if !running {
-                                        streaming_reply.set(None);
-                                    }
-                                }
-                                Some(Ok(ConversationEvent::ReplyReset {})) => {
-                                    streaming_reply.set(Some(String::new()));
-                                }
-                                Some(Ok(ConversationEvent::ReplyDelta { text, offset })) => {
-                                    apply_reply_delta(&mut streaming_reply.write(), offset, &text);
-                                }
-                                // A stop shows as its saved notice instead.
-                                Some(Ok(ConversationEvent::TurnError { message }))
-                                    if message != crate::api::chat::TURN_STOPPED =>
-                                {
+                                EventEffect::TurnError(message) => {
                                     stream_errors.write().insert(id, message);
                                 }
-                                Some(Ok(ConversationEvent::TurnError { .. })) => {}
-                                Some(Ok(ConversationEvent::ReposUpdate { repos: list })) => {
-                                    repos.set(list);
-                                }
-                                // A type added since this page loaded: the
-                                // server is newer than this bundle.
-                                Some(Ok(ConversationEvent::Unknown)) => {
-                                    *crate::frontend::STALE_BUNDLE.write() = true;
-                                }
-                                Some(Err(_)) | None => break,
+                                EventEffect::StaleBundle => *crate::frontend::STALE_BUNDLE.write() = true,
                             }
                         }
                         live.set(None);
