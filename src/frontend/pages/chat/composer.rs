@@ -34,7 +34,11 @@ pub(super) fn Composer(
                 event.prevent_default();
                 on_send.call(());
             },
+            // The placeholder goes as soon as anything is typed; the label
+            // stays, for a screen reader (SME-58).
+            label { r#for: "message-box", class: "visually-hidden", "Message" }
             input {
+                id: "message-box",
                 r#type: "text",
                 value: "{input}",
                 disabled: is_streaming(),

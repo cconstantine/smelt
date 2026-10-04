@@ -775,6 +775,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "markdown_late_image", 90, Box::pin(scenario_markdown_late_image(&t))).await;
     run_scenario(&t, only, r, k, "markdown_long_reply", 90, Box::pin(scenario_markdown_long_reply(&t))).await;
     run_scenario(&t, only, r, k, "streaming_into_a_long_transcript", 120, Box::pin(scenario_streaming_into_a_long_transcript(&t))).await;
+    run_scenario(&t, only, r, k, "message_box_label", 30, Box::pin(scenario_message_box_label(&t))).await;
     run_scenario(&t, only, r, k, "conversation_rows_by_keyboard", 60, Box::pin(scenario_conversation_rows_by_keyboard(&t))).await;
 
     let mut failures: Vec<String> = results
@@ -2895,6 +2896,26 @@ async fn scenario_conversation_rows_by_keyboard(t: &Scenario<'_>) {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let url = url_now(&page).await;
     assert!(url.ends_with(&at(first.id)), "Enter on Delete should arm it, not open its row: at {url}");
+}
+
+/// SME-57 (d), from SME-58: the message box has a label, not only a
+/// placeholder, which disappears as soon as anything is typed.
+async fn scenario_message_box_label(t: &Scenario<'_>) {
+    let conversation = t.conversation().await;
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_element(&page, CHAT_INPUT, Duration::from_secs(10)).await;
+    let label: serde_json::Value = page
+        .evaluate(format!(
+            "(() => {{ const i = document.querySelector('{}'); \
+               return {{ labels: i.labels ? i.labels.length : 0, text: i.labels && i.labels[0] ? i.labels[0].textContent.trim() : null }}; }})()",
+            CHAT_INPUT.replace('\'', "\\'")
+        ))
+        .await
+        .expect("read the message box's label")
+        .into_value()
+        .expect("facts");
+    assert_eq!(label["labels"], 1, "the message box should have one label: {label}");
+    assert!(label["text"].as_str().is_some_and(|t| !t.is_empty()), "its label should say something: {label}");
 }
 
 /// A server that answers every request after `delay` with an SVG image of
