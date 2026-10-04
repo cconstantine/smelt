@@ -35,7 +35,7 @@ impl Message {
 }
 ```
 
-`Message::blocks()` parses the stored JSON back into `ContentBlock`s — callers (persistence in `db::create_message`, rendering in `frontend/pages/chat.rs`, history-building in `turn::history_for_request`) always go through `blocks()`/a `&[ContentBlock]` parameter rather than touching `content` as a string directly. A parse error is a real possibility (malformed content shouldn't happen but isn't structurally prevented) — every caller surfaces it rather than silently rendering blank, per `development-process.md`'s "surface fallback outcomes" rule.
+`Message::blocks()` parses the stored JSON back into `ContentBlock`s — callers (persistence in `db::create_message`, rendering in `frontend/pages/chat/transcript.rs`, history-building in `turn::history_for_request`) always go through `blocks()`/a `&[ContentBlock]` parameter rather than touching `content` as a string directly. A parse error is a real possibility (malformed content shouldn't happen but isn't structurally prevented) — every caller surfaces it rather than silently rendering blank, per `development-process.md`'s "surface fallback outcomes" rule.
 
 Two `ContentBlock` variants exist only for smelt's own bookkeeping, never sent or accepted by Anthropic itself — `CompactionSummary` and `CompactionPlaceholder` (auto-compaction's own output — see SME-18). `history_for_request` translates both into plain `Text` blocks before they're ever replayed to the real API; storage and rendering see the real variant.
 

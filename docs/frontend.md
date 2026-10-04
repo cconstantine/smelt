@@ -9,7 +9,21 @@ frontend/
   mod.rs               # App (router root), Route enum, a small wrapper component per route, NotFound
   pages/
     mod.rs             # TwoStepLabel
-    chat.rs            # Chat, ConversationSidebar, ChatPanel
+    chat/              # the chat page (SME-57)
+      mod.rs           # Chat, ChatPanel (its state, effects and event stream)
+      sidebar.rs       # ConversationSidebar
+      transcript.rs    # Transcript, render_block_element and the tool/diff/notice helpers
+      context.rs       # ContextUsage: the usage bar and its detail dialog
+      composer.rs      # Composer (the message box), EXAMPLE_ASKS
+      repo_attach.rs   # RepoAttach ("Work on a repo")
+      trust_card.rs    # TrustCards (AGENTS.md waiting for trust)
+      question_card.rs # QuestionCard (the model's `ask_user` question)
+      model_setup.rs   # ModelNotes (turn and notification errors)
+      state.rs         # the pure merges of loaded and live messages and sandbox entries
+      sticky.rs        # stick-to-bottom and pointer-hold scrolling helpers
+      streaming.rs     # format_elapsed (the working line)
+      panels/          # BrowsingPanel, TodoPanel, SandboxPanel
+      tests.rs         # the page's unit tests
     git.rs             # GitSettingsPage
     language_servers.rs # LanguageServersIndex, LanguageServerNew, LanguageServerEdit
     mcp_servers.rs     # McpServersIndex, McpServerNew, McpServerEdit
@@ -118,6 +132,8 @@ use_effect(move || {
 The `use_resource` + `use_effect`-into-a-plain-signal pairing (rather than reading the resource directly in the render body) is used deliberately: it gives a stable, independently-updatable `Signal<Vec<Message>>` that `send()`'s optimistic copy and the event stream can also push into, without fighting the resource's own lifecycle.
 
 **Showing an error:** pass a server function's error through `pages::server_error_message` (`src/frontend/pages/mod.rs`), never `e.to_string()` or `"{e}"`: `ServerFnError`'s `Display` wraps the server's message as "error running server function: … (details: None)" (SME-81). An error signal that a later action can succeed after is cleared on that success, as the sidebar's is.
+
+**A request lives in a component that outlives it.** Dioxus cancels a component's tasks when the component unmounts, so a request `spawn`ed in a conditionally rendered child is dropped if its own result, or anything else, hides that child before it finishes, and whatever it was going to clear or set stays as it was. Spawn such requests in the page component (`ChatPanel`) and pass them down as an `EventHandler` (`on_navigate`, `on_stop_pod`, `on_attach`). On SME-57's split, the browsing panel's address bar stayed disabled after its session closed mid-navigation, until the navigation moved back to `ChatPanel`.
 
 ## Streaming into the UI
 
