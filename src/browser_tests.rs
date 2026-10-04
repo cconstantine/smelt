@@ -775,6 +775,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "markdown_late_image", 90, Box::pin(scenario_markdown_late_image(&t))).await;
     run_scenario(&t, only, r, k, "markdown_long_reply", 90, Box::pin(scenario_markdown_long_reply(&t))).await;
     run_scenario(&t, only, r, k, "streaming_into_a_long_transcript", 120, Box::pin(scenario_streaming_into_a_long_transcript(&t))).await;
+    run_scenario(&t, only, r, k, "unreadable_message", 30, Box::pin(scenario_unreadable_message(&t))).await;
     run_scenario(&t, only, r, k, "chat_errors_are_alerts", 30, Box::pin(scenario_chat_errors_are_alerts(&t))).await;
     run_scenario(&t, only, r, k, "message_box_label", 30, Box::pin(scenario_message_box_label(&t))).await;
     run_scenario(&t, only, r, k, "conversation_rows_by_keyboard", 60, Box::pin(scenario_conversation_rows_by_keyboard(&t))).await;
@@ -2943,6 +2944,31 @@ async fn scenario_chat_errors_are_alerts(t: &Scenario<'_>) {
         assert_eq!(line["found"], true, "no .error line has {marker}: {line}");
         assert_eq!(line["role"], "alert", "the error line with {marker} should be an alert: {line}");
     }
+}
+
+/// SME-57 (d), from SME-58: a message that can't be read shows as an
+/// error, in the error colours, not as an ordinary bubble (its class,
+/// `message-error`, had no CSS rule).
+async fn scenario_unreadable_message(t: &Scenario<'_>) {
+    let conversation = t.conversation().await;
+    sqlx::query("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', 'not json')")
+        .bind(conversation.id)
+        .execute(t.pool)
+        .await
+        .expect("seed an unreadable message");
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_element(&page, ".message-error", Duration::from_secs(10)).await;
+    let colours: serde_json::Value = page
+        .evaluate(
+            "(() => { const probe = document.createElement('p'); probe.className = 'error'; document.body.appendChild(probe); \
+               const want = getComputedStyle(probe).color; probe.remove(); \
+               return { want, got: getComputedStyle(document.querySelector('.message-error')).color }; })()",
+        )
+        .await
+        .expect("read the colours")
+        .into_value()
+        .expect("colours");
+    assert_eq!(colours["got"], colours["want"], "an unreadable message should be in the error colour: {colours}");
 }
 
 /// A server that answers every request after `delay` with an SVG image of

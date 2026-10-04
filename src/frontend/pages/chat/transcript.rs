@@ -344,7 +344,7 @@ pub(super) fn render_block_element(
             let notice = system_notice(text, commands).unwrap_or_default();
             rsx! {
                 div { key: "{key}", class: "system-notice",
-                    span { class: "system-notice-text", "{notice}" }
+                    span { "{notice}" }
                     span { class: "timestamp", "{timestamp}" }
                 }
             }
