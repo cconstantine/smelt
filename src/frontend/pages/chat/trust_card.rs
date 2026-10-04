@@ -11,6 +11,19 @@ pub(super) fn TrustCards(
 ) -> Element {
     let repos = state.repos();
     let mut repo_action_error = state.repo_action_error();
+    // Trust or Don't trust the AGENTS.md the user was shown (its hash).
+    let mut decide = move |request_id: i64, shown_hash: String, trust: bool| {
+        let Some(id) = selected() else { return };
+        repo_action_error.set(None);
+        spawn(async move {
+            if let Err(e) = decide_repo_trust(id, request_id, shown_hash, trust).await
+                // Not if the user has moved on to another conversation.
+                && selected() == Some(id)
+            {
+                repo_action_error.set(Some(server_error_message(&e)));
+            }
+        });
+    };
     rsx! {
         // A repo's AGENTS.md waits for the user's trust before it
         // becomes instructions the model follows (SME-32).
@@ -35,19 +48,7 @@ pub(super) fn TrustCards(
                         onclick: {
                             let request_id = request.id;
                             let shown_hash = request.hash.clone();
-                            move |_| {
-                                let Some(id) = selected() else { return };
-                                let shown_hash = shown_hash.clone();
-                                repo_action_error.set(None);
-                                spawn(async move {
-                                    if let Err(e) = decide_repo_trust(id, request_id, shown_hash, true).await
-                                        // Not if the user has moved on to another conversation.
-                                        && selected() == Some(id)
-                                    {
-                                        repo_action_error.set(Some(server_error_message(&e)));
-                                    }
-                                });
-                            }
+                            move |_| decide(request_id, shown_hash.clone(), true)
                         },
                         "Trust"
                     }
@@ -57,19 +58,7 @@ pub(super) fn TrustCards(
                         onclick: {
                             let request_id = request.id;
                             let shown_hash = request.hash.clone();
-                            move |_| {
-                                let Some(id) = selected() else { return };
-                                let shown_hash = shown_hash.clone();
-                                repo_action_error.set(None);
-                                spawn(async move {
-                                    if let Err(e) = decide_repo_trust(id, request_id, shown_hash, false).await
-                                        // Not if the user has moved on to another conversation.
-                                        && selected() == Some(id)
-                                    {
-                                        repo_action_error.set(Some(server_error_message(&e)));
-                                    }
-                                });
-                            }
+                            move |_| decide(request_id, shown_hash.clone(), false)
                         },
                         "Don't trust"
                     }
