@@ -99,9 +99,7 @@ pub(in super::super) fn SandboxPanel(
                             on_confirm: move |_| on_stop_pod.call(pod.pod_id),
                         }
                     }
-                    if let Some(err) = pod_stop_error() {
-                        p { class: "error", "{err}" }
-                    }
+                    super::ErrorText { message: pod_stop_error() }
                     if !pod.previews.is_empty() {
                         div { class: "sandbox-previews",
                             for preview in pod.previews.clone() {

@@ -643,8 +643,8 @@ pub(super) fn Transcript(
                 p { class: "conversation-missing",
                     "This conversation doesn't exist. It may have been deleted."
                 }
-            } else if let Some(err) = load_error() {
-                p { class: "error", "Error loading messages: {err}" }
+            } else {
+                ErrorText { message: load_error().map(|err| format!("Error loading messages: {err}")) }
             }
             for message in messages() {
                 MessageView {

@@ -775,6 +775,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "markdown_late_image", 90, Box::pin(scenario_markdown_late_image(&t))).await;
     run_scenario(&t, only, r, k, "markdown_long_reply", 90, Box::pin(scenario_markdown_long_reply(&t))).await;
     run_scenario(&t, only, r, k, "streaming_into_a_long_transcript", 120, Box::pin(scenario_streaming_into_a_long_transcript(&t))).await;
+    run_scenario(&t, only, r, k, "chat_errors_are_alerts", 30, Box::pin(scenario_chat_errors_are_alerts(&t))).await;
     run_scenario(&t, only, r, k, "message_box_label", 30, Box::pin(scenario_message_box_label(&t))).await;
     run_scenario(&t, only, r, k, "conversation_rows_by_keyboard", 60, Box::pin(scenario_conversation_rows_by_keyboard(&t))).await;
 
@@ -2916,6 +2917,32 @@ async fn scenario_message_box_label(t: &Scenario<'_>) {
         .expect("facts");
     assert_eq!(label["labels"], 1, "the message box should have one label: {label}");
     assert!(label["text"].as_str().is_some_and(|t| !t.is_empty()), "its label should say something: {label}");
+}
+
+/// SME-57 (d), from SME-58: an error line on the chat page is announced:
+/// it uses `pages::ErrorText` (`role="alert"`) like the other pages, not a
+/// bare `p.error`.
+async fn scenario_chat_errors_are_alerts(t: &Scenario<'_>) {
+    use crate::events::{ConversationEvent, publish};
+    let conversation = t.conversation().await;
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    publish(conversation.id, ConversationEvent::NotificationDeliveryFailed { detail: "NOTICE-ALERT-MARKER".into() });
+    publish(conversation.id, ConversationEvent::TurnError { message: "TURN-ALERT-MARKER".into() });
+    for marker in ["NOTICE-ALERT-MARKER", "TURN-ALERT-MARKER"] {
+        assert!(wait_for_text(&page, marker, Duration::from_secs(10)).await, "{marker} never showed");
+        let line: serde_json::Value = page
+            .evaluate(format!(
+                "(() => {{ const e = [...document.querySelectorAll('.error')].find(e => e.innerText.includes('{marker}')); \
+                   return {{ found: !!e, role: e ? (e.getAttribute('role') || 'none') : 'none' }}; }})()"
+            ))
+            .await
+            .expect("read the error line's role")
+            .into_value()
+            .expect("facts");
+        assert_eq!(line["found"], true, "no .error line has {marker}: {line}");
+        assert_eq!(line["role"], "alert", "the error line with {marker} should be an alert: {line}");
+    }
 }
 
 /// A server that answers every request after `delay` with an SVG image of

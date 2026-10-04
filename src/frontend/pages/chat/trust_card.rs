@@ -65,8 +65,6 @@ pub(super) fn TrustCards(
                 }
             }
         }
-        if let Some(err) = repo_action_error() {
-            p { class: "error", "{err}" }
-        }
+        ErrorText { message: repo_action_error() }
     }
 }

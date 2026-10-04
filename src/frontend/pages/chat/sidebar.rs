@@ -155,12 +155,8 @@ pub(super) fn ConversationSidebar(
             Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
             Link { to: Route::GitRoute {}, class: "sandbox-volumes-link git-link", "Git" }
             Link { to: Route::LanguageServersRoute {}, class: "sandbox-volumes-link language-servers-link", "Language servers" }
-            if let Some(err) = list_error() {
-                p { class: "error", "{err}" }
-            }
-            if let Some(err) = action_error() {
-                p { class: "error", "{err}" }
-            }
+            super::ErrorText { message: list_error() }
+            super::ErrorText { message: action_error() }
             if !loaded() {
                 p { class: "muted", "Loading..." }
             } else if conversations().is_empty() {
