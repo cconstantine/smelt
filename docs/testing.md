@@ -235,7 +235,7 @@ Start from `scripts/ui-check/smelt_ui.py`: a `Tab` wrapper that starts and delet
 
 Then view the screenshot (the `Read` tool renders images directly). This is a plain Python script per check, not a fixed CLI (navigating to a conversation, clicking a sidebar entry, reading back `scrollTop`/`scrollHeight` via `page.eval_on_selector`, etc.).
 
-**Before/after comparisons serve each ref from its own check worktree** (`CHECK_WORKTREE=../smelt-check-main scripts/check-server start main`, and another for the branch), not one worktree stopped and restarted on the other ref: `dx` can hand the second run the first one's bundle. Reproduce any difference once before investigating it; a race in a mock (a notice landing mid-turn in one run and after it in the other) looks like a regression too. On SME-57 both happened, and each cost a rerun.
+**Before/after comparisons serve each ref from its own check worktree** (`CHECK_WORKTREE=../smelt-check-main scripts/check-server start main`, and another for the branch), not one worktree stopped and restarted on the other ref: `dx` can hand the second run the first one's bundle. Reproduce any difference once before investigating it; a race in a mock (a notice landing mid-turn in one run and after it in the other) looks like a regression too. On SME-57 both happened, and each cost a rerun. For a change to the page's state, the scripted session also switches conversation in the page and back (a sidebar click, not a reload, so the in-page reset runs), and the check server's log is searched for API errors on both refs (SME-57's PR (b)).
 
 ### `scripts/browser-check/` (fallback)
 
