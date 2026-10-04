@@ -135,16 +135,17 @@ pub(in super::super) fn coalesce_mouse_moves(batch: Vec<(i64, BrowserInputEvent)
 #[component]
 pub(in super::super) fn BrowsingPanel(
     selected: Memo<Option<i64>>,
-    browsing_url: Signal<Option<String>>,
-    browsing_frame: Signal<Option<String>>,
-    mut address_draft: Signal<String>,
-    mut address_editing: Signal<bool>,
-    address_pending: Signal<bool>,
-    mut address_error: Signal<Option<String>>,
+    state: Store<ConversationState>,
     mut frame_shown_width: Signal<f64>,
     browser_input: Coroutine<(i64, BrowserInputEvent)>,
     on_navigate: EventHandler<()>,
 ) -> Element {
+    let browsing_url = state.browsing_url();
+    let browsing_frame = state.browsing_frame();
+    let mut address_draft = state.address_draft();
+    let mut address_editing = state.address_editing();
+    let address_pending = state.address_pending();
+    let mut address_error = state.address_error();
     rsx! {
         aside { class: "browsing-panel",
             h3 { "Live Browser" }

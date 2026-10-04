@@ -15,13 +15,14 @@ pub(super) const EXAMPLE_ASKS: [&str; 3] = [
 /// `pending_question` changes the box's placeholder.
 #[component]
 pub(super) fn Composer(
+    state: Store<ConversationState>,
     mut input: Signal<String>,
-    turn_running: Signal<bool>,
     model_ready: Signal<bool>,
-    pending_question: Signal<Option<PendingQuestion>>,
     on_send: EventHandler<()>,
     on_stop: EventHandler<MouseEvent>,
 ) -> Element {
+    let turn_running = state.turn_running();
+    let pending_question = state.pending_question();
     // The message box waits while the model works in this conversation,
     // whoever started the turn; Stop is offered instead.
     let is_streaming = move || turn_running();

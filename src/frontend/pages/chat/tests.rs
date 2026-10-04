@@ -1224,3 +1224,126 @@ fn test_apply_sandbox_command_update_for_unknown_terminal_is_a_no_op() {
     );
     assert!(terminals.is_empty());
 }
+
+/// A conversation switch replaces the open conversation's state with
+/// `ConversationState::default()` (SME-57), so every field has to start
+/// empty, or the switch would carry it into the next conversation
+/// (SME-51 B11). The pattern names every field: a new one doesn't compile
+/// here until it's checked too.
+#[test]
+fn test_conversation_state_starts_empty() {
+    let ConversationState {
+        messages,
+        load_error,
+        streaming_reply,
+        turn_running,
+        turn_elapsed,
+        notification_delivery_error,
+        todos,
+        pending_question,
+        repo_url,
+        repo_branch,
+        repo_dir,
+        repo_attaching,
+        repo_attach_error,
+        repo_action_error,
+        repos,
+        sandbox_pods,
+        sandbox_terminals,
+        pending_pod_stop,
+        pod_stop_error,
+        terminal_body_els,
+        terminal_body_stuck,
+        browsing_session_open,
+        browsing_url,
+        browsing_frame,
+        address_draft,
+        address_editing,
+        address_pending,
+        address_error,
+        context_usage,
+        context_detail,
+        context_detail_open,
+        layout_snap_pending,
+        live,
+    } = ConversationState::default();
+    assert!(messages.is_empty(), "messages");
+    assert!(load_error.is_none(), "load_error");
+    assert!(streaming_reply.is_none(), "streaming_reply");
+    assert!(!turn_running, "turn_running");
+    assert_eq!(turn_elapsed, 0, "turn_elapsed");
+    assert!(notification_delivery_error.is_none(), "notification_delivery_error");
+    assert!(todos.is_empty(), "todos");
+    assert!(pending_question.is_none(), "pending_question");
+    assert!(repo_url.is_empty(), "repo_url");
+    assert!(repo_branch.is_empty(), "repo_branch");
+    assert!(repo_dir.is_empty(), "repo_dir");
+    assert!(!repo_attaching, "repo_attaching");
+    assert!(repo_attach_error.is_none(), "repo_attach_error");
+    assert!(repo_action_error.is_none(), "repo_action_error");
+    assert!(repos.is_empty(), "repos");
+    assert!(sandbox_pods.is_empty(), "sandbox_pods");
+    assert!(sandbox_terminals.is_empty(), "sandbox_terminals");
+    assert!(pending_pod_stop.is_none(), "pending_pod_stop");
+    assert!(pod_stop_error.is_none(), "pod_stop_error");
+    assert!(terminal_body_els.is_empty(), "terminal_body_els");
+    assert!(terminal_body_stuck.is_empty(), "terminal_body_stuck");
+    assert!(!browsing_session_open, "browsing_session_open");
+    assert!(browsing_url.is_none(), "browsing_url");
+    assert!(browsing_frame.is_none(), "browsing_frame");
+    assert!(address_draft.is_empty(), "address_draft");
+    assert!(!address_editing, "address_editing");
+    assert!(!address_pending, "address_pending");
+    assert!(address_error.is_none(), "address_error");
+    assert!(context_usage.is_none(), "context_usage");
+    assert!(context_detail.is_none(), "context_detail");
+    assert!(!context_detail_open, "context_detail_open");
+    assert!(!layout_snap_pending, "layout_snap_pending");
+    assert!(live.is_none(), "live");
+}
+
+/// Runs `f` with a fresh `ConversationState` store. A store, like a signal,
+/// needs an owner, so it's created inside a `VirtualDom`'s root scope.
+fn with_state(f: impl FnOnce(Store<ConversationState>)) {
+    fn app() -> Element {
+        rsx! {}
+    }
+    let mut dom = VirtualDom::new(app);
+    dom.rebuild_in_place();
+    dom.in_scope(ScopeId::APP, || f(Store::new(ConversationState::default())));
+}
+
+/// The pods and terminals are two fields of one store, which lends out one
+/// write at a time: changing both at once has to go through
+/// `change_sandbox_panel` (a reconnect's snapshot, a pod going away).
+#[test]
+fn test_change_sandbox_panel_changes_the_pods_and_terminals_together() {
+    with_state(|state| {
+        state.sandbox_terminals().set(vec![SandboxTerminalPanelEntry {
+            terminal_id: 9,
+            pod_id: 1,
+            status: "open".to_string(),
+            commands: Vec::new(),
+        }]);
+        let snapshot = SandboxSnapshot {
+            pods: vec![SandboxPodSummary {
+                pod_id: 2,
+                status: "Running".to_string(),
+                terminals: vec![SandboxTerminalSummary {
+                    terminal_id: 20,
+                    pod_id: 2,
+                    status: "open".to_string(),
+                    commands: Vec::new(),
+                }],
+                previews: Vec::new(),
+            }],
+        };
+        change_sandbox_panel(state, |pods, terminals| merge_sandbox_snapshot(pods, terminals, snapshot));
+        assert_eq!(state.sandbox_pods().peek().iter().map(|p| p.pod_id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(
+            state.sandbox_terminals().peek().iter().map(|t| (t.terminal_id, t.pod_id)).collect::<Vec<_>>(),
+            vec![(20, 2)],
+            "the snapshot's terminals replace the old ones, and stay in the store"
+        );
+    });
+}

@@ -165,8 +165,11 @@ fn ChatPanel(
         }
     });
 
-    let mut messages: Signal<Vec<Message>> = use_signal(Vec::new);
-    let mut load_error: Signal<Option<String>> = use_signal(|| None);
+    // The open conversation's state, reset as a whole on a switch.
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut state = use_store(ConversationState::default);
+    let mut messages = state.messages();
+    let mut load_error = state.load_error();
     // The server's own "not found", distinct from a failed load: the page
     // says so and offers no message box, instead of a send that can only
     // fail.
@@ -177,15 +180,15 @@ fn ChatPanel(
     // switch, and restored on (re)connect from `get_reply_in_progress`.
     // Every tab watching the conversation shows it, whoever started the turn.
     #[allow(unused_mut)]
-    let mut streaming_reply: Signal<Option<String>> = use_signal(|| None);
+    let mut streaming_reply = state.streaming_reply();
     // The last turn error, by conversation (`TurnError`, or a send the
     // server refused).
     let mut stream_errors: Signal<HashMap<i64, String>> = use_signal(HashMap::new);
     // Whether the server has a turn running (or queued) in the selected
     // conversation, from `ConversationEvent::TurnState`: covers turns this
     // tab didn't start (another tab, a finished command waking the model).
-    #[allow(unused_mut)]
-    let mut turn_running = use_signal(|| false);
+    #[cfg(feature = "web")]
+    let mut turn_running = state.turn_running();
     // Bumped when the conversation's model or the providers change, so the
     // model picker refetches (SME-72).
     #[allow(unused_mut)]
@@ -196,8 +199,8 @@ fn ChatPanel(
     // Seconds this tab has seen the current turn running, for the
     // "Working…" line (SME-41 D1). Ticks once a second while a turn runs,
     // and resets when it ends. Web only.
-    #[allow(unused_mut)]
-    let mut turn_elapsed = use_signal(|| 0u64);
+    #[cfg(feature = "web")]
+    let mut turn_elapsed = state.turn_elapsed();
     #[cfg(feature = "web")]
     use_hook(move || {
         spawn(async move {
@@ -230,25 +233,21 @@ fn ChatPanel(
     // see `ConversationEvent::NotificationDeliveryFailed`. Separate from
     // `stream_errors` since that one's reset at the start of every `send()`
     // call; this can arrive at any time, not tied to a live send.
-    //
-    // `mut` is only exercised by the `web`-only live-subscription loop and
-    // timezone effect below (`.set()`/`.write()`); a `server`-only build
-    // never mutates these, so `allow(unused_mut)` there.
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut notification_delivery_error: Signal<Option<String>> = use_signal(|| None);
+    #[cfg(feature = "web")]
+    let mut notification_delivery_error = state.notification_delivery_error();
     let mut input = use_signal(String::new);
     let mut next_temp_id = use_signal(|| -1i64);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut todos: Signal<Vec<TodoItem>> = use_signal(Vec::new);
+    let mut todos = state.todos();
     // The question this conversation waits on, for its card (SME-34).
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut pending_question: Signal<Option<PendingQuestion>> = use_signal(|| None);
+    #[cfg(feature = "web")]
+    let mut pending_question = state.pending_question();
     // "Work on a repo" in a new conversation.
-    let mut repo_url = use_signal(String::new);
-    let mut repo_branch = use_signal(String::new);
-    let mut repo_dir = use_signal(String::new);
-    let mut repo_attaching = use_signal(|| false);
-    let mut repo_attach_error: Signal<Option<String>> = use_signal(|| None);
+    let mut repo_url = state.repo_url();
+    let mut repo_branch = state.repo_branch();
+    let mut repo_dir = state.repo_dir();
+    let mut repo_attaching = state.repo_attaching();
+    let mut repo_attach_error = state.repo_attach_error();
     // Clones the repo typed into a new conversation's "Work on a repo".
     // Here, not in `RepoAttach`: the form goes as soon as the first message
     // shows, which would drop a clone request still in flight with its
@@ -280,19 +279,16 @@ fn ChatPanel(
             repo_attaching.set(false);
         });
     };
-    // The last Trust / Don't trust / Reload failure.
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut repo_action_error: Signal<Option<String>> = use_signal(|| None);
     // The conversation's git repos (SME-32), from `ReposUpdate`.
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut repos: Signal<Vec<RepoSummary>> = use_signal(Vec::new);
+    let mut repos = state.repos();
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut sandbox_pods: Signal<Vec<SandboxPodPanelEntry>> = use_signal(Vec::new);
+    let mut sandbox_pods = state.sandbox_pods();
     // The panel's Stop button: the pod armed for stopping (click once to
     // arm, again to confirm), and the last stop's error. The pod itself
     // disappears through the usual `SandboxPodUpdate` event.
-    let mut pending_pod_stop: Signal<Option<i64>> = use_signal(|| None);
-    let mut pod_stop_error: Signal<Option<String>> = use_signal(|| None);
+    let mut pending_pod_stop = state.pending_pod_stop();
+    let mut pod_stop_error = state.pod_stop_error();
     // The sandbox panel's Stop button: click once to arm, again to stop.
     // Here, not in `SandboxPanel`: the panel unmounts once the pod is gone
     // and nothing else shows, which would drop the stop's task before it
@@ -317,35 +313,34 @@ fn ChatPanel(
         }
     };
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut sandbox_terminals: Signal<Vec<SandboxTerminalPanelEntry>> = use_signal(Vec::new);
+    let mut sandbox_terminals = state.sandbox_terminals();
     // Whether the model currently has a browsing session open — drives
     // both the panel's visibility and (via the separate effect below)
     // the live frame subscription. Updated by the initial
     // `get_browsing_state` pull and by `ConversationEvent::BrowsingSessionUpdate`.
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut browsing_session_open: Signal<bool> = use_signal(|| false);
+    let mut browsing_session_open = state.browsing_session_open();
     // The session page's current URL, from `get_browsing_state` and
     // `ConversationEvent::BrowsingUrlUpdate`.
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut browsing_url: Signal<Option<String>> = use_signal(|| None);
+    #[cfg(feature = "web")]
+    let mut browsing_url = state.browsing_url();
     // Set while this tab is live on the conversation: subscribed to its
     // events and done with the snapshot pull that follows. The id, and how
     // many times this page has connected and pulled (more than one means a
     // reconnect). Shown as `data-live`/`data-live-pulls` on the panel, which
     // the browser tests wait for (SME-59).
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut live: Signal<Option<(i64, u32)>> = use_signal(|| None);
+    let mut live = state.live();
     // The address bar's own state: what's typed, whether the viewer is
     // typing (so incoming URL changes don't clobber it), an in-flight
     // navigation, and the last navigation error.
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut address_draft = use_signal(String::new);
-    let mut address_editing = use_signal(|| false);
+    let address_draft = state.address_draft();
+    let mut address_editing = state.address_editing();
     // The live frame's width as shown; it scales to fit the panel, and
     // clicks on it are scaled back up to the page's own pixels.
     let frame_shown_width = use_signal(|| FRAME_WIDTH);
-    let mut address_pending = use_signal(|| false);
-    let mut address_error: Signal<Option<String>> = use_signal(|| None);
+    let mut address_pending = state.address_pending();
+    let mut address_error = state.address_error();
     // Goes to the address typed in the browsing panel's address bar.
     // Spawned here, not in `BrowsingPanel`: the panel unmounts when the
     // session closes, which would drop a navigation still loading and
@@ -390,21 +385,15 @@ fn ChatPanel(
     );
     // The latest live-panel frame (base64 JPEG), `None` until the first
     // one arrives after subscribing.
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut browsing_frame: Signal<Option<String>> = use_signal(|| None);
+    #[cfg(feature = "web")]
+    let mut browsing_frame = state.browsing_frame();
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut tz_offset_minutes: Signal<i32> = use_signal(|| 0);
     // `None` until the first `ContextUsageUpdate`/`get_context_usage` pull
     // — a brand-new conversation has no turn yet to report usage for. See
     // SME-18.
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut context_usage: Signal<Option<ContextUsageSnapshot>> = use_signal(|| None);
-    // The click-through detail view: closed by default, fetched on demand
-    // (not kept live) the moment it's opened — see `open_context_detail`.
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut context_detail: Signal<Option<ContextDetailSnapshot>> = use_signal(|| None);
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut context_detail_open = use_signal(|| false);
+    let mut context_usage = state.context_usage();
     // The context bar, so closing its detail view can give it focus back.
     let context_bar_el: Signal<Option<MountedEvent>> = use_signal(|| None);
 
@@ -423,7 +412,7 @@ fn ChatPanel(
     // about to click. While it waits, the transcript is scrolled to keep
     // the element under the pointer where it was.
     let pointer_over_transcript = use_signal(|| false);
-    let mut layout_snap_pending = use_signal(|| false);
+    let mut layout_snap_pending = state.layout_snap_pending();
     // Bumped when an image in a reply finishes loading and grows it, a
     // layout change like a panel appearing (SME-30).
     let media_loaded: Signal<u64> = use_signal(|| 0);
@@ -436,10 +425,8 @@ fn ChatPanel(
     // Same idea, per sandbox terminal — each terminal's own
     // `.task-terminal-body` scrolls independently, like `tail -f` on its own
     // log, so each needs its own mounted handle and stuck flag.
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut terminal_body_els: Signal<HashMap<i64, MountedEvent>> = use_signal(HashMap::new);
-    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
-    let mut terminal_body_stuck: Signal<HashMap<i64, bool>> = use_signal(HashMap::new);
+    let terminal_body_els = state.terminal_body_els();
+    let terminal_body_stuck = state.terminal_body_stuck();
 
     // Fetched once per page load (this effect reads no reactive signal, so
     // it never re-runs), not per message — timestamps are stored as
@@ -497,41 +484,10 @@ fn ChatPanel(
             }
             live.set(None);
             let Some(id) = selected() else { return };
-            todos.set(Vec::new());
-            repos.set(Vec::new());
-            // "Work on a repo" and the trust cards belong to the conversation
-            // they were used in (SME-32 code review 8).
-            repo_url.set(String::new());
-            repo_branch.set(String::new());
-            repo_dir.set(String::new());
-            repo_attaching.set(false);
-            repo_attach_error.set(None);
-            repo_action_error.set(None);
-            layout_snap_pending.set(false);
-            sandbox_pods.set(Vec::new());
-            sandbox_terminals.set(Vec::new());
-            terminal_body_els.write().clear();
-            terminal_body_stuck.write().clear();
-            browsing_session_open.set(false);
-            browsing_frame.set(None);
-            browsing_url.set(None);
-            address_editing.set(false);
-            address_error.set(None);
-            notification_delivery_error.set(None);
-            turn_running.set(false);
-            streaming_reply.set(None);
-            context_usage.set(None);
-            // The rest of what belonged to the conversation left (SME-51 B11).
-            messages.set(Vec::new());
-            load_error.set(None);
-            turn_elapsed.set(0);
-            pending_pod_stop.set(None);
-            pod_stop_error.set(None);
-            context_detail.set(None);
-            context_detail_open.set(false);
-            pending_question.set(None);
-            address_pending.set(false);
-            address_draft.set(String::new());
+            // Nothing of the conversation left behind shows in this one:
+            // its messages, panels, forms and errors (SME-32 code review 8,
+            // SME-51 B11) go in one reset.
+            state.set(ConversationState::default());
 
             let handle = spawn(async move {
                 let mut pulls = 0u32;
@@ -559,11 +515,9 @@ fn ChatPanel(
                             accept_saved_messages(&mut messages.write(), list);
                         }
                         if let Ok(snapshot) = get_sandbox_state(id).await {
-                            merge_sandbox_snapshot(
-                                &mut sandbox_pods.write(),
-                                &mut sandbox_terminals.write(),
-                                snapshot,
-                            );
+                            change_sandbox_panel(state, |pods, terminals| {
+                                merge_sandbox_snapshot(pods, terminals, snapshot)
+                            });
                         }
                         if let Ok(snapshot) = get_context_usage(id).await {
                             context_usage.set(Some(snapshot));
@@ -611,13 +565,9 @@ fn ChatPanel(
                                     status,
                                     terminated,
                                 })) => {
-                                    apply_sandbox_pod_update(
-                                        &mut sandbox_pods.write(),
-                                        &mut sandbox_terminals.write(),
-                                        pod_id,
-                                        status,
-                                        terminated,
-                                    );
+                                    change_sandbox_panel(state, |pods, terminals| {
+                                        apply_sandbox_pod_update(pods, terminals, pod_id, status, terminated)
+                                    });
                                 }
                                 Some(Ok(ConversationEvent::SandboxPreviewUpdate { pod_id, previews })) => {
                                     apply_sandbox_preview_update(&mut sandbox_pods.write(), pod_id, previews);
@@ -947,30 +897,19 @@ fn ChatPanel(
                             if browsing_session_open() {
                                 BrowsingPanel {
                                     selected,
-                                    browsing_url,
-                                    browsing_frame,
-                                    address_draft,
-                                    address_editing,
-                                    address_pending,
-                                    address_error,
+                                    state,
                                     frame_shown_width,
                                     browser_input,
                                     on_navigate: move |_| navigate_address(),
                                 }
                             }
                             if !todos().is_empty() {
-                                TodoPanel { todos }
+                                TodoPanel { state }
                             }
                             if !sandbox_pods().is_empty() || !repos().is_empty() {
                                 SandboxPanel {
                                     selected,
-                                    repos,
-                                    sandbox_pods,
-                                    sandbox_terminals,
-                                    pending_pod_stop,
-                                    pod_stop_error,
-                                    terminal_body_els,
-                                    terminal_body_stuck,
+                                    state,
                                     on_stop_pod: move |pod_id| request_pod_stop(pod_id),
                                 }
                             }
@@ -979,36 +918,20 @@ fn ChatPanel(
                     div { class: "chat-main",
                         ContextUsage {
                             selected,
-                            context_usage,
-                            context_detail,
-                            context_detail_open,
+                            state,
                             context_bar_el,
                         }
                         Transcript {
                             selected,
-                            messages,
-                            load_error,
+                            state,
                             initial_messages,
-                            turn_running,
-                            turn_elapsed,
-                            streaming_reply,
                             tz_offset_minutes,
                             input,
-                            repo_url,
-                            repo_branch,
-                            repo_dir,
-                            repo_attaching,
-                            repo_attach_error,
                             on_attach: move |_| attach_repo_now(),
                             stream_errors,
-                            notification_delivery_error,
-                            repos,
-                            repo_action_error,
-                            pending_question,
                             messages_el,
                             messages_stuck_to_bottom,
                             pointer_over_transcript,
-                            layout_snap_pending,
                             media_loaded,
                         }
                         if !conversation_missing() {
@@ -1016,10 +939,9 @@ fn ChatPanel(
                             super::ModelPicker { key: "{id}", conversation_id: id, refresh: model_changed, ready: model_ready }
                         }
                         Composer {
+                            state,
                             input,
-                            turn_running,
                             model_ready,
-                            pending_question,
                             on_send: move |_| send(),
                             on_stop: stop,
                         }

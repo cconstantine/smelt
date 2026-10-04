@@ -8,9 +8,10 @@ use super::*;
 #[component]
 pub(super) fn ModelNotes(
     selected: Memo<Option<i64>>,
+    state: Store<ConversationState>,
     stream_errors: Signal<HashMap<i64, String>>,
-    notification_delivery_error: Signal<Option<String>>,
 ) -> Element {
+    let notification_delivery_error = state.notification_delivery_error();
     let stream_error = move || selected().and_then(|id| stream_errors.read().get(&id).cloned());
     rsx! {
         if let Some(err) = stream_error() {

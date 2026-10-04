@@ -255,11 +255,12 @@ mod context_usage_tests {
 #[component]
 pub(super) fn ContextUsage(
     selected: Memo<Option<i64>>,
-    context_usage: Signal<Option<ContextUsageSnapshot>>,
-    mut context_detail: Signal<Option<ContextDetailSnapshot>>,
-    mut context_detail_open: Signal<bool>,
+    state: Store<ConversationState>,
     mut context_bar_el: Signal<Option<MountedEvent>>,
 ) -> Element {
+    let context_usage = state.context_usage();
+    let mut context_detail = state.context_detail();
+    let mut context_detail_open = state.context_detail_open();
     // Closes the detail view from inside it (its ×, Escape, a click
     // outside) and puts focus back on the bar that opened it.
     let mut close_context_detail = move || {

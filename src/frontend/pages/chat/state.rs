@@ -1,6 +1,100 @@
-//! The chat page's pure merges: loaded and live messages, the streaming reply, and the sandbox panel's entries.
+//! The chat page's per-conversation state, and the pure merges onto it:
+//! loaded and live messages, the streaming reply, and the sandbox panel's
+//! entries.
 
 use super::*;
+
+/// Everything the chat panel shows that belongs to the open conversation.
+/// Switching conversations replaces it with `ConversationState::default()`
+/// in one write, so nothing from the conversation left behind can show in
+/// the next one (SME-51 B11; SME-57). Each component reads only the fields
+/// it shows, through the store's field lenses, so a write to one field
+/// (a streamed delta, say) re-renders only what reads that field.
+///
+/// What isn't here outlives a switch on purpose: the message box's draft,
+/// the turn errors (kept by conversation), the model picker's state, the
+/// time zone, and the transcript's own scroll bookkeeping.
+#[derive(Store, Default)]
+pub(super) struct ConversationState {
+    pub(super) messages: Vec<Message>,
+    /// The load's error; "conversation not found" means it was deleted.
+    pub(super) load_error: Option<String>,
+    /// The reply as it streams: `ReplyReset` starts it, `ReplyDelta` adds
+    /// to it, and the reply being saved or the turn ending clears it.
+    pub(super) streaming_reply: Option<String>,
+    /// Whether the server has a turn running (or queued) here, whoever
+    /// started it (`ConversationEvent::TurnState`).
+    pub(super) turn_running: bool,
+    /// Seconds this tab has seen the current turn running, for the
+    /// "Working…" line (SME-41 D1).
+    pub(super) turn_elapsed: u64,
+    /// A background wake-up that failed to reach the model
+    /// (`ConversationEvent::NotificationDeliveryFailed`).
+    pub(super) notification_delivery_error: Option<String>,
+    pub(super) todos: Vec<TodoItem>,
+    /// The question this conversation waits on, for its card (SME-34).
+    pub(super) pending_question: Option<PendingQuestion>,
+    /// "Work on a repo" in a new conversation: the form, a clone in flight,
+    /// and its error.
+    pub(super) repo_url: String,
+    pub(super) repo_branch: String,
+    pub(super) repo_dir: String,
+    pub(super) repo_attaching: bool,
+    pub(super) repo_attach_error: Option<String>,
+    /// The last Trust / Don't trust / Reload failure.
+    pub(super) repo_action_error: Option<String>,
+    /// The conversation's git repos (SME-32), from `ReposUpdate`.
+    pub(super) repos: Vec<RepoSummary>,
+    pub(super) sandbox_pods: Vec<SandboxPodPanelEntry>,
+    pub(super) sandbox_terminals: Vec<SandboxTerminalPanelEntry>,
+    /// The sandbox panel's Stop button: the pod armed for stopping (click
+    /// once to arm, again to confirm), and the last stop's error.
+    pub(super) pending_pod_stop: Option<i64>,
+    pub(super) pod_stop_error: Option<String>,
+    /// Each sandbox terminal's mounted body and whether it's scrolled to
+    /// its bottom, so its output can follow along like `tail -f`.
+    pub(super) terminal_body_els: HashMap<i64, MountedEvent>,
+    pub(super) terminal_body_stuck: HashMap<i64, bool>,
+    /// Whether the model has a browsing session open, the page's URL, and
+    /// the latest frame (base64 JPEG).
+    pub(super) browsing_session_open: bool,
+    pub(super) browsing_url: Option<String>,
+    pub(super) browsing_frame: Option<String>,
+    /// The address bar: what's typed, whether the viewer is typing (so an
+    /// incoming URL doesn't clobber it), a navigation in flight, and the
+    /// last navigation's error.
+    pub(super) address_draft: String,
+    pub(super) address_editing: bool,
+    pub(super) address_pending: bool,
+    pub(super) address_error: Option<String>,
+    /// `None` until the first `ContextUsageUpdate`/`get_context_usage`
+    /// pull (SME-18).
+    pub(super) context_usage: Option<ContextUsageSnapshot>,
+    /// The context bar's detail view, fetched when it opens.
+    pub(super) context_detail: Option<ContextDetailSnapshot>,
+    pub(super) context_detail_open: bool,
+    /// A snap to the bottom that a layout change asked for, waiting for the
+    /// pointer to leave the transcript (SME-75).
+    pub(super) layout_snap_pending: bool,
+    /// Set while this tab is live on the conversation: the id, and how many
+    /// times it has connected and pulled (SME-59's `data-live`).
+    pub(super) live: Option<(i64, u32)>,
+}
+
+/// Runs `change` on the sandbox panel's pods and terminals together. They're
+/// two fields of one store, and the store lends out one write at a time
+/// (a second, while the first is held, panics), so the terminals are taken
+/// out while the pods are borrowed and put back after.
+#[cfg(any(feature = "web", test))]
+pub(super) fn change_sandbox_panel<R>(
+    state: Store<ConversationState>,
+    change: impl FnOnce(&mut Vec<SandboxPodPanelEntry>, &mut Vec<SandboxTerminalPanelEntry>) -> R,
+) -> R {
+    let mut terminals = std::mem::take(&mut *state.sandbox_terminals().write());
+    let result = change(&mut state.sandbox_pods().write(), &mut terminals);
+    state.sandbox_terminals().set(terminals);
+    result
+}
 
 /// Appends every message in `incoming` whose id isn't already present in
 /// `existing` — the same row can legitimately arrive twice (once via

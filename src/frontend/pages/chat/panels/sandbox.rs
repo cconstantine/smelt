@@ -44,15 +44,16 @@ pub(in super::super) fn repo_detail(repo: &RepoSummary) -> String {
 #[component]
 pub(in super::super) fn SandboxPanel(
     selected: Memo<Option<i64>>,
-    repos: Signal<Vec<RepoSummary>>,
-    sandbox_pods: Signal<Vec<SandboxPodPanelEntry>>,
-    sandbox_terminals: Signal<Vec<SandboxTerminalPanelEntry>>,
-    pending_pod_stop: Signal<Option<i64>>,
-    pod_stop_error: Signal<Option<String>>,
-    mut terminal_body_els: Signal<HashMap<i64, MountedEvent>>,
-    mut terminal_body_stuck: Signal<HashMap<i64, bool>>,
+    state: Store<ConversationState>,
     on_stop_pod: EventHandler<i64>,
 ) -> Element {
+    let repos = state.repos();
+    let sandbox_pods = state.sandbox_pods();
+    let sandbox_terminals = state.sandbox_terminals();
+    let pending_pod_stop = state.pending_pod_stop();
+    let pod_stop_error = state.pod_stop_error();
+    let mut terminal_body_els = state.terminal_body_els();
+    let mut terminal_body_stuck = state.terminal_body_stuck();
     rsx! {
         aside { class: "sandbox-panel",
             h3 { "Sandbox" }

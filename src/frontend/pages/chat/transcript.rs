@@ -538,31 +538,24 @@ pub(super) fn render_block_element(
 #[component]
 pub(super) fn Transcript(
     selected: Memo<Option<i64>>,
-    messages: Signal<Vec<Message>>,
-    load_error: Signal<Option<String>>,
+    state: Store<ConversationState>,
     initial_messages: Resource<Option<Result<Vec<Message>, ServerFnError>>>,
-    turn_running: Signal<bool>,
-    turn_elapsed: Signal<u64>,
-    streaming_reply: Signal<Option<String>>,
     tz_offset_minutes: Signal<i32>,
     mut input: Signal<String>,
-    repo_url: Signal<String>,
-    repo_branch: Signal<String>,
-    repo_dir: Signal<String>,
-    repo_attaching: Signal<bool>,
-    repo_attach_error: Signal<Option<String>>,
     on_attach: EventHandler<()>,
     stream_errors: Signal<HashMap<i64, String>>,
-    notification_delivery_error: Signal<Option<String>>,
-    repos: Signal<Vec<RepoSummary>>,
-    repo_action_error: Signal<Option<String>>,
-    pending_question: Signal<Option<PendingQuestion>>,
     mut messages_el: Signal<Option<MountedEvent>>,
     mut messages_stuck_to_bottom: Signal<bool>,
     mut pointer_over_transcript: Signal<bool>,
-    mut layout_snap_pending: Signal<bool>,
     mut media_loaded: Signal<u64>,
 ) -> Element {
+    let messages = state.messages();
+    let load_error = state.load_error();
+    let turn_running = state.turn_running();
+    let turn_elapsed = state.turn_elapsed();
+    let streaming_reply = state.streaming_reply();
+    let pending_question = state.pending_question();
+    let mut layout_snap_pending = state.layout_snap_pending();
     // An image in a reply loaded: a layout change for the sticky scroll.
     let on_media_load = use_callback(move |()| *media_loaded.write() += 1);
     let conversation_missing = move || load_error().as_deref() == Some("conversation not found");
@@ -660,11 +653,7 @@ pub(super) fn Transcript(
                     h2 { "What should smelt work on?" }
                     p { "It works in a sandbox of its own: it writes and runs code, uses a terminal, reads the web, and shows you each step." }
                     RepoAttach {
-                        repo_url,
-                        repo_branch,
-                        repo_dir,
-                        repo_attaching,
-                        repo_attach_error,
+                        state,
                         on_attach,
                     }
                     div { class: "example-asks",
@@ -690,8 +679,8 @@ pub(super) fn Transcript(
                     span { "Working… {format_elapsed(turn_elapsed())}" }
                 }
             }
-            ModelNotes { selected, stream_errors, notification_delivery_error }
-            TrustCards { selected, repos, repo_action_error }
+            ModelNotes { selected, state, stream_errors }
+            TrustCards { selected, state }
             // The model's question, waiting on the user (SME-34).
             if let (Some(id), Some(question)) = (selected(), pending_question()) {
                 QuestionCard { key: "{question.tool_use_id}", conversation_id: id, question }
