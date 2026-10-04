@@ -331,6 +331,8 @@ Lessons from writing these:
 
 **A piped `cargo test` invocation can look hung when it's actually finished.** If a test spawns a long-lived child process (a shared browser, kept running by design rather than torn down per-test), that child inherits and can hold open any stdio the parent process didn't explicitly close or redirect — `chromiumoxide` only pipes `chrome-headless-shell`'s stderr, not its stdout, so the browser keeps the test binary's own stdout fd alive for as long as it runs. Piping `cargo test`'s output through another command that waits for real EOF (`| tail`, `| grep`, ...) then blocks forever, even after `cargo test` itself (and the Rust test process) have already cleanly exited — not a code bug, a shell-pipeline artifact. Redirect to a real file (`> output.log 2>&1`) instead when a test launches anything long-lived; a file read doesn't block waiting for every writer to close.
 
+**A performance scenario measures a baseline on the old code first,** and asserts a ratio rather than an absolute time: the script time Chrome reports in its page metrics for a small case against a large one (SME-57's PR (c)). An absolute limit passes or fails with the machine and the cluster's load. `scripts/browser-tier` hides a passing test's prints; set `RUST_TEST_NOCAPTURE=1` to see the numbers a scenario logs.
+
 ## What's not covered yet
 
 - **The automated browser tier covers what its scenarios list, not every page.** It's not a general framework other features are expected to plug into; add a scenario when a change needs real-DOM verification that should keep running. `webfetch.rs`'s separate test covers real navigation, SSRF-guard behavior, and the browsing-session tools (below).

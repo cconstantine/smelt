@@ -52,8 +52,6 @@ pub(in super::super) fn SandboxPanel(
     let sandbox_terminals = state.sandbox_terminals();
     let pending_pod_stop = state.pending_pod_stop();
     let pod_stop_error = state.pod_stop_error();
-    let mut terminal_body_els = state.terminal_body_els();
-    let mut terminal_body_stuck = state.terminal_body_stuck();
     rsx! {
         aside { class: "sandbox-panel",
             h3 { "Sandbox" }
@@ -131,60 +129,61 @@ pub(in super::super) fn SandboxPanel(
                                     span { class: "task-terminal-id", "terminal {terminal.terminal_id}" }
                                     span { class: "task-terminal-status", "{terminal.status}" }
                                 }
-                                div {
-                                    class: "task-terminal-body",
-                                    onmounted: {
-                                        let terminal_id = terminal.terminal_id;
-                                        move |evt| {
-                                            terminal_body_els.write().insert(terminal_id, evt);
-                                        }
-                                    },
-                                    onscroll: {
-                                        let terminal_id = terminal.terminal_id;
-                                        move |evt: Event<ScrollData>| {
-                                            let d = evt.data();
-                                            terminal_body_stuck
-                                                .write()
-                                                .insert(
-                                                    terminal_id,
-                                                    is_scrolled_to_bottom(
-                                                        d.scroll_top(),
-                                                        d.scroll_height() as f64,
-                                                        d.client_height() as f64,
-                                                    ),
-                                                );
-                                        }
-                                    },
-                                    if terminal.commands.is_empty() {
-                                        span { class: "task-terminal-empty", "no commands yet" }
-                                    }
-                                    for (ci , command) in terminal.commands.iter().enumerate() {
-                                        div { key: "{command.command_id}", class: "sandbox-command-block",
-                                            div { class: "sandbox-command-header",
-                                                code { "{command.command}" }
-                                                span { class: "sandbox-command-status",
-                                                    if let Some(code) = command.exit_code {
-                                                        "{command.status} ({code})"
-                                                    } else {
-                                                        "{command.status}"
-                                                    }
-                                                }
-                                            }
-                                            for (i , line) in command.output.iter().enumerate() {
-                                                div {
-                                                    key: "line-{i}",
-                                                    class: if line.stream == "stderr" { "task-terminal-line task-terminal-line-stderr" } else { "task-terminal-line" },
-                                                    "{line.data}"
-                                                }
-                                            }
-                                            if ci == terminal.commands.len() - 1 && command.status == "running" {
-                                                span { class: "task-terminal-cursor" }
-                                            }
-                                        }
-                                    }
-                                }
+                                TerminalBody { terminal }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One terminal's output, following its bottom as it grows unless the user
+/// scrolled up to read (see `StickyBottom`). Keyed by the terminal, so its
+/// scroll state goes with it.
+#[component]
+fn TerminalBody(terminal: SandboxTerminalPanelEntry) -> Element {
+    let scroll = use_sticky_bottom();
+    // What makes the body taller: a new command, or a new line.
+    let size: usize = terminal.commands.iter().map(|c| 1 + c.output.len()).sum();
+    use_effect(use_reactive!(|size| {
+        let _ = size;
+        if scroll.is_stuck()
+            && let Some(el) = scroll.el()
+        {
+            spawn(scroll_to_bottom(el));
+        }
+    }));
+    rsx! {
+        div {
+            class: "task-terminal-body",
+            onmounted: move |evt| scroll.mounted(evt),
+            onscroll: move |evt: Event<ScrollData>| scroll.scrolled(&evt.data()),
+            if terminal.commands.is_empty() {
+                span { class: "task-terminal-empty", "no commands yet" }
+            }
+            for (ci , command) in terminal.commands.iter().enumerate() {
+                div { key: "{command.command_id}", class: "sandbox-command-block",
+                    div { class: "sandbox-command-header",
+                        code { "{command.command}" }
+                        span { class: "sandbox-command-status",
+                            if let Some(code) = command.exit_code {
+                                "{command.status} ({code})"
+                            } else {
+                                "{command.status}"
+                            }
+                        }
+                    }
+                    for (i , line) in command.output.iter().enumerate() {
+                        div {
+                            key: "line-{i}",
+                            class: if line.stream == "stderr" { "task-terminal-line task-terminal-line-stderr" } else { "task-terminal-line" },
+                            "{line.data}"
+                        }
+                    }
+                    if ci == terminal.commands.len() - 1 && command.status == "running" {
+                        span { class: "task-terminal-cursor" }
                     }
                 }
             }

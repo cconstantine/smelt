@@ -61,10 +61,6 @@ pub(super) struct ConversationState {
     /// once to arm, again to confirm), and the last stop's error.
     pub(super) pending_pod_stop: Option<i64>,
     pub(super) pod_stop_error: Option<String>,
-    /// Each sandbox terminal's mounted body and whether it's scrolled to
-    /// its bottom, so its output can follow along like `tail -f`.
-    pub(super) terminal_body_els: HashMap<i64, MountedEvent>,
-    pub(super) terminal_body_stuck: HashMap<i64, bool>,
     /// Whether the model has a browsing session open (it shows the panel
     /// and runs the frame subscription), the page's URL, and the latest
     /// frame (base64 JPEG, `None` until the first one arrives).

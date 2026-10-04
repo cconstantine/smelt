@@ -774,6 +774,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "markdown_streaming", 60, Box::pin(scenario_markdown_streaming(&t))).await;
     run_scenario(&t, only, r, k, "markdown_late_image", 90, Box::pin(scenario_markdown_late_image(&t))).await;
     run_scenario(&t, only, r, k, "markdown_long_reply", 90, Box::pin(scenario_markdown_long_reply(&t))).await;
+    run_scenario(&t, only, r, k, "streaming_into_a_long_transcript", 120, Box::pin(scenario_streaming_into_a_long_transcript(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -2727,6 +2728,118 @@ async fn scenario_markdown_long_reply(t: &Scenario<'_>) {
         .expect("a number");
     assert_eq!(blocks, 10, "every closed block should be highlighted");
     assert!(lag < Duration::from_secs(3), "the page fell {lag:?} behind a long streamed reply");
+}
+
+/// Streams a 100-delta reply into `conversation` (open in `page`, live)
+/// with a turn running, then lets the working line tick twice. Returns how
+/// long after the last delta its end showed, and the page's main-thread
+/// script time over the whole stream, in seconds.
+async fn stream_and_measure(page: &chromiumoxide::Page, conversation: i64, marker: &str) -> (Duration, f64) {
+    use crate::events::{ConversationEvent, publish};
+    use chromiumoxide::cdp::browser_protocol::performance::{EnableParams, Metric};
+    page.execute(EnableParams::default()).await.expect("enable performance metrics");
+    let script_seconds =
+        |metrics: Vec<Metric>| metrics.iter().find(|m| m.name == "ScriptDuration").map(|m| m.value).unwrap_or(0.0);
+    let before = script_seconds(page.metrics().await.expect("read metrics"));
+    publish(conversation, ConversationEvent::TurnState { running: true });
+    publish(conversation, ConversationEvent::ReplyReset {});
+    let reply: String = (0..100).map(|i| format!("word{i} ")).collect::<String>() + marker;
+    let chunk = reply.len().div_ceil(100);
+    let mut offset = 0;
+    let mut sent_last = tokio::time::Instant::now();
+    while offset < reply.len() {
+        let end = (offset + chunk).min(reply.len());
+        publish(conversation, ConversationEvent::ReplyDelta { text: reply[offset..end].to_string(), offset });
+        offset = end;
+        sent_last = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(wait_for_text(page, marker, Duration::from_secs(60)).await, "the end of the streamed reply never showed");
+    let lag = sent_last.elapsed();
+    // The working line ticks once a second.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let script = script_seconds(page.metrics().await.expect("read metrics")) - before;
+    publish(conversation, ConversationEvent::TurnState { running: false });
+    (lag, script)
+}
+
+/// SME-57 (c): streaming a reply into a long conversation costs what the
+/// reply costs, not what the conversation does. The same 100-delta reply
+/// (and the working line's ticks) streams into a one-message conversation
+/// and into one with 300 messages (markdown replies with code, tool rows);
+/// the page's script time for the long one stays within 3x the short one's,
+/// and the messages already shown keep their DOM nodes untouched. Before,
+/// every delta and every tick re-rendered and re-parsed the whole
+/// transcript, so the long one cost many times more (the page still kept
+/// up: the cost is CPU, not lag).
+async fn scenario_streaming_into_a_long_transcript(t: &Scenario<'_>) {
+    let short = t.conversation().await;
+    seed_user_message(t.pool, short.id, "One question.").await;
+    let page = t.tab(t.url(&format!("conversation/{}", short.id))).await;
+    wait_for_live_client(&page, short.id).await;
+    let (short_lag, short_script) = stream_and_measure(&page, short.id, "SHORT-END-MARKER").await;
+
+    let long = t.conversation().await;
+    for i in 0..100 {
+        seed_user_message(t.pool, long.id, &format!("Question {i}: what does part {i} do?")).await;
+        let reply = format!(
+            "### Part {i}\n\nIt **doubles** `x`. {}\n\n```rust\nfn part_{i}() -> u32 {{\n    let x = {i};\n    x * 2\n}}\n```\n",
+            "Some words about it. ".repeat(20)
+        );
+        db::create_message(t.pool, long.id, "assistant", &[
+            anthropic::ContentBlock::Text { text: reply },
+            anthropic::ContentBlock::ToolUse {
+                id: format!("toolu_long_{i}"),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": format!("/workspace/part_{i}.rs")}),
+            },
+        ])
+        .await
+        .expect("seed a reply");
+        db::create_message(t.pool, long.id, "user", &[anthropic::ContentBlock::ToolResult {
+            tool_use_id: format!("toolu_long_{i}"),
+            content: format!("fn part_{i}() {{}}"),
+            is_error: None,
+        }])
+        .await
+        .expect("seed a tool result");
+    }
+    let page = t.tab(t.url(&format!("conversation/{}", long.id))).await;
+    wait_for_live_client(&page, long.id).await;
+    assert!(
+        wait_for_count(&page, ".messages .message-assistant", 100, Duration::from_secs(30)).await,
+        "the long conversation never showed"
+    );
+    // Tag the first reply's node and count every change under it.
+    page.evaluate(
+        "(() => { const m = document.querySelector('.messages .message-assistant'); m.__smeltTag = 'first'; \
+          window.__smeltMutations = 0; \
+          new MutationObserver(r => { window.__smeltMutations += r.length; }) \
+            .observe(m, { subtree: true, childList: true, characterData: true, attributes: true }); })()",
+    )
+    .await
+    .expect("tag the first reply");
+    let (long_lag, long_script) = stream_and_measure(&page, long.id, "LONG-END-MARKER").await;
+    let first: serde_json::Value = page
+        .evaluate(
+            "(() => ({ same: document.querySelector('.messages .message-assistant')?.__smeltTag === 'first', \
+                       mutations: window.__smeltMutations }))()",
+        )
+        .await
+        .expect("read the first reply")
+        .into_value()
+        .expect("facts");
+    println!(
+        "browser tier: streaming_into_a_long_transcript: script {short_script:.2} s short, {long_script:.2} s long \
+         ({:.1}x); end shown {short_lag:?} / {long_lag:?} after the last delta; first reply {first}",
+        long_script / short_script.max(0.001)
+    );
+    assert_eq!(first["same"], true, "the first reply's node was replaced: {first}");
+    assert_eq!(first["mutations"], 0, "the first reply changed while another streamed: {first}");
+    assert!(
+        long_script <= 3.0 * short_script.max(0.05),
+        "streaming into 300 messages took {long_script:.2} s of script, against {short_script:.2} s into one"
+    );
 }
 
 /// A server that answers every request after `delay` with an SVG image of

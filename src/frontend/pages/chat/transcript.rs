@@ -531,6 +531,37 @@ pub(super) fn render_block_element(
     }
 }
 
+/// One message's blocks. Keyed by the message's id in the transcript, and
+/// re-rendered only when its own message or one of the conversation's tool
+/// maps changes: a streamed delta, a tick, or another message arriving
+/// leaves it alone (SME-57).
+#[component]
+pub(super) fn MessageView(
+    message: Message,
+    tz_offset_minutes: i32,
+    tool_names: Memo<HashMap<String, String>>,
+    tool_results: Memo<HashMap<String, (String, bool)>>,
+    commands: Memo<HashMap<String, String>>,
+    on_media_load: EventHandler<()>,
+) -> Element {
+    match message.blocks() {
+        Ok(blocks) => {
+            let thinking_open = reply_is_only_thinking(&message.role, &blocks);
+            let tool_names = tool_names.read();
+            let tool_results = tool_results.read();
+            let commands = commands.read();
+            rsx! {
+                for (i , block) in blocks.iter().enumerate() {
+                    {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes, block, &tool_names, &tool_results, &commands, thinking_open, on_media_load)}
+                }
+            }
+        }
+        Err(e) => rsx! {
+            div { class: "message message-{message.role} message-error", "Error rendering message: {e}" }
+        },
+    }
+}
+
 /// The transcript: the conversation's messages, a new conversation's
 /// first steps, the reply as it streams, the working line, errors, trust
 /// cards and the model's waiting question. Scrolling it keeps the panel's stick-to-bottom and
@@ -544,30 +575,27 @@ pub(super) fn Transcript(
     mut input: Signal<String>,
     on_attach: EventHandler<()>,
     stream_errors: Signal<HashMap<i64, String>>,
-    mut messages_el: Signal<Option<MountedEvent>>,
-    mut messages_stuck_to_bottom: Signal<bool>,
+    scroll: StickyBottom,
     mut pointer_over_transcript: Signal<bool>,
     mut media_loaded: Signal<u64>,
 ) -> Element {
     let messages = state.messages();
     let load_error = state.load_error();
     let turn_running = state.turn_running();
-    let turn_elapsed = state.turn_elapsed();
-    let streaming_reply = state.streaming_reply();
     let pending_question = state.pending_question();
     let mut layout_snap_pending = state.layout_snap_pending();
     // An image in a reply loaded: a layout change for the sticky scroll.
     let on_media_load = use_callback(move |()| *media_loaded.write() += 1);
     let conversation_missing = move || load_error().as_deref() == Some("conversation not found");
-    let streaming_text = move || streaming_reply().filter(|text| !text.is_empty());
-    let tool_names = tool_use_names_by_id(&messages());
-    let tool_results = tool_results_by_id(&messages());
-    let commands = terminal_commands_by_id(&messages());
+    // Worked out once per change to the messages, not on every render.
+    let tool_names = use_memo(move || tool_use_names_by_id(&messages.read()));
+    let tool_results = use_memo(move || tool_results_by_id(&messages.read()));
+    let commands = use_memo(move || terminal_commands_by_id(&messages.read()));
     rsx! {
         div {
             class: "messages",
             onmounted: move |evt| {
-                messages_el.set(Some(evt));
+                scroll.mounted(evt);
                 spawn(async move {
                     let _ = document::eval(TRANSCRIPT_ANCHOR_SETUP).await;
                 });
@@ -584,8 +612,8 @@ pub(super) fn Transcript(
                 pointer_over_transcript.set(false);
                 if *layout_snap_pending.peek() {
                     layout_snap_pending.set(false);
-                    if *messages_stuck_to_bottom.peek()
-                        && let Some(el) = messages_el.peek().clone()
+                    if scroll.is_stuck()
+                        && let Some(el) = scroll.el_untracked()
                     {
                         spawn(scroll_to_bottom(el));
                     }
@@ -609,15 +637,7 @@ pub(super) fn Transcript(
                 if *layout_snap_pending.peek() {
                     return;
                 }
-                let d = evt.data();
-                messages_stuck_to_bottom
-                    .set(
-                        is_scrolled_to_bottom(
-                            d.scroll_top(),
-                            d.scroll_height() as f64,
-                            d.client_height() as f64,
-                        ),
-                    );
+                scroll.scrolled(&evt.data());
             },
             if conversation_missing() {
                 p { class: "conversation-missing",
@@ -627,22 +647,14 @@ pub(super) fn Transcript(
                 p { class: "error", "Error loading messages: {err}" }
             }
             for message in messages() {
-                match message.blocks() {
-                    Ok(blocks) => {
-                        let thinking_open = reply_is_only_thinking(&message.role, &blocks);
-                        rsx! {
-                            for (i , block) in blocks.iter().enumerate() {
-                                {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes(), block, &tool_names, &tool_results, &commands, thinking_open, on_media_load)}
-                            }
-                        }
-                    },
-                    Err(e) => rsx! {
-                        div {
-                            key: "{message.id}",
-                            class: "message message-{message.role} message-error",
-                            "Error rendering message: {e}"
-                        }
-                    },
+                MessageView {
+                    key: "{message.id}",
+                    message,
+                    tz_offset_minutes: tz_offset_minutes(),
+                    tool_names,
+                    tool_results,
+                    commands,
+                    on_media_load,
                 }
             }
             // A new conversation says what smelt does and offers a
@@ -668,16 +680,9 @@ pub(super) fn Transcript(
                     }
                 }
             }
-            if let Some(reply) = streaming_text() {
-                div { class: "message message-assistant message-streaming",
-                    Markdown { source: reply, on_media_load }
-                }
-            }
+            StreamingReply { state, on_media_load }
             if turn_running() {
-                div { class: "turn-working", role: "status",
-                    span { class: "turn-working-dot" }
-                    span { "Working… {format_elapsed(turn_elapsed())}" }
-                }
+                WorkingLine { state }
             }
             ModelNotes { selected, state, stream_errors }
             TrustCards { selected, state }

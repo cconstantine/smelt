@@ -1,4 +1,5 @@
-//! Keeping a scrolled view stuck to its bottom, and the transcript's text under the pointer still (SME-75).
+//! Keeping a scrolled view stuck to its bottom (`use_sticky_bottom`), and
+//! the transcript's text under the pointer still (SME-75).
 
 use super::*;
 
@@ -17,6 +18,60 @@ pub(super) const SCROLL_BOTTOM_SLACK_PX: f64 = 32.0;
 /// does).
 pub(super) fn is_scrolled_to_bottom(scroll_top: f64, scroll_height: f64, client_height: f64) -> bool {
     scroll_height - scroll_top - client_height <= SCROLL_BOTTOM_SLACK_PX
+}
+
+/// A scrolled element that follows its content's bottom while the user is
+/// at it, like `tail -f`, and leaves them be once they scroll up to read
+/// (SME-83). The transcript and each sandbox terminal hold one
+/// (`use_sticky_bottom`). The transcript also holds the text under the
+/// pointer still through a layout change (SME-75); that part is its own,
+/// below, since the terminals have no use for it.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct StickyBottom {
+    el: Signal<Option<MountedEvent>>,
+    stuck: Signal<bool>,
+}
+
+/// A `StickyBottom` that starts stuck, so new content shows.
+pub(super) fn use_sticky_bottom() -> StickyBottom {
+    StickyBottom { el: use_signal(|| None), stuck: use_signal(|| true) }
+}
+
+impl StickyBottom {
+    /// For the element's `onmounted`.
+    pub(super) fn mounted(mut self, evt: MountedEvent) {
+        self.el.set(Some(evt));
+    }
+
+    /// For the element's `onscroll`: whether the user is still at the
+    /// bottom.
+    pub(super) fn scrolled(mut self, data: &ScrollData) {
+        self.stuck
+            .set(is_scrolled_to_bottom(data.scroll_top(), data.scroll_height() as f64, data.client_height() as f64));
+    }
+
+    /// Back to following the bottom, as when a conversation opens.
+    pub(super) fn stick(mut self) {
+        self.stuck.set(true);
+    }
+
+    /// Whether the user is following the bottom. Read without subscribing:
+    /// a scroll sets it on every event, and an effect that reran on each one
+    /// pulled a small scroll up back down (SME-83).
+    pub(super) fn is_stuck(self) -> bool {
+        *self.stuck.peek()
+    }
+
+    /// The element once mounted. Subscribes, so an effect that waits for it
+    /// reruns when it mounts.
+    pub(super) fn el(self) -> Option<MountedEvent> {
+        self.el.read().clone()
+    }
+
+    /// The element once mounted, without subscribing.
+    pub(super) fn el_untracked(self) -> Option<MountedEvent> {
+        self.el.peek().clone()
+    }
 }
 
 /// Installed on the transcript once it mounts: remembers the element under
