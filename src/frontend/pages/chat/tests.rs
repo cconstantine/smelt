@@ -1233,6 +1233,7 @@ fn test_apply_sandbox_command_update_for_unknown_terminal_is_a_no_op() {
 #[test]
 fn test_conversation_state_starts_empty() {
     let ConversationState {
+        conversation,
         messages,
         load_error,
         streaming_reply,
@@ -1267,6 +1268,7 @@ fn test_conversation_state_starts_empty() {
         layout_snap_pending,
         live,
     } = ConversationState::default();
+    assert!(conversation.is_none(), "conversation");
     assert!(messages.is_empty(), "messages");
     assert!(load_error.is_none(), "load_error");
     assert!(streaming_reply.is_none(), "streaming_reply");

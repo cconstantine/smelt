@@ -16,6 +16,12 @@ use super::*;
 /// time zone, and the transcript's own scroll bookkeeping.
 #[derive(Store, Default)]
 pub(super) struct ConversationState {
+    /// The conversation this state is about, set by the switch's reset.
+    /// An effect that acts on a field for `selected` checks it first: on a
+    /// switch, effects rerun in no set order, and one can run before the
+    /// reset, while the fields still hold the previous conversation's.
+    #[cfg_attr(not(feature = "web"), allow(dead_code))]
+    pub(super) conversation: Option<i64>,
     pub(super) messages: Vec<Message>,
     /// The load's error; "conversation not found" means it was deleted.
     pub(super) load_error: Option<String>,

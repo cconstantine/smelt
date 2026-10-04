@@ -440,7 +440,7 @@ fn ChatPanel(
             // Nothing of the conversation left behind shows in this one:
             // its messages, panels, forms and errors (SME-32 code review 8,
             // SME-51 B11) go in one reset.
-            state.set(ConversationState::default());
+            state.set(ConversationState { conversation: Some(id), ..ConversationState::default() });
 
             let handle = spawn(async move {
                 let mut pulls = 0u32;
@@ -562,7 +562,9 @@ fn ChatPanel(
                 task.cancel();
             }
             let Some(id) = selected() else { return };
-            if !browsing_session_open() {
+            // Not on the previous conversation's session: this can run on a
+            // switch before the reset does.
+            if *state.conversation().read() != Some(id) || !browsing_session_open() {
                 return;
             }
             let handle = spawn(async move {
