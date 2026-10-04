@@ -2847,9 +2847,12 @@ async fn scenario_streaming_into_a_long_transcript(t: &Scenario<'_>) {
 }
 
 /// SME-57 (d), from SME-58: a conversation in the sidebar opens from the
-/// keyboard. Each row is a tab stop that Enter or Space opens, and its
-/// Delete stays a tab stop of its own: Enter on it arms it, without
-/// opening the row it sits in. The rows took mouse clicks only.
+/// keyboard. Each row's title is a link and a tab stop that Enter or Space
+/// opens; the row itself isn't one, so its Delete isn't nested inside the
+/// link (a screen reader would read "Delete" as part of the link's name,
+/// and some can't reach a button inside a link). Delete stays a tab stop
+/// of its own: Enter on it arms it, without opening the conversation. The
+/// rows took mouse clicks only.
 async fn scenario_conversation_rows_by_keyboard(t: &Scenario<'_>) {
     let first = t.conversation().await;
     seed_user_message(t.pool, first.id, "the first row").await;
@@ -2858,13 +2861,20 @@ async fn scenario_conversation_rows_by_keyboard(t: &Scenario<'_>) {
     let page = t.tab(t.url(&format!("conversation/{}", first.id))).await;
     wait_for_live_client(&page, first.id).await;
     let row = |id: i64| format!("[data-conversation-id=\"{id}\"]");
-    let tab_index: i64 = page
-        .evaluate(format!("document.querySelector('{}').tabIndex", row(second.id).replace('\'', "\\'")))
+    let title = |id: i64| format!("{} .conversation-title", row(id));
+    let roles: serde_json::Value = page
+        .evaluate(format!(
+            "(() => {{ const r = document.querySelector('{}'), t = r.querySelector('.conversation-title'); \
+               return {{ row: r.getAttribute('role') || 'none', title: t.getAttribute('role') || 'none', tab: t.tabIndex }}; }})()",
+            row(second.id).replace('\'', "\\'")
+        ))
         .await
-        .expect("read the row's tab index")
+        .expect("read the row's roles")
         .into_value()
-        .expect("a number");
-    assert!(tab_index >= 0, "a conversation row should be a tab stop, its tabIndex is {tab_index}");
+        .expect("facts");
+    assert_eq!(roles["title"], "link", "a row's title should be its link: {roles}");
+    assert_eq!(roles["row"], "none", "the row around the link and its Delete shouldn't be a link too: {roles}");
+    assert!(roles["tab"].as_i64().is_some_and(|t| t >= 0), "the title should be a tab stop: {roles}");
     let at = |id: i64| format!("/conversation/{id}");
     let url_now = |page: &chromiumoxide::Page| {
         let page = page.clone();
@@ -2883,11 +2893,11 @@ async fn scenario_conversation_rows_by_keyboard(t: &Scenario<'_>) {
             false
         }
     };
-    let second_row = wait_for_element(&page, &row(second.id), Duration::from_secs(10)).await;
+    let second_row = wait_for_element(&page, &title(second.id), Duration::from_secs(10)).await;
     second_row.focus().await.expect("focus the second row");
     second_row.press_key("Enter").await.expect("press Enter");
     assert!(wait_for_url(&page, at(second.id)).await, "Enter on a row should open it: at {}", url_now(&page).await);
-    let first_row = wait_for_element(&page, &row(first.id), Duration::from_secs(10)).await;
+    let first_row = wait_for_element(&page, &title(first.id), Duration::from_secs(10)).await;
     first_row.focus().await.expect("focus the first row");
     first_row.press_key(" ").await.expect("press Space");
     assert!(wait_for_url(&page, at(first.id)).await, "Space on a row should open it: at {}", url_now(&page).await);

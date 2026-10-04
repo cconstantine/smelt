@@ -168,26 +168,31 @@ pub(super) fn ConversationSidebar(
                             key: "{conversation.id}",
                             "data-conversation-id": "{conversation.id}",
                             class: if selected() == Some(conversation.id) { "conversation-item active" } else { "conversation-item" },
-                            // A tab stop that Enter or Space opens, like a
-                            // link (SME-58); its Delete is a tab stop of its
-                            // own, whose keys don't reach the row.
-                            tabindex: "0",
-                            role: "link",
-                            aria_current: if selected() == Some(conversation.id) { Some("page") } else { None },
                             onclick: move |_| open_conversation(conversation.id),
-                            onkeydown: move |evt: Event<KeyboardData>| {
-                                let opens = match evt.key() {
-                                    keyboard_types::Key::Enter => true,
-                                    keyboard_types::Key::Character(c) => c == " ",
-                                    _ => false,
-                                };
-                                if opens {
-                                    // Space would scroll the list too.
-                                    evt.prevent_default();
-                                    open_conversation(conversation.id);
-                                }
-                            },
-                            span { class: "conversation-title", "{conversation.title}" }
+                            // The title is the row's link and tab stop, which
+                            // Enter or Space opens (SME-58). Not the whole
+                            // row: its Delete would be inside the link, read
+                            // as part of its name and, by some screen
+                            // readers, not reachable at all.
+                            span {
+                                class: "conversation-title",
+                                tabindex: "0",
+                                role: "link",
+                                aria_current: if selected() == Some(conversation.id) { Some("page") } else { None },
+                                onkeydown: move |evt: Event<KeyboardData>| {
+                                    let opens = match evt.key() {
+                                        keyboard_types::Key::Enter => true,
+                                        keyboard_types::Key::Character(c) => c == " ",
+                                        _ => false,
+                                    };
+                                    if opens {
+                                        // Space would scroll the list too.
+                                        evt.prevent_default();
+                                        open_conversation(conversation.id);
+                                    }
+                                },
+                                "{conversation.title}"
+                            }
                             if is_busy(conversation.id) {
                                 span { class: "conversation-busy", title: "Working" }
                             }
