@@ -106,6 +106,13 @@ pub(super) fn ConversationSidebar(
         });
     };
 
+    // Opening a row, by a click or from the keyboard.
+    let mut open_conversation = move |id: i64| {
+        pending_delete.set(None);
+        open_on_phone.set(false);
+        navigator.push(Route::ConversationRoute { id });
+    };
+
     // First click on a row's delete button arms it; a second click on the
     // same (still-armed) row confirms. Only one row is ever armed at a
     // time, so arming a different row implicitly cancels the last one.
@@ -165,10 +172,24 @@ pub(super) fn ConversationSidebar(
                             key: "{conversation.id}",
                             "data-conversation-id": "{conversation.id}",
                             class: if selected() == Some(conversation.id) { "conversation-item active" } else { "conversation-item" },
-                            onclick: move |_| {
-                                pending_delete.set(None);
-                                open_on_phone.set(false);
-                                navigator.push(Route::ConversationRoute { id: conversation.id });
+                            // A tab stop that Enter or Space opens, like a
+                            // link (SME-58); its Delete is a tab stop of its
+                            // own, whose keys don't reach the row.
+                            tabindex: "0",
+                            role: "link",
+                            aria_current: if selected() == Some(conversation.id) { Some("page") } else { None },
+                            onclick: move |_| open_conversation(conversation.id),
+                            onkeydown: move |evt: Event<KeyboardData>| {
+                                let opens = match evt.key() {
+                                    keyboard_types::Key::Enter => true,
+                                    keyboard_types::Key::Character(c) => c == " ",
+                                    _ => false,
+                                };
+                                if opens {
+                                    // Space would scroll the list too.
+                                    evt.prevent_default();
+                                    open_conversation(conversation.id);
+                                }
                             },
                             span { class: "conversation-title", "{conversation.title}" }
                             if is_busy(conversation.id) {

@@ -62,6 +62,9 @@ pub(crate) fn TwoStepButton(
                 evt.stop_propagation();
                 if armed { on_confirm.call(()) } else { on_arm.call(()) }
             },
+            // Enter or Space on the button presses it, and goes no further:
+            // the sidebar's Delete sits in a row those keys open.
+            onkeydown: move |evt: Event<KeyboardData>| evt.stop_propagation(),
             TwoStepLabel { armed, idle, confirm }
         }
     }
