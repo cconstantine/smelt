@@ -59,9 +59,9 @@ pub enum Inline {
     HardBreak,
 }
 
-/// How deep quotes and lists nest before deeper ones are flattened into
-/// their parent, so a hostile reply can't make rendering recurse without
-/// bound.
+/// How deep quotes and lists nest, and separately emphasis, strong,
+/// strikethrough and links, before deeper ones are flattened into their
+/// parent, so a hostile reply can't make rendering recurse without bound.
 pub const MAX_DEPTH: usize = 16;
 
 /// Parses a reply into blocks. Adjacent text is merged into one
@@ -72,7 +72,7 @@ pub fn parse(source: &str) -> Vec<Block> {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_GFM);
-    let mut builder = Builder { stack: vec![Container::Root(Vec::new())], depth: 0 };
+    let mut builder = Builder { stack: vec![Container::Root(Vec::new())], depth: 0, inline_depth: 0 };
     for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
         builder.event(event, source.get(range).unwrap_or(""));
     }
@@ -134,6 +134,8 @@ struct Builder {
     stack: Vec<Container>,
     /// How many quotes and lists are open.
     depth: usize,
+    /// How many emphasis, strong, strikethrough and link spans are open.
+    inline_depth: usize,
 }
 
 fn push_inline(target: &mut Vec<Inline>, inline: Inline) {
@@ -207,13 +209,23 @@ impl Builder {
             Tag::TableHead => Container::Head(Vec::new()),
             Tag::TableRow => Container::Row(Vec::new()),
             Tag::TableCell => Container::Cell(Vec::new()),
-            Tag::Emphasis => Container::Emphasis(Vec::new()),
-            Tag::Strong => Container::Strong(Vec::new()),
-            Tag::Strikethrough => Container::Strike(Vec::new()),
-            Tag::Link { dest_url, .. } => Container::Link {
-                url: allowed_url(&dest_url, &["http", "https", "mailto"]).then(|| dest_url.to_string()),
-                content: Vec::new(),
-            },
+            Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. } => {
+                self.inline_depth += 1;
+                if self.inline_depth > MAX_DEPTH {
+                    Container::Transparent { block: false }
+                } else {
+                    match tag {
+                        Tag::Emphasis => Container::Emphasis(Vec::new()),
+                        Tag::Strong => Container::Strong(Vec::new()),
+                        Tag::Strikethrough => Container::Strike(Vec::new()),
+                        Tag::Link { dest_url, .. } => Container::Link {
+                            url: allowed_url(&dest_url, &["http", "https", "mailto"]).then(|| dest_url.to_string()),
+                            content: Vec::new(),
+                        },
+                        _ => Container::Transparent { block: false },
+                    }
+                }
+            }
             Tag::Image { dest_url, .. } => Container::Image {
                 url: allowed_url(&dest_url, &["http", "https"]).then(|| dest_url.to_string()),
                 alt: String::new(),
@@ -249,6 +261,9 @@ impl Builder {
         }
         if matches!(tag, TagEnd::BlockQuote(_) | TagEnd::List(_)) {
             self.depth = self.depth.saturating_sub(1);
+        }
+        if matches!(tag, TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link) {
+            self.inline_depth = self.inline_depth.saturating_sub(1);
         }
         // The root is never popped: an unbalanced end is ignored.
         if self.stack.len() < 2 {
@@ -777,6 +792,38 @@ mod tests {
         assert!(depth(&parse(&lists)) <= MAX_DEPTH);
         // The innermost text survives the flattening.
         assert!(format!("{:?}", parse(&quotes)).contains("deep"));
+    }
+
+    fn inline_depth(inlines: &[Inline]) -> usize {
+        inlines
+            .iter()
+            .map(|i| match i {
+                Inline::Emphasis(c) | Inline::Strong(c) | Inline::Strike(c) | Inline::Link { content: c, .. } => {
+                    1 + inline_depth(c)
+                }
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// SME-30 code review: emphasis, strong, strikethrough and links nest
+    /// too, and render recursively, so they're bounded like quotes and
+    /// lists.
+    #[test]
+    fn test_inline_nesting_past_the_limit_is_flattened() {
+        let stars = "*".repeat(2_000);
+        let blocks = parse(&format!("{stars}deep{stars}"));
+        let Some(Block::Paragraph(content)) = blocks.first() else {
+            panic!("a paragraph: {blocks:?}");
+        };
+        assert!(inline_depth(content) <= MAX_DEPTH, "inline nesting {} deep", inline_depth(content));
+        assert!(format!("{content:?}").contains("deep"), "the innermost text survives");
+        let links = format!("{}x{}", "[".repeat(100), "](https://e.com)".repeat(100));
+        let Some(Block::Paragraph(content)) = parse(&links).first().cloned() else {
+            panic!("a paragraph");
+        };
+        assert!(inline_depth(&content) <= MAX_DEPTH);
     }
 
     #[test]
