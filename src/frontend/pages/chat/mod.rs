@@ -643,10 +643,11 @@ fn ChatPanel(
     // one and pulled a scroll that stayed within the slack back to the
     // bottom (SME-83).
     use_effect(move || {
+        // Borrowed, not cloned: this reruns on every streamed delta.
         let content = {
-            let list = messages();
-            let reply = streaming_reply();
-            (list.len(), list.last().map(|m| m.id), reply.as_ref().map(String::len))
+            let list = messages.read();
+            let reply_len = streaming_reply.read().as_ref().map(String::len);
+            (list.len(), list.last().map(|m| m.id), reply_len)
         };
         let changed = *last_content.peek() != Some(content);
         last_content.set(Some(content));
