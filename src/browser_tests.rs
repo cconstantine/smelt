@@ -96,19 +96,25 @@ impl BrowserTestHarness {
         // resolves to the source file's own path, which nothing serves, so
         // every page would run unstyled (SME-40 F17). Serve the stylesheet
         // at exactly the URL the page asks for.
-        let stylesheet_url = {
+        // The same for the highlighting stylesheet (SME-30).
+        let stylesheets = {
             use dioxus::prelude::*;
-            asset!("/assets/chat.css").to_string()
+            [
+                (asset!("/assets/chat.css").to_string(), "assets/chat.css"),
+                (asset!("/assets/highlight.css").to_string(), "assets/highlight.css"),
+            ]
         };
-        let stylesheet = std::fs::read_to_string(repo_root.join("assets/chat.css"))
-            .expect("read assets/chat.css");
-        let router = crate::build_router().route(
-            &stylesheet_url,
-            axum::routing::get(move || {
-                let stylesheet = stylesheet.clone();
-                async move { ([(axum::http::header::CONTENT_TYPE, "text/css")], stylesheet) }
-            }),
-        );
+        let mut router = crate::build_router();
+        for (url, path) in stylesheets {
+            let stylesheet = std::fs::read_to_string(repo_root.join(path)).expect("read a stylesheet");
+            router = router.route(
+                &url,
+                axum::routing::get(move || {
+                    let stylesheet = stylesheet.clone();
+                    async move { ([(axum::http::header::CONTENT_TYPE, "text/css")], stylesheet) }
+                }),
+            );
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind a test-local port");
@@ -764,6 +770,10 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "settings_two_step", 60, Box::pin(scenario_settings_two_step(&t))).await;
     run_scenario(&t, only, r, k, "pointer_keeps_text_still", 120, Box::pin(scenario_pointer_keeps_text_still(&t))).await;
     run_scenario(&t, only, r, k, "ask_user_card", 60, Box::pin(scenario_ask_user_card(&t))).await;
+    run_scenario(&t, only, r, k, "markdown_reply", 60, Box::pin(scenario_markdown_reply(&t))).await;
+    run_scenario(&t, only, r, k, "markdown_streaming", 60, Box::pin(scenario_markdown_streaming(&t))).await;
+    run_scenario(&t, only, r, k, "markdown_late_image", 90, Box::pin(scenario_markdown_late_image(&t))).await;
+    run_scenario(&t, only, r, k, "markdown_long_reply", 90, Box::pin(scenario_markdown_long_reply(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -2554,6 +2564,295 @@ async fn scenario_pointer_keeps_text_still(t: &Scenario<'_>) {
         assert!(
             distance >= 90.0,
             "at {width}px, a scroll after clicking the text should stay where the user put it, but the transcript is {distance}px from its bottom"
+        );
+    }
+}
+
+/// SME-30: the model's replies render as markdown, and the reply is
+/// untrusted. A heading, list, table, code block and link become those
+/// elements; raw HTML (an `<img onerror>`, a `<script>`) and a
+/// `javascript:` link stay text and never run; the user's own message
+/// stays plain; a code block's copy button copies its code.
+async fn scenario_markdown_reply(t: &Scenario<'_>) {
+    let conversation = t.conversation().await;
+    db::create_message(
+        t.pool,
+        conversation.id,
+        "user",
+        &[anthropic::ContentBlock::Text { text: "Show **markdown** please".into() }],
+    )
+    .await
+    .expect("seed the user's message");
+    let reply = "## Plan\n\n- first\n- [x] done\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn main() { let x = 1; }\n```\n\n\
+        See [the docs](https://example.com/docs) or [this](javascript:window.__smeltPwned=2).\n\n\
+        Inline <img src=x onerror=\"window.__smeltPwned=1\"> html.\n\n<script>window.__smeltPwned=3</script>\n";
+    db::create_message(t.pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: reply.into() }])
+        .await
+        .expect("seed the reply");
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    wait_for_element(&page, ".message-assistant .markdown h2", Duration::from_secs(10)).await;
+    let facts: serde_json::Value = page
+        .evaluate(
+            "(() => { const md = document.querySelector('.message-assistant .markdown');               const link = md.querySelector('a');               return {                 heading: md.querySelector('h2')?.innerText,                 items: md.querySelectorAll('ul > li').length,                 checked: md.querySelector('li.md-task input[type=checkbox]')?.checked ?? null,                 cells: Array.from(md.querySelectorAll('td')).map(c => c.innerText),                 highlighted: md.querySelectorAll('pre.hl-code .hl-keyword, pre.hl-code .hl-storage').length,                 lang: md.querySelector('.md-code-lang')?.innerText,                 links: Array.from(md.querySelectorAll('a')).map(a => a.getAttribute('href')),                 target: link?.getAttribute('target'), rel: link?.getAttribute('rel'),                 imgs: md.querySelectorAll('img').length, scripts: md.querySelectorAll('script').length,                 text: md.innerText, pwned: window.__smeltPwned ?? null,                 user: document.querySelector('.message-user .message-text')?.innerText,                 userStrong: document.querySelectorAll('.message-user strong').length }; })()",
+        )
+        .await
+        .expect("read the rendered reply")
+        .into_value()
+        .expect("facts");
+    assert_eq!(facts["heading"], "Plan", "{facts}");
+    assert_eq!(facts["items"], 2, "{facts}");
+    assert_eq!(facts["checked"], true, "a checked task item: {facts}");
+    assert_eq!(facts["cells"], serde_json::json!(["1", "2"]), "{facts}");
+    assert!(facts["highlighted"].as_i64().unwrap_or(0) > 0, "the rust block should be highlighted: {facts}");
+    assert_eq!(facts["lang"], "rust", "{facts}");
+    assert_eq!(facts["links"], serde_json::json!(["https://example.com/docs"]), "only the https link is a link: {facts}");
+    assert_eq!(facts["target"], "_blank", "{facts}");
+    assert_eq!(facts["rel"], "noopener noreferrer", "{facts}");
+    assert_eq!(facts["imgs"], 0, "raw HTML mustn't become an image: {facts}");
+    assert_eq!(facts["scripts"], 0, "{facts}");
+    assert!(facts["pwned"].is_null(), "the reply's raw HTML ran: {facts}");
+    let text = facts["text"].as_str().unwrap_or_default();
+    assert!(text.contains("<img src=x onerror=") && text.contains("<script>"), "raw HTML should show as text: {text}");
+    assert_eq!(facts["user"], "Show **markdown** please", "the user's message stays plain: {facts}");
+    assert_eq!(facts["userStrong"], 0, "{facts}");
+
+    // The copy button hands the block's code to the clipboard.
+    page.evaluate("navigator.clipboard.writeText = async text => { window.__smeltCopied = text; }")
+        .await
+        .expect("watch the clipboard");
+    click_when_present(&page, ".md-code-copy", Duration::from_secs(5)).await;
+    assert!(wait_for_text(&page, "Copied", Duration::from_secs(5)).await, "the button should say it copied");
+    let copied: Option<String> = page
+        .evaluate("window.__smeltCopied ?? null")
+        .await
+        .expect("read what was copied")
+        .into_value()
+        .expect("a string");
+    assert_eq!(copied.as_deref(), Some("fn main() { let x = 1; }\n"));
+}
+
+/// SME-30: the streaming reply renders as markdown as it arrives. A code
+/// fence that hasn't closed yet shows plain and is highlighted once it
+/// closes, and the reply looks the same once it's saved.
+async fn scenario_markdown_streaming(t: &Scenario<'_>) {
+    use crate::events::{ConversationEvent, publish};
+    let conversation = t.conversation().await;
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    publish(conversation.id, ConversationEvent::ReplyReset {});
+    let first = "Here is **bold** and code:\n\n```rust\nfn main() {\n";
+    publish(conversation.id, ConversationEvent::ReplyDelta { text: first.into(), offset: 0 });
+    wait_for_element(&page, ".message-streaming .markdown strong", Duration::from_secs(10)).await;
+    let open_fence: serde_json::Value = page
+        .evaluate(
+            "(() => { const pre = document.querySelector('.message-streaming .markdown pre');               return { pre: !!pre, highlighted: pre?.classList.contains('hl-code') ?? null, code: pre?.innerText }; })()",
+        )
+        .await
+        .expect("read the open fence")
+        .into_value()
+        .expect("facts");
+    assert_eq!(open_fence["pre"], true, "the open fence should already be a code block: {open_fence}");
+    assert_eq!(open_fence["highlighted"], false, "an open fence shows plain: {open_fence}");
+    let rest = "}\n```\n\nDone.";
+    publish(conversation.id, ConversationEvent::ReplyDelta { text: rest.into(), offset: first.len() });
+    wait_for_element(&page, ".message-streaming .markdown pre.hl-code", Duration::from_secs(10)).await;
+    let streamed: String = page
+        .evaluate("document.querySelector('.message-streaming .markdown').innerHTML.replace(/ data-dioxus-id=\"\\d+\"/g, '')")
+        .await
+        .expect("read the streamed reply")
+        .into_value()
+        .expect("html");
+    let full = format!("{first}{rest}");
+    let saved = db::create_message(t.pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: full }])
+        .await
+        .expect("save the reply");
+    publish(conversation.id, ConversationEvent::MessagesAppended { messages: vec![saved] });
+    assert!(
+        wait_for_count(&page, ".message-streaming", 0, Duration::from_secs(10)).await,
+        "the saved reply should replace its streaming copy"
+    );
+    let saved_html: String = page
+        .evaluate("document.querySelector('.message-assistant .markdown').innerHTML.replace(/ data-dioxus-id=\"\\d+\"/g, '')")
+        .await
+        .expect("read the saved reply")
+        .into_value()
+        .expect("html");
+    // Dioxus's own element ids differ between the two mounts; the reply
+    // itself mustn't.
+    assert_eq!(saved_html, streamed, "the reply changed when it was saved");
+}
+
+/// SME-30: a long reply (about 30 KB, ten code blocks) keeps up while it
+/// streams. The whole reply re-renders on every delta, so this bounds how
+/// far the page falls behind: the last delta shows within 3 s of being
+/// sent, on the debug bundle the tier serves.
+async fn scenario_markdown_long_reply(t: &Scenario<'_>) {
+    use crate::events::{ConversationEvent, publish};
+    let conversation = t.conversation().await;
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    let section = |i: usize| {
+        format!(
+            "### Part {i}\n\nSome **text** with `code` and a [link](https://example.com/{i}). {}\n\n- one\n- two\n\n```rust\nfn part_{i}() -> u32 {{\n    let x = {i};\n    x * 2\n}}\n```\n\n",
+            "Filler words to make the reply long. ".repeat(60)
+        )
+    };
+    let reply: String = (0..10).map(section).collect::<String>() + "THE-END-MARKER";
+    publish(conversation.id, ConversationEvent::ReplyReset {});
+    let chunk = reply.len().div_ceil(100);
+    let mut offset = 0;
+    let mut sent_last = tokio::time::Instant::now();
+    while offset < reply.len() {
+        let mut end = (offset + chunk).min(reply.len());
+        while !reply.is_char_boundary(end) {
+            end += 1;
+        }
+        publish(conversation.id, ConversationEvent::ReplyDelta { text: reply[offset..end].to_string(), offset });
+        offset = end;
+        sent_last = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        wait_for_text(&page, "THE-END-MARKER", Duration::from_secs(30)).await,
+        "the end of a long streamed reply never showed"
+    );
+    let lag = sent_last.elapsed();
+    println!("browser tier: markdown_long_reply: {} bytes in 100 deltas, end shown {lag:?} after the last", reply.len());
+    let blocks: i64 = page
+        .evaluate("document.querySelectorAll('.message-streaming pre.hl-code').length")
+        .await
+        .expect("count highlighted blocks")
+        .into_value()
+        .expect("a number");
+    assert_eq!(blocks, 10, "every closed block should be highlighted");
+    assert!(lag < Duration::from_secs(3), "the page fell {lag:?} behind a long streamed reply");
+}
+
+/// A server that answers every request after `delay` with an SVG image of
+/// `height` pixels, so an image in a reply grows its bubble after the
+/// reply has rendered. Returns its address.
+async fn serve_late_image(delay: Duration, height: u32) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the late image");
+    let address = format!("http://{}/", listener.local_addr().expect("the late image's address"));
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+                tokio::time::sleep(delay).await;
+                let body = format!(
+                    "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='{height}'><rect width='300' height='{height}' fill='#88c'/></svg>"
+                );
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: image/svg+xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, format!("{head}{body}").as_bytes()).await;
+            });
+        }
+    });
+    address
+}
+
+/// SME-30: an image in a reply loads after the reply has rendered and
+/// grows it. With the transcript stuck to its bottom, it stays at its
+/// bottom; with the pointer over the transcript, the text under the
+/// pointer doesn't move (SME-75's rule for anything that moves the bottom
+/// that isn't new content).
+async fn scenario_markdown_late_image(t: &Scenario<'_>) {
+    for pointer in [false, true] {
+        let image = serve_late_image(Duration::from_secs(2), 400).await;
+        let conversation = t.conversation().await;
+        for i in 0..20 {
+            db::create_message(
+                t.pool,
+                conversation.id,
+                if i % 2 == 0 { "user" } else { "assistant" },
+                &[anthropic::ContentBlock::Text { text: format!("filler message {i}") }],
+            )
+            .await
+            .expect("seed a message");
+        }
+        db::create_message(
+            t.pool,
+            conversation.id,
+            "assistant",
+            &[anthropic::ContentBlock::Text { text: format!("A picture:\n\n![late]({image})\n\nThe end.") }],
+        )
+        .await
+        .expect("seed the reply with an image");
+        let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+        wait_for_live_client(&page, conversation.id).await;
+        wait_for_element(&page, ".markdown img.md-image", Duration::from_secs(10)).await;
+        let loaded: bool = page
+            .evaluate("document.querySelector('.markdown img.md-image').complete")
+            .await
+            .expect("read the image")
+            .into_value()
+            .expect("a bool");
+        assert!(!loaded, "the image should still be loading, or this checks nothing");
+        wait_for_transcript_at_bottom(&page).await;
+        let mut before = None;
+        if pointer {
+            let centre: Vec<f64> = page
+                .evaluate("(() => { const r = document.querySelector('.messages').getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height * 0.3]; })()")
+                .await
+                .expect("read the transcript's box")
+                .into_value()
+                .expect("two numbers");
+            for dx in [0.0, 1.0] {
+                page.move_mouse(chromiumoxide::layout::Point::new(centre[0] + dx, centre[1]))
+                    .await
+                    .expect("move the mouse over the transcript");
+            }
+            let top: f64 = page
+                .evaluate(format!(
+                    "(() => {{ window.__sme30 = document.elementFromPoint({}, {}); return window.__sme30.getBoundingClientRect().top; }})()",
+                    centre[0] + 1.0,
+                    centre[1]
+                ))
+                .await
+                .expect("read what's under the pointer")
+                .into_value()
+                .expect("a number");
+            before = Some(top);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let complete: bool = page
+                .evaluate("(() => { const i = document.querySelector('.markdown img.md-image'); return i.complete && i.naturalHeight > 0; })()")
+                .await
+                .expect("read the image")
+                .into_value()
+                .expect("a bool");
+            if complete {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "the late image never loaded");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        if let Some(before) = before {
+            let after: f64 = page
+                .evaluate("window.__sme30.getBoundingClientRect().top")
+                .await
+                .expect("read where it is now")
+                .into_value()
+                .expect("a number");
+            assert!(
+                (after - before).abs() <= 2.0,
+                "the text under the pointer moved when the image loaded: top {before} -> {after}"
+            );
+            page.move_mouse(chromiumoxide::layout::Point::new(5.0, 5.0))
+                .await
+                .expect("move the mouse off the transcript");
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+        let distance = transcript_distance_from_bottom(&page).await;
+        assert!(
+            distance <= 1.0,
+            "pointer {pointer}: the transcript should be at its bottom once the image has loaded, but it's {distance}px away"
         );
     }
 }
