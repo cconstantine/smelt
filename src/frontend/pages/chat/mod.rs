@@ -192,8 +192,6 @@ fn ChatPanel(
     let sandbox_terminals = state.sandbox_terminals();
     let mut pending_pod_stop = state.pending_pod_stop();
     let mut pod_stop_error = state.pod_stop_error();
-    let terminal_body_els = state.terminal_body_els();
-    let terminal_body_stuck = state.terminal_body_stuck();
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut browsing_session_open = state.browsing_session_open();
     #[cfg(feature = "web")]
@@ -356,15 +354,9 @@ fn ChatPanel(
     // The context bar, so closing its detail view can give it focus back.
     let context_bar_el: Signal<Option<MountedEvent>> = use_signal(|| None);
 
-    // Sticky-bottom auto-scroll state for the message transcript: the
-    // mounted `.messages` element (so an effect can query/set its scroll
-    // position) and whether it was at the bottom the last time the user
-    // scrolled it — read, not written, by the auto-scroll effect below;
-    // written only by the `onscroll` handler on the element itself, so it
-    // always reflects a real user (or auto-scroll-induced) scroll position
-    // rather than the reactive-render cycle.
-    let messages_el: Signal<Option<MountedEvent>> = use_signal(|| None);
-    let mut messages_stuck_to_bottom = use_signal(|| true);
+    // The transcript follows its bottom while the user is at it (see
+    // `StickyBottom`); its `onscroll` keeps that current.
+    let transcript_scroll = use_sticky_bottom();
     // Whether the pointer is over the transcript, and whether a snap to
     // the bottom that a layout change asked for is waiting for it to
     // leave (SME-75): a side panel appearing mustn't move what the user is
@@ -408,12 +400,12 @@ fn ChatPanel(
             // A freshly loaded conversation should open scrolled to its
             // latest message, regardless of where a previous conversation
             // was left scrolled.
-            messages_stuck_to_bottom.set(true);
+            transcript_scroll.stick();
         }
         Some(Some(Err(e))) => load_error.set(Some(server_error_message(&e))),
         Some(None) => {
             messages.set(Vec::new());
-            messages_stuck_to_bottom.set(true);
+            transcript_scroll.stick();
         }
         None => {}
     });
@@ -634,14 +626,10 @@ fn ChatPanel(
 
     // Auto-scroll the transcript to its new bottom whenever a message is
     // added or streaming text grows — but only if the user was already at
-    // the bottom (`messages_stuck_to_bottom`, kept current by the
-    // `.messages` div's own `onscroll` handler below). Reads `messages()`
-    // and `streaming_reply()` so it reruns on both a persisted message and
-    // an in-flight delta. The stuck flag itself is read with `peek()`:
-    // `onscroll` sets it on every scroll event (a `set` notifies even when
-    // the value is unchanged), so reading it reactively reran this on each
-    // one and pulled a scroll that stayed within the slack back to the
-    // bottom (SME-83).
+    // the bottom (`transcript_scroll`, kept current by the transcript's own
+    // `onscroll` handler). Reads the messages and the streaming reply so it
+    // reruns on both a persisted message and an in-flight delta; the stuck
+    // flag isn't subscribed to (see `StickyBottom::is_stuck`).
     use_effect(move || {
         // Borrowed, not cloned: this reruns on every streamed delta.
         let content = {
@@ -651,10 +639,10 @@ fn ChatPanel(
         };
         let changed = *last_content.peek() != Some(content);
         last_content.set(Some(content));
-        if !*messages_stuck_to_bottom.peek() {
+        if !transcript_scroll.is_stuck() {
             return;
         }
-        let Some(el) = messages_el() else { return };
+        let Some(el) = transcript_scroll.el() else { return };
         // Rerun with nothing new (an unchanged write): only a layout change
         // can have moved the bottom, so it waits on the pointer like one.
         if !changed && *pointer_over_transcript.peek() {
@@ -691,45 +679,16 @@ fn ChatPanel(
         let _ = context_usage();
         // An image in a reply loaded and grew it (SME-30).
         let _ = media_loaded();
-        if !*messages_stuck_to_bottom.peek() {
+        if !transcript_scroll.is_stuck() {
             return;
         }
-        let Some(el) = messages_el.peek().clone() else { return };
+        let Some(el) = transcript_scroll.el_untracked() else { return };
         if *pointer_over_transcript.peek() {
             layout_snap_pending.set(true);
             spawn(keep_transcript_anchor(el, layout_snap_pending));
             return;
         }
         spawn(scroll_to_bottom(el));
-    });
-
-    // Same sticky-bottom behavior, per sandbox terminal — each terminal's
-    // body scrolls independently as its own output grows. A terminal with
-    // no recorded stuck state yet (just appeared) defaults to stuck, same as
-    // the transcript on first load. The stuck map is peeked, as above, so a
-    // scroll doesn't rerun this (SME-83).
-    use_effect(move || {
-        let current_terminals = sandbox_terminals();
-        let els = terminal_body_els();
-        let stuck = terminal_body_stuck.peek().clone();
-        for terminal in current_terminals {
-            if !stuck.get(&terminal.terminal_id).copied().unwrap_or(true) {
-                continue;
-            }
-            let Some(el) = els.get(&terminal.terminal_id).cloned() else {
-                continue;
-            };
-            spawn(async move {
-                if let Ok(size) = el.get_scroll_size().await {
-                    let _ = el
-                        .scroll(
-                            PixelsVector2D::new(0.0, size.height),
-                            ScrollBehavior::Instant,
-                        )
-                        .await;
-                }
-            });
-        }
     });
 
     rsx! {
@@ -780,8 +739,7 @@ fn ChatPanel(
                             input,
                             on_attach: move |_| attach_repo_now(),
                             stream_errors,
-                            messages_el,
-                            messages_stuck_to_bottom,
+                            scroll: transcript_scroll,
                             pointer_over_transcript,
                             media_loaded,
                         }

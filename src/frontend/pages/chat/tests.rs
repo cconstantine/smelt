@@ -1253,8 +1253,6 @@ fn test_conversation_state_starts_empty() {
         sandbox_terminals,
         pending_pod_stop,
         pod_stop_error,
-        terminal_body_els,
-        terminal_body_stuck,
         browsing_session_open,
         browsing_url,
         browsing_frame,
@@ -1288,8 +1286,6 @@ fn test_conversation_state_starts_empty() {
     assert!(sandbox_terminals.is_empty(), "sandbox_terminals");
     assert!(pending_pod_stop.is_none(), "pending_pod_stop");
     assert!(pod_stop_error.is_none(), "pod_stop_error");
-    assert!(terminal_body_els.is_empty(), "terminal_body_els");
-    assert!(terminal_body_stuck.is_empty(), "terminal_body_stuck");
     assert!(!browsing_session_open, "browsing_session_open");
     assert!(browsing_url.is_none(), "browsing_url");
     assert!(browsing_frame.is_none(), "browsing_frame");

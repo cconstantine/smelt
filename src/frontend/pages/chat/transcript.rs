@@ -575,8 +575,7 @@ pub(super) fn Transcript(
     mut input: Signal<String>,
     on_attach: EventHandler<()>,
     stream_errors: Signal<HashMap<i64, String>>,
-    mut messages_el: Signal<Option<MountedEvent>>,
-    mut messages_stuck_to_bottom: Signal<bool>,
+    scroll: StickyBottom,
     mut pointer_over_transcript: Signal<bool>,
     mut media_loaded: Signal<u64>,
 ) -> Element {
@@ -596,7 +595,7 @@ pub(super) fn Transcript(
         div {
             class: "messages",
             onmounted: move |evt| {
-                messages_el.set(Some(evt));
+                scroll.mounted(evt);
                 spawn(async move {
                     let _ = document::eval(TRANSCRIPT_ANCHOR_SETUP).await;
                 });
@@ -613,8 +612,8 @@ pub(super) fn Transcript(
                 pointer_over_transcript.set(false);
                 if *layout_snap_pending.peek() {
                     layout_snap_pending.set(false);
-                    if *messages_stuck_to_bottom.peek()
-                        && let Some(el) = messages_el.peek().clone()
+                    if scroll.is_stuck()
+                        && let Some(el) = scroll.el_untracked()
                     {
                         spawn(scroll_to_bottom(el));
                     }
@@ -638,15 +637,7 @@ pub(super) fn Transcript(
                 if *layout_snap_pending.peek() {
                     return;
                 }
-                let d = evt.data();
-                messages_stuck_to_bottom
-                    .set(
-                        is_scrolled_to_bottom(
-                            d.scroll_top(),
-                            d.scroll_height() as f64,
-                            d.client_height() as f64,
-                        ),
-                    );
+                scroll.scrolled(&evt.data());
             },
             if conversation_missing() {
                 p { class: "conversation-missing",
