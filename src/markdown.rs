@@ -100,7 +100,11 @@ fn fence_closed(raw: &str, text: &str, at_end: bool) -> bool {
     if !at_end {
         return true;
     }
-    let raw_lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    // A line that's only quote markers (`>`) is blank too.
+    let raw_lines: Vec<&str> = raw
+        .lines()
+        .filter(|l| !l.trim_start_matches(['>', ' ', '\t']).trim().is_empty())
+        .collect();
     if raw_lines.len() < 2 {
         // Only the opening fence so far.
         return false;
@@ -773,6 +777,9 @@ mod tests {
         assert_eq!(code_closed("```\n```"), vec![true], "an empty closed block");
         assert_eq!(code_closed("```"), vec![false], "just the opening fence");
         assert_eq!(code_closed("```py\nprint(1)\n``"), vec![false], "a fence still arriving");
+        assert_eq!(code_closed("> ```rust\n> foo\n> \n> bar\n>"), vec![false], "a blank quoted line after content");
+        assert_eq!(code_closed("> ```\n> foo\n>"), vec![false], "ends on a blank quoted line");
+        assert_eq!(code_closed("> ```rust\n>"), vec![false], "an empty quoted block still open");
     }
 
     #[test]
