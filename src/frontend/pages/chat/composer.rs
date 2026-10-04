@@ -23,10 +23,6 @@ pub(super) fn Composer(
 ) -> Element {
     let turn_running = state.turn_running();
     let pending_question = state.pending_question();
-    // The message box waits while the model works in this conversation,
-    // whoever started the turn; Stop is offered instead.
-    let is_streaming = move || turn_running();
-    let can_stop = move || turn_running();
     rsx! {
         form {
             class: "composer",
@@ -41,17 +37,20 @@ pub(super) fn Composer(
                 id: "message-box",
                 r#type: "text",
                 value: "{input}",
-                disabled: is_streaming(),
+                // The message box waits while the model works in this
+                // conversation, whoever started the turn; Stop is offered
+                // instead.
+                disabled: turn_running(),
                 placeholder: if pending_question().is_some() { "Answer the question above, or write a reply instead" } else { "Type a message..." },
                 oninput: move |e| input.set(e.value()),
             }
             button {
                 r#type: "submit",
-                disabled: is_streaming() || !model_ready(),
+                disabled: turn_running() || !model_ready(),
                 title: if model_ready() { "" } else { "Choose a model first" },
                 "Send"
             }
-            if can_stop() {
+            if turn_running() {
                 button {
                     r#type: "button",
                     class: "stop-turn",
