@@ -138,6 +138,20 @@ struct Builder {
     inline_depth: usize,
 }
 
+/// An inline's words, without formatting.
+fn plain_text(inline: &Inline, out: &mut String) {
+    match inline {
+        Inline::Text(t) | Inline::Code(t) => out.push_str(t),
+        Inline::Emphasis(c) | Inline::Strong(c) | Inline::Strike(c) | Inline::Link { content: c, .. } => {
+            for inline in c {
+                plain_text(inline, out);
+            }
+        }
+        Inline::Image { alt, .. } => out.push_str(alt),
+        Inline::SoftBreak | Inline::HardBreak => out.push(' '),
+    }
+}
+
 fn push_inline(target: &mut Vec<Inline>, inline: Inline) {
     if let Inline::Text(new) = &inline
         && let Some(Inline::Text(last)) = target.last_mut()
@@ -334,11 +348,10 @@ impl Builder {
     }
 
     fn inline(&mut self, inline: Inline) {
-        // An image's alt text only takes text.
+        // An image's alt text is plain text: formatting inside it keeps
+        // its words, and a line break becomes a space.
         if let Some(Container::Image { alt, .. }) = self.stack.last_mut() {
-            if let Inline::Text(t) | Inline::Code(t) = &inline {
-                alt.push_str(t);
-            }
+            plain_text(&inline, alt);
             return;
         }
         let needs_plain = self.needs_plain();
@@ -739,6 +752,16 @@ mod tests {
                 text(" x y"),
             ])]
         );
+    }
+
+    /// SME-30 code review: an image's alt text keeps its formatted words.
+    #[test]
+    fn test_an_images_alt_keeps_formatted_words() {
+        assert_eq!(
+            parse("![see **this** `big` *chart*](https://x/y.png)"),
+            vec![Block::Paragraph(vec![Inline::Image { url: "https://x/y.png".into(), alt: "see this big chart".into() }])]
+        );
+        assert_eq!(parse("![see *this*\nchart](ftp://x)"), vec![Block::Paragraph(vec![text("see this chart")])]);
     }
 
     #[test]
