@@ -373,19 +373,20 @@ fn ChatPanel(
     let mut last_content: Signal<Option<(usize, Option<i64>, Option<usize>)>> = use_signal(|| None);
 
 
-    // Fetched once per page load (this effect reads no reactive signal, so
-    // it never re-runs), not per message — timestamps are stored as
+    // Read once per page load, not per message: timestamps are stored as
     // effectively-UTC `NaiveDateTime`s with no timezone of their own, and
     // the browser's offset is the only place that information can come
-    // from. Web-only: there's no browser `Date` during SSR, and 0 (UTC) is
-    // a fine fallback for the pre-hydration render either way.
+    // from. A hook, not an effect: it reads nothing reactive, so an effect
+    // never reran anyway (SME-58). Web-only: there's no browser `Date`
+    // during SSR, and 0 (UTC) is a fine fallback for the pre-hydration
+    // render either way.
     #[cfg(feature = "web")]
-    use_effect(move || {
+    use_hook(move || {
         spawn(async move {
-            if let Ok(value) = document::eval("return -new Date().getTimezoneOffset();").await {
-                if let Some(offset) = value.as_i64() {
-                    tz_offset_minutes.set(offset as i32);
-                }
+            if let Ok(value) = document::eval("return -new Date().getTimezoneOffset();").await
+                && let Some(offset) = value.as_i64()
+            {
+                tz_offset_minutes.set(offset as i32);
             }
         });
     });
