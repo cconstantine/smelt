@@ -436,7 +436,12 @@ fn ChatPanel(
                 task.cancel();
             }
             live.set(None);
-            let Some(id) = selected() else { return };
+            let Some(id) = selected() else {
+                // With no conversation open, the state is about none, so
+                // coming back to the one it held still waits for its reset.
+                state.conversation().set(None);
+                return;
+            };
             // Nothing of the conversation left behind shows in this one:
             // its messages, panels, forms and errors (SME-32 code review 8,
             // SME-51 B11) go in one reset.

@@ -16,7 +16,8 @@ use super::*;
 /// time zone, and the transcript's own scroll bookkeeping.
 #[derive(Store, Default)]
 pub(super) struct ConversationState {
-    /// The conversation this state is about, set by the switch's reset.
+    /// The conversation this state is about: set by the switch's reset,
+    /// and `None` while no conversation is open.
     /// An effect that acts on a field for `selected` checks it first: on a
     /// switch, effects rerun in no set order, and one can run before the
     /// reset, while the fields still hold the previous conversation's.
