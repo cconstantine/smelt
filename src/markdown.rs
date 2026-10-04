@@ -73,8 +73,10 @@ pub fn parse(source: &str) -> Vec<Block> {
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_GFM);
     let mut builder = Builder { stack: vec![Container::Root(Vec::new())], depth: 0, inline_depth: 0 };
+    let end = source.trim_end().len();
     for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
-        builder.event(event, source.get(range).unwrap_or(""));
+        let at_end = range.end >= end;
+        builder.event(event, source.get(range).unwrap_or(""), at_end);
     }
     builder.finish()
 }
@@ -85,23 +87,35 @@ fn allowed_url(url: &str, schemes: &[&str]) -> bool {
         .is_some_and(|(scheme, _)| schemes.iter().any(|s| scheme.eq_ignore_ascii_case(s)))
 }
 
-/// Whether a fenced code block's source (opening fence to end) ends with a
-/// closing fence at least as long as its opening one.
-fn fence_closed(raw: &str) -> bool {
-    // Inside a quote, every line after the first keeps its `>` markers.
-    let strip = |line: &str| line.trim_start_matches(|c| c == '>' || c == ' ' || c == '\t').trim_end().to_string();
-    let lines: Vec<String> = raw.lines().map(strip).collect();
-    let (Some(first), Some(last)) = (lines.first(), lines.last()) else {
-        return false;
-    };
-    if lines.len() < 2 {
+/// Whether a fenced code block is finished, from what pulldown-cmark made
+/// of it: `raw` is its source (opening fence to wherever it ended), `text`
+/// its content, and `at_end` whether it runs to the end of the reply.
+///
+/// A block with more of the reply after it is finished, whether a closing
+/// fence or the end of its quote or list item ended it. One at the end is
+/// still open when its last source line is its last content line (behind
+/// nothing but quote markers and indentation); otherwise that last line
+/// is the closing fence.
+fn fence_closed(raw: &str, text: &str, at_end: bool) -> bool {
+    if !at_end {
+        return true;
+    }
+    let raw_lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    if raw_lines.len() < 2 {
+        // Only the opening fence so far.
         return false;
     }
-    let Some(fence) = first.chars().next().filter(|c| *c == '`' || *c == '~') else {
+    let Some(last_raw) = raw_lines.last().map(|l| l.trim_end()) else {
         return false;
     };
-    let open = first.chars().take_while(|c| *c == fence).count();
-    last.chars().count() >= open && last.chars().all(|c| c == fence)
+    let Some(last_text) = text.lines().rev().map(str::trim_end).find(|l| !l.trim().is_empty()) else {
+        // No content, and a line after the opening fence: the closing one.
+        return true;
+    };
+    let is_content = last_raw
+        .strip_suffix(last_text)
+        .is_some_and(|prefix| prefix.chars().all(|c| c == '>' || c == ' ' || c == '\t'));
+    !is_content
 }
 
 enum Container {
@@ -113,7 +127,10 @@ enum Container {
     Plain(Vec<Inline>),
     Paragraph(Vec<Inline>),
     Heading(u8, Vec<Inline>),
-    Code { lang: Option<String>, text: String, closed: bool },
+    /// `raw` is the block's source, `at_end` whether it runs to the end of
+    /// the reply: `fence_closed` decides `closed` from them once the block
+    /// ends.
+    Code { lang: Option<String>, text: String, fenced: bool, raw: String, at_end: bool },
     Html(String),
     Table { head: Vec<Vec<Inline>>, rows: Vec<Vec<Vec<Inline>>> },
     Head(Vec<Vec<Inline>>),
@@ -163,9 +180,9 @@ fn push_inline(target: &mut Vec<Inline>, inline: Inline) {
 }
 
 impl Builder {
-    fn event(&mut self, event: Event, raw: &str) {
+    fn event(&mut self, event: Event, raw: &str, at_end: bool) {
         match event {
-            Event::Start(tag) => self.start(tag, raw),
+            Event::Start(tag) => self.start(tag, raw, at_end),
             Event::End(tag) => self.end(tag),
             Event::Text(t) => self.text(&t),
             Event::Code(t) => self.inline(Inline::Code(t.to_string())),
@@ -193,7 +210,7 @@ impl Builder {
         }
     }
 
-    fn start(&mut self, tag: Tag, raw: &str) {
+    fn start(&mut self, tag: Tag, raw: &str, at_end: bool) {
         let container = match tag {
             Tag::Paragraph => Container::Paragraph(Vec::new()),
             Tag::Heading { level, .. } => Container::Heading(level as u8, Vec::new()),
@@ -204,9 +221,13 @@ impl Builder {
             Tag::CodeBlock(CodeBlockKind::Fenced(info)) => Container::Code {
                 lang: info.split_whitespace().next().map(str::to_string),
                 text: String::new(),
-                closed: fence_closed(raw),
+                fenced: true,
+                raw: raw.to_string(),
+                at_end,
             },
-            Tag::CodeBlock(CodeBlockKind::Indented) => Container::Code { lang: None, text: String::new(), closed: true },
+            Tag::CodeBlock(CodeBlockKind::Indented) => {
+                Container::Code { lang: None, text: String::new(), fenced: false, raw: String::new(), at_end }
+            }
             Tag::HtmlBlock => Container::Html(String::new()),
             Tag::List(start) => {
                 self.depth += 1;
@@ -302,7 +323,10 @@ impl Builder {
             Container::Plain(content) => self.block(Block::Plain(content)),
             Container::Paragraph(content) => self.block(Block::Paragraph(content)),
             Container::Heading(level, content) => self.block(Block::Heading { level, content }),
-            Container::Code { lang, text, closed } => self.block(Block::Code { lang, text, closed }),
+            Container::Code { lang, text, fenced, raw, at_end } => {
+                let closed = !fenced || fence_closed(&raw, &text, at_end);
+                self.block(Block::Code { lang, text, closed })
+            }
             Container::Html(html) => self.block(Block::Html(html)),
             Container::Table { head, rows } => self.block(Block::Table { head, rows }),
             Container::Head(cells) => {
@@ -717,6 +741,38 @@ mod tests {
             vec![Block::Code { lang: None, text: "a\n".into(), closed: true }]
         );
         assert_eq!(parse("~~~\nb\n~~~"), vec![Block::Code { lang: None, text: "b\n".into(), closed: true }]);
+    }
+
+    fn code_closed(source: &str) -> Vec<bool> {
+        fn walk(blocks: &[Block], out: &mut Vec<bool>) {
+            for block in blocks {
+                match block {
+                    Block::Code { closed, .. } => out.push(*closed),
+                    Block::Quote(inner) => walk(inner, out),
+                    Block::List { items, .. } => items.iter().for_each(|i| walk(&i.blocks, out)),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&parse(source), &mut out);
+        out
+    }
+
+    /// SME-30 code review: a fence ended by its quote or list item (with
+    /// more of the reply after it) is finished, and a content line that
+    /// only looks like a fence (indented four spaces, or behind a `>` in a
+    /// top-level block) doesn't close one.
+    #[test]
+    fn test_fence_closed_follows_what_pulldown_cmark_ended() {
+        assert_eq!(code_closed("> ```rust\n> fn a() {}\n\nafter"), vec![true], "ended by its quote");
+        assert_eq!(code_closed("- ```rust\n  fn a() {}\n\nafter"), vec![true], "ended by its list item");
+        assert_eq!(code_closed("> ```rust\n> fn a() {}\n> ```"), vec![true], "closed inside a quote");
+        assert_eq!(code_closed("```\ncode\n    ```"), vec![false], "an indented fence-like line is content");
+        assert_eq!(code_closed("```md\n> ```"), vec![false], "a quoted fence-like line is content");
+        assert_eq!(code_closed("```\n```"), vec![true], "an empty closed block");
+        assert_eq!(code_closed("```"), vec![false], "just the opening fence");
+        assert_eq!(code_closed("```py\nprint(1)\n``"), vec![false], "a fence still arriving");
     }
 
     #[test]
