@@ -443,6 +443,7 @@ pub(super) fn run_turn_body<'a>(
                 stream: true,
                 tools: anthropic::tools::tool_definitions(pool).await,
                 thinking: turn_model.thinking.then_some(anthropic::ThinkingConfig::Adaptive),
+                prompt_caching: turn_model.prompt_caching,
             };
 
             // Every tab watching streams the reply: the text so far is kept

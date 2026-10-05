@@ -64,6 +64,13 @@ impl ProviderKind {
             Self::Other => AuthKind::Bearer,
         }
     }
+
+    /// Whether the new-provider form starts with prompt caching on: for
+    /// Anthropic, which bills cache reads at a tenth of the input price.
+    /// Another server may refuse the `cache_control` field.
+    pub fn default_prompt_caching(self) -> bool {
+        matches!(self, Self::Anthropic)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,6 +114,7 @@ pub struct ProviderSummary {
     pub base_url: String,
     pub auth_kind: AuthKind,
     pub secret_hint: Option<String>,
+    pub prompt_caching: bool,
 }
 
 /// What the new- and edit-provider forms send. On an edit, an empty
@@ -118,6 +126,8 @@ pub struct ProviderInput {
     pub base_url: String,
     pub auth_kind: AuthKind,
     pub secret: String,
+    /// Mark turn requests for prompt caching (SME-106).
+    pub prompt_caching: bool,
 }
 
 /// The last four characters of `secret`, shown as `…abcd`, or `None` for a
@@ -223,6 +233,8 @@ mod server {
         pub endpoint: Endpoint,
         pub model: String,
         pub thinking: bool,
+        /// The provider's prompt caching setting (SME-106).
+        pub prompt_caching: bool,
         pub context_window: u32,
         /// Thinking blocks in messages up to this id were written for
         /// another provider or model, and aren't replayed.
@@ -245,6 +257,7 @@ mod server {
             Self {
                 id: provider.id,
                 secret_hint: secret_hint(&provider.secret),
+                prompt_caching: provider.prompt_caching,
                 kind: ProviderKind::parse(&provider.kind).unwrap_or(ProviderKind::Other),
                 auth_kind: AuthKind::parse(&provider.auth_kind).unwrap_or(AuthKind::ApiKey),
                 name: provider.name,
@@ -415,6 +428,7 @@ mod server {
             .map_err(db_error)?;
         Ok(Some(TurnModel {
             endpoint: endpoint(&provider),
+            prompt_caching: provider.prompt_caching,
             thinking: thinking(settings.as_ref()),
             context_window: context_window(&model, settings.as_ref()).0,
             thinking_stripped_through,
@@ -472,6 +486,7 @@ mod server {
             &input.base_url,
             input.auth_kind.as_str(),
             &input.secret,
+            input.prompt_caching,
         )
         .await
         .map_err(|e| save_error(&input.name, e))?;
@@ -506,6 +521,7 @@ mod server {
             &input.base_url,
             input.auth_kind.as_str(),
             secret,
+            input.prompt_caching,
         )
         .await
         .map_err(|e| save_error(&input.name, e))?
@@ -877,7 +893,7 @@ mod tests {
         }
 
         async fn provider(pool: &PgPool, name: &str, auth_kind: &str) -> db::InferenceProvider {
-            db::create_inference_provider(pool, name, "ollama", "http://ollama:11434", auth_kind, "the-secret")
+            db::create_inference_provider(pool, name, "ollama", "http://ollama:11434", auth_kind, "the-secret", false)
                 .await
                 .expect("create provider")
         }
@@ -952,6 +968,7 @@ mod tests {
                     },
                     model: "m1".to_string(),
                     thinking: false,
+                    prompt_caching: false,
                     context_window: 64_000,
                     thinking_stripped_through: None,
                 }
@@ -1037,6 +1054,7 @@ mod tests {
                 base_url: base_url.to_string(),
                 auth_kind: AuthKind::ApiKey,
                 secret: secret.to_string(),
+                prompt_caching: false,
             }
         }
 
@@ -1064,6 +1082,7 @@ mod tests {
                     base_url: "http://ollama:11434".to_string(),
                     auth_kind: AuthKind::ApiKey,
                     secret_hint: Some("\u{2026}7890".to_string()),
+                    prompt_caching: false,
                 }
             );
             assert!(received(&mut app_events, &crate::events::AppEvent::ProvidersChanged));
@@ -1078,6 +1097,13 @@ mod tests {
             assert_eq!(kept.secret_hint, created.secret_hint, "a blank secret keeps the stored one");
             let stored = db::get_inference_provider(&pool, created.id).await.expect("get").expect("exists");
             assert_eq!(stored.secret, "secret-1234567890");
+            let caching = update_provider(&pool, created.id, ProviderInput {
+                prompt_caching: true,
+                ..input("Home", "http://ollama:11434", "")
+            })
+            .await
+            .expect("turn caching on");
+            assert!(caching.prompt_caching, "the form's choice is saved and shown");
             assert_eq!(
                 update_provider(&pool, created.id + 100, input("Z", "http://h", "")).await,
                 Err("That provider no longer exists.".to_string())
@@ -1132,7 +1158,7 @@ mod tests {
         #[sqlx::test]
         async fn test_an_ollama_providers_models_come_with_their_details(pool: PgPool) {
             let base = mock_ollama().await;
-            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k")
+            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false)
                 .await
                 .expect("create");
             set_model_settings(&pool, p.id, "typed-by-hand", None, Some(16_384)).await.expect("set");
@@ -1162,7 +1188,7 @@ mod tests {
         #[sqlx::test]
         async fn test_a_quick_listing_skips_the_per_model_questions(pool: PgPool) {
             let base = mock_ollama().await;
-            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k")
+            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false)
                 .await
                 .expect("create");
             let listing = provider_models(&pool, p.id, false).await.expect("models");
@@ -1194,7 +1220,7 @@ mod tests {
         #[sqlx::test]
         async fn test_a_model_the_provider_dropped_isnt_shown(pool: PgPool) {
             let base = mock_ollama().await;
-            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k")
+            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false)
                 .await
                 .expect("create");
             db::set_provider_model_reported(&pool, p.id, "removed", Some(4096), None, Some(true))
@@ -1236,7 +1262,7 @@ mod tests {
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
-            let p = db::create_inference_provider(&pool, "o", "ollama", &format!("http://{addr}"), "api_key", "k")
+            let p = db::create_inference_provider(&pool, "o", "ollama", &format!("http://{addr}"), "api_key", "k", false)
                 .await
                 .expect("create");
 
@@ -1249,7 +1275,7 @@ mod tests {
 
         #[sqlx::test]
         async fn test_an_unreachable_providers_models_still_list_what_is_stored(pool: PgPool) {
-            let p = db::create_inference_provider(&pool, "gone", "anthropic", "http://127.0.0.1:1", "api_key", "k")
+            let p = db::create_inference_provider(&pool, "gone", "anthropic", "http://127.0.0.1:1", "api_key", "k", false)
                 .await
                 .expect("create");
             set_model_settings(&pool, p.id, "claude-opus-5", Some(true), None).await.expect("set");
@@ -1333,6 +1359,7 @@ pub(crate) mod test_support {
             &format!("http://{addr}"),
             "api_key",
             "test-key",
+            false,
         )
         .await
         .expect("create the mock provider");

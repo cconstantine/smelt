@@ -1887,6 +1887,8 @@ pub struct InferenceProvider {
     pub auth_kind: String,
     /// Never sent to the browser; `providers::secret_hint` is.
     pub secret: String,
+    /// Mark turn requests for prompt caching (SME-106).
+    pub prompt_caching: bool,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -1900,6 +1902,7 @@ impl std::fmt::Debug for InferenceProvider {
             .field("kind", &self.kind)
             .field("base_url", &self.base_url)
             .field("auth_kind", &self.auth_kind)
+            .field("prompt_caching", &self.prompt_caching)
             .field("secret", &"..")
             .finish_non_exhaustive()
     }
@@ -1912,16 +1915,18 @@ pub async fn create_inference_provider(
     base_url: &str,
     auth_kind: &str,
     secret: &str,
+    prompt_caching: bool,
 ) -> Result<InferenceProvider, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
-        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret)
-         VALUES ($1, $2, $3, $4, $5) RETURNING *",
+        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret, prompt_caching)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
     )
     .bind(name)
     .bind(kind)
     .bind(base_url)
     .bind(auth_kind)
     .bind(secret)
+    .bind(prompt_caching)
     .fetch_one(pool)
     .await
 }
@@ -1952,11 +1957,12 @@ pub async fn update_inference_provider(
     base_url: &str,
     auth_kind: &str,
     secret: Option<&str>,
+    prompt_caching: bool,
 ) -> Result<Option<InferenceProvider>, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
         "UPDATE inference_providers
          SET name = $2, kind = $3, base_url = $4, auth_kind = $5,
-             secret = COALESCE($6, secret), updated_at = now()
+             secret = COALESCE($6, secret), prompt_caching = $7, updated_at = now()
          WHERE id = $1 RETURNING *",
     )
     .bind(id)
@@ -1965,6 +1971,7 @@ pub async fn update_inference_provider(
     .bind(base_url)
     .bind(auth_kind)
     .bind(secret)
+    .bind(prompt_caching)
     .fetch_optional(pool)
     .await
 }
@@ -4077,7 +4084,7 @@ mod tests {
     // --- Model providers (SME-72) ---
 
     async fn test_provider(pool: &PgPool, name: &str) -> InferenceProvider {
-        create_inference_provider(pool, name, "anthropic", "https://api.anthropic.com", "api_key", "sk-ant-0123456789")
+        create_inference_provider(pool, name, "anthropic", "https://api.anthropic.com", "api_key", "sk-ant-0123456789", false)
             .await
             .expect("create provider")
     }
@@ -4089,7 +4096,7 @@ mod tests {
         let created = test_provider(&pool, "anthropic").await;
         assert_eq!(list_inference_providers(&pool).await.expect("list"), vec![created.clone()]);
 
-        let renamed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", None)
+        let renamed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", None, false)
             .await
             .expect("update")
             .expect("exists");
@@ -4099,14 +4106,15 @@ mod tests {
         );
         assert_eq!(renamed.secret, "sk-ant-0123456789", "no new secret keeps the stored one");
 
-        let rekeyed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", Some("new-secret"))
+        let rekeyed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", Some("new-secret"), true)
             .await
             .expect("update")
             .expect("exists");
         assert_eq!(rekeyed.secret, "new-secret");
+        assert!(!renamed.prompt_caching && rekeyed.prompt_caching, "set outright by each update");
 
         assert_eq!(
-            update_inference_provider(&pool, 999_999, "x", "other", "u", "bearer", None).await.expect("update"),
+            update_inference_provider(&pool, 999_999, "x", "other", "u", "bearer", None, false).await.expect("update"),
             None
         );
     }

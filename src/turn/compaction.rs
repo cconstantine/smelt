@@ -378,6 +378,7 @@ pub(super) async fn compact_conversation(
         stream: true,
         tools: vec![],
         thinking: None,
+        prompt_caching: false,
     };
 
     let mut discard_deltas = |_: &str| {};

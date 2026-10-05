@@ -413,6 +413,7 @@ struct ProviderForm {
     base_url: String,
     auth_kind: AuthKind,
     secret: String,
+    prompt_caching: bool,
 }
 
 impl ProviderForm {
@@ -423,6 +424,7 @@ impl ProviderForm {
             base_url: String::new(),
             auth_kind: kind.default_auth_kind(),
             secret: String::new(),
+            prompt_caching: kind.default_prompt_caching(),
         }
     }
 
@@ -433,6 +435,7 @@ impl ProviderForm {
             base_url: provider.base_url.clone(),
             auth_kind: provider.auth_kind,
             secret: String::new(),
+            prompt_caching: provider.prompt_caching,
         }
     }
 
@@ -443,6 +446,7 @@ impl ProviderForm {
             base_url: self.base_url.clone(),
             auth_kind: self.auth_kind,
             secret: self.secret.clone(),
+            prompt_caching: self.prompt_caching,
         }
     }
 }
@@ -477,6 +481,7 @@ fn ProviderFields(
                         f.kind = kind;
                         if is_new {
                             f.auth_kind = kind.default_auth_kind();
+                            f.prompt_caching = kind.default_prompt_caching();
                         }
                     }
                 },
@@ -520,6 +525,15 @@ fn ProviderFields(
                 value: "{form().secret}", oninput: move |e| form.write().secret = e.value() }
             p { class: "muted",
                 "Stays on the server: pages only ever show its last four characters. A local Ollama needs one but ignores it, so any value does."
+            }
+
+            label { class: "provider-checkbox",
+                input { id: "provider-caching", r#type: "checkbox", checked: form().prompt_caching,
+                    onchange: move |e| form.write().prompt_caching = e.checked() }
+                "Prompt caching"
+            }
+            p { class: "muted",
+                "Marks each turn's request so the server can reuse the conversation so far instead of reading it again; on Anthropic a cached read costs a tenth of the input price. Turn it off if this server refuses requests with a cache_control error."
             }
 
             super::ErrorText { message: error }

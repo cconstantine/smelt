@@ -798,6 +798,7 @@ async fn test_a_bearer_providers_turn_sends_its_token_as_a_bearer_header(pool: P
         &format!("http://{addr}"),
         "bearer",
         "hf-token",
+        false,
     )
     .await
     .expect("create provider");
@@ -1353,6 +1354,65 @@ async fn test_compaction_keeps_its_own_system_prompt(pool: PgPool) {
         &prompt_environment(&pool, conversation.id, crate::providers::test_support::MOCK_MODEL).await,
     );
     assert_eq!(requests[1]["system"].as_str(), Some(expected.as_str()));
+}
+
+/// On a provider with prompt caching on, the turn's request carries both
+/// cache markers; compaction's one-off summarization call carries neither.
+#[sqlx::test]
+async fn test_a_caching_provider_marks_turn_requests_but_not_compaction(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    db::create_message(
+        &pool,
+        conversation.id,
+        "user",
+        &[anthropic::ContentBlock::Text {
+            text: "earlier message".to_string(),
+        }],
+    )
+    .await
+    .expect("seed earlier message");
+    db::upsert_conversation_usage(
+        &pool,
+        conversation.id,
+        &anthropic::TokenUsage {
+            input_tokens: 190_000,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+    )
+    .await
+    .expect("seed usage");
+    let requests = start_recording_mock_upstream(&pool, vec![
+        text_reply_body("Summary: nothing live."),
+        text_reply_body("Hi again"),
+    ])
+    .await;
+    sqlx::query("UPDATE inference_providers SET prompt_caching = true")
+        .execute(&pool)
+        .await
+        .expect("turn caching on");
+
+    run_turn(&pool, conversation.id, hello())
+        .await
+        .expect("run_turn should succeed");
+
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests.len(), 2, "a compaction call, then the real turn");
+    assert!(requests[0].get("cache_control").is_none(), "compaction isn't marked: {}", requests[0]);
+    assert_eq!(requests[0]["system"].as_str(), Some(COMPACTION_SYSTEM_PROMPT));
+    let ephemeral = serde_json::json!({"type": "ephemeral"});
+    assert_eq!(requests[1]["cache_control"], ephemeral);
+    let expected = system_prompt(
+        &prompt_environment(&pool, conversation.id, crate::providers::test_support::MOCK_MODEL).await,
+    );
+    assert_eq!(
+        requests[1]["system"],
+        serde_json::json!([{"type": "text", "text": expected, "cache_control": ephemeral}])
+    );
 }
 
 /// The detail view shows exactly the system prompt a turn sends.

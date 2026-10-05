@@ -3173,6 +3173,17 @@ div.mcp-status-not-connected::before {
     flex-basis: 100%;
     margin: 0;
 }
+/* SME-106: the checkbox sits beside its label, like the MCP form's radios. */
+.mcp-add-form label.provider-checkbox {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+}
+.mcp-add-form .provider-checkbox input {
+    margin: 0;
+    padding: 0;
+}
 
 /* SME-72: /providers. */
 .providers-default {

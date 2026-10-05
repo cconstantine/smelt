@@ -412,9 +412,9 @@ fn request_body(request: &CreateMessageRequest, binding: Binding) -> Result<Valu
             for message in &mut stripped.messages {
                 message.content = super::types::strip_thinking(std::mem::take(&mut message.content));
             }
-            serde_json::to_value(&stripped)
+            stripped.to_body()
         }
-        _ => serde_json::to_value(request),
+        _ => request.to_body(),
     }
     .map_err(|e| format!("couldn't encode the model request: {e}"))?;
     if binding == Binding::DropBlock
@@ -539,10 +539,15 @@ pub async fn stream_anthropic_message(
             binding = next;
             continue;
         }
-        return Err(format!(
-            "model provider error {status}: {}",
-            provider_error_message(&body)
-        ));
+        let message = provider_error_message(&body);
+        // A server that doesn't know prompt caching names the field it
+        // refused; the fix is the provider's setting, not a retry.
+        let hint = if request.prompt_caching && message.contains("cache_control") {
+            " (This server may not support prompt caching: turn off \u{201c}Prompt caching\u{201d} on its provider.)"
+        } else {
+            ""
+        };
+        return Err(format!("model provider error {status}: {message}{hint}"));
     };
 
     let mut byte_stream = response.bytes_stream();
@@ -714,6 +719,7 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
         };
         let result = stream_anthropic_message(&endpoint, &request, |_| {}).await;
         assert!(result.is_err(), "a redirect isn't a reply");
@@ -945,6 +951,7 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
         };
 
         stream_anthropic_message(&test_endpoint(addr), &request, on_delta).await
@@ -1007,6 +1014,7 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
         };
         let result = stream_anthropic_message(&test_endpoint(addr), &request, |_| {}).await;
         (result, count.load(std::sync::atomic::Ordering::SeqCst))
@@ -1143,6 +1151,7 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking,
+            prompt_caching: false,
         }
     }
 
@@ -1196,6 +1205,45 @@ mod tests {
         stream_anthropic_message(&other, &request, |_| {}).await.expect("another provider");
         let other_seen = requests_seen(&other_record);
         assert!(!other_seen[0].has_binding_beta() && other_seen[0].drop_block().is_none(), "another provider is untouched");
+    }
+
+    #[tokio::test]
+    async fn test_a_caching_request_carries_both_markers_even_when_retried_stripped() {
+        let (endpoint, record) = recording_upstream(vec![(400, BINDING_BODY), (200, OK_BODY)]).await;
+        let mut request = request_replaying_thinking(None);
+        request.prompt_caching = true;
+        stream_anthropic_message(&endpoint, &request, |_| {}).await.expect("should recover");
+        let seen = requests_seen(&record);
+        assert_eq!(seen.len(), 2);
+        for (i, sent) in seen.iter().enumerate() {
+            assert_eq!(sent.body["cache_control"], serde_json::json!({"type": "ephemeral"}), "request {i}");
+            assert_eq!(
+                sent.body["system"][0]["cache_control"],
+                serde_json::json!({"type": "ephemeral"}),
+                "request {i}"
+            );
+        }
+    }
+
+    /// What a strict server says to the top-level `cache_control`.
+    const CACHE_CONTROL_REFUSED_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"cache_control: Extra inputs are not permitted"}}"#;
+
+    #[tokio::test]
+    async fn test_a_refused_cache_marker_names_the_provider_setting() {
+        let (endpoint, _record) = recording_upstream(vec![(400, CACHE_CONTROL_REFUSED_BODY)]).await;
+        let mut request = request_replaying_thinking(None);
+        request.prompt_caching = true;
+        let error = stream_anthropic_message(&endpoint, &request, |_| {}).await.expect_err("refused");
+        assert!(error.contains("cache_control: Extra inputs are not permitted"), "keeps the server's words: {error}");
+        assert!(error.contains("Prompt caching"), "names the setting to turn off: {error}");
+    }
+
+    #[tokio::test]
+    async fn test_a_400_without_caching_gets_no_caching_hint() {
+        let (endpoint, _record) = recording_upstream(vec![(400, CACHE_CONTROL_REFUSED_BODY)]).await;
+        let request = request_replaying_thinking(None);
+        let error = stream_anthropic_message(&endpoint, &request, |_| {}).await.expect_err("refused");
+        assert!(!error.contains("Prompt caching"), "{error}");
     }
 
     #[tokio::test]
@@ -1549,6 +1597,7 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
         };
 
         let result = tokio::time::timeout(
@@ -1610,6 +1659,7 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
         };
 
         let endpoint = Endpoint {
@@ -1671,6 +1721,7 @@ mod tests {
                 stream: true,
                 tools: vec![],
                 thinking: None,
+                prompt_caching: false,
             },
             Binding::AsIs,
             std::time::Duration::from_secs(5),
