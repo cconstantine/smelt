@@ -69,7 +69,4 @@ docker pull -q "$DOCKER_IMAGE"
 docker save -o "$DOCKER_TAR_PATH" "$DOCKER_IMAGE"
 cargo run --bin sandbox_image_import --features server -- "$DOCKER_TAR_PATH"
 
-# The record file earlier versions wrote; cluster-doctor no longer reads it.
-rm -f target/sandbox-image/agent-sources.sha256
-
 echo "$TAGS and $DOCKER_IMAGE built and imported into the cluster"

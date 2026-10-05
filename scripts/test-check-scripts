@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Checks that the scripts a session runs for the gate and for hands-on
+# checks delete no files (SME-107), and scripts/check-server's state files:
+# emptied rather than removed, an empty one meaning "not running" or "no
+# scratch database". Needs no cluster or database: dx, sqlx, curl and the
+# image check are stubs. Claude Code's safety check refuses a command whose
+# scripts remove files, so this keeps everything it writes, under
+# target/test-check-scripts, overwritten on the next run.
+#
+#   scripts/test-check-scripts
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+failures=0
+fail() {
+    echo "FAIL: $*" >&2
+    failures=$((failures + 1))
+}
+
+# None of the scripts the gate or a hands-on check runs removes a file.
+for script in scripts/check-server scripts/browser-tier scripts/check.sh scripts/build-sandbox-image.sh; do
+    if found=$(grep -nE '(^|[^[:alnum:]_-])(rm|rmdir|unlink|shred)([[:space:]]|$)|-delete([[:space:]]|$)' "$script" | grep -vE '^[0-9]+:[[:space:]]*#'); then
+        fail "$script removes files: $found"
+    fi
+done
+
+dir=$PWD/target/test-check-scripts
+mkdir -p "$dir/bin"
+
+# dx serve: runs until stopped, like the real one.
+cat >"$dir/bin/dx" <<'EOF'
+#!/usr/bin/env bash
+exec sleep 600
+EOF
+# sqlx: records each call, one per line.
+cat >"$dir/bin/sqlx" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >>"$SQLX_CALLS"
+EOF
+# curl: the server is up at once.
+cat >"$dir/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+# The image check: the cluster has it.
+cat >"$dir/bin/import" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$dir/bin/dx" "$dir/bin/sqlx" "$dir/bin/curl" "$dir/bin/import"
+
+# The check worktree: a clone sharing this repo's objects, so it can check
+# out any commit here without registering a worktree. Reused across runs.
+worktree=$dir/worktree
+[ -d "$worktree/.git" ] || git clone -q --shared --no-checkout "$PWD" "$worktree" || exit 1
+
+export SQLX_CALLS=$dir/sqlx-calls
+pid_file=$worktree/.check-server.pid
+scratch_file=$worktree/.check-server.scratch-db
+check_server() {
+    env -u SANDBOX_IMAGE PATH="$dir/bin:$PATH" CHECK_WORKTREE="$worktree" \
+        SANDBOX_IMAGE_IMPORT="$dir/bin/import" DATABASE_URL=postgres://u@localhost/smelt_dev \
+        scripts/check-server "$@" 2>&1
+}
+scratch_url=postgres://u@localhost/smelt_scratch_worktree
+
+# Whatever an earlier, failed run left running.
+check_server stop >/dev/null
+: >"$SQLX_CALLS"
+
+# start with a scratch database: both state files written.
+if ! out=$(CHECK_SCRATCH_DB=1 check_server start HEAD); then
+    fail "start: $out"
+fi
+pgid=$(cat "$pid_file" 2>/dev/null)
+[ -n "$pgid" ] && pgrep -g "$pgid" >/dev/null || fail "after start, the pid file names no live group: '$pgid'"
+[ "$(cat "$scratch_file" 2>/dev/null)" = "$scratch_url" ] || fail "after start, the scratch file holds '$(cat "$scratch_file" 2>/dev/null)'"
+grep -qx "database create --database-url $scratch_url" "$SQLX_CALLS" || fail "start didn't create the scratch database: $(cat "$SQLX_CALLS")"
+case "$(check_server status)" in running*) ;; *) fail "status after start: $(check_server status)" ;; esac
+
+# stop: the group gone, the database dropped, both files kept and empty.
+: >"$SQLX_CALLS"
+out=$(check_server stop)
+[ -n "$pgid" ] && pgrep -g "$pgid" >/dev/null && fail "after stop, group $pgid is still running"
+grep -qx "database drop -y --database-url $scratch_url" "$SQLX_CALLS" || fail "stop didn't drop the scratch database: $(cat "$SQLX_CALLS")"
+for file in "$pid_file" "$scratch_file"; do
+    if [ ! -e "$file" ]; then
+        fail "stop removed $(basename "$file")"
+    elif [ -s "$file" ]; then
+        fail "after stop, $(basename "$file") holds '$(cat "$file")'"
+    fi
+done
+[ "$(check_server status)" = "not running" ] || fail "status after stop: $(check_server status)"
+
+# stop again: nothing running, nothing to drop.
+: >"$SQLX_CALLS"
+out=$(check_server stop)
+grep -q "no check server running" <<<"$out" || fail "a second stop said: $out"
+[ -s "$SQLX_CALLS" ] && fail "a second stop called sqlx: $(cat "$SQLX_CALLS")"
+
+# start again, without a scratch database, over the emptied files.
+if ! out=$(check_server start HEAD); then
+    fail "a second start: $out"
+fi
+[ -s "$scratch_file" ] && fail "a start without CHECK_SCRATCH_DB left '$(cat "$scratch_file")' to drop"
+check_server stop >/dev/null
+
+# A crashed run: a pid file naming a dead group, and a scratch database
+# never dropped. status says not running, stop drops the database, and a
+# start goes ahead.
+dead=$(bash -c 'echo $$')
+echo "$dead" >"$pid_file"
+echo "$scratch_url" >"$scratch_file"
+[ "$(check_server status)" = "not running" ] || fail "status with a dead pid: $(check_server status)"
+: >"$SQLX_CALLS"
+check_server stop >/dev/null
+grep -qx "database drop -y --database-url $scratch_url" "$SQLX_CALLS" || fail "stop after a crash didn't drop the scratch database: $(cat "$SQLX_CALLS")"
+[ -e "$pid_file" ] && [ ! -s "$pid_file" ] || fail "stop after a crash didn't leave an empty pid file"
+echo "$dead" >"$pid_file"
+if ! out=$(check_server start HEAD); then
+    fail "start over a dead pid: $out"
+fi
+check_server stop >/dev/null
+
+if [ "$failures" -gt 0 ]; then
+    echo "$failures failure(s)"
+    exit 1
+fi
+echo "all check-script tests passed"
