@@ -308,10 +308,13 @@ pub struct ModelCall<'a> {
 pub async fn record_model_call(pool: &PgPool, call: &ModelCall<'_>) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query(
+        // The provider as it is now: a turn reads it when it starts, and the
+        // user may delete it before the reply finishes. A deleted one gives
+        // null, as the deletion's own SET NULL would (code review 1).
         "INSERT INTO model_call_usage
              (conversation_id, provider_id, model, kind, input_tokens, output_tokens,
               cache_creation_input_tokens, cache_read_input_tokens, cost_usd)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+         VALUES ($1, (SELECT id FROM inference_providers WHERE id = $2), $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(call.conversation_id)
     .bind(call.provider_id)
@@ -4350,6 +4353,39 @@ mod tests {
             ],
             "costliest first; the 31-day-old call is out; a deleted provider's calls stay"
         );
+    }
+
+    /// A turn reads its provider when it starts; the user may delete the
+    /// provider before the reply finishes. The call is still recorded, with
+    /// no provider, as rows the deletion itself nulls (code review 1).
+    #[sqlx::test]
+    async fn test_a_call_on_a_provider_deleted_mid_turn_is_recorded_without_it(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let provider = test_provider(&pool, "gone").await;
+        delete_inference_provider(&pool, provider.id).await.expect("delete");
+
+        record_model_call(
+            &pool,
+            &ModelCall {
+                conversation_id: conversation.id,
+                provider_id: provider.id,
+                model: "m",
+                kind: ModelCallKind::Turn,
+                usage: usage(10, 1, 0, 0),
+                cost_usd: None,
+            },
+        )
+        .await
+        .expect("a deleted provider doesn't fail the turn");
+
+        let provider_id: Option<i64> =
+            sqlx::query_scalar("SELECT provider_id FROM model_call_usage WHERE conversation_id = $1")
+                .bind(conversation.id)
+                .fetch_one(&pool)
+                .await
+                .expect("the row");
+        assert_eq!(provider_id, None);
+        assert_eq!(get_conversation_usage(&pool, conversation.id).await.expect("usage"), Some(usage(10, 1, 0, 0)));
     }
 
     /// Mechanical CRUD, mirroring the MCP server table's: a characterization
