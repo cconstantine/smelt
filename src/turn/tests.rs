@@ -799,6 +799,7 @@ async fn test_a_bearer_providers_turn_sends_its_token_as_a_bearer_header(pool: P
         "bearer",
         "hf-token",
         false,
+        None,
     )
     .await
     .expect("create provider");
@@ -1515,6 +1516,52 @@ async fn test_each_model_call_of_a_turn_is_recorded_with_its_usage(pool: PgPool)
         (3, 6_100, 5_000, 347),
         "the detail view sums every call, compaction included"
     );
+}
+
+/// Each call is priced from the catalog when it's recorded, as the
+/// provider's catalog entry; a provider without one records no cost.
+#[sqlx::test]
+async fn test_each_recorded_call_is_priced_from_the_catalog(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    start_recording_mock_upstream(&pool, vec![with_usage(&text_reply_body("Hi!"), 10_000, 100_000, 1_000)]).await;
+    let mut providers = crate::pricing::Providers::new();
+    providers.insert(
+        "priced".to_string(),
+        crate::pricing::CatalogProvider {
+            name: "Priced".to_string(),
+            api: None,
+            models: [(
+                crate::providers::test_support::MOCK_MODEL.to_string(),
+                crate::pricing::ModelPrices {
+                    base: crate::pricing::Prices { input: 4.0, output: 20.0, cache_read: Some(0.2), cache_write: Some(5.0) },
+                    tiers: vec![],
+                },
+            )]
+            .into(),
+        },
+    );
+    crate::pricing::CATALOG.set_for_test(providers);
+
+    run_turn(&pool, conversation.id, hello()).await.expect("unpriced turn");
+    sqlx::query("UPDATE inference_providers SET price_catalog_provider = 'priced'")
+        .execute(&pool)
+        .await
+        .expect("price the mock provider");
+    run_turn(&pool, conversation.id, hello()).await.expect("priced turn");
+
+    let costs: Vec<Option<f64>> =
+        sqlx::query_scalar("SELECT cost_usd FROM model_call_usage WHERE conversation_id = $1 ORDER BY id")
+            .bind(conversation.id)
+            .fetch_all(&pool)
+            .await
+            .expect("costs");
+    // 10k uncached at $4, 100k read at $0.20, 1k out at $20 per million.
+    assert_eq!(costs.len(), 2);
+    assert_eq!(costs[0], None, "no catalog entry, no cost");
+    assert!((costs[1].expect("priced") - 0.08).abs() < 1e-9, "{costs:?}");
 }
 
 /// The detail view shows exactly the system prompt a turn sends.

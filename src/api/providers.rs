@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
 use crate::db;
-use crate::providers::{ModelChoice, ModelInfo, ProviderInput, ProviderModels, ProviderSummary};
+use crate::providers::{ModelChoice, ModelInfo, PriceSource, ProviderInput, ProviderModels, ProviderSummary};
 
 #[get("/api/providers")]
 pub async fn list_providers() -> ServerFnResult<Vec<ProviderSummary>> {
@@ -38,6 +38,13 @@ pub async fn update_provider(id: i64, input: ProviderInput) -> ServerFnResult<Pr
     crate::providers::update_provider(db::get(), id, input)
         .await
         .map_err(ServerFnError::new)
+}
+
+/// The price catalog's providers, by name, for the form's "Prices from"
+/// choice; empty until the catalog is first fetched (SME-106).
+#[get("/api/price-sources")]
+pub async fn list_price_sources() -> ServerFnResult<Vec<PriceSource>> {
+    Ok(crate::pricing::price_sources())
 }
 
 #[delete("/api/providers/{id}")]

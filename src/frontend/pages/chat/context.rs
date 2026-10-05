@@ -448,7 +448,13 @@ pub(super) fn ContextUsage(
                                     "cache write: {detail.spend.cache_creation_input_tokens}, cache read: {detail.spend.cache_read_input_tokens}, "
                                     "output: {detail.spend.output_tokens}"
                                 }
-                                p { class: "muted", "Completed calls only: a stopped or failed call isn't counted." }
+                                p { class: "muted",
+                                    "Completed calls only: a stopped or failed call isn't counted. Each call is priced from models.dev's list "
+                                    "when it finished, without time-of-day surcharges such as DeepSeek's peak hours."
+                                    if let Some(at) = detail.prices_as_of {
+                                        {format!(" Prices as of {} UTC.", at.format("%Y-%m-%d %H:%M"))}
+                                    }
+                                }
                             }
                             h4 { "Tools ({detail.tools.len()})" }
                             for tool in &detail.tools {

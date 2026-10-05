@@ -519,7 +519,11 @@ pub(super) fn run_turn_body<'a>(
                     model: &turn_model.model,
                     kind: db::ModelCallKind::Turn,
                     usage: turn.usage,
-                    cost_usd: None,
+                    cost_usd: crate::pricing::call_cost(
+                        turn_model.price_catalog_provider.as_deref(),
+                        &turn_model.model,
+                        &turn.usage,
+                    ),
                 },
             )
             .await

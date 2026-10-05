@@ -222,6 +222,31 @@ pub async fn upsert_conversation_usage(
     Ok(())
 }
 
+/// The saved price catalog (SME-106): when it was fetched, and
+/// `pricing::Providers` as JSON.
+pub async fn get_price_catalog(
+    pool: &PgPool,
+) -> Result<Option<(NaiveDateTime, serde_json::Value)>, sqlx::Error> {
+    sqlx::query_as("SELECT fetched_at, providers FROM price_catalog").fetch_optional(pool).await
+}
+
+/// Replaces the saved price catalog.
+pub async fn save_price_catalog(
+    pool: &PgPool,
+    fetched_at: NaiveDateTime,
+    providers: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO price_catalog (id, fetched_at, providers) VALUES (TRUE, $1, $2)
+         ON CONFLICT (id) DO UPDATE SET fetched_at = EXCLUDED.fetched_at, providers = EXCLUDED.providers",
+    )
+    .bind(fetched_at)
+    .bind(providers)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Which request a `model_call_usage` row is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelCallKind {
@@ -1965,6 +1990,8 @@ pub struct InferenceProvider {
     pub secret: String,
     /// Mark turn requests for prompt caching (SME-106).
     pub prompt_caching: bool,
+    /// The models.dev provider that prices its calls (SME-106).
+    pub price_catalog_provider: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -1979,6 +2006,7 @@ impl std::fmt::Debug for InferenceProvider {
             .field("base_url", &self.base_url)
             .field("auth_kind", &self.auth_kind)
             .field("prompt_caching", &self.prompt_caching)
+            .field("price_catalog_provider", &self.price_catalog_provider)
             .field("secret", &"..")
             .finish_non_exhaustive()
     }
@@ -1992,10 +2020,11 @@ pub async fn create_inference_provider(
     auth_kind: &str,
     secret: &str,
     prompt_caching: bool,
+    price_catalog_provider: Option<&str>,
 ) -> Result<InferenceProvider, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
-        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret, prompt_caching)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
+        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret, prompt_caching, price_catalog_provider)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
     )
     .bind(name)
     .bind(kind)
@@ -2003,6 +2032,7 @@ pub async fn create_inference_provider(
     .bind(auth_kind)
     .bind(secret)
     .bind(prompt_caching)
+    .bind(price_catalog_provider)
     .fetch_one(pool)
     .await
 }
@@ -2034,11 +2064,13 @@ pub async fn update_inference_provider(
     auth_kind: &str,
     secret: Option<&str>,
     prompt_caching: bool,
+    price_catalog_provider: Option<&str>,
 ) -> Result<Option<InferenceProvider>, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
         "UPDATE inference_providers
          SET name = $2, kind = $3, base_url = $4, auth_kind = $5,
-             secret = COALESCE($6, secret), prompt_caching = $7, updated_at = now()
+             secret = COALESCE($6, secret), prompt_caching = $7, price_catalog_provider = $8,
+             updated_at = now()
          WHERE id = $1 RETURNING *",
     )
     .bind(id)
@@ -2048,6 +2080,7 @@ pub async fn update_inference_provider(
     .bind(auth_kind)
     .bind(secret)
     .bind(prompt_caching)
+    .bind(price_catalog_provider)
     .fetch_optional(pool)
     .await
 }
@@ -4160,7 +4193,7 @@ mod tests {
     // --- Model providers (SME-72) ---
 
     async fn test_provider(pool: &PgPool, name: &str) -> InferenceProvider {
-        create_inference_provider(pool, name, "anthropic", "https://api.anthropic.com", "api_key", "sk-ant-0123456789", false)
+        create_inference_provider(pool, name, "anthropic", "https://api.anthropic.com", "api_key", "sk-ant-0123456789", false, None)
             .await
             .expect("create provider")
     }
@@ -4251,7 +4284,7 @@ mod tests {
         let created = test_provider(&pool, "anthropic").await;
         assert_eq!(list_inference_providers(&pool).await.expect("list"), vec![created.clone()]);
 
-        let renamed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", None, false)
+        let renamed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", None, false, None)
             .await
             .expect("update")
             .expect("exists");
@@ -4261,15 +4294,19 @@ mod tests {
         );
         assert_eq!(renamed.secret, "sk-ant-0123456789", "no new secret keeps the stored one");
 
-        let rekeyed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", Some("new-secret"), true)
+        let rekeyed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", Some("new-secret"), true, Some("anthropic"))
             .await
             .expect("update")
             .expect("exists");
         assert_eq!(rekeyed.secret, "new-secret");
         assert!(!renamed.prompt_caching && rekeyed.prompt_caching, "set outright by each update");
+        assert_eq!(
+            (renamed.price_catalog_provider.as_deref(), rekeyed.price_catalog_provider.as_deref()),
+            (None, Some("anthropic"))
+        );
 
         assert_eq!(
-            update_inference_provider(&pool, 999_999, "x", "other", "u", "bearer", None, false).await.expect("update"),
+            update_inference_provider(&pool, 999_999, "x", "other", "u", "bearer", None, false, None).await.expect("update"),
             None
         );
     }

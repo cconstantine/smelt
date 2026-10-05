@@ -5,13 +5,13 @@ use dioxus::prelude::*;
 
 use crate::api::chat::{get_conversation_model, set_conversation_model};
 use crate::api::providers::{
-    add_provider_model, create_provider, delete_provider, get_default_model, get_provider, list_provider_models,
-    list_providers, refresh_model_details, set_default_model, set_model_settings, update_provider,
+    add_provider_model, create_provider, delete_provider, get_default_model, get_provider, list_price_sources,
+    list_provider_models, list_providers, refresh_model_details, set_default_model, set_model_settings, update_provider,
 };
 use crate::frontend::Route;
 use crate::providers::{
-    AuthKind, ConversationModel, ModelChoice, ModelInfo, ProviderInput, ProviderKind, ProviderSummary,
-    ASSUMED_CONTEXT_WINDOW,
+    suggest_price_source, AuthKind, ConversationModel, ModelChoice, ModelInfo, PriceSource, ProviderInput, ProviderKind,
+    ProviderSummary, ASSUMED_CONTEXT_WINDOW,
 };
 
 use super::server_error_message;
@@ -414,6 +414,10 @@ struct ProviderForm {
     auth_kind: AuthKind,
     secret: String,
     prompt_caching: bool,
+    /// The catalog provider that prices its calls (SME-106).
+    price_source: Option<String>,
+    /// Picked by the user: no longer follows the address.
+    price_source_chosen: bool,
 }
 
 impl ProviderForm {
@@ -425,6 +429,8 @@ impl ProviderForm {
             auth_kind: kind.default_auth_kind(),
             secret: String::new(),
             prompt_caching: kind.default_prompt_caching(),
+            price_source: None,
+            price_source_chosen: false,
         }
     }
 
@@ -436,6 +442,8 @@ impl ProviderForm {
             auth_kind: provider.auth_kind,
             secret: String::new(),
             prompt_caching: provider.prompt_caching,
+            price_source: provider.price_catalog_provider.clone(),
+            price_source_chosen: true,
         }
     }
 
@@ -447,6 +455,15 @@ impl ProviderForm {
             auth_kind: self.auth_kind,
             secret: self.secret.clone(),
             prompt_caching: self.prompt_caching,
+            price_catalog_provider: self.price_source.clone(),
+        }
+    }
+
+    /// Follows the address and kind with the suggested price source, until
+    /// the user picks one.
+    fn follow_suggestion(&mut self, sources: &[PriceSource]) {
+        if !self.price_source_chosen {
+            self.price_source = suggest_price_source(sources, self.kind, &self.base_url);
         }
     }
 }
@@ -461,6 +478,8 @@ fn ProviderFields(
     on_save: EventHandler<ProviderInput>,
 ) -> Element {
     let mut form = form;
+    let sources = use_resource(|| async { list_price_sources().await.unwrap_or_default() });
+    let source_list = move || sources().unwrap_or_default();
     let submit = move |event: Event<FormData>| {
         event.prevent_default();
         on_save.call(form().input());
@@ -483,6 +502,7 @@ fn ProviderFields(
                             f.auth_kind = kind.default_auth_kind();
                             f.prompt_caching = kind.default_prompt_caching();
                         }
+                        f.follow_suggestion(&source_list());
                     }
                 },
                 for kind in ProviderKind::ALL {
@@ -503,7 +523,11 @@ fn ProviderFields(
 
             label { r#for: "provider-url", "Base URL" }
             input { id: "provider-url", r#type: "url", required: true, placeholder: "{form().kind.base_url_placeholder()}",
-                value: "{form().base_url}", oninput: move |e| form.write().base_url = e.value() }
+                value: "{form().base_url}", oninput: move |e| {
+                    let mut f = form.write();
+                    f.base_url = e.value();
+                    f.follow_suggestion(&source_list());
+                } }
             p { class: "muted", "Turns go to this address's /v1/messages." }
 
             label { r#for: "provider-auth", "Sent as" }
@@ -534,6 +558,35 @@ fn ProviderFields(
             }
             p { class: "muted",
                 "Marks each turn's request so the server can reuse the conversation so far instead of reading it again; on Anthropic a cached read costs a tenth of the input price. Turn it off if this server refuses requests with a cache_control error."
+            }
+
+            label { r#for: "provider-prices", "Prices from" }
+            select {
+                id: "provider-prices",
+                onchange: move |e| {
+                    let mut f = form.write();
+                    f.price_source = Some(e.value()).filter(|v| !v.is_empty());
+                    f.price_source_chosen = true;
+                },
+                option { value: "", selected: form().price_source.is_none(), "None: show tokens only" }
+                // Kept when the list doesn't have it (not fetched yet, or
+                // gone from the catalog), so saving doesn't drop it.
+                if let Some(id) = form().price_source.filter(|id| !source_list().iter().any(|s| &s.id == id)) {
+                    option { value: "{id}", selected: true, "{id}" }
+                }
+                for source in source_list() {
+                    option { key: "{source.id}", value: "{source.id}",
+                        selected: form().price_source.as_deref() == Some(source.id.as_str()),
+                        "{source.name} ({source.id})" }
+                }
+            }
+            p { class: "muted",
+                "Each call's cost comes from this entry in the models.dev price list, refreshed hourly. Pick the plan's own entry for a flat-rate coding plan (its calls cost $0), or None for a local server."
+            }
+            if form().price_source.is_none() {
+                if let Some(suggested) = suggest_price_source(&source_list(), form().kind, &form().base_url) {
+                    p { class: "muted", "models.dev lists this address as \u{201c}{suggested}\u{201d}." }
+                }
             }
 
             super::ErrorText { message: error }
