@@ -50,11 +50,13 @@ echo "== cluster ($SANDBOX_IMAGE)"
 scripts/cluster-doctor
 
 echo "== server tests"
-log=$(mktemp)
-trap 'rm -f "$log"' EXIT
+# Kept, and overwritten by the next run: this script deletes no files, so a
+# session can run it unattended (SME-107).
+mkdir -p target/check
+log=target/check/server-tests.log
 if ! cargo test --features server >"$log" 2>&1; then
     grep -E 'FAILED|panicked|^error' -A3 "$log" | head -40
-    echo "server tests failed (full log: rerun without scripts/check.sh)"
+    echo "server tests failed (full log: $log)"
     exit 1
 fi
 grep -E '^test result' "$log" | tail -1

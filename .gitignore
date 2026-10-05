@@ -27,4 +27,5 @@ __pycache__/
 # scripts/check-server and scripts/ui-check (SME-51)
 .check-server.pid
 .check-server.log
+.check-server.scratch-db
 ui-check-out/
