@@ -53,14 +53,15 @@ echo "== cluster ($SANDBOX_IMAGE)"
 scripts/cluster-doctor || exit 1
 
 echo "== web bundle"
-log=$(mktemp)
+# Kept, and overwritten by the next run: this script deletes no files, so a
+# session can run it unattended (SME-107).
+mkdir -p target/browser-tier
+log=target/browser-tier/web-bundle.log
 if ! dx build --platform web >"$log" 2>&1; then
     tail -30 "$log"
-    rm -f "$log"
-    echo "dx build failed" >&2
+    echo "dx build failed (full log: $log)" >&2
     exit 1
 fi
-rm -f "$log"
 
 echo "== scratch database $name"
 # From empty, even after a run that failed to drop it.

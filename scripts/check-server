@@ -39,6 +39,9 @@ else
 fi
 worktree=${CHECK_WORKTREE:-$default_worktree}
 port=${CHECK_PORT:-8081}
+# The state files are emptied, never removed, so a session can run this
+# unattended (SME-107): an empty or missing one means nothing to stop.
+# Holds the running server's process group id.
 pid_file() { echo "$worktree/.check-server.pid"; }
 log_file() { echo "$worktree/.check-server.log"; }
 # Holds the scratch database's URL while one exists, so `stop` can drop it.
@@ -65,9 +68,9 @@ scratch_db_url() {
 drop_scratch_db() {
     local file
     file=$(scratch_db_file)
-    [ -f "$file" ] || return 0
+    [ -s "$file" ] || return 0
     sqlx database drop -y --database-url "$(cat "$file")" >/dev/null
-    rm -f "$file"
+    : >"$file"
     echo "dropped the scratch database"
 }
 
@@ -100,7 +103,7 @@ browser_check_cache() {
 running_pgid() {
     local file
     file=$(pid_file)
-    [ -f "$file" ] || return 1
+    [ -s "$file" ] || return 1
     local pgid
     pgid=$(cat "$file")
     # Still ours if a process in that group is still alive.
@@ -112,7 +115,7 @@ stop() {
     local pgid
     if ! pgid=$(running_pgid); then
         echo "no check server running"
-        rm -f "$(pid_file)"
+        [ -e "$(pid_file)" ] && : >"$(pid_file)"
         drop_scratch_db
         return 0
     fi
@@ -124,7 +127,7 @@ stop() {
     if pgrep -g "$pgid" >/dev/null 2>&1; then
         kill -KILL -- "-$pgid" 2>/dev/null || true
     fi
-    rm -f "$(pid_file)"
+    : >"$(pid_file)"
     echo "stopped the check server (process group $pgid)"
     # Only once the server is gone: Postgres won't drop a database in use.
     drop_scratch_db
