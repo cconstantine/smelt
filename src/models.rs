@@ -29,6 +29,21 @@ pub struct ConversationSpend {
     pub unpriced_calls: i64,
 }
 
+/// "1 model call", "2 model calls" (SME-106).
+pub fn calls_text(calls: i64) -> String {
+    if calls == 1 { "1 model call".to_string() } else { format!("{calls} model calls") }
+}
+
+#[cfg(test)]
+mod calls_text_tests {
+    #[test]
+    fn test_one_call_is_singular_and_others_plural() {
+        assert_eq!(super::calls_text(1), "1 model call");
+        assert_eq!(super::calls_text(2), "2 model calls");
+        assert_eq!(super::calls_text(0), "0 model calls");
+    }
+}
+
 /// What `calls` cost, said for a person (SME-106): `cost_usd` over the
 /// calls that had a price, `unpriced_calls` of them without one.
 pub fn cost_text(calls: i64, cost_usd: Option<f64>, unpriced_calls: i64) -> String {

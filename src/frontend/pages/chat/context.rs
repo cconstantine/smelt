@@ -431,7 +431,7 @@ pub(super) fn ContextUsage(
                             p { "{spend_cost_text(&detail.spend)}" }
                             if detail.spend.calls > 0 {
                                 p {
-                                    "{detail.spend.calls} model calls — uncached input: {detail.spend.input_tokens}, "
+                                    "{crate::models::calls_text(detail.spend.calls)} — uncached input: {detail.spend.input_tokens}, "
                                     "cache write: {detail.spend.cache_creation_input_tokens}, cache read: {detail.spend.cache_read_input_tokens}, "
                                     "output: {detail.spend.output_tokens}"
                                 }
