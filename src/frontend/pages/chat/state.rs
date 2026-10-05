@@ -221,14 +221,6 @@ pub(super) fn apply_event(state: Store<ConversationState>, event: ConversationEv
     EventEffect::None
 }
 
-/// Appends every message in `incoming` whose id isn't already present in
-/// `existing` — the same row can legitimately arrive twice (once via
-/// `send_message`'s own `ChatEvent::Done`, once via the live
-/// `MessagesAppended` broadcast, or via the one-shot reconciliation pull on
-/// (re)connect), and a duplicate id must never render as two bubbles.
-///
-/// Only called from the `web`-only live event-subscription loop below;
-/// exercised directly by this module's own tests otherwise.
 /// The message list to show once `conversation_id`'s messages have loaded:
 /// the loaded list, plus any saved message of that conversation already on
 /// screen that the load doesn't have. Opening a conversation starts two
@@ -252,7 +244,6 @@ pub(super) fn apply_loaded_messages(
     loaded
 }
 
-#[cfg(any(feature = "web", test))]
 /// Messages the server just saved (`MessagesAppended`), into the list on
 /// screen: each saved user message replaces one optimistic copy of itself
 /// (a negative id with the same text, shown the moment it was sent), then
@@ -289,6 +280,12 @@ pub(super) fn sent_part(message: &Message) -> Result<Vec<ContentBlock>, String> 
     }
 }
 
+/// Appends every message in `incoming` whose id isn't already present in
+/// `existing` — the same row can legitimately arrive twice (once via
+/// `send_message`'s own `ChatEvent::Done`, once via the live
+/// `MessagesAppended` broadcast, or via the one-shot reconciliation pull on
+/// (re)connect), and a duplicate id must never render as two bubbles.
+/// Called by `accept_saved_messages`.
 #[cfg(any(feature = "web", test))]
 pub(super) fn merge_messages_by_id(existing: &mut Vec<Message>, incoming: Vec<Message>) {
     for message in incoming {

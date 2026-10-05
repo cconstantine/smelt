@@ -106,6 +106,13 @@ pub(super) fn ConversationSidebar(
         });
     };
 
+    // Opening a row, by a click or from the keyboard.
+    let mut open_conversation = move |id: i64| {
+        pending_delete.set(None);
+        open_on_phone.set(false);
+        navigator.push(Route::ConversationRoute { id });
+    };
+
     // First click on a row's delete button arms it; a second click on the
     // same (still-armed) row confirms. Only one row is ever armed at a
     // time, so arming a different row implicitly cancels the last one.
@@ -148,12 +155,8 @@ pub(super) fn ConversationSidebar(
             Link { to: Route::SandboxVolumesRoute {}, class: "sandbox-volumes-link", "Sandbox volumes" }
             Link { to: Route::GitRoute {}, class: "sandbox-volumes-link git-link", "Git" }
             Link { to: Route::LanguageServersRoute {}, class: "sandbox-volumes-link language-servers-link", "Language servers" }
-            if let Some(err) = list_error() {
-                p { class: "error", "{err}" }
-            }
-            if let Some(err) = action_error() {
-                p { class: "error", "{err}" }
-            }
+            super::ErrorText { message: list_error() }
+            super::ErrorText { message: action_error() }
             if !loaded() {
                 p { class: "muted", "Loading..." }
             } else if conversations().is_empty() {
@@ -165,12 +168,31 @@ pub(super) fn ConversationSidebar(
                             key: "{conversation.id}",
                             "data-conversation-id": "{conversation.id}",
                             class: if selected() == Some(conversation.id) { "conversation-item active" } else { "conversation-item" },
-                            onclick: move |_| {
-                                pending_delete.set(None);
-                                open_on_phone.set(false);
-                                navigator.push(Route::ConversationRoute { id: conversation.id });
-                            },
-                            span { class: "conversation-title", "{conversation.title}" }
+                            onclick: move |_| open_conversation(conversation.id),
+                            // The title is the row's link and tab stop, which
+                            // Enter or Space opens (SME-58). Not the whole
+                            // row: its Delete would be inside the link, read
+                            // as part of its name and, by some screen
+                            // readers, not reachable at all.
+                            span {
+                                class: "conversation-title",
+                                tabindex: "0",
+                                role: "link",
+                                aria_current: if selected() == Some(conversation.id) { Some("page") } else { None },
+                                onkeydown: move |evt: Event<KeyboardData>| {
+                                    let opens = match evt.key() {
+                                        keyboard_types::Key::Enter => true,
+                                        keyboard_types::Key::Character(c) => c == " ",
+                                        _ => false,
+                                    };
+                                    if opens {
+                                        // Space would scroll the list too.
+                                        evt.prevent_default();
+                                        open_conversation(conversation.id);
+                                    }
+                                },
+                                "{conversation.title}"
+                            }
                             if is_busy(conversation.id) {
                                 span { class: "conversation-busy", title: "Working" }
                             }
@@ -183,13 +205,13 @@ pub(super) fn ConversationSidebar(
                             if let Some(now) = now_utc() {
                                 span { class: "conversation-age", {short_age((now - conversation.updated_at).num_seconds())} }
                             }
-                            button {
-                                class: if pending_delete() == Some(conversation.id) { "delete-conversation confirm" } else { "delete-conversation" },
-                                onclick: move |evt: Event<MouseData>| {
-                                    evt.stop_propagation();
-                                    request_delete(conversation.id);
-                                },
-                                super::TwoStepLabel { armed: pending_delete() == Some(conversation.id), idle: "Delete", confirm: "Confirm?" }
+                            super::TwoStepButton {
+                                armed: pending_delete() == Some(conversation.id),
+                                class: "delete-conversation",
+                                idle: "Delete",
+                                confirm: "Confirm?",
+                                on_arm: move |_| request_delete(conversation.id),
+                                on_confirm: move |_| request_delete(conversation.id),
                             }
                         }
                     }

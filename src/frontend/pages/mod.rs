@@ -41,13 +41,15 @@ pub(crate) fn ErrorText(message: Option<String>) -> Element {
 /// A two-step button: the first click arms it (`on_arm`), a click while
 /// it's armed confirms (`on_confirm`). The caller keeps the state, so one
 /// armed row out of many and a lone button both fit: `armed` says whether
-/// this one is. Armed, it carries the `confirm` class too.
+/// this one is. Armed, it carries the `confirm` class too. `title` is its
+/// tooltip, if it has one.
 #[component]
 pub(crate) fn TwoStepButton(
     armed: bool,
     class: &'static str,
     idle: &'static str,
     confirm: &'static str,
+    #[props(default)] title: Option<&'static str>,
     on_arm: EventHandler<()>,
     on_confirm: EventHandler<()>,
 ) -> Element {
@@ -55,6 +57,7 @@ pub(crate) fn TwoStepButton(
         button {
             class: if armed { "{class} confirm" } else { "{class}" },
             r#type: "button",
+            title,
             onclick: move |evt: Event<MouseData>| {
                 evt.stop_propagation();
                 if armed { on_confirm.call(()) } else { on_arm.call(()) }

@@ -775,6 +775,10 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "markdown_late_image", 90, Box::pin(scenario_markdown_late_image(&t))).await;
     run_scenario(&t, only, r, k, "markdown_long_reply", 90, Box::pin(scenario_markdown_long_reply(&t))).await;
     run_scenario(&t, only, r, k, "streaming_into_a_long_transcript", 120, Box::pin(scenario_streaming_into_a_long_transcript(&t))).await;
+    run_scenario(&t, only, r, k, "unreadable_message", 30, Box::pin(scenario_unreadable_message(&t))).await;
+    run_scenario(&t, only, r, k, "chat_errors_are_alerts", 30, Box::pin(scenario_chat_errors_are_alerts(&t))).await;
+    run_scenario(&t, only, r, k, "message_box_label", 30, Box::pin(scenario_message_box_label(&t))).await;
+    run_scenario(&t, only, r, k, "conversation_rows_by_keyboard", 60, Box::pin(scenario_conversation_rows_by_keyboard(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -2840,6 +2844,141 @@ async fn scenario_streaming_into_a_long_transcript(t: &Scenario<'_>) {
         long_script <= 3.0 * short_script.max(0.05),
         "streaming into 300 messages took {long_script:.2} s of script, against {short_script:.2} s into one"
     );
+}
+
+/// SME-57 (d), from SME-58: a conversation in the sidebar opens from the
+/// keyboard. Each row's title is a link and a tab stop that Enter or Space
+/// opens; the row itself isn't one, so its Delete isn't nested inside the
+/// link (a screen reader would read "Delete" as part of the link's name,
+/// and some can't reach a button inside a link). Delete stays a tab stop
+/// of its own: Enter on it arms it, without opening the conversation. The
+/// rows took mouse clicks only.
+async fn scenario_conversation_rows_by_keyboard(t: &Scenario<'_>) {
+    let first = t.conversation().await;
+    seed_user_message(t.pool, first.id, "the first row").await;
+    let second = t.conversation().await;
+    seed_user_message(t.pool, second.id, "the second row").await;
+    let page = t.tab(t.url(&format!("conversation/{}", first.id))).await;
+    wait_for_live_client(&page, first.id).await;
+    let row = |id: i64| format!("[data-conversation-id=\"{id}\"]");
+    let title = |id: i64| format!("{} .conversation-title", row(id));
+    let roles: serde_json::Value = page
+        .evaluate(format!(
+            "(() => {{ const r = document.querySelector('{}'), t = r.querySelector('.conversation-title'); \
+               return {{ row: r.getAttribute('role') || 'none', title: t.getAttribute('role') || 'none', tab: t.tabIndex }}; }})()",
+            row(second.id).replace('\'', "\\'")
+        ))
+        .await
+        .expect("read the row's roles")
+        .into_value()
+        .expect("facts");
+    assert_eq!(roles["title"], "link", "a row's title should be its link: {roles}");
+    assert_eq!(roles["row"], "none", "the row around the link and its Delete shouldn't be a link too: {roles}");
+    assert!(roles["tab"].as_i64().is_some_and(|t| t >= 0), "the title should be a tab stop: {roles}");
+    let at = |id: i64| format!("/conversation/{id}");
+    let url_now = |page: &chromiumoxide::Page| {
+        let page = page.clone();
+        async move { page.url().await.ok().flatten().unwrap_or_default() }
+    };
+    let wait_for_url = |page: &chromiumoxide::Page, suffix: String| {
+        let page = page.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline {
+                if page.url().await.ok().flatten().is_some_and(|u| u.ends_with(&suffix)) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            false
+        }
+    };
+    let second_row = wait_for_element(&page, &title(second.id), Duration::from_secs(10)).await;
+    second_row.focus().await.expect("focus the second row");
+    second_row.press_key("Enter").await.expect("press Enter");
+    assert!(wait_for_url(&page, at(second.id)).await, "Enter on a row should open it: at {}", url_now(&page).await);
+    let first_row = wait_for_element(&page, &title(first.id), Duration::from_secs(10)).await;
+    first_row.focus().await.expect("focus the first row");
+    first_row.press_key(" ").await.expect("press Space");
+    assert!(wait_for_url(&page, at(first.id)).await, "Space on a row should open it: at {}", url_now(&page).await);
+    let delete = wait_for_element(&page, &format!("{} .delete-conversation", row(second.id)), Duration::from_secs(10)).await;
+    delete.focus().await.expect("focus the second row's Delete");
+    delete.press_key("Enter").await.expect("press Enter on Delete");
+    wait_for_element(&page, &format!("{} .delete-conversation.confirm", row(second.id)), Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let url = url_now(&page).await;
+    assert!(url.ends_with(&at(first.id)), "Enter on Delete should arm it, not open its row: at {url}");
+}
+
+/// SME-57 (d), from SME-58: the message box has a label, not only a
+/// placeholder, which disappears as soon as anything is typed.
+async fn scenario_message_box_label(t: &Scenario<'_>) {
+    let conversation = t.conversation().await;
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_element(&page, CHAT_INPUT, Duration::from_secs(10)).await;
+    let label: serde_json::Value = page
+        .evaluate(format!(
+            "(() => {{ const i = document.querySelector('{}'); \
+               return {{ labels: i.labels ? i.labels.length : 0, text: i.labels && i.labels[0] ? i.labels[0].textContent.trim() : null }}; }})()",
+            CHAT_INPUT.replace('\'', "\\'")
+        ))
+        .await
+        .expect("read the message box's label")
+        .into_value()
+        .expect("facts");
+    assert_eq!(label["labels"], 1, "the message box should have one label: {label}");
+    assert!(label["text"].as_str().is_some_and(|t| !t.is_empty()), "its label should say something: {label}");
+}
+
+/// SME-57 (d), from SME-58: an error line on the chat page is announced:
+/// it uses `pages::ErrorText` (`role="alert"`) like the other pages, not a
+/// bare `p.error`.
+async fn scenario_chat_errors_are_alerts(t: &Scenario<'_>) {
+    use crate::events::{ConversationEvent, publish};
+    let conversation = t.conversation().await;
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    publish(conversation.id, ConversationEvent::NotificationDeliveryFailed { detail: "NOTICE-ALERT-MARKER".into() });
+    publish(conversation.id, ConversationEvent::TurnError { message: "TURN-ALERT-MARKER".into() });
+    for marker in ["NOTICE-ALERT-MARKER", "TURN-ALERT-MARKER"] {
+        assert!(wait_for_text(&page, marker, Duration::from_secs(10)).await, "{marker} never showed");
+        let line: serde_json::Value = page
+            .evaluate(format!(
+                "(() => {{ const e = [...document.querySelectorAll('.error')].find(e => e.innerText.includes('{marker}')); \
+                   return {{ found: !!e, role: e ? (e.getAttribute('role') || 'none') : 'none' }}; }})()"
+            ))
+            .await
+            .expect("read the error line's role")
+            .into_value()
+            .expect("facts");
+        assert_eq!(line["found"], true, "no .error line has {marker}: {line}");
+        assert_eq!(line["role"], "alert", "the error line with {marker} should be an alert: {line}");
+    }
+}
+
+/// SME-57 (d), from SME-58: a message that can't be read shows as an
+/// error, in the error colours, not as an ordinary bubble (its class,
+/// `message-error`, had no CSS rule).
+async fn scenario_unreadable_message(t: &Scenario<'_>) {
+    let conversation = t.conversation().await;
+    sqlx::query("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', 'not json')")
+        .bind(conversation.id)
+        .execute(t.pool)
+        .await
+        .expect("seed an unreadable message");
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_element(&page, ".message-error", Duration::from_secs(10)).await;
+    let colours: serde_json::Value = page
+        .evaluate(
+            "(() => { const probe = document.createElement('p'); probe.className = 'error'; document.body.appendChild(probe); \
+               const want = getComputedStyle(probe).color; probe.remove(); \
+               return { want, got: getComputedStyle(document.querySelector('.message-error')).color }; })()",
+        )
+        .await
+        .expect("read the colours")
+        .into_value()
+        .expect("colours");
+    assert_eq!(colours["got"], colours["want"], "an unreadable message should be in the error colour: {colours}");
 }
 
 /// A server that answers every request after `delay` with an SVG image of

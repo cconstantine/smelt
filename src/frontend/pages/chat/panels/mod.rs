@@ -1,6 +1,6 @@
 //! The chat page's side panels.
 
-use super::TwoStepLabel;
+use super::{ErrorText, TwoStepButton};
 
 mod browsing;
 mod sandbox;

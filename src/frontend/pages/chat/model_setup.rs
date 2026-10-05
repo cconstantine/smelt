@@ -21,7 +21,7 @@ pub(super) fn ModelNotes(
                     Link { to: Route::ProvidersRoute {}, "Model providers" }
                 }
             } else {
-                p { class: "error", "{err}" }
+                ErrorText { message: Some(err) }
             }
         }
         if let Some(err) = notification_delivery_error() {
@@ -31,7 +31,7 @@ pub(super) fn ModelNotes(
                     Link { to: Route::ProvidersRoute {}, "Model providers" }
                 }
             } else {
-                p { class: "error", "A background notification failed to reach the model: {err}" }
+                ErrorText { message: Some(format!("A background notification failed to reach the model: {err}")) }
             }
         }
     }

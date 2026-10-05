@@ -333,9 +333,20 @@ body {
     padding: 10px 14px;
     border-radius: 14px;
     line-height: 1.5;
-    white-space: pre-wrap;
     font-size: 15px;
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+/* A message's own text keeps its line breaks; a rendered reply
+   (`.message-markdown`, below) doesn't need them. */
+.message-text {
+    white-space: pre-wrap;
+}
+
+/* A message that couldn't be read says so in the error colours. */
+.message.message-error {
+    color: var(--danger);
+    background: var(--danger-bg);
 }
 
 .message-user {
@@ -356,7 +367,7 @@ body {
     opacity: 0.85;
 }
 
-/* The model's replies render as markdown (SME-30): the bubble's
+/* The model's replies render as markdown (SME-30): `.message-text`'s
    pre-wrap is for plain text, so rendered replies use normal wrapping and
    their own block spacing. Wide tables and code scroll inside the bubble
    rather than widening it, at every window width. */
@@ -1440,6 +1451,19 @@ body {
 .composer button:disabled {
     opacity: 0.5;
     cursor: default;
+}
+
+/* Text for a screen reader only: the message box's label (SME-58). */
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
 }
 
 .error {

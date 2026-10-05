@@ -8,7 +8,7 @@ Dioxus components under `src/frontend/`, rendered via **fullstack SSR**: the ser
 frontend/
   mod.rs               # App (router root), Route enum, a small wrapper component per route, NotFound
   pages/
-    mod.rs             # TwoStepLabel
+    mod.rs             # TwoStepButton, TwoStepLabel, ErrorText, server_error_message
     chat/              # the chat page (SME-57)
       mod.rs           # Chat, ChatPanel (its effects, actions and event stream)
       sidebar.rs       # ConversationSidebar
@@ -94,7 +94,11 @@ The sidebar links to the other pages: "MCP servers", "Sandboxes" (`/pods`), "San
 
 The conversation's sandbox panel has the same two-click "Stop sandbox" button.
 
-**Two-step buttons** (click once to arm, again to confirm) use `TwoStepLabel` (`pages/mod.rs`) for their label. Both labels share one grid cell and the inactive one is hidden, so arming doesn't resize the button or move what's around it, and the confirming click lands where the first did. Browser scenario 12 checks this on `/pods`, and scenario 16 on the sidebar's Delete. Use it for any new two-step button.
+**Two-step buttons** (click once to arm, again to confirm) are `TwoStepButton` (`pages/mod.rs`): the caller keeps which one is armed, and says what arming and confirming do (`on_arm`, `on_confirm`). Its label is `TwoStepLabel`: both labels share one grid cell and the inactive one is hidden, so arming doesn't resize the button or move what's around it, and the confirming click lands where the first did. Browser scenario 12 checks this on `/pods`, and scenario 16 on the sidebar's Delete. Its clicks stop at the button, so it can sit in a row that opens on a click (the sidebar's Delete). Use it for any new two-step button. An error line is `ErrorText` (`role="alert"`, so a screen reader announces it), not a bare `p.error`.
+
+**The sidebar's rows open from the keyboard** (SME-58): each row's title is its link and a tab stop (`role="link"`, `aria-current="page"` on the open one) that Enter or Space opens, and its Delete is a tab stop of its own, beside the link rather than inside it, where a screen reader would read it as part of the link's name (browser scenario `conversation_rows_by_keyboard`). The message box has a label for a screen reader (`.visually-hidden`), since its placeholder goes as soon as anything is typed.
+
+**An interactive element never contains another.** No button inside a link or inside an element with `role="link"` or `role="button"`: a screen reader reads the inner control as part of the outer one's name, and some can't reach it at all. Make the part that opens it (a row's title) the link, and put the other controls beside it, as the sidebar's rows do. A plan for keyboard access names the element that takes focus. On SME-57's PR (d) the plan said "each row a tab stop that Enter opens", which led to the whole row as the link with Delete inside it; the browser scenario passed it, and only code review caught it.
 
 While a turn runs in the conversation (`TurnState`, whoever started it), the composer shows **Stop** next to Send. Stop calls `stop_turn`. The stop saves a notice message (`api::chat::STOP_NOTICE`), which the transcript shows as "Stopped.", so it shows in every tab and survives a reload (SME-51 B10). The turn's `TurnError` carrying `TURN_STOPPED` is ignored. If `stop_turn` itself fails, the chat shows "Couldn't stop the turn: …".
 

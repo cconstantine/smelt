@@ -344,7 +344,7 @@ pub(super) fn render_block_element(
             let notice = system_notice(text, commands).unwrap_or_default();
             rsx! {
                 div { key: "{key}", class: "system-notice",
-                    span { class: "system-notice-text", "{notice}" }
+                    span { "{notice}" }
                     span { class: "timestamp", "{timestamp}" }
                 }
             }
@@ -643,8 +643,8 @@ pub(super) fn Transcript(
                 p { class: "conversation-missing",
                     "This conversation doesn't exist. It may have been deleted."
                 }
-            } else if let Some(err) = load_error() {
-                p { class: "error", "Error loading messages: {err}" }
+            } else {
+                ErrorText { message: load_error().map(|err| format!("Error loading messages: {err}")) }
             }
             for message in messages() {
                 MessageView {
