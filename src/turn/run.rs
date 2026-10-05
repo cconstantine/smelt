@@ -509,9 +509,21 @@ pub(super) fn run_turn_body<'a>(
             // `pending_new_content` resets — only what's persisted after
             // this point is "new" again). See
             // SME-18.
-            db::upsert_conversation_usage(pool, conversation_id, &turn.usage)
-                .await
-                .map_err(ServerFnError::new)?;
+            // Also appended to the conversation's call history, in the
+            // same transaction, for its cost (SME-106).
+            db::record_model_call(
+                pool,
+                &db::ModelCall {
+                    conversation_id,
+                    provider_id: turn_model.provider_id,
+                    model: &turn_model.model,
+                    kind: db::ModelCallKind::Turn,
+                    usage: turn.usage,
+                    cost_usd: None,
+                },
+            )
+            .await
+            .map_err(ServerFnError::new)?;
             crate::events::publish(
                 conversation_id,
                 crate::events::ConversationEvent::ContextUsageUpdate {

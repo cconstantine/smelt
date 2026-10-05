@@ -389,6 +389,21 @@ pub(super) async fn compact_conversation(
     )
     .await
     .map_err(ServerFnError::new)?;
+    // Recorded as soon as it completes: the tokens are spent whether or
+    // not the summary is saved below (SME-106).
+    db::record_model_call(
+        pool,
+        &db::ModelCall {
+            conversation_id,
+            provider_id: turn_model.provider_id,
+            model: &turn_model.model,
+            kind: db::ModelCallKind::Compaction,
+            usage: turn.usage,
+            cost_usd: None,
+        },
+    )
+    .await
+    .map_err(ServerFnError::new)?;
     let summary = turn
         .content
         .into_iter()

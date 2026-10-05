@@ -156,6 +156,54 @@ pub(super) fn render_context_meter(breakdown: &ContextUsageBreakdown) -> Element
     }
 }
 
+/// What the conversation's completed calls cost, for the detail view
+/// (SME-106).
+fn spend_cost_text(spend: &crate::models::ConversationSpend) -> String {
+    if spend.calls == 0 {
+        return "No completed model calls yet.".to_string();
+    }
+    let Some(cost) = spend.cost_usd else {
+        return "No price for this model, so tokens only.".to_string();
+    };
+    // A cheap model's call costs a fraction of a cent: two places would
+    // show it as nothing.
+    let dollars = if cost > 0.0 && cost < 0.01 { format!("${cost:.4}") } else { format!("${cost:.2}") };
+    match spend.unpriced_calls {
+        0 => dollars,
+        1 => format!("{dollars}, plus 1 call with no price"),
+        n => format!("{dollars}, plus {n} calls with no price"),
+    }
+}
+
+#[cfg(test)]
+mod spend_tests {
+    use super::*;
+    use crate::models::ConversationSpend;
+
+    fn spend(calls: i64, cost_usd: Option<f64>, unpriced_calls: i64) -> ConversationSpend {
+        ConversationSpend { calls, cost_usd, unpriced_calls, ..ConversationSpend::default() }
+    }
+
+    #[test]
+    fn test_spend_with_no_calls_says_so() {
+        assert_eq!(spend_cost_text(&spend(0, None, 0)), "No completed model calls yet.");
+    }
+
+    #[test]
+    fn test_spend_shows_cents_and_keeps_small_amounts_visible() {
+        assert_eq!(spend_cost_text(&spend(3, Some(1.234), 0)), "$1.23");
+        assert_eq!(spend_cost_text(&spend(1, Some(0.00421), 0)), "$0.0042", "not rounded away to $0.00");
+        assert_eq!(spend_cost_text(&spend(2, Some(0.0), 0)), "$0.00", "a flat-rate plan's $0 prices");
+    }
+
+    #[test]
+    fn test_spend_counts_calls_left_out_for_want_of_a_price() {
+        assert_eq!(spend_cost_text(&spend(2, None, 2)), "No price for this model, so tokens only.");
+        assert_eq!(spend_cost_text(&spend(3, Some(0.5), 1)), "$0.50, plus 1 call with no price");
+        assert_eq!(spend_cost_text(&spend(5, Some(0.5), 2)), "$0.50, plus 2 calls with no price");
+    }
+}
+
 #[cfg(test)]
 mod context_usage_tests {
     use super::*;
@@ -392,6 +440,16 @@ pub(super) fn ContextUsage(
                                 {render_context_meter(&context_usage_breakdown(usage, detail.context_window))}
                             }
                             p { "Context window: {detail.context_window}" }
+                            h4 { class: "context-detail-heading", "Spent so far" }
+                            p { "{spend_cost_text(&detail.spend)}" }
+                            if detail.spend.calls > 0 {
+                                p {
+                                    "{detail.spend.calls} model calls — uncached input: {detail.spend.input_tokens}, "
+                                    "cache write: {detail.spend.cache_creation_input_tokens}, cache read: {detail.spend.cache_read_input_tokens}, "
+                                    "output: {detail.spend.output_tokens}"
+                                }
+                                p { class: "muted", "Completed calls only: a stopped or failed call isn't counted." }
+                            }
                             h4 { "Tools ({detail.tools.len()})" }
                             for tool in &detail.tools {
                                 div { class: "context-detail-tool",

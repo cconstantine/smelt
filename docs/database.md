@@ -82,6 +82,7 @@ The tables after every migration has run. All `id`s are `BIGINT GENERATED ALWAYS
 | `conversations` | `id`, `title`, `created_at`, `updated_at`, `provider_id`, `model`, `last_turn_model_key`, `model_changed_at_message_id` | `provider_id`/`model`: the conversation's model, both null until its first turn takes the default (a `CHECK` keeps them together; FK → `inference_providers` `RESTRICT`, cleared by `delete_inference_provider`). `last_turn_model_key`: the backend (provider, base URL, model) its last turn ran on; `model_changed_at_message_id`: its last message when a turn started on a different one, so thinking signed for the old one isn't replayed. Both set at turn start, under the turn lock (SME-72). `title`'s column default is `'New Conversation'`, but `db::create_conversation` always binds `DEFAULT_TITLE` (`"New conversation"`). Auto-titling from the first user message matches either spelling, case-insensitively. |
 | `messages` | `conversation_id`, `role`, `content` (JSON-serialized content blocks as `TEXT`, see [models.md](models.md)) | `role` `CHECK`ed to `user`/`assistant`. FK → `conversations` cascade. |
 | `conversation_context_usage` | The last turn's four token counts | PK is `conversation_id` (one row per conversation). FK → `conversations` cascade. |
+| `model_call_usage` | One row per completed model call (SME-106): `provider_id`, `model`, `kind` (`turn`/`compaction`), the four token counts, `cost_usd`, `created_at` | Append-only. Written by `db::record_model_call`, which for a turn's call also upserts `conversation_context_usage` in the same transaction; a compaction's isn't the last-known usage. A stopped or failed call has no final usage and no row. `cost_usd` is null without a price and never recomputed. FK → `conversations` cascade, → `inference_providers` `SET NULL` (the model and tokens stay). `db::get_conversation_spend` sums a conversation's rows for the context detail view. |
 | `conversation_todos` | `items` JSONB, the todo list | PK is `conversation_id`. FK → `conversations` cascade. |
 | `pending_questions` | `tool_use_id`, `questions` JSONB (the model's `ask_user` input), `answer` JSONB (null while waiting) | PK is `conversation_id`: at most one per conversation. FK → `conversations` cascade. The card's answer is written once (`WHERE answer IS NULL`); the next turn deletes the row in the same transaction that saves the call's result (SME-34). |
 
@@ -125,6 +126,7 @@ Every FK in the schema is `ON DELETE CASCADE`, so deleting a `conversations` row
 conversations
 ├── messages
 ├── conversation_context_usage
+├── model_call_usage
 ├── conversation_todos
 ├── pending_questions
 ├── sandbox_pods

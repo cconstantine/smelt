@@ -12,6 +12,23 @@ pub struct Conversation {
     pub updated_at: NaiveDateTime,
 }
 
+/// What a conversation's completed model calls used and cost in all
+/// (SME-106, `db::get_conversation_spend`). A stopped or failed call has no
+/// final usage and isn't counted.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "server", derive(sqlx::FromRow))]
+pub struct ConversationSpend {
+    pub calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_input_tokens: i64,
+    pub cache_read_input_tokens: i64,
+    /// The sum over the calls that had a price; `None` when none did.
+    pub cost_usd: Option<f64>,
+    /// Calls with no price, left out of `cost_usd`.
+    pub unpriced_calls: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "server", derive(sqlx::FromRow))]
 pub struct Message {

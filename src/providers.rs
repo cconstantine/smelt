@@ -231,6 +231,8 @@ mod server {
     #[derive(Clone, Debug, PartialEq)]
     pub struct TurnModel {
         pub endpoint: Endpoint,
+        /// The provider the turn runs on, for its usage records.
+        pub provider_id: i64,
         pub model: String,
         pub thinking: bool,
         /// The provider's prompt caching setting (SME-106).
@@ -428,6 +430,7 @@ mod server {
             .map_err(db_error)?;
         Ok(Some(TurnModel {
             endpoint: endpoint(&provider),
+            provider_id,
             prompt_caching: provider.prompt_caching,
             thinking: thinking(settings.as_ref()),
             context_window: context_window(&model, settings.as_ref()).0,
@@ -966,6 +969,7 @@ mod tests {
                         base_url: "http://ollama:11434".to_string(),
                         auth: Auth::Bearer("the-secret".to_string()),
                     },
+                    provider_id: bearer.id,
                     model: "m1".to_string(),
                     thinking: false,
                     prompt_caching: false,

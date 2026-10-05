@@ -1415,6 +1415,108 @@ async fn test_a_caching_provider_marks_turn_requests_but_not_compaction(pool: Pg
     );
 }
 
+/// `body` reporting `input`/`cache_read` input tokens and `output` output
+/// tokens, as a real reply's `message_start` and `message_delta` do.
+fn with_usage(body: &str, input: i64, cache_read: i64, output: i64) -> String {
+    body.replacen(
+        r#"{"type":"message_start"}"#,
+        &format!(
+            r#"{{"type":"message_start","message":{{"usage":{{"input_tokens":{input},"cache_creation_input_tokens":0,"cache_read_input_tokens":{cache_read},"output_tokens":1}}}}}}"#
+        ),
+        1,
+    )
+    .replacen(r#""delta":{"stop_reason""#, &format!(r#""usage":{{"output_tokens":{output}}},"delta":{{"stop_reason""#), 1)
+}
+
+/// Every completed model call is recorded with its own usage: the
+/// compaction's summary call, then each call of the turn's tool loop.
+#[sqlx::test]
+async fn test_each_model_call_of_a_turn_is_recorded_with_its_usage(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    db::create_message(
+        &pool,
+        conversation.id,
+        "user",
+        &[anthropic::ContentBlock::Text {
+            text: "earlier message".to_string(),
+        }],
+    )
+    .await
+    .expect("seed earlier message");
+    db::upsert_conversation_usage(
+        &pool,
+        conversation.id,
+        &anthropic::TokenUsage {
+            input_tokens: 190_000,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+    )
+    .await
+    .expect("seed usage");
+    let tool_use_body = sse_body(&[
+        ("message_start", r#"{"type":"message_start"}"#),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"todoread","input":{}}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+        ),
+        ("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+        ("message_delta", r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ]);
+    start_recording_mock_upstream(&pool, vec![
+        with_usage(&text_reply_body("Summary: nothing live."), 5_000, 0, 300),
+        with_usage(&tool_use_body, 1_000, 2_000, 40),
+        with_usage(&text_reply_body("Done"), 100, 3_000, 7),
+    ])
+    .await;
+    let provider_id: i64 = sqlx::query_scalar("SELECT default_provider_id FROM inference_settings")
+        .fetch_one(&pool)
+        .await
+        .expect("the mock provider");
+
+    run_turn(&pool, conversation.id, hello())
+        .await
+        .expect("run_turn should succeed");
+
+    let rows: Vec<(Option<i64>, String, String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT provider_id, model, kind, input_tokens, cache_read_input_tokens, output_tokens
+         FROM model_call_usage WHERE conversation_id = $1 ORDER BY id",
+    )
+    .bind(conversation.id)
+    .fetch_all(&pool)
+    .await
+    .expect("the recorded calls");
+    let model = crate::providers::test_support::MOCK_MODEL.to_string();
+    assert_eq!(
+        rows,
+        vec![
+            (Some(provider_id), model.clone(), "compaction".to_string(), 5_000, 0, 300),
+            (Some(provider_id), model.clone(), "turn".to_string(), 1_000, 2_000, 40),
+            (Some(provider_id), model.clone(), "turn".to_string(), 100, 3_000, 7),
+        ]
+    );
+    assert_eq!(
+        db::get_conversation_usage(&pool, conversation.id).await.expect("usage").map(|u| u.input_tokens),
+        Some(100),
+        "the last turn call is the conversation's last known usage"
+    );
+    let spend = context_detail(&pool, conversation.id).await.expect("context detail").spend;
+    assert_eq!(
+        (spend.calls, spend.input_tokens, spend.cache_read_input_tokens, spend.output_tokens),
+        (3, 6_100, 5_000, 347),
+        "the detail view sums every call, compaction included"
+    );
+}
+
 /// The detail view shows exactly the system prompt a turn sends.
 #[sqlx::test]
 async fn test_context_detail_shows_the_system_prompt_a_turn_sends(pool: PgPool) {

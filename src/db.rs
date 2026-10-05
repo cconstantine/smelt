@@ -197,7 +197,7 @@ pub async fn clear_conversation_usage(pool: &PgPool, conversation_id: i64) -> Re
 /// only," not a history, so this is always a full replace, not an
 /// accumulation.
 pub async fn upsert_conversation_usage(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     conversation_id: i64,
     usage: &crate::anthropic::TokenUsage,
 ) -> Result<(), sqlx::Error> {
@@ -217,9 +217,85 @@ pub async fn upsert_conversation_usage(
     .bind(usage.output_tokens)
     .bind(usage.cache_creation_input_tokens)
     .bind(usage.cache_read_input_tokens)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
+}
+
+/// Which request a `model_call_usage` row is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelCallKind {
+    Turn,
+    Compaction,
+}
+
+impl ModelCallKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::Compaction => "compaction",
+        }
+    }
+}
+
+/// One completed model call, for `record_model_call`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelCall<'a> {
+    pub conversation_id: i64,
+    pub provider_id: i64,
+    pub model: &'a str,
+    pub kind: ModelCallKind,
+    pub usage: crate::anthropic::TokenUsage,
+    /// From the price catalog when the call finished; `None` without a price.
+    pub cost_usd: Option<f64>,
+}
+
+/// Appends `call` to `model_call_usage` (SME-106). A turn's call is also
+/// the conversation's new last-known usage (`upsert_conversation_usage`),
+/// written in the same transaction so the two never disagree. A
+/// compaction's isn't: it described the old, long history.
+pub async fn record_model_call(pool: &PgPool, call: &ModelCall<'_>) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO model_call_usage
+             (conversation_id, provider_id, model, kind, input_tokens, output_tokens,
+              cache_creation_input_tokens, cache_read_input_tokens, cost_usd)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(call.conversation_id)
+    .bind(call.provider_id)
+    .bind(call.model)
+    .bind(call.kind.as_str())
+    .bind(call.usage.input_tokens)
+    .bind(call.usage.output_tokens)
+    .bind(call.usage.cache_creation_input_tokens)
+    .bind(call.usage.cache_read_input_tokens)
+    .bind(call.cost_usd)
+    .execute(&mut *tx)
+    .await?;
+    if call.kind == ModelCallKind::Turn {
+        upsert_conversation_usage(&mut *tx, call.conversation_id, &call.usage).await?;
+    }
+    tx.commit().await
+}
+
+pub async fn get_conversation_spend(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<crate::models::ConversationSpend, sqlx::Error> {
+    sqlx::query_as::<_, crate::models::ConversationSpend>(
+        "SELECT count(*) AS calls,
+                COALESCE(sum(input_tokens), 0)::BIGINT AS input_tokens,
+                COALESCE(sum(output_tokens), 0)::BIGINT AS output_tokens,
+                COALESCE(sum(cache_creation_input_tokens), 0)::BIGINT AS cache_creation_input_tokens,
+                COALESCE(sum(cache_read_input_tokens), 0)::BIGINT AS cache_read_input_tokens,
+                sum(cost_usd) AS cost_usd,
+                count(*) FILTER (WHERE cost_usd IS NULL) AS unpriced_calls
+         FROM model_call_usage WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
 }
 
 /// Current todo list for `conversation_id` — empty if `todowrite` has never
@@ -4087,6 +4163,85 @@ mod tests {
         create_inference_provider(pool, name, "anthropic", "https://api.anthropic.com", "api_key", "sk-ant-0123456789", false)
             .await
             .expect("create provider")
+    }
+
+    fn usage(input: i64, output: i64, write: i64, read: i64) -> crate::anthropic::TokenUsage {
+        crate::anthropic::TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_input_tokens: write,
+            cache_read_input_tokens: read,
+        }
+    }
+
+    /// Mechanical CRUD: a characterization round trip rather than
+    /// test-first (SME-106).
+    #[sqlx::test]
+    async fn test_model_calls_add_up_and_only_a_turns_call_is_the_last_known_usage(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let other = create_conversation(&pool).await.expect("another conversation");
+        let provider = test_provider(&pool, "p").await;
+        assert_eq!(
+            get_conversation_spend(&pool, conversation.id).await.expect("spend"),
+            crate::models::ConversationSpend::default(),
+            "no calls yet"
+        );
+
+        let call = |kind, usage, cost_usd| ModelCall {
+            conversation_id: conversation.id,
+            provider_id: provider.id,
+            model: "m",
+            kind,
+            usage,
+            cost_usd,
+        };
+        record_model_call(&pool, &call(ModelCallKind::Turn, usage(10, 1, 100, 0), Some(0.5)))
+            .await
+            .expect("first turn call");
+        record_model_call(&pool, &call(ModelCallKind::Turn, usage(20, 2, 0, 100), Some(0.25)))
+            .await
+            .expect("second turn call");
+        record_model_call(&pool, &call(ModelCallKind::Compaction, usage(300, 3, 0, 0), None))
+            .await
+            .expect("compaction call");
+        record_model_call(
+            &pool,
+            &ModelCall { conversation_id: other.id, ..call(ModelCallKind::Turn, usage(1, 1, 1, 1), Some(9.0)) },
+        )
+        .await
+        .expect("another conversation's call");
+
+        assert_eq!(
+            get_conversation_spend(&pool, conversation.id).await.expect("spend"),
+            crate::models::ConversationSpend {
+                calls: 3,
+                input_tokens: 330,
+                output_tokens: 6,
+                cache_creation_input_tokens: 100,
+                cache_read_input_tokens: 100,
+                cost_usd: Some(0.75),
+                unpriced_calls: 1,
+            }
+        );
+        assert_eq!(
+            get_conversation_usage(&pool, conversation.id).await.expect("usage"),
+            Some(usage(20, 2, 0, 100)),
+            "the last turn call, not the compaction after it"
+        );
+
+        delete_inference_provider(&pool, provider.id).await.expect("delete provider");
+        let kept: (Option<i64>, String) =
+            sqlx::query_as("SELECT provider_id, model FROM model_call_usage WHERE conversation_id = $1 LIMIT 1")
+                .bind(conversation.id)
+                .fetch_one(&pool)
+                .await
+                .expect("rows outlive their provider");
+        assert_eq!(kept, (None, "m".to_string()));
+        assert_eq!(get_conversation_spend(&pool, conversation.id).await.expect("spend").calls, 3);
+
+        delete_conversation(&pool, conversation.id).await.expect("delete conversation");
+        assert_eq!(get_conversation_spend(&pool, conversation.id).await.expect("spend").calls, 0, "cascade");
+        assert_eq!(get_conversation_spend(&pool, other.id).await.expect("spend").calls, 1);
     }
 
     /// Mechanical CRUD, mirroring the MCP server table's: a characterization
