@@ -247,6 +247,32 @@ pub async fn save_price_catalog(
     Ok(())
 }
 
+/// Each provider's models' calls since `since`, costliest first (SME-106).
+/// A deleted provider's calls are kept, grouped under no provider.
+pub async fn model_spend_since(
+    pool: &PgPool,
+    since: NaiveDateTime,
+) -> Result<Vec<crate::models::ModelSpend>, sqlx::Error> {
+    sqlx::query_as::<_, crate::models::ModelSpend>(
+        "SELECT p.name AS provider_name, u.model,
+                count(*) AS calls,
+                sum(u.input_tokens)::BIGINT AS input_tokens,
+                sum(u.output_tokens)::BIGINT AS output_tokens,
+                sum(u.cache_creation_input_tokens)::BIGINT AS cache_creation_input_tokens,
+                sum(u.cache_read_input_tokens)::BIGINT AS cache_read_input_tokens,
+                sum(u.cost_usd) AS cost_usd,
+                count(*) FILTER (WHERE u.cost_usd IS NULL) AS unpriced_calls
+         FROM model_call_usage u
+         LEFT JOIN inference_providers p ON p.id = u.provider_id
+         WHERE u.created_at >= $1
+         GROUP BY u.provider_id, p.name, u.model
+         ORDER BY sum(u.cost_usd) DESC NULLS LAST, count(*) DESC, p.name, u.model",
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await
+}
+
 /// Which request a `model_call_usage` row is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelCallKind {
@@ -4275,6 +4301,51 @@ mod tests {
         delete_conversation(&pool, conversation.id).await.expect("delete conversation");
         assert_eq!(get_conversation_spend(&pool, conversation.id).await.expect("spend").calls, 0, "cascade");
         assert_eq!(get_conversation_spend(&pool, other.id).await.expect("spend").calls, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_model_spend_sums_each_providers_model_over_the_period(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let kept = test_provider(&pool, "kept").await;
+        let gone = test_provider(&pool, "gone").await;
+        let call = |provider_id, model, input, cost_usd| ModelCall {
+            conversation_id: conversation.id,
+            provider_id,
+            model,
+            kind: ModelCallKind::Turn,
+            usage: usage(input, 1, 0, 0),
+            cost_usd,
+        };
+        for c in [
+            call(kept.id, "a", 10, Some(1.0)),
+            call(kept.id, "a", 20, None),
+            call(kept.id, "b", 5, Some(3.0)),
+            call(gone.id, "a", 7, Some(0.5)),
+            call(kept.id, "old", 1, Some(100.0)),
+        ] {
+            record_model_call(&pool, &c).await.expect("record");
+        }
+        sqlx::query("UPDATE model_call_usage SET created_at = now() - interval '31 days' WHERE model = 'old'")
+            .execute(&pool)
+            .await
+            .expect("age one call");
+        delete_inference_provider(&pool, gone.id).await.expect("delete");
+
+        let since = chrono::Utc::now().naive_utc() - chrono::Duration::days(30);
+        let spend = model_spend_since(&pool, since).await.expect("spend");
+        let rows: Vec<(Option<&str>, &str, i64, i64, Option<f64>, i64)> = spend
+            .iter()
+            .map(|s| (s.provider_name.as_deref(), s.model.as_str(), s.calls, s.input_tokens, s.cost_usd, s.unpriced_calls))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (Some("kept"), "b", 1, 5, Some(3.0), 0),
+                (Some("kept"), "a", 2, 30, Some(1.0), 1),
+                (None, "a", 1, 7, Some(0.5), 0),
+            ],
+            "costliest first; the 31-day-old call is out; a deleted provider's calls stay"
+        );
     }
 
     /// Mechanical CRUD, mirroring the MCP server table's: a characterization

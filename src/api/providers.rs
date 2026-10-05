@@ -40,6 +40,16 @@ pub async fn update_provider(id: i64, input: ProviderInput) -> ServerFnResult<Pr
         .map_err(ServerFnError::new)
 }
 
+/// Each provider's models' use and cost over the last 30 days, for the
+/// providers page (SME-106).
+#[get("/api/providers/spend")]
+pub async fn get_recent_spend() -> ServerFnResult<Vec<crate::models::ModelSpend>> {
+    let since = chrono::Utc::now().naive_utc() - chrono::Duration::days(30);
+    db::model_spend_since(db::get(), since)
+        .await
+        .map_err(ServerFnError::new)
+}
+
 /// The price catalog's providers, by name, for the form's "Prices from"
 /// choice; empty until the catalog is first fetched (SME-106).
 #[get("/api/price-sources")]

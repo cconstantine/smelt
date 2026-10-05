@@ -159,20 +159,7 @@ pub(super) fn render_context_meter(breakdown: &ContextUsageBreakdown) -> Element
 /// What the conversation's completed calls cost, for the detail view
 /// (SME-106).
 fn spend_cost_text(spend: &crate::models::ConversationSpend) -> String {
-    if spend.calls == 0 {
-        return "No completed model calls yet.".to_string();
-    }
-    let Some(cost) = spend.cost_usd else {
-        return "No price for this model, so tokens only.".to_string();
-    };
-    // A cheap model's call costs a fraction of a cent: two places would
-    // show it as nothing.
-    let dollars = if cost > 0.0 && cost < 0.01 { format!("${cost:.4}") } else { format!("${cost:.2}") };
-    match spend.unpriced_calls {
-        0 => dollars,
-        1 => format!("{dollars}, plus 1 call with no price"),
-        n => format!("{dollars}, plus {n} calls with no price"),
-    }
+    crate::models::cost_text(spend.calls, spend.cost_usd, spend.unpriced_calls)
 }
 
 #[cfg(test)]

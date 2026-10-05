@@ -29,6 +29,42 @@ pub struct ConversationSpend {
     pub unpriced_calls: i64,
 }
 
+/// What `calls` cost, said for a person (SME-106): `cost_usd` over the
+/// calls that had a price, `unpriced_calls` of them without one.
+pub fn cost_text(calls: i64, cost_usd: Option<f64>, unpriced_calls: i64) -> String {
+    if calls == 0 {
+        return "No completed model calls yet.".to_string();
+    }
+    let Some(cost) = cost_usd else {
+        return "No price for this model, so tokens only.".to_string();
+    };
+    // A cheap model's call costs a fraction of a cent: two places would
+    // show it as nothing.
+    let dollars = if cost > 0.0 && cost < 0.01 { format!("${cost:.4}") } else { format!("${cost:.2}") };
+    match unpriced_calls {
+        0 => dollars,
+        1 => format!("{dollars}, plus 1 call with no price"),
+        n => format!("{dollars}, plus {n} calls with no price"),
+    }
+}
+
+/// What one provider's model was used for and cost over a period, for the
+/// providers page (SME-106, `db::model_spend_since`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "server", derive(sqlx::FromRow))]
+pub struct ModelSpend {
+    /// `None` once the provider is deleted.
+    pub provider_name: Option<String>,
+    pub model: String,
+    pub calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_input_tokens: i64,
+    pub cache_read_input_tokens: i64,
+    pub cost_usd: Option<f64>,
+    pub unpriced_calls: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "server", derive(sqlx::FromRow))]
 pub struct Message {

@@ -5,7 +5,7 @@ use dioxus::prelude::*;
 
 use crate::api::chat::{get_conversation_model, set_conversation_model};
 use crate::api::providers::{
-    add_provider_model, create_provider, delete_provider, get_default_model, get_provider, list_price_sources,
+    add_provider_model, create_provider, delete_provider, get_default_model, get_provider, get_recent_spend, list_price_sources,
     list_provider_models, list_providers, refresh_model_details, set_default_model, set_model_settings, update_provider,
 };
 use crate::frontend::Route;
@@ -311,6 +311,7 @@ pub fn ProvidersIndex() -> Element {
         refresh();
         get_default_model().await
     });
+    let recent_spend = use_resource(move || async move { get_recent_spend().await });
     let mut changing_default = use_signal(|| false);
     let mut default_error: Signal<Option<String>> = use_signal(|| None);
     let choose_default = move |(provider_id, model): (i64, String)| {
@@ -401,7 +402,60 @@ pub fn ProvidersIndex() -> Element {
                     }
                 },
             }
+
+            if let Some(Ok(spend)) = recent_spend() {
+                if !spend.is_empty() {
+                    section { class: "providers-spend",
+                        h2 { "Last 30 days" }
+                        p { class: "muted",
+                            "Completed model calls, priced from each provider's \u{201c}Prices from\u{201d} entry when they finished."
+                        }
+                        div { class: "mcp-server-list",
+                            for row in spend {
+                                div { class: "mcp-server-row",
+                                    key: "{row.provider_name.clone().unwrap_or_default()}/{row.model}",
+                                    div { class: "mcp-server-summary",
+                                        span { class: "mcp-server-name", "{model_spend_label(&row)}" }
+                                        span { class: "mcp-server-url",
+                                            "{row.calls} calls \u{b7} input {row.input_tokens} uncached, {row.cache_creation_input_tokens} written, "
+                                            "{row.cache_read_input_tokens} read \u{b7} output {row.output_tokens}"
+                                        }
+                                    }
+                                    span { class: "providers-spend-cost",
+                                        "{crate::models::cost_text(row.calls, row.cost_usd, row.unpriced_calls)}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
+    }
+}
+
+/// "Provider · model" for a spend row, or the model alone under a deleted
+/// provider.
+fn model_spend_label(row: &crate::models::ModelSpend) -> String {
+    match &row.provider_name {
+        Some(provider) => format!("{provider} \u{b7} {}", row.model),
+        None => format!("{} (deleted provider)", row.model),
+    }
+}
+
+#[cfg(test)]
+mod spend_label_tests {
+    use super::*;
+
+    #[test]
+    fn test_a_spend_row_names_its_provider_or_says_it_was_deleted() {
+        let row = |provider: Option<&str>| crate::models::ModelSpend {
+            provider_name: provider.map(str::to_string),
+            model: "m".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(model_spend_label(&row(Some("Anthropic"))), "Anthropic \u{b7} m");
+        assert_eq!(model_spend_label(&row(None)), "m (deleted provider)");
     }
 }
 
