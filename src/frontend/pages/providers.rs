@@ -823,6 +823,7 @@ fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
 fn ProviderModelRow(id: i64, model: ModelInfo) -> Element {
     let mut window = use_signal(|| model.context_window_override.map(|w| w.to_string()).unwrap_or_default());
     let mut thinking = use_signal(|| model.thinking_override);
+    let mut effort = use_signal(|| model.effort_override);
     let mut error: Signal<Option<String>> = use_signal(|| None);
     let mut saved = use_signal(|| false);
     let model_id = model.id.clone();
@@ -855,7 +856,7 @@ fn ProviderModelRow(id: i64, model: ModelInfo) -> Element {
         };
         let model_id = model_id.clone();
         spawn(async move {
-            match set_model_settings(id, model_id, thinking(), context_window).await {
+            match set_model_settings(id, model_id, thinking(), context_window, effort()).await {
                 Ok(()) => {
                     error.set(None);
                     saved.set(true);
@@ -893,6 +894,26 @@ fn ProviderModelRow(id: i64, model: ModelInfo) -> Element {
                             value: "{choice}",
                             selected: thinking_choice(thinking()) == choice,
                             "{thinking_label(choice, provider_thinking)}"
+                        }
+                    }
+                }
+            }
+            label { class: "provider-model-thinking",
+                "Effort "
+                select {
+                    aria_label: "Effort for {model.id}",
+                    title: "Sent as output_config.effort to an Anthropic provider; other kinds ignore it. Changing it re-reads a conversation's cache once.",
+                    onchange: move |e| {
+                        effort.set(crate::anthropic::Effort::parse(&e.value()));
+                        saved.set(false);
+                    },
+                    option { value: "", selected: effort().is_none(), "model's default" }
+                    for level in crate::anthropic::Effort::ALL {
+                        option {
+                            key: "{level.as_str()}",
+                            value: "{level.as_str()}",
+                            selected: effort() == Some(level),
+                            "{level.as_str()}"
                         }
                     }
                 }
@@ -963,6 +984,7 @@ mod tests {
             display_name: None,
             thinking_override: None,
             context_window_override: None,
+            effort_override: None,
             reported_context_window: None,
             reported_tools: tools,
             thinking: true,

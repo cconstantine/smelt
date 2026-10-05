@@ -1564,6 +1564,30 @@ async fn test_each_recorded_call_is_priced_from_the_catalog(pool: PgPool) {
     assert!((costs[1].expect("priced") - 0.08).abs() < 1e-9, "{costs:?}");
 }
 
+/// A model's effort goes out as `output_config.effort` on its turns, and
+/// nothing goes out while it's unset.
+#[sqlx::test]
+async fn test_a_models_effort_is_sent_on_its_turns(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
+
+    run_turn(&pool, conversation.id, hello()).await.expect("turn without effort");
+    sqlx::query("INSERT INTO provider_models (provider_id, model, effort) SELECT id, $1, 'low' FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .execute(&pool)
+        .await
+        .expect("set the mock model's effort");
+    run_turn(&pool, conversation.id, hello()).await.expect("turn with effort");
+
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].get("output_config").is_none(), "unset sends none: {}", requests[0]);
+    assert_eq!(requests[1]["output_config"], serde_json::json!({"effort": "low"}));
+}
+
 /// The detail view shows exactly the system prompt a turn sends.
 #[sqlx::test]
 async fn test_context_detail_shows_the_system_prompt_a_turn_sends(pool: PgPool) {

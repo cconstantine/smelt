@@ -134,6 +134,44 @@ pub struct ToolDefinition {
     pub input_schema: serde_json::Value,
 }
 
+/// How hard the model works on a reply (`output_config.effort`): thinking
+/// depth and overall token spend (SME-106). Ungated: the providers page
+/// sets it per model.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    pub const ALL: [Effort; 5] = [Self::Low, Self::Medium, Self::High, Self::Xhigh, Self::Max];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|e| e.as_str() == value)
+    }
+}
+
+/// `output_config`: only its effort, the one field smelt sends.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct OutputConfig {
+    pub effort: Effort,
+}
+
 /// `{"type": "adaptive"}` — the model manages its own thinking budget
 /// within `max_tokens` rather than a caller-specified `budget_tokens`
 /// (deprecated on current models). The only variant smelt sends; kept as
@@ -159,6 +197,8 @@ pub struct CreateMessageRequest {
     pub tools: Vec<ToolDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
     /// Mark the request for prompt caching (SME-106); see `to_body`. Not a
     /// wire field itself.
     #[serde(skip)]
@@ -326,6 +366,7 @@ mod tests {
             tools: vec![],
             thinking: None,
             prompt_caching: false,
+            output_config: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert!(
@@ -345,6 +386,7 @@ mod tests {
             tools: vec![],
             thinking: Some(ThinkingConfig::Adaptive),
             prompt_caching: false,
+            output_config: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -419,6 +461,7 @@ mod tests {
             tools: vec![],
             thinking: None,
             prompt_caching: false,
+            output_config: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert!(
@@ -455,6 +498,7 @@ mod tests {
             tools: vec![],
             thinking: None,
             prompt_caching: false,
+            output_config: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert!(
@@ -473,7 +517,21 @@ mod tests {
             tools: vec![],
             thinking: None,
             prompt_caching,
+            output_config: None,
         }
+    }
+
+    #[test]
+    fn test_effort_goes_in_output_config_and_is_left_out_when_unset() {
+        let mut request = caching_request(false);
+        assert!(request.to_body().expect("encodes").get("output_config").is_none());
+        request.output_config = Some(OutputConfig { effort: Effort::Xhigh });
+        assert_eq!(request.to_body().expect("encodes")["output_config"], serde_json::json!({"effort": "xhigh"}));
+        for effort in Effort::ALL {
+            assert_eq!(Effort::parse(effort.as_str()), Some(effort));
+            assert_eq!(serde_json::to_value(effort).expect("encodes"), serde_json::json!(effort.as_str()));
+        }
+        assert_eq!(Effort::parse("extreme"), None);
     }
 
     #[test]

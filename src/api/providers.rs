@@ -99,8 +99,9 @@ pub async fn set_model_settings(
     model: String,
     thinking: Option<bool>,
     context_window: Option<u32>,
+    effort: Option<crate::anthropic::Effort>,
 ) -> ServerFnResult<()> {
-    crate::providers::set_model_settings(db::get(), id, &model, thinking, context_window)
+    crate::providers::set_model_settings(db::get(), id, &model, thinking, context_window, effort)
         .await
         .map_err(ServerFnError::new)
 }

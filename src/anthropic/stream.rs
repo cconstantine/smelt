@@ -65,6 +65,10 @@ impl Endpoint {
             std::sync::LazyLock::new(|| {
                 reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
+                    // smelt's own name on every model request, listing
+                    // included: Kimi Code's terms count a hidden or faked
+                    // client identity as a violation (SME-106).
+                    .user_agent(concat!("smelt/", env!("CARGO_PKG_VERSION")))
                     .build()
                     .map_err(|e| format!("couldn't set up the HTTP client: {e}"))
             });
@@ -720,6 +724,7 @@ mod tests {
             tools: vec![],
             thinking: None,
             prompt_caching: false,
+            output_config: None,
         };
         let result = stream_anthropic_message(&endpoint, &request, |_| {}).await;
         assert!(result.is_err(), "a redirect isn't a reply");
@@ -952,6 +957,7 @@ mod tests {
             tools: vec![],
             thinking: None,
             prompt_caching: false,
+            output_config: None,
         };
 
         stream_anthropic_message(&test_endpoint(addr), &request, on_delta).await
@@ -1015,6 +1021,7 @@ mod tests {
             tools: vec![],
             thinking: None,
             prompt_caching: false,
+            output_config: None,
         };
         let result = stream_anthropic_message(&test_endpoint(addr), &request, |_| {}).await;
         (result, count.load(std::sync::atomic::Ordering::SeqCst))
@@ -1051,6 +1058,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct Seen {
         beta: Option<String>,
+        user_agent: Option<String>,
         body: Value,
     }
 
@@ -1095,10 +1103,14 @@ mod tests {
                         .get("anthropic-beta")
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_string);
+                    let user_agent = headers
+                        .get(axum::http::header::USER_AGENT)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
                     let body = serde_json::from_str(&body).unwrap_or(Value::Null);
                     let i = {
                         let mut record = record.lock().expect("record lock");
-                        record.push(Seen { beta, body });
+                        record.push(Seen { beta, user_agent, body });
                         record.len() - 1
                     };
                     let (status, body) = responses[i.min(responses.len() - 1)];
@@ -1152,6 +1164,7 @@ mod tests {
             tools: vec![],
             thinking,
             prompt_caching: false,
+            output_config: None,
         }
     }
 
@@ -1205,6 +1218,20 @@ mod tests {
         stream_anthropic_message(&other, &request, |_| {}).await.expect("another provider");
         let other_seen = requests_seen(&other_record);
         assert!(!other_seen[0].has_binding_beta() && other_seen[0].drop_block().is_none(), "another provider is untouched");
+    }
+
+    /// smelt says who it is: Kimi Code's terms forbid a tool hiding or
+    /// faking its identity (SME-106).
+    #[tokio::test]
+    async fn test_a_model_request_names_smelt_and_its_version() {
+        let (endpoint, record) = recording_upstream(vec![(200, OK_BODY)]).await;
+        stream_anthropic_message(&endpoint, &request_replaying_thinking(None), |_| {})
+            .await
+            .expect("streams");
+        assert_eq!(
+            requests_seen(&record)[0].user_agent.as_deref(),
+            Some(concat!("smelt/", env!("CARGO_PKG_VERSION")))
+        );
     }
 
     #[tokio::test]
@@ -1598,6 +1625,7 @@ mod tests {
             tools: vec![],
             thinking: None,
             prompt_caching: false,
+            output_config: None,
         };
 
         let result = tokio::time::timeout(
@@ -1660,6 +1688,7 @@ mod tests {
             tools: vec![],
             thinking: None,
             prompt_caching: false,
+            output_config: None,
         };
 
         let endpoint = Endpoint {
@@ -1722,6 +1751,7 @@ mod tests {
                 tools: vec![],
                 thinking: None,
                 prompt_caching: false,
+                output_config: None,
             },
             Binding::AsIs,
             std::time::Duration::from_secs(5),

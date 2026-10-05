@@ -213,6 +213,8 @@ pub struct ModelInfo {
     pub thinking_override: Option<bool>,
     /// The user's override, if any.
     pub context_window_override: Option<u32>,
+    /// The user's effort, if set (SME-106).
+    pub effort_override: Option<crate::anthropic::Effort>,
     /// What the provider reported, if it did.
     pub reported_context_window: Option<u32>,
     pub reported_tools: Option<bool>,
@@ -299,6 +301,8 @@ mod server {
         pub prompt_caching: bool,
         /// The catalog provider its calls are priced as (SME-106).
         pub price_catalog_provider: Option<String>,
+        /// The model's effort, for an Anthropic provider only (SME-106).
+        pub effort: Option<crate::anthropic::Effort>,
         pub context_window: u32,
         /// Thinking blocks in messages up to this id were written for
         /// another provider or model, and aren't replayed.
@@ -362,6 +366,7 @@ mod server {
             display_name,
             thinking_override: row.and_then(|r| r.thinking),
             context_window_override: row.and_then(|r| positive(r.context_window)),
+            effort_override: row.and_then(|r| r.effort.as_deref()).and_then(crate::anthropic::Effort::parse),
             reported_context_window: row.and_then(|r| positive(r.reported_context_window)),
             reported_tools: row.and_then(|r| r.reported_tools),
             thinking: thinking(row),
@@ -496,6 +501,10 @@ mod server {
             provider_id,
             prompt_caching: provider.prompt_caching,
             price_catalog_provider: provider.price_catalog_provider.clone(),
+            // Sent to Anthropic only: another server may refuse the field.
+            effort: (ProviderKind::parse(&provider.kind) == Some(ProviderKind::Anthropic))
+                .then(|| settings.as_ref().and_then(|r| r.effort.as_deref()).and_then(crate::anthropic::Effort::parse))
+                .flatten(),
             thinking: thinking(settings.as_ref()),
             context_window: context_window(&model, settings.as_ref()).0,
             thinking_stripped_through,
@@ -789,6 +798,7 @@ mod server {
         model: &str,
         thinking: Option<bool>,
         context_window: Option<u32>,
+        effort: Option<crate::anthropic::Effort>,
     ) -> Result<(), String> {
         let model = model.trim();
         if model.is_empty() {
@@ -803,7 +813,7 @@ mod server {
                     .ok_or("A context window is a number of tokens, at least 1024.")?,
             ),
         };
-        db::set_provider_model_overrides(pool, provider_id, model, thinking, context_window)
+        db::set_provider_model_overrides(pool, provider_id, model, thinking, context_window, effort.map(|e| e.as_str()))
             .await
             .map_err(provider_gone)?;
         providers_changed();
@@ -990,6 +1000,7 @@ mod tests {
                 reported_context_window,
                 reported_thinking,
                 reported_tools: None,
+                effort: None,
                 added_by_hand: false,
             }
         }
@@ -1075,7 +1086,7 @@ mod tests {
             let conversation = db::create_conversation_with_id(&pool, 9_172_000_001).await.expect("conversation");
             let bearer = provider(&pool, "gateway", "bearer").await;
             db::set_default_model(&pool, bearer.id, "m1").await.expect("default");
-            db::set_provider_model_overrides(&pool, bearer.id, "m1", Some(false), Some(64_000))
+            db::set_provider_model_overrides(&pool, bearer.id, "m1", Some(false), Some(64_000), None)
                 .await
                 .expect("overrides");
             let mut events = crate::events::subscribe(conversation.id);
@@ -1094,6 +1105,7 @@ mod tests {
                     thinking: false,
                     prompt_caching: false,
                     price_catalog_provider: None,
+                    effort: None,
                     context_window: 64_000,
                     thinking_stripped_through: None,
                 }
@@ -1246,17 +1258,47 @@ mod tests {
             );
         }
 
+        /// Effort is kept per model and sent only on an Anthropic provider:
+        /// another server may refuse the field (SME-106).
+        #[sqlx::test]
+        async fn test_a_models_effort_is_kept_and_sent_only_to_anthropic(pool: PgPool) {
+            use crate::anthropic::Effort;
+            let anthropic = db::create_inference_provider(&pool, "a", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None)
+                .await
+                .expect("anthropic provider");
+            let ollama = provider(&pool, "o", "api_key").await;
+            for p in [&anthropic, &ollama] {
+                set_model_settings(&pool, p.id, "m", None, None, Some(Effort::Low)).await.expect("set");
+                let row = db::get_provider_model(&pool, p.id, "m").await.expect("get").expect("exists");
+                assert_eq!(model_info("m".to_string(), None, Some(&row), None).effort_override, Some(Effort::Low));
+            }
+
+            let on_anthropic = db::create_conversation_with_id(&pool, 9_172_000_010).await.expect("conversation");
+            db::set_conversation_model(&pool, on_anthropic.id, anthropic.id, "m").await.expect("pick");
+            let turn = resolve_turn_model(&pool, on_anthropic.id).await.expect("resolves");
+            assert_eq!(turn.effort, Some(Effort::Low));
+
+            let on_ollama = db::create_conversation_with_id(&pool, 9_172_000_011).await.expect("conversation");
+            db::set_conversation_model(&pool, on_ollama.id, ollama.id, "m").await.expect("pick");
+            let turn = resolve_turn_model(&pool, on_ollama.id).await.expect("resolves");
+            assert_eq!(turn.effort, None, "not sent to an Ollama server");
+
+            set_model_settings(&pool, anthropic.id, "m", None, None, None).await.expect("clear");
+            let turn = resolve_turn_model(&pool, on_anthropic.id).await.expect("resolves");
+            assert_eq!(turn.effort, None, "unset sends none");
+        }
+
         #[sqlx::test]
         async fn test_model_settings_are_checked(pool: PgPool) {
             let p = provider(&pool, "p", "api_key").await;
-            assert!(set_model_settings(&pool, p.id, " ", None, None).await.is_err());
-            assert!(set_model_settings(&pool, p.id, "m", None, Some(10)).await.is_err(), "too small");
-            assert!(set_model_settings(&pool, p.id, "m", None, Some(u32::MAX)).await.is_err(), "too big");
+            assert!(set_model_settings(&pool, p.id, " ", None, None, None).await.is_err());
+            assert!(set_model_settings(&pool, p.id, "m", None, Some(10), None).await.is_err(), "too small");
+            assert!(set_model_settings(&pool, p.id, "m", None, Some(u32::MAX), None).await.is_err(), "too big");
             assert_eq!(
-                set_model_settings(&pool, p.id + 1, "m", Some(true), None).await,
+                set_model_settings(&pool, p.id + 1, "m", Some(true), None, None).await,
                 Err("That provider no longer exists.".to_string())
             );
-            set_model_settings(&pool, p.id, "m", Some(false), Some(32_768)).await.expect("set");
+            set_model_settings(&pool, p.id, "m", Some(false), Some(32_768), None).await.expect("set");
             let row = db::get_provider_model(&pool, p.id, "m").await.expect("get").expect("exists");
             assert_eq!((row.thinking, row.context_window), (Some(false), Some(32_768)));
         }
@@ -1297,7 +1339,7 @@ mod tests {
             let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None)
                 .await
                 .expect("create");
-            set_model_settings(&pool, p.id, "typed-by-hand", None, Some(16_384)).await.expect("set");
+            set_model_settings(&pool, p.id, "typed-by-hand", None, Some(16_384), None).await.expect("set");
 
             let listing = provider_models(&pool, p.id, true).await.expect("models");
 
@@ -1338,7 +1380,7 @@ mod tests {
         #[sqlx::test]
         async fn test_adding_a_model_by_id_keeps_its_settings(pool: PgPool) {
             let p = provider(&pool, "p", "api_key").await;
-            set_model_settings(&pool, p.id, "llama3", Some(false), Some(32_768)).await.expect("set");
+            set_model_settings(&pool, p.id, "llama3", Some(false), Some(32_768), None).await.expect("set");
             add_model(&pool, p.id, " llama3 ").await.expect("add");
             let row = db::get_provider_model(&pool, p.id, "llama3").await.expect("get").expect("exists");
             assert_eq!((row.thinking, row.context_window), (Some(false), Some(32_768)));
@@ -1363,7 +1405,7 @@ mod tests {
                 .await
                 .expect("seen once");
             add_model(&pool, p.id, "by-hand").await.expect("add");
-            set_model_settings(&pool, p.id, "tuned", None, Some(16_384)).await.expect("set");
+            set_model_settings(&pool, p.id, "tuned", None, Some(16_384), None).await.expect("set");
 
             let listing = provider_models(&pool, p.id, false).await.expect("models");
             let ids: Vec<&str> = listing.models.iter().map(|m| m.id.as_str()).collect();
@@ -1414,7 +1456,7 @@ mod tests {
             let p = db::create_inference_provider(&pool, "gone", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None)
                 .await
                 .expect("create");
-            set_model_settings(&pool, p.id, "claude-opus-5", Some(true), None).await.expect("set");
+            set_model_settings(&pool, p.id, "claude-opus-5", Some(true), None, None).await.expect("set");
             let listing = provider_models(&pool, p.id, true).await.expect("models");
             assert!(listing.listing_error.is_some());
             assert_eq!(listing.models.len(), 1);

@@ -2149,6 +2149,8 @@ pub struct ProviderModelRow {
     pub reported_context_window: Option<i32>,
     pub reported_thinking: Option<bool>,
     pub reported_tools: Option<bool>,
+    /// The user's effort, `anthropic::Effort` as text (SME-106).
+    pub effort: Option<String>,
     /// Added on the provider's page as a model its listing doesn't show,
     /// so it's shown even when the listing works and lacks it.
     pub added_by_hand: bool,
@@ -2202,17 +2204,19 @@ pub async fn set_provider_model_overrides(
     model: &str,
     thinking: Option<bool>,
     context_window: Option<i32>,
+    effort: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO provider_models (provider_id, model, thinking, context_window)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO provider_models (provider_id, model, thinking, context_window, effort)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (provider_id, model) DO UPDATE
-         SET thinking = $3, context_window = $4",
+         SET thinking = $3, context_window = $4, effort = $5",
     )
     .bind(provider_id)
     .bind(model)
     .bind(thinking)
     .bind(context_window)
+    .bind(effort)
     .execute(pool)
     .await?;
     Ok(())
@@ -4511,7 +4515,7 @@ mod tests {
     async fn test_model_overrides_and_reported_details_leave_each_other_alone(pool: PgPool) {
         let provider = test_provider(&pool, "p").await;
         set_provider_model_reported(&pool, provider.id, "m", Some(4096), Some(false), Some(true)).await.expect("reported");
-        set_provider_model_overrides(&pool, provider.id, "m", Some(true), Some(32_768)).await.expect("overrides");
+        set_provider_model_overrides(&pool, provider.id, "m", Some(true), Some(32_768), None).await.expect("overrides");
         set_provider_model_reported(&pool, provider.id, "m", Some(8192), None, Some(true)).await.expect("reported");
 
         let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
@@ -4525,6 +4529,7 @@ mod tests {
                 reported_context_window: Some(8192),
                 reported_thinking: None,
                 reported_tools: Some(true),
+                effort: None,
                 added_by_hand: false,
             }
         );
