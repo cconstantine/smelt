@@ -57,7 +57,7 @@ smelt is one server binary plus a web bundle. Alongside it, it needs:
    - `DATABASE_URL` and `KUBECONFIG`.
    - `PORT`: default `8080`.
    - `SMELT_BASE_URL`: the public address, used for MCP OAuth redirects and preview pages.
-   - `SMELT_ALLOWED_HOSTS`: the host names smelt is reached by. Requests for any other host are then refused.
+   - `SMELT_ALLOWED_HOSTS`: the host names smelt is reached by. Requests for any other host name are then refused. IP addresses and `localhost` always work, so this is no substitute for the firewall below.
    - `SMELT_PREVIEW_URL` and `SMELT_PREVIEW_ADDR`: where sandbox previews live.
    - `BROWSER_CHECK_CACHE`: from step 4.
 7. **Put it behind TLS.** Use a reverse proxy that speaks HTTP/2: each tab holds an open event stream, and HTTP/1.1 allows only six connections per host. Route the preview host names (for example `{port}-{conversation}-smelt.example.com`) to `SMELT_PREVIEW_ADDR`'s port. They need wildcard DNS and a wildcard TLS certificate. The proxy must pass the browser's `Host` header through unchanged (in nginx, `proxy_set_header Host $host;`), since the preview listener reads the conversation and port from it, and must pass WebSocket upgrades through for a dev server's live reload. See [Sandbox previews](docs/setup.md#sandbox-previews).
