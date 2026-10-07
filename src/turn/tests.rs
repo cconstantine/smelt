@@ -1889,7 +1889,8 @@ async fn test_a_reply_the_window_stopped_gets_a_room_left_notice(pool: PgPool) {
     let conversation = db::create_conversation(&pool)
         .await
         .expect("create conversation");
-    let body = text_reply_body("Half a tho")
+    // Stopped by the window after 9,000 tokens, well short of its budget.
+    let body = with_usage(&text_reply_body("Half a tho"), 100, 0, 9_000)
         .replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"model_context_window_exceeded""#);
     start_recording_mock_upstream(&pool, vec![body]).await;
 
@@ -1900,7 +1901,11 @@ async fn test_a_reply_the_window_stopped_gets_a_room_left_notice(pool: PgPool) {
         [anthropic::ContentBlock::Text { text }] => text.clone(),
         other => panic!("one text block: {other:?}"),
     };
-    assert_eq!(parse_cut_off_notice(&notice), Some((16_384, ReplyLimit::RoomLeft)));
+    assert_eq!(
+        parse_cut_off_notice(&notice),
+        Some((9_000, ReplyLimit::RoomLeft)),
+        "what it wrote, not the budget it didn't reach (review 2)"
+    );
 }
 
 /// SME-111 review 1: a llama.cpp reply budget too small to think in

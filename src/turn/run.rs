@@ -564,14 +564,22 @@ pub(super) fn run_turn_body<'a>(
             // The context window stopping it (Claude 4.5+'s own stop
             // reason) is the room running out, whatever bound the budget
             // (SME-111 review 1).
+            // The window stops a reply short of its budget: the notice
+            // says what it wrote (SME-111 review 2).
             let cut_off_by = match turn.stop_reason.as_str() {
-                "max_tokens" => Some(budget.limit),
-                "model_context_window_exceeded" => Some(crate::api::chat::ReplyLimit::RoomLeft),
+                "max_tokens" => Some((budget.tokens, budget.limit)),
+                "model_context_window_exceeded" => Some((
+                    u32::try_from(turn.usage.output_tokens)
+                        .ok()
+                        .filter(|written| *written > 0)
+                        .unwrap_or(budget.tokens),
+                    crate::api::chat::ReplyLimit::RoomLeft,
+                )),
                 _ => None,
             };
-            if let Some(limit) = cut_off_by {
+            if let Some((tokens, limit)) = cut_off_by {
                 let notice = [anthropic::ContentBlock::Text {
-                    text: crate::api::chat::cut_off_notice(budget.tokens, limit),
+                    text: crate::api::chat::cut_off_notice(tokens, limit),
                 }];
                 let saved = db::create_message(pool, conversation_id, "user", &notice)
                     .await
