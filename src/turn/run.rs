@@ -460,6 +460,9 @@ pub(super) fn run_turn_body<'a>(
             let budget = reply_budget(turn_model.context_window, projected, turn_model.output_cap);
             request.max_tokens = budget.tokens;
             request.thinking = turn_model.thinking_config(request.max_tokens);
+            // A budget with no room to think in turned thinking off: the
+            // template is told too (SME-111 review 1).
+            request.chat_template_kwargs = turn_model.chat_template_kwargs(request.thinking.is_some());
 
             // Every tab watching streams the reply: the text so far is kept
             // for a tab that connects mid-reply, and each delta published.

@@ -1903,6 +1903,32 @@ async fn test_a_reply_the_window_stopped_gets_a_room_left_notice(pool: PgPool) {
     assert_eq!(parse_cut_off_notice(&notice), Some((16_384, ReplyLimit::RoomLeft)));
 }
 
+/// SME-111 review 1: a llama.cpp reply budget too small to think in
+/// (4,096 or less) turns thinking off, said plainly, instead of sending a
+/// reasoning budget of 0 while thinking is on.
+#[sqlx::test]
+async fn test_a_reply_budget_too_small_to_think_in_turns_thinking_off(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
+    sqlx::query("UPDATE inference_providers SET kind = 'llama_cpp'")
+        .execute(&pool)
+        .await
+        .expect("make the mock a llama.cpp server");
+    sqlx::query("INSERT INTO provider_models (provider_id, model, reported_context_window, max_output) SELECT id, $1, 262144, 4096 FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .execute(&pool)
+        .await
+        .expect("a small reply cap");
+    run_turn(&pool, conversation.id, hello()).await.expect("turn");
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests[0]["max_tokens"], 4096);
+    assert!(requests[0].get("thinking").is_none(), "{}", requests[0]);
+    assert_eq!(requests[0]["chat_template_kwargs"], serde_json::json!({"enable_thinking": false}));
+}
+
 /// A model on an Anthropic provider that nothing sized keeps the reply
 /// budget every turn had: a Claude model refuses one above its own cap.
 #[sqlx::test]

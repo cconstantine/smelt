@@ -441,8 +441,12 @@ mod server {
                 return None;
             }
             Some(match self.kind {
-                ProviderKind::LlamaCpp => crate::anthropic::ThinkingConfig::Enabled {
-                    budget_tokens: reasoning_budget(reply_budget, self.reasoning_cap),
+                // No room to think in: thinking off, said so (the turn
+                // tells the template too), rather than a budget of 0 with
+                // thinking on (SME-111 review 1).
+                ProviderKind::LlamaCpp => match reasoning_budget(reply_budget, self.reasoning_cap) {
+                    0 => return None,
+                    budget_tokens => crate::anthropic::ThinkingConfig::Enabled { budget_tokens },
                 },
                 ProviderKind::Anthropic | ProviderKind::Ollama | ProviderKind::Other => {
                     crate::anthropic::ThinkingConfig::Adaptive
@@ -1664,6 +1668,7 @@ mod tests {
             let llama = TurnModel { reasoning_cap: Some(50_000), ..llama_turn_model(None) };
             assert_eq!(llama.thinking_config(131_072), Some(ThinkingConfig::Enabled { budget_tokens: 50_000 }));
             assert_eq!(TurnModel { thinking: false, ..llama.clone() }.thinking_config(131_072), None);
+            assert_eq!(llama.thinking_config(4_096), None, "no room to think in (review 1)");
             for kind in [ProviderKind::Anthropic, ProviderKind::Ollama, ProviderKind::Other] {
                 assert_eq!(
                     TurnModel { kind, ..llama.clone() }.thinking_config(131_072),
