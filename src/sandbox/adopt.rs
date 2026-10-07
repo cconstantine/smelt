@@ -177,3 +177,59 @@ where
     adopt_if(api, object, instance, decide).await;
     matches!(api.get_opt(&name).await, Ok(Some(now)) if ownership(now.meta(), instance) == Ownership::Ours)
 }
+
+/// Adopts `conversation_id`'s unlabelled sandbox pods and claims, for a
+/// teardown by the database that owns them: startup's adoption may have
+/// missed them, and the conversation's record is already gone, so the
+/// next start never would. Language server pods go with their sandbox pod
+/// (`ownerReferences`).
+pub(super) async fn adopt_conversation_objects(client: &kube::Client, conversation_id: i64, instance: &db::SmeltInstance) {
+    let this_conversation = std::collections::HashSet::from([conversation_id]);
+    let none = std::collections::HashSet::new();
+    let decide = |meta: &ObjectMeta| should_adopt(meta, instance, &this_conversation, &none);
+    let pods = pods_api(client);
+    let selector = ListParams::default().labels(&format!("{CONVERSATION_LABEL}={conversation_id},!{INSTANCE_LABEL}"));
+    match pods.list(&selector).await {
+        Ok(list) => {
+            for pod in list {
+                adopt_if(&pods, pod, &instance.id, decide).await;
+            }
+        }
+        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't list a conversation's unlabelled pods to adopt"),
+    }
+    let pvcs = pvc_api(client);
+    for name in [docker_pvc_name(conversation_id), workspace_pvc_name(conversation_id)] {
+        match pvcs.get_opt(&name).await {
+            Ok(Some(claim)) if ownership(&claim.metadata, &instance.id) == Ownership::Unlabelled => {
+                adopt_if(&pvcs, claim, &instance.id, decide).await
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(claim = %name, error = %e, "couldn't read a conversation's claim to adopt"),
+        }
+    }
+}
+
+/// Adopts the unlabelled pod named by `pod_id`'s record if it's labelled
+/// with that record's conversation, for the database that owns objects
+/// from before SME-115. True once it's ours.
+pub(super) async fn adopt_record_pod(pool: &PgPool, pods: &Api<Pod>, pod_id: i64, instance: &db::SmeltInstance) -> bool {
+    let conversation_id = match db::sandbox_pod_conversation_id(pool, pod_id).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return false,
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't read a pod record's conversation to adopt its pod");
+            return false;
+        }
+    };
+    let pod = match pods.get_opt(&pod_name(pod_id)).await {
+        Ok(Some(pod)) => pod,
+        Ok(_) => return false,
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't read a pod to adopt");
+            return false;
+        }
+    };
+    let this_conversation = std::collections::HashSet::from([conversation_id]);
+    let none = std::collections::HashSet::new();
+    adopt_one(pods, pod, &instance.id, |meta| should_adopt(meta, instance, &this_conversation, &none)).await
+}

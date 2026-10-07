@@ -429,7 +429,7 @@ where
 pub(super) async fn clean_up_after_failed_start(pool: &PgPool, client: &kube::Client, conversation_id: i64, label_id: i64) {
     if !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
         match db::smelt_instance(pool).await {
-            Ok(instance) => teardown_conversation_with(client, label_id, &[], &instance.id).await,
+            Ok(instance) => teardown_conversation_with(client, label_id, &[], &instance).await,
             Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't read this database's instance to clean up"),
         }
     }
@@ -516,7 +516,7 @@ pub(super) async fn create_pod_attempt(
             // The conversation may have been deleted while this pod was
             // starting; its teardown had nothing to find yet (SME-51 B5).
             if !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
-                teardown_conversation_with(&manager.client, conversation_id, &[], &instance.id).await;
+                teardown_conversation_with(&manager.client, conversation_id, &[], &instance).await;
                 return Err(SandboxError::StartFailed(
                     "the conversation was deleted while its sandbox was starting".to_string(),
                 ));
@@ -612,10 +612,22 @@ async fn delete_terminated_pod(pool: &PgPool, client: &kube::Client, pod_id: i64
     // Only its ownership and uid are kept: a whole `Pod` held across the
     // delete below made every caller's future twice the size, which
     // overflowed a debug build's stack (SME-115).
-    let (owner, uid) = match pods.get_opt(&name).await? {
+    let (mut owner, mut uid) = match pods.get_opt(&name).await? {
         Some(pod) => (ownership(&pod.metadata, &instance.id), pod.metadata.uid),
         None => return Ok(()),
     };
+    // One from before SME-115 that startup's adoption missed: adopted now
+    // if it's this record's conversation's, so it's stopped rather than
+    // left running with its record closed (SME-115 review 1).
+    if owner == Ownership::Unlabelled
+        && instance.owns_unlabelled
+        && Box::pin(adopt_record_pod(pool, &pods, pod_id, &instance)).await
+    {
+        (owner, uid) = match pods.get_opt(&name).await? {
+            Some(pod) => (ownership(&pod.metadata, &instance.id), pod.metadata.uid),
+            None => return Ok(()),
+        };
+    }
     match owner {
         Ownership::Ours => {
             let params = DeleteParams {
@@ -853,7 +865,7 @@ pub async fn teardown_conversation(pool: &PgPool, conversation_id: i64, pod_ids:
     // Without it nothing can be told ours: leave it all (SME-115). The
     // startup sweep gets the claims; the pods are logged.
     match db::smelt_instance(pool).await {
-        Ok(instance) => teardown_conversation_with(&manager.client, conversation_id, pod_ids, &instance.id).await,
+        Ok(instance) => teardown_conversation_with(&manager.client, conversation_id, pod_ids, &instance).await,
         Err(e) => tracing::warn!(
             conversation_id,
             ?pod_ids,
@@ -874,9 +886,16 @@ pub(super) async fn teardown_conversation_with(
     client: &kube::Client,
     conversation_id: i64,
     pod_ids: &[i64],
-    instance: &str,
+    instance: &db::SmeltInstance,
 ) {
     let pods = pods_api(client);
+    // What startup's adoption missed is this conversation's too: adopted
+    // now, by the database that owns such objects, so it goes below
+    // instead of being left for good (SME-115 review 1).
+    if instance.owns_unlabelled {
+        Box::pin(adopt_conversation_objects(client, conversation_id, instance)).await;
+    }
+    let instance = instance.id.as_str();
     // Its sandbox pods, and its language server pods (SME-35).
     for label in [CONVERSATION_LABEL, crate::lsp::pods::LSP_OF_LABEL] {
         let selector =

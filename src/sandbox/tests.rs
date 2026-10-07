@@ -2162,7 +2162,7 @@ async fn test_teardown_deletes_a_conversations_pod_that_has_no_record() {
     .expect("pod");
     pods.create(&PostParams::default(), &server_pod).await.expect("create server pod");
 
-    teardown_conversation_with(&client, conversation_id, &[], TEST_INSTANCE).await;
+    teardown_conversation_with(&client, conversation_id, &[], &test_instance()).await;
     let gone = tokio::time::timeout(Duration::from_secs(60), async {
         while pods.get_opt(&name).await.ok().flatten().is_some()
             || pods.get_opt(&server).await.ok().flatten().is_some()
@@ -2202,7 +2202,7 @@ async fn test_teardown_deletes_our_pod_named_by_its_record_but_not_an_unlabelled
         pods.create(&PostParams::default(), &pod).await.expect("create pod");
     }
 
-    teardown_conversation_with(&client, conversation_id, &[conversation_id + 1, conversation_id + 2], TEST_INSTANCE)
+    teardown_conversation_with(&client, conversation_id, &[conversation_id + 1, conversation_id + 2], &test_instance())
         .await;
     let ours_gone = tokio::time::timeout(Duration::from_secs(60), async {
         while pods.get_opt(&ours).await.ok().flatten().is_some() {
@@ -2249,7 +2249,7 @@ async fn test_teardown_leaves_another_databases_conversation_of_the_same_id() {
         make_claim(&client, claim, conversation_id, Some(theirs)).await;
     }
 
-    teardown_conversation_with(&client, conversation_id, &[conversation_id], TEST_INSTANCE).await;
+    teardown_conversation_with(&client, conversation_id, &[conversation_id], &test_instance()).await;
     let mut deleted = Vec::new();
     for name in [&sandbox, &server] {
         if !pods.get_opt(name).await.expect("read").is_some_and(|p| p.metadata.deletion_timestamp.is_none()) {
@@ -2604,6 +2604,75 @@ async fn test_a_missed_claim_is_adopted_when_the_owner_needs_it() {
     assert!(adopted.is_ok(), "{adopted:?}");
     assert_eq!(label.as_deref(), Some(TEST_INSTANCE));
     assert!(matches!(scratch, Err(SandboxError::NotOurs { ownership: Ownership::Unlabelled, .. })), "{scratch:?}");
+}
+
+/// SME-115 review 1: when startup's adoption missed a conversation's pod
+/// and claims (a transient API error), the database that owns objects
+/// from before the fix still deletes them with the conversation, instead
+/// of leaving them for good. A database that doesn't own them leaves them
+/// (`test_teardown_deletes_our_pod_named_by_its_record_but_not_an_unlabelled_one`).
+#[tokio::test]
+async fn test_the_owner_tears_down_a_conversation_adoption_missed() {
+    let client = test_client().await;
+    let pods = pods_api(&client);
+    let conversation_id = unused_conversation_id();
+    let owner = db::SmeltInstance { id: TEST_INSTANCE.to_string(), owns_unlabelled: true };
+    let pod = pod_name(conversation_id);
+    let spec: Pod = serde_json::from_value(serde_json::json!({
+        "metadata": {"name": pod, "labels": {CONVERSATION_LABEL: conversation_id.to_string()}},
+        "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
+    }))
+    .expect("pod");
+    pods.create(&PostParams::default(), &spec).await.expect("create pod");
+    let claims = [docker_pvc_name(conversation_id), workspace_pvc_name(conversation_id)];
+    for claim in &claims {
+        make_claim(&client, claim, conversation_id, None).await;
+    }
+
+    teardown_conversation_with(&client, conversation_id, &[], &owner).await;
+    let mut kept = Vec::new();
+    if pods.get_opt(&pod).await.expect("read").is_some_and(|p| p.metadata.deletion_timestamp.is_none()) {
+        kept.push(pod.clone());
+    }
+    for claim in &claims {
+        if claim_kept(&client, claim).await {
+            kept.push(claim.clone());
+        }
+    }
+
+    pods.delete(&pod, &immediate_delete_params()).await.ok();
+    for claim in &claims {
+        pvc_api(&client).delete(claim, &DeleteParams::default()).await.ok();
+    }
+    assert!(kept.is_empty(), "the owning database left its own conversation's {kept:?}");
+}
+
+/// SME-115 review 1: stopping a pod startup's adoption missed deletes it
+/// for the database that owns it, instead of closing the record and
+/// leaving the pod running (every later start of the conversation would
+/// then wait on it and time out).
+#[sqlx::test]
+async fn test_the_owner_terminates_a_pod_adoption_missed(pool: PgPool) {
+    let client = test_client().await;
+    let pods = pods_api(&client);
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    sqlx::query("UPDATE smelt_instance SET owns_unlabelled = true").execute(&pool).await.expect("an owning database");
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let row = db::create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+    let name = pod_name(row.id);
+    let spec: Pod = serde_json::from_value(serde_json::json!({
+        "metadata": {"name": name, "labels": {CONVERSATION_LABEL: conversation.id.to_string()}},
+        "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
+    }))
+    .expect("pod");
+    pods.create(&PostParams::default(), &spec).await.expect("create pod");
+
+    let closed = force_terminate_pod_with(&pool, &client, row.id).await;
+    let kept = pods.get_opt(&name).await.expect("read").is_some_and(|p| p.metadata.deletion_timestamp.is_none());
+
+    pods.delete(&name, &immediate_delete_params()).await.ok();
+    assert!(closed.is_ok(), "{closed:?}");
+    assert!(!kept, "the owning database closed the record and left its pod running");
 }
 
 /// SME-115: a new pod waits out the conversation's stopping pods, ours
