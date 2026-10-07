@@ -112,6 +112,11 @@ async fn main() {
     }
     tracing::info!("sandbox manager initialized");
 
+    // The dev or production database labels the cluster objects it made
+    // before SME-115 as its own, before the pod watch and the claim sweep,
+    // which see only labelled ones. Awaited: the watch must see them.
+    sandbox::adopt_unlabelled_objects(pool).await;
+
     // Keeps pod records in step with the cluster, so the sidebar's dots
     // and /pods match it. Only here, never in the browser test harness:
     // see `sandbox::watch_pods`.

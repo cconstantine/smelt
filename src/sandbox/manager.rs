@@ -13,7 +13,7 @@ use super::*;
 pub(super) async fn ensure_volume_claims(
     client: &kube::Client,
     volumes: &[db::SandboxVolume],
-    instance: &str,
+    instance: &db::SmeltInstance,
 ) -> Result<(), SandboxError> {
     let pvcs = pvc_api(client);
     for volume in volumes {
@@ -21,12 +21,22 @@ pub(super) async fn ensure_volume_claims(
         match pvcs.get_opt(&claim).await? {
             None => {
                 tracing::warn!(claim = %claim, "volume claim missing; recreating it");
-                pvcs.create(&PostParams::default(), &build_volume_pvc_spec(volume.id, instance))
+                pvcs.create(&PostParams::default(), &build_volume_pvc_spec(volume.id, &instance.id))
                     .await?;
             }
             // Never another database's volume (SME-115).
-            Some(existing) => match ownership(&existing.metadata, instance) {
+            Some(existing) => match ownership(&existing.metadata, &instance.id) {
                 Ownership::Ours => {}
+                // One from before the fix that startup missed: its owner
+                // adopts it now.
+                Ownership::Unlabelled if instance.owns_unlabelled => {
+                    let none = std::collections::HashSet::new();
+                    let this_volume = std::collections::HashSet::from([volume.id]);
+                    let decide = |meta: &ObjectMeta| should_adopt(meta, instance, &none, &this_volume);
+                    if !adopt_one(&pvcs, existing, &instance.id, decide).await {
+                        return Err(SandboxError::NotOurs { name: claim, ownership: Ownership::Unlabelled });
+                    }
+                }
                 other => return Err(SandboxError::NotOurs { name: claim, ownership: other }),
             },
         }
@@ -64,7 +74,7 @@ impl SandboxManager {
             memory: "512Mi".to_string(),
             storage: PodStorage::Ephemeral,
         };
-        self.create_with_docker(session_id, memory, &docker, volumes, TEST_INSTANCE).await
+        self.create_with_docker(session_id, memory, &docker, volumes, &test_instance()).await
     }
 
     /// `memory` is an already-resolved value (the caller's own
@@ -83,7 +93,7 @@ impl SandboxManager {
         memory: &str,
         docker: &DockerSidecar,
         volumes: &[db::SandboxVolume],
-        instance: &str,
+        instance: &db::SmeltInstance,
     ) -> Result<Sandbox, SandboxError> {
         self.create_with_running_timeout(
             session_id,
@@ -110,7 +120,7 @@ impl SandboxManager {
         docker: &DockerSidecar,
         volumes: &[db::SandboxVolume],
         running_timeout: Duration,
-        instance: &str,
+        instance: &db::SmeltInstance,
     ) -> Result<Sandbox, SandboxError> {
         let pods = pods_api(&self.client);
         let name = format!("sandbox-{session_id}");
@@ -123,10 +133,10 @@ impl SandboxManager {
         let just_created = match pods.get_opt(&name).await? {
             // Never another database's pod (SME-115): its agent runs
             // commands for whoever connects.
-            Some(pod) if ownership(&pod.metadata, instance) != Ownership::Ours => {
+            Some(pod) if ownership(&pod.metadata, &instance.id) != Ownership::Ours => {
                 return Err(SandboxError::NotOurs {
                     name,
-                    ownership: ownership(&pod.metadata, instance),
+                    ownership: ownership(&pod.metadata, &instance.id),
                 });
             }
             Some(pod) => {
@@ -146,7 +156,7 @@ impl SandboxManager {
                 ensure_volume_claims(&self.client, volumes, instance).await?;
                 pods.create(
                     &PostParams::default(),
-                    &build_pod_spec(&name, memory, docker, volumes, instance),
+                    &build_pod_spec(&name, memory, docker, volumes, &instance.id),
                 )
                 .await?;
                 true
@@ -484,12 +494,12 @@ pub(super) async fn create_pod_attempt(
         let _ = db::terminate_sandbox_pod(pool, row.id).await;
         return Err(e);
     }
-    if let Err(e) = ensure_conversation_pvcs(&manager.client, conversation_id, &instance.id).await {
+    if let Err(e) = ensure_conversation_pvcs(&manager.client, conversation_id, &instance).await {
         let _ = db::terminate_sandbox_pod(pool, row.id).await;
         return Err(e);
     }
     match manager
-        .create_with_docker(&row.id.to_string(), &memory, &docker, &volumes, &instance.id)
+        .create_with_docker(&row.id.to_string(), &memory, &docker, &volumes, &instance)
         .await
     {
         Ok(sandbox) => {

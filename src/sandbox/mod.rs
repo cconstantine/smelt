@@ -31,6 +31,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use crate::docker_net::{DOCKER_BRIDGE_IP, DOCKER_NETWORK_POOL};
 use crate::{db, events};
 
+mod adopt;
 mod agent;
 mod claims;
 mod exec;
@@ -40,6 +41,7 @@ mod ports;
 mod spec;
 mod watch;
 
+pub use self::adopt::*;
 pub use self::agent::*;
 pub use self::claims::*;
 pub use self::exec::*;

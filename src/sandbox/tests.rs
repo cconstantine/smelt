@@ -1079,7 +1079,7 @@ async fn test_open_pod_port_reaches_the_conversations_own_pod(pool: PgPool) {
     let instance = db::smelt_instance(&pool).await.expect("instance");
     let docker = DockerSidecar { memory: "512Mi".to_string(), storage: PodStorage::Ephemeral };
     let sandbox = manager
-        .create_with_docker(&row.id.to_string(), "128Mi", &docker, &[], &instance.id)
+        .create_with_docker(&row.id.to_string(), "128Mi", &docker, &[], &instance)
         .await
         .expect("create the pod");
     let open = |conversation_id: i64, port: u16| {
@@ -1559,14 +1559,14 @@ async fn test_docker_in_a_sandbox_pod_works_and_stays_inside_the_pod() {
         memory: "1Gi".to_string(),
         storage: PodStorage::Conversation(conversation_id),
     };
-    ensure_conversation_pvcs(&client, conversation_id, TEST_INSTANCE).await.expect("ensure docker claim");
+    ensure_conversation_pvcs(&client, conversation_id, &test_instance()).await.expect("ensure docker claim");
     // Every pod this test makes, so cleanup below finds them even after
     // a failed assertion unwinds out of the checks.
     let created: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
 
     let checks = tokio::time::timeout(Duration::from_secs(300), async {
         let first = manager
-            .create_with_docker(&unique_session_id("docker"), "256Mi", &docker, &[], TEST_INSTANCE)
+            .create_with_docker(&unique_session_id("docker"), "256Mi", &docker, &[], &test_instance())
             .await
             .expect("create pod with docker");
         created.lock().expect("created").push(first.pod_name.clone());
@@ -1726,7 +1726,7 @@ async fn test_docker_in_a_sandbox_pod_works_and_stays_inside_the_pod() {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
         let second = manager
-            .create_with_docker(&unique_session_id("docker"), "256Mi", &docker, &[], TEST_INSTANCE)
+            .create_with_docker(&unique_session_id("docker"), "256Mi", &docker, &[], &test_instance())
             .await
             .expect("recreate pod on the same claim");
         created.lock().expect("created").push(second.pod_name.clone());
@@ -1775,7 +1775,7 @@ async fn test_an_oom_in_a_nested_container_restarts_only_the_docker_sidecar() {
         storage: PodStorage::Ephemeral,
     };
     let sandbox = manager
-        .create_with_docker(&unique_session_id("docker-oom"), "128Mi", &docker, &[], TEST_INSTANCE)
+        .create_with_docker(&unique_session_id("docker-oom"), "128Mi", &docker, &[], &test_instance())
         .await
         .expect("create pod");
     let name = sandbox.pod_name.clone();
@@ -1887,9 +1887,9 @@ async fn test_wait_for_conversation_pods_gone_waits_out_a_stopping_pod() {
         memory: "256Mi".to_string(),
         storage: PodStorage::Conversation(conversation_id),
     };
-    ensure_conversation_pvcs(&client, conversation_id, TEST_INSTANCE).await.expect("ensure docker claim");
+    ensure_conversation_pvcs(&client, conversation_id, &test_instance()).await.expect("ensure docker claim");
     let sandbox = manager
-        .create_with_docker(&unique_session_id("stopping"), "128Mi", &docker, &[], TEST_INSTANCE)
+        .create_with_docker(&unique_session_id("stopping"), "128Mi", &docker, &[], &test_instance())
         .await
         .expect("create pod");
     let name = sandbox.pod_name.clone();
@@ -2099,7 +2099,7 @@ async fn test_a_failed_start_for_a_deleted_conversation_leaves_no_claims(pool: P
     // other runs' claims in the shared test namespace.
     let offset = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64 + 2_000_000_000;
     db::delete_conversation(&pool, deleted.id).await.expect("delete");
-    let instance = db::smelt_instance(&pool).await.expect("instance").id;
+    let instance = db::smelt_instance(&pool).await.expect("instance");
     for id in [deleted.id, live.id] {
         ensure_conversation_pvcs(&client, id + offset, &instance).await.expect("claims");
     }
@@ -2109,8 +2109,8 @@ async fn test_a_failed_start_for_a_deleted_conversation_leaves_no_claims(pool: P
 
     let gone = pvcs.get_opt(&docker_pvc_name(deleted.id + offset)).await.expect("get").is_none_or(|p| p.metadata.deletion_timestamp.is_some());
     let kept = pvcs.get_opt(&docker_pvc_name(live.id + offset)).await.expect("get").is_some();
-    delete_conversation_pvcs(&client, live.id + offset, &instance).await;
-    delete_conversation_pvcs(&client, deleted.id + offset, &instance).await;
+    delete_conversation_pvcs(&client, live.id + offset, &instance.id).await;
+    delete_conversation_pvcs(&client, deleted.id + offset, &instance.id).await;
     assert!(gone, "the deleted conversation's re-created claim was left behind");
     assert!(kept, "a live conversation's claims must stay");
 }
@@ -2282,8 +2282,8 @@ async fn test_another_databases_claims_are_never_mounted() {
     make_claim(&client, &workspace_pvc_name(foreign), foreign, Some("another-smelt-database")).await;
     make_claim(&client, &workspace_pvc_name(unlabelled), unlabelled, None).await;
 
-    let refused_foreign = ensure_conversation_pvcs(&client, foreign, TEST_INSTANCE).await;
-    let refused_unlabelled = ensure_conversation_pvcs(&client, unlabelled, TEST_INSTANCE).await;
+    let refused_foreign = ensure_conversation_pvcs(&client, foreign, &test_instance()).await;
+    let refused_unlabelled = ensure_conversation_pvcs(&client, unlabelled, &test_instance()).await;
     let kept = [
         claim_kept(&client, &workspace_pvc_name(foreign)).await,
         claim_kept(&client, &workspace_pvc_name(unlabelled)).await,
@@ -2332,7 +2332,7 @@ async fn test_another_databases_pod_of_the_same_name_is_never_reused() {
             &DockerSidecar { memory: "512Mi".to_string(), storage: PodStorage::Ephemeral },
             &[],
             Duration::from_secs(5),
-            TEST_INSTANCE,
+            &test_instance(),
         )
         .await;
     let kept = pods.get_opt(&name).await.expect("read").is_some_and(|p| p.metadata.deletion_timestamp.is_none());
@@ -2365,7 +2365,7 @@ async fn test_another_databases_volume_claim_is_refused_and_left() {
         updated_at: chrono::Utc::now().naive_utc(),
     };
 
-    let mounted = ensure_volume_claims(&client, std::slice::from_ref(&volume), TEST_INSTANCE).await;
+    let mounted = ensure_volume_claims(&client, std::slice::from_ref(&volume), &test_instance()).await;
     let deleted = delete_volume_claim(&client, id, TEST_INSTANCE).await;
     let kept = claim_kept(&client, &name).await;
 
@@ -2429,6 +2429,181 @@ async fn test_a_record_whose_pod_is_another_databases_is_closed_and_the_pod_left
     pods.delete(&name, &immediate_delete_params()).await.ok();
     assert!(closed, "the record stayed open on another database's pod");
     assert!(kept, "closing the record deleted another database's pod");
+}
+
+fn owner() -> db::SmeltInstance {
+    db::SmeltInstance { id: "ours".to_string(), owns_unlabelled: true }
+}
+
+fn named_meta(name: &str, labels: &[(&str, &str)]) -> ObjectMeta {
+    ObjectMeta {
+        name: Some(name.to_string()),
+        labels: Some(labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+        ..Default::default()
+    }
+}
+
+/// SME-115: adoption labels only what this database made before the fix:
+/// never without `owns_unlabelled`, never an object already labelled
+/// (another database's, or ours), and only one whose conversation or
+/// volume this database still has.
+#[test]
+fn test_adoption_takes_only_unlabelled_objects_of_our_conversations_and_volumes() {
+    let conversations = std::collections::HashSet::from([1528]);
+    let volumes = std::collections::HashSet::from([3]);
+    let adopts = |meta: &ObjectMeta, instance: &db::SmeltInstance| should_adopt(meta, instance, &conversations, &volumes);
+    let claim = named_meta("sandbox-workspace-1528", &[(CONVERSATION_LABEL, "1528")]);
+    let pod = named_meta("sandbox-401", &[(CONVERSATION_LABEL, "1528")]);
+    let volume = named_meta("sandbox-volume-3", &[]);
+    for meta in [&claim, &pod, &volume] {
+        assert!(adopts(meta, &owner()), "{:?}", meta.name);
+        assert!(!adopts(meta, &db::SmeltInstance { owns_unlabelled: false, ..owner() }), "a scratch database adopted {:?}", meta.name);
+    }
+    let gone = named_meta("sandbox-workspace-7", &[(CONVERSATION_LABEL, "7")]);
+    let gone_volume = named_meta("sandbox-volume-4", &[]);
+    let theirs = named_meta("sandbox-workspace-1528", &[(CONVERSATION_LABEL, "1528"), (INSTANCE_LABEL, "theirs")]);
+    let already = named_meta("sandbox-workspace-1528", &[(CONVERSATION_LABEL, "1528"), (INSTANCE_LABEL, "ours")]);
+    let stranger = named_meta("something-else", &[]);
+    for meta in [&gone, &gone_volume, &theirs, &already, &stranger] {
+        assert!(!adopts(meta, &owner()), "adopted {:?} {:?}", meta.name, meta.labels);
+    }
+}
+
+/// SME-115: a language server pod is adopted with the sandbox pod it runs
+/// next to, never otherwise.
+#[test]
+fn test_adoption_takes_a_server_pod_only_with_its_sandbox_pod() {
+    let ours = std::collections::HashSet::from([401]);
+    let server = |pod: &str, labels: &[(&str, &str)]| {
+        let mut all = vec![(crate::lsp::pods::LSP_POD_LABEL, pod)];
+        all.extend_from_slice(labels);
+        named_meta(&format!("lsp-{pod}-x"), &all)
+    };
+    assert!(should_adopt_server(&server("401", &[]), &owner(), &ours));
+    assert!(!should_adopt_server(&server("401", &[]), &db::SmeltInstance { owns_unlabelled: false, ..owner() }, &ours));
+    assert!(!should_adopt_server(&server("402", &[]), &owner(), &ours), "its sandbox pod isn't ours");
+    assert!(!should_adopt_server(&server("401", &[(INSTANCE_LABEL, "theirs")]), &owner(), &ours));
+}
+
+/// The instance label of `name`'s object, read back from the cluster.
+async fn instance_of<K>(api: &Api<K>, name: &str) -> Option<String>
+where
+    K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    api.get(name).await.expect("read").meta().labels.as_ref().and_then(|l| l.get(INSTANCE_LABEL).cloned())
+}
+
+/// The unlabelled objects of one conversation, as a database from before
+/// SME-115 left them: its claim, its pod, and a language server pod next
+/// to it; plus a claim of a conversation the database no longer has.
+/// Returns (claim, pod, server pod, gone claim) names.
+async fn make_pre_fix_objects(client: &kube::Client, conversation_id: i64, pod_id: i64) -> [String; 4] {
+    let pods = pods_api(client);
+    let claim = workspace_pvc_name(conversation_id);
+    let gone = workspace_pvc_name(conversation_id + 1);
+    make_claim(client, &claim, conversation_id, None).await;
+    make_claim(client, &gone, conversation_id + 1, None).await;
+    let pod = pod_name(pod_id);
+    let server = format!("lsp-{pod_id}-x");
+    for (name, labels) in [
+        (&pod, serde_json::json!({CONVERSATION_LABEL: conversation_id.to_string()})),
+        (&server, serde_json::json!({
+            crate::lsp::pods::LSP_OF_LABEL: conversation_id.to_string(),
+            crate::lsp::pods::LSP_POD_LABEL: pod_id.to_string(),
+        })),
+    ] {
+        let spec: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": name, "labels": labels},
+            "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
+        }))
+        .expect("pod");
+        pods.create(&PostParams::default(), &spec).await.expect("create pod");
+    }
+    [claim, pod, server, gone]
+}
+
+async fn remove_pre_fix_objects(client: &kube::Client, [claim, pod, server, gone]: &[String; 4]) {
+    for name in [pod, server] {
+        pods_api(client).delete(name, &immediate_delete_params()).await.ok();
+    }
+    for name in [claim, gone] {
+        pvc_api(client).delete(name, &DeleteParams::default()).await.ok();
+    }
+}
+
+/// SME-115: the database that made the objects from before the fix (the
+/// dev database) labels its conversation's claim, pod and server pod as
+/// its own at startup, so its watch, sweep and teardown see them again; a
+/// claim of a conversation it no longer has is left as it was.
+#[sqlx::test]
+async fn test_the_owning_database_adopts_its_unlabelled_objects(pool: PgPool) {
+    let client = test_client().await;
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    sqlx::query("UPDATE smelt_instance SET owns_unlabelled = true").execute(&pool).await.expect("an owning database");
+    let ours = db::smelt_instance(&pool).await.expect("instance").id;
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let pod_row = db::create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+    let names = make_pre_fix_objects(&client, conversation.id, pod_row.id).await;
+
+    adopt_unlabelled_objects_with(&client, &pool).await;
+    let labels = [
+        instance_of(&pvc_api(&client), &names[0]).await,
+        instance_of(&pods_api(&client), &names[1]).await,
+        instance_of(&pods_api(&client), &names[2]).await,
+        instance_of(&pvc_api(&client), &names[3]).await,
+    ];
+
+    remove_pre_fix_objects(&client, &names).await;
+    assert_eq!(labels, [Some(ours.clone()), Some(ours.clone()), Some(ours), None]);
+}
+
+/// SME-115: a database that didn't make them (a scratch one) adopts
+/// nothing, even for a conversation id it happens to have too.
+#[sqlx::test]
+async fn test_a_scratch_database_adopts_nothing(pool: PgPool) {
+    let client = test_client().await;
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let pod_row = db::create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+    let names = make_pre_fix_objects(&client, conversation.id, pod_row.id).await;
+
+    adopt_unlabelled_objects_with(&client, &pool).await;
+    let labels = [
+        instance_of(&pvc_api(&client), &names[0]).await,
+        instance_of(&pods_api(&client), &names[1]).await,
+        instance_of(&pods_api(&client), &names[2]).await,
+        instance_of(&pvc_api(&client), &names[3]).await,
+    ];
+
+    remove_pre_fix_objects(&client, &names).await;
+    assert_eq!(labels, [None, None, None, None]);
+}
+
+/// SME-115: when startup's adoption missed a claim, the owning database
+/// adopts it when a pod first needs it, instead of locking the
+/// conversation out of its /workspace until a restart. A scratch database
+/// still refuses it.
+#[tokio::test]
+async fn test_a_missed_claim_is_adopted_when_the_owner_needs_it() {
+    let client = test_client().await;
+    let owned = unused_conversation_id();
+    let refused = owned + 1;
+    let owner = db::SmeltInstance { id: TEST_INSTANCE.to_string(), owns_unlabelled: true };
+    make_claim(&client, &workspace_pvc_name(owned), owned, None).await;
+    make_claim(&client, &workspace_pvc_name(refused), refused, None).await;
+
+    let adopted = ensure_conversation_pvcs(&client, owned, &owner).await;
+    let label = instance_of(&pvc_api(&client), &workspace_pvc_name(owned)).await;
+    let scratch = ensure_conversation_pvcs(&client, refused, &test_instance()).await;
+
+    for id in [owned, refused] {
+        for name in [docker_pvc_name(id), workspace_pvc_name(id)] {
+            pvc_api(&client).delete(&name, &DeleteParams::default()).await.ok();
+        }
+    }
+    assert!(adopted.is_ok(), "{adopted:?}");
+    assert_eq!(label.as_deref(), Some(TEST_INSTANCE));
+    assert!(matches!(scratch, Err(SandboxError::NotOurs { ownership: Ownership::Unlabelled, .. })), "{scratch:?}");
 }
 
 /// SME-115: a new pod waits out the conversation's stopping pods, ours
@@ -2537,12 +2712,12 @@ async fn test_ensure_docker_pvc_creates_once_and_delete_removes_it() {
         + 1_000_000_000;
     let name = docker_pvc_name(conversation_id);
 
-    ensure_conversation_pvcs(&client, conversation_id, TEST_INSTANCE).await.expect("first ensure should create");
+    ensure_conversation_pvcs(&client, conversation_id, &test_instance()).await.expect("first ensure should create");
     let first = pvcs.get_opt(&name).await.expect("get claim");
     let first_uid = first.and_then(|p| p.metadata.uid);
     assert!(first_uid.is_some(), "ensure_docker_pvc should create {name}");
 
-    ensure_conversation_pvcs(&client, conversation_id, TEST_INSTANCE).await.expect("second ensure should reuse");
+    ensure_conversation_pvcs(&client, conversation_id, &test_instance()).await.expect("second ensure should reuse");
     let second_uid = pvcs.get_opt(&name).await.expect("get claim").and_then(|p| p.metadata.uid);
     assert_eq!(first_uid, second_uid, "a second ensure must reuse the claim, not replace it");
 
@@ -3788,7 +3963,7 @@ async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
         let docker = DockerSidecar { memory: "512Mi".to_string(), storage: PodStorage::Ephemeral };
         let volume_sandbox = get()
             .expect("set above")
-            .create_with_docker(&volume_session_id, "128Mi", &docker, &volumes, &instance.id)
+            .create_with_docker(&volume_session_id, "128Mi", &docker, &volumes, &instance)
             .await
             .expect("create with a volume should succeed");
         let write =
@@ -3978,7 +4153,7 @@ async fn test_create_deletes_the_pod_it_just_created_if_it_never_reaches_running
             },
             &[],
             Duration::from_millis(1),
-            TEST_INSTANCE,
+            &test_instance(),
         )
         .await;
     match result {

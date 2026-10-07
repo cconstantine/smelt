@@ -296,10 +296,10 @@ pub(super) async fn wait_for_conversation_pods_gone(
 pub(super) async fn ensure_conversation_pvcs(
     client: &kube::Client,
     conversation_id: i64,
-    instance: &str,
+    instance: &db::SmeltInstance,
 ) -> Result<(), SandboxError> {
     let pvcs = pvc_api(client);
-    for (name, spec) in conversation_pvc_specs(conversation_id, instance) {
+    for (name, spec) in conversation_pvc_specs(conversation_id, &instance.id) {
         let existing = match pvcs.get_opt(&name).await? {
             Some(claim) => claim,
             None => match pvcs.create(&PostParams::default(), &spec).await {
@@ -309,9 +309,18 @@ pub(super) async fn ensure_conversation_pvcs(
                 Err(e) => return Err(e.into()),
             },
         };
-        // Never another database's /workspace (SME-115).
-        match ownership(&existing.metadata, instance) {
+        // Never another database's /workspace (SME-115). One from before
+        // the fix that startup missed is adopted now, by its owner only.
+        match ownership(&existing.metadata, &instance.id) {
             Ownership::Ours => {}
+            Ownership::Unlabelled if instance.owns_unlabelled => {
+                let this_conversation = std::collections::HashSet::from([conversation_id]);
+                let none = std::collections::HashSet::new();
+                let decide = |meta: &ObjectMeta| should_adopt(meta, instance, &this_conversation, &none);
+                if !adopt_one(&pvcs, existing, &instance.id, decide).await {
+                    return Err(SandboxError::NotOurs { name, ownership: Ownership::Unlabelled });
+                }
+            }
             other => return Err(SandboxError::NotOurs { name, ownership: other }),
         }
     }
