@@ -582,6 +582,17 @@ fn sign_in_expired(config: &McpServerConfig) -> String {
 /// or a refresh when it's expiring. A grant that can't be refreshed drops
 /// the server's cached connection, which would otherwise still report
 /// Connected (SME-113).
+/// The server's stored grant as it is now, to tell whether another
+/// refresh replaced it. `None` too when it can't be read.
+async fn stored_grant(pool: &sqlx::PgPool, server_id: i64) -> Option<serde_json::Value> {
+    crate::db::get_mcp_server_config(pool, server_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|config| config.oauth_credentials)
+        .map(|json| json.0)
+}
+
 async fn check_sign_in(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<(), CheckError> {
     let token = tokio::time::timeout(CONNECT_TIMEOUT, async {
         let client = oauth_client(pool, config)
@@ -591,13 +602,26 @@ async fn check_sign_in(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<
         // rotates its refresh token whether or not anyone waits for the
         // reply, so the reply must still be saved when this check times
         // out or its request goes away (review 2).
-        let fetching = tokio::spawn(async move { client.get_access_token().await });
-        let fetched = fetching.await.map_err(|e| {
-            CheckError::Unreachable(format!(
-                "getting an OAuth token for MCP server {:?} failed: {e}",
-                config.name
-            ))
-        })?;
+        let fetch = |client: OAuthClient| async move {
+            tokio::spawn(async move { client.get_access_token().await })
+                .await
+                .map_err(|e| {
+                    CheckError::Unreachable(format!(
+                        "getting an OAuth token for MCP server {:?} failed: {e}",
+                        config.name
+                    ))
+                })
+        };
+        let grant_before = stored_grant(pool, config.id).await;
+        let mut fetched = fetch(client.clone()).await?;
+        if matches!(fetched, Err(rmcp::transport::auth::AuthError::AuthorizationRequired))
+            && stored_grant(pool, config.id).await != grant_before
+        {
+            // The provider refused this refresh, but the grant changed
+            // meanwhile: another manager refreshed first with the same
+            // refresh token (review 2). Its new grant is what counts.
+            fetched = fetch(client).await?;
+        }
         fetched.map_err(|e| match e {
             rmcp::transport::auth::AuthError::AuthorizationRequired => {
                 CheckError::SignInExpired(sign_in_expired(config))
@@ -1512,7 +1536,8 @@ mod tests {
                 }
                 let gate = mock.refresh_gate.lock().unwrap().clone();
                 if let Some(gate) = gate {
-                    let _permit = gate.acquire().await;
+                    // Each permit lets exactly one refresh through.
+                    gate.acquire().await.expect("refresh gate").forget();
                 }
                 let required = mock.required_secret.lock().unwrap().clone();
                 if let Some((client_id, secret)) = required {
@@ -1997,6 +2022,38 @@ mod tests {
 
         let result = call_tool(&pool, &config, "echo", serde_json::json!({})).await;
         assert_eq!(result, Ok("called with access-2".to_string()), "the rotated grant was saved");
+        evict(server.id).await;
+    }
+
+    /// SME-113 review 2: after an `evict` mid-call, an old manager and the
+    /// status check's new one can refresh with the same refresh token. The
+    /// provider refuses whichever comes second, but the other just saved a
+    /// good grant, so the check mustn't call the sign-in expired.
+    #[sqlx::test]
+    async fn test_a_check_that_loses_a_refresh_race_is_not_reported_as_expired(pool: sqlx::PgPool) {
+        let mock = oauth_http::spawn().await;
+        let server = oauth_http::create_server(&pool, &mock, None).await;
+        oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+        let config = oauth_http::config(&pool, server.id).await;
+        connection_check(&pool, &config).await.expect("connects");
+        let old_client = OAUTH_CLIENTS.lock().await.get(&server.id).expect("cached").client.clone();
+        evict(server.id).await;
+        oauth_http::age_token(&pool, server.id).await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *mock.refresh_gate.lock().unwrap() = Some(gate.clone());
+
+        let old_refresh = tokio::spawn(async move { old_client.get_access_token().await });
+        assert!(wait_until(|| mock.refresh_client_ids.lock().unwrap().len() == 1).await);
+        let check = tokio::spawn({
+            let (pool, config) = (pool.clone(), config.clone());
+            async move { connection_check(&pool, &config).await }
+        });
+        assert!(wait_until(|| mock.refresh_client_ids.lock().unwrap().len() == 2).await);
+        gate.add_permits(1);
+        old_refresh.await.expect("old refresh task").expect("the first refresh wins");
+        gate.add_permits(1);
+
+        assert_eq!(check.await.expect("check task"), Ok(vec!["echo".to_string()]));
         evict(server.id).await;
     }
 }
