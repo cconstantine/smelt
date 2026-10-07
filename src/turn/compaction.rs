@@ -378,6 +378,8 @@ pub(super) async fn compact_conversation(
         stream: true,
         tools: vec![],
         thinking: None,
+        prompt_caching: false,
+        output_config: None,
     };
 
     let mut discard_deltas = |_: &str| {};
@@ -385,6 +387,25 @@ pub(super) async fn compact_conversation(
         &turn_model.endpoint,
         &summarization_request,
         &mut discard_deltas,
+    )
+    .await
+    .map_err(ServerFnError::new)?;
+    // Recorded as soon as it completes: the tokens are spent whether or
+    // not the summary is saved below (SME-106).
+    db::record_model_call(
+        pool,
+        &db::ModelCall {
+            conversation_id,
+            provider_id: turn_model.provider_id,
+            model: &turn_model.model,
+            kind: db::ModelCallKind::Compaction,
+            usage: turn.usage,
+            cost_usd: crate::pricing::call_cost(
+                turn_model.price_catalog_provider.as_deref(),
+                &turn_model.model,
+                &turn.usage,
+            ),
+        },
     )
     .await
     .map_err(ServerFnError::new)?;

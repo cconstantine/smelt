@@ -204,6 +204,10 @@ pub struct ContextDetailSnapshot {
     pub message_count: usize,
     pub usage: Option<anthropic::TokenUsage>,
     pub context_window: u32,
+    /// Every completed model call so far, with its cost (SME-106).
+    pub spend: crate::models::ConversationSpend,
+    /// When the price catalog was last fetched; `None` before the first.
+    pub prices_as_of: Option<chrono::NaiveDateTime>,
 }
 
 #[get("/api/conversations/{id}/context-detail")]
@@ -239,6 +243,10 @@ pub(crate) async fn context_detail(pool: &PgPool, id: i64) -> ServerFnResult<Con
         message_count,
         usage,
         context_window,
+        spend: db::get_conversation_spend(pool, id)
+            .await
+            .map_err(ServerFnError::new)?,
+        prices_as_of: crate::pricing::CATALOG.current().map(|c| c.fetched_at),
     })
 }
 

@@ -134,6 +134,44 @@ pub struct ToolDefinition {
     pub input_schema: serde_json::Value,
 }
 
+/// How hard the model works on a reply (`output_config.effort`): thinking
+/// depth and overall token spend (SME-106). Ungated: the providers page
+/// sets it per model.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    pub const ALL: [Effort; 5] = [Self::Low, Self::Medium, Self::High, Self::Xhigh, Self::Max];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|e| e.as_str() == value)
+    }
+}
+
+/// `output_config`: only its effort, the one field smelt sends.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct OutputConfig {
+    pub effort: Effort,
+}
+
 /// `{"type": "adaptive"}` — the model manages its own thinking budget
 /// within `max_tokens` rather than a caller-specified `budget_tokens`
 /// (deprecated on current models). The only variant smelt sends; kept as
@@ -159,6 +197,36 @@ pub struct CreateMessageRequest {
     pub tools: Vec<ToolDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
+    /// Mark the request for prompt caching (SME-106); see `to_body`. Not a
+    /// wire field itself.
+    #[serde(skip)]
+    pub prompt_caching: bool,
+}
+
+#[cfg(feature = "server")]
+impl CreateMessageRequest {
+    /// The JSON body to send. With `prompt_caching`, two breakpoints: the
+    /// system prompt becomes one text block with its own `cache_control`,
+    /// a fixed read point for the tools and system prefix, and a top-level
+    /// `cache_control` caches up to the end of the transcript, moving with
+    /// it each call (Anthropic's automatic caching).
+    pub fn to_body(&self) -> serde_json::Result<serde_json::Value> {
+        let mut body = serde_json::to_value(self)?;
+        if self.prompt_caching {
+            let ephemeral = serde_json::json!({"type": "ephemeral"});
+            if let Some(system) = &self.system {
+                body["system"] = serde_json::json!([{
+                    "type": "text",
+                    "text": system,
+                    "cache_control": ephemeral,
+                }]);
+            }
+            body["cache_control"] = ephemeral;
+        }
+        Ok(body)
+    }
 }
 
 #[cfg(test)]
@@ -297,6 +365,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
+            output_config: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert!(
@@ -315,6 +385,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: Some(ThinkingConfig::Adaptive),
+            prompt_caching: false,
+            output_config: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -388,6 +460,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
+            output_config: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert!(
@@ -423,11 +497,77 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
+            output_config: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert!(
             value.get("system").is_none(),
             "system key should be omitted entirely when None, got: {value:?}"
         );
+    }
+
+    fn caching_request(prompt_caching: bool) -> CreateMessageRequest {
+        CreateMessageRequest {
+            model: "claude-opus-5-5".to_string(),
+            max_tokens: 4096,
+            system: Some("You are smelt.".to_string()),
+            messages: vec![],
+            stream: true,
+            tools: vec![],
+            thinking: None,
+            prompt_caching,
+            output_config: None,
+        }
+    }
+
+    #[test]
+    fn test_effort_goes_in_output_config_and_is_left_out_when_unset() {
+        let mut request = caching_request(false);
+        assert!(request.to_body().expect("encodes").get("output_config").is_none());
+        request.output_config = Some(OutputConfig { effort: Effort::Xhigh });
+        assert_eq!(request.to_body().expect("encodes")["output_config"], serde_json::json!({"effort": "xhigh"}));
+        for effort in Effort::ALL {
+            assert_eq!(Effort::parse(effort.as_str()), Some(effort));
+            assert_eq!(serde_json::to_value(effort).expect("encodes"), serde_json::json!(effort.as_str()));
+        }
+        assert_eq!(Effort::parse("extreme"), None);
+    }
+
+    #[test]
+    fn test_caching_marks_the_system_prompt_and_the_whole_request() {
+        let body = caching_request(true).to_body().expect("encodes");
+        assert_eq!(
+            body["system"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "You are smelt.",
+                "cache_control": {"type": "ephemeral"}
+            }]),
+            "the system prompt is one block with its own breakpoint: {body}"
+        );
+        assert_eq!(
+            body["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "the top-level marker caches up to the end of the transcript: {body}"
+        );
+        assert!(body.get("prompt_caching").is_none(), "not a wire field: {body}");
+    }
+
+    #[test]
+    fn test_without_caching_the_body_has_no_markers_and_a_plain_system_string() {
+        let body = caching_request(false).to_body().expect("encodes");
+        assert_eq!(body["system"], serde_json::json!("You are smelt."));
+        assert!(body.get("cache_control").is_none(), "{body}");
+        assert!(body.get("prompt_caching").is_none(), "{body}");
+    }
+
+    #[test]
+    fn test_caching_without_a_system_prompt_still_marks_the_request() {
+        let mut request = caching_request(true);
+        request.system = None;
+        let body = request.to_body().expect("encodes");
+        assert!(body.get("system").is_none(), "{body}");
+        assert_eq!(body["cache_control"], serde_json::json!({"type": "ephemeral"}));
     }
 }

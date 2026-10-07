@@ -306,6 +306,8 @@ When the user mentions a new idea, create a **Backlog** ticket for it before it 
 
 **After a range edit to a Linear ticket or document** (`replace_range`, or replacing a whole section), read it back and compare it against the version from before the edit; sections outside the range should be unchanged. A save's reply can show stale content, so read it again rather than trusting the reply. On SME-32 a `replace_range` on the Current state document silently deleted 11 architecture bullets, restored only because an earlier copy was still in the session. `replace_range`'s `to` anchor is exclusive: end the range at the next section's heading and include that heading in `new_string` (or `replace` the whole old section). Ending it at a section's own last line left that line duplicated on SME-70, SME-49, SME-86 and SME-90.
 
+**Prefer `replace` with a unique anchor over `replace_range`.** Quote just the text that changes, with enough around it to match once; a range's two anchors are where the doubled lines and lost sections above came from. **When appending a table row** (`append`, or `insert_after` a table's last row), check whether the content already ends with a newline, and if it does, don't start the row with another: a blank line ends a Markdown table, so the new row shows as a paragraph under it. On SME-106 range edits left a doubled heading, and an append left a blank line splitting a table.
+
 ---
 
 ## Retrospective (end of each project)

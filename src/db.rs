@@ -197,7 +197,7 @@ pub async fn clear_conversation_usage(pool: &PgPool, conversation_id: i64) -> Re
 /// only," not a history, so this is always a full replace, not an
 /// accumulation.
 pub async fn upsert_conversation_usage(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     conversation_id: i64,
     usage: &crate::anthropic::TokenUsage,
 ) -> Result<(), sqlx::Error> {
@@ -217,9 +217,143 @@ pub async fn upsert_conversation_usage(
     .bind(usage.output_tokens)
     .bind(usage.cache_creation_input_tokens)
     .bind(usage.cache_read_input_tokens)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// The saved price catalog (SME-106): when it was fetched, and
+/// `pricing::Providers` as JSON.
+pub async fn get_price_catalog(
+    pool: &PgPool,
+) -> Result<Option<(NaiveDateTime, serde_json::Value)>, sqlx::Error> {
+    sqlx::query_as("SELECT fetched_at, providers FROM price_catalog").fetch_optional(pool).await
+}
+
+/// Replaces the saved price catalog.
+pub async fn save_price_catalog(
+    pool: &PgPool,
+    fetched_at: NaiveDateTime,
+    providers: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO price_catalog (id, fetched_at, providers) VALUES (TRUE, $1, $2)
+         ON CONFLICT (id) DO UPDATE SET fetched_at = EXCLUDED.fetched_at, providers = EXCLUDED.providers",
+    )
+    .bind(fetched_at)
+    .bind(providers)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Each provider's models' calls since `since`, costliest first (SME-106).
+/// A deleted provider's calls are kept, grouped under no provider.
+pub async fn model_spend_since(
+    pool: &PgPool,
+    since: NaiveDateTime,
+) -> Result<Vec<crate::models::ModelSpend>, sqlx::Error> {
+    sqlx::query_as::<_, crate::models::ModelSpend>(
+        "SELECT p.name AS provider_name, u.model,
+                count(*) AS calls,
+                sum(u.input_tokens)::BIGINT AS input_tokens,
+                sum(u.output_tokens)::BIGINT AS output_tokens,
+                sum(u.cache_creation_input_tokens)::BIGINT AS cache_creation_input_tokens,
+                sum(u.cache_read_input_tokens)::BIGINT AS cache_read_input_tokens,
+                sum(u.cost_usd) AS cost_usd,
+                count(*) FILTER (WHERE u.cost_usd IS NULL) AS unpriced_calls
+         FROM model_call_usage u
+         LEFT JOIN inference_providers p ON p.id = u.provider_id
+         WHERE u.created_at >= $1
+         GROUP BY u.provider_id, p.name, u.model
+         ORDER BY sum(u.cost_usd) DESC NULLS LAST, count(*) DESC, p.name, u.model",
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await
+}
+
+/// Which request a `model_call_usage` row is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelCallKind {
+    Turn,
+    Compaction,
+}
+
+impl ModelCallKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::Compaction => "compaction",
+        }
+    }
+}
+
+/// One completed model call, for `record_model_call`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelCall<'a> {
+    pub conversation_id: i64,
+    pub provider_id: i64,
+    pub model: &'a str,
+    pub kind: ModelCallKind,
+    pub usage: crate::anthropic::TokenUsage,
+    /// From the price catalog when the call finished; `None` without a price.
+    pub cost_usd: Option<f64>,
+}
+
+/// Appends `call` to `model_call_usage` (SME-106). A turn's call is also
+/// the conversation's new last-known usage (`upsert_conversation_usage`),
+/// written in the same transaction so the two never disagree. A
+/// compaction's isn't: it described the old, long history.
+pub async fn record_model_call(pool: &PgPool, call: &ModelCall<'_>) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        // The provider as it is now: a turn reads it when it starts, and the
+        // user may delete it before the reply finishes. A deleted one gives
+        // null, as the deletion's own SET NULL would (code review 1). `FOR
+        // KEY SHARE` waits for a delete still in progress and then reads
+        // null; without it the id is read, and the foreign key fails once
+        // the delete commits (code review 2).
+        "INSERT INTO model_call_usage
+             (conversation_id, provider_id, model, kind, input_tokens, output_tokens,
+              cache_creation_input_tokens, cache_read_input_tokens, cost_usd)
+         VALUES ($1, (SELECT id FROM inference_providers WHERE id = $2 FOR KEY SHARE),
+                 $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(call.conversation_id)
+    .bind(call.provider_id)
+    .bind(call.model)
+    .bind(call.kind.as_str())
+    .bind(call.usage.input_tokens)
+    .bind(call.usage.output_tokens)
+    .bind(call.usage.cache_creation_input_tokens)
+    .bind(call.usage.cache_read_input_tokens)
+    .bind(call.cost_usd)
+    .execute(&mut *tx)
+    .await?;
+    if call.kind == ModelCallKind::Turn {
+        upsert_conversation_usage(&mut *tx, call.conversation_id, &call.usage).await?;
+    }
+    tx.commit().await
+}
+
+pub async fn get_conversation_spend(
+    pool: &PgPool,
+    conversation_id: i64,
+) -> Result<crate::models::ConversationSpend, sqlx::Error> {
+    sqlx::query_as::<_, crate::models::ConversationSpend>(
+        "SELECT count(*) AS calls,
+                COALESCE(sum(input_tokens), 0)::BIGINT AS input_tokens,
+                COALESCE(sum(output_tokens), 0)::BIGINT AS output_tokens,
+                COALESCE(sum(cache_creation_input_tokens), 0)::BIGINT AS cache_creation_input_tokens,
+                COALESCE(sum(cache_read_input_tokens), 0)::BIGINT AS cache_read_input_tokens,
+                sum(cost_usd) AS cost_usd,
+                count(*) FILTER (WHERE cost_usd IS NULL) AS unpriced_calls
+         FROM model_call_usage WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
 }
 
 /// Current todo list for `conversation_id` — empty if `todowrite` has never
@@ -1887,6 +2021,10 @@ pub struct InferenceProvider {
     pub auth_kind: String,
     /// Never sent to the browser; `providers::secret_hint` is.
     pub secret: String,
+    /// Mark turn requests for prompt caching (SME-106).
+    pub prompt_caching: bool,
+    /// The models.dev provider that prices its calls (SME-106).
+    pub price_catalog_provider: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -1900,6 +2038,8 @@ impl std::fmt::Debug for InferenceProvider {
             .field("kind", &self.kind)
             .field("base_url", &self.base_url)
             .field("auth_kind", &self.auth_kind)
+            .field("prompt_caching", &self.prompt_caching)
+            .field("price_catalog_provider", &self.price_catalog_provider)
             .field("secret", &"..")
             .finish_non_exhaustive()
     }
@@ -1912,16 +2052,20 @@ pub async fn create_inference_provider(
     base_url: &str,
     auth_kind: &str,
     secret: &str,
+    prompt_caching: bool,
+    price_catalog_provider: Option<&str>,
 ) -> Result<InferenceProvider, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
-        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret)
-         VALUES ($1, $2, $3, $4, $5) RETURNING *",
+        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret, prompt_caching, price_catalog_provider)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
     )
     .bind(name)
     .bind(kind)
     .bind(base_url)
     .bind(auth_kind)
     .bind(secret)
+    .bind(prompt_caching)
+    .bind(price_catalog_provider)
     .fetch_one(pool)
     .await
 }
@@ -1952,11 +2096,14 @@ pub async fn update_inference_provider(
     base_url: &str,
     auth_kind: &str,
     secret: Option<&str>,
+    prompt_caching: bool,
+    price_catalog_provider: Option<&str>,
 ) -> Result<Option<InferenceProvider>, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
         "UPDATE inference_providers
          SET name = $2, kind = $3, base_url = $4, auth_kind = $5,
-             secret = COALESCE($6, secret), updated_at = now()
+             secret = COALESCE($6, secret), prompt_caching = $7, price_catalog_provider = $8,
+             updated_at = now()
          WHERE id = $1 RETURNING *",
     )
     .bind(id)
@@ -1965,6 +2112,8 @@ pub async fn update_inference_provider(
     .bind(base_url)
     .bind(auth_kind)
     .bind(secret)
+    .bind(prompt_caching)
+    .bind(price_catalog_provider)
     .fetch_optional(pool)
     .await
 }
@@ -2007,6 +2156,8 @@ pub struct ProviderModelRow {
     pub reported_context_window: Option<i32>,
     pub reported_thinking: Option<bool>,
     pub reported_tools: Option<bool>,
+    /// The user's effort, `anthropic::Effort` as text (SME-106).
+    pub effort: Option<String>,
     /// Added on the provider's page as a model its listing doesn't show,
     /// so it's shown even when the listing works and lacks it.
     pub added_by_hand: bool,
@@ -2060,17 +2211,19 @@ pub async fn set_provider_model_overrides(
     model: &str,
     thinking: Option<bool>,
     context_window: Option<i32>,
+    effort: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO provider_models (provider_id, model, thinking, context_window)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO provider_models (provider_id, model, thinking, context_window, effort)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (provider_id, model) DO UPDATE
-         SET thinking = $3, context_window = $4",
+         SET thinking = $3, context_window = $4, effort = $5",
     )
     .bind(provider_id)
     .bind(model)
     .bind(thinking)
     .bind(context_window)
+    .bind(effort)
     .execute(pool)
     .await?;
     Ok(())
@@ -4077,9 +4230,231 @@ mod tests {
     // --- Model providers (SME-72) ---
 
     async fn test_provider(pool: &PgPool, name: &str) -> InferenceProvider {
-        create_inference_provider(pool, name, "anthropic", "https://api.anthropic.com", "api_key", "sk-ant-0123456789")
+        create_inference_provider(pool, name, "anthropic", "https://api.anthropic.com", "api_key", "sk-ant-0123456789", false, None)
             .await
             .expect("create provider")
+    }
+
+    fn usage(input: i64, output: i64, write: i64, read: i64) -> crate::anthropic::TokenUsage {
+        crate::anthropic::TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_input_tokens: write,
+            cache_read_input_tokens: read,
+        }
+    }
+
+    /// Mechanical CRUD: a characterization round trip rather than
+    /// test-first (SME-106).
+    #[sqlx::test]
+    async fn test_model_calls_add_up_and_only_a_turns_call_is_the_last_known_usage(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let other = create_conversation(&pool).await.expect("another conversation");
+        let provider = test_provider(&pool, "p").await;
+        assert_eq!(
+            get_conversation_spend(&pool, conversation.id).await.expect("spend"),
+            crate::models::ConversationSpend::default(),
+            "no calls yet"
+        );
+
+        let call = |kind, usage, cost_usd| ModelCall {
+            conversation_id: conversation.id,
+            provider_id: provider.id,
+            model: "m",
+            kind,
+            usage,
+            cost_usd,
+        };
+        record_model_call(&pool, &call(ModelCallKind::Turn, usage(10, 1, 100, 0), Some(0.5)))
+            .await
+            .expect("first turn call");
+        record_model_call(&pool, &call(ModelCallKind::Turn, usage(20, 2, 0, 100), Some(0.25)))
+            .await
+            .expect("second turn call");
+        record_model_call(&pool, &call(ModelCallKind::Compaction, usage(300, 3, 0, 0), None))
+            .await
+            .expect("compaction call");
+        record_model_call(
+            &pool,
+            &ModelCall { conversation_id: other.id, ..call(ModelCallKind::Turn, usage(1, 1, 1, 1), Some(9.0)) },
+        )
+        .await
+        .expect("another conversation's call");
+
+        assert_eq!(
+            get_conversation_spend(&pool, conversation.id).await.expect("spend"),
+            crate::models::ConversationSpend {
+                calls: 3,
+                input_tokens: 330,
+                output_tokens: 6,
+                cache_creation_input_tokens: 100,
+                cache_read_input_tokens: 100,
+                cost_usd: Some(0.75),
+                unpriced_calls: 1,
+            }
+        );
+        assert_eq!(
+            get_conversation_usage(&pool, conversation.id).await.expect("usage"),
+            Some(usage(20, 2, 0, 100)),
+            "the last turn call, not the compaction after it"
+        );
+
+        delete_inference_provider(&pool, provider.id).await.expect("delete provider");
+        let kept: (Option<i64>, String) =
+            sqlx::query_as("SELECT provider_id, model FROM model_call_usage WHERE conversation_id = $1 LIMIT 1")
+                .bind(conversation.id)
+                .fetch_one(&pool)
+                .await
+                .expect("rows outlive their provider");
+        assert_eq!(kept, (None, "m".to_string()));
+        assert_eq!(get_conversation_spend(&pool, conversation.id).await.expect("spend").calls, 3);
+
+        delete_conversation(&pool, conversation.id).await.expect("delete conversation");
+        assert_eq!(get_conversation_spend(&pool, conversation.id).await.expect("spend").calls, 0, "cascade");
+        assert_eq!(get_conversation_spend(&pool, other.id).await.expect("spend").calls, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_model_spend_sums_each_providers_model_over_the_period(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let kept = test_provider(&pool, "kept").await;
+        let gone = test_provider(&pool, "gone").await;
+        let call = |provider_id, model, input, cost_usd| ModelCall {
+            conversation_id: conversation.id,
+            provider_id,
+            model,
+            kind: ModelCallKind::Turn,
+            usage: usage(input, 1, 0, 0),
+            cost_usd,
+        };
+        for c in [
+            call(kept.id, "a", 10, Some(1.0)),
+            call(kept.id, "a", 20, None),
+            call(kept.id, "b", 5, Some(3.0)),
+            call(gone.id, "a", 7, Some(0.5)),
+            call(kept.id, "old", 1, Some(100.0)),
+        ] {
+            record_model_call(&pool, &c).await.expect("record");
+        }
+        sqlx::query("UPDATE model_call_usage SET created_at = now() - interval '31 days' WHERE model = 'old'")
+            .execute(&pool)
+            .await
+            .expect("age one call");
+        delete_inference_provider(&pool, gone.id).await.expect("delete");
+
+        let since = chrono::Utc::now().naive_utc() - chrono::Duration::days(30);
+        let spend = model_spend_since(&pool, since).await.expect("spend");
+        let rows: Vec<(Option<&str>, &str, i64, i64, Option<f64>, i64)> = spend
+            .iter()
+            .map(|s| (s.provider_name.as_deref(), s.model.as_str(), s.calls, s.input_tokens, s.cost_usd, s.unpriced_calls))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (Some("kept"), "b", 1, 5, Some(3.0), 0),
+                (Some("kept"), "a", 2, 30, Some(1.0), 1),
+                (None, "a", 1, 7, Some(0.5), 0),
+            ],
+            "costliest first; the 31-day-old call is out; a deleted provider's calls stay"
+        );
+    }
+
+    /// A turn reads its provider when it starts; the user may delete the
+    /// provider before the reply finishes. The call is still recorded, with
+    /// no provider, as rows the deletion itself nulls (code review 1).
+    #[sqlx::test]
+    async fn test_a_call_on_a_provider_deleted_mid_turn_is_recorded_without_it(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let provider = test_provider(&pool, "gone").await;
+        delete_inference_provider(&pool, provider.id).await.expect("delete");
+
+        record_model_call(
+            &pool,
+            &ModelCall {
+                conversation_id: conversation.id,
+                provider_id: provider.id,
+                model: "m",
+                kind: ModelCallKind::Turn,
+                usage: usage(10, 1, 0, 0),
+                cost_usd: None,
+            },
+        )
+        .await
+        .expect("a deleted provider doesn't fail the turn");
+
+        let provider_id: Option<i64> =
+            sqlx::query_scalar("SELECT provider_id FROM model_call_usage WHERE conversation_id = $1")
+                .bind(conversation.id)
+                .fetch_one(&pool)
+                .await
+                .expect("the row");
+        assert_eq!(provider_id, None);
+        assert_eq!(get_conversation_usage(&pool, conversation.id).await.expect("usage"), Some(usage(10, 1, 0, 0)));
+    }
+
+    /// The same, with the delete still uncommitted when the call is recorded:
+    /// the record waits for it and then sees no provider, rather than taking
+    /// the id and failing the foreign key once the delete commits (code
+    /// review 2).
+    #[sqlx::test]
+    async fn test_a_call_recorded_while_its_provider_is_being_deleted_is_recorded_without_it(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let provider = test_provider(&pool, "going").await;
+
+        let mut deleting = pool.begin().await.expect("begin the delete");
+        sqlx::query("DELETE FROM inference_providers WHERE id = $1")
+            .bind(provider.id)
+            .execute(&mut *deleting)
+            .await
+            .expect("delete, uncommitted");
+
+        let record = tokio::spawn({
+            let pool = pool.clone();
+            let (conversation_id, provider_id) = (conversation.id, provider.id);
+            async move {
+                record_model_call(
+                    &pool,
+                    &ModelCall {
+                        conversation_id,
+                        provider_id,
+                        model: "m",
+                        kind: ModelCallKind::Turn,
+                        usage: usage(10, 1, 0, 0),
+                        cost_usd: None,
+                    },
+                )
+                .await
+            }
+        });
+        // Commit only once the record is waiting on the delete's row lock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                  WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("pg_stat_activity");
+            if waiting > 0 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the record never waited on the delete");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        deleting.commit().await.expect("commit the delete");
+
+        record
+            .await
+            .expect("record task")
+            .expect("a provider deleted while the call is recorded doesn't fail the turn");
+        let provider_id: Option<i64> =
+            sqlx::query_scalar("SELECT provider_id FROM model_call_usage WHERE conversation_id = $1")
+                .bind(conversation.id)
+                .fetch_one(&pool)
+                .await
+                .expect("the row");
+        assert_eq!(provider_id, None);
     }
 
     /// Mechanical CRUD, mirroring the MCP server table's: a characterization
@@ -4089,7 +4464,7 @@ mod tests {
         let created = test_provider(&pool, "anthropic").await;
         assert_eq!(list_inference_providers(&pool).await.expect("list"), vec![created.clone()]);
 
-        let renamed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", None)
+        let renamed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", None, false, None)
             .await
             .expect("update")
             .expect("exists");
@@ -4099,14 +4474,19 @@ mod tests {
         );
         assert_eq!(renamed.secret, "sk-ant-0123456789", "no new secret keeps the stored one");
 
-        let rekeyed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", Some("new-secret"))
+        let rekeyed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", Some("new-secret"), true, Some("anthropic"))
             .await
             .expect("update")
             .expect("exists");
         assert_eq!(rekeyed.secret, "new-secret");
+        assert!(!renamed.prompt_caching && rekeyed.prompt_caching, "set outright by each update");
+        assert_eq!(
+            (renamed.price_catalog_provider.as_deref(), rekeyed.price_catalog_provider.as_deref()),
+            (None, Some("anthropic"))
+        );
 
         assert_eq!(
-            update_inference_provider(&pool, 999_999, "x", "other", "u", "bearer", None).await.expect("update"),
+            update_inference_provider(&pool, 999_999, "x", "other", "u", "bearer", None, false, None).await.expect("update"),
             None
         );
     }
@@ -4240,7 +4620,7 @@ mod tests {
     async fn test_model_overrides_and_reported_details_leave_each_other_alone(pool: PgPool) {
         let provider = test_provider(&pool, "p").await;
         set_provider_model_reported(&pool, provider.id, "m", Some(4096), Some(false), Some(true)).await.expect("reported");
-        set_provider_model_overrides(&pool, provider.id, "m", Some(true), Some(32_768)).await.expect("overrides");
+        set_provider_model_overrides(&pool, provider.id, "m", Some(true), Some(32_768), None).await.expect("overrides");
         set_provider_model_reported(&pool, provider.id, "m", Some(8192), None, Some(true)).await.expect("reported");
 
         let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
@@ -4254,6 +4634,7 @@ mod tests {
                 reported_context_window: Some(8192),
                 reported_thinking: None,
                 reported_tools: Some(true),
+                effort: None,
                 added_by_hand: false,
             }
         );

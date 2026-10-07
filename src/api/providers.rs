@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
 use crate::db;
-use crate::providers::{ModelChoice, ModelInfo, ProviderInput, ProviderModels, ProviderSummary};
+use crate::providers::{ModelChoice, ModelInfo, PriceSource, ProviderInput, ProviderModels, ProviderSummary};
 
 #[get("/api/providers")]
 pub async fn list_providers() -> ServerFnResult<Vec<ProviderSummary>> {
@@ -38,6 +38,23 @@ pub async fn update_provider(id: i64, input: ProviderInput) -> ServerFnResult<Pr
     crate::providers::update_provider(db::get(), id, input)
         .await
         .map_err(ServerFnError::new)
+}
+
+/// Each provider's models' use and cost over the last 30 days, for the
+/// providers page (SME-106).
+#[get("/api/providers/spend")]
+pub async fn get_recent_spend() -> ServerFnResult<Vec<crate::models::ModelSpend>> {
+    let since = chrono::Utc::now().naive_utc() - chrono::Duration::days(30);
+    db::model_spend_since(db::get(), since)
+        .await
+        .map_err(ServerFnError::new)
+}
+
+/// The price catalog's providers, by name, for the form's "Prices from"
+/// choice; empty until the catalog is first fetched (SME-106).
+#[get("/api/price-sources")]
+pub async fn list_price_sources() -> ServerFnResult<Vec<PriceSource>> {
+    Ok(crate::pricing::price_sources())
 }
 
 #[delete("/api/providers/{id}")]
@@ -82,8 +99,9 @@ pub async fn set_model_settings(
     model: String,
     thinking: Option<bool>,
     context_window: Option<u32>,
+    effort: Option<crate::anthropic::Effort>,
 ) -> ServerFnResult<()> {
-    crate::providers::set_model_settings(db::get(), id, &model, thinking, context_window)
+    crate::providers::set_model_settings(db::get(), id, &model, thinking, context_window, effort)
         .await
         .map_err(ServerFnError::new)
 }
