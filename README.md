@@ -42,7 +42,7 @@ Dark mode follows the system setting:
 smelt is one server binary plus a web bundle. Alongside it, it needs:
 
 - **Postgres.** smelt applies its own migrations at startup.
-- **A single-node k3s cluster** for the sandboxes, with a default StorageClass (k3s ships `local-path`). It has to be k3s on one node: the sandbox image is imported straight into that node's containerd at k3s's socket path, with no registry, and pods never pull it. smelt runs the sandboxes in the `smelt-park` namespace under a `park` service account, and [k8s/smelt-park-rbac.yaml](k8s/smelt-park-rbac.yaml) creates both. The cluster must allow privileged pods, because each sandbox's Docker sidecar is privileged. Live memory and CPU on the Sandboxes page also need metrics-server.
+- **A single-node k3s cluster** for the sandboxes, with a default StorageClass (k3s ships `local-path`). It has to be k3s on one node: the sandbox image is imported straight into that node's containerd at k3s's socket path, with no registry, and pods never pull it. smelt runs the sandboxes in the `smelt-park` namespace under a `park` service account, and [k8s/smelt-park-rbac.yaml](k8s/smelt-park-rbac.yaml) creates both. The cluster must allow privileged pods, because each sandbox's Docker sidecar is privileged. Live memory and CPU on the Sandboxes page also need metrics-server. The cluster needs to pull from Docker Hub: the image import's loader pod (`rancher/k3s`, pinned to k3s v1.34, whose `ctr` should match your cluster's containerd) and language-server pods both come from there.
 - **The sandbox image**, delivered straight to the node's containerd with no registry involved.
 - **Headless Chrome**, for `webfetch` and browsing sessions.
 
