@@ -36,11 +36,21 @@ use crate::db::{self, McpServerConfig};
 pub struct PgCredentialStore {
     pool: PgPool,
     server_id: i64,
+    /// Set for a connection's manager, whose only saves are refreshes:
+    /// see `save`.
+    refresh_only: bool,
 }
 
 impl PgCredentialStore {
+    /// The store a login attempt saves its new grant through,
+    /// unconditionally.
     pub fn new(pool: PgPool, server_id: i64) -> Self {
-        Self { pool, server_id }
+        Self { pool, server_id, refresh_only: false }
+    }
+
+    /// The store a connection's manager refreshes through (SME-113).
+    fn for_refreshes(pool: PgPool, server_id: i64) -> Self {
+        Self { pool, server_id, refresh_only: true }
     }
 }
 
@@ -61,9 +71,31 @@ impl CredentialStore for PgCredentialStore {
         }
     }
 
+    /// A refresh saves only over a grant for the same client, so one that
+    /// finishes after a Disconnect, a URL change or a new Connect doesn't
+    /// bring the old grant back. It then fails, so the request it was for
+    /// doesn't go on with a grant the user removed or replaced (SME-113).
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
         let value = serde_json::to_value(&credentials)
             .map_err(|e| AuthError::InternalError(e.to_string()))?;
+        if self.refresh_only {
+            let saved = db::save_refreshed_mcp_server_oauth_credentials(
+                &self.pool,
+                self.server_id,
+                &credentials.client_id,
+                value,
+            )
+            .await
+            .map_err(|e| AuthError::InternalError(e.to_string()))?;
+            return if saved {
+                Ok(())
+            } else {
+                Err(AuthError::InternalError(
+                    "the sign-in was removed or replaced while its token was being refreshed"
+                        .to_string(),
+                ))
+            };
+        }
         db::set_mcp_server_oauth_credentials(&self.pool, self.server_id, Some(value))
             .await
             .map_err(|e| AuthError::InternalError(e.to_string()))
@@ -175,7 +207,7 @@ pub async fn connection_manager(
                 config.name
             )
         })?;
-    manager.set_credential_store(PgCredentialStore::new(pool.clone(), config.id));
+    manager.set_credential_store(PgCredentialStore::for_refreshes(pool.clone(), config.id));
     let restored = manager.initialize_from_store().await.map_err(|e| {
         format!(
             "failed to load stored OAuth credentials for MCP server {:?}: {e}",

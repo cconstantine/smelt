@@ -1177,7 +1177,8 @@ mod tests {
             /// refresh that doesn't authenticate with it is refused, as
             /// GitHub refuses one without `client_secret`.
             pub required_secret: StdMutex<Option<(String, String)>>,
-            /// The `client_id` each refresh request named.
+            /// The `client_id` each refresh request named, recorded as it
+            /// arrives (before `refresh_gate`).
             pub refresh_client_ids: StdMutex<Vec<String>>,
             /// When set, a refresh waits for a permit before answering.
             pub refresh_gate: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -1308,12 +1309,12 @@ mod tests {
             Form(form): Form<HashMap<String, String>>,
         ) -> Response {
             if form.get("grant_type").map(String::as_str) == Some("refresh_token") {
+                if let Some(client_id) = form.get("client_id") {
+                    mock.refresh_client_ids.lock().unwrap().push(client_id.clone());
+                }
                 let gate = mock.refresh_gate.lock().unwrap().clone();
                 if let Some(gate) = gate {
                     let _permit = gate.acquire().await;
-                }
-                if let Some(client_id) = form.get("client_id") {
-                    mock.refresh_client_ids.lock().unwrap().push(client_id.clone());
                 }
                 let required = mock.required_secret.lock().unwrap().clone();
                 if let Some((client_id, secret)) = required {
@@ -1560,6 +1561,87 @@ mod tests {
         mock.reject_refreshes.store(false, Ordering::SeqCst);
         connection_check(&pool, &config).await.expect("the next check connects again");
         assert_eq!(mock.initialize_count(), 2, "a fresh connection, not the cached one");
+        evict(server.id).await;
+    }
+
+    /// Starts a tool call whose connect has to refresh the (aged) token,
+    /// and returns once the refresh has reached the provider, where it
+    /// waits for the returned gate.
+    async fn call_held_at_refresh(
+        pool: &sqlx::PgPool,
+        mock: &Arc<oauth_http::Mock>,
+        config: &McpServerConfig,
+    ) -> (tokio::task::JoinHandle<Result<String, String>>, Arc<tokio::sync::Semaphore>) {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *mock.refresh_gate.lock().unwrap() = Some(gate.clone());
+        let call = tokio::spawn({
+            let (pool, config) = (pool.clone(), config.clone());
+            async move { call_tool(&pool, &config, "echo", serde_json::json!({})).await }
+        });
+        assert!(
+            wait_until(|| !mock.refresh_client_ids.lock().unwrap().is_empty()).await,
+            "the refresh should reach the provider"
+        );
+        (call, gate)
+    }
+
+    async fn wait_until(check: impl Fn() -> bool) -> bool {
+        for _ in 0..50 {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    async fn stored_client_id(pool: &sqlx::PgPool, server_id: i64) -> Option<String> {
+        oauth_http::config(pool, server_id)
+            .await
+            .oauth_credentials
+            .and_then(|json| json.0.get("client_id")?.as_str().map(str::to_string))
+    }
+
+    /// SME-113: a refresh that finishes after a Disconnect doesn't write
+    /// the grant back (the server would quietly reconnect itself), and the
+    /// call it was for fails rather than going on with it.
+    #[sqlx::test]
+    async fn test_a_refresh_finishing_after_a_disconnect_does_not_restore_the_grant(pool: sqlx::PgPool) {
+        let mock = oauth_http::spawn().await;
+        let server = oauth_http::create_server(&pool, &mock, None).await;
+        oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+        oauth_http::age_token(&pool, server.id).await;
+        let config = oauth_http::config(&pool, server.id).await;
+        let (call, gate) = call_held_at_refresh(&pool, &mock, &config).await;
+
+        crate::mcp_oauth::disconnect(&pool, &config).await.expect("disconnect");
+        evict(server.id).await;
+        gate.add_permits(1);
+        let result = call.await.expect("call task");
+
+        assert!(result.is_err(), "the call went on with a removed grant: {result:?}");
+        assert_eq!(oauth_http::config(&pool, server.id).await.oauth_credentials, None);
+        assert!(!REGISTRY.lock().await.contains_key(&server.id), "nothing cached for a disconnected server");
+        evict(server.id).await;
+    }
+
+    /// SME-113: nor does it overwrite a new grant a Connect saved meanwhile
+    /// (dynamic registration gives each Connect a new client id).
+    #[sqlx::test]
+    async fn test_a_refresh_finishing_after_a_new_grant_keeps_the_new_grant(pool: sqlx::PgPool) {
+        let mock = oauth_http::spawn().await;
+        let server = oauth_http::create_server(&pool, &mock, None).await;
+        oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+        oauth_http::age_token(&pool, server.id).await;
+        let config = oauth_http::config(&pool, server.id).await;
+        let (call, gate) = call_held_at_refresh(&pool, &mock, &config).await;
+
+        oauth_http::save_grant(&pool, server.id, &mock, "client-1").await;
+        evict(server.id).await;
+        gate.add_permits(1);
+        let _ = call.await.expect("call task");
+
+        assert_eq!(stored_client_id(&pool, server.id).await.as_deref(), Some("client-1"));
         evict(server.id).await;
     }
 }
