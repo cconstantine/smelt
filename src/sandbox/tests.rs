@@ -1074,8 +1074,12 @@ async fn test_open_pod_port_reaches_the_conversations_own_pod(pool: PgPool) {
     let with_pod = db::create_conversation(&pool).await.expect("create conversation");
     let without_pod = db::create_conversation(&pool).await.expect("create conversation");
     let row = db::create_sandbox_pod(&pool, with_pod.id).await.expect("create the pod's row");
+    // As this database's (SME-115): a port-forward goes only into a pod
+    // labelled with the database's instance.
+    let instance = db::smelt_instance(&pool).await.expect("instance");
+    let docker = DockerSidecar { memory: "512Mi".to_string(), storage: PodStorage::Ephemeral };
     let sandbox = manager
-        .create(&row.id.to_string(), "128Mi", &[])
+        .create_with_docker(&row.id.to_string(), "128Mi", &docker, &[], &instance.id)
         .await
         .expect("create the pod");
     let open = |conversation_id: i64, port: u16| {
@@ -2374,6 +2378,59 @@ async fn test_another_databases_volume_claim_is_refused_and_left() {
     assert!(kept, "deleting our volume deleted another database's claim");
 }
 
+/// SME-115: what reads as this database's pod. One from before the fix
+/// counts only for the database that owns those (adoption may have missed
+/// it); another database's never does.
+#[test]
+fn test_counts_as_ours_only_ours_and_unadopted_ones_for_their_owner() {
+    let owner = db::SmeltInstance { id: "ours".to_string(), owns_unlabelled: true };
+    let scratch = db::SmeltInstance { id: "ours".to_string(), owns_unlabelled: false };
+    for (meta, for_owner, for_scratch) in [
+        (meta_with_instance(Some("ours")), true, true),
+        (meta_with_instance(None), true, false),
+        (meta_with_instance(Some("theirs")), false, false),
+    ] {
+        assert_eq!(counts_as_ours(&meta, &owner), for_owner, "{:?}", meta.labels);
+        assert_eq!(counts_as_ours(&meta, &scratch), for_scratch, "{:?}", meta.labels);
+    }
+}
+
+/// SME-115: the pod watch is limited to this database's pods, so another
+/// smelt's Docker restarts, language server stops and finished pods never
+/// reach this database's records by their ids.
+#[test]
+fn test_the_pod_watch_sees_only_our_instance() {
+    assert_eq!(watcher_config("ours").label_selector.as_deref(), Some("smelt/instance=ours"));
+}
+
+/// SME-115: a live record whose pod name is taken by another database's
+/// pod (still running) is closed as gone, and that pod is left. Before the
+/// fix the record stayed open on the other pod's status, and terminating
+/// it deleted that pod.
+#[sqlx::test]
+async fn test_a_record_whose_pod_is_another_databases_is_closed_and_the_pod_left(pool: PgPool) {
+    let client = test_client().await;
+    let pods = pods_api(&client);
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let row = db::create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+    let name = pod_name(row.id);
+    let pod: Pod = serde_json::from_value(serde_json::json!({
+        "metadata": {"name": name, "labels": {INSTANCE_LABEL: "another-smelt-database"}},
+        "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
+    }))
+    .expect("pod");
+    pods.create(&PostParams::default(), &pod).await.expect("create pod");
+
+    close_if_gone_with(&pool, &client, row.id).await;
+    let closed = !db::sandbox_pod_is_live(&pool, row.id).await.expect("live?");
+    let kept = pods.get_opt(&name).await.expect("read").is_some_and(|p| p.metadata.deletion_timestamp.is_none());
+
+    pods.delete(&name, &immediate_delete_params()).await.ok();
+    assert!(closed, "the record stayed open on another database's pod");
+    assert!(kept, "closing the record deleted another database's pod");
+}
+
 /// SME-115: a new pod waits out the conversation's stopping pods, ours
 /// and ones from before the fix, but never another database's pod
 /// labelled with the same conversation.
@@ -3567,10 +3624,13 @@ async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
         let mut no_agent_limits = std::collections::BTreeMap::new();
         no_agent_limits.insert("cpu".to_string(), Quantity("250m".to_string()));
         no_agent_limits.insert("memory".to_string(), Quantity("128Mi".to_string()));
+        // This database's (SME-115): only such a pod is ever deleted.
+        let instance_g = db::smelt_instance(&pool).await.expect("instance");
         let no_agent_pod = Pod {
             metadata: ObjectMeta {
                 name: Some(pod_name(pod_g)),
                 namespace: Some(NAMESPACE.to_string()),
+                labels: Some(instance_labels(&instance_g.id)),
                 ..Default::default()
             },
             spec: Some(PodSpec {
@@ -4089,7 +4149,7 @@ async fn test_pod_death_reason_reports_oomkilled_from_a_real_oom_kill() {
 
     let reason = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if let Some(reason) = pod_death_reason(&pods, &sandbox.pod_name).await {
+            if let Some(reason) = pod_death_reason(&pods, &sandbox.pod_name, &test_instance()).await {
                 return reason;
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -4242,7 +4302,7 @@ async fn test_pod_death_reason_reflects_a_real_pod_then_its_absence() {
     let pods = pods_api(&client);
 
     assert_eq!(
-        pod_death_reason(&pods, &sandbox.pod_name).await,
+        pod_death_reason(&pods, &sandbox.pod_name, &test_instance()).await,
         None,
         "a genuinely Running pod is inconclusive"
     );
@@ -4251,7 +4311,7 @@ async fn test_pod_death_reason_reflects_a_real_pod_then_its_absence() {
         .await
         .expect("delete should succeed");
     assert_eq!(
-        pod_death_reason(&pods, &sandbox.pod_name).await,
+        pod_death_reason(&pods, &sandbox.pod_name, &test_instance()).await,
         Some(None),
         "a pod that's gone entirely is confirmed dead with no reason to report"
     );

@@ -279,6 +279,12 @@ pub(crate) const INSTANCE_LABEL: &str = "smelt/instance";
 #[cfg(test)]
 pub(crate) const TEST_INSTANCE: &str = "smelt-tests";
 
+/// The instance of the tests' own pods, as a database's would read.
+#[cfg(test)]
+pub(crate) fn test_instance() -> db::SmeltInstance {
+    db::SmeltInstance { id: TEST_INSTANCE.to_string(), owns_unlabelled: false }
+}
+
 /// Whose a cluster object is, from one server's side (SME-115).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ownership {
@@ -298,6 +304,18 @@ pub fn ownership(meta: &ObjectMeta, instance: &str) -> Ownership {
         // An empty instance (never read) is nobody's.
         Some(label) if !instance.is_empty() && label == instance => Ownership::Ours,
         Some(_) => Ownership::Foreign,
+    }
+}
+
+/// Whether a pod counts as this database's for reading it and for keeping
+/// its record open: ours, or one from before SME-115 while this database
+/// owns those (adoption missed it: it may still be ours). Another
+/// database's pod reads as absent.
+pub fn counts_as_ours(meta: &ObjectMeta, instance: &db::SmeltInstance) -> bool {
+    match ownership(meta, &instance.id) {
+        Ownership::Ours => true,
+        Ownership::Unlabelled => instance.owns_unlabelled,
+        Ownership::Foreign => false,
     }
 }
 

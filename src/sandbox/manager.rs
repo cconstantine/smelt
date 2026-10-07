@@ -342,8 +342,13 @@ pub(super) fn decide_pod_death_reason(pod: Option<Pod>) -> Option<Option<String>
 /// `pods.get_opt` fetch, handed straight to the pure decision function.
 /// An API call that itself fails is treated the same as "inconclusive"
 /// (`None`), never as confirmation either way — see SME-12's "How."
-pub(super) async fn pod_death_reason(pods: &Api<Pod>, name: &str) -> Option<Option<String>> {
-    match pods.get_opt(name).await {
+/// Another database's pod of that name reads as gone (SME-115).
+pub(super) async fn pod_death_reason(
+    pods: &Api<Pod>,
+    name: &str,
+    instance: &db::SmeltInstance,
+) -> Option<Option<String>> {
+    match read_our_pod(pods, name, instance).await {
         Ok(pod) => decide_pod_death_reason(pod),
         Err(_) => None,
     }
@@ -427,7 +432,9 @@ pub(super) async fn create_pod_now(
     conversation_id: i64,
     limits: PodLimitOverrides,
 ) -> Result<i64, SandboxError> {
-    let result = create_pod_attempt(pool, conversation_id, limits).await;
+    // Boxed: the attempt's future is large, and a caller awaiting it in
+    // a debug build holds it on its own stack frame (SME-115).
+    let result = Box::pin(create_pod_attempt(pool, conversation_id, limits)).await;
     // Only a deleted conversation needs the cluster touched; a refused
     // start for a live one (a pod already exists, say) doesn't.
     if result.is_err() && !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
@@ -573,15 +580,60 @@ pub(super) async fn force_terminate_pod(
     pool: &PgPool,
     pod_id: i64,
 ) -> Result<Option<db::SandboxPod>, SandboxError> {
-    terminate_pod_with(pool, pod_id, async {
-        let pods = pods_api(&get()?.client);
-        let name = pod_name(pod_id);
-        if pods.get_opt(&name).await?.is_some() {
-            pods.delete(&name, &pod_delete_params()).await?;
+    terminate_pod_with(pool, pod_id, async { Box::pin(delete_terminated_pod(pool, &get()?.client, pod_id)).await }).await
+}
+
+/// `force_terminate_pod` on `client`.
+pub(super) async fn force_terminate_pod_with(
+    pool: &PgPool,
+    client: &kube::Client,
+    pod_id: i64,
+) -> Result<Option<db::SandboxPod>, SandboxError> {
+    terminate_pod_with(pool, pod_id, Box::pin(delete_terminated_pod(pool, client, pod_id))).await
+}
+
+/// The cluster's part of terminating `pod_id`: deletes its pod if it's
+/// still there and ours (SME-115). Another database's pod of that name,
+/// or one from before the fix, is left; its record is closed all the same.
+async fn delete_terminated_pod(pool: &PgPool, client: &kube::Client, pod_id: i64) -> Result<(), SandboxError> {
+    let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
+    let pods = pods_api(client);
+    let name = pod_name(pod_id);
+    // Only its ownership and uid are kept: a whole `Pod` held across the
+    // delete below made every caller's future twice the size, which
+    // overflowed a debug build's stack (SME-115).
+    let (owner, uid) = match pods.get_opt(&name).await? {
+        Some(pod) => (ownership(&pod.metadata, &instance.id), pod.metadata.uid),
+        None => return Ok(()),
+    };
+    match owner {
+        Ownership::Ours => {
+            let params = DeleteParams {
+                preconditions: Some(kube::api::Preconditions { uid, resource_version: None }),
+                ..pod_delete_params()
+            };
+            match pods.delete(&name, &params).await {
+                Ok(_) => Ok(()),
+                // Gone, or replaced since it was read: not ours to delete.
+                Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => Ok(()),
+                Err(e) => Err(e.into()),
+            }
         }
-        Ok(())
-    })
-    .await
+        other => {
+            tracing::warn!(pod = %name, ownership = ?other, "closed the record of a pod that isn't this database's; the pod is left");
+            Ok(())
+        }
+    }
+}
+
+/// `name`'s pod if it counts as this database's (`counts_as_ours`);
+/// `None` when there's none, or it's another database's.
+pub(super) async fn read_our_pod(
+    pods: &Api<Pod>,
+    name: &str,
+    instance: &db::SmeltInstance,
+) -> Result<Option<Pod>, kube::Error> {
+    Ok(pods.get_opt(name).await?.filter(|pod| counts_as_ours(&pod.metadata, instance)))
 }
 
 /// `force_terminate_pod` with the cluster's delete passed in, so a test can
@@ -628,10 +680,12 @@ pub struct PodDetails {
     pub cpu_limits: Vec<String>,
 }
 
-/// `pod_id`'s phase and limits, or `None` if Kubernetes has no such pod.
-pub async fn pod_details(pod_id: i64) -> Result<Option<PodDetails>, SandboxError> {
+/// `pod_id`'s phase and limits, or `None` if Kubernetes has no such pod
+/// of this database's (SME-115).
+pub async fn pod_details(pool: &PgPool, pod_id: i64) -> Result<Option<PodDetails>, SandboxError> {
     let pods = pods_api(&get()?.client);
-    let Some(pod) = pods.get_opt(&pod_name(pod_id)).await? else {
+    let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
+    let Some(pod) = read_our_pod(&pods, &pod_name(pod_id), &instance).await? else {
         return Ok(None);
     };
     let (memory_limits, cpu_limits) = pod_container_limits(&pod);
@@ -666,11 +720,11 @@ pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInf
     let rows = db::list_sandbox_pods(pool, conversation_id)
         .await
         .map_err(SandboxError::Db)?;
+    let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
     let mut result = Vec::with_capacity(rows.len());
     for row in rows {
         let name = pod_name(row.id);
-        let status = pods
-            .get_opt(&name)
+        let status = read_our_pod(&pods, &name, &instance)
             .await?
             .and_then(|p| p.status)
             .and_then(|s| s.phase)
@@ -851,15 +905,17 @@ pub(super) async fn delete_listed(pods: &Api<Pod>, selector: &ListParams, conver
 /// object that was read. Another database's pod of the same name, or one
 /// from before the fix, is left and logged. Best-effort.
 pub(super) async fn delete_pod_if_ours(pods: &Api<Pod>, name: &str, instance: &str) {
-    let pod = match pods.get_opt(name).await {
-        Ok(Some(pod)) => pod,
+    // Only its ownership and uid are kept across the delete (see
+    // `delete_terminated_pod`).
+    let (owner, uid) = match pods.get_opt(name).await {
+        Ok(Some(pod)) => (ownership(&pod.metadata, instance), pod.metadata.uid),
         Ok(None) => return,
         Err(e) => {
             tracing::warn!(pod = %name, error = %e, "couldn't read a pod to delete");
             return;
         }
     };
-    match (ownership(&pod.metadata, instance), pod.metadata.uid) {
+    match (owner, uid) {
         (Ownership::Ours, Some(uid)) => delete_pod_if_unchanged(pods, name, &uid).await,
         (Ownership::Ours, None) => tracing::warn!(pod = %name, "a pod with no uid; left alone"),
         (Ownership::Unlabelled, _) => {

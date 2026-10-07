@@ -24,13 +24,20 @@ pub(super) trait AgentDialer: Send + Sync {
     fn death_reason(&self, pod_id: i64) -> BoxFuture<'_, Option<Option<String>>>;
 }
 
-/// A port-forward to the agent's port in the pod.
-pub(super) struct ClusterDialer(kube::Client);
+/// A port-forward to the agent's port in the pod. Another database's pod
+/// of the same name reads as absent and is never dialed (SME-115).
+pub(super) struct ClusterDialer(kube::Client, db::SmeltInstance);
 
 impl AgentDialer for ClusterDialer {
     fn dial(&self, pod_id: i64) -> BoxFuture<'_, Result<Box<dyn AgentIo>, SandboxError>> {
         Box::pin(async move {
-            let mut forward = pods_api(&self.0).portforward(&pod_name(pod_id), &[AGENT_PORT]).await?;
+            let name = pod_name(pod_id);
+            if let Some(pod) = pods_api(&self.0).get_opt(&name).await?
+                && !counts_as_ours(&pod.metadata, &self.1)
+            {
+                return Err(SandboxError::NotOurs { ownership: ownership(&pod.metadata, &self.1.id), name });
+            }
+            let mut forward = pods_api(&self.0).portforward(&name, &[AGENT_PORT]).await?;
             let stream = require_stream(forward.take_stream(AGENT_PORT), "the agent port's port-forward")?;
             Ok(Box::new(stream) as Box<dyn AgentIo>)
         })
@@ -38,25 +45,25 @@ impl AgentDialer for ClusterDialer {
 
     fn is_running(&self, pod_id: i64) -> BoxFuture<'_, Result<bool, SandboxError>> {
         Box::pin(async move {
-            let pod = pods_api(&self.0).get_opt(&pod_name(pod_id)).await?;
+            let pod = read_our_pod(&pods_api(&self.0), &pod_name(pod_id), &self.1).await?;
             Ok(pod.and_then(|p| p.status).and_then(|s| s.phase).as_deref() == Some("Running"))
         })
     }
 
     fn death_reason(&self, pod_id: i64) -> BoxFuture<'_, Option<Option<String>>> {
-        Box::pin(async move { pod_death_reason(&pods_api(&self.0), &pod_name(pod_id)).await })
+        Box::pin(async move { pod_death_reason(&pods_api(&self.0), &pod_name(pod_id), &self.1).await })
     }
 }
 
 /// The dialer for `pod_id`: the cluster, unless a test put a fake agent in
 /// for that pod.
 #[cfg_attr(not(test), allow(unused_variables))] // only a test puts a fake in
-pub(super) fn dialer_for(pod_id: i64) -> Result<Arc<dyn AgentDialer>, SandboxError> {
+pub(super) fn dialer_for(pod_id: i64, instance: db::SmeltInstance) -> Result<Arc<dyn AgentDialer>, SandboxError> {
     #[cfg(test)]
     if let Some(dialer) = test_dialers().lock().unwrap_or_else(|e| e.into_inner()).get(&pod_id) {
         return Ok(dialer.clone());
     }
-    Ok(Arc::new(ClusterDialer(get()?.client.clone())))
+    Ok(Arc::new(ClusterDialer(get()?.client.clone(), instance)))
 }
 
 /// Fake agents, by the pod id each test owns. Keyed by pod so tests running
@@ -399,7 +406,8 @@ pub(super) fn connect_with_retry(
             return Err(TerminalError::AgentOutdated { found });
         }
 
-        let dialer = dialer_for(pod_id)?;
+        let instance = db::smelt_instance(&pool).await?;
+        let dialer = dialer_for(pod_id, instance)?;
         if mode == ConnectMode::First && !dialer.is_running(pod_id).await? {
             return Err(TerminalError::NoPod);
         }

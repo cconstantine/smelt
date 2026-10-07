@@ -222,11 +222,13 @@ pub(crate) async fn pod_overviews(pool: &sqlx::PgPool) -> Result<Vec<PodOverview
     };
     let mut overviews = Vec::with_capacity(rows.len());
     for row in rows {
-        let details = match crate::sandbox::pod_details(row.pod_id).await {
-            Ok(details) => details.unwrap_or_default(),
+        // `Ok(None)`: no pod of this database's by that name (SME-115),
+        // so a same-named pod's usage isn't shown against this row either.
+        let (details, ours) = match crate::sandbox::pod_details(pool, row.pod_id).await {
+            Ok(details) => (details.clone().unwrap_or_default(), details.is_some()),
             Err(e) => {
                 tracing::warn!(pod_id = row.pod_id, error = %e, "couldn't read pod details");
-                crate::sandbox::PodDetails::default()
+                (crate::sandbox::PodDetails::default(), true)
             }
         };
         overviews.push(PodOverview {
@@ -238,10 +240,10 @@ pub(crate) async fn pod_overviews(pool: &sqlx::PgPool) -> Result<Vec<PodOverview
             activity: pod_activity(&row),
             memory_limit: sum_memory_limits(&details.memory_limits),
             cpu_limit: sum_cpu_limits(&details.cpu_limits),
-            usage: usage.get(&crate::sandbox::pod_name(row.pod_id)).cloned(),
+            usage: ours.then(|| usage.get(&crate::sandbox::pod_name(row.pod_id)).cloned()).flatten(),
             terminals: row.live_terminals,
             agent: crate::sandbox::agent_status(row.pod_id),
-            language_servers: server_overviews(row.conversation_id, row.pod_id, &usage).await,
+            language_servers: server_overviews(pool, row.conversation_id, row.pod_id, &usage).await,
             observed_at: row.observed_at,
         });
     }
@@ -252,6 +254,7 @@ pub(crate) async fn pod_overviews(pool: &sqlx::PgPool) -> Result<Vec<PodOverview
 /// cluster can't be asked.
 #[cfg(feature = "server")]
 async fn server_overviews(
+    pool: &sqlx::PgPool,
     conversation_id: i64,
     pod_id: i64,
     usage: &std::collections::HashMap<String, PodUsage>,
@@ -264,7 +267,14 @@ async fn server_overviews(
             return Vec::new();
         }
     };
-    let servers = match pods::list_with(&client, conversation_id).await {
+    let instance = match db::smelt_instance(pool).await {
+        Ok(instance) => instance.id,
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't list language server pods");
+            return Vec::new();
+        }
+    };
+    let servers = match pods::list_with(&client, conversation_id, &instance).await {
         Ok(servers) => servers,
         Err(e) => {
             tracing::warn!(pod_id, error = %e, "couldn't list language server pods");

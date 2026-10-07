@@ -40,7 +40,14 @@ pub async fn watch_pods(pool: PgPool) {
             return;
         }
     };
-    let events = watcher(pods_api(&client), watcher::Config::default()).default_backoff();
+    let instance = match db::smelt_instance(&pool).await {
+        Ok(instance) => instance.id,
+        Err(e) => {
+            tracing::error!(error = %e, "can't watch pods: couldn't read this database's instance");
+            return;
+        }
+    };
+    let events = watcher(pods_api(&client), watcher_config(&instance)).default_backoff();
     futures_util::pin_mut!(events);
     // Pods listed since the last `Init`, until `InitDone` completes the set.
     let mut listed = std::collections::HashSet::new();
@@ -103,6 +110,13 @@ pub async fn watch_pods(pool: PgPool) {
     }
 }
 
+/// The watch sees only this database's pods (SME-115): every smelt server
+/// shares the namespace, and another's pods would be matched to our rows
+/// by their ids (Docker restarts, language server stops, closed records).
+pub(super) fn watcher_config(instance: &str) -> kube::runtime::watcher::Config {
+    kube::runtime::watcher::Config::default().labels(&format!("{INSTANCE_LABEL}={instance}"))
+}
+
 /// The smelt pod id behind a watched pod (`sandbox-{id}`), or `None` for
 /// any other pod in the namespace.
 pub(super) fn watched_pod_id(pod: &Pod) -> Option<i64> {
@@ -134,6 +148,16 @@ pub(super) fn close_after_grace(pool: PgPool, pod_id: i64) {
 /// to the top of the sidebar, and a cluster rebuild can leave dozens); it
 /// finds out if it tries the pod again.
 pub(super) async fn close_if_gone(pool: &PgPool, pod_id: i64) {
+    match get() {
+        Ok(manager) => close_if_gone_with(pool, &manager.client, pod_id).await,
+        Err(_) => tracing::warn!(pod_id, "couldn't check a pod in Kubernetes: the sandbox isn't set up"),
+    }
+}
+
+/// `close_if_gone` on `client`. A pod of that name that isn't this
+/// database's counts as gone (SME-115): the record is closed and the pod
+/// left.
+pub(super) async fn close_if_gone_with(pool: &PgPool, client: &kube::Client, pod_id: i64) {
     match db::sandbox_pod_is_live(pool, pod_id).await {
         Ok(true) => {}
         Ok(false) => return,
@@ -145,11 +169,14 @@ pub(super) async fn close_if_gone(pool: &PgPool, pod_id: i64) {
     if registry_get(pod_id).is_some() {
         return;
     }
-    let Ok(manager) = get() else {
-        tracing::warn!(pod_id, "couldn't check a pod in Kubernetes: the sandbox isn't set up");
-        return;
+    let instance = match db::smelt_instance(pool).await {
+        Ok(instance) => instance,
+        Err(e) => {
+            tracing::warn!(pod_id, error = %e, "couldn't read this database's instance to check a pod");
+            return;
+        }
     };
-    match pods_api(&manager.client).get_opt(&pod_name(pod_id)).await {
+    match read_our_pod(&pods_api(client), &pod_name(pod_id), &instance).await {
         Ok(Some(pod)) if !pod_has_finished(&pod) => return,
         Ok(_) => {}
         Err(e) => {
@@ -160,7 +187,7 @@ pub(super) async fn close_if_gone(pool: &PgPool, pod_id: i64) {
     close_pod_terminals(pool, pod_id).await;
     // Deletes a finished pod's object if it's still there, marks the row
     // terminated, and tells the UI (the sandbox panel, the sidebar, /pods).
-    match force_terminate_pod(pool, pod_id).await {
+    match force_terminate_pod_with(pool, client, pod_id).await {
         Ok(_) => tracing::info!(pod_id, "closed the record of a pod that's gone from the cluster"),
         Err(e) => tracing::warn!(pod_id, error = %e, "couldn't close the record of a gone pod"),
     }

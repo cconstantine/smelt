@@ -305,9 +305,11 @@ async fn install_rc(client: &kube::Client, name: &str) -> Option<String> {
 }
 
 /// The server pods working for `conversation_id`.
-pub async fn list_with(client: &kube::Client, conversation_id: i64) -> Result<Vec<ServerPod>, String> {
+/// Only this database's (`instance`, SME-115).
+pub async fn list_with(client: &kube::Client, conversation_id: i64, instance: &str) -> Result<Vec<ServerPod>, String> {
     let pods = crate::sandbox::pods_api(client);
-    let selector = kube::api::ListParams::default().labels(&format!("{LSP_OF_LABEL}={conversation_id}"));
+    let selector = kube::api::ListParams::default()
+        .labels(&format!("{LSP_OF_LABEL}={conversation_id},{}={instance}", crate::sandbox::INSTANCE_LABEL));
     let mut servers = Vec::new();
     for pod in pods.list(&selector).await.map_err(|e| e.to_string())? {
         if pod.metadata.deletion_timestamp.is_some() {
@@ -347,11 +349,13 @@ pub async fn list_with(client: &kube::Client, conversation_id: i64) -> Result<Ve
 }
 
 /// Deletes every pod of server `name`, in every conversation: its config
-/// was deleted or disabled.
-pub async fn stop_everywhere_with(client: &kube::Client, name: &str) -> Result<(), String> {
+/// was deleted or disabled. Only this database's (`instance`, SME-115):
+/// another smelt sharing the namespace has its own config.
+pub async fn stop_everywhere_with(client: &kube::Client, name: &str, instance: &str) -> Result<(), String> {
     // One by one: smelt's role can delete pods, not collections of them.
     let pods = crate::sandbox::pods_api(client);
-    let selector = kube::api::ListParams::default().labels(&format!("{LSP_SERVER_LABEL}={name}"));
+    let selector = kube::api::ListParams::default()
+        .labels(&format!("{LSP_SERVER_LABEL}={name},{}={instance}", crate::sandbox::INSTANCE_LABEL));
     for pod in pods.list(&selector).await.map_err(|e| e.to_string())? {
         if let Some(pod_name) = pod.metadata.name {
             pods.delete(&pod_name, &crate::sandbox::pod_delete_params()).await.map_err(|e| e.to_string())?;
@@ -362,10 +366,17 @@ pub async fn stop_everywhere_with(client: &kube::Client, name: &str) -> Result<(
 
 /// Deletes server `name`'s pod for `conversation_id` (to restart it with
 /// newer settings).
-pub async fn stop_everywhere_in(client: &kube::Client, conversation_id: i64, name: &str) -> Result<(), String> {
+pub async fn stop_everywhere_in(
+    client: &kube::Client,
+    conversation_id: i64,
+    name: &str,
+    instance: &str,
+) -> Result<(), String> {
     let pods = crate::sandbox::pods_api(client);
-    let selector = kube::api::ListParams::default()
-        .labels(&format!("{LSP_SERVER_LABEL}={name},{LSP_OF_LABEL}={conversation_id}"));
+    let selector = kube::api::ListParams::default().labels(&format!(
+        "{LSP_SERVER_LABEL}={name},{LSP_OF_LABEL}={conversation_id},{}={instance}",
+        crate::sandbox::INSTANCE_LABEL
+    ));
     for pod in pods.list(&selector).await.map_err(|e| e.to_string())? {
         if let Some(pod_name) = pod.metadata.name {
             pods.delete(&pod_name, &crate::sandbox::pod_delete_params()).await.map_err(|e| e.to_string())?;
@@ -974,7 +985,7 @@ pub(crate) mod tests {
             outcomes.sort_by_key(|o| format!("{o:?}"));
             assert_eq!(outcomes, vec![Ok(Started::AlreadyRunning), Ok(Started::Started)], "{first:?} {second:?}");
 
-            let listed = list_with(&client, sandbox.conversation_id).await.expect("list");
+            let listed = list_with(&client, sandbox.conversation_id, &sandbox.instance).await.expect("list");
             assert_eq!(listed.len(), 1);
             assert_eq!((listed[0].name.as_str(), &listed[0].state, listed[0].config_version.as_str()), ("echo", &ServerState::Ready, "v1"));
             let pod = crate::sandbox::pods_api(&client).get(&listed[0].pod_name).await.expect("pod");
@@ -997,7 +1008,7 @@ pub(crate) mod tests {
                 .expect("delete the sandbox");
             let mut gone = false;
             for _ in 0..120 {
-                if list_with(&client, sandbox.conversation_id).await.expect("list").is_empty() {
+                if list_with(&client, sandbox.conversation_id, &sandbox.instance).await.expect("list").is_empty() {
                     gone = true;
                     break;
                 }
@@ -1013,7 +1024,7 @@ pub(crate) mod tests {
         async fn test_a_failed_install_says_why_and_leaves_nothing() {
             with_sandbox(|client, sandbox| async move {
             let result = start_with(&client, &sandbox, &echo_server("broken", "echo no such package >&2; exit 3"), "v1").await;
-            let listed = list_with(&client, sandbox.conversation_id).await.expect("list");
+            let listed = list_with(&client, sandbox.conversation_id, &sandbox.instance).await.expect("list");
             let error = result.expect_err("the install failed");
             assert!(error.contains("no such package") && error.contains('3'), "{error}");
             assert!(listed.is_empty(), "the failed server's pod was left: {listed:?}");
@@ -1044,7 +1055,7 @@ pub(crate) mod tests {
 
             let mut state = None;
             for _ in 0..120 {
-                state = list_with(&client, sandbox.conversation_id).await.expect("list").pop().map(|p| p.state);
+                state = list_with(&client, sandbox.conversation_id, &sandbox.instance).await.expect("list").pop().map(|p| p.state);
                 if matches!(state, Some(ServerState::Stopped(_))) {
                     break;
                 }
@@ -1095,6 +1106,38 @@ pub(crate) mod tests {
             assert!(kept, "another database's server pod was deleted");
         }
 
+        /// SME-115: stopping a server everywhere (its config was deleted)
+        /// stops only this database's pods of it: another smelt sharing the
+        /// namespace has its own config of that name.
+        #[tokio::test]
+        async fn test_stopping_a_server_everywhere_leaves_another_databases() {
+            let client = client().await;
+            let pods = crate::sandbox::pods_api(&client);
+            let id = unique();
+            let server = format!("stop-{id}");
+            let name = server_pod_name(id, &server);
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "metadata": {"name": name, "labels": {
+                    LSP_OF_LABEL: id.to_string(),
+                    LSP_SERVER_LABEL: server,
+                    crate::sandbox::INSTANCE_LABEL: "another-smelt-database",
+                }},
+                "spec": {"containers": [{"name": "server", "image": "smelt.invalid/none:0"}]},
+            }))
+            .expect("pod");
+            pods.create(&PostParams::default(), &pod).await.expect("create pod");
+
+            let stopped = stop_everywhere_with(&client, &server, crate::sandbox::TEST_INSTANCE).await;
+            let stopped_in = stop_everywhere_in(&client, id, &server, crate::sandbox::TEST_INSTANCE).await;
+            let listed = list_with(&client, id, crate::sandbox::TEST_INSTANCE).await;
+            let kept = pods.get_opt(&name).await.expect("read").is_some_and(|p| p.metadata.deletion_timestamp.is_none());
+
+            pods.delete(&name, &DeleteParams { grace_period_seconds: Some(0), ..Default::default() }).await.ok();
+            assert_eq!((stopped, stopped_in), (Ok(()), Ok(())));
+            assert_eq!(listed, Ok(Vec::new()), "another database's server pod was listed as ours");
+            assert!(kept, "stopping a server everywhere deleted another database's pod");
+        }
+
         /// Closing a server's stdin over `pods/exec` reaches the process in
         /// its pod, whether the stream is shut down or just dropped: that's
         /// how a language server is told to exit.
@@ -1142,10 +1185,10 @@ pub(crate) mod tests {
             with_sandbox(|client, sandbox| async move {
             let name = format!("gone-{}", sandbox.conversation_id % 100_000);
             start_with(&client, &sandbox, &echo_server(&name, ""), "v1").await.expect("start");
-            stop_everywhere_with(&client, &name).await.expect("stop");
+            stop_everywhere_with(&client, &name, crate::sandbox::TEST_INSTANCE).await.expect("stop");
             let mut gone = false;
             for _ in 0..120 {
-                if list_with(&client, sandbox.conversation_id).await.expect("list").is_empty() {
+                if list_with(&client, sandbox.conversation_id, &sandbox.instance).await.expect("list").is_empty() {
                     gone = true;
                     break;
                 }

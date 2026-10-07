@@ -66,7 +66,13 @@ pub(super) async fn open_pod_port_with(
         check_reachable_port(port)?;
     }
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
-    dial_pod(&client()?, &pod_name(pod_id), host, port).await
+    let client = client()?;
+    // Never into another database's pod of the same name (SME-115).
+    let instance = db::smelt_instance(pool).await?;
+    if read_our_pod(&pods_api(&client), &pod_name(pod_id), &instance).await?.is_none() {
+        return Err(TerminalError::NoPod);
+    }
+    dial_pod(&client, &pod_name(pod_id), host, port).await
 }
 
 /// Opens a connection to `host:port` in the pod named `pod`: a

@@ -323,15 +323,17 @@ pub(super) async fn ensure_conversation_pvcs(
 /// labelled with `instance` are deleted (SME-115).
 pub(super) async fn delete_conversation_pvcs(client: &kube::Client, conversation_id: i64, instance: &str) {
     for name in [docker_pvc_name(conversation_id), workspace_pvc_name(conversation_id)] {
-        let claim = match pvc_api(client).get_opt(&name).await {
-            Ok(Some(claim)) => claim,
+        // Only its ownership and uid are kept across the delete (see
+        // `delete_terminated_pod`).
+        let (owner, uid) = match pvc_api(client).get_opt(&name).await {
+            Ok(Some(claim)) => (ownership(&claim.metadata, instance), claim.metadata.uid),
             Ok(None) => continue,
             Err(e) => {
                 tracing::warn!(claim = %name, error = %e, "couldn't read a conversation's claim to delete");
                 continue;
             }
         };
-        match (ownership(&claim.metadata, instance), claim.metadata.uid) {
+        match (owner, uid) {
             (Ownership::Ours, Some(uid)) => delete_claim_if_unchanged(client, &name, &uid).await,
             (Ownership::Ours, None) => tracing::warn!(claim = %name, "a claim with no uid; left alone"),
             (Ownership::Unlabelled, _) => {

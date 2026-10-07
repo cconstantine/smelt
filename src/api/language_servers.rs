@@ -33,7 +33,7 @@ pub async fn create_language_server(config: LanguageServerConfig) -> ServerFnRes
 pub async fn update_language_server(id: i64, config: LanguageServerConfig) -> ServerFnResult<LanguageServer> {
     let before = db::get_language_server(db::get(), id).await.map_err(ServerFnError::new)?;
     let saved = crate::lsp::config::save(db::get(), Some(id), &config).await.map_err(ServerFnError::new)?;
-    crate::lsp::config::stop_servers(crate::lsp::config::servers_to_stop(before.as_ref().map(|s| &s.config), Some(&saved.config))).await;
+    crate::lsp::config::stop_servers(db::get(), crate::lsp::config::servers_to_stop(before.as_ref().map(|s| &s.config), Some(&saved.config))).await;
     Ok(saved)
 }
 
@@ -48,6 +48,6 @@ pub async fn lookup_language_server(package: String) -> ServerFnResult<LanguageS
 #[delete("/api/language-servers/{id}")]
 pub async fn delete_language_server(id: i64) -> ServerFnResult<()> {
     let deleted = db::delete_language_server(db::get(), id).await.map_err(ServerFnError::new)?;
-    crate::lsp::config::stop_servers(crate::lsp::config::servers_to_stop(deleted.as_ref().map(|s| &s.config), None)).await;
+    crate::lsp::config::stop_servers(db::get(), crate::lsp::config::servers_to_stop(deleted.as_ref().map(|s| &s.config), None)).await;
     Ok(())
 }
