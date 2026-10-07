@@ -625,15 +625,14 @@ pub async fn connection_check(
     if config.auth_mode == "oauth" {
         check_sign_in(pool, config).await?;
     }
-    ensure_connected(pool, config, Attempt::Always)
-        .await
-        .map_err(|e| {
-            if e.sign_in_rejected {
-                CheckError::SignInExpired(sign_in_expired(config))
-            } else {
-                CheckError::Unreachable(e.message)
-            }
-        })?;
+    if let Err(e) = ensure_connected(pool, config, Attempt::Always).await {
+        if !e.sign_in_rejected {
+            return Err(CheckError::Unreachable(e.message));
+        }
+        // As `check_sign_in` does for a refusal it sees itself.
+        evict(config.id).await;
+        return Err(CheckError::SignInExpired(sign_in_expired(config)));
+    }
     let registry = REGISTRY.lock().await;
     let conn = registry.get(&config.id).ok_or_else(|| {
         CheckError::Unreachable(format!(
@@ -1922,6 +1921,10 @@ mod tests {
         let checked = connection_check(&pool, &config).await;
 
         assert!(matches!(&checked, Err(CheckError::SignInExpired(_))), "{checked:?}");
+        assert!(
+            !OAUTH_CLIENTS.lock().await.contains_key(&server.id),
+            "an expired sign-in drops the server's manager too (review 1)"
+        );
         evict(server.id).await;
     }
 
