@@ -300,7 +300,7 @@ impl Blocks {
     fn start(&mut self, index: Option<usize>, block: PartialBlock) -> Result<(), String> {
         let index = index.unwrap_or_else(|| {
             let seen = self.open.keys().chain(self.done.keys().map(|(i, _)| i));
-            seen.max().map_or(0, |i| i + 1)
+            seen.max().map_or(0, |i| i.saturating_add(1))
         });
         if self.open.contains_key(&index) || self.done.keys().any(|(i, _)| *i == index) {
             tracing::warn!(index, "the model provider reused a content block's index");
@@ -1806,6 +1806,22 @@ mod tests {
         blocks.stop(Some(1)).expect("stop");
         blocks.text(Some(0), "late".to_string()).expect("text");
         assert_eq!(blocks.finish().expect("finish"), vec![text("first"), text("late"), text("second")]);
+    }
+
+    /// A provider's index at `usize::MAX`, then an event without one, must
+    /// not overflow working out the next free index (review round 1).
+    #[test]
+    fn test_a_block_at_the_largest_index_doesnt_overflow_the_next() {
+        let mut blocks = Blocks::default();
+        blocks.text(Some(usize::MAX), "last".to_string()).expect("text");
+        blocks.thinking(None, "Hm".to_string()).expect("thinking");
+        assert_eq!(
+            blocks.finish().expect("finish"),
+            vec![
+                text("last"),
+                ContentBlock::Thinking { thinking: "Hm".to_string(), signature: String::new() },
+            ]
+        );
     }
 
     /// A signature or tool input with no block of its kind open is
