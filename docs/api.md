@@ -283,7 +283,7 @@ pub async fn navigate_browser(id: i64, address: String) -> ServerFnResult<()>;
 | `delete_language_server` | `DELETE /api/language-servers/{id}` | stops its pods everywhere |
 | `lookup_language_server` | `GET /api/language-servers/lookup/{package}` | a suggested config from mason's registry and Helix |
 | `list_mcp_servers` / `get_mcp_server` | `GET /api/mcp-servers`, `GET /api/mcp-servers/{id}` | the `/mcp-servers` pages; header names only, never values (see [mcp.md](mcp.md)) |
-| `mcp_server_status` | `GET /api/mcp-servers/{id}/status` | a real connection attempt: `Connected { tool_names }`, `Unreachable { error }` or `NotConnected` |
+| `mcp_server_status` | `GET /api/mcp-servers/{id}/status` | a real connection attempt: `Connected { tool_names }`, `Unreachable { error }`, `NotConnected` or `NeedsReconnect { error }` (an OAuth sign-in that can't be refreshed, SME-113) |
 | `create_mcp_server` / `update_mcp_server` | `POST /api/mcp-servers`, `POST /api/mcp-servers/{id}` | update merges headers and drops the cached connection |
 | `delete_mcp_server` | `DELETE /api/mcp-servers/{id}` | also drops the cached connection |
 | `start_mcp_server_oauth` | `POST /api/mcp-servers/{id}/oauth/start` | returns the authorization URL the browser goes to (SME-16) |

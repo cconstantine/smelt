@@ -170,7 +170,70 @@ static REGISTRY: LazyLock<AsyncMutex<HashMap<i64, Connection>>> =
 /// A future `tool_definitions_for`/`call_tool` call reconnects fresh.
 pub async fn evict(server_id: i64) {
     REGISTRY.lock().await.remove(&server_id);
+    OAUTH_CLIENTS.lock().await.remove(&server_id);
     lock_failures().remove(&server_id);
+}
+
+/// An OAuth server's HTTP client: rmcp's `AuthClient`, which gets a token
+/// from the server's `AuthorizationManager` before every request.
+type OAuthClient = rmcp::transport::auth::AuthClient<reqwest_rmcp::Client>;
+
+struct SharedOAuthClient {
+    client: OAuthClient,
+    /// What the manager was built for: the server's URL and the stored
+    /// grant's client id. A manager built for anything else isn't reused.
+    url: String,
+    grant_client_id: Option<String>,
+}
+
+/// One `AuthClient` per OAuth server, cloned into each of its connections
+/// and used by the status check (SME-113). Clones share one manager behind
+/// one mutex, so refreshes are one at a time: with GitHub rotating refresh
+/// tokens on every refresh, two managers refreshing at once would retire
+/// each other's tokens. `evict` drops the entry (an edit, a delete, a
+/// Disconnect, a new grant), and an entry built for another URL or another
+/// grant's client is rebuilt rather than reused, which also covers a build
+/// that finishes after an `evict`.
+static OAUTH_CLIENTS: LazyLock<AsyncMutex<HashMap<i64, SharedOAuthClient>>> =
+    LazyLock::new(|| AsyncMutex::new(HashMap::new()));
+
+/// One lock per server, held while building its `AuthClient`, so two
+/// callers don't build two managers.
+static BUILDING_OAUTH: LazyLock<std::sync::Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn grant_client_id(config: &McpServerConfig) -> Option<String> {
+    config
+        .oauth_credentials
+        .as_ref()
+        .and_then(|json| json.0.get("client_id")?.as_str().map(str::to_string))
+}
+
+/// The server's shared `AuthClient`, built on first use.
+async fn oauth_client(
+    pool: &sqlx::PgPool,
+    config: &McpServerConfig,
+) -> Result<OAuthClient, String> {
+    let grant_client_id = grant_client_id(config);
+    let lock = server_lock(&BUILDING_OAUTH, config.id);
+    let _building = lock.lock().await;
+    if let Some(shared) = OAUTH_CLIENTS.lock().await.get(&config.id)
+        && shared.url == config.url
+        && shared.grant_client_id == grant_client_id
+    {
+        return Ok(shared.client.clone());
+    }
+    let manager = crate::mcp_oauth::connection_manager(pool, config).await?;
+    let client = OAuthClient::new(transport_http_client()?, manager);
+    OAUTH_CLIENTS.lock().await.insert(
+        config.id,
+        SharedOAuthClient {
+            client: client.clone(),
+            url: config.url.clone(),
+            grant_client_id,
+        },
+    );
+    Ok(client)
 }
 
 /// Drops `server_id`'s cached connection if it's still `service`: one a
@@ -209,8 +272,11 @@ fn failed_recently(server_id: i64) -> bool {
 static CONNECTING: LazyLock<std::sync::Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-fn connect_lock(server_id: i64) -> Arc<AsyncMutex<()>> {
-    CONNECTING
+fn server_lock(
+    locks: &std::sync::Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>,
+    server_id: i64,
+) -> Arc<AsyncMutex<()>> {
+    locks
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .entry(server_id)
@@ -233,10 +299,10 @@ enum Attempt {
 /// racing the request — see SME-15's
 /// retrospective). Generic over `f`'s return type so it's unit-testable
 /// without a real network call; `connect`'s only caller wires it in below.
-async fn retry_once<F, Fut, T>(mut f: F) -> Result<T, String>
+async fn retry_once<F, Fut, T, E>(mut f: F) -> Result<T, E>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, String>>,
+    Fut: std::future::Future<Output = Result<T, E>>,
 {
     match f().await {
         Ok(value) => Ok(value),
@@ -276,7 +342,47 @@ type Serving = std::pin::Pin<
     >,
 >;
 
-async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connection, String> {
+/// Why connecting failed. `sign_in_rejected`: the server answered 401
+/// even after `AuthClient`'s refresh, or no token could be had, so only a
+/// Reconnect will help (SME-113).
+#[derive(Debug)]
+struct ConnectError {
+    message: String,
+    sign_in_rejected: bool,
+}
+
+impl From<String> for ConnectError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            sign_in_rejected: false,
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Whether a transport error is the server's 401, which `AuthClient`
+/// passes on once its refresh and retry haven't helped.
+fn is_auth_rejection(error: &rmcp::transport::DynamicTransportError) -> bool {
+    use rmcp::transport::streamable_http_client::StreamableHttpError;
+    error
+        .error
+        .downcast_ref::<StreamableHttpError<reqwest_rmcp::Error>>()
+        .is_some_and(|e| {
+            matches!(
+                e,
+                StreamableHttpError::AuthRequired(_)
+                    | StreamableHttpError::Auth(rmcp::transport::auth::AuthError::AuthorizationRequired)
+            )
+        })
+}
+
+async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connection, ConnectError> {
     install_crypto_provider();
     let headers = build_header_map(&config.extra_headers.0)?;
     let transport_config =
@@ -296,31 +402,34 @@ async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connec
         // runs the provider's metadata discovery, so it's inside the
         // timeout too.
         let serving: Serving = if config.auth_mode == "oauth" {
-            let manager = crate::mcp_oauth::connection_manager(pool, config).await?;
-            let client = rmcp::transport::auth::AuthClient::new(http_client, manager);
+            let client = oauth_client(pool, config).await?;
             Box::pin(handler.serve(StreamableHttpClientTransport::with_client(client, transport_config)))
         } else {
             Box::pin(handler.serve(StreamableHttpClientTransport::with_client(http_client, transport_config)))
         };
-        let service = serving
-            .await
-            .map_err(|e| format!("failed to connect to MCP server {:?}: {e}", config.name))?;
+        let service = serving.await.map_err(|e| ConnectError {
+            sign_in_rejected: matches!(
+                &e,
+                rmcp::service::ClientInitializeError::TransportError { error, .. } if is_auth_rejection(error)
+            ),
+            message: format!("failed to connect to MCP server {:?}: {e}", config.name),
+        })?;
         let tools = service.list_all_tools().await.map_err(|e| {
             format!(
                 "failed to list tools from MCP server {:?}: {e}",
                 config.name
             )
         })?;
-        Ok::<_, String>((service, tools))
+        Ok::<_, ConnectError>((service, tools))
     };
     let (service, tools) = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
         .await
         .map_err(|_| {
-            format!(
+            ConnectError::from(format!(
                 "MCP server {:?} didn't answer within {}s",
                 config.name,
                 CONNECT_TIMEOUT.as_secs()
-            )
+            ))
         })??;
 
     Ok(Connection {
@@ -340,7 +449,7 @@ async fn ensure_connected(
     pool: &sqlx::PgPool,
     config: &McpServerConfig,
     attempt: Attempt,
-) -> Result<(), String> {
+) -> Result<(), ConnectError> {
     let existing = {
         let registry = REGISTRY.lock().await;
         registry
@@ -370,16 +479,16 @@ async fn ensure_connected(
         )
     };
     if attempt == Attempt::SkipRecentFailures && failed_recently(config.id) {
-        return Err(skip_error());
+        return Err(skip_error().into());
     }
-    let lock = connect_lock(config.id);
+    let lock = server_lock(&CONNECTING, config.id);
     let _connecting = lock.lock().await;
     // Someone else may have connected, or failed, while this waited.
     if REGISTRY.lock().await.contains_key(&config.id) {
         return Ok(());
     }
     if attempt == Attempt::SkipRecentFailures && failed_recently(config.id) {
-        return Err(skip_error());
+        return Err(skip_error().into());
     }
     match retry_once(|| connect(pool, config)).await {
         Ok(connection) => {
@@ -452,6 +561,56 @@ pub async fn tool_definitions_for(
         .collect()
 }
 
+/// Why `connection_check` couldn't report a server as connected.
+#[derive(Debug, PartialEq)]
+pub enum CheckError {
+    /// The server, or its OAuth provider, couldn't be reached or failed.
+    Unreachable(String),
+    /// An OAuth server's sign-in can't be refreshed (no refresh token, or
+    /// the provider refused it): only a Reconnect brings it back (SME-113).
+    SignInExpired(String),
+}
+
+fn sign_in_expired(config: &McpServerConfig) -> String {
+    format!(
+        "the sign-in to MCP server {:?} has expired or was revoked; use Reconnect",
+        config.name
+    )
+}
+
+/// For an OAuth server, gets a token from its shared manager: a store read,
+/// or a refresh when it's expiring. A grant that can't be refreshed drops
+/// the server's cached connection, which would otherwise still report
+/// Connected (SME-113).
+async fn check_sign_in(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<(), CheckError> {
+    let token = tokio::time::timeout(CONNECT_TIMEOUT, async {
+        let client = oauth_client(pool, config)
+            .await
+            .map_err(CheckError::Unreachable)?;
+        client.get_access_token().await.map_err(|e| match e {
+            rmcp::transport::auth::AuthError::AuthorizationRequired => {
+                CheckError::SignInExpired(sign_in_expired(config))
+            }
+            other => CheckError::Unreachable(format!(
+                "couldn't get an OAuth token for MCP server {:?}: {other}",
+                config.name
+            )),
+        })
+    })
+    .await
+    .map_err(|_| {
+        CheckError::Unreachable(format!(
+            "MCP server {:?}'s OAuth provider didn't answer within {}s",
+            config.name,
+            CONNECT_TIMEOUT.as_secs()
+        ))
+    })?;
+    if let Err(CheckError::SignInExpired(_)) = &token {
+        evict(config.id).await;
+    }
+    token.map(|_| ())
+}
+
 /// Attempts a real connection to `config`'s server and reports its current
 /// tool names on success — the `/mcp-servers` UI's live "connected" status
 /// (index page's badge, edit page's full status) rather than a cached
@@ -462,14 +621,25 @@ pub async fn tool_definitions_for(
 pub async fn connection_check(
     pool: &sqlx::PgPool,
     config: &McpServerConfig,
-) -> Result<Vec<String>, String> {
-    ensure_connected(pool, config, Attempt::Always).await?;
+) -> Result<Vec<String>, CheckError> {
+    if config.auth_mode == "oauth" {
+        check_sign_in(pool, config).await?;
+    }
+    ensure_connected(pool, config, Attempt::Always)
+        .await
+        .map_err(|e| {
+            if e.sign_in_rejected {
+                CheckError::SignInExpired(sign_in_expired(config))
+            } else {
+                CheckError::Unreachable(e.message)
+            }
+        })?;
     let registry = REGISTRY.lock().await;
     let conn = registry.get(&config.id).ok_or_else(|| {
-        format!(
+        CheckError::Unreachable(format!(
             "connection to MCP server {:?} vanished immediately after connecting",
             config.name
-        )
+        ))
     })?;
     Ok(conn
         .tools
@@ -502,7 +672,9 @@ pub async fn call_tool(
         }
     };
 
-    ensure_connected(pool, config, Attempt::SkipRecentFailures).await?;
+    ensure_connected(pool, config, Attempt::SkipRecentFailures)
+        .await
+        .map_err(|e| e.message)?;
     let service = REGISTRY
         .lock()
         .await
@@ -1642,6 +1814,107 @@ mod tests {
         let _ = call.await.expect("call task");
 
         assert_eq!(stored_client_id(&pool, server.id).await.as_deref(), Some("client-1"));
+        evict(server.id).await;
+    }
+
+    /// SME-113: a grant the provider won't refresh any more shows as such,
+    /// not as Connected from the cached connection, and the connection is
+    /// dropped.
+    #[sqlx::test]
+    async fn test_a_sign_in_that_cannot_be_refreshed_is_reported_as_expired(pool: sqlx::PgPool) {
+        let mock = oauth_http::spawn().await;
+        let server = oauth_http::create_server(&pool, &mock, None).await;
+        oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+        let config = oauth_http::config(&pool, server.id).await;
+        connection_check(&pool, &config).await.expect("connects");
+
+        oauth_http::age_token(&pool, server.id).await;
+        mock.reject_refreshes.store(true, Ordering::SeqCst);
+        let checked = connection_check(&pool, &config).await;
+
+        assert!(
+            matches!(&checked, Err(CheckError::SignInExpired(message)) if message.contains("Reconnect")),
+            "{checked:?}"
+        );
+        assert!(!REGISTRY.lock().await.contains_key(&server.id), "the dead connection is dropped");
+        evict(server.id).await;
+    }
+
+    /// SME-113: the status check and a connection refresh through one
+    /// manager per server. With a manager each, both refreshed with the
+    /// same refresh token, and the provider (rotating it, as GitHub does)
+    /// refused the second, reporting a live sign-in as expired.
+    #[sqlx::test]
+    async fn test_the_status_check_and_a_tool_call_share_one_refresh(pool: sqlx::PgPool) {
+        let mock = oauth_http::spawn().await;
+        let server = oauth_http::create_server(&pool, &mock, None).await;
+        oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+        oauth_http::age_token(&pool, server.id).await;
+        let config = oauth_http::config(&pool, server.id).await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *mock.refresh_gate.lock().unwrap() = Some(gate.clone());
+
+        let check = tokio::spawn({
+            let (pool, config) = (pool.clone(), config.clone());
+            async move { connection_check(&pool, &config).await }
+        });
+        let call = tokio::spawn({
+            let (pool, config) = (pool.clone(), config.clone());
+            async move { call_tool(&pool, &config, "echo", serde_json::json!({})).await }
+        });
+        assert!(
+            wait_until(|| !mock.refresh_client_ids.lock().unwrap().is_empty()).await,
+            "a refresh should reach the provider"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        gate.add_permits(2);
+
+        let (checked, called) = (check.await.expect("check task"), call.await.expect("call task"));
+        assert_eq!(checked, Ok(vec!["echo".to_string()]));
+        assert_eq!(called, Ok("called with access-2".to_string()));
+        assert_eq!(mock.refresh_client_ids.lock().unwrap().len(), 1, "one refresh request");
+        evict(server.id).await;
+    }
+
+    /// SME-113: a new grant (a Connect, which evicts) gets a new manager,
+    /// so its refreshes name its own client, not the old grant's.
+    #[sqlx::test]
+    async fn test_a_new_grant_refreshes_with_its_own_client(pool: sqlx::PgPool) {
+        let mock = oauth_http::spawn().await;
+        let server = oauth_http::create_server(&pool, &mock, None).await;
+        oauth_http::save_grant(&pool, server.id, &mock, "client-1").await;
+        let config = oauth_http::config(&pool, server.id).await;
+        connection_check(&pool, &config).await.expect("connects with the first grant");
+
+        oauth_http::save_grant(&pool, server.id, &mock, "client-2").await;
+        evict(server.id).await;
+        oauth_http::age_token(&pool, server.id).await;
+        let config = oauth_http::config(&pool, server.id).await;
+        connection_check(&pool, &config).await.expect("connects with the new grant");
+
+        assert_eq!(
+            mock.refresh_client_ids.lock().unwrap().last().map(String::as_str),
+            Some("client-2")
+        );
+        evict(server.id).await;
+    }
+
+    /// SME-113: a token revoked before its expiry, whose refresh the
+    /// provider refuses, shows as an expired sign-in on a fresh connect
+    /// (the server's 401 after `AuthClient`'s one refresh), not as an
+    /// unreachable server.
+    #[sqlx::test]
+    async fn test_a_revoked_sign_in_that_cannot_be_refreshed_is_reported_as_expired(pool: sqlx::PgPool) {
+        let mock = oauth_http::spawn().await;
+        let server = oauth_http::create_server(&pool, &mock, None).await;
+        let first = oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+        mock.revoke(&first);
+        mock.reject_refreshes.store(true, Ordering::SeqCst);
+        let config = oauth_http::config(&pool, server.id).await;
+
+        let checked = connection_check(&pool, &config).await;
+
+        assert!(matches!(&checked, Err(CheckError::SignInExpired(_))), "{checked:?}");
         evict(server.id).await;
     }
 }

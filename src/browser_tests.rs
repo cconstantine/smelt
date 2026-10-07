@@ -762,6 +762,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "switch_resets_context_detail", 30, Box::pin(scenario_switch_resets_context_detail(&t))).await;
     run_scenario(&t, only, r, k, "model_picker", 60, Box::pin(scenario_model_picker(&t))).await;
     run_scenario(&t, only, r, k, "oauth_headers", 30, Box::pin(scenario_oauth_headers(&t))).await;
+    run_scenario(&t, only, r, k, "oauth_sign_in_expired", 30, Box::pin(scenario_oauth_sign_in_expired(&t))).await;
     run_scenario(&t, only, r, k, "stale_bundle", 60, Box::pin(scenario_stale_bundle(&t))).await;
     run_scenario(&t, only, r, k, "transcript_scroll", 60, Box::pin(scenario_transcript_scroll(&t))).await;
     run_scenario(&t, only, r, k, "context_from_the_keyboard", 60, Box::pin(scenario_context_from_the_keyboard(&t))).await;
@@ -2275,6 +2276,83 @@ async fn scenario_model_picker(t: &Scenario<'_>) {
         .expect("read the conversation's model")
         .expect("the conversation exists");
     assert_eq!(stored.model.as_deref(), Some("other-model"));
+}
+
+/// SME-113: an OAuth server whose sign-in can't be refreshed (here an
+/// expired token with no refresh token) shows "Sign-in expired", its own
+/// status, on the list and the edit page, which offers Reconnect and
+/// Disconnect. Before, it read Connected until a tool call failed.
+async fn scenario_oauth_sign_in_expired(t: &Scenario<'_>) {
+    let pool = t.pool;
+    // The provider: nothing to discover (rmcp falls back to its default
+    // endpoints), and no refresh is ever attempted without a refresh token.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the provider");
+    let addr = listener.local_addr().expect("provider address");
+    let provider = tokio::spawn(async move {
+        let _ = axum::serve(listener, axum::Router::new()).await;
+    });
+    let server = db::create_mcp_server_config(
+        pool,
+        &unique_id("sign-in-expired"),
+        &format!("http://{addr}/mcp"),
+        &std::collections::HashMap::new(),
+        "oauth",
+        None,
+        None,
+    )
+    .await
+    .expect("create an OAuth server");
+    db::set_mcp_server_oauth_credentials(
+        pool,
+        server.id,
+        Some(serde_json::json!({
+            "client_id": "client",
+            "token_response": {"access_token": "expired", "token_type": "bearer", "expires_in": 60},
+            "granted_scopes": [],
+            "token_received_at": 1_000_000_000u64,
+        })),
+    )
+    .await
+    .expect("store an expired grant");
+
+    let list = t.tab(t.url("mcp-servers")).await;
+    let badge_selector = format!("a[href='/mcp-servers/{}'] .mcp-status", server.id);
+    let badge_text = format!(
+        "(() => {{ const b = document.querySelector({badge_selector:?}); return b ? b.className + '|' + b.innerText : ''; }})()"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let badge = loop {
+        let badge: String = list
+            .evaluate(badge_text.as_str())
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok())
+            .unwrap_or_default();
+        if !badge.contains("checking") && !badge.is_empty() || tokio::time::Instant::now() >= deadline {
+            break badge;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    let edit = t.tab(t.url(&format!("mcp-servers/{}", server.id))).await;
+    let status_shown = wait_for_text(&edit, "Sign-in expired \u{2014} use Reconnect below.", Duration::from_secs(15)).await;
+    let buttons: Vec<String> = edit
+        .evaluate("Array.from(document.querySelectorAll('.mcp-oauth-actions button')).map(b => b.innerText)")
+        .await
+        .ok()
+        .and_then(|v| v.into_value().ok())
+        .unwrap_or_default();
+
+    // Deleted before the checks, so a failing one doesn't leave it behind.
+    db::delete_mcp_server_config(pool, server.id).await.expect("delete the OAuth server");
+    crate::mcp::evict(server.id).await;
+    provider.abort();
+    assert!(
+        badge.contains("mcp-status-needs-reconnect") && badge.ends_with("|Sign-in expired"),
+        "the list's badge: {badge:?}"
+    );
+    assert!(status_shown, "the edit page should say the sign-in expired");
+    assert_eq!(buttons, vec!["Reconnect".to_string(), "Disconnect".to_string()]);
 }
 
 /// Scenario 25 (SME-76): an OAuth server takes extra headers too, such as

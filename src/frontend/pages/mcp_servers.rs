@@ -157,6 +157,9 @@ fn McpServerStatusBadge(id: i64) -> Element {
         Some(Ok(McpConnectionStatus::NotConnected)) => rsx! {
             span { class: "mcp-status mcp-status-not-connected", "Not connected" }
         },
+        Some(Ok(McpConnectionStatus::NeedsReconnect { error })) => rsx! {
+            span { class: "mcp-status mcp-status-needs-reconnect", title: "{error}", "Sign-in expired" }
+        },
         Some(Err(e)) => rsx! {
             span { class: "mcp-status mcp-status-unreachable", title: "{super::server_error_message(&e)}", "Error" }
         },
@@ -567,6 +570,12 @@ pub fn McpServerEdit(id: i64) -> Element {
                                 p { "Not connected \u{2014} use Connect below." }
                             }
                         },
+                        Some(Ok(McpConnectionStatus::NeedsReconnect { error })) => rsx! {
+                            div { class: "mcp-status mcp-status-needs-reconnect",
+                                p { "Sign-in expired \u{2014} use Reconnect below." }
+                                p { class: "mcp-status-detail", "{error}" }
+                            }
+                        },
                         Some(Err(e)) => rsx! {
                             div { class: "mcp-status mcp-status-unreachable",
                                 super::ErrorText { message: Some(super::server_error_message(&e)) }
@@ -677,13 +686,13 @@ pub fn McpServerEdit(id: i64) -> Element {
                                 r#type: "button",
                                 disabled: oauth_connecting(),
                                 onclick: connect_oauth,
-                                if matches!(status(), Some(Ok(McpConnectionStatus::Connected { .. }))) {
+                                if matches!(status(), Some(Ok(McpConnectionStatus::Connected { .. } | McpConnectionStatus::NeedsReconnect { .. }))) {
                                     "Reconnect"
                                 } else {
                                     "Connect"
                                 }
                             }
-                            if matches!(status(), Some(Ok(McpConnectionStatus::Connected { .. } | McpConnectionStatus::Unreachable { .. }))) {
+                            if matches!(status(), Some(Ok(McpConnectionStatus::Connected { .. } | McpConnectionStatus::Unreachable { .. } | McpConnectionStatus::NeedsReconnect { .. }))) {
                                 button {
                                     class: "mcp-oauth-disconnect",
                                     r#type: "button",

@@ -18,6 +18,8 @@
     --danger-bg: #fdecea;
     --ok: #1e7e34;
     --ok-bg: #e8f7ed;
+    --warn: #9a6700;
+    --warn-bg: #fff4d6;
     --accent: #3b6fd8;
 }
 
@@ -38,6 +40,8 @@
         --danger-bg: #3a1b18;
         --ok: #5cc98a;
         --ok-bg: #16301f;
+        --warn: #e3b341;
+        --warn-bg: #3a2e10;
         --accent: #7aa2ff;
     }
 }
@@ -1847,6 +1851,30 @@ div.mcp-status-not-connected {
 
 div.mcp-status-not-connected::before {
     content: none;
+}
+
+/* A sign-in that can't be refreshed (SME-113): not the network's fault,
+   so amber rather than Unreachable's red. */
+.mcp-status-needs-reconnect {
+    background: var(--warn-bg);
+    color: var(--warn);
+}
+
+div.mcp-status-needs-reconnect {
+    display: block;
+    border-radius: 10px;
+    padding: 12px 14px;
+    white-space: normal;
+}
+
+div.mcp-status-needs-reconnect::before {
+    content: none;
+}
+
+div.mcp-status-needs-reconnect .mcp-status-detail {
+    color: var(--text-2);
+    font-weight: 400;
+    overflow-wrap: anywhere;
 }
 
 .mcp-auth-mode-choice {
