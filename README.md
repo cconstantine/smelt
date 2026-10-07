@@ -82,7 +82,7 @@ scripts/browser-check/setup.sh
 dx serve --fullstack --addr 0.0.0.0 --port 8080
 ```
 
-Then open <http://localhost:8180>. Previews are on port 8181. Compose publishes these ports on every interface of your machine, and the `docker` and `k3s` services are privileged. So the warning above applies here too: use the stack on a trusted network, or bind the ports to `127.0.0.1` in `docker-compose.yml`. [Dev over HTTPS](docs/setup.md#dev-over-https-http2) covers the HTTPS address (`https://localhost:8443`).
+Then open <http://localhost:8180>. Previews are on port 8181. Compose publishes these ports, and Caddy's 8443 (below), on every interface of your machine, and the `docker` and `k3s` services are privileged. So the warning above applies here too: use the stack on a trusted network, or bind the ports to `127.0.0.1` in `docker-compose.yml`. [Dev over HTTPS](docs/setup.md#dev-over-https-http2) covers the HTTPS address (`https://localhost:8443`).
 
 ## Documentation
 
