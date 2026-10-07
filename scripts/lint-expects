@@ -19,9 +19,10 @@ cd "$(dirname "$0")/.."
 lints=(-D warnings -A clippy::all -D clippy::expect_used)
 
 # A container built before SME-95 has no clippy (the Dockerfile adds it now).
-# Say what to run rather than leaving rustup's own error in check.sh's output.
+# Say what to run rather than leaving rustup's own error in check.sh's output
+# (it starts "error:" so check.sh's filter shows it).
 if ! cargo clippy --version >/dev/null 2>&1; then
-    echo "lint-expects: clippy isn't installed for this toolchain." >&2
+    echo "error: clippy isn't installed for this toolchain (lint-expects needs it)." >&2
     echo "Run once: rustup component add clippy" >&2
     exit 1
 fi
