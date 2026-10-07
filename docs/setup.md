@@ -85,6 +85,13 @@ builds with no warnings, plus the server tests), `scripts/check-server`
 `scripts/clean-test-namespace.sh` (deletes pods and Docker data claims left behind
 in the `smelt-park-test` namespace).
 
+Several smelt servers can share a cluster's `smelt-park` namespace (the dev
+server and a check server on a scratch database): each database labels its
+pods and claims `smelt/instance=<its id>` and touches only its own (SME-115).
+Don't run a copy of a database against the same cluster as its original: the
+copy has the same instance id, so the two would delete and reuse each other's
+sandboxes.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on every pull request, every push to `main`,

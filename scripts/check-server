@@ -23,9 +23,10 @@
 #                   another branch, which stop smelt starting: on SME-65 every
 #                   page was a 500 because SME-35's branch had applied one.
 #                   Nothing from the dev database is copied into it.
-#                   Refused until SME-115 lands: a server on a scratch
-#                   database deletes the sandbox claims (each conversation's
-#                   /workspace) of every conversation on the dev server.
+#                   Refused for a REF without SME-115's fix: such a server
+#                   on a scratch database deletes the sandbox claims (each
+#                   conversation's /workspace) of every conversation on the
+#                   dev server.
 #
 # `dx serve` runs its server as a child process, so stopping only the `dx`
 # process leaves the server running (SME-51). This starts `dx` in a process
@@ -145,15 +146,6 @@ start() {
     [ "${1:-}" = "--" ] && shift
     local overrides=("$@")
 
-    # Before anything is checked out, created or started (SME-115): every
-    # smelt server sweeps the shared sandbox namespace for claims whose
-    # conversation isn't in its own database, so one on an empty database
-    # deletes the dev server's conversations' /workspace.
-    if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
-        echo "CHECK_SCRATCH_DB=1 is disabled until SME-115 lands: a server on a scratch database deletes the dev server's sandbox claims" >&2
-        exit 1
-    fi
-
     if running_pgid >/dev/null; then
         echo "a check server is already running; scripts/check-server stop first" >&2
         exit 1
@@ -161,6 +153,16 @@ start() {
 
     local commit
     commit=$(git -C "$repo" rev-parse --verify "$ref^{commit}")
+    # Before anything is checked out, created or started (SME-115): a
+    # smelt from before the fix sweeps the shared sandbox namespace for
+    # claims whose conversation isn't in its own database, so one on an
+    # empty database deletes the dev server's conversations' /workspace.
+    # The fix came with the smelt_instance migration.
+    if [ "${CHECK_SCRATCH_DB:-}" = 1 ] &&
+        ! git -C "$repo" cat-file -e "$commit:migrations/20261007200000_smelt_instance.sql" 2>/dev/null; then
+        echo "CHECK_SCRATCH_DB=1 is refused for $ref ($commit): it predates SME-115's fix, so a server serving it on a scratch database deletes the dev server's sandbox claims" >&2
+        exit 1
+    fi
     if [ -d "$worktree" ]; then
         git -C "$worktree" checkout -q --detach "$commit"
     else
