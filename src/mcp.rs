@@ -173,6 +173,21 @@ pub async fn evict(server_id: i64) {
     lock_failures().remove(&server_id);
 }
 
+/// Drops `server_id`'s cached connection if it's still `service`: one a
+/// caller found dead, not a newer one that replaced it meanwhile.
+async fn drop_connection(
+    server_id: i64,
+    service: &Arc<RunningService<RoleClient, SmeltClientHandler>>,
+) {
+    let mut registry = REGISTRY.lock().await;
+    if registry
+        .get(&server_id)
+        .is_some_and(|conn| Arc::ptr_eq(&conn.service, service))
+    {
+        registry.remove(&server_id);
+    }
+}
+
 /// When each server last failed to connect, so model calls can skip it
 /// for `RETRY_AFTER_FAILURE` instead of waiting on it every time.
 static FAILED_AT: LazyLock<std::sync::Mutex<HashMap<i64, std::time::Instant>>> =
@@ -343,9 +358,7 @@ async fn ensure_connected(
                 }
                 return Ok(());
             }
-            Err(_) => {
-                REGISTRY.lock().await.remove(&config.id);
-            }
+            Err(_) => drop_connection(config.id, &service).await,
         }
     }
 
@@ -510,13 +523,24 @@ pub async fn call_tool(
                 config.name,
                 CALL_TIMEOUT.as_secs()
             )
-        })?
-        .map_err(|e| {
-            format!(
+        })?;
+    let result = match result {
+        Ok(result) => result,
+        Err(e) => {
+            // Below MCP (a transport error, such as a 401 that survived
+            // `AuthClient`'s refresh and retry, or a closed connection),
+            // the connection is taken as dead, so the next caller connects
+            // again rather than every call failing on it (SME-113). A
+            // JSON-RPC error from the tool itself isn't the connection's.
+            if !matches!(e, rmcp::service::ServiceError::McpError(_)) {
+                drop_connection(config.id, &service).await;
+            }
+            return Err(format!(
                 "MCP tool call to {:?} on {:?} failed: {e}",
                 tool_name, config.name
-            )
-        })?;
+            ));
+        }
+    };
 
     let content = result
         .content
@@ -1052,6 +1076,11 @@ mod tests {
             called.as_ref().is_ok_and(|r| r.as_ref().is_err_and(|e| e.contains("didn't answer"))),
             "{called:?}"
         );
+        assert!(
+            REGISTRY.lock().await.contains_key(&-1112),
+            "a slow call isn't a dead connection"
+        );
+        REGISTRY.lock().await.remove(&-1112);
     }
 
     /// SME-40 F1: listing tools for a turn waited the full connect timeout
@@ -1226,6 +1255,13 @@ mod tests {
                 Some("tools/list") => serde_json::json!({"tools": [
                     {"name": "echo", "description": "Echoes", "inputSchema": {"type": "object"}}
                 ]}),
+                Some("tools/call") if request["params"]["name"] == "fail" => {
+                    return axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32602, "message": "the tool refused"},
+                    }))
+                    .into_response();
+                }
                 Some("tools/call") => serde_json::json!({
                     "content": [{"type": "text", "text": format!("called with {token}")}],
                     "isError": false,
@@ -1496,6 +1532,34 @@ mod tests {
 
         assert_eq!(result, Ok("called with access-2".to_string()));
         assert_eq!(mock.refresh_count(), 1);
+        evict(server.id).await;
+    }
+
+    /// SME-113: a call that fails below MCP (here a 401 that survives the
+    /// refresh-and-retry) drops the connection, so the next caller connects
+    /// again instead of every call failing on the same dead connection. A
+    /// JSON-RPC error from the tool itself keeps it.
+    #[sqlx::test]
+    async fn test_a_tool_call_that_fails_at_the_transport_drops_the_connection(pool: sqlx::PgPool) {
+        let mock = oauth_http::spawn().await;
+        let server = oauth_http::create_server(&pool, &mock, None).await;
+        let first = oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+        let config = oauth_http::config(&pool, server.id).await;
+        connection_check(&pool, &config).await.expect("connects");
+
+        let refused = call_tool(&pool, &config, "fail", serde_json::json!({})).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(REGISTRY.lock().await.contains_key(&server.id), "a tool's own error keeps the connection");
+
+        mock.revoke(&first);
+        mock.reject_refreshes.store(true, Ordering::SeqCst);
+        let failed = call_tool(&pool, &config, "echo", serde_json::json!({})).await;
+        assert!(failed.is_err(), "{failed:?}");
+        assert!(!REGISTRY.lock().await.contains_key(&server.id), "the dead connection is dropped");
+
+        mock.reject_refreshes.store(false, Ordering::SeqCst);
+        connection_check(&pool, &config).await.expect("the next check connects again");
+        assert_eq!(mock.initialize_count(), 2, "a fresh connection, not the cached one");
         evict(server.id).await;
     }
 }
