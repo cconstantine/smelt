@@ -487,6 +487,10 @@ mod server {
             effort: row
                 .and_then(|r| r.effort.as_deref())
                 .and_then(crate::anthropic::Effort::parse)
+                // Only a level the row offers for llama.cpp: one set while
+                // the provider was another kind (`max`) can be one the
+                // template refuses, failing every turn (SME-111 review 1).
+                .filter(|effort| LLAMA_CPP_EFFORTS.contains(effort))
                 .filter(|_| caps.supports_reasoning_effort()),
             preserve_thinking: caps.supports_preserve_reasoning().then_some(provider.keep_reasoning),
         }
@@ -1760,6 +1764,14 @@ mod tests {
                 template_settings(&llama_provider(Some(both), true), None),
                 TemplateSettings { effort: None, preserve_thinking: Some(true) }
             );
+            // SME-111 review 1: a level the row doesn't offer for llama.cpp
+            // (set while the provider was another kind) isn't sent: the
+            // user's template refuses `max`, failing every turn.
+            let effort_caps = serde_json::json!({"template_caps": {"supports_reasoning_effort": true}});
+            for (stored, sent) in [("max", None), ("xhigh", None), ("high", Some(Effort::High))] {
+                let stale = db::ProviderModelRow { effort: Some(stored.to_string()), ..self::row(None, None, None, None) };
+                assert_eq!(template_settings(&llama_provider(Some(effort_caps.clone()), false), Some(&stale)).effort, sent, "{stored}");
+            }
             let neither = serde_json::json!({"template_caps": {"supports_reasoning_effort": false}});
             assert_eq!(template_settings(&llama_provider(Some(neither), false), Some(&row)), TemplateSettings::default());
             assert_eq!(template_settings(&llama_provider(None, false), Some(&row)), TemplateSettings::default(), "never read");

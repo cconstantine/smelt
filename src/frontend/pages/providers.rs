@@ -1096,7 +1096,9 @@ fn ProviderModelRow(id: i64, model: ModelInfo, kind: ProviderKind, efforts: Vec<
                         // Kept when this kind doesn't offer it, so saving
                         // doesn't drop it.
                         if let Some(level) = effort().filter(|level| !efforts.contains(level)) {
-                            option { value: "{level.as_str()}", selected: true, "{level.as_str()}" }
+                            option { value: "{level.as_str()}", selected: true,
+                                if llama_cpp_efforts { "{level.as_str()} (not sent)" } else { "{level.as_str()}" }
+                            }
                         }
                         for level in efforts.clone() {
                             option {
