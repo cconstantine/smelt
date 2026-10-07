@@ -7,10 +7,9 @@
 //! restart (`rmcp`'s own default is in-memory only), and the
 //! start/callback/disconnect lifecycle the `/mcp-servers` UI and the
 //! `/oauth/mcp-callback/{id}` route (`main.rs`) drive. `src/mcp.rs`'s
-//! `connect()` is the other half — it fetches a fresh access token through
-//! the same `PgCredentialStore` and feeds it into the existing
-//! static-header transport path rather than wiring OAuth into the
-//! transport's HTTP client directly.
+//! `connect()` is the other half: its transport's HTTP client is rmcp's
+//! `AuthClient`, which gets a token from `connection_manager`'s manager
+//! before every request, refreshing it when it's expiring (SME-113).
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -25,9 +24,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::db::{self, McpServerConfig};
 
 /// Postgres-backed `CredentialStore` for one server's OAuth grant, bound to
-/// a single `mcp_servers.id`. Plugged into a fresh `AuthorizationManager`
-/// every time one is built (`start`, and `crate::mcp::connect`'s OAuth
-/// branch) rather than kept alive across requests itself. Takes its pool
+/// a single `mcp_servers.id`. Plugged into each `AuthorizationManager`
+/// smelt builds (`start`, and `connection_manager` for connections); it
+/// keeps nothing in memory, so every load reads the row fresh. Takes its pool
 /// explicitly rather than reaching for `db::get()` internally — same
 /// testable-all-the-way-down convention every other `db.rs`-touching
 /// function in this codebase already follows (see `anthropic::tools`'
@@ -150,6 +149,48 @@ pub async fn start(
         .await
         .insert(config.id, PendingAttempt { state, stored });
     Ok(url)
+}
+
+/// The `AuthorizationManager` a server's connections get their tokens
+/// from (SME-113): built from the stored grant, so its client is the one
+/// that grant was issued to. rmcp's `AuthClient` asks it for a token
+/// before every request, and it refreshes one that's expiring, saving the
+/// result through `PgCredentialStore`.
+pub async fn connection_manager(
+    pool: &PgPool,
+    config: &McpServerConfig,
+) -> Result<AuthorizationManager, String> {
+    if config.oauth_credentials.is_none() {
+        return Err(format!(
+            "MCP server {:?} is configured for OAuth but has never connected — use the Connect button on its edit page",
+            config.name
+        ));
+    }
+    crate::mcp::install_crypto_provider();
+    let mut manager = AuthorizationManager::new(config.url.as_str())
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to initialize OAuth for MCP server {:?}: {e}",
+                config.name
+            )
+        })?;
+    manager.set_credential_store(PgCredentialStore::new(pool.clone(), config.id));
+    let restored = manager.initialize_from_store().await.map_err(|e| {
+        format!(
+            "failed to load stored OAuth credentials for MCP server {:?}: {e}",
+            config.name
+        )
+    })?;
+    if !restored {
+        // No token stored, or rmcp discarded one bound to a provider whose
+        // issuer has since changed.
+        return Err(format!(
+            "MCP server {:?} has no usable sign-in — use the Connect button on its edit page",
+            config.name
+        ));
+    }
+    Ok(manager)
 }
 
 /// Completes an in-flight authorization attempt — pops `server_id`'s
@@ -811,8 +852,8 @@ mod tests {
         );
 
         // `get_access_token` on a fresh manager built from the same store
-        // mirrors exactly what `crate::mcp::oauth_headers` does on every
-        // `connect()` — proves both persistence and transparent refresh
+        // mirrors what `connection_manager`'s manager does before each
+        // request — proves both persistence and transparent refresh
         // (the initial token's `expires_in: 0` forces this).
         let mut manager = rmcp::transport::auth::AuthorizationManager::new(base_url.as_str())
             .await

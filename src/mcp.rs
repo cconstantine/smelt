@@ -96,8 +96,7 @@ pub fn parse_tool_name(name: &str) -> Option<(&str, &str)> {
 }
 
 /// Refuses extra headers an `auth_mode` server can't use: an OAuth
-/// server's `Authorization` is its token, which `oauth_headers` sets over
-/// any saved one (SME-76 lets OAuth servers have other headers, such as
+/// server's `Authorization` is its token, which rmcp's `AuthClient` sets (SME-76 lets OAuth servers have other headers, such as
 /// GitHub's `X-MCP-Toolsets`).
 pub fn check_extra_headers(auth_mode: &str, headers: &HashMap<String, String>) -> Result<(), String> {
     if auth_mode == "oauth" && headers.keys().any(|name| name.eq_ignore_ascii_case("authorization")) {
@@ -230,60 +229,6 @@ where
     }
 }
 
-/// Fetches a fresh OAuth access token for `config` (auto-refreshing via the
-/// stored refresh token if the current one is expired — and persisting
-/// that refresh through `PgCredentialStore`) and merges it into `config`'s
-/// static `extra_headers` as a plain `Authorization: Bearer <token>` —
-/// deliberately reusing the same `build_header_map`/`custom_headers` path
-/// static-header mode already uses, rather than wiring `rmcp`'s
-/// `AuthClient`/`AuthorizedHttpClient` into the transport's HTTP client
-/// directly. See SME-16's "`src/mcp.rs` —
-/// `connect()`'s new branch." A token that expires mid-connection (a
-/// long-lived cached `Connection`) isn't proactively refreshed — only the
-/// next fresh `connect()` re-fetches one; a documented limitation, not an
-/// oversight.
-async fn oauth_headers(
-    pool: &sqlx::PgPool,
-    config: &McpServerConfig,
-) -> Result<HashMap<String, String>, String> {
-    if config.oauth_credentials.is_none() {
-        return Err(format!(
-            "MCP server {:?} is configured for OAuth but has never connected — use the Connect button on its edit page",
-            config.name
-        ));
-    }
-
-    install_crypto_provider();
-    let mut manager = rmcp::transport::auth::AuthorizationManager::new(config.url.as_str())
-        .await
-        .map_err(|e| {
-            format!(
-                "failed to initialize OAuth for MCP server {:?}: {e}",
-                config.name
-            )
-        })?;
-    manager.set_credential_store(crate::mcp_oauth::PgCredentialStore::new(
-        pool.clone(),
-        config.id,
-    ));
-    manager.initialize_from_store().await.map_err(|e| {
-        format!(
-            "failed to load stored OAuth credentials for MCP server {:?}: {e}",
-            config.name
-        )
-    })?;
-    let token = manager.get_access_token().await.map_err(|e| {
-        format!(
-            "failed to get an OAuth access token for MCP server {:?}: {e}",
-            config.name
-        )
-    })?;
-
-    let mut headers = config.extra_headers.0.clone();
-    headers.insert("Authorization".to_string(), format!("Bearer {token}"));
-    Ok(headers)
-}
-
 /// Installs ring as rustls's process-wide default provider, if none is yet.
 /// rmcp's reqwest client is built with `rustls-no-provider` (one crypto
 /// backend in the binary, SME-60), and building it with no default installed
@@ -293,25 +238,56 @@ pub(crate) fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// The HTTP client rmcp's own transport builds for itself
+/// (`default_http_client`, private): no idle pooling, and no redirects, so
+/// a header (an OAuth token included) is never replayed to a redirect
+/// target.
+fn transport_http_client() -> Result<reqwest_rmcp::Client, String> {
+    reqwest_rmcp::Client::builder()
+        .pool_max_idle_per_host(0)
+        .redirect(reqwest_rmcp::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("failed to build the MCP HTTP client: {e}"))
+}
+
+type Serving = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    RunningService<RoleClient, SmeltClientHandler>,
+                    rmcp::service::ClientInitializeError,
+                >,
+            > + Send,
+    >,
+>;
+
 async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connection, String> {
     install_crypto_provider();
-    let extra_headers = if config.auth_mode == "oauth" {
-        oauth_headers(pool, config).await?
-    } else {
-        config.extra_headers.0.clone()
-    };
-    let headers = build_header_map(&extra_headers)?;
+    let headers = build_header_map(&config.extra_headers.0)?;
     let transport_config =
         StreamableHttpClientTransportConfig::with_uri(config.url.clone()).custom_headers(headers);
-    let transport = StreamableHttpClientTransport::from_config(transport_config);
+    let http_client = transport_http_client()?;
 
     let stale = Arc::new(AtomicBool::new(false));
     let handler = SmeltClientHandler {
         stale: stale.clone(),
     };
     let connecting = async {
-        let service = handler
-            .serve(transport)
+        // An OAuth server's requests go through rmcp's `AuthClient`, which
+        // gets a token before each one (refreshing it when it's expiring)
+        // and, when the server rejects one anyway, refreshes once and
+        // retries (SME-113). A token baked into the connection's headers
+        // expired with the connection still cached. Building the manager
+        // runs the provider's metadata discovery, so it's inside the
+        // timeout too.
+        let serving: Serving = if config.auth_mode == "oauth" {
+            let manager = crate::mcp_oauth::connection_manager(pool, config).await?;
+            let client = rmcp::transport::auth::AuthClient::new(http_client, manager);
+            Box::pin(handler.serve(StreamableHttpClientTransport::with_client(client, transport_config)))
+        } else {
+            Box::pin(handler.serve(StreamableHttpClientTransport::with_client(http_client, transport_config)))
+        };
+        let service = serving
             .await
             .map_err(|e| format!("failed to connect to MCP server {:?}: {e}", config.name))?;
         let tools = service.list_all_tools().await.map_err(|e| {
@@ -746,8 +722,8 @@ mod tests {
 
     /// Never actually connected to — every test below either pre-populates
     /// `REGISTRY` directly (so `connect` is never reached) or uses a
-    /// `static_headers` config (so `oauth_headers`, the only path that
-    /// touches the pool, is never reached either). Same lazy-fake-pool
+    /// `static_headers` config (so `mcp_oauth::connection_manager`, the
+    /// only path that touches the pool, is never reached either). Same lazy-fake-pool
     /// pattern `anthropic::tools`' own tests already use for the same
     /// reason. OAuth-touching behavior gets its own `#[sqlx::test]`s in
     /// `mcp_oauth.rs`.
@@ -1127,5 +1103,379 @@ mod tests {
             attempts.load(Ordering::SeqCst) > after_first,
             "the status check should make a fresh attempt"
         );
+    }
+
+    /// SME-113: an MCP server over real HTTP that checks bearer tokens, and
+    /// the OAuth provider that issues them, in one Axum app. The MCP side
+    /// answers `initialize`, `tools/list` and `tools/call` with plain JSON
+    /// (Streamable HTTP's JSON response mode) and 401s, with a
+    /// `WWW-Authenticate` challenge as GitHub and Linear send, any token it
+    /// doesn't currently accept. The provider side is rmcp's legacy
+    /// endpoints at the root (`/token`, `/register`; no metadata), and
+    /// rotates refresh tokens the way GitHub does: a refresh kills the old
+    /// refresh token and every access token issued before it.
+    mod oauth_http {
+        use super::*;
+
+        use std::collections::HashSet;
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::AtomicU32;
+
+        use axum::extract::{Form, State};
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::post;
+
+        #[derive(Default)]
+        struct Tokens {
+            accepted: HashSet<String>,
+            live_refresh: HashSet<String>,
+            issued: u32,
+        }
+
+        pub struct Mock {
+            pub mcp_url: String,
+            tokens: StdMutex<Tokens>,
+            /// `grant_type=refresh_token` requests answered with a token.
+            pub refreshes: AtomicU32,
+            /// `initialize` requests that got past the token check.
+            pub initializes: AtomicU32,
+            registered: AtomicU32,
+            /// Answer every refresh with `invalid_grant`, as a provider
+            /// does for a revoked or expired refresh token.
+            pub reject_refreshes: AtomicBool,
+            /// A pre-registered client's `(client_id, client_secret)`: a
+            /// refresh that doesn't authenticate with it is refused, as
+            /// GitHub refuses one without `client_secret`.
+            pub required_secret: StdMutex<Option<(String, String)>>,
+            /// The `client_id` each refresh request named.
+            pub refresh_client_ids: StdMutex<Vec<String>>,
+            /// When set, a refresh waits for a permit before answering.
+            pub refresh_gate: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
+        }
+
+        impl Mock {
+            /// Issues a new access/refresh token pair the MCP side accepts.
+            pub fn issue(&self) -> (String, String) {
+                let mut tokens = self.tokens.lock().unwrap();
+                tokens.issued += 1;
+                let n = tokens.issued;
+                let pair = (format!("access-{n}"), format!("refresh-{n}"));
+                tokens.accepted.insert(pair.0.clone());
+                tokens.live_refresh.insert(pair.1.clone());
+                pair
+            }
+
+            /// The MCP side stops accepting `token`, as for a token the
+            /// user revoked or that expired at the provider.
+            pub fn revoke(&self, token: &str) {
+                self.tokens.lock().unwrap().accepted.remove(token);
+            }
+
+            fn accepts(&self, token: &str) -> bool {
+                self.tokens.lock().unwrap().accepted.contains(token)
+            }
+
+            pub fn refresh_count(&self) -> u32 {
+                self.refreshes.load(Ordering::SeqCst)
+            }
+
+            pub fn initialize_count(&self) -> u32 {
+                self.initializes.load(Ordering::SeqCst)
+            }
+        }
+
+        fn unauthorized() -> Response {
+            (
+                StatusCode::UNAUTHORIZED,
+                [("www-authenticate", "Bearer error=\"invalid_token\"")],
+            )
+                .into_response()
+        }
+
+        fn bearer(headers: &HeaderMap) -> Option<String> {
+            headers
+                .get("authorization")?
+                .to_str()
+                .ok()?
+                .strip_prefix("Bearer ")
+                .map(str::to_string)
+        }
+
+        async fn mcp_handler(
+            State(mock): State<Arc<Mock>>,
+            headers: HeaderMap,
+            axum::Json(request): axum::Json<serde_json::Value>,
+        ) -> Response {
+            let Some(token) = bearer(&headers).filter(|t| mock.accepts(t)) else {
+                return unauthorized();
+            };
+            let Some(id) = request.get("id").cloned() else {
+                // A notification (`notifications/initialized`).
+                return StatusCode::ACCEPTED.into_response();
+            };
+            let result = match request["method"].as_str() {
+                Some("initialize") => {
+                    mock.initializes.fetch_add(1, Ordering::SeqCst);
+                    serde_json::json!({
+                        "protocolVersion": request["params"]["protocolVersion"],
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "mock", "version": "0"},
+                    })
+                }
+                Some("tools/list") => serde_json::json!({"tools": [
+                    {"name": "echo", "description": "Echoes", "inputSchema": {"type": "object"}}
+                ]}),
+                Some("tools/call") => serde_json::json!({
+                    "content": [{"type": "text", "text": format!("called with {token}")}],
+                    "isError": false,
+                }),
+                _ => {
+                    return axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32601, "message": "method not found"},
+                    }))
+                    .into_response();
+                }
+            };
+            axum::Json(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
+        }
+
+        fn token_error(status: StatusCode, error: &str) -> Response {
+            (status, axum::Json(serde_json::json!({"error": error}))).into_response()
+        }
+
+        /// RFC 6749 §2.3.1's HTTP Basic client authentication, as oauth2
+        /// sends it: each part form-urlencoded, then base64.
+        fn basic_auth(client_id: &str, secret: &str) -> String {
+            let encode = |s: &str| -> String {
+                percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).collect()
+            };
+            let raw = format!("{}:{}", encode(client_id), encode(secret));
+            const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            for chunk in raw.as_bytes().chunks(3) {
+                let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+                let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+                for i in 0..4 {
+                    if i <= chunk.len() {
+                        out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+                    } else {
+                        out.push('=');
+                    }
+                }
+            }
+            format!("Basic {out}")
+        }
+
+        async fn token_handler(
+            State(mock): State<Arc<Mock>>,
+            headers: HeaderMap,
+            Form(form): Form<HashMap<String, String>>,
+        ) -> Response {
+            if form.get("grant_type").map(String::as_str) == Some("refresh_token") {
+                let gate = mock.refresh_gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    let _permit = gate.acquire().await;
+                }
+                if let Some(client_id) = form.get("client_id") {
+                    mock.refresh_client_ids.lock().unwrap().push(client_id.clone());
+                }
+                let required = mock.required_secret.lock().unwrap().clone();
+                if let Some((client_id, secret)) = required {
+                    let header_ok = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        == Some(basic_auth(&client_id, &secret).as_str());
+                    let body_ok = form.get("client_secret") == Some(&secret);
+                    if !header_ok && !body_ok {
+                        return token_error(StatusCode::UNAUTHORIZED, "invalid_client");
+                    }
+                }
+                if mock.reject_refreshes.load(Ordering::SeqCst) {
+                    return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
+                }
+                let presented = form.get("refresh_token").cloned().unwrap_or_default();
+                {
+                    let mut tokens = mock.tokens.lock().unwrap();
+                    if !tokens.live_refresh.remove(&presented) {
+                        return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
+                    }
+                    tokens.accepted.clear();
+                }
+                mock.refreshes.fetch_add(1, Ordering::SeqCst);
+            }
+            let (access, refresh) = mock.issue();
+            axum::Json(serde_json::json!({
+                "access_token": access,
+                "token_type": "bearer",
+                "expires_in": 3600,
+                "refresh_token": refresh,
+            }))
+            .into_response()
+        }
+
+        async fn register_handler(State(mock): State<Arc<Mock>>) -> axum::Json<serde_json::Value> {
+            let n = mock.registered.fetch_add(1, Ordering::SeqCst) + 1;
+            axum::Json(serde_json::json!({"client_id": format!("client-{n}"), "redirect_uris": []}))
+        }
+
+        pub async fn spawn() -> Arc<Mock> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+            let addr = listener.local_addr().expect("mock addr");
+            let mock = Arc::new(Mock {
+                mcp_url: format!("http://{addr}/mcp"),
+                tokens: StdMutex::default(),
+                refreshes: AtomicU32::new(0),
+                initializes: AtomicU32::new(0),
+                registered: AtomicU32::new(0),
+                reject_refreshes: AtomicBool::new(false),
+                required_secret: StdMutex::new(None),
+                refresh_client_ids: StdMutex::new(Vec::new()),
+                refresh_gate: StdMutex::new(None),
+            });
+            let app = axum::Router::new()
+                .route("/mcp", post(mcp_handler))
+                .route("/token", post(token_handler))
+                .route("/register", post(register_handler))
+                .with_state(mock.clone());
+            tokio::spawn(async move { axum::serve(listener, app).await.expect("mock server") });
+            mock
+        }
+
+        /// An `oauth` server row pointing at `mock`, with an id of its own:
+        /// `REGISTRY` and the other maps are shared by every test in the
+        /// process, while each `#[sqlx::test]` database numbers rows from 1.
+        pub async fn create_server(
+            pool: &sqlx::PgPool,
+            mock: &Mock,
+            client: Option<(&str, &str)>,
+        ) -> McpServerConfig {
+            static NEXT_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(20_000_000);
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            sqlx::query(&format!("ALTER TABLE mcp_servers ALTER COLUMN id RESTART WITH {id}"))
+                .execute(pool)
+                .await
+                .expect("set the next mcp_servers id");
+            crate::db::create_mcp_server_config(
+                pool,
+                &format!("oauth-http-{id}"),
+                &mock.mcp_url,
+                &HashMap::new(),
+                "oauth",
+                client.map(|c| c.0),
+                client.map(|c| c.1),
+            )
+            .await
+            .expect("create mcp server config")
+        }
+
+        /// Saves a grant `mock` just issued, as a completed Connect would,
+        /// and returns its access token.
+        pub async fn save_grant(pool: &sqlx::PgPool, server_id: i64, mock: &Mock, client_id: &str) -> String {
+            let (access, refresh) = mock.issue();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs();
+            let credentials = serde_json::json!({
+                "client_id": client_id,
+                "token_response": {
+                    "access_token": access,
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                    "refresh_token": refresh,
+                },
+                "granted_scopes": [],
+                "token_received_at": now,
+            });
+            crate::db::set_mcp_server_oauth_credentials(pool, server_id, Some(credentials))
+                .await
+                .expect("save grant");
+            access
+        }
+
+        /// Moves the stored token's receipt back two hours, past its
+        /// hour-long `expires_in`: an expired token without a sleep.
+        pub async fn age_token(pool: &sqlx::PgPool, server_id: i64) {
+            sqlx::query(
+                "UPDATE mcp_servers SET oauth_credentials = jsonb_set(oauth_credentials, '{token_received_at}', \
+                 to_jsonb((oauth_credentials->>'token_received_at')::bigint - 7200)) WHERE id = $1",
+            )
+            .bind(server_id)
+            .execute(pool)
+            .await
+            .expect("age token");
+        }
+
+        pub async fn config(pool: &sqlx::PgPool, server_id: i64) -> McpServerConfig {
+            crate::db::get_mcp_server_config(pool, server_id)
+                .await
+                .expect("get config")
+                .expect("config exists")
+        }
+    }
+
+    /// SME-113, the bug as reported: a cached connection kept the token it
+    /// was opened with, so once that token expired the status still said
+    /// Connected and every tool call failed with a 401.
+    #[sqlx::test]
+    async fn test_a_tool_call_after_the_token_expires_uses_a_refreshed_token(pool: sqlx::PgPool) {
+        let mock = oauth_http::spawn().await;
+        let server = oauth_http::create_server(&pool, &mock, None).await;
+        let first = oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+        let config = oauth_http::config(&pool, server.id).await;
+        assert_eq!(
+            connection_check(&pool, &config).await.expect("connects with the first token"),
+            vec!["echo".to_string()]
+        );
+
+        mock.revoke(&first);
+        oauth_http::age_token(&pool, server.id).await;
+        let result = call_tool(&pool, &config, "echo", serde_json::json!({})).await;
+
+        assert_eq!(result, Ok("called with access-2".to_string()));
+        assert_eq!(mock.refresh_count(), 1);
+        evict(server.id).await;
+    }
+
+    /// SME-113: a token the provider stopped accepting before its expiry
+    /// (revoked, or a clock out by more than the refresh margin) is
+    /// refreshed once and the request retried.
+    #[sqlx::test]
+    async fn test_a_rejected_token_that_has_not_expired_is_refreshed_and_retried(pool: sqlx::PgPool) {
+        let mock = oauth_http::spawn().await;
+        let server = oauth_http::create_server(&pool, &mock, None).await;
+        let first = oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+        let config = oauth_http::config(&pool, server.id).await;
+        connection_check(&pool, &config).await.expect("connects with the first token");
+
+        mock.revoke(&first);
+        let result = call_tool(&pool, &config, "echo", serde_json::json!({})).await;
+
+        assert_eq!(result, Ok("called with access-2".to_string()));
+        assert_eq!(mock.refresh_count(), 1, "exactly one refresh");
+        evict(server.id).await;
+    }
+
+    /// SME-113: a refreshed grant is saved, so after a restart (nothing in
+    /// memory) the next connect uses it rather than refreshing again with
+    /// a refresh token the provider has already retired.
+    #[sqlx::test]
+    async fn test_a_refreshed_grant_survives_a_restart_without_another_refresh(pool: sqlx::PgPool) {
+        let mock = oauth_http::spawn().await;
+        let server = oauth_http::create_server(&pool, &mock, None).await;
+        oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+        oauth_http::age_token(&pool, server.id).await;
+        let config = oauth_http::config(&pool, server.id).await;
+        connection_check(&pool, &config).await.expect("connects after a refresh");
+        assert_eq!(mock.refresh_count(), 1);
+
+        evict(server.id).await;
+        let result = call_tool(&pool, &config, "echo", serde_json::json!({})).await;
+
+        assert_eq!(result, Ok("called with access-2".to_string()));
+        assert_eq!(mock.refresh_count(), 1, "the saved token was used, not refreshed again");
+        evict(server.id).await;
     }
 }
