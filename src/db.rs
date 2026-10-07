@@ -1223,6 +1223,37 @@ pub async fn set_git_identity(
     Ok(())
 }
 
+// --- This database's identity in the cluster (SME-115) ---
+
+/// Which database a cluster object belongs to. Every smelt server shares
+/// the sandbox namespace, and its objects are named after this database's
+/// ids, so each one is labelled `smelt/instance=<id>` and a server only
+/// deletes, reuses, mounts or watches objects carrying its own id.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SmeltInstance {
+    /// A UUID, made when the database was migrated.
+    pub id: String,
+    /// Whether this database owns the objects made before SME-115, which
+    /// carry no instance label: true only for a database that already had
+    /// conversations or volumes when it migrated (the dev and production
+    /// databases), fixed then. Only such a database adopts them.
+    pub owns_unlabelled: bool,
+}
+
+/// The migration that made `smelt_instance` (its version).
+#[cfg(test)]
+const SMELT_INSTANCE_MIGRATION: i64 = 20261007200000;
+
+/// This database's `smelt_instance` row.
+#[cfg_attr(not(test), expect(dead_code, reason = "the sandbox reads it from SME-115's next commit"))]
+pub async fn smelt_instance(pool: &PgPool) -> Result<SmeltInstance, sqlx::Error> {
+    let (id, owns_unlabelled): (String, bool) =
+        sqlx::query_as("SELECT instance_id::text, owns_unlabelled FROM smelt_instance")
+            .fetch_one(pool)
+            .await?;
+    Ok(SmeltInstance { id, owns_unlabelled })
+}
+
 // --- A conversation's git repos (SME-32) ---
 
 #[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
@@ -4645,6 +4676,52 @@ mod tests {
         );
         assert_eq!(list_provider_models(&pool, provider.id).await.expect("list"), vec![row]);
     }
+
+    /// SME-115: an empty database (a scratch, test or fresh one) migrates
+    /// to an instance of its own that owns no unlabelled cluster object.
+    #[sqlx::test]
+    async fn test_an_empty_database_gets_an_instance_that_owns_nothing_unlabelled(pool: PgPool) {
+        let instance = smelt_instance(&pool).await.expect("the instance row");
+        assert_eq!(instance.id.len(), 36, "a UUID: {:?}", instance.id);
+        assert!(!instance.owns_unlabelled, "an empty database must never adopt another's objects");
+        assert_eq!(smelt_instance(&pool).await.expect("read again"), instance, "fixed once made");
+    }
+
+    /// SME-115: a database that already had conversations when it
+    /// migrated (the dev database) owns the objects made before the fix.
+    #[sqlx::test(migrations = false)]
+    async fn test_a_database_with_conversations_before_the_migration_owns_unlabelled_objects(pool: PgPool) {
+        let all = sqlx::migrate!();
+        let before = sqlx::migrate::Migrator {
+            migrations: std::borrow::Cow::Owned(
+                all.iter().filter(|m| m.version < SMELT_INSTANCE_MIGRATION).cloned().collect(),
+            ),
+            ..sqlx::migrate!()
+        };
+        assert!(before.iter().count() < all.iter().count(), "the instance migration is in the set");
+        before.run(&pool).await.expect("migrate up to the instance migration");
+        create_conversation(&pool).await.expect("a conversation from before the fix");
+        all.run(&pool).await.expect("the rest of the migrations");
+
+        let instance = smelt_instance(&pool).await.expect("the instance row");
+        assert!(instance.owns_unlabelled);
+        assert_eq!(instance.id.len(), 36, "a UUID: {:?}", instance.id);
+    }
+
+    /// One instance per database: the table takes no second row.
+    #[sqlx::test]
+    async fn test_the_instance_table_holds_one_row(pool: PgPool) {
+        smelt_instance(&pool).await.expect("the instance row");
+        let second = sqlx::query("INSERT INTO smelt_instance (owns_unlabelled) VALUES (false)")
+            .execute(&pool)
+            .await;
+        let refused = second.expect_err("a second instance row was accepted");
+        assert!(
+            refused.as_database_error().is_some_and(|d| d.is_unique_violation()),
+            "refused for the wrong reason: {refused}"
+        );
+    }
+
 
     /// SME-99: the browser tier's ids start clear of every other run's,
     /// for each table whose ids name cluster objects.
