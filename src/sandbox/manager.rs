@@ -803,14 +803,15 @@ pub(super) async fn delete_volume_claim(client: &kube::Client, id: i64, instance
         return Ok(());
     };
     match (ownership(&claim.metadata, instance), claim.metadata.uid) {
-        (Ownership::Ours, uid) => {
+        (Ownership::Ours, Some(uid)) => {
             let params = DeleteParams {
-                preconditions: Some(kube::api::Preconditions { uid, resource_version: None }),
+                preconditions: Some(kube::api::Preconditions { uid: Some(uid), resource_version: None }),
                 ..Default::default()
             };
             match pvcs.delete(&name, &params).await {
                 Ok(_) => Ok(()),
-                Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+                // Gone, or replaced since it was read: not ours to delete.
+                Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => Ok(()),
                 Err(e) => Err(e.into()),
             }
         }
