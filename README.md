@@ -67,6 +67,8 @@ smelt is one server binary plus a web bundle. Alongside it, it needs:
 
 smelt has **no login**. Anyone who can reach it can use your model keys and run commands in your sandboxes. And because the Docker sidecar is privileged, those commands can reach root on the sandbox's node. Keep smelt behind something that authenticates, such as a VPN or an authenticating proxy, and the preview host names with it. And make that the only way in: smelt listens on every interface (`0.0.0.0:$PORT`, and previews on `0.0.0.0:8181` by default). So firewall `PORT`, and either firewall the preview port or set `SMELT_PREVIEW_ADDR=127.0.0.1:8181`. [docs/setup.md](docs/setup.md#docker-in-the-sandbox) has the details. Model provider keys and the git SSH private key are stored in plain text in Postgres for now, so protect the database and its backups the same way.
 
+The model is a risk too, not only outsiders. It runs whatever it decides to in its sandbox, and a web page, repo or tool result it reads can talk it into something. Anything it runs can become root on the k3s node. Sandboxes have unrestricted network access (smelt's private-address guard covers only its own `webfetch` and `http_request`, not a command in a terminal). And every sandbox can read the git SSH private key. So give the k3s cluster a machine or VM of its own, away from smelt's database and anything else you care about. And use a deploy key or a low-privilege account's key, not your main account's.
+
 ### Trying it locally
 
 [docker-compose.yml](docker-compose.yml) brings up a dev stack: Postgres, a k3s cluster with the RBAC already applied, a Docker daemon, and a container to build and run smelt in.
