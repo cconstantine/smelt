@@ -195,16 +195,18 @@ impl ChatTemplateKwargs {
     }
 }
 
-/// `{"type": "adaptive"}` — the model manages its own thinking budget
-/// within `max_tokens` rather than a caller-specified `budget_tokens`
-/// (deprecated on current models). The only variant smelt sends; kept as
-/// an enum rather than a bare string so an unsupported value can't be
-/// constructed by mistake.
+/// `thinking`: `{"type": "adaptive"}`, the model managing its own thinking
+/// within `max_tokens`, for every kind but llama.cpp; Anthropic refuses
+/// `budget_tokens` on current models. `{"type": "enabled", "budget_tokens":
+/// N}` for llama.cpp only, which forces the end of thinking at N tokens
+/// (SME-111). An enum rather than a bare string so an unsupported value
+/// can't be constructed by mistake.
 #[cfg(feature = "server")]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThinkingConfig {
     Adaptive,
+    Enabled { budget_tokens: u32 },
 }
 
 #[cfg(feature = "server")]
@@ -378,6 +380,14 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ThinkingConfig::Adaptive).unwrap(),
             serde_json::json!({"type": "adaptive"})
+        );
+    }
+
+    #[test]
+    fn test_an_enabled_thinking_budget_wire_shape() {
+        assert_eq!(
+            serde_json::to_value(ThinkingConfig::Enabled { budget_tokens: 98_304 }).unwrap(),
+            serde_json::json!({"type": "enabled", "budget_tokens": 98_304})
         );
     }
 

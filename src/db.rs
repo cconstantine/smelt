@@ -2191,6 +2191,8 @@ pub struct ProviderModelRow {
     pub max_output: Option<i32>,
     /// The provider's cap on a reply, as last reported.
     pub reported_max_output: Option<i32>,
+    /// The user's cap on a reply's thinking, llama.cpp only (SME-111).
+    pub reasoning_budget: Option<i32>,
     /// Added on the provider's page as a model its listing doesn't show,
     /// so it's shown even when the listing works and lacks it.
     pub added_by_hand: bool,
@@ -2246,12 +2248,13 @@ pub async fn set_provider_model_overrides(
     context_window: Option<i32>,
     effort: Option<&str>,
     max_output: Option<i32>,
+    reasoning_budget: Option<i32>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO provider_models (provider_id, model, thinking, context_window, effort, max_output)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        "INSERT INTO provider_models (provider_id, model, thinking, context_window, effort, max_output, reasoning_budget)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (provider_id, model) DO UPDATE
-         SET thinking = $3, context_window = $4, effort = $5, max_output = $6",
+         SET thinking = $3, context_window = $4, effort = $5, max_output = $6, reasoning_budget = $7",
     )
     .bind(provider_id)
     .bind(model)
@@ -2259,6 +2262,7 @@ pub async fn set_provider_model_overrides(
     .bind(context_window)
     .bind(effort)
     .bind(max_output)
+    .bind(reasoning_budget)
     .execute(pool)
     .await?;
     Ok(())
@@ -4660,7 +4664,7 @@ mod tests {
     async fn test_model_overrides_and_reported_details_leave_each_other_alone(pool: PgPool) {
         let provider = test_provider(&pool, "p").await;
         set_provider_model_reported(&pool, provider.id, "m", Some(4096), Some(false), Some(true), Some(1024)).await.expect("reported");
-        set_provider_model_overrides(&pool, provider.id, "m", Some(true), Some(32_768), None, Some(2048)).await.expect("overrides");
+        set_provider_model_overrides(&pool, provider.id, "m", Some(true), Some(32_768), None, Some(2048), Some(1024)).await.expect("overrides");
         set_provider_model_reported(&pool, provider.id, "m", Some(8192), None, Some(true), Some(4096)).await.expect("reported");
 
         let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
@@ -4677,6 +4681,7 @@ mod tests {
                 effort: None,
                 max_output: Some(2048),
                 reported_max_output: Some(4096),
+                reasoning_budget: Some(1024),
                 added_by_hand: false,
             }
         );

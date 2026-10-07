@@ -445,7 +445,8 @@ pub(super) fn run_turn_body<'a>(
                 messages: history,
                 stream: true,
                 tools: anthropic::tools::tool_definitions(pool).await,
-                thinking: turn_model.thinking.then_some(anthropic::ThinkingConfig::Adaptive),
+                // Set below, with the reply budget it's a share of.
+                thinking: None,
                 prompt_caching: turn_model.prompt_caching,
                 output_config: turn_model.effort.map(|effort| anthropic::OutputConfig { effort }),
                 chat_template_kwargs: turn_model.chat_template_kwargs(turn_model.thinking),
@@ -457,6 +458,7 @@ pub(super) fn run_turn_body<'a>(
             let projected = projected_input(last_known_usage.as_ref(), estimate_tokens(&pending_new_content))
                 .unwrap_or_else(|| estimate_request_tokens(&request));
             request.max_tokens = reply_budget(turn_model.context_window, projected, turn_model.output_cap);
+            request.thinking = turn_model.thinking_config(request.max_tokens);
 
             // Every tab watching streams the reply: the text so far is kept
             // for a tab that connects mid-reply, and each delta published.

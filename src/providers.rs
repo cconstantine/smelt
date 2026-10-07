@@ -277,6 +277,8 @@ pub struct ModelInfo {
     pub effort_override: Option<crate::anthropic::Effort>,
     /// The user's cap on a reply, if set (SME-111).
     pub max_output_override: Option<u32>,
+    /// The user's cap on a reply's thinking, if set (SME-111).
+    pub reasoning_budget_override: Option<u32>,
     /// What the provider reported, if it did.
     pub reported_context_window: Option<u32>,
     pub reported_tools: Option<bool>,
@@ -301,6 +303,8 @@ pub struct ModelSettings {
     pub effort: Option<crate::anthropic::Effort>,
     /// "Max reply tokens" (SME-111).
     pub max_output: Option<u32>,
+    /// "Reasoning budget", llama.cpp only (SME-111).
+    pub reasoning_budget: Option<u32>,
 }
 
 /// A provider's models: the listing merged with every model that has
@@ -390,6 +394,8 @@ mod server {
         /// The most a reply may be, if anything caps it besides the
         /// window (SME-111).
         pub output_cap: Option<u32>,
+        /// The user's cap on a reply's thinking (SME-111).
+        pub reasoning_cap: Option<u32>,
         /// For a llama.cpp provider, the chat template's settings it sends
         /// (SME-111).
         pub template: Option<TemplateSettings>,
@@ -408,7 +414,42 @@ mod server {
         pub preserve_thinking: Option<bool>,
     }
 
+    /// A reply's share of its budget that thinking may take by default
+    /// (SME-111): three quarters, leaving at least `MIN_ANSWER_TOKENS`.
+    pub const REASONING_SHARE: (u32, u32) = (3, 4);
+
+    /// What a reply keeps for its answer and any tool call, at least.
+    pub const MIN_ANSWER_TOKENS: u32 = 4_096;
+
+    /// How many of a `reply_budget` thinking may use: `REASONING_SHARE`
+    /// of it, leaving `MIN_ANSWER_TOKENS`, capped by the user's `cap`.
+    pub fn reasoning_budget(reply_budget: u32, cap: Option<u32>) -> u32 {
+        let (share, of) = REASONING_SHARE;
+        let automatic = (u64::from(reply_budget) * u64::from(share) / u64::from(of)) as u32;
+        let budget = automatic.min(reply_budget.saturating_sub(MIN_ANSWER_TOKENS));
+        cap.map_or(budget, |cap| budget.min(cap))
+    }
+
     impl TurnModel {
+        /// The `thinking` a request to this model with `reply_budget`
+        /// carries: none with thinking off, a budget for llama.cpp, which
+        /// enforces it, and adaptive for the rest. Anthropic refuses a
+        /// budget on current models, Ollama doesn't enforce one, and Other
+        /// may be a gateway in front of Claude.
+        pub fn thinking_config(&self, reply_budget: u32) -> Option<crate::anthropic::ThinkingConfig> {
+            if !self.thinking {
+                return None;
+            }
+            Some(match self.kind {
+                ProviderKind::LlamaCpp => crate::anthropic::ThinkingConfig::Enabled {
+                    budget_tokens: reasoning_budget(reply_budget, self.reasoning_cap),
+                },
+                ProviderKind::Anthropic | ProviderKind::Ollama | ProviderKind::Other => {
+                    crate::anthropic::ThinkingConfig::Adaptive
+                }
+            })
+        }
+
         /// The `chat_template_kwargs` a request to this model carries, with
         /// thinking on or off: `None` but for a llama.cpp provider, and
         /// when there's nothing to send.
@@ -516,6 +557,7 @@ mod server {
             context_window_override: row.and_then(|r| positive(r.context_window)),
             effort_override: row.and_then(|r| r.effort.as_deref()).and_then(crate::anthropic::Effort::parse),
             max_output_override: row.and_then(|r| positive(r.max_output)),
+            reasoning_budget_override: row.and_then(|r| positive(r.reasoning_budget)),
             reported_context_window: row.and_then(|r| positive(r.reported_context_window)),
             reported_tools: row.and_then(|r| r.reported_tools),
             thinking: thinking(row),
@@ -658,6 +700,7 @@ mod server {
                 .flatten(),
             template: (kind == ProviderKind::LlamaCpp).then(|| template_settings(&provider, settings.as_ref())),
             output_cap: output_cap(kind, settings.as_ref()),
+            reasoning_cap: settings.as_ref().and_then(|r| positive(r.reasoning_budget)),
             kind,
             thinking: thinking(settings.as_ref()),
             context_window: context_window(&model, settings.as_ref()).0,
@@ -913,6 +956,7 @@ mod server {
                         || row.context_window.is_some()
                         || row.effort.is_some()
                         || row.max_output.is_some()
+                        || row.reasoning_budget.is_some()
                 })
                 .map(|row| model_info(kind, row.model.clone(), None, Some(&row), None)),
         );
@@ -1025,6 +1069,11 @@ mod server {
             1024,
             "Max reply tokens is a number of tokens, at least 1024.",
         )?;
+        let reasoning_budget = token_count(
+            settings.reasoning_budget,
+            1,
+            "A reasoning budget is a number of tokens, at least 1.",
+        )?;
         db::set_provider_model_overrides(
             pool,
             provider_id,
@@ -1033,6 +1082,7 @@ mod server {
             context_window,
             settings.effort.map(|e| e.as_str()),
             max_output,
+            reasoning_budget,
         )
         .await
         .map_err(provider_gone)?;
@@ -1254,6 +1304,7 @@ mod tests {
                 effort: None,
                 max_output: None,
                 reported_max_output: None,
+                reasoning_budget: None,
                 added_by_hand: false,
             }
         }
@@ -1367,7 +1418,7 @@ mod tests {
             let conversation = db::create_conversation_with_id(&pool, 9_172_000_001).await.expect("conversation");
             let bearer = provider(&pool, "gateway", "bearer").await;
             db::set_default_model(&pool, bearer.id, "m1").await.expect("default");
-            db::set_provider_model_overrides(&pool, bearer.id, "m1", Some(false), Some(64_000), None, None)
+            db::set_provider_model_overrides(&pool, bearer.id, "m1", Some(false), Some(64_000), None, None, None)
                 .await
                 .expect("overrides");
             let mut events = crate::events::subscribe(conversation.id);
@@ -1390,6 +1441,7 @@ mod tests {
                     kind: ProviderKind::Ollama,
                     template: None,
                     output_cap: None,
+                    reasoning_cap: None,
                     context_window: 64_000,
                     thinking_stripped_through: None,
                 }
@@ -1587,8 +1639,37 @@ mod tests {
                 kind: ProviderKind::LlamaCpp,
                 template,
                 output_cap: None,
+                reasoning_cap: None,
                 context_window: 262_144,
                 thinking_stripped_through: None,
+            }
+        }
+
+        /// SME-111: thinking may take three quarters of the reply budget,
+        /// leaving 4,096 for the answer, and no more than the user's cap.
+        #[test]
+        fn test_the_reasoning_budget_leaves_room_to_answer() {
+            assert_eq!(reasoning_budget(131_072, None), 98_304, "three quarters");
+            assert_eq!(reasoning_budget(131_072, Some(20_000)), 20_000, "the user's cap");
+            assert_eq!(reasoning_budget(131_072, Some(200_000)), 98_304, "a cap above it changes nothing");
+            assert_eq!(reasoning_budget(12_000, None), 7_904, "4,096 left to answer");
+            assert_eq!(reasoning_budget(2_048, None), 0, "too small to think in");
+        }
+
+        /// SME-111: only llama.cpp is sent a budget; with thinking off,
+        /// nothing.
+        #[test]
+        fn test_only_llama_cpp_is_sent_a_thinking_budget() {
+            use crate::anthropic::ThinkingConfig;
+            let llama = TurnModel { reasoning_cap: Some(50_000), ..llama_turn_model(None) };
+            assert_eq!(llama.thinking_config(131_072), Some(ThinkingConfig::Enabled { budget_tokens: 50_000 }));
+            assert_eq!(TurnModel { thinking: false, ..llama.clone() }.thinking_config(131_072), None);
+            for kind in [ProviderKind::Anthropic, ProviderKind::Ollama, ProviderKind::Other] {
+                assert_eq!(
+                    TurnModel { kind, ..llama.clone() }.thinking_config(131_072),
+                    Some(ThinkingConfig::Adaptive),
+                    "{kind:?}"
+                );
             }
         }
 
@@ -1749,6 +1830,12 @@ mod tests {
             set_model_settings(&pool, p.id, "m", reply(65_536)).await.expect("set");
             let row = db::get_provider_model(&pool, p.id, "m").await.expect("get").expect("exists");
             assert_eq!((row.max_output, row.context_window), (Some(65_536), None), "every setting saved together");
+            let thinking = |reasoning_budget| ModelSettings { reasoning_budget: Some(reasoning_budget), ..Default::default() };
+            assert!(set_model_settings(&pool, p.id, "m", thinking(0)).await.is_err(), "zero");
+            set_model_settings(&pool, p.id, "m", thinking(20_000)).await.expect("set");
+            let row = db::get_provider_model(&pool, p.id, "m").await.expect("get").expect("exists");
+            assert_eq!(row.reasoning_budget, Some(20_000));
+            assert_eq!(model_info(ProviderKind::LlamaCpp, "m".to_string(), None, Some(&row), None).reasoning_budget_override, Some(20_000));
         }
 
         /// An Ollama-shaped mock: `/api/tags` lists two models, `/api/show`

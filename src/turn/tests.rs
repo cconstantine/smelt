@@ -1771,6 +1771,51 @@ async fn test_a_models_max_reply_tokens_caps_its_turns(pool: PgPool) {
     assert_eq!(requests[0]["max_tokens"], 8192);
 }
 
+/// SME-111: a llama.cpp model's turn caps its thinking at three quarters
+/// of the reply budget, or the model's reasoning budget; an Anthropic
+/// one's thinking stays adaptive.
+#[sqlx::test]
+async fn test_a_llama_cpp_turn_sends_a_thinking_budget(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("on Anthropic");
+    sqlx::query("UPDATE inference_providers SET kind = 'llama_cpp'")
+        .execute(&pool)
+        .await
+        .expect("make the mock a llama.cpp server");
+    sqlx::query("INSERT INTO provider_models (provider_id, model, reported_context_window) SELECT id, $1, 262144 FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .execute(&pool)
+        .await
+        .expect("size the mock model");
+    run_turn(&pool, conversation.id, hello()).await.expect("automatic budget");
+    sqlx::query("UPDATE provider_models SET reasoning_budget = 20000")
+        .execute(&pool)
+        .await
+        .expect("cap its reasoning");
+    run_turn(&pool, conversation.id, hello()).await.expect("capped budget");
+    sqlx::query("UPDATE provider_models SET thinking = false")
+        .execute(&pool)
+        .await
+        .expect("thinking off");
+    run_turn(&pool, conversation.id, hello()).await.expect("thinking off");
+
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests[0]["thinking"], serde_json::json!({"type": "adaptive"}));
+    let budget = requests[1]["max_tokens"].as_u64().expect("a number");
+    assert_eq!(
+        requests[1]["thinking"],
+        serde_json::json!({"type": "enabled", "budget_tokens": budget * 3 / 4}),
+        "three quarters of {budget}"
+    );
+    assert_eq!(requests[2]["thinking"], serde_json::json!({"type": "enabled", "budget_tokens": 20000}));
+    assert!(requests[3].get("thinking").is_none(), "{}", requests[3]);
+    assert_eq!(requests[3]["chat_template_kwargs"], serde_json::json!({"enable_thinking": false}));
+}
+
 /// A model on an Anthropic provider that nothing sized keeps the reply
 /// budget every turn had: a Claude model refuses one above its own cap.
 #[sqlx::test]

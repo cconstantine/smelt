@@ -968,6 +968,7 @@ fn ProviderModelRow(id: i64, model: ModelInfo, kind: ProviderKind, efforts: Vec<
     let llama_cpp_efforts = kind == ProviderKind::LlamaCpp;
     let mut window = use_signal(|| model.context_window_override.map(|w| w.to_string()).unwrap_or_default());
     let mut max_output = use_signal(|| model.max_output_override.map(|n| n.to_string()).unwrap_or_default());
+    let mut reasoning = use_signal(|| model.reasoning_budget_override.map(|n| n.to_string()).unwrap_or_default());
     let mut thinking = use_signal(|| model.thinking_override);
     let mut effort = use_signal(|| model.effort_override);
     let mut error: Signal<Option<String>> = use_signal(|| None);
@@ -991,17 +992,24 @@ fn ProviderModelRow(id: i64, model: ModelInfo, kind: ProviderKind, efforts: Vec<
     };
     let save = move |event: Event<FormData>| {
         event.prevent_default();
-        let (context_window, max_output) = match (
+        let (context_window, max_output, reasoning_budget) = match (
             token_field(&window(), "The context window"),
             token_field(&max_output(), "Max reply tokens"),
+            token_field(&reasoning(), "The reasoning budget"),
         ) {
-            (Ok(window), Ok(max_output)) => (window, max_output),
-            (Err(e), _) | (_, Err(e)) => {
+            (Ok(window), Ok(max_output), Ok(reasoning)) => (window, max_output, reasoning),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
                 error.set(Some(e));
                 return;
             }
         };
-        let settings = ModelSettings { thinking: thinking(), context_window, effort: effort(), max_output };
+        let settings = ModelSettings {
+            thinking: thinking(),
+            context_window,
+            effort: effort(),
+            max_output,
+            reasoning_budget,
+        };
         let model_id = model_id.clone();
         spawn(async move {
             match set_model_settings(id, model_id, settings).await {
@@ -1037,6 +1045,18 @@ fn ProviderModelRow(id: i64, model: ModelInfo, kind: ProviderKind, efforts: Vec<
                         max_output.set(e.value());
                         saved.set(false);
                     } }
+            }
+            if kind == ProviderKind::LlamaCpp {
+                label { class: "provider-model-window",
+                    "Reasoning budget "
+                    input { r#type: "text", inputmode: "numeric", placeholder: "automatic", value: "{reasoning}",
+                        aria_label: "Reasoning budget for {model.id}",
+                        title: "The most a reply may spend thinking before llama.cpp makes the model answer. Automatic: three quarters of the reply's budget, leaving at least 4,096 tokens to answer; a number here caps that. At 10 tokens a second, 100,000 tokens is close to three hours.",
+                        oninput: move |e| {
+                            reasoning.set(e.value());
+                            saved.set(false);
+                        } }
+                }
             }
             label { class: "provider-model-thinking",
                 "Thinking "
@@ -1205,6 +1225,7 @@ mod tests {
             context_window_override: None,
             effort_override: None,
             max_output_override: None,
+            reasoning_budget_override: None,
             max_output: None,
             reported_context_window: None,
             reported_tools: tools,
