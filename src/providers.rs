@@ -21,7 +21,8 @@ pub const ASSUMED_CONTEXT_WINDOW: u32 = 200_000;
 /// The reply cap of a model on an Anthropic or Other provider that nothing
 /// sized (SME-111): a Claude model refuses a `max_tokens` above its own
 /// cap, so these keep what every turn asked for before. Ollama and
-/// llama.cpp have no cap of their own; the window bounds them.
+/// llama.cpp have no cap of their own; the window bounds them, once
+/// something sized it (else this too).
 #[cfg(feature = "server")]
 pub const UNKNOWN_OUTPUT_CAP: u32 = 16_384;
 
@@ -535,7 +536,7 @@ mod server {
     /// The cap on a reply to a model on a `kind` provider (SME-111): the
     /// user's, else what the provider reported, else `UNKNOWN_OUTPUT_CAP`
     /// on an Anthropic or Other provider. `None`: only the window caps it.
-    pub fn output_cap(kind: ProviderKind, row: Option<&db::ProviderModelRow>) -> Option<u32> {
+    pub fn output_cap(kind: ProviderKind, model: &str, row: Option<&db::ProviderModelRow>) -> Option<u32> {
         let reported = row.and_then(|r| positive(r.reported_max_output));
         let users = row.and_then(|r| positive(r.max_output)).map(|users| match (kind, reported) {
             // Anthropic refuses a `max_tokens` above the model's own cap,
@@ -545,7 +546,13 @@ mod server {
         });
         users
             .or(reported)
-            .or_else(|| matches!(kind, ProviderKind::Anthropic | ProviderKind::Other).then_some(UNKNOWN_OUTPUT_CAP))
+            .or_else(|| {
+                // A window nothing sized is the assumed 200,000, which
+                // doesn't bound a local server's real one (SME-111 review 1).
+                let window_known = context_window(model, row).1;
+                (matches!(kind, ProviderKind::Anthropic | ProviderKind::Other) || !window_known)
+                    .then_some(UNKNOWN_OUTPUT_CAP)
+            })
     }
 
     /// Whether a turn asks for thinking: the user's override, else what
@@ -573,7 +580,7 @@ mod server {
             reported_context_window: row.and_then(|r| positive(r.reported_context_window)),
             reported_tools: row.and_then(|r| r.reported_tools),
             thinking: thinking(row),
-            max_output: output_cap(kind, row),
+            max_output: output_cap(kind, &id, row),
             context_window,
             context_window_known,
             details_error,
@@ -711,7 +718,7 @@ mod server {
                 .then(|| settings.as_ref().and_then(|r| r.effort.as_deref()).and_then(crate::anthropic::Effort::parse))
                 .flatten(),
             template: (kind == ProviderKind::LlamaCpp).then(|| template_settings(&provider, settings.as_ref())),
-            output_cap: output_cap(kind, settings.as_ref()),
+            output_cap: output_cap(kind, &model, settings.as_ref()),
             reasoning_cap: settings.as_ref().and_then(|r| positive(r.reasoning_budget)),
             kind,
             thinking: thinking(settings.as_ref()),
@@ -1346,21 +1353,26 @@ mod tests {
         /// 16,384 where a Claude model may sit behind the provider.
         #[test]
         fn test_the_output_cap_prefers_the_override_then_the_report_then_the_kinds() {
+            // Sized, as the window is unless a case says otherwise.
             let capped = |max_output, reported_max_output| db::ProviderModelRow {
                 max_output,
                 reported_max_output,
-                ..row(None, None, None, None)
+                ..row(None, None, Some(262_144), None)
             };
-            assert_eq!(output_cap(ProviderKind::Anthropic, Some(&capped(Some(8192), Some(128_000)))), Some(8192));
-            assert_eq!(output_cap(ProviderKind::Anthropic, Some(&capped(None, Some(128_000)))), Some(128_000));
-            assert_eq!(output_cap(ProviderKind::Anthropic, None), Some(UNKNOWN_OUTPUT_CAP));
-            assert_eq!(output_cap(ProviderKind::Other, Some(&capped(Some(0), Some(-1)))), Some(UNKNOWN_OUTPUT_CAP), "not sizes");
-            assert_eq!(output_cap(ProviderKind::LlamaCpp, None), None, "the window bounds it");
-            assert_eq!(output_cap(ProviderKind::Ollama, Some(&capped(None, None))), None);
-            assert_eq!(output_cap(ProviderKind::LlamaCpp, Some(&capped(Some(32_768), None))), Some(32_768));
+            assert_eq!(output_cap(ProviderKind::Anthropic, "m", Some(&capped(Some(8192), Some(128_000)))), Some(8192));
+            assert_eq!(output_cap(ProviderKind::Anthropic, "m", Some(&capped(None, Some(128_000)))), Some(128_000));
+            assert_eq!(output_cap(ProviderKind::Anthropic, "m", None), Some(UNKNOWN_OUTPUT_CAP));
+            assert_eq!(output_cap(ProviderKind::Other, "m", Some(&capped(Some(0), Some(-1)))), Some(UNKNOWN_OUTPUT_CAP), "not sizes");
+            assert_eq!(output_cap(ProviderKind::LlamaCpp, "m", Some(&capped(None, None))), None, "the window bounds it");
+            // SME-111 review 1: a window nothing sized (assumed 200,000)
+            // doesn't bound a local server's real one, so it keeps 16,384.
+            assert_eq!(output_cap(ProviderKind::LlamaCpp, "m", None), Some(UNKNOWN_OUTPUT_CAP));
+            assert_eq!(output_cap(ProviderKind::Ollama, "m", Some(&row(None, None, None, None))), Some(UNKNOWN_OUTPUT_CAP));
+            assert_eq!(output_cap(ProviderKind::Ollama, "m", Some(&capped(None, None))), None);
+            assert_eq!(output_cap(ProviderKind::LlamaCpp, "m", Some(&capped(Some(32_768), None))), Some(32_768));
             // SME-111 review 1: Anthropic refuses more than the model's cap.
-            assert_eq!(output_cap(ProviderKind::Anthropic, Some(&capped(Some(200_000), Some(128_000)))), Some(128_000));
-            assert_eq!(output_cap(ProviderKind::Other, Some(&capped(Some(200_000), Some(128_000)))), Some(200_000), "a gateway's report may not be the model's");
+            assert_eq!(output_cap(ProviderKind::Anthropic, "m", Some(&capped(Some(200_000), Some(128_000)))), Some(128_000));
+            assert_eq!(output_cap(ProviderKind::Other, "m", Some(&capped(Some(200_000), Some(128_000)))), Some(200_000), "a gateway's report may not be the model's");
             let info = model_info(ProviderKind::LlamaCpp, "m".to_string(), None, Some(&capped(Some(32_768), None)), None);
             assert_eq!((info.max_output_override, info.max_output), (Some(32_768), Some(32_768)));
         }
