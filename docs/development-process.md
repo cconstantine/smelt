@@ -81,7 +81,7 @@ For tickets the Project Manager runs, step 4 replaces [Code review](#code-review
 
 ### Code Reviewer
 
-Reviews one PR's diff for bugs, including security gaps, and changes nothing. It reads the PR's branch in the Developer's worktree (or a detached worktree of its own), never the main checkout; any test it runs to reproduce a finding goes under the cluster lock. It checks each finding against the code before reporting it, and reports each with a severity, the file and line, what goes wrong in a concrete case, and a suggested fix. It says which findings it confirmed and which it only suspects.
+Reviews one PR's diff for bugs, including security gaps, and changes nothing. It reads the PR's branch in the Developer's worktree (or a detached worktree of its own), never the main checkout; any test it runs to reproduce a finding goes under the cluster lock. It may use `/code-review <PR number>` to do the review (see [Code review](#code-review-after-opening-the-pr)). It checks each finding against the code before reporting it, and reports each with a severity, the file and line, what goes wrong in a concrete case, and a suggested fix. It says which findings it confirmed and which it only suspects.
 
 ### Integrator
 
@@ -342,7 +342,9 @@ propose first, update after the user agrees.
 
 ## Code review (after opening the PR)
 
-Every PR gets a code review once it's open, while CI runs: `/code-review <PR number>`. It reads the whole diff for bugs, including security gaps, which a project's own tests are poorly placed to find because they were written with the same assumptions as the code.
+Every PR gets a code review once it's open, while CI runs, by a [Code Reviewer](#code-reviewer) sub-agent started on the PR. It reads the whole diff for bugs, including security gaps, which a project's own tests are poorly placed to find because they were written with the same assumptions as the code.
+
+Don't run `/code-review` from the conversation that wrote the change: the skill forks that conversation, and its reviewer then inherits the author's assumptions and context, against the rule that sub-agents start fresh (see [Personas](#personas)). The Code Reviewer may run `/code-review <PR number>` itself, since its fork carries only the Code Reviewer's own brief; it still checks and reports each finding as its persona says. (SME-114)
 
 1. **Check each finding before reporting it.** Confirm it against the code (and, where it's cheap, reproduce it) so the report says which findings are real.
 2. **Report the findings and stop.** Give each one a severity, what goes wrong and a suggested fix, and let the user choose what gets fixed. Fixing changes the PR under review, so it waits for their go-ahead.
