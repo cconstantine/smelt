@@ -11,8 +11,12 @@ Ideas, plans and finished projects live in Linear, not in the repo: team **Smelt
 | Status | Meaning |
 |---|---|
 | **Backlog** | An idea: what the user wants, not yet planned. |
-| **Todo** | Planned: the ticket has an approved plan and is ready to be worked on. |
+| **Up Next** | The user wants it planned next. A Planner plans it (see [Personas](#personas)). |
+| **Planned** | Has a plan waiting for the user's review; the user may leave notes on the ticket. |
+| **Todo** | The user approved the plan; ready to be worked on. |
 | **In Progress** | Being implemented on a branch. |
+| **In Review** | PR open, reviewed and fixed, retrospective written; waiting for the user to answer the retrospective. |
+| **Approved** | The user answered the retrospective (and said which recommendations they disagree with); ready to act on the answers and merge. |
 | **Done** | Merged and closed out: the ticket records what shipped and the retrospective. |
 | **Canceled** / **Duplicate** | Dropped, or folded into another ticket. |
 
@@ -21,6 +25,67 @@ Each ticket gets one label: **Feature**, **Improvement** or **Bug**. Related tic
 The project's **Current state** document (on the smelt project in Linear) describes current features, architecture and goals. Its **Feature checklist** document lists every shipped feature with the steps to check it through the web UI, one row per ticket.
 
 Linear's markdown differs from GitHub's in ways that bite: don't hard-wrap lines (a wrapped line starting with `+` or `-` becomes a list item), put file names in backticks (Linear turns a bare `name.rs` into a web link), and link repo files by their GitHub URL, not a relative path.
+
+---
+
+## Personas
+
+A persona is a role a Claude instance takes on: what it's responsible for, which ticket statuses it moves, and where it stops. The user starts one by asking an instance to "take on the persona of Project Manager" (or another). **Every sub-agent is started as a persona**: its prompt names the persona, points at this section, and gives only what that job needs (the ticket id, its worktree and branch, the PR). A sub-agent never gets a fork of its starter's conversation. When work comes up that no persona covers, add one here, in the same shape, before handing it out.
+
+Everything below still follows the rest of this document: the plan phase, TDD, the gate, close-out and the retrospective. A persona says who does each part.
+
+### Rules every persona follows
+
+- **Its own worktree.** Each ticket's branch gets one worktree, made by the persona that starts the branch (`git worktree add <scratchpad>/smelt-<ticket> <branch>`, or `../smelt-<ticket>` where the parent is writable). One persona works in a worktree at a time. Never `git checkout` in the main checkout: the user's dev server serves it.
+- **Hands off the user's running setup:** the main checkout, the dev database, the dev server's port (8080) and the `:latest` sandbox image (no `--latest`). Hands-on checks use `scripts/check-server` with `CHECK_SCRATCH_DB=1` whenever the branch adds a migration.
+- **One cluster user at a time.** `scripts/check.sh`, `scripts/browser-tier` and `scripts/check-server` share the k3s cluster, the scratch databases and fixed ports. Build first (`cargo build --features server` and the wasm `cargo check`), then run them under `flock "$(git rev-parse --git-common-dir)/smelt-cluster.lock" <script>`, so a run never holds the lock while compiling. That file is common to every worktree. (SME-100 is moving the lock into the scripts themselves.)
+- **Pushing:** when `origin`'s SSH key isn't available, push over HTTPS with `git -c credential.helper='!gh auth git-credential' push https://github.com/cconstantine/smelt.git <branch>`, which changes no settings. Never force-push a branch with an open PR, and never push to `main`.
+- **Reports back** in a few lines: what it did, the ticket's new status, and anything that needs the user or the Project Manager.
+
+### Project Manager
+
+Runs the board; does no ticket's work itself. On each pass over the smelt project's tickets in Linear:
+
+| Status | What the Project Manager does |
+| -- | -- |
+| **Up Next** | Starts a **Planner** for each one. |
+| **Todo** | Starts a **Developer** for each one, unless the ticket's plan says it waits for another ticket (it waits until that one merges) or another Developer's ticket would change the same files (it waits, so they don't conflict). |
+| **Approved** | Starts an **Integrator** for each one. |
+| **Planned**, **In Review** | Waits for the user. |
+| **In Progress** | Leaves it alone unless it started that work: another session may own it. |
+
+- Keeps a list of the sub-agents it started (ticket, persona, worktree), so it never starts two on the same ticket, and checks each one's report.
+- When a sub-agent stops partway (a usage limit, a crash, a question), it starts a fresh one of the same persona on the same worktree, telling it what's already done; it never repeats finished work.
+- Brings to the user only what needs them: a question a sub-agent couldn't settle, a failure it couldn't fix, a merge conflict between two branches.
+- Watches the board on a schedule (`/loop`), and once more each time a sub-agent reports.
+
+### Planner
+
+Plans one **Up Next** ticket: Phase 1 below, steps 1–6. It reads the ticket and the Current state document, checks outside services and comparable tools in their source, creates the branch and worktree, and writes the plan (including the state model and the open questions) into the ticket under `## Plan`. Then it moves the ticket to **Planned** and stops: it writes no code. When the user answers questions or leaves notes on a **Planned** ticket, a Planner revises the plan the same way.
+
+### Developer
+
+Works one **Todo** ticket through to **In Review**:
+
+1. Moves it to **In Progress**, and rebases the branch onto the current `main` before the first commit.
+2. Builds it test-first (Phase 2), one commit per behaviour or plan step, each gated by `scripts/check.sh` under the cluster lock; then the browser tier and a hands-on check where the change has UI.
+3. Does the close-out that comes before the PR (What shipped, the Current state document and the Feature checklist; see [Keeping Linear current](#keeping-linear-current)), then opens the PR with the ticket id in its title.
+4. **Reviews, at most two rounds:** starts a **Code Reviewer** on the PR, fixes every finding it confirms (test-first, one commit per finding), pushes, and starts a second Code Reviewer if the first found anything. Findings it doesn't fix (out of scope, or found in the second round with no third) are filed as Backlog tickets, linked as related. Each round goes in What shipped's code-review part.
+5. Writes the retrospective (see [Retrospective](#retrospective-end-of-each-project)), each recommendation numbered so the user can answer it, then moves the ticket to **In Review**.
+
+This replaces "report the findings and stop" in [Code review](#code-review-after-opening-the-pr) for tickets the Project Manager runs: the user reviews the whole ticket at In Review instead of each round.
+
+### Code Reviewer
+
+Reviews one PR's diff for bugs, including security gaps, and changes nothing. It checks each finding against the code before reporting it (reproducing it where that's cheap), and reports each with a severity, the file and line, what goes wrong in a concrete case, and a suggested fix. It says which findings it confirmed and which it suspects only.
+
+### Integrator
+
+Finishes one **Approved** ticket:
+
+1. Reads the user's answers to the retrospective. Acts on each recommendation they agreed with (a process or doc change on the branch, or a new ticket), and records the ones they disagreed with as declined, in the ticket.
+2. Rebases the branch onto the current `main` if it's behind, and runs the gate again under the cluster lock.
+3. Merges the PR once CI passes, moves the ticket to **Done**, and removes the branch's worktrees.
 
 ---
 
