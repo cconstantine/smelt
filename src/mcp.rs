@@ -587,7 +587,18 @@ async fn check_sign_in(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<
         let client = oauth_client(pool, config)
             .await
             .map_err(CheckError::Unreachable)?;
-        client.get_access_token().await.map_err(|e| match e {
+        // In a task of its own: a refresh the provider has received
+        // rotates its refresh token whether or not anyone waits for the
+        // reply, so the reply must still be saved when this check times
+        // out or its request goes away (review 2).
+        let fetching = tokio::spawn(async move { client.get_access_token().await });
+        let fetched = fetching.await.map_err(|e| {
+            CheckError::Unreachable(format!(
+                "getting an OAuth token for MCP server {:?} failed: {e}",
+                config.name
+            ))
+        })?;
+        fetched.map_err(|e| match e {
             rmcp::transport::auth::AuthError::AuthorizationRequired => {
                 CheckError::SignInExpired(sign_in_expired(config))
             }
@@ -1477,10 +1488,23 @@ mod tests {
             format!("Basic {out}")
         }
 
+        /// A provider finishes a token request it has received even if the
+        /// client hangs up meanwhile (it rotates the refresh token either
+        /// way), so the work runs in a task of its own.
         async fn token_handler(
             State(mock): State<Arc<Mock>>,
             headers: HeaderMap,
             Form(form): Form<HashMap<String, String>>,
+        ) -> Response {
+            tokio::spawn(token_reply(mock, headers, form))
+                .await
+                .expect("token reply task")
+        }
+
+        async fn token_reply(
+            mock: Arc<Mock>,
+            headers: HeaderMap,
+            form: HashMap<String, String>,
         ) -> Response {
             if form.get("grant_type").map(String::as_str) == Some("refresh_token") {
                 if let Some(client_id) = form.get("client_id") {
@@ -1948,6 +1972,31 @@ mod tests {
         let checked = connection_check(&pool, &config).await;
 
         assert!(matches!(&checked, Err(CheckError::SignInExpired(_))), "{checked:?}");
+        evict(server.id).await;
+    }
+
+    /// SME-113 review 2: a status check that gives up while its refresh is
+    /// at the provider mustn't drop the reply. GitHub has rotated the
+    /// refresh token by then, so an unsaved reply loses the sign-in.
+    #[sqlx::test]
+    async fn test_a_status_check_that_times_out_mid_refresh_keeps_the_new_grant(pool: sqlx::PgPool) {
+        let mock = oauth_http::spawn().await;
+        let server = oauth_http::create_server(&pool, &mock, None).await;
+        oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+        oauth_http::age_token(&pool, server.id).await;
+        let config = oauth_http::config(&pool, server.id).await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *mock.refresh_gate.lock().unwrap() = Some(gate.clone());
+
+        let checked = connection_check(&pool, &config).await;
+        assert!(matches!(&checked, Err(CheckError::Unreachable(_))), "the check gives up: {checked:?}");
+        gate.add_permits(1);
+        assert!(wait_until(|| mock.refresh_count() == 1).await, "the provider rotates the token");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        *mock.refresh_gate.lock().unwrap() = None;
+
+        let result = call_tool(&pool, &config, "echo", serde_json::json!({})).await;
+        assert_eq!(result, Ok("called with access-2".to_string()), "the rotated grant was saved");
         evict(server.id).await;
     }
 }
