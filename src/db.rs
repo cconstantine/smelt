@@ -1245,7 +1245,6 @@ pub struct SmeltInstance {
 const SMELT_INSTANCE_MIGRATION: i64 = 20261007200000;
 
 /// This database's `smelt_instance` row.
-#[cfg_attr(not(test), expect(dead_code, reason = "the sandbox reads it from SME-115's next commit"))]
 pub async fn smelt_instance(pool: &PgPool) -> Result<SmeltInstance, sqlx::Error> {
     let (id, owns_unlabelled): (String, bool) =
         sqlx::query_as("SELECT instance_id::text, owns_unlabelled FROM smelt_instance")

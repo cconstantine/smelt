@@ -46,7 +46,9 @@ pub async fn sandbox_ref(pool: &PgPool, client: &kube::Client, conversation_id: 
         .get(&pod_name)
         .await
         .map_err(|e| format!("Couldn't find the sandbox pod: {e}"))?;
+    let instance = crate::db::smelt_instance(pool).await.map_err(|e| e.to_string())?;
     Ok(SandboxRef {
+        instance: instance.id,
         conversation_id,
         pod_id,
         pod_uid: pod.metadata.uid.clone().ok_or("the sandbox pod has no uid")?,

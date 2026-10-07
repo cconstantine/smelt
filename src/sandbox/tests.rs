@@ -54,7 +54,7 @@ fn mount_path_of<'a>(c: &'a Container, volume: &str) -> Option<&'a str> {
 
 #[test]
 fn test_pod_spec_runs_dockerd_in_a_privileged_native_sidecar() {
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[]);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
     let spec = pod.spec.expect("pod should have a spec");
     let docker = container(&spec.init_containers, "docker");
 
@@ -90,7 +90,7 @@ fn test_pod_spec_runs_dockerd_in_a_privileged_native_sidecar() {
 
 #[test]
 fn test_pod_spec_leaves_the_sandbox_container_unprivileged() {
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[]);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
     let spec = pod.spec.expect("pod should have a spec");
     let main = Some(spec.containers);
     let sandbox = container(&main, "sandbox");
@@ -102,7 +102,7 @@ fn test_pod_spec_leaves_the_sandbox_container_unprivileged() {
 
 #[test]
 fn test_pod_spec_shares_workspace_and_socket_but_keeps_docker_data_in_the_sidecar() {
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[]);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
     let spec = pod.spec.expect("pod should have a spec");
     let docker = container(&spec.init_containers, "docker");
     let main = Some(spec.containers.clone());
@@ -145,7 +145,7 @@ fn test_pod_spec_ephemeral_storage_is_empty_dirs() {
         storage: PodStorage::Ephemeral,
         ..docker_for_conversation(42)
     };
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker, &[]);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker, &[], TEST_INSTANCE);
     let volumes = pod.spec.and_then(|s| s.volumes).expect("pod should have volumes");
     for name in ["docker-data", "workspace"] {
         let v = volumes.iter().find(|v| v.name == name).expect(name);
@@ -163,7 +163,7 @@ fn test_pod_spec_mounts_user_volumes_into_both_containers_at_the_same_path() {
         created_at: chrono::Utc::now().naive_utc(),
         updated_at: chrono::Utc::now().naive_utc(),
     }];
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &volumes);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &volumes, TEST_INSTANCE);
     let spec = pod.spec.expect("pod should have a spec");
     let docker = container(&spec.init_containers, "docker");
     let main = Some(spec.containers.clone());
@@ -175,7 +175,7 @@ fn test_pod_spec_mounts_user_volumes_into_both_containers_at_the_same_path() {
 
 #[test]
 fn test_pod_spec_labels_a_pod_with_its_conversation_only_when_it_uses_the_claim() {
-    let labelled = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[]);
+    let labelled = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
     assert_eq!(
         labelled.metadata.labels.as_ref().and_then(|l| l.get(CONVERSATION_LABEL)).map(String::as_str),
         Some("42"),
@@ -185,8 +185,57 @@ fn test_pod_spec_labels_a_pod_with_its_conversation_only_when_it_uses_the_claim(
         storage: PodStorage::Ephemeral,
         ..docker_for_conversation(42)
     };
-    let unlabelled = build_pod_spec("sandbox-1", "1Gi", &ephemeral, &[]);
+    let unlabelled = build_pod_spec("sandbox-1", "1Gi", &ephemeral, &[], TEST_INSTANCE);
     assert!(unlabelled.metadata.labels.and_then(|l| l.get(CONVERSATION_LABEL).cloned()).is_none());
+}
+
+/// SME-115: every object smelt creates says which database it belongs
+/// to, so another smelt server sharing the namespace can leave it alone.
+#[test]
+fn test_every_pod_and_claim_carries_its_instance() {
+    let instance = "0b7f3d1c-3a60-4c1e-9d55-2f0e1c7a9b42";
+    let label = |meta: &ObjectMeta| meta.labels.as_ref().and_then(|l| l.get(INSTANCE_LABEL)).cloned();
+    let ephemeral = DockerSidecar {
+        storage: PodStorage::Ephemeral,
+        ..docker_for_conversation(42)
+    };
+    for docker in [docker_for_conversation(42), ephemeral] {
+        let pod = build_pod_spec("sandbox-1", "1Gi", &docker, &[], instance);
+        assert_eq!(label(&pod.metadata).as_deref(), Some(instance), "a pod on {:?}", docker.storage);
+    }
+    for (_, claim) in conversation_pvc_specs(42, instance) {
+        assert_eq!(label(&claim.metadata).as_deref(), Some(instance), "{:?}", claim.metadata.name);
+        assert_eq!(
+            claim.metadata.labels.as_ref().and_then(|l| l.get(CONVERSATION_LABEL)).map(String::as_str),
+            Some("42"),
+            "the conversation label stays"
+        );
+    }
+    let volume = build_volume_pvc_spec(7, instance);
+    assert_eq!(label(&volume.metadata).as_deref(), Some(instance));
+}
+
+fn meta_with_instance(instance: Option<&str>) -> ObjectMeta {
+    ObjectMeta {
+        name: Some("sandbox-workspace-1528".to_string()),
+        labels: Some(
+            [(CONVERSATION_LABEL.to_string(), "1528".to_string())]
+                .into_iter()
+                .chain(instance.map(|i| (INSTANCE_LABEL.to_string(), i.to_string())))
+                .collect(),
+        ),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_ownership_tells_ours_from_unlabelled_and_foreign() {
+    assert_eq!(ownership(&meta_with_instance(Some("ours")), "ours"), Ownership::Ours);
+    assert_eq!(ownership(&meta_with_instance(None), "ours"), Ownership::Unlabelled);
+    assert_eq!(ownership(&ObjectMeta::default(), "ours"), Ownership::Unlabelled, "no labels at all");
+    assert_eq!(ownership(&meta_with_instance(Some("theirs")), "ours"), Ownership::Foreign);
+    // An instance that was never read must not match an empty label.
+    assert_eq!(ownership(&meta_with_instance(Some("")), ""), Ownership::Foreign);
 }
 
 fn claim(name: &str, conversation: Option<&str>) -> PersistentVolumeClaim {
@@ -488,7 +537,7 @@ fn test_check_reachable_port_refuses_both_of_the_agents_ports() {
 /// no memory and has no CPU request or limit at all.
 #[test]
 fn test_pod_spec_reserves_nothing_and_limits_only_memory() {
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[]);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
     let spec = pod.spec.expect("a pod spec");
     let containers = spec.containers.iter().chain(spec.init_containers.iter().flatten());
     for container in containers {
@@ -508,7 +557,7 @@ fn test_pod_spec_reserves_nothing_and_limits_only_memory() {
 
 #[test]
 fn test_pod_container_limits_include_the_docker_sidecar() {
-    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[]);
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
     assert_eq!(
         pod_container_limits(&pod),
         (vec!["1Gi".to_string(), "2Gi".to_string()], Vec::<String>::new())
@@ -556,7 +605,7 @@ fn test_the_metrics_request_names_the_namespaces_pods() {
 
 #[test]
 fn test_docker_pvc_spec_is_named_labelled_and_sized_for_the_conversation() {
-    let [(pvc_name, pvc), (workspace_name, workspace)] = conversation_pvc_specs(42);
+    let [(pvc_name, pvc), (workspace_name, workspace)] = conversation_pvc_specs(42, TEST_INSTANCE);
     assert_eq!(workspace_name, "sandbox-workspace-42", "each claim's name comes beside its spec");
     assert_eq!(workspace.metadata.name.as_deref(), Some(workspace_name.as_str()));
     assert_eq!(workspace.metadata.labels, pvc.metadata.labels);
@@ -1467,14 +1516,14 @@ async fn test_docker_in_a_sandbox_pod_works_and_stays_inside_the_pod() {
         memory: "1Gi".to_string(),
         storage: PodStorage::Conversation(conversation_id),
     };
-    ensure_conversation_pvcs(&client, conversation_id).await.expect("ensure docker claim");
+    ensure_conversation_pvcs(&client, conversation_id, TEST_INSTANCE).await.expect("ensure docker claim");
     // Every pod this test makes, so cleanup below finds them even after
     // a failed assertion unwinds out of the checks.
     let created: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
 
     let checks = tokio::time::timeout(Duration::from_secs(300), async {
         let first = manager
-            .create_with_docker(&unique_session_id("docker"), "256Mi", &docker, &[])
+            .create_with_docker(&unique_session_id("docker"), "256Mi", &docker, &[], TEST_INSTANCE)
             .await
             .expect("create pod with docker");
         created.lock().expect("created").push(first.pod_name.clone());
@@ -1634,7 +1683,7 @@ async fn test_docker_in_a_sandbox_pod_works_and_stays_inside_the_pod() {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
         let second = manager
-            .create_with_docker(&unique_session_id("docker"), "256Mi", &docker, &[])
+            .create_with_docker(&unique_session_id("docker"), "256Mi", &docker, &[], TEST_INSTANCE)
             .await
             .expect("recreate pod on the same claim");
         created.lock().expect("created").push(second.pod_name.clone());
@@ -1683,7 +1732,7 @@ async fn test_an_oom_in_a_nested_container_restarts_only_the_docker_sidecar() {
         storage: PodStorage::Ephemeral,
     };
     let sandbox = manager
-        .create_with_docker(&unique_session_id("docker-oom"), "128Mi", &docker, &[])
+        .create_with_docker(&unique_session_id("docker-oom"), "128Mi", &docker, &[], TEST_INSTANCE)
         .await
         .expect("create pod");
     let name = sandbox.pod_name.clone();
@@ -1795,9 +1844,9 @@ async fn test_wait_for_conversation_pods_gone_waits_out_a_stopping_pod() {
         memory: "256Mi".to_string(),
         storage: PodStorage::Conversation(conversation_id),
     };
-    ensure_conversation_pvcs(&client, conversation_id).await.expect("ensure docker claim");
+    ensure_conversation_pvcs(&client, conversation_id, TEST_INSTANCE).await.expect("ensure docker claim");
     let sandbox = manager
-        .create_with_docker(&unique_session_id("stopping"), "128Mi", &docker, &[])
+        .create_with_docker(&unique_session_id("stopping"), "128Mi", &docker, &[], TEST_INSTANCE)
         .await
         .expect("create pod");
     let name = sandbox.pod_name.clone();
@@ -2007,7 +2056,7 @@ async fn test_a_failed_start_for_a_deleted_conversation_leaves_no_claims(pool: P
     let offset = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64 + 2_000_000_000;
     db::delete_conversation(&pool, deleted.id).await.expect("delete");
     for id in [deleted.id, live.id] {
-        ensure_conversation_pvcs(&client, id + offset).await.expect("claims");
+        ensure_conversation_pvcs(&client, id + offset, TEST_INSTANCE).await.expect("claims");
     }
 
     clean_up_after_failed_start(&pool, &client, deleted.id, deleted.id + offset).await;
@@ -2126,12 +2175,12 @@ async fn test_ensure_docker_pvc_creates_once_and_delete_removes_it() {
         + 1_000_000_000;
     let name = docker_pvc_name(conversation_id);
 
-    ensure_conversation_pvcs(&client, conversation_id).await.expect("first ensure should create");
+    ensure_conversation_pvcs(&client, conversation_id, TEST_INSTANCE).await.expect("first ensure should create");
     let first = pvcs.get_opt(&name).await.expect("get claim");
     let first_uid = first.and_then(|p| p.metadata.uid);
     assert!(first_uid.is_some(), "ensure_docker_pvc should create {name}");
 
-    ensure_conversation_pvcs(&client, conversation_id).await.expect("second ensure should reuse");
+    ensure_conversation_pvcs(&client, conversation_id, TEST_INSTANCE).await.expect("second ensure should reuse");
     let second_uid = pvcs.get_opt(&name).await.expect("get claim").and_then(|p| p.metadata.uid);
     assert_eq!(first_uid, second_uid, "a second ensure must reuse the claim, not replace it");
 
@@ -3557,6 +3606,7 @@ async fn test_create_deletes_the_pod_it_just_created_if_it_never_reaches_running
             },
             &[],
             Duration::from_millis(1),
+            TEST_INSTANCE,
         )
         .await;
     match result {

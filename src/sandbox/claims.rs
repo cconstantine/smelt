@@ -230,9 +230,13 @@ pub(super) async fn wait_for_conversation_pods_gone(
 /// Creates the conversation's claims unless they already exist, so its
 /// later pods reuse its images and build cache and find /workspace as the
 /// last pod left it.
-pub(super) async fn ensure_conversation_pvcs(client: &kube::Client, conversation_id: i64) -> Result<(), SandboxError> {
+pub(super) async fn ensure_conversation_pvcs(
+    client: &kube::Client,
+    conversation_id: i64,
+    instance: &str,
+) -> Result<(), SandboxError> {
     let pvcs = pvc_api(client);
-    for (name, spec) in conversation_pvc_specs(conversation_id) {
+    for (name, spec) in conversation_pvc_specs(conversation_id, instance) {
         if pvcs.get_opt(&name).await?.is_some() {
             continue;
         }

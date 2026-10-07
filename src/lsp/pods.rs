@@ -38,6 +38,8 @@ pub struct SandboxRef {
     pub pod_name: String,
     pub pod_uid: String,
     pub node: String,
+    /// The database's instance (SME-115): the server pod is labelled with it.
+    pub instance: String,
 }
 
 /// `lsp-<pod id>-<server>`.
@@ -71,6 +73,7 @@ pub fn server_pod_spec(sandbox: &SandboxRef, config: &LanguageServerConfig, conf
                 LSP_OF_LABEL: sandbox.conversation_id.to_string(),
                 LSP_SERVER_LABEL: config.name,
                 LSP_POD_LABEL: sandbox.pod_id.to_string(),
+                crate::sandbox::INSTANCE_LABEL: sandbox.instance,
             },
             "annotations": {CONFIG_VERSION_ANNOTATION: config_version},
             "ownerReferences": [{
@@ -446,6 +449,7 @@ pub(crate) mod tests {
             pod_name: "sandbox-7".to_string(),
             pod_uid: "uid-7".to_string(),
             node: "node-a".to_string(),
+            instance: "instance-a".to_string(),
         }
     }
 
@@ -474,6 +478,7 @@ pub(crate) mod tests {
         assert_eq!(labels.get(LSP_SERVER_LABEL).map(String::as_str), Some("rust-analyzer"));
         assert_eq!(labels.get(LSP_POD_LABEL).map(String::as_str), Some("7"));
         assert!(!labels.contains_key("smelt/conversation"), "the sandbox pod's own label would make create_pod wait on it");
+        assert_eq!(labels.get(crate::sandbox::INSTANCE_LABEL).map(String::as_str), Some("instance-a"), "SME-115");
         assert_eq!(
             meta.annotations.as_ref().and_then(|a| a.get(CONFIG_VERSION_ANNOTATION)).map(String::as_str),
             Some("2026-09-28T08:00:00")
@@ -790,6 +795,7 @@ pub(crate) mod tests {
                         pod_name: name.to_string(),
                         pod_uid: p.metadata.uid.clone().ok_or("the Running pod has no uid")?,
                         node: p.spec.as_ref().and_then(|s| s.node_name.clone()).ok_or("the Running pod has no node")?,
+                        instance: crate::sandbox::TEST_INSTANCE.to_string(),
                     });
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;

@@ -13,13 +13,14 @@ use super::*;
 pub(super) async fn ensure_volume_claims(
     client: &kube::Client,
     volumes: &[db::SandboxVolume],
+    instance: &str,
 ) -> Result<(), SandboxError> {
     let pvcs = pvc_api(client);
     for volume in volumes {
         let claim = sandbox_volume_pvc_name(volume.id);
         if pvcs.get_opt(&claim).await?.is_none() {
             tracing::warn!(claim = %claim, "volume claim missing; recreating it");
-            pvcs.create(&PostParams::default(), &build_volume_pvc_spec(volume.id))
+            pvcs.create(&PostParams::default(), &build_volume_pvc_spec(volume.id, instance))
                 .await?;
         }
     }
@@ -56,7 +57,7 @@ impl SandboxManager {
             memory: "512Mi".to_string(),
             storage: PodStorage::Ephemeral,
         };
-        self.create_with_docker(session_id, memory, &docker, volumes).await
+        self.create_with_docker(session_id, memory, &docker, volumes, TEST_INSTANCE).await
     }
 
     /// `memory` is an already-resolved value (the caller's own
@@ -67,13 +68,15 @@ impl SandboxManager {
     /// `volumes` is every currently-configured `sandbox_volumes` row —
     /// every pod gets every one of them mounted, unconditionally (see
     /// SME-17's Phase 4); an empty slice is fine for callers (mostly
-    /// tests) that don't care.
+    /// tests) that don't care. `instance` is the database's (SME-115):
+    /// the pod is labelled with it.
     pub async fn create_with_docker(
         &self,
         session_id: &str,
         memory: &str,
         docker: &DockerSidecar,
         volumes: &[db::SandboxVolume],
+        instance: &str,
     ) -> Result<Sandbox, SandboxError> {
         self.create_with_running_timeout(
             session_id,
@@ -81,6 +84,7 @@ impl SandboxManager {
             docker,
             volumes,
             running_wait_timeout(),
+            instance,
         )
         .await
     }
@@ -99,6 +103,7 @@ impl SandboxManager {
         docker: &DockerSidecar,
         volumes: &[db::SandboxVolume],
         running_timeout: Duration,
+        instance: &str,
     ) -> Result<Sandbox, SandboxError> {
         let pods = pods_api(&self.client);
         let name = format!("sandbox-{session_id}");
@@ -123,10 +128,10 @@ impl SandboxManager {
                 false
             }
             None => {
-                ensure_volume_claims(&self.client, volumes).await?;
+                ensure_volume_claims(&self.client, volumes, instance).await?;
                 pods.create(
                     &PostParams::default(),
-                    &build_pod_spec(&name, memory, docker, volumes),
+                    &build_pod_spec(&name, memory, docker, volumes, instance),
                 )
                 .await?;
                 true
@@ -428,6 +433,7 @@ pub(super) async fn create_pod_attempt(
     let (memory, docker) = limits.resolve(conversation_id);
 
     let manager = get()?;
+    let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
     // The database's own one-live-pod rule backs up the check above.
     let row = db::create_sandbox_pod(pool, conversation_id).await.map_err(|e| {
         if e.as_database_error().is_some_and(|d| d.is_unique_violation()) {
@@ -453,12 +459,12 @@ pub(super) async fn create_pod_attempt(
         let _ = db::terminate_sandbox_pod(pool, row.id).await;
         return Err(e);
     }
-    if let Err(e) = ensure_conversation_pvcs(&manager.client, conversation_id).await {
+    if let Err(e) = ensure_conversation_pvcs(&manager.client, conversation_id, &instance.id).await {
         let _ = db::terminate_sandbox_pod(pool, row.id).await;
         return Err(e);
     }
     match manager
-        .create_with_docker(&row.id.to_string(), &memory, &docker, &volumes)
+        .create_with_docker(&row.id.to_string(), &memory, &docker, &volumes, &instance.id)
         .await
     {
         Ok(sandbox) => {
@@ -676,13 +682,14 @@ pub async fn create_volume(
     validate_mount_path(&resolved_path).map_err(SandboxError::InvalidMountPath)?;
     // Before the row, so a missing manager leaves nothing behind.
     let manager = get()?;
+    let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
     let row = db::create_sandbox_volume(pool, name, &resolved_path)
         .await
         .map_err(SandboxError::Db)?;
 
     let pvcs = pvc_api(&manager.client);
     if let Err(e) = pvcs
-        .create(&PostParams::default(), &build_volume_pvc_spec(row.id))
+        .create(&PostParams::default(), &build_volume_pvc_spec(row.id, &instance.id))
         .await
     {
         let _ = db::delete_sandbox_volume(pool, row.id).await;
