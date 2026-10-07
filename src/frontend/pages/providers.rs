@@ -553,10 +553,12 @@ fn ProviderFields(
         if !suggest_kind || url.is_empty() {
             return;
         }
-        // The answer is for the address it asked about.
+        // The answer is for the address it asked about, if the field
+        // still holds it (SME-111 review 1).
         spawn(async move {
             let found = probe_llama_cpp(url.clone()).await.unwrap_or(false);
-            llama_cpp_at.set(found.then_some(url));
+            let shown = after_probe(llama_cpp_at.peek().clone(), url, found, &form.peek().base_url);
+            llama_cpp_at.set(shown);
         });
     };
     // A saved address is asked about once, when the form opens.
@@ -889,6 +891,16 @@ fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
     }
 }
 
+/// The address the llama.cpp suggestion is for, once the probe of `asked`
+/// answers `found`: an answer for an address the field no longer holds
+/// (a slow probe finishing after a later one) changes nothing.
+fn after_probe(shown: Option<String>, asked: String, found: bool, current: &str) -> Option<String> {
+    if asked != current.trim() {
+        return shown;
+    }
+    found.then_some(asked)
+}
+
 /// A token-count field's value: blank for none, commas allowed.
 fn token_field(text: &str, name: &str) -> Result<Option<u32>, String> {
     let text = text.replace(',', "");
@@ -1200,6 +1212,17 @@ mod tests {
             llama_server_summary(&LlamaServerInfo::default()),
             "llama.cpp \u{b7} template: no reasoning effort or preserved reasoning"
         );
+    }
+
+    /// SME-111 review 1: a slow probe of an old address doesn't hide the
+    /// suggestion for the address in the field.
+    #[test]
+    fn test_only_the_current_addresss_probe_counts() {
+        let b = "http://b".to_string();
+        assert_eq!(after_probe(None, b.clone(), true, "http://b"), Some(b.clone()));
+        assert_eq!(after_probe(Some(b.clone()), "http://a".to_string(), false, "http://b"), Some(b.clone()), "a stale no");
+        assert_eq!(after_probe(None, "http://a".to_string(), true, "http://b"), None, "a stale yes");
+        assert_eq!(after_probe(Some(b.clone()), b, false, "http://b"), None, "the current address said no");
     }
 
     #[test]
