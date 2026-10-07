@@ -19,7 +19,7 @@ Every conversation is a coding session. The model gets a sandbox of its own, a K
 - **Language servers.** You configure language servers as data, filled in from mason's registry, and the model starts them next to its sandbox for diagnostics and code navigation.
 - **Housekeeping.** The Sandboxes page lists every live pod with its memory and CPU use, and stops any of them. A tab left open across a deploy says it's out of date. There's a dark mode, and the layout works at phone width.
 
-The full, current feature list is the project's "Current state" document in Linear. [docs/architecture.md](docs/architecture.md) describes how it's built.
+[docs/setup.md](docs/setup.md) covers each feature's setup, and [docs/architecture.md](docs/architecture.md) describes how it's built.
 
 ## Screenshots
 
@@ -96,4 +96,4 @@ Then open <http://localhost:8180>. Previews are on port 8181. Compose publishes 
 | Tests | [docs/testing.md](docs/testing.md) |
 | How work is planned, built and reviewed | [docs/development-process.md](docs/development-process.md) |
 
-Work is tracked as tickets in Linear (`SME-N` ids in commits and comments).
+Work is tracked in a private Linear workspace; the `SME-N` ids in commits and comments are its tickets.
