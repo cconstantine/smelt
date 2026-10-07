@@ -558,9 +558,17 @@ pub(super) fn run_turn_body<'a>(
             // model and to every tab (SME-111). Not continued: Claude
             // refuses a prefilled partial reply, and a local model would
             // start its reasoning over.
-            if turn.stop_reason == "max_tokens" {
+            // The context window stopping it (Claude 4.5+'s own stop
+            // reason) is the room running out, whatever bound the budget
+            // (SME-111 review 1).
+            let cut_off_by = match turn.stop_reason.as_str() {
+                "max_tokens" => Some(budget.limit),
+                "model_context_window_exceeded" => Some(crate::api::chat::ReplyLimit::RoomLeft),
+                _ => None,
+            };
+            if let Some(limit) = cut_off_by {
                 let notice = [anthropic::ContentBlock::Text {
-                    text: crate::api::chat::cut_off_notice(budget.tokens, budget.limit),
+                    text: crate::api::chat::cut_off_notice(budget.tokens, limit),
                 }];
                 let saved = db::create_message(pool, conversation_id, "user", &notice)
                     .await

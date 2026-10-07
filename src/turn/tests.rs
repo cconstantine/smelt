@@ -1879,6 +1879,30 @@ async fn test_a_cut_off_reply_is_followed_by_a_notice(pool: PgPool) {
     assert_eq!(requests[0]["max_tokens"], 16_384);
 }
 
+/// SME-111 review 1: a reply the context window stopped
+/// (`model_context_window_exceeded`, Claude 4.5+) is cut off too, and the
+/// notice says the conversation ran out of room, whatever bound the budget.
+#[sqlx::test]
+async fn test_a_reply_the_window_stopped_gets_a_room_left_notice(pool: PgPool) {
+    use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    let body = text_reply_body("Half a tho")
+        .replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"model_context_window_exceeded""#);
+    start_recording_mock_upstream(&pool, vec![body]).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn still succeeds");
+
+    assert_eq!(saved.len(), 3, "the message, the reply and a notice: {saved:?}");
+    let notice = match saved[2].blocks().expect("blocks").as_slice() {
+        [anthropic::ContentBlock::Text { text }] => text.clone(),
+        other => panic!("one text block: {other:?}"),
+    };
+    assert_eq!(parse_cut_off_notice(&notice), Some((16_384, ReplyLimit::RoomLeft)));
+}
+
 /// A model on an Anthropic provider that nothing sized keeps the reply
 /// budget every turn had: a Claude model refuses one above its own cap.
 #[sqlx::test]
