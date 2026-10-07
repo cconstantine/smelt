@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# No `expect()` in production code unless it's necessary and safe
+# (SME-95): clippy's `expect_used`, denied for the server build (smelt and
+# its binaries, the sandbox agent included) and the web build. Test code
+# isn't compiled here, so its `expect()`s are untouched. Every other clippy
+# lint is off: the project doesn't follow clippy's defaults.
+#
+# An `expect()` that can't fail, or where a panic is the right answer
+# (startup), carries an attribute saying why:
+#
+#   #[expect(clippy::expect_used, reason = "the shell was spawned with stdin piped")]
+#
+# `#[expect]` rather than `#[allow]`: once the `expect()` under it goes,
+# the attribute is reported unfulfilled, and `-D warnings` fails on it.
+# Exits non-zero on any finding. check.sh and CI run it.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+lints=(-D warnings -A clippy::all -D clippy::expect_used)
+
+echo "== lint: server (expect_used)"
+cargo clippy --features server -- "${lints[@]}"
+
+echo "== lint: web (expect_used)"
+cargo clippy --no-default-features --features web --target wasm32-unknown-unknown -- "${lints[@]}"

@@ -599,6 +599,7 @@ fn ChatPanel(
 
         let temp_id = next_temp_id();
         next_temp_id.set(temp_id - 1);
+        #[expect(clippy::expect_used, reason = "a text ContentBlock always serializes")]
         messages.write().push(Message {
             id: temp_id,
             conversation_id: id,

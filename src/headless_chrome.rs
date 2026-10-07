@@ -174,6 +174,7 @@ async fn spawn_owned(binary: &Path, args: &[String], ld_library_path: &str) -> R
                 }
             };
             let _ = updates.send(LaunchUpdate::Spawned(child.id()));
+            #[expect(clippy::expect_used, reason = "Chrome was spawned with stderr piped, and this is its one take")]
             let stderr = child.stderr.take().expect("stderr is piped");
             for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
                 if let Some(url) = line.strip_prefix("DevTools listening on ") {

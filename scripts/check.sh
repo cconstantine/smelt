@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The checks every commit must pass (docs/development-process.md, "Every
 # commit builds for both targets"): the web build and the server build,
-# each with no warnings, and the server tests, run against this working
+# each with no warnings, no unexplained expect() outside tests
+# (scripts/lint-expects), and the server tests, run against this working
 # tree's own sandbox image (SANDBOX_IMAGE, see scripts/sandbox-image-ref).
 # Exits non-zero on any failure, so it can gate a commit:
 #
@@ -38,6 +39,13 @@ if grep -qE '^(warning|error)' <<<"$server_output"; then
     echo "the server build has warnings"
     exit 1
 fi
+
+# No new expect() outside tests without a reason (SME-95).
+lint_output=$(scripts/lint-expects 2>&1) || {
+    echo "$lint_output" | grep -E '^(warning|error)' -A8
+    echo "an expect() in production code: handle the error, or say why it can't fail (scripts/lint-expects)"
+    exit 1
+}
 
 # The tests' pods run this working tree's own agent, from the image named
 # after its sources (SME-102), not the shared `:latest` the dev server uses.

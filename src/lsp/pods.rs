@@ -57,6 +57,7 @@ fn pod_script(install_command: &str) -> String {
 
 /// The server pod for `config` next to `sandbox`, its config version
 /// `config_version`.
+#[expect(clippy::expect_used, reason = "a fixed shape whose values are all strings, which deserializes as a Pod")]
 pub fn server_pod_spec(sandbox: &SandboxRef, config: &LanguageServerConfig, config_version: &str) -> Pod {
     let mut env = vec![
         json!({"name": "HOME", "value": POD_HOME}),

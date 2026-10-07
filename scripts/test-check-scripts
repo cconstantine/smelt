@@ -18,7 +18,7 @@ fail() {
 }
 
 # None of the scripts the gate or a hands-on check runs removes a file.
-for script in scripts/check-server scripts/browser-tier scripts/check.sh scripts/build-sandbox-image.sh; do
+for script in scripts/check-server scripts/browser-tier scripts/check.sh scripts/lint-expects scripts/build-sandbox-image.sh; do
     if found=$(grep -nE '(^|[^[:alnum:]_-])(rm|rmdir|unlink|shred)([[:space:]]|$)|-delete([[:space:]]|$)' "$script" | grep -vE '^[0-9]+:[[:space:]]*#'); then
         fail "$script removes files: $found"
     fi

@@ -60,6 +60,7 @@ pub fn suggest(package_yaml: &str, languages_toml: &str) -> Result<Suggestion, S
         .filter(|config| config.as_object().is_some_and(|o| !o.is_empty()));
     for (server, extra) in ADJUSTMENTS {
         if *server == package.name {
+            #[expect(clippy::expect_used, reason = "ADJUSTMENTS is a constant, and its JSON is covered by the catalog's tests")]
             let extra: serde_json::Value = serde_json::from_str(extra).expect("the adjustments are valid JSON");
             let merged = initialization_options.get_or_insert_with(|| serde_json::json!({}));
             merge(merged, &extra);

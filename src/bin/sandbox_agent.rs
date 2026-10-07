@@ -1087,19 +1087,23 @@ async fn create_terminal(state: &Arc<AppState>, terminal_id: String) -> Reply {
             return reply_error(&format!("failed to spawn shell: {e}"));
         }
     };
+    #[expect(clippy::expect_used, reason = "a child that hasn't been waited on always has its pid")]
     let bash_pid = child
         .id()
         .expect("bash should have a pid immediately after spawn");
+    #[expect(clippy::expect_used, reason = "the shell was spawned with stdin piped, and this is its one take")]
     let mut stdin = child
         .stdin
         .take()
         .expect("stdin requested via Stdio::piped()");
+    #[expect(clippy::expect_used, reason = "the shell was spawned with stdout piped, and this is its one take")]
     let stdout = BufReader::new(
         child
             .stdout
             .take()
             .expect("stdout requested via Stdio::piped()"),
     );
+    #[expect(clippy::expect_used, reason = "the shell was spawned with stderr piped, and this is its one take")]
     let stderr = BufReader::new(
         child
             .stderr
@@ -1725,6 +1729,7 @@ extern "C" fn exit_on_sigterm(_: nix::libc::c_int) {
     unsafe { nix::libc::_exit(0) }
 }
 
+#[expect(clippy::expect_used, reason = "startup: an agent that can't set its signals or serve has nothing to fall back to")]
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()

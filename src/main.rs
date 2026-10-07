@@ -65,6 +65,7 @@ fn build_router() -> axum::Router {
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }
 
+#[expect(clippy::expect_used, reason = "startup: smelt can't run without its migrations or its listener")]
 #[cfg(feature = "server")]
 #[tokio::main]
 async fn main() {

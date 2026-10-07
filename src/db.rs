@@ -17,6 +17,7 @@ static POOL: OnceLock<PgPool> = OnceLock::new();
 const CONNECT_RETRIES: u32 = 10;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+#[expect(clippy::expect_used, reason = "startup: smelt can't run without its database")]
 pub async fn init() -> &'static PgPool {
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
@@ -53,6 +54,7 @@ pub async fn init() -> &'static PgPool {
     POOL.get().unwrap()
 }
 
+#[expect(clippy::expect_used, reason = "db::get() before db::init() is a programming error, by design")]
 pub fn get() -> &'static PgPool {
     POOL.get()
         .expect("Database not initialized. Call db::init() first.")
@@ -118,6 +120,7 @@ async fn create_message_on(
     role: &str,
     content: &[ContentBlock],
 ) -> Result<Message, sqlx::Error> {
+    #[expect(clippy::expect_used, reason = "ContentBlock has no non-string map keys and no floats, so it always serializes")]
     let content_json = serde_json::to_string(content)
         .expect("ContentBlock always serializes: no non-string map keys, no floats");
 

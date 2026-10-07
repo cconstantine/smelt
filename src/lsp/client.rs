@@ -85,6 +85,7 @@ impl Drop for LspClient {
 
 /// The bytes of one message: a `Content-Length` header, then the JSON.
 pub fn frame(message: &Value) -> Vec<u8> {
+    #[expect(clippy::expect_used, reason = "a serde_json::Value always serializes")]
     let body = serde_json::to_vec(message).expect("a JSON value always serializes");
     let mut out = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
     out.extend(body);
