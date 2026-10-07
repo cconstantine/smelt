@@ -65,7 +65,7 @@ smelt is one server binary plus a web bundle. Alongside it, it needs:
 
 ### Before you expose it
 
-smelt has **no login**. Anyone who can reach it can use your model keys and run commands in your sandboxes. And because the Docker sidecar is privileged, those commands can reach root on the sandbox's node. Keep smelt behind something that authenticates, such as a VPN or an authenticating proxy, and the preview host names with it. [docs/setup.md](docs/setup.md#docker-in-the-sandbox) has the details.
+smelt has **no login**. Anyone who can reach it can use your model keys and run commands in your sandboxes. And because the Docker sidecar is privileged, those commands can reach root on the sandbox's node. Keep smelt behind something that authenticates, such as a VPN or an authenticating proxy, and the preview host names with it. And make that the only way in: smelt listens on every interface (`0.0.0.0:$PORT`, and previews on `0.0.0.0:8181` by default). So firewall `PORT`, and either firewall the preview port or set `SMELT_PREVIEW_ADDR=127.0.0.1:8181`. [docs/setup.md](docs/setup.md#docker-in-the-sandbox) has the details.
 
 ### Trying it locally
 
