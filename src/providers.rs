@@ -928,7 +928,15 @@ mod server {
         let (server_caps, server_error) = if kind == ProviderKind::LlamaCpp && ask_each {
             read_llama_props(pool, &provider, &endpoint, &mut listed).await?
         } else {
-            (server_caps(&provider), None)
+            let stored = server_caps(&provider);
+            // What `/props` said last still wins over `/v1/models`' whole-
+            // server window and missing tool flag (SME-111 review 2).
+            if kind == ProviderKind::LlamaCpp
+                && let Some(info) = &stored
+            {
+                crate::anthropic::models::apply_llama_props(&mut listed, info);
+            }
+            (stored, None)
         };
 
         let mut details_errors = std::collections::HashMap::new();
@@ -1849,6 +1857,31 @@ mod tests {
             let listing = provider_models(&pool, p.id, true).await.expect("models");
             assert!(listing.server_error.as_deref().is_some_and(|e| e.contains("503")), "{listing:?}");
             assert_eq!(listing.server_caps, Some(caps));
+        }
+
+        /// SME-111 review 2: the picker's quick listing (no `/props`)
+        /// doesn't replace the slot window and tool support `/props` gave
+        /// with `/v1/models`' whole-server `meta.n_ctx` and no tool flag.
+        #[sqlx::test]
+        async fn test_a_quick_llama_cpp_listing_keeps_what_props_said(pool: PgPool) {
+            let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let base = mock_llama_cpp(up).await;
+            let p = db::create_inference_provider(&pool, "llama", "llama_cpp", &base, "bearer", "k", false, None, true)
+                .await
+                .expect("create");
+            // A four-slot server: each slot has a quarter of the 262,144.
+            let caps = serde_json::json!({
+                "n_ctx": 65536, "total_slots": 4, "model_alias": "flash-next",
+                "template_caps": {"supports_tool_calls": false}
+            });
+            db::set_inference_provider_server_caps(&pool, p.id, &caps).await.expect("caps");
+
+            let listing = provider_models(&pool, p.id, false).await.expect("models");
+
+            let model = &listing.models[0];
+            assert_eq!((model.context_window, model.reported_tools), (65_536, Some(false)), "{model:?}");
+            let stored = db::get_provider_model(&pool, p.id, "flash-next").await.expect("get").expect("stored");
+            assert_eq!((stored.reported_context_window, stored.reported_tools), (Some(65_536), Some(false)));
         }
 
         #[sqlx::test]
