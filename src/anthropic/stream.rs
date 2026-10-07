@@ -545,9 +545,14 @@ pub async fn stream_anthropic_message(
         }
         let message = provider_error_message(&body);
         // A server that doesn't know prompt caching names the field it
-        // refused; the fix is the provider's setting, not a retry.
+        // refused; the fix is the provider's setting, not a retry. The same
+        // goes for a model refusing effort, or the level asked for.
         let hint = if request.prompt_caching && message.contains("cache_control") {
             " (This server may not support prompt caching: turn off \u{201c}Prompt caching\u{201d} on its provider.)"
+        } else if request.output_config.is_some()
+            && (message.contains("effort") || message.contains("output_config"))
+        {
+            " (This model may not support this effort level: change or clear \u{201c}Effort\u{201d} for it on its provider's models.)"
         } else {
             ""
         };
@@ -1271,6 +1276,35 @@ mod tests {
         let request = request_replaying_thinking(None);
         let error = stream_anthropic_message(&endpoint, &request, |_| {}).await.expect_err("refused");
         assert!(!error.contains("Prompt caching"), "{error}");
+    }
+
+    /// Synthetic refusals of `output_config.effort`, one naming each field: a
+    /// model without effort, and one without the level asked for.
+    const EFFORT_REFUSED_BODIES: [&str; 2] = [
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"This model does not support the effort parameter."}}"#,
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"output_config: Extra inputs are not permitted"}}"#,
+    ];
+
+    #[tokio::test]
+    async fn test_a_refused_effort_names_the_models_effort_setting() {
+        for body in EFFORT_REFUSED_BODIES {
+            let (endpoint, _record) = recording_upstream(vec![(400, body)]).await;
+            let mut request = request_replaying_thinking(None);
+            request.output_config = Some(super::super::types::OutputConfig { effort: super::super::types::Effort::Xhigh });
+            let error = stream_anthropic_message(&endpoint, &request, |_| {}).await.expect_err("refused");
+            assert!(error.contains(&provider_error_message(body)), "keeps the server's words: {error}");
+            assert!(error.contains("\u{201c}Effort\u{201d}"), "names the setting to change: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_400_without_effort_gets_no_effort_hint() {
+        for body in EFFORT_REFUSED_BODIES {
+            let (endpoint, _record) = recording_upstream(vec![(400, body)]).await;
+            let request = request_replaying_thinking(None);
+            let error = stream_anthropic_message(&endpoint, &request, |_| {}).await.expect_err("refused");
+            assert!(!error.contains("Effort"), "{error}");
+        }
     }
 
     #[tokio::test]
