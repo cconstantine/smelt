@@ -93,7 +93,8 @@ pub fn parse(json: &str) -> Result<Providers, String> {
         size: u64,
     }
 
-    let raw: BTreeMap<String, RawProvider> =
+    // Provider by provider too: one malformed provider loses only itself.
+    let raw: BTreeMap<String, serde_json::Value> =
         serde_json::from_str(json).map_err(|e| format!("not the models.dev catalog: {e}"))?;
     let model = |raw: serde_json::Value| -> Option<ModelPrices> {
         let cost = serde_json::from_value::<RawModel>(raw).ok()?.cost;
@@ -116,6 +117,7 @@ pub fn parse(json: &str) -> Result<Providers, String> {
     };
     Ok(raw
         .into_iter()
+        .filter_map(|(id, provider)| Some((id, serde_json::from_value::<RawProvider>(provider).ok()?)))
         .map(|(id, provider)| {
             let models = match provider.models {
                 serde_json::Value::Object(models) => models
@@ -396,6 +398,9 @@ mod tests {
         let providers = parse(
             r#"{
                 "odd": {"id": "odd", "name": "Odd", "models": "not a map"},
+                "nameless": {"name": null, "models": {"m": {"cost": {"input": 1, "output": 2}}}},
+                "numeric": {"name": "N", "api": 123, "models": {"m": {"cost": {"input": 1, "output": 2}}}},
+                "string": "nope",
                 "p": {"id": "p", "name": "P", "models": {
                     "bad": {"cost": {"input": "4 dollars", "output": 20}},
                     "good": {"cost": {"input": 1, "output": 2}}
@@ -404,6 +409,9 @@ mod tests {
         )
         .expect("parses");
         assert!(providers["odd"].models.is_empty());
+        for bad in ["nameless", "numeric", "string"] {
+            assert!(!providers.contains_key(bad), "a malformed provider is left out: {bad}");
+        }
         assert!(!providers["p"].models.contains_key("bad"));
         assert_eq!(providers["p"].models["good"].base.output, 2.0);
     }
@@ -411,7 +419,10 @@ mod tests {
     #[test]
     fn test_parse_refuses_what_isnt_the_catalog() {
         assert!(parse("<html>rate limited</html>").is_err());
-        assert!(parse(r#"{"anthropic": "nope"}"#).is_err());
+        assert!(parse(r#"[{"anthropic": {}}]"#).is_err(), "not an object");
+        // A bad provider is skipped, here leaving none: `refresh` refuses
+        // that as listing no prices.
+        assert_eq!(parse(r#"{"anthropic": "nope"}"#), Ok(Providers::new()));
     }
 
     #[test]
@@ -503,13 +514,14 @@ mod tests {
             (500, "oops".to_string()),
             (200, "<html>rate limited</html>".to_string()),
             (200, "{}".to_string()),
+            (200, r#"{"anthropic": "nope"}"#.to_string()),
         ])
         .await;
         let store = CatalogStore::new();
         store.refresh(&pool, &url).await.expect("first refresh");
         let good = store.current().expect("in memory");
 
-        for _ in 0..3 {
+        for _ in 0..4 {
             assert!(store.refresh(&pool, &url).await.is_err());
             assert_eq!(store.current(), Some(good.clone()), "memory unchanged");
         }
