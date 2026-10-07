@@ -457,7 +457,8 @@ pub(super) fn run_turn_body<'a>(
             // Thinking shares it with the reply.
             let projected = projected_input(last_known_usage.as_ref(), estimate_tokens(&pending_new_content))
                 .unwrap_or_else(|| estimate_request_tokens(&request));
-            request.max_tokens = reply_budget(turn_model.context_window, projected, turn_model.output_cap);
+            let budget = reply_budget(turn_model.context_window, projected, turn_model.output_cap);
+            request.max_tokens = budget.tokens;
             request.thinking = turn_model.thinking_config(request.max_tokens);
 
             // Every tab watching streams the reply: the text so far is kept
@@ -552,6 +553,20 @@ pub(super) fn run_turn_body<'a>(
             );
             last_known_usage = Some(turn.usage);
             pending_new_content.clear();
+
+            // Cut off at its budget: said once, after the reply, to the
+            // model and to every tab (SME-111). Not continued: Claude
+            // refuses a prefilled partial reply, and a local model would
+            // start its reasoning over.
+            if turn.stop_reason == "max_tokens" {
+                let notice = [anthropic::ContentBlock::Text {
+                    text: crate::api::chat::cut_off_notice(budget.tokens, budget.limit),
+                }];
+                let saved = db::create_message(pool, conversation_id, "user", &notice)
+                    .await
+                    .map_err(ServerFnError::new)?;
+                record_saved(conversation_id, &mut persisted, saved);
+            }
 
             if turn.stop_reason != "tool_use" {
                 return Ok(persisted);

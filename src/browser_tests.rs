@@ -779,6 +779,8 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "markdown_long_reply", 90, Box::pin(scenario_markdown_long_reply(&t))).await;
     run_scenario(&t, only, r, k, "streaming_into_a_long_transcript", 120, Box::pin(scenario_streaming_into_a_long_transcript(&t))).await;
     run_scenario(&t, only, r, k, "unreadable_message", 30, Box::pin(scenario_unreadable_message(&t))).await;
+    run_scenario(&t, only, r, k, "cut_off_notice", 30, Box::pin(scenario_cut_off_notice(&t))).await;
+    run_scenario(&t, only, r, k, "llama_cpp_provider", 60, Box::pin(scenario_llama_cpp_provider(&t))).await;
     run_scenario(&t, only, r, k, "chat_errors_are_alerts", 30, Box::pin(scenario_chat_errors_are_alerts(&t))).await;
     run_scenario(&t, only, r, k, "message_box_label", 30, Box::pin(scenario_message_box_label(&t))).await;
     run_scenario(&t, only, r, k, "conversation_rows_by_keyboard", 60, Box::pin(scenario_conversation_rows_by_keyboard(&t))).await;
@@ -2982,6 +2984,134 @@ async fn scenario_unreadable_message(t: &Scenario<'_>) {
         .into_value()
         .expect("colours");
     assert_eq!(colours["got"], colours["want"], "an unreadable message should be in the error colour: {colours}");
+}
+
+/// SME-111: a reply cut off at its budget is followed by a notice; a tab
+/// already open shows it live, as the transcript's notice line naming the
+/// limit and what to change, not as the user talking.
+async fn scenario_cut_off_notice(t: &Scenario<'_>) {
+    use crate::api::chat::{ReplyLimit, cut_off_notice};
+    let conversation = t.conversation().await;
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    // Live: the tab's event stream is open before the messages are saved.
+    assert!(
+        wait_until(|| async { crate::events::subscriber_count(conversation.id) > 0 }, Duration::from_secs(10)).await,
+        "the tab never subscribed to its conversation"
+    );
+    for (role, text) in [("assistant", "Half a tho".to_string()), ("user", cut_off_notice(131_072, ReplyLimit::HalfWindow))] {
+        let saved = db::create_message(t.pool, conversation.id, role, &[crate::anthropic::ContentBlock::Text { text }])
+            .await
+            .expect("save a message");
+        crate::events::publish(
+            conversation.id,
+            crate::events::ConversationEvent::MessagesAppended { messages: vec![saved] },
+        );
+    }
+    wait_for_element(&page, ".system-notice", Duration::from_secs(10)).await;
+    let shown: String = page
+        .evaluate("document.querySelector('.system-notice').innerText")
+        .await
+        .expect("read the notice")
+        .into_value()
+        .expect("a string");
+    assert!(
+        shown.contains("cut off at its limit of 131,072 tokens (half the context window)") && shown.contains("reasoning budget"),
+        "{shown}"
+    );
+    let bubbles: usize = page
+        .evaluate("[...document.querySelectorAll('.message')].filter(m => m.innerText.includes('Your last reply')).length")
+        .await
+        .expect("count raw notices")
+        .into_value()
+        .expect("a number");
+    assert_eq!(bubbles, 0, "not shown as the user's own words");
+}
+
+/// A mock llama.cpp server answering `/v1/models` and `/props` with the
+/// user's real server's (fixtures). Returns its address.
+async fn serve_mock_llama_cpp() -> String {
+    let app = axum::Router::new()
+        .route("/v1/models", axum::routing::get(|| async {
+            ([(axum::http::header::CONTENT_TYPE, "application/json")], include_str!("anthropic/fixtures/llama_cpp_v1_models.json"))
+        }))
+        .route("/props", axum::routing::get(|| async {
+            ([(axum::http::header::CONTENT_TYPE, "application/json")], include_str!("anthropic/fixtures/llama_cpp_props.json"))
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the mock llama.cpp server");
+    let address = format!("http://{}", listener.local_addr().expect("its address"));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    address
+}
+
+/// SME-111: the new-provider form suggests the llama.cpp kind for an
+/// address that answers like one, and switches only when asked; a
+/// llama.cpp provider's page shows what its server said and offers its
+/// template's efforts and a reasoning budget.
+async fn scenario_llama_cpp_provider(t: &Scenario<'_>) {
+    let address = serve_mock_llama_cpp().await;
+    let form = t.tab(t.url("providers/new")).await;
+    // Hydrated: the form asks for the price list from the browser.
+    wait_for_resource(&form, "/api/price-sources").await;
+    let url_field = wait_for_element(&form, "#provider-url", Duration::from_secs(10)).await;
+    url_field.focus().await.expect("focus the address");
+    url_field.type_str(&address).await.expect("type the address");
+    let typed: String = form
+        .evaluate("document.querySelector('#provider-url').value")
+        .await
+        .expect("read the address")
+        .into_value()
+        .expect("a string");
+    assert_eq!(typed, address);
+    // Leaving the field commits it, which asks the address.
+    wait_for_element(&form, "#provider-name", Duration::from_secs(5))
+        .await
+        .focus()
+        .await
+        .expect("focus the name");
+    if !wait_for_text(&form, "This looks like a llama.cpp server", Duration::from_secs(10)).await {
+        let state: serde_json::Value = form
+            .evaluate("({ url: document.querySelector('#provider-url').value, probes: performance.getEntriesByType('resource').filter(e => e.name.includes('probe')).map(e => e.name + ' ' + e.responseStatus), active: document.activeElement?.id })")
+            .await
+            .expect("read the form")
+            .into_value()
+            .expect("json");
+        panic!("no llama.cpp suggestion: {state}");
+    }
+    let kind = |page: &chromiumoxide::Page| {
+        let page = page.clone();
+        async move {
+            page.evaluate("document.querySelector('#provider-kind').value")
+                .await
+                .expect("read the kind")
+                .into_value::<String>()
+                .expect("a string")
+        }
+    };
+    assert_eq!(kind(&form).await, "anthropic", "suggested, not switched");
+    click_when_present(&form, ".provider-kind-suggestion button", Duration::from_secs(5)).await;
+    wait_for_element(&form, "#provider-keep-reasoning", Duration::from_secs(5)).await;
+    assert_eq!(kind(&form).await, "llama_cpp");
+
+    let provider = db::create_inference_provider(t.pool, &unique_id("llama"), "llama_cpp", &address, "bearer", "key", false, None, true)
+        .await
+        .expect("create a llama.cpp provider");
+    let page = t.tab(t.url(&format!("providers/{}", provider.id))).await;
+    assert!(
+        wait_for_text(&page, "flash-next \u{b7} 1 slot \u{b7} 262,144-token window", Duration::from_secs(15)).await,
+        "the server's /props isn't shown"
+    );
+    let efforts: Vec<String> = page
+        .evaluate("[...document.querySelector('select[aria-label=\"Effort for flash-next\"]').options].map(o => o.text)")
+        .await
+        .expect("read the efforts")
+        .into_value()
+        .expect("strings");
+    assert_eq!(efforts, vec!["template's default", "low", "medium", "high"]);
+    wait_for_element(&page, "input[aria-label=\"Reasoning budget for flash-next\"]", Duration::from_secs(5)).await;
+    wait_for_element(&page, "input[aria-label=\"Max reply tokens for flash-next\"]", Duration::from_secs(5)).await;
+    db::delete_inference_provider(t.pool, provider.id).await.expect("delete the llama.cpp provider");
 }
 
 /// A server that answers every request after `delay` with an SVG image of

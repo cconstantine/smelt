@@ -103,14 +103,31 @@ pub(super) fn estimate_request_tokens(request: &anthropic::CreateMessageRequest)
 /// below `MIN_REPLY_TOKENS` (or half a smaller window), as every turn
 /// asked for before; the compaction trigger keeps that much room.
 #[cfg(feature = "server")]
-pub(super) fn reply_budget(context_window: u32, projected_input: u64, output_cap: Option<u32>) -> u32 {
+pub(super) fn reply_budget(context_window: u32, projected_input: u64, output_cap: Option<u32>) -> ReplyBudget {
     let half = context_window / 2;
     let room = (context_window as u64)
         .saturating_sub(projected_input)
         .saturating_sub(COMPACTION_SAFETY_BUFFER as u64);
     let room = u32::try_from(room).unwrap_or(u32::MAX);
     let budget = room.min(half).max(MIN_REPLY_TOKENS.min(half));
-    output_cap.map_or(budget, |cap| budget.min(cap)).max(1)
+    let tokens = output_cap.map_or(budget, |cap| budget.min(cap)).max(1);
+    let limit = if output_cap == Some(tokens) {
+        crate::api::chat::ReplyLimit::OutputCap
+    } else if tokens == half {
+        crate::api::chat::ReplyLimit::HalfWindow
+    } else {
+        // The room left, or the floor kept when there's even less.
+        crate::api::chat::ReplyLimit::RoomLeft
+    };
+    ReplyBudget { tokens, limit }
+}
+
+/// A reply's budget, and what bound it (for a cut-off notice).
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReplyBudget {
+    pub(super) tokens: u32,
+    pub(super) limit: crate::api::chat::ReplyLimit,
 }
 
 /// Whether it's safe to end a compaction's covered range right after a

@@ -469,19 +469,31 @@ fn test_should_compact_true_when_projected_crosses_reserved_ceiling() {
 #[test]
 fn test_the_reply_budget_grows_with_the_room_left() {
     // The user's llama.cpp model at the start of a conversation.
-    assert_eq!(reply_budget(262_144, 35_000, None), 131_072, "half the window");
+    assert_eq!(reply_budget(262_144, 35_000, None).tokens, 131_072, "half the window");
     // A model whose output cap is the smallest.
-    assert_eq!(reply_budget(1_000_000, 35_000, Some(128_000)), 128_000);
-    assert_eq!(reply_budget(200_000, 35_000, Some(16_384)), 16_384, "an unknown Claude cap");
+    assert_eq!(reply_budget(1_000_000, 35_000, Some(128_000)).tokens, 128_000);
+    assert_eq!(reply_budget(200_000, 35_000, Some(16_384)).tokens, 16_384, "an unknown Claude cap");
     // Room left is the smallest: the request must fit.
-    assert_eq!(reply_budget(262_144, 220_000, None), 262_144 - 220_000 - COMPACTION_SAFETY_BUFFER);
+    assert_eq!(reply_budget(262_144, 220_000, None).tokens, 262_144 - 220_000 - COMPACTION_SAFETY_BUFFER);
     // Less room than the floor: what every turn asked for before.
-    assert_eq!(reply_budget(262_144, 250_000, None), MIN_REPLY_TOKENS);
-    assert_eq!(reply_budget(262_144, 400_000, None), MIN_REPLY_TOKENS, "past the window");
+    assert_eq!(reply_budget(262_144, 250_000, None).tokens, MIN_REPLY_TOKENS);
+    assert_eq!(reply_budget(262_144, 400_000, None).tokens, MIN_REPLY_TOKENS, "past the window");
     // A small window: at most half of it.
-    assert_eq!(reply_budget(4_096, 1_000, None), 2_048);
-    assert_eq!(reply_budget(4_096, 1_000, Some(1_024)), 1_024, "the cap wins over the floor");
-    assert_eq!(reply_budget(0, 0, None), 1, "never zero, which the API refuses");
+    assert_eq!(reply_budget(4_096, 1_000, None).tokens, 2_048);
+    assert_eq!(reply_budget(4_096, 1_000, Some(1_024)).tokens, 1_024, "the cap wins over the floor");
+    assert_eq!(reply_budget(0, 0, None).tokens, 1, "never zero, which the API refuses");
+}
+
+/// SME-111: a budget says what bound it, for a cut-off notice.
+#[test]
+fn test_the_reply_budget_says_what_bound_it() {
+    use crate::api::chat::ReplyLimit;
+    assert_eq!(reply_budget(262_144, 35_000, None).limit, ReplyLimit::HalfWindow);
+    assert_eq!(reply_budget(1_000_000, 35_000, Some(128_000)).limit, ReplyLimit::OutputCap);
+    assert_eq!(reply_budget(262_144, 220_000, None).limit, ReplyLimit::RoomLeft);
+    assert_eq!(reply_budget(262_144, 250_000, None).limit, ReplyLimit::RoomLeft, "the floor: nearly full");
+    assert_eq!(reply_budget(262_144, 250_000, Some(8_192)).limit, ReplyLimit::OutputCap);
+    assert_eq!(reply_budget(4_096, 1_000, None).limit, ReplyLimit::HalfWindow);
 }
 
 #[test]
@@ -1814,6 +1826,57 @@ async fn test_a_llama_cpp_turn_sends_a_thinking_budget(pool: PgPool) {
     assert_eq!(requests[2]["thinking"], serde_json::json!({"type": "enabled", "budget_tokens": 20000}));
     assert!(requests[3].get("thinking").is_none(), "{}", requests[3]);
     assert_eq!(requests[3]["chat_template_kwargs"], serde_json::json!({"enable_thinking": false}));
+}
+
+fn cut_off_reply_body(text: &str) -> String {
+    text_reply_body(text).replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#)
+}
+
+/// SME-111: a reply that hits its `max_tokens` is kept, followed by a
+/// notice every tab gets live, naming the limit and what bound it; a
+/// reply that finishes gets none.
+#[sqlx::test]
+async fn test_a_cut_off_reply_is_followed_by_a_notice(pool: PgPool) {
+    use crate::api::chat::{ReplyLimit, cut_off_notice};
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![cut_off_reply_body("Half a tho"), text_reply_body("Done.")]).await;
+    let mut events = crate::events::subscribe(conversation.id);
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("a cut-off turn still succeeds");
+
+    let notice = cut_off_notice(16_384, ReplyLimit::OutputCap);
+    let texts: Vec<(String, String)> = saved
+        .iter()
+        .map(|m| (m.role.clone(), m.content.clone()))
+        .collect();
+    assert_eq!(texts.len(), 3, "the message, the reply and the notice: {texts:?}");
+    assert!(texts[1].1.contains("Half a tho"), "the reply is kept: {texts:?}");
+    assert_eq!(texts[2].0, "user");
+    let notice_text = match saved[2].blocks().expect("blocks").as_slice() {
+        [anthropic::ContentBlock::Text { text }] => text.clone(),
+        other => panic!("one text block: {other:?}"),
+    };
+    assert_eq!(notice_text, notice);
+    assert_eq!(
+        crate::api::chat::parse_cut_off_notice(&notice_text),
+        Some((16_384, ReplyLimit::OutputCap)),
+        "an unsized Anthropic model's cap bound it"
+    );
+    let mut published = false;
+    while let Ok(event) = events.try_recv() {
+        if let crate::events::ConversationEvent::MessagesAppended { messages } = event {
+            published |= messages.iter().any(|m| m.id == saved[2].id);
+        }
+    }
+    assert!(published, "every tab is told");
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("a finished turn");
+    assert_eq!(saved.len(), 2, "no notice after a finished reply");
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests[0]["max_tokens"], 16_384);
 }
 
 /// A model on an Anthropic provider that nothing sized keeps the reply

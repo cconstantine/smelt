@@ -85,6 +85,60 @@ pub const TURN_STOPPED: &str = "stopped by the user";
 /// Not server-only: the chat page shows it as "Stopped.".
 pub const STOP_NOTICE: &str = "The user stopped this turn before it finished. Don't carry on with what it asked unless they ask again.";
 
+/// What bound a reply's budget (SME-111), which a cut-off notice names
+/// along with the setting to raise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplyLimit {
+    /// The model's "Max reply tokens", or its provider's cap.
+    OutputCap,
+    /// Half the context window, the most a single reply may be.
+    HalfWindow,
+    /// What the conversation had left.
+    RoomLeft,
+}
+
+impl ReplyLimit {
+    pub const ALL: [ReplyLimit; 3] = [Self::OutputCap, Self::HalfWindow, Self::RoomLeft];
+
+    /// How a notice says it, for the model and for the transcript.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::OutputCap => "the model's maximum reply length",
+            Self::HalfWindow => "half the context window",
+            Self::RoomLeft => "the room left in the conversation",
+        }
+    }
+
+    /// What the user can change, as the transcript says it.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::OutputCap => "Raise \u{201c}Max reply tokens\u{201d} for this model on its provider's page, or lower its effort or reasoning budget.",
+            Self::HalfWindow => "A reply can be at most half the context window: lower the model's effort or reasoning budget on its provider's page, or ask for less at once.",
+            Self::RoomLeft => "The conversation is nearly full, and compacts before the next reply.",
+        }
+    }
+}
+
+/// How a cut-off notice starts (`cut_off_notice`).
+pub const CUT_OFF_NOTICE_START: &str = "Your last reply was cut off: it reached its limit of ";
+
+/// Saved in the conversation after a reply that hit its `max_tokens`
+/// (SME-111), so the model knows its reply is incomplete and every tab
+/// shows that it was cut off (`parse_cut_off_notice`).
+#[cfg(any(feature = "server", test))]
+pub fn cut_off_notice(tokens: u32, limit: ReplyLimit) -> String {
+    format!("{CUT_OFF_NOTICE_START}{tokens} tokens ({}) before it finished.", limit.reason())
+}
+
+/// A cut-off notice's limit and what bound it.
+pub fn parse_cut_off_notice(text: &str) -> Option<(u32, ReplyLimit)> {
+    let rest = text.strip_prefix(CUT_OFF_NOTICE_START)?;
+    let (tokens, rest) = rest.split_once(" tokens (")?;
+    let (reason, rest) = rest.split_once(')')?;
+    let limit = ReplyLimit::ALL.into_iter().find(|limit| limit.reason() == reason)?;
+    (rest == " before it finished.").then_some((tokens.parse().ok()?, limit))
+}
+
 /// The conversation's last failed turn's error, if the user hasn't written
 /// since: the reconnect pull's copy of `ConversationEvent::TurnError`.
 #[get("/api/conversations/{id}/turn-error")]
