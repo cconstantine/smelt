@@ -52,6 +52,8 @@ ENV USER=dev
 # Add WASM target for the Dioxus web/client build
 RUN rustup target add wasm32-unknown-unknown
 RUN rustup component add rustfmt
+# scripts/lint-expects (SME-95)
+RUN rustup component add clippy
 
 # Downloads into ~/.cache/ms-playwright — dev-owned, no root needed for this
 # part. `/opt/playwright-venv/bin/playwright`/`python` is the entry point for

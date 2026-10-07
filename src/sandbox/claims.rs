@@ -232,8 +232,7 @@ pub(super) async fn wait_for_conversation_pods_gone(
 /// last pod left it.
 pub(super) async fn ensure_conversation_pvcs(client: &kube::Client, conversation_id: i64) -> Result<(), SandboxError> {
     let pvcs = pvc_api(client);
-    for spec in conversation_pvc_specs(conversation_id) {
-        let name = spec.metadata.name.clone().expect("named above");
+    for (name, spec) in conversation_pvc_specs(conversation_id) {
         if pvcs.get_opt(&name).await?.is_some() {
             continue;
         }

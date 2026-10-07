@@ -97,6 +97,7 @@ async fn main() {
     }
 
     let pool = db::init().await;
+    #[expect(clippy::expect_used, reason = "startup: smelt can't run on a schema it couldn't migrate")]
     sqlx::migrate!()
         .run(pool)
         .await
@@ -141,10 +142,12 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
+    #[expect(clippy::expect_used, reason = "startup: smelt can't run without its listener")]
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .expect("failed to bind listener");
     tracing::info!("listening on {}", listener.local_addr().unwrap());
+    #[expect(clippy::expect_used, reason = "serving is the process's whole job: when it ends, the process does")]
     axum::serve(listener, router).await.expect("server error");
 }
 

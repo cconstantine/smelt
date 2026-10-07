@@ -196,6 +196,7 @@ fn pod_activity(row: &db::LivePodRow) -> PodActivity {
     if row.running_commands > 0 {
         return PodActivity::Busy;
     }
+    #[expect(clippy::expect_used, reason = "the array's first element is always Some, so the max is too")]
     let latest = [Some(row.created_at), Some(row.conversation_updated_at), row.last_command_finished_at]
         .into_iter()
         .flatten()

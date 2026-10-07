@@ -18,8 +18,10 @@ const CONNECT_RETRIES: u32 = 10;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 pub async fn init() -> &'static PgPool {
+    #[expect(clippy::expect_used, reason = "startup: smelt can't run without its database")]
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
+    #[expect(clippy::expect_used, reason = "startup: smelt can't run without its database")]
     let options = db_url
         .parse::<PgConnectOptions>()
         .expect("Invalid DATABASE_URL");
@@ -49,10 +51,12 @@ pub async fn init() -> &'static PgPool {
         }
     };
 
+    #[expect(clippy::expect_used, reason = "a second db::init() is a programming error")]
     POOL.set(pool).expect("Database already initialized");
     POOL.get().unwrap()
 }
 
+#[expect(clippy::expect_used, reason = "db::get() before db::init() is a programming error, by design")]
 pub fn get() -> &'static PgPool {
     POOL.get()
         .expect("Database not initialized. Call db::init() first.")
@@ -118,6 +122,7 @@ async fn create_message_on(
     role: &str,
     content: &[ContentBlock],
 ) -> Result<Message, sqlx::Error> {
+    #[expect(clippy::expect_used, reason = "a ContentBlock always serializes: its map keys are strings, and a serde_json::Value holds only finite numbers")]
     let content_json = serde_json::to_string(content)
         .expect("ContentBlock always serializes: no non-string map keys, no floats");
 

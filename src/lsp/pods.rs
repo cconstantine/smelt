@@ -57,6 +57,7 @@ fn pod_script(install_command: &str) -> String {
 
 /// The server pod for `config` next to `sandbox`, its config version
 /// `config_version`.
+#[expect(clippy::expect_used, reason = "a fixed Pod shape; the values from the user (env, image, limits) are strings, which the fields they fill take")]
 pub fn server_pod_spec(sandbox: &SandboxRef, config: &LanguageServerConfig, config_version: &str) -> Pod {
     let mut env = vec![
         json!({"name": "HOME", "value": POD_HOME}),

@@ -87,8 +87,8 @@ pub enum SandboxError {
     /// `Terminating`, `Failed`). What to do here is an open question in
     /// SME-7's plan — not resolved, just surfaced rather than guessed at.
     ExistingPodNotRunning(String),
-    /// A local I/O failure: `Sandbox::exec`'s (real-cluster tests only), or
-    /// a port-forward that gave no stream for the agent's port.
+    /// A local I/O failure reading or writing an exec's or a
+    /// port-forward's stream.
     Io(std::io::Error),
     WebSocket(tokio_tungstenite::tungstenite::Error),
     /// A `sandbox_pods`/`sandbox_terminals` query failed — see SME-9's
@@ -106,6 +106,11 @@ pub enum SandboxError {
     AgentConnectTimeout,
     /// A sandbox call before `init()` built the manager (SME-56).
     NotInitialized,
+    /// kube gave no stream for something smelt asked it for: an exec's
+    /// stdin, stdout or stderr, or a port-forward's port. kube returns one
+    /// for every stream requested, so this is a kube upgrade changing that,
+    /// failing the one request rather than panicking (SME-95).
+    NoStream(String),
 }
 
 impl std::fmt::Display for SandboxError {
@@ -124,7 +129,7 @@ impl std::fmt::Display for SandboxError {
             SandboxError::ExistingPodNotRunning(phase) => {
                 write!(f, "existing sandbox pod is not Running (phase: {phase})")
             }
-            SandboxError::Io(e) => write!(f, "I/O error reading exec output: {e}"),
+            SandboxError::Io(e) => write!(f, "I/O error on an exec's or port-forward's stream: {e}"),
             SandboxError::WebSocket(e) => {
                 write!(f, "WebSocket error talking to sandbox agent: {e}")
             }
@@ -141,6 +146,7 @@ impl std::fmt::Display for SandboxError {
             SandboxError::NotInitialized => {
                 write!(f, "the sandbox isn't set up yet (sandbox::init() hasn't run)")
             }
+            SandboxError::NoStream(what) => write!(f, "kube gave no stream for {what}"),
         }
     }
 }
@@ -151,6 +157,11 @@ impl From<kube::Error> for SandboxError {
     fn from(e: kube::Error) -> Self {
         SandboxError::Kube(e)
     }
+}
+
+/// The stream kube gave for `what`, or `SandboxError::NoStream` naming it.
+pub(super) fn require_stream<T>(stream: Option<T>, what: &str) -> Result<T, SandboxError> {
+    stream.ok_or_else(|| SandboxError::NoStream(what.to_owned()))
 }
 
 pub(crate) fn pods_api(client: &kube::Client) -> Api<Pod> {

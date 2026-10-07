@@ -516,11 +516,52 @@ fn test_pod_container_limits_include_the_docker_sidecar() {
 }
 
 #[test]
+fn test_a_missing_stream_is_a_no_stream_error_naming_it() {
+    let err = require_stream::<u8>(None, "the exec's stdout").expect_err("no stream should be an error");
+    assert!(
+        matches!(&err, SandboxError::NoStream(what) if what == "the exec's stdout"),
+        "expected NoStream naming the stream, got {err:?}"
+    );
+    assert_eq!(err.to_string(), "kube gave no stream for the exec's stdout");
+    assert_eq!(
+        require_stream(Some(7u8), "the exec's stdout").expect("a stream kube gave is passed through"),
+        7
+    );
+}
+
+#[test]
+fn test_an_io_error_says_it_was_on_an_exec_or_port_forward_stream() {
+    let err = SandboxError::Io(std::io::Error::other("broken pipe"));
+    assert_eq!(err.to_string(), "I/O error on an exec's or port-forward's stream: broken pipe");
+}
+
+#[test]
+fn test_a_metrics_request_for_an_invalid_namespace_is_an_error_not_a_panic() {
+    let result = pod_metrics_request("bad namespace");
+    assert!(
+        matches!(result, Err(SandboxError::Kube(kube::Error::HttpError(_)))),
+        "a space isn't a URI character: expected an HttpError, got {result:?}"
+    );
+}
+
+#[test]
+fn test_the_metrics_request_names_the_namespaces_pods() {
+    let request = pod_metrics_request(NAMESPACE).expect("the namespace makes a valid request");
+    assert_eq!(request.method(), http::Method::GET);
+    assert_eq!(
+        request.uri().to_string(),
+        format!("/apis/metrics.k8s.io/v1beta1/namespaces/{NAMESPACE}/pods")
+    );
+}
+
+#[test]
 fn test_docker_pvc_spec_is_named_labelled_and_sized_for_the_conversation() {
-    let [pvc, workspace] = conversation_pvc_specs(42);
-    assert_eq!(workspace.metadata.name.as_deref(), Some("sandbox-workspace-42"));
+    let [(pvc_name, pvc), (workspace_name, workspace)] = conversation_pvc_specs(42);
+    assert_eq!(workspace_name, "sandbox-workspace-42", "each claim's name comes beside its spec");
+    assert_eq!(workspace.metadata.name.as_deref(), Some(workspace_name.as_str()));
     assert_eq!(workspace.metadata.labels, pvc.metadata.labels);
-    assert_eq!(pvc.metadata.name.as_deref(), Some("sandbox-docker-42"));
+    assert_eq!(pvc_name, "sandbox-docker-42", "each claim's name comes beside its spec");
+    assert_eq!(pvc.metadata.name.as_deref(), Some(pvc_name.as_str()));
     assert_eq!(
         pvc.metadata
             .labels

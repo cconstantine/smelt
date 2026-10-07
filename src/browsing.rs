@@ -736,6 +736,7 @@ mod server {
     /// page's `event.buttons` reports. Getting these wrong turns a plain
     /// hover into a drag. Only ever called with a mouse event — the key
     /// events are handled before `send_input` reaches here.
+    #[expect(clippy::expect_used, reason = "the builder's required fields (type, x and y) are always set")]
     fn mouse_event_params(event: &BrowserInputEvent) -> DispatchMouseEventParams {
         use chromiumoxide::cdp::browser_protocol::input::MouseButton;
         const LEFT: i64 = 1;
