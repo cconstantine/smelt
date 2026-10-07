@@ -156,6 +156,16 @@ pub async fn start_with(
     let pods = crate::sandbox::pods_api(client);
     let name = server_pod_name(sandbox.pod_id, &config.name);
     let existing = pods.get_opt(&name).await.map_err(|e| e.to_string())?;
+    // Never another database's pod of the same name (SME-115).
+    if let Some(pod) = &existing
+        && crate::sandbox::ownership(&pod.metadata, &sandbox.instance) != crate::sandbox::Ownership::Ours
+    {
+        return Err(crate::sandbox::SandboxError::NotOurs {
+            name,
+            ownership: crate::sandbox::ownership(&pod.metadata, &sandbox.instance),
+        }
+        .to_string());
+    }
     let created = match existing {
         Some(pod) if pod.metadata.deletion_timestamp.is_none() && !has_stopped(&pod) => false,
         stale => {
@@ -1048,6 +1058,41 @@ pub(crate) mod tests {
             assert_eq!(start_with(&client, &sandbox, &config, "v1").await, Ok(Started::Started));
             })
             .await;
+        }
+
+        /// SME-115: a server pod of the same name that is another
+        /// database's is refused and left alone, never reused or replaced.
+        #[tokio::test]
+        async fn test_another_databases_server_pod_is_left_alone() {
+            let client = client().await;
+            let pods = crate::sandbox::pods_api(&client);
+            let id = unique();
+            let sandbox = SandboxRef {
+                conversation_id: id,
+                pod_id: id,
+                pod_name: crate::sandbox::pod_name(id),
+                pod_uid: "unused".to_string(),
+                node: "unused".to_string(),
+                instance: crate::sandbox::TEST_INSTANCE.to_string(),
+            };
+            let name = server_pod_name(id, "theirs");
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "metadata": {"name": name, "labels": {
+                    LSP_OF_LABEL: id.to_string(),
+                    LSP_SERVER_LABEL: "theirs",
+                    crate::sandbox::INSTANCE_LABEL: "another-smelt-database",
+                }},
+                "spec": {"containers": [{"name": "server", "image": "smelt.invalid/none:0"}]},
+            }))
+            .expect("pod");
+            pods.create(&PostParams::default(), &pod).await.expect("create pod");
+
+            let started = start_with(&client, &sandbox, &echo_server("theirs", ""), "v1").await;
+            let kept = pods.get_opt(&name).await.expect("read").is_some_and(|p| p.metadata.deletion_timestamp.is_none());
+
+            pods.delete(&name, &DeleteParams { grace_period_seconds: Some(0), ..Default::default() }).await.ok();
+            assert!(started.as_ref().is_err_and(|e| e.contains("SME-115")), "{started:?}");
+            assert!(kept, "another database's server pod was deleted");
         }
 
         /// Closing a server's stdin over `pods/exec` reaches the process in

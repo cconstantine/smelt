@@ -2267,6 +2267,113 @@ async fn test_teardown_leaves_another_databases_conversation_of_the_same_id() {
     assert!(deleted.is_empty(), "teardown deleted another database's {deleted:?}");
 }
 
+/// SME-115: a conversation's claims that are another database's (or from
+/// before the fix, unadopted) are refused, never mounted, and left as
+/// they were. Before the fix the start went ahead and mounted them.
+#[tokio::test]
+async fn test_another_databases_claims_are_never_mounted() {
+    let client = test_client().await;
+    let foreign = unused_conversation_id();
+    let unlabelled = foreign + 1;
+    make_claim(&client, &workspace_pvc_name(foreign), foreign, Some("another-smelt-database")).await;
+    make_claim(&client, &workspace_pvc_name(unlabelled), unlabelled, None).await;
+
+    let refused_foreign = ensure_conversation_pvcs(&client, foreign, TEST_INSTANCE).await;
+    let refused_unlabelled = ensure_conversation_pvcs(&client, unlabelled, TEST_INSTANCE).await;
+    let kept = [
+        claim_kept(&client, &workspace_pvc_name(foreign)).await,
+        claim_kept(&client, &workspace_pvc_name(unlabelled)).await,
+    ];
+
+    for id in [foreign, unlabelled] {
+        for name in [docker_pvc_name(id), workspace_pvc_name(id)] {
+            pvc_api(&client).delete(&name, &DeleteParams::default()).await.ok();
+        }
+    }
+    match refused_foreign {
+        Err(SandboxError::NotOurs { name, ownership: Ownership::Foreign }) => {
+            assert_eq!(name, workspace_pvc_name(foreign))
+        }
+        other => panic!("another database's /workspace wasn't refused: {other:?}"),
+    }
+    match refused_unlabelled {
+        Err(e @ SandboxError::NotOurs { ownership: Ownership::Unlabelled, .. }) => {
+            assert!(e.to_string().contains("SME-115"), "{e}")
+        }
+        other => panic!("an unadopted /workspace wasn't refused: {other:?}"),
+    }
+    assert_eq!(kept, [true, true], "a refused claim was changed");
+}
+
+/// SME-115: a pod named like ours that is another database's is refused,
+/// never reused (its agent runs commands for whoever connects), and left.
+#[tokio::test]
+async fn test_another_databases_pod_of_the_same_name_is_never_reused() {
+    let client = test_client().await;
+    let manager = SandboxManager::new(client.clone());
+    let pods = pods_api(&client);
+    let session_id = unique_session_id("foreign");
+    let name = format!("sandbox-{session_id}");
+    let pod: Pod = serde_json::from_value(serde_json::json!({
+        "metadata": {"name": name, "labels": {INSTANCE_LABEL: "another-smelt-database"}},
+        "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
+    }))
+    .expect("pod");
+    pods.create(&PostParams::default(), &pod).await.expect("create pod");
+
+    let result = manager
+        .create_with_running_timeout(
+            &session_id,
+            "128Mi",
+            &DockerSidecar { memory: "512Mi".to_string(), storage: PodStorage::Ephemeral },
+            &[],
+            Duration::from_secs(5),
+            TEST_INSTANCE,
+        )
+        .await;
+    let kept = pods.get_opt(&name).await.expect("read").is_some_and(|p| p.metadata.deletion_timestamp.is_none());
+
+    pods.delete(&name, &immediate_delete_params()).await.ok();
+    assert!(
+        matches!(result, Err(SandboxError::NotOurs { ownership: Ownership::Foreign, .. })),
+        "another database's pod was used: {:?}",
+        result.as_ref().map(|s| &s.pod_name)
+    );
+    assert!(kept, "another database's pod was deleted");
+}
+
+/// SME-115: another database's volume claim of the same name is refused,
+/// never mounted, and deleting our volume of that id leaves it.
+#[tokio::test]
+async fn test_another_databases_volume_claim_is_refused_and_left() {
+    let client = test_client().await;
+    let pvcs = pvc_api(&client);
+    let id = unused_conversation_id();
+    let name = sandbox_volume_pvc_name(id);
+    pvcs.create(&PostParams::default(), &build_volume_pvc_spec(id, "another-smelt-database"))
+        .await
+        .expect("create the claim");
+    let volume = db::SandboxVolume {
+        id,
+        name: "sme-115".to_string(),
+        mount_path: "/data".to_string(),
+        created_at: chrono::Utc::now().naive_utc(),
+        updated_at: chrono::Utc::now().naive_utc(),
+    };
+
+    let mounted = ensure_volume_claims(&client, std::slice::from_ref(&volume), TEST_INSTANCE).await;
+    let deleted = delete_volume_claim(&client, id, TEST_INSTANCE).await;
+    let kept = claim_kept(&client, &name).await;
+
+    pvcs.delete(&name, &DeleteParams::default()).await.ok();
+    assert!(
+        matches!(mounted, Err(SandboxError::NotOurs { ownership: Ownership::Foreign, .. })),
+        "another database's volume claim was used: {mounted:?}"
+    );
+    assert!(deleted.is_ok(), "{deleted:?}");
+    assert!(kept, "deleting our volume deleted another database's claim");
+}
+
 /// SME-115: a new pod waits out the conversation's stopping pods, ours
 /// and ones from before the fix, but never another database's pod
 /// labelled with the same conversation.
@@ -3615,8 +3722,15 @@ async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
 
         let volumes = db::list_sandbox_volumes(&pool).await.expect("list_sandbox_volumes");
         let volume_session_id = unique_session_id(VOLUME_MOUNT_SESSION_LABEL);
-        let volume_sandbox =
-            get().expect("set above").create(&volume_session_id, "128Mi", &volumes).await.expect("create with a volume should succeed");
+        // As this database's: its volume's claim is labelled with its
+        // instance (SME-115), and a pod of another instance can't mount it.
+        let instance = db::smelt_instance(&pool).await.expect("instance");
+        let docker = DockerSidecar { memory: "512Mi".to_string(), storage: PodStorage::Ephemeral };
+        let volume_sandbox = get()
+            .expect("set above")
+            .create_with_docker(&volume_session_id, "128Mi", &docker, &volumes, &instance.id)
+            .await
+            .expect("create with a volume should succeed");
         let write =
             volume_sandbox.exec(&["sh", "-c", "echo hello > /data/testvol/marker.txt"]).await.expect("exec should succeed");
         assert_eq!(write.exit_code, 0, "writing into the mounted volume should succeed");

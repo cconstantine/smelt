@@ -18,10 +18,17 @@ pub(super) async fn ensure_volume_claims(
     let pvcs = pvc_api(client);
     for volume in volumes {
         let claim = sandbox_volume_pvc_name(volume.id);
-        if pvcs.get_opt(&claim).await?.is_none() {
-            tracing::warn!(claim = %claim, "volume claim missing; recreating it");
-            pvcs.create(&PostParams::default(), &build_volume_pvc_spec(volume.id, instance))
-                .await?;
+        match pvcs.get_opt(&claim).await? {
+            None => {
+                tracing::warn!(claim = %claim, "volume claim missing; recreating it");
+                pvcs.create(&PostParams::default(), &build_volume_pvc_spec(volume.id, instance))
+                    .await?;
+            }
+            // Never another database's volume (SME-115).
+            Some(existing) => match ownership(&existing.metadata, instance) {
+                Ownership::Ours => {}
+                other => return Err(SandboxError::NotOurs { name: claim, ownership: other }),
+            },
         }
     }
     Ok(())
@@ -114,6 +121,14 @@ impl SandboxManager {
         // pod's non-`Running` status could be a transient blip on
         // something another part of the system still depends on.
         let just_created = match pods.get_opt(&name).await? {
+            // Never another database's pod (SME-115): its agent runs
+            // commands for whoever connects.
+            Some(pod) if ownership(&pod.metadata, instance) != Ownership::Ours => {
+                return Err(SandboxError::NotOurs {
+                    name,
+                    ownership: ownership(&pod.metadata, instance),
+                });
+            }
             Some(pod) => {
                 let phase = pod.status.and_then(|s| s.phase).unwrap_or_default();
                 if phase != "Running" {
@@ -706,15 +721,40 @@ pub async fn create_volume(
 /// there" tolerance `force_terminate_pod` already has for its own pod.
 pub async fn delete_volume(pool: &PgPool, id: i64) -> Result<(), SandboxError> {
     let manager = get()?;
-    let pvcs = pvc_api(&manager.client);
-    let pvc_name = sandbox_volume_pvc_name(id);
-    if pvcs.get_opt(&pvc_name).await?.is_some() {
-        pvcs.delete(&pvc_name, &DeleteParams::default()).await?;
-    }
+    let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
+    delete_volume_claim(&manager.client, id, &instance.id).await?;
     db::delete_sandbox_volume(pool, id)
         .await
         .map_err(SandboxError::Db)?;
     Ok(())
+}
+
+/// Deletes volume `id`'s claim if it's ours (SME-115), only while it's
+/// still the object read. Another database's claim of that name, or one
+/// from before the fix, is left and logged.
+pub(super) async fn delete_volume_claim(client: &kube::Client, id: i64, instance: &str) -> Result<(), SandboxError> {
+    let pvcs = pvc_api(client);
+    let name = sandbox_volume_pvc_name(id);
+    let Some(claim) = pvcs.get_opt(&name).await? else {
+        return Ok(());
+    };
+    match (ownership(&claim.metadata, instance), claim.metadata.uid) {
+        (Ownership::Ours, uid) => {
+            let params = DeleteParams {
+                preconditions: Some(kube::api::Preconditions { uid, resource_version: None }),
+                ..Default::default()
+            };
+            match pvcs.delete(&name, &params).await {
+                Ok(_) => Ok(()),
+                Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        }
+        (other, _) => {
+            tracing::warn!(claim = %name, ownership = ?other, "left a volume claim that isn't this database's");
+            Ok(())
+        }
+    }
 }
 
 /// Whether sandbox pod `pod_id` still exists in the cluster (terminating

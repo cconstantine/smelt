@@ -47,6 +47,12 @@ pub async fn sandbox_ref(pool: &PgPool, client: &kube::Client, conversation_id: 
         .await
         .map_err(|e| format!("Couldn't find the sandbox pod: {e}"))?;
     let instance = crate::db::smelt_instance(pool).await.map_err(|e| e.to_string())?;
+    // Servers mount the sandbox's /workspace: never another database's
+    // (SME-115).
+    let ownership = crate::sandbox::ownership(&pod.metadata, &instance.id);
+    if ownership != crate::sandbox::Ownership::Ours {
+        return Err(crate::sandbox::SandboxError::NotOurs { name: pod_name, ownership }.to_string());
+    }
     Ok(SandboxRef {
         instance: instance.id,
         conversation_id,

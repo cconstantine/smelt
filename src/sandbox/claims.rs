@@ -300,15 +300,19 @@ pub(super) async fn ensure_conversation_pvcs(
 ) -> Result<(), SandboxError> {
     let pvcs = pvc_api(client);
     for (name, spec) in conversation_pvc_specs(conversation_id, instance) {
-        if pvcs.get_opt(&name).await?.is_some() {
-            continue;
-        }
-        match pvcs.create(&PostParams::default(), &spec).await {
-            // Another create for the same conversation got there first.
-            Err(kube::Error::Api(e)) if e.code == 409 => {}
-            other => {
-                other?;
-            }
+        let existing = match pvcs.get_opt(&name).await? {
+            Some(claim) => claim,
+            None => match pvcs.create(&PostParams::default(), &spec).await {
+                Ok(_) => continue,
+                // Another create got there first: whose is it?
+                Err(kube::Error::Api(e)) if e.code == 409 => pvcs.get(&name).await?,
+                Err(e) => return Err(e.into()),
+            },
+        };
+        // Never another database's /workspace (SME-115).
+        match ownership(&existing.metadata, instance) {
+            Ownership::Ours => {}
+            other => return Err(SandboxError::NotOurs { name, ownership: other }),
         }
     }
     Ok(())
