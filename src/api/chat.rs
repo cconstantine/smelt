@@ -60,7 +60,7 @@ pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
     // one still starting sees the conversation gone (`create_pod`).
     // Best-effort, unconditional (unlike terminate_pod, which the model
     // calls and which is guarded).
-    crate::sandbox::teardown_conversation(id, &pod_ids).await;
+    crate::sandbox::teardown_conversation(db::get(), id, &pod_ids).await;
     crate::events::forget(id);
     forget_conversation_lock(id);
     // After the delete, so a listener refetching sees the pod rows gone.

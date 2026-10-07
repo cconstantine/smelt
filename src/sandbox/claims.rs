@@ -256,18 +256,27 @@ pub(super) async fn report_docker_restart(pool: &PgPool, pod_id: i64, reason: Op
 
 /// Waits until no pod labelled with `conversation_id` is left in the
 /// cluster, so a new pod never shares the Docker claim with one still
-/// stopping.
+/// stopping. Ours, and ones with no instance label (from before SME-115:
+/// possibly ours, and waiting harms nothing); never another database's.
 pub(super) async fn wait_for_conversation_pods_gone(
     client: &kube::Client,
     conversation_id: i64,
     timeout: Duration,
+    instance: &str,
 ) -> Result<(), SandboxError> {
     let pods = pods_api(client);
-    let selector = ListParams::default().labels(&format!("{CONVERSATION_LABEL}={conversation_id}"));
+    let selectors = [
+        format!("{CONVERSATION_LABEL}={conversation_id},{INSTANCE_LABEL}={instance}"),
+        format!("{CONVERSATION_LABEL}={conversation_id},!{INSTANCE_LABEL}"),
+    ]
+    .map(|labels| ListParams::default().labels(&labels));
     let waited = tokio::time::timeout(timeout, async {
         loop {
-            let remaining = pods.list(&selector).await?;
-            if remaining.items.is_empty() {
+            let mut remaining = false;
+            for selector in &selectors {
+                remaining |= !pods.list(selector).await?.items.is_empty();
+            }
+            if !remaining {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -306,13 +315,27 @@ pub(super) async fn ensure_conversation_pvcs(
 }
 
 /// Best-effort, like the rest of conversation teardown: logged, never
-/// returned. The startup sweep catches whatever this misses.
-pub(super) async fn delete_conversation_pvcs(client: &kube::Client, conversation_id: i64) {
+/// returned. The startup sweep catches whatever this misses. Only claims
+/// labelled with `instance` are deleted (SME-115).
+pub(super) async fn delete_conversation_pvcs(client: &kube::Client, conversation_id: i64, instance: &str) {
     for name in [docker_pvc_name(conversation_id), workspace_pvc_name(conversation_id)] {
-        match pvc_api(client).delete(&name, &DeleteParams::default()).await {
-            Ok(_) => {}
-            Err(kube::Error::Api(e)) if e.code == 404 => {}
-            Err(e) => tracing::warn!(claim = %name, error = %e, "failed to delete a conversation's claim"),
+        let claim = match pvc_api(client).get_opt(&name).await {
+            Ok(Some(claim)) => claim,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(claim = %name, error = %e, "couldn't read a conversation's claim to delete");
+                continue;
+            }
+        };
+        match (ownership(&claim.metadata, instance), claim.metadata.uid) {
+            (Ownership::Ours, Some(uid)) => delete_claim_if_unchanged(client, &name, &uid).await,
+            (Ownership::Ours, None) => tracing::warn!(claim = %name, "a claim with no uid; left alone"),
+            (Ownership::Unlabelled, _) => {
+                tracing::warn!(claim = %name, "left a claim with no smelt/instance label (made before SME-115)")
+            }
+            (Ownership::Foreign, _) => {
+                tracing::info!(claim = %name, "left another smelt database's claim of the same name")
+            }
         }
     }
 }

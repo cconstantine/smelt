@@ -1899,7 +1899,7 @@ async fn test_wait_for_conversation_pods_gone_waits_out_a_stopping_pod() {
         .expect("start deleting the pod");
     let listed_while_stopping = pods.get_opt(&name).await.expect("get pod").is_some();
     let waited =
-        wait_for_conversation_pods_gone(&client, conversation_id, Duration::from_secs(60)).await;
+        wait_for_conversation_pods_gone(&client, conversation_id, Duration::from_secs(60), TEST_INSTANCE).await;
     let still_there = pods.get_opt(&name).await.expect("get pod").is_some();
 
     pods.delete(&name, &immediate_delete_params()).await.ok();
@@ -2033,7 +2033,8 @@ async fn test_a_stopping_pod_from_another_run_doesnt_hold_up_the_tier(pool: PgPo
             .await
             .map_err(|e| format!("move the id sequences: {e}"))?;
         let conversation = db::create_conversation(&pool).await.map_err(|e| format!("conversation: {e}"))?;
-        wait_for_conversation_pods_gone(&client, conversation.id, Duration::from_secs(10))
+        let instance = db::smelt_instance(&pool).await.map_err(|e| format!("instance: {e}"))?.id;
+        wait_for_conversation_pods_gone(&client, conversation.id, Duration::from_secs(10), &instance)
             .await
             .map_err(|e| format!("conversation {}'s pod would wait: {e:?}", conversation.id))?;
         Ok(conversation.id)
@@ -2094,8 +2095,9 @@ async fn test_a_failed_start_for_a_deleted_conversation_leaves_no_claims(pool: P
     // other runs' claims in the shared test namespace.
     let offset = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64 + 2_000_000_000;
     db::delete_conversation(&pool, deleted.id).await.expect("delete");
+    let instance = db::smelt_instance(&pool).await.expect("instance").id;
     for id in [deleted.id, live.id] {
-        ensure_conversation_pvcs(&client, id + offset, TEST_INSTANCE).await.expect("claims");
+        ensure_conversation_pvcs(&client, id + offset, &instance).await.expect("claims");
     }
 
     clean_up_after_failed_start(&pool, &client, deleted.id, deleted.id + offset).await;
@@ -2103,8 +2105,8 @@ async fn test_a_failed_start_for_a_deleted_conversation_leaves_no_claims(pool: P
 
     let gone = pvcs.get_opt(&docker_pvc_name(deleted.id + offset)).await.expect("get").is_none_or(|p| p.metadata.deletion_timestamp.is_some());
     let kept = pvcs.get_opt(&docker_pvc_name(live.id + offset)).await.expect("get").is_some();
-    delete_conversation_pvcs(&client, live.id + offset).await;
-    delete_conversation_pvcs(&client, deleted.id + offset).await;
+    delete_conversation_pvcs(&client, live.id + offset, &instance).await;
+    delete_conversation_pvcs(&client, deleted.id + offset, &instance).await;
     assert!(gone, "the deleted conversation's re-created claim was left behind");
     assert!(kept, "a live conversation's claims must stay");
 }
@@ -2140,7 +2142,7 @@ async fn test_teardown_deletes_a_conversations_pod_that_has_no_record() {
     // that doesn't exist keeps it Pending and costs the cluster nothing.
     let name = format!("sandbox-{conversation_id}");
     let pod: Pod = serde_json::from_value(serde_json::json!({
-        "metadata": {"name": name, "labels": {CONVERSATION_LABEL: conversation_id.to_string()}},
+        "metadata": {"name": name, "labels": {CONVERSATION_LABEL: conversation_id.to_string(), INSTANCE_LABEL: TEST_INSTANCE}},
         "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
     }))
     .expect("pod");
@@ -2150,13 +2152,13 @@ async fn test_teardown_deletes_a_conversations_pod_that_has_no_record() {
     // its own label.
     let server = format!("lsp-{conversation_id}-x");
     let server_pod: Pod = serde_json::from_value(serde_json::json!({
-        "metadata": {"name": server, "labels": {crate::lsp::pods::LSP_OF_LABEL: conversation_id.to_string()}},
+        "metadata": {"name": server, "labels": {crate::lsp::pods::LSP_OF_LABEL: conversation_id.to_string(), INSTANCE_LABEL: TEST_INSTANCE}},
         "spec": {"containers": [{"name": "server", "image": "smelt.invalid/none:0"}]},
     }))
     .expect("pod");
     pods.create(&PostParams::default(), &server_pod).await.expect("create server pod");
 
-    teardown_conversation_with(&client, conversation_id, &[]).await;
+    teardown_conversation_with(&client, conversation_id, &[], TEST_INSTANCE).await;
     let gone = tokio::time::timeout(Duration::from_secs(60), async {
         while pods.get_opt(&name).await.ok().flatten().is_some()
             || pods.get_opt(&server).await.ok().flatten().is_some()
@@ -2175,31 +2177,128 @@ async fn test_teardown_deletes_a_conversations_pod_that_has_no_record() {
 /// SME-88: a pod without the conversation label (one from before
 /// SME-33) is still deleted, found by its record's id.
 #[tokio::test]
-async fn test_teardown_deletes_an_unlabelled_pod_named_by_its_record() {
+async fn test_teardown_deletes_our_pod_named_by_its_record_but_not_an_unlabelled_one() {
     let client = test_client().await;
     let pods = pods_api(&client);
     let conversation_id = (uuid_like().parse::<u128>().expect("nanos") % 1_000_000_000) as i64
         + 1_000_000_000;
-    let pod_id = conversation_id + 1;
-    let name = pod_name(pod_id);
-    let pod: Pod = serde_json::from_value(serde_json::json!({
-        "metadata": {"name": name},
-        "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
-    }))
-    .expect("pod");
-    pods.create(&PostParams::default(), &pod).await.expect("create pod");
+    // Ours, with no conversation label (SME-88), and one from before
+    // SME-115, with no label at all.
+    let ours = pod_name(conversation_id + 1);
+    let unlabelled = pod_name(conversation_id + 2);
+    for (name, labels) in [
+        (&ours, serde_json::json!({INSTANCE_LABEL: TEST_INSTANCE})),
+        (&unlabelled, serde_json::json!({})),
+    ] {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": name, "labels": labels},
+            "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
+        }))
+        .expect("pod");
+        pods.create(&PostParams::default(), &pod).await.expect("create pod");
+    }
 
-    teardown_conversation_with(&client, conversation_id, &[pod_id]).await;
-    let gone = tokio::time::timeout(Duration::from_secs(60), async {
-        while pods.get_opt(&name).await.ok().flatten().is_some() {
+    teardown_conversation_with(&client, conversation_id, &[conversation_id + 1, conversation_id + 2], TEST_INSTANCE)
+        .await;
+    let ours_gone = tokio::time::timeout(Duration::from_secs(60), async {
+        while pods.get_opt(&ours).await.ok().flatten().is_some() {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     })
     .await
     .is_ok();
+    let unlabelled_kept = pods
+        .get_opt(&unlabelled)
+        .await
+        .expect("read the pod")
+        .is_some_and(|pod| pod.metadata.deletion_timestamp.is_none());
 
-    pods.delete(&name, &immediate_delete_params()).await.ok();
-    assert!(gone, "{name} survived its conversation's teardown");
+    pods.delete(&ours, &immediate_delete_params()).await.ok();
+    pods.delete(&unlabelled, &immediate_delete_params()).await.ok();
+    assert!(ours_gone, "{ours} survived its conversation's teardown");
+    assert!(unlabelled_kept, "teardown deleted {unlabelled}, which has no instance label");
+}
+
+/// SME-115: a server deleting its conversation N leaves another database's
+/// conversation N alone: its sandbox pod, its language server pod (found
+/// by label), a pod its records happen to name, and its claims. Before
+/// the fix teardown deleted them all.
+#[tokio::test]
+async fn test_teardown_leaves_another_databases_conversation_of_the_same_id() {
+    let client = test_client().await;
+    let pods = pods_api(&client);
+    let pvcs = pvc_api(&client);
+    let theirs = "another-smelt-database";
+    let conversation_id = unused_conversation_id();
+    let sandbox = pod_name(conversation_id);
+    let server = format!("lsp-{conversation_id}-x");
+    for (name, label) in [(&sandbox, CONVERSATION_LABEL), (&server, crate::lsp::pods::LSP_OF_LABEL)] {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": name, "labels": {label: conversation_id.to_string(), INSTANCE_LABEL: theirs}},
+            "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
+        }))
+        .expect("pod");
+        pods.create(&PostParams::default(), &pod).await.expect("create pod");
+    }
+    let claims = [docker_pvc_name(conversation_id), workspace_pvc_name(conversation_id)];
+    for claim in &claims {
+        make_claim(&client, claim, conversation_id, Some(theirs)).await;
+    }
+
+    teardown_conversation_with(&client, conversation_id, &[conversation_id], TEST_INSTANCE).await;
+    let mut deleted = Vec::new();
+    for name in [&sandbox, &server] {
+        if !pods.get_opt(name).await.expect("read").is_some_and(|p| p.metadata.deletion_timestamp.is_none()) {
+            deleted.push(name.clone());
+        }
+    }
+    for claim in &claims {
+        if !claim_kept(&client, claim).await {
+            deleted.push(claim.clone());
+        }
+    }
+
+    for name in [&sandbox, &server] {
+        pods.delete(name, &immediate_delete_params()).await.ok();
+    }
+    for claim in &claims {
+        pvcs.delete(claim, &DeleteParams::default()).await.ok();
+    }
+    assert!(deleted.is_empty(), "teardown deleted another database's {deleted:?}");
+}
+
+/// SME-115: a new pod waits out the conversation's stopping pods, ours
+/// and ones from before the fix, but never another database's pod
+/// labelled with the same conversation.
+#[tokio::test]
+async fn test_the_wait_for_old_pods_ignores_another_databases() {
+    let client = test_client().await;
+    let pods = pods_api(&client);
+    let conversation_id = unused_conversation_id();
+    let foreign = pod_name(conversation_id);
+    let pod: Pod = serde_json::from_value(serde_json::json!({
+        "metadata": {"name": foreign, "labels": {CONVERSATION_LABEL: conversation_id.to_string(), INSTANCE_LABEL: "another-smelt-database"}},
+        "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
+    }))
+    .expect("pod");
+    pods.create(&PostParams::default(), &pod).await.expect("create pod");
+    let foreign_ignored =
+        wait_for_conversation_pods_gone(&client, conversation_id, Duration::from_secs(3), TEST_INSTANCE).await;
+
+    // The same pod with no instance label: waited on.
+    let unlabel = serde_json::json!({"metadata": {"labels": {INSTANCE_LABEL: null}}});
+    pods.patch(&foreign, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&unlabel))
+        .await
+        .expect("drop the instance label");
+    let unlabelled_waited =
+        wait_for_conversation_pods_gone(&client, conversation_id, Duration::from_secs(2), TEST_INSTANCE).await;
+
+    pods.delete(&foreign, &immediate_delete_params()).await.ok();
+    assert!(foreign_ignored.is_ok(), "waited on another database's pod: {foreign_ignored:?}");
+    assert!(
+        matches!(unlabelled_waited, Err(SandboxError::Timeout(_))),
+        "a pod from before the fix may be ours, and must be waited out: {unlabelled_waited:?}"
+    );
 }
 
 /// A conversation id no other test or run uses: claims are named after it.
@@ -2283,7 +2382,7 @@ async fn test_ensure_docker_pvc_creates_once_and_delete_removes_it() {
     let second_uid = pvcs.get_opt(&name).await.expect("get claim").and_then(|p| p.metadata.uid);
     assert_eq!(first_uid, second_uid, "a second ensure must reuse the claim, not replace it");
 
-    delete_conversation_pvcs(&client, conversation_id).await;
+    delete_conversation_pvcs(&client, conversation_id, TEST_INSTANCE).await;
     let gone = tokio::time::timeout(Duration::from_secs(30), async {
         while pvcs.get_opt(&name).await.expect("get claim").is_some() {
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -3456,7 +3555,7 @@ async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
             .map(|c| c.claim_name);
         assert_eq!(mounted_workspace.as_deref(), Some(workspace_claim.as_str()), "pod j's /workspace is its conversation's claim");
 
-        teardown_conversation(conversation_j.id, &[]).await;
+        teardown_conversation(&pool, conversation_j.id, &[]).await;
         // The claim's `pvc-protection` finalizer holds it until the pod
         // is really gone.
         let docker_claim_gone = tokio::time::timeout(Duration::from_secs(60), async {
@@ -3496,7 +3595,7 @@ async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
             }
         })
         .await;
-        teardown_conversation(conversation_k.id, &[]).await;
+        teardown_conversation(&pool, conversation_k.id, &[]).await;
         assert!(announced.is_ok(), "a create_pod whose caller went away never finished");
 
         // --- Generic volumes: create_volume/delete_volume manage a

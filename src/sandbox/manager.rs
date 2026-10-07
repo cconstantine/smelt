@@ -398,7 +398,10 @@ where
 /// id its pods and claims are labelled with (the same, outside tests).
 pub(super) async fn clean_up_after_failed_start(pool: &PgPool, client: &kube::Client, conversation_id: i64, label_id: i64) {
     if !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
-        teardown_conversation_with(client, label_id, &[]).await;
+        match db::smelt_instance(pool).await {
+            Ok(instance) => teardown_conversation_with(client, label_id, &[], &instance.id).await,
+            Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't read this database's instance to clean up"),
+        }
     }
 }
 
@@ -453,7 +456,7 @@ pub(super) async fn create_pod_attempt(
     // `SandboxManager::delete` itself already uses for the same reason.
     // A pod terminate_pod just stopped can still hold the Docker claim.
     if let Err(e) =
-        wait_for_conversation_pods_gone(&manager.client, conversation_id, running_wait_timeout())
+        wait_for_conversation_pods_gone(&manager.client, conversation_id, running_wait_timeout(), &instance.id)
             .await
     {
         let _ = db::terminate_sandbox_pod(pool, row.id).await;
@@ -481,7 +484,7 @@ pub(super) async fn create_pod_attempt(
             // The conversation may have been deleted while this pod was
             // starting; its teardown had nothing to find yet (SME-51 B5).
             if !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
-                teardown_conversation_with(&manager.client, conversation_id, &[]).await;
+                teardown_conversation_with(&manager.client, conversation_id, &[], &instance.id).await;
                 return Err(SandboxError::StartFailed(
                     "the conversation was deleted while its sandbox was starting".to_string(),
                 ));
@@ -734,10 +737,24 @@ pub(crate) async fn pod_exists(pod_id: i64) -> bool {
 /// here: `db::delete_conversation`'s `ON DELETE CASCADE` chain removes
 /// `sandbox_pods`/`sandbox_terminals`/`terminal_commands` for real right
 /// after this runs.
-pub async fn teardown_conversation(conversation_id: i64, pod_ids: &[i64]) {
-    match get() {
-        Ok(manager) => teardown_conversation_with(&manager.client, conversation_id, pod_ids).await,
-        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't tear down the conversation's sandbox"),
+pub async fn teardown_conversation(pool: &PgPool, conversation_id: i64, pod_ids: &[i64]) {
+    let manager = match get() {
+        Ok(manager) => manager,
+        Err(e) => {
+            tracing::warn!(conversation_id, error = %e, "couldn't tear down the conversation's sandbox");
+            return;
+        }
+    };
+    // Without it nothing can be told ours: leave it all (SME-115). The
+    // startup sweep gets the claims; the pods are logged.
+    match db::smelt_instance(pool).await {
+        Ok(instance) => teardown_conversation_with(&manager.client, conversation_id, pod_ids, &instance.id).await,
+        Err(e) => tracing::warn!(
+            conversation_id,
+            ?pod_ids,
+            error = %e,
+            "couldn't read this database's instance; the conversation's sandbox is left running"
+        ),
     }
 }
 
@@ -745,42 +762,90 @@ pub async fn teardown_conversation(conversation_id: i64, pod_ids: &[i64]) {
 /// conversation label: a `create_pod` racing the conversation's deletion
 /// makes a pod whose record the delete then cascades away (SME-51 B5).
 /// `pod_ids`, the conversation's live pod records read before the delete,
-/// name the rest (SME-88).
-pub(super) async fn teardown_conversation_with(client: &kube::Client, conversation_id: i64, pod_ids: &[i64]) {
+/// name the rest (SME-88). Only objects labelled with `instance` are
+/// deleted: another database's conversation of the same id, or one from
+/// before SME-115, is left alone.
+pub(super) async fn teardown_conversation_with(
+    client: &kube::Client,
+    conversation_id: i64,
+    pod_ids: &[i64],
+    instance: &str,
+) {
     let pods = pods_api(client);
     // Its sandbox pods, and its language server pods (SME-35).
     for label in [CONVERSATION_LABEL, crate::lsp::pods::LSP_OF_LABEL] {
-        let selector = ListParams::default().labels(&format!("{label}={conversation_id}"));
-        delete_listed(&pods, &selector, conversation_id).await;
+        let selector =
+            ListParams::default().labels(&format!("{label}={conversation_id},{INSTANCE_LABEL}={instance}"));
+        delete_listed(&pods, &selector, conversation_id, instance).await;
     }
-    // And the pods its records name, labelled or not (one from before
-    // SME-33 has no label; SME-88). A pod deleted above is already gone.
+    // And the pods its records name, without a conversation label (one
+    // from before SME-33; SME-88). A pod deleted above is already gone.
     for &pod_id in pod_ids {
         deregister(pod_id);
-        match pods.delete(&pod_name(pod_id), &pod_delete_params()).await {
-            Ok(_) => {}
-            Err(kube::Error::Api(e)) if e.code == 404 => {}
-            Err(e) => tracing::warn!(pod_id, error = %e, "failed to delete pod during conversation teardown"),
-        }
+        delete_pod_if_ours(&pods, &pod_name(pod_id), instance).await;
     }
     // After the pods: Kubernetes holds a claim until no pod mounts it.
-    delete_conversation_pvcs(client, conversation_id).await;
+    delete_conversation_pvcs(client, conversation_id, instance).await;
 }
 
-pub(super) async fn delete_listed(pods: &Api<Pod>, selector: &ListParams, conversation_id: i64) {
+pub(super) async fn delete_listed(pods: &Api<Pod>, selector: &ListParams, conversation_id: i64, instance: &str) {
     match pods.list(selector).await {
         Ok(list) => {
             for pod in list {
+                // Whatever the selector: only ours (SME-115).
+                if ownership(&pod.metadata, instance) != Ownership::Ours {
+                    continue;
+                }
                 if let Some(pod_id) = watched_pod_id(&pod) {
                     deregister(pod_id);
                 }
-                let Some(name) = pod.metadata.name else { continue };
-                if let Err(e) = pods.delete(&name, &pod_delete_params()).await {
-                    tracing::warn!(pod = %name, error = %e, "failed to delete pod during conversation teardown");
-                }
+                let (Some(name), Some(uid)) = (pod.metadata.name, pod.metadata.uid) else { continue };
+                delete_pod_if_unchanged(pods, &name, &uid).await;
             }
         }
         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't list a deleted conversation's pods"),
+    }
+}
+
+/// Deletes pod `name` if it's ours (SME-115), only while it's still the
+/// object that was read. Another database's pod of the same name, or one
+/// from before the fix, is left and logged. Best-effort.
+pub(super) async fn delete_pod_if_ours(pods: &Api<Pod>, name: &str, instance: &str) {
+    let pod = match pods.get_opt(name).await {
+        Ok(Some(pod)) => pod,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(pod = %name, error = %e, "couldn't read a pod to delete");
+            return;
+        }
+    };
+    match (ownership(&pod.metadata, instance), pod.metadata.uid) {
+        (Ownership::Ours, Some(uid)) => delete_pod_if_unchanged(pods, name, &uid).await,
+        (Ownership::Ours, None) => tracing::warn!(pod = %name, "a pod with no uid; left alone"),
+        (Ownership::Unlabelled, _) => {
+            tracing::warn!(pod = %name, "left a pod with no smelt/instance label (made before SME-115)")
+        }
+        (Ownership::Foreign, _) => tracing::info!(pod = %name, "left another smelt database's pod of the same name"),
+    }
+}
+
+/// Deletes pod `name` with smelt's grace period, only while it's still
+/// the object with `uid`. Best-effort: logged, never returned.
+pub(super) async fn delete_pod_if_unchanged(pods: &Api<Pod>, name: &str, uid: &str) {
+    let params = DeleteParams {
+        preconditions: Some(kube::api::Preconditions {
+            uid: Some(uid.to_string()),
+            resource_version: None,
+        }),
+        ..pod_delete_params()
+    };
+    match pods.delete(name, &params).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(e)) if e.code == 404 => {}
+        Err(kube::Error::Api(e)) if e.code == 409 => {
+            tracing::info!(pod = %name, "a pod was replaced since it was read; left alone")
+        }
+        Err(e) => tracing::warn!(pod = %name, error = %e, "failed to delete a pod"),
     }
 }
 
