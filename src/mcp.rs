@@ -1882,8 +1882,11 @@ mod tests {
         evict(server.id).await;
     }
 
-    /// SME-113: a new grant (a Connect, which evicts) gets a new manager,
-    /// so its refreshes name its own client, not the old grant's.
+    /// SME-113: a manager built for an older grant isn't reused for a new
+    /// one, even when no `evict` came between them (a build that finished
+    /// after the callback's evict), so the new grant's refreshes name its
+    /// own client. Review 1: this test used to evict first, which left
+    /// nothing cached to reuse.
     #[sqlx::test]
     async fn test_a_new_grant_refreshes_with_its_own_client(pool: sqlx::PgPool) {
         let mock = oauth_http::spawn().await;
@@ -1891,9 +1894,9 @@ mod tests {
         oauth_http::save_grant(&pool, server.id, &mock, "client-1").await;
         let config = oauth_http::config(&pool, server.id).await;
         connection_check(&pool, &config).await.expect("connects with the first grant");
+        assert!(OAUTH_CLIENTS.lock().await.contains_key(&server.id), "the first grant's manager is cached");
 
         oauth_http::save_grant(&pool, server.id, &mock, "client-2").await;
-        evict(server.id).await;
         oauth_http::age_token(&pool, server.id).await;
         let config = oauth_http::config(&pool, server.id).await;
         connection_check(&pool, &config).await.expect("connects with the new grant");
@@ -1903,6 +1906,7 @@ mod tests {
             Some("client-2")
         );
         evict(server.id).await;
+        assert!(!OAUTH_CLIENTS.lock().await.contains_key(&server.id), "evict drops the manager");
     }
 
     /// SME-113: a token revoked before its expiry, whose refresh the
