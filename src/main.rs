@@ -104,6 +104,15 @@ async fn main() {
         .expect("failed to run database migrations");
     tracing::info!("database initialized and migrations applied");
 
+    // A fresh database (a scratch check server's) names its pods and claims
+    // far from the dev server's (SME-115). Ownership checks still hold if
+    // this fails; a name that meets another database's is refused.
+    match db::start_ids_clear_if_fresh(pool).await {
+        Ok(Some(base)) => tracing::info!(base, "a fresh database: its ids start clear of other smelt databases'"),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "couldn't move a fresh database's ids clear of other smelt databases'"),
+    }
+
     mcp::ensure_default_servers(pool).await;
 
     if let Err(e) = sandbox::init().await {
