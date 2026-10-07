@@ -29,6 +29,8 @@ mod mcp_oauth;
 mod models;
 #[cfg(feature = "server")]
 mod preview;
+#[cfg(feature = "server")]
+mod pricing;
 mod providers;
 mod questions;
 #[cfg(feature = "server")]
@@ -128,6 +130,10 @@ async fn main() {
     // Each sandbox's dev servers, for the user's browser, on a listener of
     // its own (SME-42).
     preview::start(pool.clone()).await;
+
+    // Model prices for each call's cost: the saved copy, then models.dev
+    // now and hourly (SME-106).
+    pricing::start(pool.clone());
 
     let router = build_router();
 

@@ -5,13 +5,13 @@ use dioxus::prelude::*;
 
 use crate::api::chat::{get_conversation_model, set_conversation_model};
 use crate::api::providers::{
-    add_provider_model, create_provider, delete_provider, get_default_model, get_provider, list_provider_models,
-    list_providers, refresh_model_details, set_default_model, set_model_settings, update_provider,
+    add_provider_model, create_provider, delete_provider, get_default_model, get_provider, get_recent_spend, list_price_sources,
+    list_provider_models, list_providers, refresh_model_details, set_default_model, set_model_settings, update_provider,
 };
 use crate::frontend::Route;
 use crate::providers::{
-    AuthKind, ConversationModel, ModelChoice, ModelInfo, ProviderInput, ProviderKind, ProviderSummary,
-    ASSUMED_CONTEXT_WINDOW,
+    suggest_price_source, AuthKind, ConversationModel, ModelChoice, ModelInfo, PriceSource, ProviderInput, ProviderKind,
+    ProviderSummary, ASSUMED_CONTEXT_WINDOW,
 };
 
 use super::server_error_message;
@@ -311,6 +311,7 @@ pub fn ProvidersIndex() -> Element {
         refresh();
         get_default_model().await
     });
+    let recent_spend = use_resource(move || async move { get_recent_spend().await });
     let mut changing_default = use_signal(|| false);
     let mut default_error: Signal<Option<String>> = use_signal(|| None);
     let choose_default = move |(provider_id, model): (i64, String)| {
@@ -401,7 +402,60 @@ pub fn ProvidersIndex() -> Element {
                     }
                 },
             }
+
+            if let Some(Ok(spend)) = recent_spend() {
+                if !spend.is_empty() {
+                    section { class: "providers-spend",
+                        h2 { "Last 30 days" }
+                        p { class: "muted",
+                            "Completed model calls, priced from each provider's \u{201c}Prices from\u{201d} entry when they finished."
+                        }
+                        div { class: "mcp-server-list",
+                            for row in spend {
+                                div { class: "mcp-server-row",
+                                    key: "{row.provider_name.clone().unwrap_or_default()}/{row.model}",
+                                    div { class: "mcp-server-summary",
+                                        span { class: "mcp-server-name", "{model_spend_label(&row)}" }
+                                        span { class: "mcp-server-url",
+                                            "{crate::models::calls_text(row.calls)} \u{b7} input {row.input_tokens} uncached, {row.cache_creation_input_tokens} written, "
+                                            "{row.cache_read_input_tokens} read \u{b7} output {row.output_tokens}"
+                                        }
+                                    }
+                                    span { class: "providers-spend-cost",
+                                        "{crate::models::cost_text(row.calls, row.cost_usd, row.unpriced_calls)}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
+    }
+}
+
+/// "Provider · model" for a spend row, or the model alone under a deleted
+/// provider.
+fn model_spend_label(row: &crate::models::ModelSpend) -> String {
+    match &row.provider_name {
+        Some(provider) => format!("{provider} \u{b7} {}", row.model),
+        None => format!("{} (deleted provider)", row.model),
+    }
+}
+
+#[cfg(test)]
+mod spend_label_tests {
+    use super::*;
+
+    #[test]
+    fn test_a_spend_row_names_its_provider_or_says_it_was_deleted() {
+        let row = |provider: Option<&str>| crate::models::ModelSpend {
+            provider_name: provider.map(str::to_string),
+            model: "m".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(model_spend_label(&row(Some("Anthropic"))), "Anthropic \u{b7} m");
+        assert_eq!(model_spend_label(&row(None)), "m (deleted provider)");
     }
 }
 
@@ -413,6 +467,11 @@ struct ProviderForm {
     base_url: String,
     auth_kind: AuthKind,
     secret: String,
+    prompt_caching: bool,
+    /// The catalog provider that prices its calls (SME-106).
+    price_source: Option<String>,
+    /// Picked by the user: no longer follows the address.
+    price_source_chosen: bool,
 }
 
 impl ProviderForm {
@@ -423,6 +482,9 @@ impl ProviderForm {
             base_url: String::new(),
             auth_kind: kind.default_auth_kind(),
             secret: String::new(),
+            prompt_caching: kind.default_prompt_caching(),
+            price_source: None,
+            price_source_chosen: false,
         }
     }
 
@@ -433,6 +495,9 @@ impl ProviderForm {
             base_url: provider.base_url.clone(),
             auth_kind: provider.auth_kind,
             secret: String::new(),
+            prompt_caching: provider.prompt_caching,
+            price_source: provider.price_catalog_provider.clone(),
+            price_source_chosen: true,
         }
     }
 
@@ -443,6 +508,16 @@ impl ProviderForm {
             base_url: self.base_url.clone(),
             auth_kind: self.auth_kind,
             secret: self.secret.clone(),
+            prompt_caching: self.prompt_caching,
+            price_catalog_provider: self.price_source.clone(),
+        }
+    }
+
+    /// Follows the address and kind with the suggested price source, until
+    /// the user picks one.
+    fn follow_suggestion(&mut self, sources: &[PriceSource]) {
+        if !self.price_source_chosen {
+            self.price_source = suggest_price_source(sources, self.kind, &self.base_url);
         }
     }
 }
@@ -457,6 +532,8 @@ fn ProviderFields(
     on_save: EventHandler<ProviderInput>,
 ) -> Element {
     let mut form = form;
+    let sources = use_resource(|| async { list_price_sources().await.unwrap_or_default() });
+    let source_list = move || sources().unwrap_or_default();
     let submit = move |event: Event<FormData>| {
         event.prevent_default();
         on_save.call(form().input());
@@ -477,7 +554,9 @@ fn ProviderFields(
                         f.kind = kind;
                         if is_new {
                             f.auth_kind = kind.default_auth_kind();
+                            f.prompt_caching = kind.default_prompt_caching();
                         }
+                        f.follow_suggestion(&source_list());
                     }
                 },
                 for kind in ProviderKind::ALL {
@@ -498,7 +577,11 @@ fn ProviderFields(
 
             label { r#for: "provider-url", "Base URL" }
             input { id: "provider-url", r#type: "url", required: true, placeholder: "{form().kind.base_url_placeholder()}",
-                value: "{form().base_url}", oninput: move |e| form.write().base_url = e.value() }
+                value: "{form().base_url}", oninput: move |e| {
+                    let mut f = form.write();
+                    f.base_url = e.value();
+                    f.follow_suggestion(&source_list());
+                } }
             p { class: "muted", "Turns go to this address's /v1/messages." }
 
             label { r#for: "provider-auth", "Sent as" }
@@ -520,6 +603,44 @@ fn ProviderFields(
                 value: "{form().secret}", oninput: move |e| form.write().secret = e.value() }
             p { class: "muted",
                 "Stays on the server: pages only ever show its last four characters. A local Ollama needs one but ignores it, so any value does."
+            }
+
+            label { class: "provider-checkbox",
+                input { id: "provider-caching", r#type: "checkbox", checked: form().prompt_caching,
+                    onchange: move |e| form.write().prompt_caching = e.checked() }
+                "Prompt caching"
+            }
+            p { class: "muted",
+                "Marks each turn's request so the server can reuse the conversation so far instead of reading it again; on Anthropic a cached read costs a tenth of the input price. Turn it off if this server refuses requests with a cache_control error."
+            }
+
+            label { r#for: "provider-prices", "Prices from" }
+            select {
+                id: "provider-prices",
+                onchange: move |e| {
+                    let mut f = form.write();
+                    f.price_source = Some(e.value()).filter(|v| !v.is_empty());
+                    f.price_source_chosen = true;
+                },
+                option { value: "", selected: form().price_source.is_none(), "None: show tokens only" }
+                // Kept when the list doesn't have it (not fetched yet, or
+                // gone from the catalog), so saving doesn't drop it.
+                if let Some(id) = form().price_source.filter(|id| !source_list().iter().any(|s| &s.id == id)) {
+                    option { value: "{id}", selected: true, "{id}" }
+                }
+                for source in source_list() {
+                    option { key: "{source.id}", value: "{source.id}",
+                        selected: form().price_source.as_deref() == Some(source.id.as_str()),
+                        "{source.name} ({source.id})" }
+                }
+            }
+            p { class: "muted",
+                "Each call's cost comes from this entry in the models.dev price list, refreshed hourly. Pick the plan's own entry for a flat-rate coding plan (its calls cost $0), or None for a local server."
+            }
+            if form().price_source.is_none() {
+                if let Some(suggested) = suggest_price_source(&source_list(), form().kind, &form().base_url) {
+                    p { class: "muted", "models.dev lists this address as \u{201c}{suggested}\u{201d}." }
+                }
             }
 
             super::ErrorText { message: error }
@@ -702,6 +823,7 @@ fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
 fn ProviderModelRow(id: i64, model: ModelInfo) -> Element {
     let mut window = use_signal(|| model.context_window_override.map(|w| w.to_string()).unwrap_or_default());
     let mut thinking = use_signal(|| model.thinking_override);
+    let mut effort = use_signal(|| model.effort_override);
     let mut error: Signal<Option<String>> = use_signal(|| None);
     let mut saved = use_signal(|| false);
     let model_id = model.id.clone();
@@ -734,7 +856,7 @@ fn ProviderModelRow(id: i64, model: ModelInfo) -> Element {
         };
         let model_id = model_id.clone();
         spawn(async move {
-            match set_model_settings(id, model_id, thinking(), context_window).await {
+            match set_model_settings(id, model_id, thinking(), context_window, effort()).await {
                 Ok(()) => {
                     error.set(None);
                     saved.set(true);
@@ -772,6 +894,26 @@ fn ProviderModelRow(id: i64, model: ModelInfo) -> Element {
                             value: "{choice}",
                             selected: thinking_choice(thinking()) == choice,
                             "{thinking_label(choice, provider_thinking)}"
+                        }
+                    }
+                }
+            }
+            label { class: "provider-model-thinking",
+                "Effort "
+                select {
+                    aria_label: "Effort for {model.id}",
+                    title: "Sent as output_config.effort to an Anthropic provider; other kinds ignore it. Changing it re-reads a conversation's cache once.",
+                    onchange: move |e| {
+                        effort.set(crate::anthropic::Effort::parse(&e.value()));
+                        saved.set(false);
+                    },
+                    option { value: "", selected: effort().is_none(), "model's default" }
+                    for level in crate::anthropic::Effort::ALL {
+                        option {
+                            key: "{level.as_str()}",
+                            value: "{level.as_str()}",
+                            selected: effort() == Some(level),
+                            "{level.as_str()}"
                         }
                     }
                 }
@@ -842,6 +984,7 @@ mod tests {
             display_name: None,
             thinking_override: None,
             context_window_override: None,
+            effort_override: None,
             reported_context_window: None,
             reported_tools: tools,
             thinking: true,

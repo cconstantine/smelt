@@ -8,13 +8,13 @@ pub mod models;
 
 pub mod tools;
 
-pub use types::{ContentBlock, TokenUsage, ToolDefinition};
+pub use types::{ContentBlock, Effort, TokenUsage, ToolDefinition};
 // The rest of the Messages API request/response shape is only built and
 // sent by `stream.rs`, which is itself server-only (see its own `#[cfg]`
 // above) — the `web` (browser) build never touches them, only the shared
 // types above.
 #[cfg(feature = "server")]
-pub use types::{AnthropicMessage, CreateMessageRequest, ThinkingConfig};
+pub use types::{AnthropicMessage, CreateMessageRequest, OutputConfig, ThinkingConfig};
 
 /// Known context-window size (real token count) for a recognized
 /// `claude-*` model id — nothing in the Messages API surfaces this, so it

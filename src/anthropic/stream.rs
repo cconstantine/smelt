@@ -65,6 +65,10 @@ impl Endpoint {
             std::sync::LazyLock::new(|| {
                 reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
+                    // smelt's own name on every model request, listing
+                    // included: Kimi Code's terms count a hidden or faked
+                    // client identity as a violation (SME-106).
+                    .user_agent(concat!("smelt/", env!("CARGO_PKG_VERSION")))
                     .build()
                     .map_err(|e| format!("couldn't set up the HTTP client: {e}"))
             });
@@ -526,9 +530,9 @@ fn request_body(request: &CreateMessageRequest, binding: Binding) -> Result<Valu
             for message in &mut stripped.messages {
                 message.content = super::types::strip_thinking(std::mem::take(&mut message.content));
             }
-            serde_json::to_value(&stripped)
+            stripped.to_body()
         }
-        _ => serde_json::to_value(request),
+        _ => request.to_body(),
     }
     .map_err(|e| format!("couldn't encode the model request: {e}"))?;
     if binding == Binding::DropBlock
@@ -653,10 +657,20 @@ pub async fn stream_anthropic_message(
             binding = next;
             continue;
         }
-        return Err(format!(
-            "model provider error {status}: {}",
-            provider_error_message(&body)
-        ));
+        let message = provider_error_message(&body);
+        // A server that doesn't know prompt caching names the field it
+        // refused; the fix is the provider's setting, not a retry. The same
+        // goes for a model refusing effort, or the level asked for.
+        let hint = if request.prompt_caching && message.contains("cache_control") {
+            " (This server may not support prompt caching: turn off \u{201c}Prompt caching\u{201d} on its provider.)"
+        } else if request.output_config.is_some()
+            && (message.contains("effort") || message.contains("output_config"))
+        {
+            " (This model may not support this effort level: change or clear \u{201c}Effort\u{201d} for it on its provider's models.)"
+        } else {
+            ""
+        };
+        return Err(format!("model provider error {status}: {message}{hint}"));
     };
 
     let mut byte_stream = response.bytes_stream();
@@ -792,6 +806,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
+            output_config: None,
         };
         let result = stream_anthropic_message(&endpoint, &request, |_| {}).await;
         assert!(result.is_err(), "a redirect isn't a reply");
@@ -1023,6 +1039,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
+            output_config: None,
         };
 
         stream_anthropic_message(&test_endpoint(addr), &request, on_delta).await
@@ -1085,6 +1103,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
+            output_config: None,
         };
         let result = stream_anthropic_message(&test_endpoint(addr), &request, |_| {}).await;
         (result, count.load(std::sync::atomic::Ordering::SeqCst))
@@ -1121,6 +1141,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct Seen {
         beta: Option<String>,
+        user_agent: Option<String>,
         body: Value,
     }
 
@@ -1165,10 +1186,14 @@ mod tests {
                         .get("anthropic-beta")
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_string);
+                    let user_agent = headers
+                        .get(axum::http::header::USER_AGENT)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
                     let body = serde_json::from_str(&body).unwrap_or(Value::Null);
                     let i = {
                         let mut record = record.lock().expect("record lock");
-                        record.push(Seen { beta, body });
+                        record.push(Seen { beta, user_agent, body });
                         record.len() - 1
                     };
                     let (status, body) = responses[i.min(responses.len() - 1)];
@@ -1221,6 +1246,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking,
+            prompt_caching: false,
+            output_config: None,
         }
     }
 
@@ -1274,6 +1301,88 @@ mod tests {
         stream_anthropic_message(&other, &request, |_| {}).await.expect("another provider");
         let other_seen = requests_seen(&other_record);
         assert!(!other_seen[0].has_binding_beta() && other_seen[0].drop_block().is_none(), "another provider is untouched");
+    }
+
+    /// smelt says who it is: Kimi Code's terms forbid a tool hiding or
+    /// faking its identity (SME-106).
+    #[tokio::test]
+    async fn test_a_model_request_names_smelt_and_its_version() {
+        let (endpoint, record) = recording_upstream(vec![(200, OK_BODY)]).await;
+        stream_anthropic_message(&endpoint, &request_replaying_thinking(None), |_| {})
+            .await
+            .expect("streams");
+        assert_eq!(
+            requests_seen(&record)[0].user_agent.as_deref(),
+            Some(concat!("smelt/", env!("CARGO_PKG_VERSION")))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_caching_request_carries_both_markers_even_when_retried_stripped() {
+        let (endpoint, record) = recording_upstream(vec![(400, BINDING_BODY), (200, OK_BODY)]).await;
+        let mut request = request_replaying_thinking(None);
+        request.prompt_caching = true;
+        stream_anthropic_message(&endpoint, &request, |_| {}).await.expect("should recover");
+        let seen = requests_seen(&record);
+        assert_eq!(seen.len(), 2);
+        for (i, sent) in seen.iter().enumerate() {
+            assert_eq!(sent.body["cache_control"], serde_json::json!({"type": "ephemeral"}), "request {i}");
+            assert_eq!(
+                sent.body["system"][0]["cache_control"],
+                serde_json::json!({"type": "ephemeral"}),
+                "request {i}"
+            );
+        }
+    }
+
+    /// What a strict server says to the top-level `cache_control`.
+    const CACHE_CONTROL_REFUSED_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"cache_control: Extra inputs are not permitted"}}"#;
+
+    #[tokio::test]
+    async fn test_a_refused_cache_marker_names_the_provider_setting() {
+        let (endpoint, _record) = recording_upstream(vec![(400, CACHE_CONTROL_REFUSED_BODY)]).await;
+        let mut request = request_replaying_thinking(None);
+        request.prompt_caching = true;
+        let error = stream_anthropic_message(&endpoint, &request, |_| {}).await.expect_err("refused");
+        assert!(error.contains("cache_control: Extra inputs are not permitted"), "keeps the server's words: {error}");
+        assert!(error.contains("Prompt caching"), "names the setting to turn off: {error}");
+    }
+
+    #[tokio::test]
+    async fn test_a_400_without_caching_gets_no_caching_hint() {
+        let (endpoint, _record) = recording_upstream(vec![(400, CACHE_CONTROL_REFUSED_BODY)]).await;
+        let request = request_replaying_thinking(None);
+        let error = stream_anthropic_message(&endpoint, &request, |_| {}).await.expect_err("refused");
+        assert!(!error.contains("Prompt caching"), "{error}");
+    }
+
+    /// Synthetic refusals of `output_config.effort`, one naming each field: a
+    /// model without effort, and one without the level asked for.
+    const EFFORT_REFUSED_BODIES: [&str; 2] = [
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"This model does not support the effort parameter."}}"#,
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"output_config: Extra inputs are not permitted"}}"#,
+    ];
+
+    #[tokio::test]
+    async fn test_a_refused_effort_names_the_models_effort_setting() {
+        for body in EFFORT_REFUSED_BODIES {
+            let (endpoint, _record) = recording_upstream(vec![(400, body)]).await;
+            let mut request = request_replaying_thinking(None);
+            request.output_config = Some(super::super::types::OutputConfig { effort: super::super::types::Effort::Xhigh });
+            let error = stream_anthropic_message(&endpoint, &request, |_| {}).await.expect_err("refused");
+            assert!(error.contains(&provider_error_message(body)), "keeps the server's words: {error}");
+            assert!(error.contains("\u{201c}Effort\u{201d}"), "names the setting to change: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_400_without_effort_gets_no_effort_hint() {
+        for body in EFFORT_REFUSED_BODIES {
+            let (endpoint, _record) = recording_upstream(vec![(400, body)]).await;
+            let request = request_replaying_thinking(None);
+            let error = stream_anthropic_message(&endpoint, &request, |_| {}).await.expect_err("refused");
+            assert!(!error.contains("Effort"), "{error}");
+        }
     }
 
     #[tokio::test]
@@ -1899,6 +2008,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
+            output_config: None,
         };
 
         let result = tokio::time::timeout(
@@ -1960,6 +2071,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
+            output_config: None,
         };
 
         let endpoint = Endpoint {
@@ -2021,6 +2134,8 @@ mod tests {
                 stream: true,
                 tools: vec![],
                 thinking: None,
+                prompt_caching: false,
+                output_config: None,
             },
             Binding::AsIs,
             std::time::Duration::from_secs(5),
