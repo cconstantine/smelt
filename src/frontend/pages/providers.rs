@@ -11,7 +11,7 @@ use crate::api::providers::{
 };
 use crate::frontend::Route;
 use crate::providers::{
-    suggest_price_source, AuthKind, ConversationModel, LlamaServerInfo, ModelChoice, ModelInfo, PriceSource, ProviderInput,
+    suggest_price_source, AuthKind, ConversationModel, LlamaServerInfo, ModelChoice, ModelInfo, ModelSettings, PriceSource, ProviderInput,
     ProviderKind, ProviderSummary, ASSUMED_CONTEXT_WINDOW, LLAMA_CPP_EFFORTS,
 };
 
@@ -889,6 +889,16 @@ fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
     }
 }
 
+/// A token-count field's value: blank for none, commas allowed.
+fn token_field(text: &str, name: &str) -> Result<Option<u32>, String> {
+    let text = text.replace(',', "");
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse::<u32>().map(Some).map_err(|_| format!("{name} is a number of tokens."))
+}
+
 /// A llama.cpp server's `/props`, as one line under the models' heading:
 /// its build, model, slots and window, and what its template supports.
 #[component]
@@ -957,6 +967,7 @@ fn effort_choices(kind: ProviderKind, caps: Option<&LlamaServerInfo>) -> Vec<cra
 fn ProviderModelRow(id: i64, model: ModelInfo, kind: ProviderKind, efforts: Vec<crate::anthropic::Effort>) -> Element {
     let llama_cpp_efforts = kind == ProviderKind::LlamaCpp;
     let mut window = use_signal(|| model.context_window_override.map(|w| w.to_string()).unwrap_or_default());
+    let mut max_output = use_signal(|| model.max_output_override.map(|n| n.to_string()).unwrap_or_default());
     let mut thinking = use_signal(|| model.thinking_override);
     let mut effort = use_signal(|| model.effort_override);
     let mut error: Signal<Option<String>> = use_signal(|| None);
@@ -974,24 +985,26 @@ fn ProviderModelRow(id: i64, model: ModelInfo, kind: ProviderKind, efforts: Vec<
     } else {
         format!("unknown, assuming {}", group_digits(ASSUMED_CONTEXT_WINDOW))
     };
+    let max_output_placeholder = match model.max_output {
+        Some(cap) => group_digits(cap),
+        None => "automatic".to_string(),
+    };
     let save = move |event: Event<FormData>| {
         event.prevent_default();
-        let text = window().replace(',', "");
-        let text = text.trim();
-        let context_window = if text.is_empty() {
-            None
-        } else {
-            match text.parse::<u32>() {
-                Ok(n) => Some(n),
-                Err(_) => {
-                    error.set(Some("The context window is a number of tokens.".to_string()));
-                    return;
-                }
+        let (context_window, max_output) = match (
+            token_field(&window(), "The context window"),
+            token_field(&max_output(), "Max reply tokens"),
+        ) {
+            (Ok(window), Ok(max_output)) => (window, max_output),
+            (Err(e), _) | (_, Err(e)) => {
+                error.set(Some(e));
+                return;
             }
         };
+        let settings = ModelSettings { thinking: thinking(), context_window, effort: effort(), max_output };
         let model_id = model_id.clone();
         spawn(async move {
-            match set_model_settings(id, model_id, thinking(), context_window, effort()).await {
+            match set_model_settings(id, model_id, settings).await {
                 Ok(()) => {
                     error.set(None);
                     saved.set(true);
@@ -1012,6 +1025,16 @@ fn ProviderModelRow(id: i64, model: ModelInfo, kind: ProviderKind, efforts: Vec<
                     aria_label: "Context window for {model.id}",
                     oninput: move |e| {
                         window.set(e.value());
+                        saved.set(false);
+                    } }
+            }
+            label { class: "provider-model-window",
+                "Max reply tokens "
+                input { r#type: "text", inputmode: "numeric", placeholder: "{max_output_placeholder}", value: "{max_output}",
+                    aria_label: "Max reply tokens for {model.id}",
+                    title: "The most one reply may be, thinking included. Automatic: what the provider reports, else up to half the context window (16,384 on an Anthropic or other provider that reports none, since a Claude model refuses more than its own cap).",
+                    oninput: move |e| {
+                        max_output.set(e.value());
                         saved.set(false);
                     } }
             }
@@ -1158,6 +1181,13 @@ mod tests {
     }
 
     #[test]
+    fn test_a_token_field_is_blank_or_a_number() {
+        assert_eq!(token_field("  ", "Max reply tokens"), Ok(None));
+        assert_eq!(token_field("131,072", "Max reply tokens"), Ok(Some(131_072)));
+        assert_eq!(token_field("lots", "Max reply tokens"), Err("Max reply tokens is a number of tokens.".to_string()));
+    }
+
+    #[test]
     fn test_digits_are_grouped_by_thousands() {
         assert_eq!(group_digits(0), "0");
         assert_eq!(group_digits(999), "999");
@@ -1174,6 +1204,8 @@ mod tests {
             thinking_override: None,
             context_window_override: None,
             effort_override: None,
+            max_output_override: None,
+            max_output: None,
             reported_context_window: None,
             reported_tools: tools,
             thinking: true,

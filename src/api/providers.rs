@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
 use crate::db;
-use crate::providers::{ModelChoice, ModelInfo, PriceSource, ProviderInput, ProviderModels, ProviderSummary};
+use crate::providers::{ModelChoice, ModelInfo, ModelSettings, PriceSource, ProviderInput, ProviderModels, ProviderSummary};
 
 #[get("/api/providers")]
 pub async fn list_providers() -> ServerFnResult<Vec<ProviderSummary>> {
@@ -94,14 +94,8 @@ pub async fn refresh_model_details(id: i64, model: String) -> ServerFnResult<Mod
 /// The user's overrides for a model; `None` goes back to what the
 /// provider says.
 #[post("/api/providers/{id}/models/settings")]
-pub async fn set_model_settings(
-    id: i64,
-    model: String,
-    thinking: Option<bool>,
-    context_window: Option<u32>,
-    effort: Option<crate::anthropic::Effort>,
-) -> ServerFnResult<()> {
-    crate::providers::set_model_settings(db::get(), id, &model, thinking, context_window, effort)
+pub async fn set_model_settings(id: i64, model: String, settings: ModelSettings) -> ServerFnResult<()> {
+    crate::providers::set_model_settings(db::get(), id, &model, settings)
         .await
         .map_err(ServerFnError::new)
 }

@@ -37,6 +37,8 @@ pub struct ModelDetails {
     pub context_window: Option<u32>,
     pub thinking: Option<bool>,
     pub tools: Option<bool>,
+    /// The most a reply may be: Anthropic's `max_tokens` (SME-111).
+    pub max_output: Option<u32>,
 }
 
 /// One model in a provider's listing, with whatever details the listing
@@ -70,12 +72,13 @@ fn parse_v1_model(entry: &Value) -> Option<ListedModel> {
     let id = entry.get("id")?.as_str()?.to_string();
     // Anthropic's `max_input_tokens`, or llama.cpp's runtime
     // `meta.n_ctx`. Zero (the docs' placeholder) isn't a size.
-    let context_window = entry
-        .get("max_input_tokens")
-        .or_else(|| entry.pointer("/meta/n_ctx"))
-        .and_then(Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok())
-        .filter(|n| *n > 0);
+    let size = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0)
+    };
+    let context_window = size(entry.get("max_input_tokens").or_else(|| entry.pointer("/meta/n_ctx")));
     Some(ListedModel {
         display_name: entry
             .get("display_name")
@@ -87,6 +90,8 @@ fn parse_v1_model(entry: &Value) -> Option<ListedModel> {
                 .pointer("/capabilities/thinking/supported")
                 .and_then(Value::as_bool),
             tools: None,
+            // Anthropic's output cap (SME-111).
+            max_output: size(entry.get("max_tokens")),
         },
         id,
     })
@@ -141,6 +146,7 @@ fn parse_ollama_show(body: &Value) -> ModelDetails {
         context_window,
         thinking,
         tools: capabilities.as_ref().map(|caps| caps.contains(&"tools")),
+        max_output: None,
     }
 }
 
@@ -416,7 +422,7 @@ mod tests {
                 id: "claude-opus-5".to_string(),
                 display_name: Some("Claude Opus 5".to_string()),
                 // The docs' example says 0 tokens: a placeholder, not a size.
-                details: ModelDetails { context_window: None, thinking: Some(true), tools: None },
+                details: ModelDetails { context_window: None, thinking: Some(true), tools: None, max_output: None },
             }]
         );
         assert_eq!(next.as_deref(), Some("last_id"), "has_more, so continue after last_id");
@@ -430,7 +436,7 @@ mod tests {
             vec![ListedModel {
                 id: "flash-next".to_string(),
                 display_name: None,
-                details: ModelDetails { context_window: Some(262_144), thinking: None, tools: None },
+                details: ModelDetails { context_window: Some(262_144), thinking: None, tools: None, max_output: None },
             }]
         );
         assert_eq!(next, None, "no has_more");
@@ -470,7 +476,7 @@ mod tests {
         ListedModel {
             id: id.to_string(),
             display_name: None,
-            details: ModelDetails { context_window: window, thinking: None, tools: None },
+            details: ModelDetails { context_window: window, thinking: None, tools: None, max_output: None },
         }
     }
 
@@ -479,7 +485,7 @@ mod tests {
         let info = parse_llama_props(&json(LLAMA_CPP_PROPS));
         let mut one = vec![listed("anything", Some(4096))];
         apply_llama_props(&mut one, &info);
-        assert_eq!(one[0].details, ModelDetails { context_window: Some(262_144), thinking: None, tools: Some(true) }, "the only one listed");
+        assert_eq!(one[0].details, ModelDetails { context_window: Some(262_144), thinking: None, tools: Some(true), max_output: None }, "the only one listed");
 
         let mut several = vec![listed("other", Some(4096)), listed("flash-next", None)];
         apply_llama_props(&mut several, &info);
@@ -498,13 +504,24 @@ mod tests {
         assert!(error.contains("data"), "says what's missing: {error}");
     }
 
+    /// SME-111: Anthropic's listing gives each model's output cap as
+    /// `max_tokens`; the docs' example's 0 is a placeholder.
+    #[test]
+    fn test_an_anthropic_models_output_cap_is_its_max_tokens() {
+        let body = json(r#"{"data":[{"id":"claude-x","max_input_tokens":1000000,"max_tokens":128000}],"has_more":false}"#);
+        let (models, _) = parse_v1_models(&body).expect("parses");
+        assert_eq!(models[0].details.max_output, Some(128_000));
+        let (fixture, _) = parse_v1_models(&json(ANTHROPIC)).expect("parses");
+        assert_eq!(fixture[0].details.max_output, None, "0 isn't a cap");
+    }
+
     #[test]
     fn test_a_real_sized_anthropic_model_keeps_its_window() {
         let body = json(r#"{"data":[{"id":"claude-x","max_input_tokens":1000000,"capabilities":{"thinking":{"supported":false}}}],"has_more":false}"#);
         let (models, _) = parse_v1_models(&body).expect("parses");
         assert_eq!(
             models[0].details,
-            ModelDetails { context_window: Some(1_000_000), thinking: Some(false), tools: None }
+            ModelDetails { context_window: Some(1_000_000), thinking: Some(false), tools: None, max_output: None }
         );
     }
 
@@ -527,7 +544,7 @@ mod tests {
             parse_ollama_show(&json(OLLAMA_SHOW)),
             // The fixture's capabilities are completion, thinking and
             // vision: no tools. Its trained length (131072) isn't used.
-            ModelDetails { context_window: Some(2048), thinking: Some(true), tools: Some(false) }
+            ModelDetails { context_window: Some(2048), thinking: Some(true), tools: Some(false), max_output: None }
         );
     }
 
@@ -542,7 +559,7 @@ mod tests {
         let body = json(r#"{"capabilities":["completion","tools","thinking"],"thinking":{"values":[false],"default":false}}"#);
         assert_eq!(
             parse_ollama_show(&body),
-            ModelDetails { context_window: None, thinking: Some(false), tools: Some(true) }
+            ModelDetails { context_window: None, thinking: Some(false), tools: Some(true), max_output: None }
         );
     }
 
@@ -676,7 +693,7 @@ mod tests {
         let details = model_details(ProviderKind::Ollama, &endpoint, "gemma4").await.expect("details");
         assert_eq!(
             details,
-            ModelDetails { context_window: Some(4096), thinking: Some(false), tools: Some(true) }
+            ModelDetails { context_window: Some(4096), thinking: Some(false), tools: Some(true), max_output: None }
         );
     }
 
@@ -695,7 +712,7 @@ mod tests {
         let one = r#"{"id":"claude-x","display_name":"X","max_input_tokens":1000000,"capabilities":{"thinking":{"supported":true}},"type":"model"}"#;
         let (endpoint, seen) = mock_provider(vec![("/v1/models/claude-x", one.to_string())]).await;
         let details = model_details(ProviderKind::Anthropic, &endpoint, "claude-x").await.expect("details");
-        assert_eq!(details, ModelDetails { context_window: Some(1_000_000), thinking: Some(true), tools: None });
+        assert_eq!(details, ModelDetails { context_window: Some(1_000_000), thinking: Some(true), tools: None, max_output: None });
         let paths: Vec<String> = seen.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(p, _)| p.clone()).collect();
         assert_eq!(paths, vec!["/v1/models/claude-x".to_string()]);
     }

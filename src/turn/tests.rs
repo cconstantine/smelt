@@ -1749,6 +1749,28 @@ async fn test_a_turns_reply_budget_grows_with_the_room_left(pool: PgPool) {
     assert!((131_072 - 1..=131_072).contains(&second), "still half the window: {second}");
 }
 
+/// SME-111: the user's "Max reply tokens" caps a turn's reply budget.
+#[sqlx::test]
+async fn test_a_models_max_reply_tokens_caps_its_turns(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
+    sqlx::query("UPDATE inference_providers SET kind = 'llama_cpp'")
+        .execute(&pool)
+        .await
+        .expect("make the mock a llama.cpp server");
+    sqlx::query("INSERT INTO provider_models (provider_id, model, reported_context_window, max_output) SELECT id, $1, 262144, 8192 FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .execute(&pool)
+        .await
+        .expect("cap the mock model");
+    run_turn(&pool, conversation.id, hello()).await.expect("turn");
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests[0]["max_tokens"], 8192);
+}
+
 /// A model on an Anthropic provider that nothing sized keeps the reply
 /// budget every turn had: a Claude model refuses one above its own cap.
 #[sqlx::test]
