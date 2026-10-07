@@ -536,7 +536,15 @@ mod server {
     /// user's, else what the provider reported, else `UNKNOWN_OUTPUT_CAP`
     /// on an Anthropic or Other provider. `None`: only the window caps it.
     pub fn output_cap(kind: ProviderKind, row: Option<&db::ProviderModelRow>) -> Option<u32> {
-        row.and_then(|r| positive(r.max_output).or(positive(r.reported_max_output)))
+        let reported = row.and_then(|r| positive(r.reported_max_output));
+        let users = row.and_then(|r| positive(r.max_output)).map(|users| match (kind, reported) {
+            // Anthropic refuses a `max_tokens` above the model's own cap,
+            // so the user's can lower it, not raise it (SME-111 review 1).
+            (ProviderKind::Anthropic, Some(reported)) => users.min(reported),
+            _ => users,
+        });
+        users
+            .or(reported)
             .or_else(|| matches!(kind, ProviderKind::Anthropic | ProviderKind::Other).then_some(UNKNOWN_OUTPUT_CAP))
     }
 
@@ -1350,6 +1358,9 @@ mod tests {
             assert_eq!(output_cap(ProviderKind::LlamaCpp, None), None, "the window bounds it");
             assert_eq!(output_cap(ProviderKind::Ollama, Some(&capped(None, None))), None);
             assert_eq!(output_cap(ProviderKind::LlamaCpp, Some(&capped(Some(32_768), None))), Some(32_768));
+            // SME-111 review 1: Anthropic refuses more than the model's cap.
+            assert_eq!(output_cap(ProviderKind::Anthropic, Some(&capped(Some(200_000), Some(128_000)))), Some(128_000));
+            assert_eq!(output_cap(ProviderKind::Other, Some(&capped(Some(200_000), Some(128_000)))), Some(200_000), "a gateway's report may not be the model's");
             let info = model_info(ProviderKind::LlamaCpp, "m".to_string(), None, Some(&capped(Some(32_768), None)), None);
             assert_eq!((info.max_output_override, info.max_output), (Some(32_768), Some(32_768)));
         }
