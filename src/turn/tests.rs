@@ -2496,6 +2496,48 @@ async fn test_a_turn_publishes_each_message_as_it_is_saved(pool: PgPool) {
     );
 }
 
+/// SME-112: on llama.cpp, whose blocks overlap, the commentary before a
+/// tool call is saved with it (it used to show while streaming and then
+/// vanish), every tab gets it, and the next request replays it.
+#[sqlx::test]
+async fn test_commentary_before_a_tool_call_on_llama_cpp_is_saved(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_309)
+        .await
+        .expect("create conversation");
+    let llama_cpp = include_str!("../anthropic/fixtures/llama_cpp_messages_stream.sse");
+    let requests =
+        start_recording_mock_upstream(&pool, vec![llama_cpp.to_string(), text_reply_body("Nothing to do.")]).await;
+    let mut rx = events::subscribe(conversation.id);
+
+    run_turn(&pool, conversation.id, hello())
+        .await
+        .expect("run_turn should succeed");
+
+    let commentary = anthropic::ContentBlock::Text {
+        text: "Let me check your todo list.".to_string(),
+    };
+    let saved = db::list_messages(&pool, conversation.id).await.expect("list messages");
+    let first_reply = &saved[1];
+    assert_eq!(first_reply.role, "assistant");
+    let blocks = first_reply.blocks().expect("blocks");
+    assert!(
+        matches!(&blocks[..], [anthropic::ContentBlock::Thinking { .. }, text, anthropic::ContentBlock::ToolUse { .. }] if *text == commentary),
+        "{blocks:?}"
+    );
+    let published = drain_events(&mut rx).await.into_iter().any(|event| match event {
+        events::ConversationEvent::MessagesAppended { messages } => {
+            messages.iter().any(|m| m.role == "assistant" && m.blocks().expect("blocks").contains(&commentary))
+        }
+        _ => false,
+    });
+    assert!(published, "every tab gets the commentary");
+    let second_request = requests.lock().expect("the request log")[1].clone();
+    let replayed = &second_request["messages"][1];
+    assert_eq!(replayed["role"], "assistant");
+    assert_eq!(replayed["content"][1], serde_json::json!({"type": "text", "text": "Let me check your todo list."}));
+}
+
 #[sqlx::test]
 async fn test_run_turn_executes_tool_and_persists_full_round_trip(pool: PgPool) {
     let _guard = lock_turn_tests();
