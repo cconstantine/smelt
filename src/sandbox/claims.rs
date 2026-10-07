@@ -3,54 +3,108 @@
 
 use super::*;
 
-/// The conversations whose Docker data claims outlived them: claims
-/// labelled with a conversation that isn't in `live`.
+/// A claim the startup sweep deletes: this database's, for a conversation
+/// it no longer has.
+#[derive(Debug, PartialEq)]
+pub(super) struct OrphanedClaim {
+    pub(super) conversation_id: i64,
+    pub(super) name: String,
+    /// Deleted only while it's still this object (SME-115).
+    pub(super) uid: String,
+}
+
+/// The claims that outlived their conversation: labelled with a
+/// conversation that isn't in `live`, and ours (SME-115). A claim from
+/// before the fix (no instance label) or another database's is never an
+/// orphan, whatever the selector that listed it.
 pub(super) fn orphaned_docker_claims(
     claims: &[PersistentVolumeClaim],
     live: &std::collections::HashSet<i64>,
-) -> Vec<i64> {
-    claims
+    instance: &str,
+) -> Vec<OrphanedClaim> {
+    let mut orphans: Vec<OrphanedClaim> = claims
         .iter()
-        .filter_map(|c| c.metadata.labels.as_ref()?.get(CONVERSATION_LABEL)?.parse().ok())
-        .filter(|id| !live.contains(id))
-        .collect::<std::collections::BTreeSet<i64>>()
-        .into_iter()
-        .collect()
+        .filter(|c| ownership(&c.metadata, instance) == Ownership::Ours)
+        .filter_map(|c| {
+            Some(OrphanedClaim {
+                conversation_id: c.metadata.labels.as_ref()?.get(CONVERSATION_LABEL)?.parse().ok()?,
+                name: c.metadata.name.clone()?,
+                uid: c.metadata.uid.clone()?,
+            })
+        })
+        .filter(|orphan| !live.contains(&orphan.conversation_id))
+        .collect();
+    orphans.sort_by(|a, b| a.name.cmp(&b.name));
+    orphans
 }
 
-/// Deletes Docker data claims whose conversation is gone. Conversation
-/// teardown deletes its claim best-effort, so this catches what that
-/// missed. Run once at startup by `main`, never from tests: tests share
-/// the namespace but each has its own database, so from a test every
-/// other test's claim would look orphaned.
+/// Deletes the claims of conversations this database no longer has.
+/// Conversation teardown deletes its claims best-effort, so this catches
+/// what that missed. Run once at startup by `main`.
 pub async fn sweep_orphaned_conversation_claims(pool: &PgPool) {
-    let client = match get() {
-        Ok(manager) => &manager.client,
+    match get() {
+        Ok(manager) => sweep_orphaned_conversation_claims_with(&manager.client, pool).await,
+        Err(e) => tracing::warn!(error = %e, "couldn't sweep orphaned conversation claims"),
+    }
+}
+
+/// `sweep_orphaned_conversation_claims` on `client`. Only this database's
+/// claims (`smelt/instance`) are listed: every smelt server shares the
+/// namespace, and to one whose database is empty (a scratch check server)
+/// every other server's claims looked orphaned (SME-115).
+pub(super) async fn sweep_orphaned_conversation_claims_with(client: &kube::Client, pool: &PgPool) {
+    let instance = match db::smelt_instance(pool).await {
+        Ok(instance) => instance.id,
         Err(e) => {
-            tracing::warn!(error = %e, "couldn't sweep orphaned conversation claims");
+            tracing::warn!(error = %e, "couldn't read this database's instance; skipping the claim sweep");
             return;
         }
     };
-    let selector = ListParams::default().labels(CONVERSATION_LABEL);
+    let selector = ListParams::default().labels(&format!("{CONVERSATION_LABEL},{INSTANCE_LABEL}={instance}"));
     // Claims first, then conversations: a claim only exists for a
     // conversation that already did, so none can be missed in between.
     let claims = match pvc_api(client).list(&selector).await {
         Ok(list) => list.items,
         Err(e) => {
-            tracing::warn!(error = %e, "couldn't list docker data claims to sweep");
+            tracing::warn!(error = %e, "couldn't list conversation claims to sweep");
             return;
         }
     };
     let live = match db::list_conversations(pool).await {
         Ok(conversations) => conversations.into_iter().map(|c| c.id).collect(),
         Err(e) => {
-            tracing::warn!(error = %e, "couldn't list conversations to sweep docker data claims");
+            tracing::warn!(error = %e, "couldn't list conversations to sweep their claims");
             return;
         }
     };
-    for conversation_id in orphaned_docker_claims(&claims, &live) {
-        tracing::info!(conversation_id, "deleting a deleted conversation's docker data claim");
-        delete_conversation_pvcs(client, conversation_id).await;
+    for orphan in orphaned_docker_claims(&claims, &live, &instance) {
+        tracing::info!(
+            claim = %orphan.name,
+            conversation_id = orphan.conversation_id,
+            "deleting a deleted conversation's claim"
+        );
+        delete_claim_if_unchanged(client, &orphan.name, &orphan.uid).await;
+    }
+}
+
+/// Deletes claim `name` only while it's still the object with `uid`: one
+/// deleted and made again since (by another server, say) is left alone.
+/// Best-effort: logged, never returned.
+pub(super) async fn delete_claim_if_unchanged(client: &kube::Client, name: &str, uid: &str) {
+    let params = DeleteParams {
+        preconditions: Some(kube::api::Preconditions {
+            uid: Some(uid.to_string()),
+            resource_version: None,
+        }),
+        ..Default::default()
+    };
+    match pvc_api(client).delete(name, &params).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(e)) if e.code == 404 => {}
+        Err(kube::Error::Api(e)) if e.code == 409 => {
+            tracing::info!(claim = %name, "a claim was replaced since it was read; left alone")
+        }
+        Err(e) => tracing::warn!(claim = %name, error = %e, "failed to delete a claim"),
     }
 }
 

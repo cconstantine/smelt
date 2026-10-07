@@ -292,7 +292,6 @@ pub enum Ownership {
 
 /// Whose `meta`'s object is, for a server of `instance`. Only `Ours` may
 /// be deleted, reused or mounted.
-#[cfg_attr(not(test), expect(dead_code, reason = "the sweep uses it from SME-115's next commit"))]
 pub fn ownership(meta: &ObjectMeta, instance: &str) -> Ownership {
     match meta.labels.as_ref().and_then(|labels| labels.get(INSTANCE_LABEL)) {
         None => Ownership::Unlabelled,

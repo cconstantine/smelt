@@ -239,15 +239,29 @@ fn test_ownership_tells_ours_from_unlabelled_and_foreign() {
 }
 
 fn claim(name: &str, conversation: Option<&str>) -> PersistentVolumeClaim {
+    claim_of(name, conversation, Some(TEST_INSTANCE))
+}
+
+fn claim_of(name: &str, conversation: Option<&str>, instance: Option<&str>) -> PersistentVolumeClaim {
     PersistentVolumeClaim {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
-            labels: conversation
-                .map(|c| [(CONVERSATION_LABEL.to_string(), c.to_string())].into()),
+            uid: Some(format!("uid-{name}")),
+            labels: Some(
+                conversation
+                    .map(|c| (CONVERSATION_LABEL.to_string(), c.to_string()))
+                    .into_iter()
+                    .chain(instance.map(|i| (INSTANCE_LABEL.to_string(), i.to_string())))
+                    .collect(),
+            ),
             ..Default::default()
         },
         ..Default::default()
     }
+}
+
+fn names(orphans: &[OrphanedClaim]) -> Vec<&str> {
+    orphans.iter().map(|o| o.name.as_str()).collect()
 }
 
 #[test]
@@ -260,14 +274,39 @@ fn test_orphaned_docker_claims_are_those_whose_conversation_is_gone() {
         claim("sandbox-docker-x", Some("not-a-number")),
     ];
     let live = std::collections::HashSet::from([1]);
-    assert_eq!(orphaned_docker_claims(&claims, &live), vec![2]);
-    // A conversation has two claims (Docker data and /workspace): it's
-    // named once.
+    let orphans = orphaned_docker_claims(&claims, &live, TEST_INSTANCE);
+    assert_eq!(names(&orphans), vec!["sandbox-docker-2"]);
+    assert_eq!(orphans[0].conversation_id, 2);
+    assert_eq!(orphans[0].uid, "uid-sandbox-docker-2", "deleted only while it's still this object");
+    // A conversation has two claims (Docker data and /workspace): both go.
     let both = vec![
         claim("sandbox-docker-4", Some("4")),
         claim("sandbox-workspace-4", Some("4")),
     ];
-    assert_eq!(orphaned_docker_claims(&both, &live), vec![4]);
+    assert_eq!(
+        names(&orphaned_docker_claims(&both, &live, TEST_INSTANCE)),
+        vec!["sandbox-docker-4", "sandbox-workspace-4"]
+    );
+}
+
+/// SME-115, the bug: a server on an empty database (a check server's
+/// scratch one) took every conversation's claims in the namespace for
+/// orphans. Only its own are; one from before the fix (no instance) and
+/// another database's never are.
+#[test]
+fn test_only_our_own_claims_are_ever_orphans() {
+    let claims = vec![
+        claim_of("sandbox-workspace-1528", Some("1528"), None),
+        claim_of("sandbox-docker-1528", Some("1528"), Some("the-dev-database")),
+        claim_of("sandbox-workspace-7", Some("7"), Some("a-scratch-database")),
+    ];
+    let nothing_live = std::collections::HashSet::new();
+    assert_eq!(
+        names(&orphaned_docker_claims(&claims, &nothing_live, "a-scratch-database")),
+        vec!["sandbox-workspace-7"]
+    );
+    assert!(orphaned_docker_claims(&claims, &nothing_live, "yet-another").is_empty());
+    assert!(orphaned_docker_claims(&claims, &nothing_live, "").is_empty(), "an unread instance owns nothing");
 }
 
 #[test]
@@ -2161,6 +2200,66 @@ async fn test_teardown_deletes_an_unlabelled_pod_named_by_its_record() {
 
     pods.delete(&name, &immediate_delete_params()).await.ok();
     assert!(gone, "{name} survived its conversation's teardown");
+}
+
+/// A conversation id no other test or run uses: claims are named after it.
+fn unused_conversation_id() -> i64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    3_000_000_000 + i64::try_from(nanos % 1_000_000_000).unwrap_or_default()
+}
+
+/// A small claim for `conversation_id` labelled with `instance` (or with
+/// no instance, like one from before SME-115).
+async fn make_claim(client: &kube::Client, name: &str, conversation_id: i64, instance: Option<&str>) {
+    let mut spec = build_conversation_pvc_spec(name.to_string(), conversation_id, "1Mi".to_string(), "unused");
+    let labels = spec.metadata.labels.get_or_insert_default();
+    match instance {
+        Some(instance) => labels.insert(INSTANCE_LABEL.to_string(), instance.to_string()),
+        None => labels.remove(INSTANCE_LABEL),
+    };
+    pvc_api(client).create(&PostParams::default(), &spec).await.expect("create a claim");
+}
+
+/// Whether `name` is still there and not being deleted.
+async fn claim_kept(client: &kube::Client, name: &str) -> bool {
+    match pvc_api(client).get_opt(name).await.expect("read a claim") {
+        Some(claim) => claim.metadata.deletion_timestamp.is_none(),
+        None => false,
+    }
+}
+
+/// SME-115's regression test: a server whose database has no
+/// conversations (B, a scratch check server) sweeps the shared namespace
+/// at startup. It must delete only its own orphan, never another
+/// database's claims (A, the dev server's) or one from before the fix.
+/// Before the fix it deleted all three. Runs the sweep for real in the
+/// shared test namespace: it can't reach another test's claims either.
+#[sqlx::test]
+async fn test_a_sweep_deletes_only_its_own_databases_orphans(pool: PgPool) {
+    let client = test_client().await;
+    let ours = db::smelt_instance(&pool).await.expect("instance").id;
+    let base = unused_conversation_id();
+    let theirs = format!("sandbox-workspace-{base}");
+    let before_the_fix = format!("sandbox-workspace-{}", base + 1);
+    let our_orphan = format!("sandbox-workspace-{}", base + 2);
+    make_claim(&client, &theirs, base, Some("another-smelt-database")).await;
+    make_claim(&client, &before_the_fix, base + 1, None).await;
+    make_claim(&client, &our_orphan, base + 2, Some(&ours)).await;
+
+    sweep_orphaned_conversation_claims_with(&client, &pool).await;
+
+    let kept_theirs = claim_kept(&client, &theirs).await;
+    let kept_unlabelled = claim_kept(&client, &before_the_fix).await;
+    let kept_ours = claim_kept(&client, &our_orphan).await;
+    for name in [&theirs, &before_the_fix, &our_orphan] {
+        let _ = pvc_api(&client).delete(name, &DeleteParams::default()).await;
+    }
+    assert!(kept_theirs, "the sweep deleted another database's claim");
+    assert!(kept_unlabelled, "the sweep deleted a claim with no instance label");
+    assert!(!kept_ours, "the sweep left its own orphan");
 }
 
 /// A conversation's Docker claim is created once and reused, and
