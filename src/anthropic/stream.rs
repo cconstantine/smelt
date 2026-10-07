@@ -65,6 +65,10 @@ impl Endpoint {
             std::sync::LazyLock::new(|| {
                 reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
+                    // smelt's own name on every model request, listing
+                    // included: Kimi Code's terms count a hidden or faked
+                    // client identity as a violation (SME-106).
+                    .user_agent(concat!("smelt/", env!("CARGO_PKG_VERSION")))
                     .build()
                     .map_err(|e| format!("couldn't set up the HTTP client: {e}"))
             });
@@ -218,11 +222,21 @@ fn interpret_stream_event(value: &Value) -> StreamOutcome {
     }
 }
 
+/// The `index` a `content_block_*` event names, the block it belongs to.
+fn block_index(value: &Value) -> Option<usize> {
+    value
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|i| usize::try_from(i).ok())
+}
+
 /// Accumulates one in-progress content block across its
 /// `content_block_start` → `content_block_delta`* → `content_block_stop`
-/// events. Anthropic emits blocks sequentially, never interleaved, so
-/// tracking a single "current" accumulator (rather than a map keyed by
-/// block index) is sufficient.
+/// events. Several can be open at once: Anthropic and Ollama close each
+/// block before starting the next, but llama.cpp opens thinking, text and
+/// each tool call without closing any, and stops them all at the end of
+/// the reply (SME-112). See `Blocks`.
+#[derive(Debug)]
 enum PartialBlock {
     Text(String),
     ToolUse {
@@ -262,6 +276,110 @@ impl PartialBlock {
                 signature,
             }),
         }
+    }
+}
+
+/// A reply's content blocks as they stream, keyed by each event's `index`
+/// (SME-112). A block is opened by its start or its first delta, and
+/// finished by its stop or the end of the stream; the reply's content is
+/// in index order, whatever order the stops came in. An event without an
+/// index (no real provider sends one) belongs to the block opened last,
+/// or opens one after every block seen so far.
+#[derive(Default)]
+struct Blocks {
+    open: std::collections::BTreeMap<usize, PartialBlock>,
+    /// Finished blocks by (index, order finished): a block reopened at an
+    /// index already finished lands right after the first.
+    done: std::collections::BTreeMap<(usize, usize), ContentBlock>,
+    last: Option<usize>,
+}
+
+impl Blocks {
+    fn open_at(&mut self, index: Option<usize>) -> Option<&mut PartialBlock> {
+        self.open.get_mut(&index.or(self.last)?)
+    }
+
+    /// Opens `block` at `index` (or after every block seen, without one).
+    /// A block still open there is finished first.
+    fn start(&mut self, index: Option<usize>, block: PartialBlock) -> Result<(), String> {
+        let index = index.unwrap_or_else(|| {
+            let seen = self.open.keys().chain(self.done.keys().map(|(i, _)| i));
+            seen.max().map_or(0, |i| i.saturating_add(1))
+        });
+        // The same tool call started again while open (llama.cpp's final
+        // chunk can resend a call's start): keep the one call and its input.
+        if let (Some(PartialBlock::ToolUse { id, name, .. }), PartialBlock::ToolUse { id: new_id, name: new_name, .. }) =
+            (self.open.get_mut(&index), &block)
+            && id == new_id
+        {
+            name.clone_from(new_name);
+            self.last = Some(index);
+            return Ok(());
+        }
+        if self.open.contains_key(&index) || self.done.keys().any(|(i, _)| *i == index) {
+            tracing::warn!(index, "the model provider reused a content block's index");
+        }
+        self.stop(Some(index))?;
+        self.open.insert(index, block);
+        self.last = Some(index);
+        Ok(())
+    }
+
+    /// Finishes the block at `index` (or the one opened last). A stop
+    /// for a block that isn't open is ignored.
+    fn stop(&mut self, index: Option<usize>) -> Result<(), String> {
+        let Some(index) = index.or(self.last) else {
+            return Ok(());
+        };
+        if let Some(block) = self.open.remove(&index) {
+            let order = self.done.len();
+            self.done.insert((index, order), block.finalize()?);
+        }
+        Ok(())
+    }
+
+    fn text(&mut self, index: Option<usize>, text: String) -> Result<(), String> {
+        if let Some(PartialBlock::Text(existing)) = self.open_at(index) {
+            existing.push_str(&text);
+            return Ok(());
+        }
+        self.start(index, PartialBlock::Text(text))
+    }
+
+    fn thinking(&mut self, index: Option<usize>, thinking: String) -> Result<(), String> {
+        if let Some(PartialBlock::Thinking { thinking: existing, .. }) = self.open_at(index) {
+            existing.push_str(&thinking);
+            return Ok(());
+        }
+        self.start(
+            index,
+            PartialBlock::Thinking {
+                thinking,
+                signature: String::new(),
+            },
+        )
+    }
+
+    /// Dropped unless its index holds an open thinking block.
+    fn signature(&mut self, index: Option<usize>, signature: &str) {
+        if let Some(PartialBlock::Thinking { signature: existing, .. }) = self.open_at(index) {
+            existing.push_str(signature);
+        }
+    }
+
+    /// Dropped unless its index holds an open tool call.
+    fn tool_input(&mut self, index: Option<usize>, partial_json: &str) {
+        if let Some(PartialBlock::ToolUse { partial_json: existing, .. }) = self.open_at(index) {
+            existing.push_str(partial_json);
+        }
+    }
+
+    /// Finishes every block still open and returns them all in index order.
+    fn finish(mut self) -> Result<Vec<ContentBlock>, String> {
+        while let Some(&index) = self.open.keys().next() {
+            self.stop(Some(index))?;
+        }
+        Ok(self.done.into_values().collect())
     }
 }
 
@@ -412,9 +530,9 @@ fn request_body(request: &CreateMessageRequest, binding: Binding) -> Result<Valu
             for message in &mut stripped.messages {
                 message.content = super::types::strip_thinking(std::mem::take(&mut message.content));
             }
-            serde_json::to_value(&stripped)
+            stripped.to_body()
         }
-        _ => serde_json::to_value(request),
+        _ => request.to_body(),
     }
     .map_err(|e| format!("couldn't encode the model request: {e}"))?;
     if binding == Binding::DropBlock
@@ -539,16 +657,25 @@ pub async fn stream_anthropic_message(
             binding = next;
             continue;
         }
-        return Err(format!(
-            "model provider error {status}: {}",
-            provider_error_message(&body)
-        ));
+        let message = provider_error_message(&body);
+        // A server that doesn't know prompt caching names the field it
+        // refused; the fix is the provider's setting, not a retry. The same
+        // goes for a model refusing effort, or the level asked for.
+        let hint = if request.prompt_caching && message.contains("cache_control") {
+            " (This server may not support prompt caching: turn off \u{201c}Prompt caching\u{201d} on its provider.)"
+        } else if request.output_config.is_some()
+            && (message.contains("effort") || message.contains("output_config"))
+        {
+            " (This model may not support this effort level: change or clear \u{201c}Effort\u{201d} for it on its provider's models.)"
+        } else {
+            ""
+        };
+        return Err(format!("model provider error {status}: {message}{hint}"));
     };
 
     let mut byte_stream = response.bytes_stream();
     let mut line_buffer = String::new();
-    let mut content: Vec<ContentBlock> = Vec::new();
-    let mut current: Option<PartialBlock> = None;
+    let mut blocks = Blocks::default();
     let mut stop_reason = String::new();
     let mut usage = TokenUsage::default();
 
@@ -574,59 +701,28 @@ pub async fn stream_anthropic_message(
             if dropped > 0 {
                 tracing::info!(dropped, "the model provider dropped replayed thinking it couldn't accept");
             }
+            let index = block_index(&value);
             match interpret_stream_event(&value) {
                 StreamOutcome::TextDelta(text) => {
                     on_delta(&text);
-                    match &mut current {
-                        Some(PartialBlock::Text(existing)) => existing.push_str(&text),
-                        _ => current = Some(PartialBlock::Text(text)),
-                    }
+                    blocks.text(index, text)?;
                 }
                 // Not passed to `on_delta` — thinking is never part of the
                 // live-typed reply, only shown (collapsed) once the full
                 // block lands with the finished message. No live "typing"
                 // effect for it, unlike text.
-                StreamOutcome::ThinkingDelta(thinking) => match &mut current {
-                    Some(PartialBlock::Thinking {
-                        thinking: existing, ..
-                    }) => existing.push_str(&thinking),
-                    _ => {
-                        current = Some(PartialBlock::Thinking {
-                            thinking,
-                            signature: String::new(),
-                        })
-                    }
-                },
-                StreamOutcome::ThinkingSignatureDelta(signature) => {
-                    if let Some(PartialBlock::Thinking {
-                        signature: existing,
-                        ..
-                    }) = &mut current
-                    {
-                        existing.push_str(&signature);
-                    }
-                }
-                StreamOutcome::ToolUseStart { id, name } => {
-                    current = Some(PartialBlock::ToolUse {
+                StreamOutcome::ThinkingDelta(thinking) => blocks.thinking(index, thinking)?,
+                StreamOutcome::ThinkingSignatureDelta(signature) => blocks.signature(index, &signature),
+                StreamOutcome::ToolUseStart { id, name } => blocks.start(
+                    index,
+                    PartialBlock::ToolUse {
                         id,
                         name,
                         partial_json: String::new(),
-                    });
-                }
-                StreamOutcome::ToolUseInputDelta(partial_json) => {
-                    if let Some(PartialBlock::ToolUse {
-                        partial_json: existing,
-                        ..
-                    }) = &mut current
-                    {
-                        existing.push_str(&partial_json);
-                    }
-                }
-                StreamOutcome::BlockStop => {
-                    if let Some(block) = current.take() {
-                        content.push(block.finalize()?);
-                    }
-                }
+                    },
+                )?,
+                StreamOutcome::ToolUseInputDelta(partial_json) => blocks.tool_input(index, &partial_json),
+                StreamOutcome::BlockStop => blocks.stop(index)?,
                 StreamOutcome::StopReason {
                     reason,
                     output_tokens,
@@ -647,12 +743,8 @@ pub async fn stream_anthropic_message(
         }
     }
 
-    if let Some(block) = current.take() {
-        content.push(block.finalize()?);
-    }
-
     Ok(StreamedTurn {
-        content,
+        content: blocks.finish()?,
         stop_reason,
         usage,
     })
@@ -714,6 +806,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
+            output_config: None,
         };
         let result = stream_anthropic_message(&endpoint, &request, |_| {}).await;
         assert!(result.is_err(), "a redirect isn't a reply");
@@ -945,6 +1039,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
+            output_config: None,
         };
 
         stream_anthropic_message(&test_endpoint(addr), &request, on_delta).await
@@ -1007,6 +1103,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
+            output_config: None,
         };
         let result = stream_anthropic_message(&test_endpoint(addr), &request, |_| {}).await;
         (result, count.load(std::sync::atomic::Ordering::SeqCst))
@@ -1043,6 +1141,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct Seen {
         beta: Option<String>,
+        user_agent: Option<String>,
         body: Value,
     }
 
@@ -1087,10 +1186,14 @@ mod tests {
                         .get("anthropic-beta")
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_string);
+                    let user_agent = headers
+                        .get(axum::http::header::USER_AGENT)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
                     let body = serde_json::from_str(&body).unwrap_or(Value::Null);
                     let i = {
                         let mut record = record.lock().expect("record lock");
-                        record.push(Seen { beta, body });
+                        record.push(Seen { beta, user_agent, body });
                         record.len() - 1
                     };
                     let (status, body) = responses[i.min(responses.len() - 1)];
@@ -1143,6 +1246,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking,
+            prompt_caching: false,
+            output_config: None,
         }
     }
 
@@ -1196,6 +1301,88 @@ mod tests {
         stream_anthropic_message(&other, &request, |_| {}).await.expect("another provider");
         let other_seen = requests_seen(&other_record);
         assert!(!other_seen[0].has_binding_beta() && other_seen[0].drop_block().is_none(), "another provider is untouched");
+    }
+
+    /// smelt says who it is: Kimi Code's terms forbid a tool hiding or
+    /// faking its identity (SME-106).
+    #[tokio::test]
+    async fn test_a_model_request_names_smelt_and_its_version() {
+        let (endpoint, record) = recording_upstream(vec![(200, OK_BODY)]).await;
+        stream_anthropic_message(&endpoint, &request_replaying_thinking(None), |_| {})
+            .await
+            .expect("streams");
+        assert_eq!(
+            requests_seen(&record)[0].user_agent.as_deref(),
+            Some(concat!("smelt/", env!("CARGO_PKG_VERSION")))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_caching_request_carries_both_markers_even_when_retried_stripped() {
+        let (endpoint, record) = recording_upstream(vec![(400, BINDING_BODY), (200, OK_BODY)]).await;
+        let mut request = request_replaying_thinking(None);
+        request.prompt_caching = true;
+        stream_anthropic_message(&endpoint, &request, |_| {}).await.expect("should recover");
+        let seen = requests_seen(&record);
+        assert_eq!(seen.len(), 2);
+        for (i, sent) in seen.iter().enumerate() {
+            assert_eq!(sent.body["cache_control"], serde_json::json!({"type": "ephemeral"}), "request {i}");
+            assert_eq!(
+                sent.body["system"][0]["cache_control"],
+                serde_json::json!({"type": "ephemeral"}),
+                "request {i}"
+            );
+        }
+    }
+
+    /// What a strict server says to the top-level `cache_control`.
+    const CACHE_CONTROL_REFUSED_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"cache_control: Extra inputs are not permitted"}}"#;
+
+    #[tokio::test]
+    async fn test_a_refused_cache_marker_names_the_provider_setting() {
+        let (endpoint, _record) = recording_upstream(vec![(400, CACHE_CONTROL_REFUSED_BODY)]).await;
+        let mut request = request_replaying_thinking(None);
+        request.prompt_caching = true;
+        let error = stream_anthropic_message(&endpoint, &request, |_| {}).await.expect_err("refused");
+        assert!(error.contains("cache_control: Extra inputs are not permitted"), "keeps the server's words: {error}");
+        assert!(error.contains("Prompt caching"), "names the setting to turn off: {error}");
+    }
+
+    #[tokio::test]
+    async fn test_a_400_without_caching_gets_no_caching_hint() {
+        let (endpoint, _record) = recording_upstream(vec![(400, CACHE_CONTROL_REFUSED_BODY)]).await;
+        let request = request_replaying_thinking(None);
+        let error = stream_anthropic_message(&endpoint, &request, |_| {}).await.expect_err("refused");
+        assert!(!error.contains("Prompt caching"), "{error}");
+    }
+
+    /// Synthetic refusals of `output_config.effort`, one naming each field: a
+    /// model without effort, and one without the level asked for.
+    const EFFORT_REFUSED_BODIES: [&str; 2] = [
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"This model does not support the effort parameter."}}"#,
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"output_config: Extra inputs are not permitted"}}"#,
+    ];
+
+    #[tokio::test]
+    async fn test_a_refused_effort_names_the_models_effort_setting() {
+        for body in EFFORT_REFUSED_BODIES {
+            let (endpoint, _record) = recording_upstream(vec![(400, body)]).await;
+            let mut request = request_replaying_thinking(None);
+            request.output_config = Some(super::super::types::OutputConfig { effort: super::super::types::Effort::Xhigh });
+            let error = stream_anthropic_message(&endpoint, &request, |_| {}).await.expect_err("refused");
+            assert!(error.contains(&provider_error_message(body)), "keeps the server's words: {error}");
+            assert!(error.contains("\u{201c}Effort\u{201d}"), "names the setting to change: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_400_without_effort_gets_no_effort_hint() {
+        for body in EFFORT_REFUSED_BODIES {
+            let (endpoint, _record) = recording_upstream(vec![(400, body)]).await;
+            let request = request_replaying_thinking(None);
+            let error = stream_anthropic_message(&endpoint, &request, |_| {}).await.expect_err("refused");
+            assert!(!error.contains("Effort"), "{error}");
+        }
     }
 
     #[tokio::test]
@@ -1517,6 +1704,278 @@ mod tests {
         );
     }
 
+    /// llama.cpp's reply: thinking, commentary and a tool call, each block
+    /// opened without closing the one before, every stop at the end.
+    const LLAMA_CPP_STREAM: &str = include_str!("fixtures/llama_cpp_messages_stream.sse");
+
+    /// SME-112: commentary before a tool call was lost on llama.cpp, whose
+    /// blocks overlap. Every block is kept, in index order.
+    #[tokio::test]
+    async fn test_overlapping_blocks_from_llama_cpp_are_all_kept() {
+        let mut deltas = Vec::new();
+        let turn = run_against_mock_upstream(LLAMA_CPP_STREAM, |d| deltas.push(d.to_string()))
+            .await
+            .expect("stream should succeed");
+
+        assert_eq!(deltas.concat(), "Let me check your todo list.");
+        assert_eq!(
+            turn.content,
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "The user wants their todos.".to_string(),
+                    signature: String::new(),
+                },
+                ContentBlock::Text {
+                    text: "Let me check your todo list.".to_string()
+                },
+                ContentBlock::ToolUse {
+                    id: "k8ZpQ2wLm4RtY7vXc1NbJ6dHs9FgA3eU".to_string(),
+                    name: "todoread".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ]
+        );
+        assert_eq!(turn.stop_reason, "tool_use");
+        assert_eq!(turn.usage.input_tokens, 1834);
+        assert_eq!(turn.usage.output_tokens, 27);
+    }
+
+    /// An SSE body of `data` payloads, each with its `type` as the event
+    /// name, kept for the test's whole run like a fixture.
+    fn sse(data: &[serde_json::Value]) -> &'static str {
+        let body: String = data
+            .iter()
+            .map(|d| format!("event: {}\ndata: {d}\n\n", d["type"].as_str().expect("a type")))
+            .collect();
+        Box::leak(body.into_boxed_str())
+    }
+
+    fn text_at(index: usize, text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": text}})
+    }
+
+    fn tool_at(index: usize, id: &str, input: &str) -> [serde_json::Value; 2] {
+        [
+            serde_json::json!({"type": "content_block_start", "index": index, "content_block": {"type": "tool_use", "id": id, "name": "add"}}),
+            serde_json::json!({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": input}}),
+        ]
+    }
+
+    fn stop_at(index: usize) -> serde_json::Value {
+        serde_json::json!({"type": "content_block_stop", "index": index})
+    }
+
+    fn tool_use_end() -> [serde_json::Value; 2] {
+        [
+            serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+            serde_json::json!({"type": "message_stop"}),
+        ]
+    }
+
+    fn add_call(id: &str, a: i64) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "add".to_string(),
+            input: serde_json::json!({"a": a}),
+        }
+    }
+
+    fn text(text: &str) -> ContentBlock {
+        ContentBlock::Text { text: text.to_string() }
+    }
+
+    /// Two tool calls open at once, as llama.cpp sends them: each keeps
+    /// its own input.
+    #[tokio::test]
+    async fn test_two_overlapping_tool_calls_are_both_kept() {
+        let [start_a, input_a] = tool_at(1, "call_a", r#"{"a":1}"#);
+        let [start_b, input_b] = tool_at(2, "call_b", r#"{"a":2}"#);
+        let [delta, stop] = tool_use_end();
+        let body = sse(&[
+            text_at(0, "Two sums."),
+            start_a,
+            input_a,
+            start_b,
+            input_b,
+            stop_at(0),
+            stop_at(1),
+            stop_at(2),
+            delta,
+            stop,
+        ]);
+        let turn = run_against_mock_upstream(body, |_| {}).await.expect("stream should succeed");
+        assert_eq!(turn.content, vec![text("Two sums."), add_call("call_a", 1), add_call("call_b", 2)]);
+    }
+
+    /// The reply's content is in index order, not the order its stops
+    /// came in.
+    #[tokio::test]
+    async fn test_blocks_stopped_out_of_order_are_kept_in_index_order() {
+        let [start, input] = tool_at(1, "call_a", r#"{"a":1}"#);
+        let [delta, stop] = tool_use_end();
+        let body = sse(&[text_at(0, "Adding."), start, input, stop_at(1), stop_at(0), delta, stop]);
+        let turn = run_against_mock_upstream(body, |_| {}).await.expect("stream should succeed");
+        assert_eq!(turn.content, vec![text("Adding."), add_call("call_a", 1)]);
+    }
+
+    /// A stream that ends with no stops at all keeps every block.
+    #[tokio::test]
+    async fn test_blocks_never_stopped_are_kept_at_the_end_of_the_stream() {
+        let [start, input] = tool_at(2, "call_a", r#"{"a":1}"#);
+        let [delta, stop] = tool_use_end();
+        let thinking = serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "Hm."}});
+        let body = sse(&[thinking, text_at(1, "Adding."), start, input, delta, stop]);
+        let turn = run_against_mock_upstream(body, |_| {}).await.expect("stream should succeed");
+        assert_eq!(
+            turn.content,
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "Hm.".to_string(),
+                    signature: String::new()
+                },
+                text("Adding."),
+                add_call("call_a", 1),
+            ]
+        );
+    }
+
+    /// Ollama's order (`StreamConverter.Process`): each block started and
+    /// stopped before the next starts.
+    #[tokio::test]
+    async fn test_sequential_blocks_from_ollama_are_kept() {
+        let [start, input] = tool_at(1, "call_a", r#"{"a":1}"#);
+        let [delta, stop] = tool_use_end();
+        let body = sse(&[
+            serde_json::json!({"type": "message_start", "message": {"usage": {"input_tokens": 5, "output_tokens": 0}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            text_at(0, "Add"),
+            text_at(0, "ing."),
+            stop_at(0),
+            start,
+            input,
+            stop_at(1),
+            delta,
+            stop,
+        ]);
+        let turn = run_against_mock_upstream(body, |_| {}).await.expect("stream should succeed");
+        assert_eq!(turn.content, vec![text("Adding."), add_call("call_a", 1)]);
+    }
+
+    /// A tool call whose input never parses still fails the call, whether
+    /// its stop came or the stream just ended.
+    #[tokio::test]
+    async fn test_an_unparseable_tool_input_still_fails_the_call() {
+        for with_stop in [true, false] {
+            let [start, input] = tool_at(0, "call_a", r#"{"a":"#);
+            let [delta, stop] = tool_use_end();
+            let mut events = vec![start, input];
+            if with_stop {
+                events.push(stop_at(0));
+            }
+            events.extend([delta, stop]);
+            let err = run_against_mock_upstream(sse(&events), |_| {})
+                .await
+                .expect_err("a broken tool input fails");
+            assert!(err.contains("failed to parse tool_use input JSON for add"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_block_index_reads_the_events_index() {
+        assert_eq!(block_index(&serde_json::json!({"type": "content_block_start", "index": 2})), Some(2));
+        assert_eq!(block_index(&text_at(1, "x")), Some(1));
+        assert_eq!(block_index(&stop_at(3)), Some(3));
+        assert_eq!(block_index(&serde_json::json!({"type": "content_block_stop"})), None);
+        assert_eq!(block_index(&serde_json::json!({"type": "content_block_stop", "index": -1})), None);
+    }
+
+    /// Without indexes, events go to the block opened last, as they did
+    /// before blocks were tracked by index.
+    #[test]
+    fn test_blocks_without_an_index_follow_one_another() {
+        let mut blocks = Blocks::default();
+        blocks.thinking(None, "Hm".to_string()).expect("thinking");
+        blocks.signature(None, "sig");
+        blocks.stop(None).expect("stop");
+        blocks.text(None, "A".to_string()).expect("text");
+        blocks.text(None, "B".to_string()).expect("text");
+        blocks
+            .start(None, PartialBlock::ToolUse { id: "t".to_string(), name: "add".to_string(), partial_json: String::new() })
+            .expect("start");
+        blocks.tool_input(None, r#"{"a":1}"#);
+        assert_eq!(
+            blocks.finish().expect("finish"),
+            vec![
+                ContentBlock::Thinking { thinking: "Hm".to_string(), signature: "sig".to_string() },
+                text("AB"),
+                add_call("t", 1),
+            ]
+        );
+    }
+
+    /// A delta for a block already stopped opens another, kept right after
+    /// it; a stop for a block never opened changes nothing.
+    #[test]
+    fn test_a_delta_after_its_blocks_stop_is_kept_after_it() {
+        let mut blocks = Blocks::default();
+        blocks.text(Some(0), "first".to_string()).expect("text");
+        blocks.stop(Some(0)).expect("stop");
+        blocks.stop(Some(7)).expect("a stray stop is ignored");
+        blocks.text(Some(1), "second".to_string()).expect("text");
+        blocks.stop(Some(1)).expect("stop");
+        blocks.text(Some(0), "late".to_string()).expect("text");
+        assert_eq!(blocks.finish().expect("finish"), vec![text("first"), text("late"), text("second")]);
+    }
+
+    /// A provider's index at `usize::MAX`, then an event without one, must
+    /// not overflow working out the next free index (review round 1).
+    #[test]
+    fn test_a_block_at_the_largest_index_doesnt_overflow_the_next() {
+        let mut blocks = Blocks::default();
+        blocks.text(Some(usize::MAX), "last".to_string()).expect("text");
+        blocks.thinking(None, "Hm".to_string()).expect("thinking");
+        assert_eq!(
+            blocks.finish().expect("finish"),
+            vec![
+                text("last"),
+                ContentBlock::Thinking { thinking: "Hm".to_string(), signature: String::new() },
+            ]
+        );
+    }
+
+    /// A tool call started again while it's open (llama.cpp's final chunk
+    /// can resend a call's start) stays one call, whether or not any of
+    /// its input had come (review round 2).
+    #[test]
+    fn test_a_tool_call_started_twice_stays_one_call() {
+        let call = || PartialBlock::ToolUse { id: "t".to_string(), name: "add".to_string(), partial_json: String::new() };
+        let mut empty = Blocks::default();
+        empty.start(Some(0), call()).expect("start");
+        empty.start(Some(0), call()).expect("start again");
+        empty.tool_input(Some(0), r#"{"a":1}"#);
+        assert_eq!(empty.finish().expect("finish"), vec![add_call("t", 1)]);
+
+        let mut partial = Blocks::default();
+        partial.start(Some(0), call()).expect("start");
+        partial.tool_input(Some(0), "{");
+        partial.start(Some(0), call()).expect("start again");
+        partial.tool_input(Some(0), r#""a":1}"#);
+        assert_eq!(partial.finish().expect("finish"), vec![add_call("t", 1)]);
+    }
+
+    /// A signature or tool input with no block of its kind open is
+    /// dropped, as before.
+    #[test]
+    fn test_a_signature_or_tool_input_without_its_block_is_dropped() {
+        let mut blocks = Blocks::default();
+        blocks.signature(Some(0), "sig");
+        blocks.tool_input(Some(0), "{}");
+        blocks.text(Some(1), "hi".to_string()).expect("text");
+        blocks.signature(Some(1), "sig");
+        blocks.tool_input(Some(1), "{}");
+        assert_eq!(blocks.finish().expect("finish"), vec![text("hi")]);
+    }
+
     /// Regression test for SME-8's retrospective's hung
     /// live model call: before `RESPONSE_TIMEOUT` existed, a connection
     /// that never got a response at all (accepted, then silence) hung
@@ -1549,6 +2008,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
+            output_config: None,
         };
 
         let result = tokio::time::timeout(
@@ -1610,6 +2071,8 @@ mod tests {
             stream: true,
             tools: vec![],
             thinking: None,
+            prompt_caching: false,
+            output_config: None,
         };
 
         let endpoint = Endpoint {
@@ -1671,6 +2134,8 @@ mod tests {
                 stream: true,
                 tools: vec![],
                 thinking: None,
+                prompt_caching: false,
+                output_config: None,
             },
             Binding::AsIs,
             std::time::Duration::from_secs(5),

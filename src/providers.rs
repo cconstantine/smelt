@@ -64,6 +64,13 @@ impl ProviderKind {
             Self::Other => AuthKind::Bearer,
         }
     }
+
+    /// Whether the new-provider form starts with prompt caching on: for
+    /// Anthropic, which bills cache reads at a tenth of the input price.
+    /// Another server may refuse the `cache_control` field.
+    pub fn default_prompt_caching(self) -> bool {
+        matches!(self, Self::Anthropic)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,6 +114,8 @@ pub struct ProviderSummary {
     pub base_url: String,
     pub auth_kind: AuthKind,
     pub secret_hint: Option<String>,
+    pub prompt_caching: bool,
+    pub price_catalog_provider: Option<String>,
 }
 
 /// What the new- and edit-provider forms send. On an edit, an empty
@@ -118,6 +127,67 @@ pub struct ProviderInput {
     pub base_url: String,
     pub auth_kind: AuthKind,
     pub secret: String,
+    /// Mark turn requests for prompt caching (SME-106).
+    pub prompt_caching: bool,
+    /// The catalog provider that prices its calls, or `None` (SME-106).
+    pub price_catalog_provider: Option<String>,
+}
+
+/// A models.dev catalog provider, for the provider form's "Prices from"
+/// choice (SME-106).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PriceSource {
+    pub id: String,
+    pub name: String,
+    pub api: Option<String>,
+}
+
+/// The catalog provider to suggest for a provider of `kind` at
+/// `base_url`: the one whose API is at the same host, nearest by path.
+/// `None` when nothing matches, or when two match equally well (a service
+/// and a plan on it share an address, and only the user knows which key
+/// they have).
+pub fn suggest_price_source(sources: &[PriceSource], kind: ProviderKind, base_url: &str) -> Option<String> {
+    let (host, path) = host_and_path(base_url)?;
+    // The catalog gives Anthropic no address of its own.
+    if kind == ProviderKind::Anthropic && host == "api.anthropic.com" {
+        return sources.iter().any(|s| s.id == "anthropic").then(|| "anthropic".to_string());
+    }
+    let mut best: Option<(usize, &PriceSource)> = None;
+    let mut tied = false;
+    for source in sources {
+        let Some((api_host, api_path)) = source.api.as_deref().and_then(host_and_path) else {
+            continue;
+        };
+        if api_host != host {
+            continue;
+        }
+        let shared = path.iter().zip(&api_path).take_while(|(a, b)| a == b).count();
+        match best {
+            Some((score, _)) if score > shared => {}
+            Some((score, _)) if score == shared => tied = true,
+            _ => {
+                best = Some((shared, source));
+                tied = false;
+            }
+        }
+    }
+    best.filter(|_| !tied).map(|(_, source)| source.id.clone())
+}
+
+/// `url`'s host, lowercased, and its path's segments; `None` for anything
+/// but an http(s) address.
+fn host_and_path(url: &str) -> Option<(String, Vec<String>)> {
+    let rest = url.trim();
+    let rest = rest
+        .strip_prefix("https://")
+        .or_else(|| rest.strip_prefix("http://"))?;
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if host.is_empty() {
+        return None;
+    }
+    let segments = path.split('/').filter(|s| !s.is_empty()).map(str::to_string).collect();
+    Some((host.to_ascii_lowercase(), segments))
 }
 
 /// The last four characters of `secret`, shown as `…abcd`, or `None` for a
@@ -143,6 +213,8 @@ pub struct ModelInfo {
     pub thinking_override: Option<bool>,
     /// The user's override, if any.
     pub context_window_override: Option<u32>,
+    /// The user's effort, if set (SME-106).
+    pub effort_override: Option<crate::anthropic::Effort>,
     /// What the provider reported, if it did.
     pub reported_context_window: Option<u32>,
     pub reported_tools: Option<bool>,
@@ -221,8 +293,16 @@ mod server {
     #[derive(Clone, Debug, PartialEq)]
     pub struct TurnModel {
         pub endpoint: Endpoint,
+        /// The provider the turn runs on, for its usage records.
+        pub provider_id: i64,
         pub model: String,
         pub thinking: bool,
+        /// The provider's prompt caching setting (SME-106).
+        pub prompt_caching: bool,
+        /// The catalog provider its calls are priced as (SME-106).
+        pub price_catalog_provider: Option<String>,
+        /// The model's effort, for an Anthropic provider only (SME-106).
+        pub effort: Option<crate::anthropic::Effort>,
         pub context_window: u32,
         /// Thinking blocks in messages up to this id were written for
         /// another provider or model, and aren't replayed.
@@ -245,6 +325,8 @@ mod server {
             Self {
                 id: provider.id,
                 secret_hint: secret_hint(&provider.secret),
+                prompt_caching: provider.prompt_caching,
+                price_catalog_provider: provider.price_catalog_provider,
                 kind: ProviderKind::parse(&provider.kind).unwrap_or(ProviderKind::Other),
                 auth_kind: AuthKind::parse(&provider.auth_kind).unwrap_or(AuthKind::ApiKey),
                 name: provider.name,
@@ -284,6 +366,7 @@ mod server {
             display_name,
             thinking_override: row.and_then(|r| r.thinking),
             context_window_override: row.and_then(|r| positive(r.context_window)),
+            effort_override: row.and_then(|r| r.effort.as_deref()).and_then(crate::anthropic::Effort::parse),
             reported_context_window: row.and_then(|r| positive(r.reported_context_window)),
             reported_tools: row.and_then(|r| r.reported_tools),
             thinking: thinking(row),
@@ -415,6 +498,13 @@ mod server {
             .map_err(db_error)?;
         Ok(Some(TurnModel {
             endpoint: endpoint(&provider),
+            provider_id,
+            prompt_caching: provider.prompt_caching,
+            price_catalog_provider: provider.price_catalog_provider.clone(),
+            // Sent to Anthropic only: another server may refuse the field.
+            effort: (ProviderKind::parse(&provider.kind) == Some(ProviderKind::Anthropic))
+                .then(|| settings.as_ref().and_then(|r| r.effort.as_deref()).and_then(crate::anthropic::Effort::parse))
+                .flatten(),
             thinking: thinking(settings.as_ref()),
             context_window: context_window(&model, settings.as_ref()).0,
             thinking_stripped_through,
@@ -442,10 +532,17 @@ mod server {
                 ));
             }
         }
+        let price_catalog_provider = input
+            .price_catalog_provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
         Ok(ProviderInput {
             name,
             base_url,
             secret: input.secret.trim().to_string(),
+            price_catalog_provider,
             ..input
         })
     }
@@ -472,6 +569,8 @@ mod server {
             &input.base_url,
             input.auth_kind.as_str(),
             &input.secret,
+            input.prompt_caching,
+            input.price_catalog_provider.as_deref(),
         )
         .await
         .map_err(|e| save_error(&input.name, e))?;
@@ -506,6 +605,8 @@ mod server {
             &input.base_url,
             input.auth_kind.as_str(),
             secret,
+            input.prompt_caching,
+            input.price_catalog_provider.as_deref(),
         )
         .await
         .map_err(|e| save_error(&input.name, e))?
@@ -697,6 +798,7 @@ mod server {
         model: &str,
         thinking: Option<bool>,
         context_window: Option<u32>,
+        effort: Option<crate::anthropic::Effort>,
     ) -> Result<(), String> {
         let model = model.trim();
         if model.is_empty() {
@@ -711,7 +813,7 @@ mod server {
                     .ok_or("A context window is a number of tokens, at least 1024.")?,
             ),
         };
-        db::set_provider_model_overrides(pool, provider_id, model, thinking, context_window)
+        db::set_provider_model_overrides(pool, provider_id, model, thinking, context_window, effort.map(|e| e.as_str()))
             .await
             .map_err(provider_gone)?;
         providers_changed();
@@ -817,6 +919,53 @@ mod tests {
     }
 
     #[cfg(feature = "server")]
+    fn source(id: &str, api: Option<&str>) -> PriceSource {
+        PriceSource { id: id.to_string(), name: id.to_string(), api: api.map(str::to_string) }
+    }
+
+    fn catalog_sources() -> Vec<PriceSource> {
+        vec![
+            source("anthropic", None),
+            source("deepseek", Some("https://api.deepseek.com")),
+            source("minimax", Some("https://api.minimax.io/anthropic/v1")),
+            source("minimax-coding-plan", Some("https://api.minimax.io/anthropic/v1")),
+            source("moonshotai", Some("https://api.moonshot.ai/v1")),
+            source("zai", Some("https://api.z.ai/api/paas/v4")),
+            source("zai-coding-plan", Some("https://api.z.ai/api/coding/paas/v4")),
+        ]
+    }
+
+    #[test]
+    fn test_anthropics_own_api_is_priced_as_anthropic() {
+        let sources = catalog_sources();
+        assert_eq!(
+            suggest_price_source(&sources, ProviderKind::Anthropic, "https://api.anthropic.com").as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            suggest_price_source(&sources, ProviderKind::Anthropic, "https://API.anthropic.com/").as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            suggest_price_source(&sources, ProviderKind::Anthropic, "http://localhost:4000"),
+            None,
+            "a gateway isn't Anthropic's prices"
+        );
+    }
+
+    #[test]
+    fn test_another_service_is_matched_by_host_then_path() {
+        let sources = catalog_sources();
+        let suggest = |url| suggest_price_source(&sources, ProviderKind::Other, url);
+        assert_eq!(suggest("https://api.deepseek.com/anthropic").as_deref(), Some("deepseek"));
+        assert_eq!(suggest("https://api.moonshot.ai/anthropic").as_deref(), Some("moonshotai"));
+        assert_eq!(suggest("https://api.z.ai/api/coding/paas/v4").as_deref(), Some("zai-coding-plan"), "nearest path");
+        assert_eq!(suggest("https://api.z.ai/api/anthropic"), None, "two equally near");
+        assert_eq!(suggest("https://api.minimax.io/anthropic"), None, "a service and its plan share the address");
+        assert_eq!(suggest("http://llama:8080"), None);
+        assert_eq!(suggest("not a url"), None);
+    }
+
     mod server_tests {
         use sqlx::PgPool;
 
@@ -851,6 +1000,7 @@ mod tests {
                 reported_context_window,
                 reported_thinking,
                 reported_tools: None,
+                effort: None,
                 added_by_hand: false,
             }
         }
@@ -877,7 +1027,7 @@ mod tests {
         }
 
         async fn provider(pool: &PgPool, name: &str, auth_kind: &str) -> db::InferenceProvider {
-            db::create_inference_provider(pool, name, "ollama", "http://ollama:11434", auth_kind, "the-secret")
+            db::create_inference_provider(pool, name, "ollama", "http://ollama:11434", auth_kind, "the-secret", false, None)
                 .await
                 .expect("create provider")
         }
@@ -936,7 +1086,7 @@ mod tests {
             let conversation = db::create_conversation_with_id(&pool, 9_172_000_001).await.expect("conversation");
             let bearer = provider(&pool, "gateway", "bearer").await;
             db::set_default_model(&pool, bearer.id, "m1").await.expect("default");
-            db::set_provider_model_overrides(&pool, bearer.id, "m1", Some(false), Some(64_000))
+            db::set_provider_model_overrides(&pool, bearer.id, "m1", Some(false), Some(64_000), None)
                 .await
                 .expect("overrides");
             let mut events = crate::events::subscribe(conversation.id);
@@ -950,8 +1100,12 @@ mod tests {
                         base_url: "http://ollama:11434".to_string(),
                         auth: Auth::Bearer("the-secret".to_string()),
                     },
+                    provider_id: bearer.id,
                     model: "m1".to_string(),
                     thinking: false,
+                    prompt_caching: false,
+                    price_catalog_provider: None,
+                    effort: None,
                     context_window: 64_000,
                     thinking_stripped_through: None,
                 }
@@ -1037,6 +1191,8 @@ mod tests {
                 base_url: base_url.to_string(),
                 auth_kind: AuthKind::ApiKey,
                 secret: secret.to_string(),
+                prompt_caching: false,
+                price_catalog_provider: None,
             }
         }
 
@@ -1064,6 +1220,8 @@ mod tests {
                     base_url: "http://ollama:11434".to_string(),
                     auth_kind: AuthKind::ApiKey,
                     secret_hint: Some("\u{2026}7890".to_string()),
+                    prompt_caching: false,
+                    price_catalog_provider: None,
                 }
             );
             assert!(received(&mut app_events, &crate::events::AppEvent::ProvidersChanged));
@@ -1078,23 +1236,69 @@ mod tests {
             assert_eq!(kept.secret_hint, created.secret_hint, "a blank secret keeps the stored one");
             let stored = db::get_inference_provider(&pool, created.id).await.expect("get").expect("exists");
             assert_eq!(stored.secret, "secret-1234567890");
+            let caching = update_provider(&pool, created.id, ProviderInput {
+                prompt_caching: true,
+                price_catalog_provider: Some(" deepseek ".to_string()),
+                ..input("Home", "http://ollama:11434", "")
+            })
+            .await
+            .expect("turn caching on");
+            assert!(caching.prompt_caching, "the form's choice is saved and shown");
+            assert_eq!(caching.price_catalog_provider.as_deref(), Some("deepseek"));
+            let unpriced = update_provider(&pool, created.id, ProviderInput {
+                price_catalog_provider: Some("  ".to_string()),
+                ..input("Home", "http://ollama:11434", "")
+            })
+            .await
+            .expect("no prices");
+            assert_eq!(unpriced.price_catalog_provider, None, "a blank choice is none");
             assert_eq!(
                 update_provider(&pool, created.id + 100, input("Z", "http://h", "")).await,
                 Err("That provider no longer exists.".to_string())
             );
         }
 
+        /// Effort is kept per model and sent only on an Anthropic provider:
+        /// another server may refuse the field (SME-106).
+        #[sqlx::test]
+        async fn test_a_models_effort_is_kept_and_sent_only_to_anthropic(pool: PgPool) {
+            use crate::anthropic::Effort;
+            let anthropic = db::create_inference_provider(&pool, "a", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None)
+                .await
+                .expect("anthropic provider");
+            let ollama = provider(&pool, "o", "api_key").await;
+            for p in [&anthropic, &ollama] {
+                set_model_settings(&pool, p.id, "m", None, None, Some(Effort::Low)).await.expect("set");
+                let row = db::get_provider_model(&pool, p.id, "m").await.expect("get").expect("exists");
+                assert_eq!(model_info("m".to_string(), None, Some(&row), None).effort_override, Some(Effort::Low));
+            }
+
+            let on_anthropic = db::create_conversation_with_id(&pool, 9_172_000_010).await.expect("conversation");
+            db::set_conversation_model(&pool, on_anthropic.id, anthropic.id, "m").await.expect("pick");
+            let turn = resolve_turn_model(&pool, on_anthropic.id).await.expect("resolves");
+            assert_eq!(turn.effort, Some(Effort::Low));
+
+            let on_ollama = db::create_conversation_with_id(&pool, 9_172_000_011).await.expect("conversation");
+            db::set_conversation_model(&pool, on_ollama.id, ollama.id, "m").await.expect("pick");
+            let turn = resolve_turn_model(&pool, on_ollama.id).await.expect("resolves");
+            assert_eq!(turn.effort, None, "not sent to an Ollama server");
+
+            set_model_settings(&pool, anthropic.id, "m", None, None, None).await.expect("clear");
+            let turn = resolve_turn_model(&pool, on_anthropic.id).await.expect("resolves");
+            assert_eq!(turn.effort, None, "unset sends none");
+        }
+
         #[sqlx::test]
         async fn test_model_settings_are_checked(pool: PgPool) {
             let p = provider(&pool, "p", "api_key").await;
-            assert!(set_model_settings(&pool, p.id, " ", None, None).await.is_err());
-            assert!(set_model_settings(&pool, p.id, "m", None, Some(10)).await.is_err(), "too small");
-            assert!(set_model_settings(&pool, p.id, "m", None, Some(u32::MAX)).await.is_err(), "too big");
+            assert!(set_model_settings(&pool, p.id, " ", None, None, None).await.is_err());
+            assert!(set_model_settings(&pool, p.id, "m", None, Some(10), None).await.is_err(), "too small");
+            assert!(set_model_settings(&pool, p.id, "m", None, Some(u32::MAX), None).await.is_err(), "too big");
             assert_eq!(
-                set_model_settings(&pool, p.id + 1, "m", Some(true), None).await,
+                set_model_settings(&pool, p.id + 1, "m", Some(true), None, None).await,
                 Err("That provider no longer exists.".to_string())
             );
-            set_model_settings(&pool, p.id, "m", Some(false), Some(32_768)).await.expect("set");
+            set_model_settings(&pool, p.id, "m", Some(false), Some(32_768), None).await.expect("set");
             let row = db::get_provider_model(&pool, p.id, "m").await.expect("get").expect("exists");
             assert_eq!((row.thinking, row.context_window), (Some(false), Some(32_768)));
         }
@@ -1132,10 +1336,10 @@ mod tests {
         #[sqlx::test]
         async fn test_an_ollama_providers_models_come_with_their_details(pool: PgPool) {
             let base = mock_ollama().await;
-            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k")
+            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None)
                 .await
                 .expect("create");
-            set_model_settings(&pool, p.id, "typed-by-hand", None, Some(16_384)).await.expect("set");
+            set_model_settings(&pool, p.id, "typed-by-hand", None, Some(16_384), None).await.expect("set");
 
             let listing = provider_models(&pool, p.id, true).await.expect("models");
 
@@ -1162,7 +1366,7 @@ mod tests {
         #[sqlx::test]
         async fn test_a_quick_listing_skips_the_per_model_questions(pool: PgPool) {
             let base = mock_ollama().await;
-            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k")
+            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None)
                 .await
                 .expect("create");
             let listing = provider_models(&pool, p.id, false).await.expect("models");
@@ -1176,7 +1380,7 @@ mod tests {
         #[sqlx::test]
         async fn test_adding_a_model_by_id_keeps_its_settings(pool: PgPool) {
             let p = provider(&pool, "p", "api_key").await;
-            set_model_settings(&pool, p.id, "llama3", Some(false), Some(32_768)).await.expect("set");
+            set_model_settings(&pool, p.id, "llama3", Some(false), Some(32_768), None).await.expect("set");
             add_model(&pool, p.id, " llama3 ").await.expect("add");
             let row = db::get_provider_model(&pool, p.id, "llama3").await.expect("get").expect("exists");
             assert_eq!((row.thinking, row.context_window), (Some(false), Some(32_768)));
@@ -1194,14 +1398,14 @@ mod tests {
         #[sqlx::test]
         async fn test_a_model_the_provider_dropped_isnt_shown(pool: PgPool) {
             let base = mock_ollama().await;
-            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k")
+            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None)
                 .await
                 .expect("create");
             db::set_provider_model_reported(&pool, p.id, "removed", Some(4096), None, Some(true))
                 .await
                 .expect("seen once");
             add_model(&pool, p.id, "by-hand").await.expect("add");
-            set_model_settings(&pool, p.id, "tuned", None, Some(16_384)).await.expect("set");
+            set_model_settings(&pool, p.id, "tuned", None, Some(16_384), None).await.expect("set");
 
             let listing = provider_models(&pool, p.id, false).await.expect("models");
             let ids: Vec<&str> = listing.models.iter().map(|m| m.id.as_str()).collect();
@@ -1236,7 +1440,7 @@ mod tests {
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
-            let p = db::create_inference_provider(&pool, "o", "ollama", &format!("http://{addr}"), "api_key", "k")
+            let p = db::create_inference_provider(&pool, "o", "ollama", &format!("http://{addr}"), "api_key", "k", false, None)
                 .await
                 .expect("create");
 
@@ -1249,10 +1453,10 @@ mod tests {
 
         #[sqlx::test]
         async fn test_an_unreachable_providers_models_still_list_what_is_stored(pool: PgPool) {
-            let p = db::create_inference_provider(&pool, "gone", "anthropic", "http://127.0.0.1:1", "api_key", "k")
+            let p = db::create_inference_provider(&pool, "gone", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None)
                 .await
                 .expect("create");
-            set_model_settings(&pool, p.id, "claude-opus-5", Some(true), None).await.expect("set");
+            set_model_settings(&pool, p.id, "claude-opus-5", Some(true), None, None).await.expect("set");
             let listing = provider_models(&pool, p.id, true).await.expect("models");
             assert!(listing.listing_error.is_some());
             assert_eq!(listing.models.len(), 1);
@@ -1333,6 +1537,8 @@ pub(crate) mod test_support {
             &format!("http://{addr}"),
             "api_key",
             "test-key",
+            false,
+            None,
         )
         .await
         .expect("create the mock provider");
