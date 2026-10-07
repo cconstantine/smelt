@@ -49,7 +49,7 @@ smelt is one server binary plus a web bundle. Alongside it, it needs:
 ### Steps
 
 1. **Get a build environment.** Build inside the repo's [Dockerfile](Dockerfile) image (its `base` stage, on `rust:1.96-trixie`), or on Debian trixie on x86_64 with the same tools: Rust, the `wasm32-unknown-unknown` target and the Dioxus CLI at the version the Dockerfile pins (`dioxus-cli@0.7.9`; a different `dx` refuses to build the project). Other hosts don't work. The sandbox agent is linked against the build host's glibc and runs in a `debian:trixie-slim` image, so a newer glibc stops every sandbox from starting. `scripts/browser-check/setup.sh` also fetches Chrome's libraries with `apt-get`. Run the server binary in a matching environment too.
-2. **Set up the cluster.** Run `kubectl apply -f k8s/smelt-park-rbac.yaml`, then make a kubeconfig for the `park` service account. [scripts/k3s-bootstrap.sh](scripts/k3s-bootstrap.sh) shows how: it mints a long-lived token secret and writes the kubeconfig. Point `KUBECONFIG` at that file.
+2. **Set up the cluster.** Run `kubectl apply -f k8s/smelt-park-rbac.yaml`, then make a kubeconfig for the `park` service account. [scripts/k3s-bootstrap.sh](scripts/k3s-bootstrap.sh) shows how: it mints a long-lived token secret and writes the kubeconfig. It's written for the compose stack, so use your cluster's API address and an admin kubeconfig instead of its `k3s:6443` and `/k3s-admin/k3s.yaml`. Point `KUBECONFIG` at that file.
 3. **Deliver the sandbox image.** With `DOCKER_HOST` and `KUBECONFIG` set, run `scripts/build-sandbox-image.sh --latest`. Run it again after every upgrade of smelt. The image is named after the agent's sources, and an older agent can speak an older protocol than the server.
 4. **Install headless Chrome:** `scripts/browser-check/setup.sh`. Then set `BROWSER_CHECK_CACHE` to the absolute path of the `.browser-check-cache` directory it creates.
 5. **Build:** `dx bundle --platform web`. It produces a release server binary next to its web bundle, and dx's output says where. Run the binary from that layout: it serves the bundle from the `public/` directory beside it.
@@ -60,7 +60,7 @@ smelt is one server binary plus a web bundle. Alongside it, it needs:
    - `SMELT_ALLOWED_HOSTS`: the host names smelt is reached by. Requests for any other host are then refused.
    - `SMELT_PREVIEW_URL` and `SMELT_PREVIEW_ADDR`: where sandbox previews live.
    - `BROWSER_CHECK_CACHE`: from step 4.
-7. **Put it behind TLS.** Use a reverse proxy that speaks HTTP/2: each tab holds an open event stream, and HTTP/1.1 allows only six connections per host. Route the preview host names (for example `{port}-{conversation}-smelt.example.com`) to `SMELT_PREVIEW_ADDR`'s port. See [Sandbox previews](docs/setup.md#sandbox-previews).
+7. **Put it behind TLS.** Use a reverse proxy that speaks HTTP/2: each tab holds an open event stream, and HTTP/1.1 allows only six connections per host. Route the preview host names (for example `{port}-{conversation}-smelt.example.com`) to `SMELT_PREVIEW_ADDR`'s port. They need wildcard DNS and a wildcard TLS certificate. See [Sandbox previews](docs/setup.md#sandbox-previews).
 8. **Add a model provider.** Open smelt, go to **Model providers** in the sidebar, and add one with its key. Nothing about the model is read from the environment.
 
 ### Before you expose it
