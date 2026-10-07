@@ -2117,7 +2117,10 @@ pub async fn update_inference_provider(
         "UPDATE inference_providers
          SET name = $2, kind = $3, base_url = $4, auth_kind = $5,
              secret = COALESCE($6, secret), prompt_caching = $7, price_catalog_provider = $8,
-             keep_reasoning = $9, updated_at = now()
+             keep_reasoning = $9,
+             -- Another server's caps don't describe this one (SME-111 review 2).
+             server_caps = CASE WHEN kind = $3 AND base_url = $4 THEN server_caps END,
+             updated_at = now()
          WHERE id = $1 RETURNING *",
     )
     .bind(id)
@@ -4532,6 +4535,32 @@ mod tests {
             update_inference_provider(&pool, 999_999, "x", "other", "u", "bearer", None, false, None, true).await.expect("update"),
             None
         );
+    }
+
+    /// SME-111 review 2: what a llama.cpp server said about itself goes
+    /// when the provider points at another address or becomes another
+    /// kind, so a turn never sends settings for the old server's template.
+    #[sqlx::test]
+    async fn test_a_providers_server_caps_go_when_its_address_or_kind_changes(pool: PgPool) {
+        let caps = serde_json::json!({"template_caps": {"supports_reasoning_effort": true}});
+        let p = create_inference_provider(&pool, "llama", "llama_cpp", "http://one", "bearer", "k", false, None, true)
+            .await
+            .expect("create");
+        let caps_after = |name: &'static str, kind: &'static str, url: &'static str| {
+            let pool = pool.clone();
+            let caps = caps.clone();
+            async move {
+                set_inference_provider_server_caps(&pool, p.id, &caps).await.expect("caps");
+                update_inference_provider(&pool, p.id, name, kind, url, "bearer", None, false, None, false)
+                    .await
+                    .expect("update")
+                    .expect("exists")
+                    .server_caps
+            }
+        };
+        assert_eq!(caps_after("renamed", "llama_cpp", "http://one").await, Some(caps.clone()), "same server");
+        assert_eq!(caps_after("renamed", "llama_cpp", "http://two").await, None, "another address");
+        assert_eq!(caps_after("renamed", "other", "http://two").await, None, "another kind");
     }
 
     #[sqlx::test]
