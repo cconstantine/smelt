@@ -1879,6 +1879,32 @@ async fn test_a_cut_off_reply_is_followed_by_a_notice(pool: PgPool) {
     assert_eq!(requests[0]["max_tokens"], 16_384);
 }
 
+/// SME-111 review 2: a reply bound by an Anthropic model's own reported
+/// cap, which "Max reply tokens" can't raise, says it's the model's own
+/// maximum rather than telling the user to raise the setting.
+#[sqlx::test]
+async fn test_a_reply_at_the_models_own_cap_doesnt_say_raise_it(pool: PgPool) {
+    use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    start_recording_mock_upstream(&pool, vec![cut_off_reply_body("Half a tho")]).await;
+    sqlx::query("INSERT INTO provider_models (provider_id, model, reported_max_output, max_output) SELECT id, $1, 8192, 64000 FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .execute(&pool)
+        .await
+        .expect("a reported cap below the user's");
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("turn");
+
+    let notice = match saved[2].blocks().expect("blocks").as_slice() {
+        [anthropic::ContentBlock::Text { text }] => text.clone(),
+        other => panic!("one text block: {other:?}"),
+    };
+    assert_eq!(parse_cut_off_notice(&notice), Some((8_192, ReplyLimit::ModelMaximum)));
+}
+
 /// SME-111 review 1: a reply the context window stopped
 /// (`model_context_window_exceeded`, Claude 4.5+) is cut off too, and the
 /// notice says the conversation ran out of room, whatever bound the budget.

@@ -89,8 +89,12 @@ pub const STOP_NOTICE: &str = "The user stopped this turn before it finished. Do
 /// along with the setting to raise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplyLimit {
-    /// The model's "Max reply tokens", or its provider's cap.
+    /// The model's "Max reply tokens", or the default cap for a model
+    /// nothing sized: the user can raise it.
     OutputCap,
+    /// An Anthropic model's own cap, as its listing reports it: "Max
+    /// reply tokens" can't go above it (SME-111 review 2).
+    ModelMaximum,
     /// Half the context window, the most a single reply may be.
     HalfWindow,
     /// What the conversation had left.
@@ -98,12 +102,13 @@ pub enum ReplyLimit {
 }
 
 impl ReplyLimit {
-    pub const ALL: [ReplyLimit; 3] = [Self::OutputCap, Self::HalfWindow, Self::RoomLeft];
+    pub const ALL: [ReplyLimit; 4] = [Self::OutputCap, Self::ModelMaximum, Self::HalfWindow, Self::RoomLeft];
 
     /// How a notice says it, for the model and for the transcript.
     pub fn reason(self) -> &'static str {
         match self {
             Self::OutputCap => "the model's maximum reply length",
+            Self::ModelMaximum => "the most this model can write in one reply",
             Self::HalfWindow => "half the context window",
             Self::RoomLeft => "the room left in the conversation",
         }
@@ -113,6 +118,7 @@ impl ReplyLimit {
     pub fn hint(self) -> &'static str {
         match self {
             Self::OutputCap => "Raise \u{201c}Max reply tokens\u{201d} for this model on its provider's page, or lower its effort or reasoning budget.",
+            Self::ModelMaximum => "That's the model's own limit: lower its effort on its provider's page, or ask for less at once.",
             Self::HalfWindow => "A reply can be at most half the context window: lower the model's effort or reasoning budget on its provider's page, or ask for less at once.",
             Self::RoomLeft => "The conversation is nearly full, and compacts before the next reply.",
         }

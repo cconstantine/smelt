@@ -567,7 +567,12 @@ pub(super) fn run_turn_body<'a>(
             // The window stops a reply short of its budget: the notice
             // says what it wrote (SME-111 review 2).
             let cut_off_by = match turn.stop_reason.as_str() {
-                "max_tokens" => Some((budget.tokens, budget.limit)),
+                "max_tokens" => Some((budget.tokens, match budget.limit {
+                    crate::api::chat::ReplyLimit::OutputCap if turn_model.output_cap_is_models_own => {
+                        crate::api::chat::ReplyLimit::ModelMaximum
+                    }
+                    limit => limit,
+                })),
                 "model_context_window_exceeded" => Some((
                     u32::try_from(turn.usage.output_tokens)
                         .ok()

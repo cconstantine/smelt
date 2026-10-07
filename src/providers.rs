@@ -397,6 +397,9 @@ mod server {
         pub output_cap: Option<u32>,
         /// The user's cap on a reply's thinking (SME-111).
         pub reasoning_cap: Option<u32>,
+        /// `output_cap` is an Anthropic model's own, which "Max reply
+        /// tokens" can't raise (SME-111 review 2).
+        pub output_cap_is_models_own: bool,
         /// For a llama.cpp provider, the chat template's settings it sends
         /// (SME-111).
         pub template: Option<TemplateSettings>,
@@ -724,6 +727,9 @@ mod server {
             template: (kind == ProviderKind::LlamaCpp).then(|| template_settings(&provider, settings.as_ref())),
             output_cap: output_cap(kind, &model, settings.as_ref()),
             reasoning_cap: settings.as_ref().and_then(|r| positive(r.reasoning_budget)),
+            output_cap_is_models_own: kind == ProviderKind::Anthropic
+                && settings.as_ref().and_then(|r| positive(r.reported_max_output)).is_some()
+                && settings.as_ref().and_then(|r| positive(r.reported_max_output)) == output_cap(kind, &model, settings.as_ref()),
             kind,
             thinking: thinking(settings.as_ref()),
             context_window: context_window(&model, settings.as_ref()).0,
@@ -1481,6 +1487,7 @@ mod tests {
                     template: None,
                     output_cap: None,
                     reasoning_cap: None,
+                    output_cap_is_models_own: false,
                     context_window: 64_000,
                     thinking_stripped_through: None,
                 }
@@ -1679,6 +1686,7 @@ mod tests {
                 template,
                 output_cap: None,
                 reasoning_cap: None,
+                output_cap_is_models_own: false,
                 context_window: 262_144,
                 thinking_stripped_through: None,
             }
