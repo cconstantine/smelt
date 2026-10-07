@@ -302,6 +302,16 @@ impl Blocks {
             let seen = self.open.keys().chain(self.done.keys().map(|(i, _)| i));
             seen.max().map_or(0, |i| i.saturating_add(1))
         });
+        // The same tool call started again while open (llama.cpp's final
+        // chunk can resend a call's start): keep the one call and its input.
+        if let (Some(PartialBlock::ToolUse { id, name, .. }), PartialBlock::ToolUse { id: new_id, name: new_name, .. }) =
+            (self.open.get_mut(&index), &block)
+            && id == new_id
+        {
+            name.clone_from(new_name);
+            self.last = Some(index);
+            return Ok(());
+        }
         if self.open.contains_key(&index) || self.done.keys().any(|(i, _)| *i == index) {
             tracing::warn!(index, "the model provider reused a content block's index");
         }
@@ -1822,6 +1832,26 @@ mod tests {
                 ContentBlock::Thinking { thinking: "Hm".to_string(), signature: String::new() },
             ]
         );
+    }
+
+    /// A tool call started again while it's open (llama.cpp's final chunk
+    /// can resend a call's start) stays one call, whether or not any of
+    /// its input had come (review round 2).
+    #[test]
+    fn test_a_tool_call_started_twice_stays_one_call() {
+        let call = || PartialBlock::ToolUse { id: "t".to_string(), name: "add".to_string(), partial_json: String::new() };
+        let mut empty = Blocks::default();
+        empty.start(Some(0), call()).expect("start");
+        empty.start(Some(0), call()).expect("start again");
+        empty.tool_input(Some(0), r#"{"a":1}"#);
+        assert_eq!(empty.finish().expect("finish"), vec![add_call("t", 1)]);
+
+        let mut partial = Blocks::default();
+        partial.start(Some(0), call()).expect("start");
+        partial.tool_input(Some(0), "{");
+        partial.start(Some(0), call()).expect("start again");
+        partial.tool_input(Some(0), r#""a":1}"#);
+        assert_eq!(partial.finish().expect("finish"), vec![add_call("t", 1)]);
     }
 
     /// A signature or tool input with no block of its kind open is
