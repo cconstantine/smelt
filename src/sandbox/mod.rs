@@ -129,7 +129,7 @@ impl std::fmt::Display for SandboxError {
             SandboxError::ExistingPodNotRunning(phase) => {
                 write!(f, "existing sandbox pod is not Running (phase: {phase})")
             }
-            SandboxError::Io(e) => write!(f, "I/O error reading exec output: {e}"),
+            SandboxError::Io(e) => write!(f, "I/O error on an exec's or port-forward's stream: {e}"),
             SandboxError::WebSocket(e) => {
                 write!(f, "WebSocket error talking to sandbox agent: {e}")
             }

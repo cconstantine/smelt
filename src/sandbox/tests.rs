@@ -530,6 +530,12 @@ fn test_a_missing_stream_is_a_no_stream_error_naming_it() {
 }
 
 #[test]
+fn test_an_io_error_says_it_was_on_an_exec_or_port_forward_stream() {
+    let err = SandboxError::Io(std::io::Error::other("broken pipe"));
+    assert_eq!(err.to_string(), "I/O error on an exec's or port-forward's stream: broken pipe");
+}
+
+#[test]
 fn test_a_metrics_request_for_an_invalid_namespace_is_an_error_not_a_panic() {
     let result = pod_metrics_request("bad namespace");
     assert!(
