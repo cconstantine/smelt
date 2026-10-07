@@ -459,9 +459,58 @@ fn test_should_compact_false_comfortably_under_ceiling() {
 
 #[test]
 fn test_should_compact_true_when_projected_crosses_reserved_ceiling() {
-    // ceiling = 200_000 - max(MAX_TOKENS, COMPACTION_SAFETY_BUFFER) = 183_616
+    // ceiling = 200_000 - max(MIN_REPLY_TOKENS, COMPACTION_SAFETY_BUFFER) = 183_616
     let last = usage(183_000, 0, 0, 0);
     assert!(should_compact(Some(&last), 1_000, 200_000));
+}
+
+/// SME-111: the reply budget is the smallest of the model's cap, the room
+/// left and half the window, never below what every turn asked for.
+#[test]
+fn test_the_reply_budget_grows_with_the_room_left() {
+    // The user's llama.cpp model at the start of a conversation.
+    assert_eq!(reply_budget(262_144, 35_000, None), 131_072, "half the window");
+    // A model whose output cap is the smallest.
+    assert_eq!(reply_budget(1_000_000, 35_000, Some(128_000)), 128_000);
+    assert_eq!(reply_budget(200_000, 35_000, Some(16_384)), 16_384, "an unknown Claude cap");
+    // Room left is the smallest: the request must fit.
+    assert_eq!(reply_budget(262_144, 220_000, None), 262_144 - 220_000 - COMPACTION_SAFETY_BUFFER);
+    // Less room than the floor: what every turn asked for before.
+    assert_eq!(reply_budget(262_144, 250_000, None), MIN_REPLY_TOKENS);
+    assert_eq!(reply_budget(262_144, 400_000, None), MIN_REPLY_TOKENS, "past the window");
+    // A small window: at most half of it.
+    assert_eq!(reply_budget(4_096, 1_000, None), 2_048);
+    assert_eq!(reply_budget(4_096, 1_000, Some(1_024)), 1_024, "the cap wins over the floor");
+    assert_eq!(reply_budget(0, 0, None), 1, "never zero, which the API refuses");
+}
+
+#[test]
+fn test_a_requests_estimate_counts_its_messages_system_and_tools() {
+    let request = anthropic::CreateMessageRequest {
+        model: "m".to_string(),
+        max_tokens: 1,
+        system: Some("s".repeat(400)),
+        messages: vec![anthropic::AnthropicMessage { role: "user".to_string(), content: vec![text_block(&"a".repeat(800))] }],
+        stream: true,
+        tools: vec![anthropic::ToolDefinition {
+            name: "t".repeat(20),
+            description: "d".repeat(380),
+            input_schema: serde_json::json!({}),
+        }],
+        thinking: None,
+        output_config: None,
+        chat_template_kwargs: None,
+        prompt_caching: false,
+    };
+    let tools = serde_json::to_string(&request.tools).expect("tools encode").len() as u64 / 4;
+    assert_eq!(estimate_request_tokens(&request), 100 + 200 + tools);
+    assert!(tools >= 100);
+}
+
+#[test]
+fn test_projected_input_needs_a_measured_usage() {
+    assert_eq!(projected_input(None, 500), None);
+    assert_eq!(projected_input(Some(&usage(1_000, 200, 30, 4_000)), 500), Some(5_730));
 }
 
 #[test]
@@ -1646,6 +1695,72 @@ async fn test_a_llama_cpp_turn_sends_template_settings_and_compaction_turns_thin
         serde_json::json!({"reasoning_effort": "high", "preserve_thinking": false})
     );
     assert!(requests[1].get("output_config").is_none(), "{}", requests[1]);
+}
+
+/// SME-111: a turn asks for a reply as long as the conversation has room
+/// for: half a llama.cpp model's window at the start, and after a
+/// compaction the new, smaller history's room, not the old one's.
+#[sqlx::test]
+async fn test_a_turns_reply_budget_grows_with_the_room_left(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    db::create_message(
+        &pool,
+        conversation.id,
+        "user",
+        &[anthropic::ContentBlock::Text { text: "earlier message".to_string() }],
+    )
+    .await
+    .expect("seed earlier message");
+    db::upsert_conversation_usage(
+        &pool,
+        conversation.id,
+        &anthropic::TokenUsage { input_tokens: 250_000, ..Default::default() },
+    )
+    .await
+    .expect("seed usage near the window");
+    let requests = start_recording_mock_upstream(&pool, vec![
+        text_reply_body("Summary: nothing live."),
+        with_usage(&text_reply_body("Hi"), 40_000, 0, 10),
+        text_reply_body("Again"),
+    ])
+    .await;
+    sqlx::query("UPDATE inference_providers SET kind = 'llama_cpp'")
+        .execute(&pool)
+        .await
+        .expect("make the mock a llama.cpp server");
+    sqlx::query("INSERT INTO provider_models (provider_id, model, reported_context_window) SELECT id, $1, 262144 FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .execute(&pool)
+        .await
+        .expect("size the mock model");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("first turn");
+    run_turn(&pool, conversation.id, hello()).await.expect("second turn");
+
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests.len(), 3, "a compaction, then two turns");
+    assert_eq!(requests[0]["max_tokens"], 2048, "the summary's own");
+    assert_eq!(requests[1]["max_tokens"], 131_072, "half the window, after compacting: {}", requests[1]["max_tokens"]);
+    // 262,144 - (40,010 measured + "hello") - 4,096 of headroom.
+    let second = requests[2]["max_tokens"].as_u64().expect("a number");
+    assert!((131_072 - 1..=131_072).contains(&second), "still half the window: {second}");
+}
+
+/// A model on an Anthropic provider that nothing sized keeps the reply
+/// budget every turn had: a Claude model refuses one above its own cap.
+#[sqlx::test]
+async fn test_an_unsized_anthropic_models_reply_budget_stays_as_it_was(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("turn");
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests[0]["max_tokens"], 16_384);
 }
 
 /// The detail view shows exactly the system prompt a turn sends.
@@ -3022,7 +3137,7 @@ async fn test_run_turn_compacts_before_sending_when_usage_is_near_the_ceiling(po
 
     // A prior turn's persisted message plus usage close enough to the
     // reserved ceiling (200_000 - 16_384 = 183_616 for the default
-    // "claude-opus-4-8" model — see `context_window_for`/`MAX_TOKENS`)
+    // "claude-opus-4-8" model — see `context_window_for`/`MIN_REPLY_TOKENS`)
     // that the very next turn must compact before sending, regardless
     // of how small the new message's own estimate is.
     db::create_message(

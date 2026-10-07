@@ -18,6 +18,13 @@ pub const NO_MODEL_CONFIGURED: &str = "No model is chosen for this conversation.
 /// The context window assumed for a model no source sizes.
 pub const ASSUMED_CONTEXT_WINDOW: u32 = 200_000;
 
+/// The reply cap of a model on an Anthropic or Other provider that nothing
+/// sized (SME-111): a Claude model refuses a `max_tokens` above its own
+/// cap, so these keep what every turn asked for before. Ollama and
+/// llama.cpp have no cap of their own; the window bounds them.
+#[cfg(feature = "server")]
+pub const UNKNOWN_OUTPUT_CAP: u32 = 16_384;
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
@@ -365,6 +372,9 @@ mod server {
         pub effort: Option<crate::anthropic::Effort>,
         /// The provider's kind: which controls a request carries.
         pub kind: ProviderKind,
+        /// The most a reply may be, if anything caps it besides the
+        /// window (SME-111).
+        pub output_cap: Option<u32>,
         /// For a llama.cpp provider, the chat template's settings it sends
         /// (SME-111).
         pub template: Option<TemplateSettings>,
@@ -460,6 +470,11 @@ mod server {
         row.and_then(|r| positive(r.context_window).or(positive(r.reported_context_window)))
             .or_else(|| crate::anthropic::context_window_for(model))
             .map_or((ASSUMED_CONTEXT_WINDOW, false), |window| (window, true))
+    }
+
+    /// The cap on a reply to a model on a `kind` provider (SME-111).
+    pub fn output_cap(kind: ProviderKind) -> Option<u32> {
+        matches!(kind, ProviderKind::Anthropic | ProviderKind::Other).then_some(UNKNOWN_OUTPUT_CAP)
     }
 
     /// Whether a turn asks for thinking: the user's override, else what
@@ -621,6 +636,7 @@ mod server {
                 .then(|| settings.as_ref().and_then(|r| r.effort.as_deref()).and_then(crate::anthropic::Effort::parse))
                 .flatten(),
             template: (kind == ProviderKind::LlamaCpp).then(|| template_settings(&provider, settings.as_ref())),
+            output_cap: output_cap(kind),
             kind,
             thinking: thinking(settings.as_ref()),
             context_window: context_window(&model, settings.as_ref()).0,
@@ -1299,6 +1315,7 @@ mod tests {
                     effort: None,
                     kind: ProviderKind::Ollama,
                     template: None,
+                    output_cap: None,
                     context_window: 64_000,
                     thinking_stripped_through: None,
                 }
@@ -1495,6 +1512,7 @@ mod tests {
                 effort: None,
                 kind: ProviderKind::LlamaCpp,
                 template,
+                output_cap: None,
                 context_window: 262_144,
                 thinking_stripped_through: None,
             }

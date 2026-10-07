@@ -41,11 +41,13 @@ pub(super) const MAX_TURNS: usize = 10_000;
 #[cfg(feature = "server")]
 pub(super) const CLONE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Every real turn's requested reply budget — shared with the
-/// auto-compaction trigger below, which reserves at least this much
-/// headroom off the context window before deciding a request is too big.
+/// The smallest reply budget a turn asks for (SME-111, until then every
+/// turn's fixed `max_tokens`): the auto-compaction trigger reserves at
+/// least this much off the context window before deciding a request is
+/// too big, so a turn that doesn't compact has room for it. The budget
+/// itself grows with the room left (`reply_budget`).
 #[cfg(feature = "server")]
-pub(super) const MAX_TOKENS: u32 = 16_384;
+pub(super) const MIN_REPLY_TOKENS: u32 = 16_384;
 
 /// Runs one full tool-use round trip for `conversation_id`: persists
 /// `new_message`, then loops calling the real Anthropic API — executing any
@@ -420,6 +422,9 @@ pub(super) fn run_turn_body<'a>(
                 turn_model.context_window,
             ) {
                 compact_conversation(pool, conversation_id, turn_model).await?;
+                // The last usage measured the history just summarized: the
+                // reply budget below estimates the new one instead.
+                last_known_usage = None;
             }
 
             let history = history_for_request(
@@ -432,10 +437,8 @@ pub(super) fn run_turn_body<'a>(
 
             let mut request = anthropic::CreateMessageRequest {
                 model: turn_model.model.clone(),
-                // Raised alongside `thinking`: adaptive thinking shares
-                // this budget with the actual reply, and 4096 left no
-                // headroom for both once thinking turned on.
-                max_tokens: MAX_TOKENS,
+                // Set below, once the request's size is known.
+                max_tokens: MIN_REPLY_TOKENS,
                 system: Some(system_prompt(
                     &prompt_environment(pool, conversation_id, &turn_model.model).await,
                 )),
@@ -447,6 +450,13 @@ pub(super) fn run_turn_body<'a>(
                 output_config: turn_model.effort.map(|effort| anthropic::OutputConfig { effort }),
                 chat_template_kwargs: turn_model.chat_template_kwargs(turn_model.thinking),
             };
+
+            // As long as the conversation has room for, computed per
+            // request: each tool round's from its own usage (SME-111).
+            // Thinking shares it with the reply.
+            let projected = projected_input(last_known_usage.as_ref(), estimate_tokens(&pending_new_content))
+                .unwrap_or_else(|| estimate_request_tokens(&request));
+            request.max_tokens = reply_budget(turn_model.context_window, projected, turn_model.output_cap);
 
             // Every tab watching streams the reply: the text so far is kept
             // for a tab that connects mid-reply, and each delta published.
