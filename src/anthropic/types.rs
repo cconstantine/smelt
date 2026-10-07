@@ -172,6 +172,29 @@ pub struct OutputConfig {
     pub effort: Effort,
 }
 
+/// `chat_template_kwargs`: settings a llama.cpp server passes to the
+/// model's chat template through its Anthropic endpoint (SME-111). Each is
+/// left out when unset, leaving the template's own default.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ChatTemplateKwargs {
+    /// `false` turns the template's reasoning off; llama.cpp reads it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<Effort>,
+    /// Whether earlier turns' reasoning is rendered into the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserve_thinking: Option<bool>,
+}
+
+#[cfg(feature = "server")]
+impl ChatTemplateKwargs {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// `{"type": "adaptive"}` — the model manages its own thinking budget
 /// within `max_tokens` rather than a caller-specified `budget_tokens`
 /// (deprecated on current models). The only variant smelt sends; kept as
@@ -199,6 +222,9 @@ pub struct CreateMessageRequest {
     pub thinking: Option<ThinkingConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_config: Option<OutputConfig>,
+    /// For a llama.cpp provider only (SME-111).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
     /// Mark the request for prompt caching (SME-106); see `to_body`. Not a
     /// wire field itself.
     #[serde(skip)]
@@ -367,6 +393,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             output_config: None,
+            chat_template_kwargs: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert!(
@@ -387,6 +414,7 @@ mod tests {
             thinking: Some(ThinkingConfig::Adaptive),
             prompt_caching: false,
             output_config: None,
+            chat_template_kwargs: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -462,6 +490,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             output_config: None,
+            chat_template_kwargs: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert!(
@@ -499,6 +528,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             output_config: None,
+            chat_template_kwargs: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert!(
@@ -518,6 +548,7 @@ mod tests {
             thinking: None,
             prompt_caching,
             output_config: None,
+            chat_template_kwargs: None,
         }
     }
 
@@ -532,6 +563,29 @@ mod tests {
             assert_eq!(serde_json::to_value(effort).expect("encodes"), serde_json::json!(effort.as_str()));
         }
         assert_eq!(Effort::parse("extreme"), None);
+    }
+
+    /// SME-111: llama.cpp's template settings go in `chat_template_kwargs`,
+    /// each left out when unset, and the whole object when none is set.
+    #[test]
+    fn test_template_kwargs_are_sent_only_when_set() {
+        let mut request = caching_request(false);
+        assert!(request.to_body().expect("encodes").get("chat_template_kwargs").is_none());
+        request.chat_template_kwargs = Some(ChatTemplateKwargs {
+            enable_thinking: None,
+            reasoning_effort: Some(Effort::Medium),
+            preserve_thinking: Some(false),
+        });
+        assert_eq!(
+            request.to_body().expect("encodes")["chat_template_kwargs"],
+            serde_json::json!({"reasoning_effort": "medium", "preserve_thinking": false})
+        );
+        request.chat_template_kwargs = Some(ChatTemplateKwargs { enable_thinking: Some(false), ..Default::default() });
+        assert_eq!(
+            request.to_body().expect("encodes")["chat_template_kwargs"],
+            serde_json::json!({"enable_thinking": false})
+        );
+        assert!(ChatTemplateKwargs::default().is_empty());
     }
 
     #[test]

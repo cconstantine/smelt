@@ -260,6 +260,7 @@ pub async fn navigate_browser(id: i64, address: String) -> ServerFnResult<()>;
 | `create_provider` / `update_provider` | `POST /api/providers`, `POST /api/providers/{id}` | checked (a name, an http(s) base URL, a key when new); an empty key on update keeps the stored one, unless the base URL changed: the key only goes where it was entered for |
 | `delete_provider` | `DELETE /api/providers/{id}` | conversations using it, and the default if it was the default's, go back to having none |
 | `list_provider_models` | `GET /api/providers/{id}/models?ask_each` | asks the provider (see [setup.md](setup.md#model-providers)), stores what it reports, and adds models with stored settings it didn't list; a listing error is returned with them. `ask_each` also asks an Ollama server about every model (the provider's page); the picker leaves it off |
+| `probe_llama_cpp` | `POST /api/providers/probe-llama-cpp` | whether an address answers `/props` like llama.cpp, for the provider form's suggestion (SME-111); asked without any key |
 | `add_provider_model` | `POST /api/providers/{id}/models/add` | a model the listing doesn't show, keeping any settings it has |
 | `refresh_model_details` | `POST /api/providers/{id}/models/refresh` | asks about one model, when it's chosen |
 | `set_model_settings` | `POST /api/providers/{id}/models/settings` | a model's thinking and context-window overrides |

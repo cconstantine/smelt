@@ -2030,6 +2030,10 @@ pub struct InferenceProvider {
     pub prompt_caching: bool,
     /// The models.dev provider that prices its calls (SME-106).
     pub price_catalog_provider: Option<String>,
+    /// llama.cpp only: send the template's `preserve_thinking` (SME-111).
+    pub keep_reasoning: bool,
+    /// llama.cpp only: its `/props`, as `providers::LlamaServerInfo`.
+    pub server_caps: Option<serde_json::Value>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -2045,6 +2049,8 @@ impl std::fmt::Debug for InferenceProvider {
             .field("auth_kind", &self.auth_kind)
             .field("prompt_caching", &self.prompt_caching)
             .field("price_catalog_provider", &self.price_catalog_provider)
+            .field("keep_reasoning", &self.keep_reasoning)
+            .field("server_caps", &self.server_caps)
             .field("secret", &"..")
             .finish_non_exhaustive()
     }
@@ -2059,10 +2065,11 @@ pub async fn create_inference_provider(
     secret: &str,
     prompt_caching: bool,
     price_catalog_provider: Option<&str>,
+    keep_reasoning: bool,
 ) -> Result<InferenceProvider, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
-        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret, prompt_caching, price_catalog_provider)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
+        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret, prompt_caching, price_catalog_provider, keep_reasoning)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *",
     )
     .bind(name)
     .bind(kind)
@@ -2071,6 +2078,7 @@ pub async fn create_inference_provider(
     .bind(secret)
     .bind(prompt_caching)
     .bind(price_catalog_provider)
+    .bind(keep_reasoning)
     .fetch_one(pool)
     .await
 }
@@ -2103,12 +2111,13 @@ pub async fn update_inference_provider(
     secret: Option<&str>,
     prompt_caching: bool,
     price_catalog_provider: Option<&str>,
+    keep_reasoning: bool,
 ) -> Result<Option<InferenceProvider>, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
         "UPDATE inference_providers
          SET name = $2, kind = $3, base_url = $4, auth_kind = $5,
              secret = COALESCE($6, secret), prompt_caching = $7, price_catalog_provider = $8,
-             updated_at = now()
+             keep_reasoning = $9, updated_at = now()
          WHERE id = $1 RETURNING *",
     )
     .bind(id)
@@ -2119,8 +2128,23 @@ pub async fn update_inference_provider(
     .bind(secret)
     .bind(prompt_caching)
     .bind(price_catalog_provider)
+    .bind(keep_reasoning)
     .fetch_optional(pool)
     .await
+}
+
+/// Keeps what a llama.cpp server last said about itself (SME-111).
+pub async fn set_inference_provider_server_caps(
+    pool: &PgPool,
+    id: i64,
+    server_caps: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE inference_providers SET server_caps = $2 WHERE id = $1")
+        .bind(id)
+        .bind(server_caps)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Deletes a provider, first clearing it as the default and from every
@@ -4235,7 +4259,7 @@ mod tests {
     // --- Model providers (SME-72) ---
 
     async fn test_provider(pool: &PgPool, name: &str) -> InferenceProvider {
-        create_inference_provider(pool, name, "anthropic", "https://api.anthropic.com", "api_key", "sk-ant-0123456789", false, None)
+        create_inference_provider(pool, name, "anthropic", "https://api.anthropic.com", "api_key", "sk-ant-0123456789", false, None, true)
             .await
             .expect("create provider")
     }
@@ -4469,7 +4493,7 @@ mod tests {
         let created = test_provider(&pool, "anthropic").await;
         assert_eq!(list_inference_providers(&pool).await.expect("list"), vec![created.clone()]);
 
-        let renamed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", None, false, None)
+        let renamed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", None, false, None, true)
             .await
             .expect("update")
             .expect("exists");
@@ -4479,7 +4503,7 @@ mod tests {
         );
         assert_eq!(renamed.secret, "sk-ant-0123456789", "no new secret keeps the stored one");
 
-        let rekeyed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", Some("new-secret"), true, Some("anthropic"))
+        let rekeyed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", Some("new-secret"), true, Some("anthropic"), true)
             .await
             .expect("update")
             .expect("exists");
@@ -4491,7 +4515,7 @@ mod tests {
         );
 
         assert_eq!(
-            update_inference_provider(&pool, 999_999, "x", "other", "u", "bearer", None, false, None).await.expect("update"),
+            update_inference_provider(&pool, 999_999, "x", "other", "u", "bearer", None, false, None, true).await.expect("update"),
             None
         );
     }

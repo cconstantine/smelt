@@ -380,6 +380,9 @@ pub(super) async fn compact_conversation(
         thinking: None,
         prompt_caching: false,
         output_config: None,
+        // Thinking off, said so a llama.cpp template doesn't reason
+        // anyway and spend the summary's tokens on it (SME-111).
+        chat_template_kwargs: turn_model.chat_template_kwargs(false),
     };
 
     let mut discard_deltas = |_: &str| {};

@@ -800,6 +800,7 @@ async fn test_a_bearer_providers_turn_sends_its_token_as_a_bearer_header(pool: P
         "hf-token",
         false,
         None,
+        true,
     )
     .await
     .expect("create provider");
@@ -1586,6 +1587,65 @@ async fn test_a_models_effort_is_sent_on_its_turns(pool: PgPool) {
     assert_eq!(requests.len(), 2);
     assert!(requests[0].get("output_config").is_none(), "unset sends none: {}", requests[0]);
     assert_eq!(requests[1]["output_config"], serde_json::json!({"effort": "low"}));
+}
+
+/// SME-111: a llama.cpp provider's turn tells the chat template its
+/// settings in `chat_template_kwargs`, never as `output_config`, and its
+/// compaction turns the template's reasoning off.
+#[sqlx::test]
+async fn test_a_llama_cpp_turn_sends_template_settings_and_compaction_turns_thinking_off(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    db::create_message(
+        &pool,
+        conversation.id,
+        "user",
+        &[anthropic::ContentBlock::Text { text: "earlier message".to_string() }],
+    )
+    .await
+    .expect("seed earlier message");
+    db::upsert_conversation_usage(
+        &pool,
+        conversation.id,
+        &anthropic::TokenUsage { input_tokens: 190_000, ..Default::default() },
+    )
+    .await
+    .expect("seed usage");
+    let requests = start_recording_mock_upstream(&pool, vec![
+        text_reply_body("Summary: nothing live."),
+        text_reply_body("Hi"),
+    ])
+    .await;
+    sqlx::query(
+        "UPDATE inference_providers SET kind = 'llama_cpp', keep_reasoning = false,
+         server_caps = '{\"template_caps\": {\"supports_reasoning_effort\": true, \"supports_preserve_reasoning\": true}}'",
+    )
+    .execute(&pool)
+    .await
+    .expect("make the mock a llama.cpp server");
+    sqlx::query("INSERT INTO provider_models (provider_id, model, effort) SELECT id, $1, 'high' FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .execute(&pool)
+        .await
+        .expect("set the mock model's effort");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("turn");
+
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests.len(), 2, "a compaction call, then the real turn");
+    assert_eq!(
+        requests[0]["chat_template_kwargs"],
+        serde_json::json!({"enable_thinking": false, "preserve_thinking": false}),
+        "the summary isn't spent on reasoning: {}",
+        requests[0]
+    );
+    assert_eq!(
+        requests[1]["chat_template_kwargs"],
+        serde_json::json!({"reasoning_effort": "high", "preserve_thinking": false})
+    );
+    assert!(requests[1].get("output_config").is_none(), "{}", requests[1]);
 }
 
 /// The detail view shows exactly the system prompt a turn sends.

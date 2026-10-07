@@ -106,6 +106,13 @@ pub async fn set_model_settings(
         .map_err(ServerFnError::new)
 }
 
+/// Whether `base_url` answers `/props` as a llama.cpp server does, for
+/// the provider form's suggestion (SME-111). Asked without any key.
+#[post("/api/providers/probe-llama-cpp")]
+pub async fn probe_llama_cpp(base_url: String) -> ServerFnResult<bool> {
+    Ok(crate::anthropic::models::probe_llama_cpp(&base_url).await)
+}
+
 #[get("/api/default-model")]
 pub async fn get_default_model() -> ServerFnResult<Option<ModelChoice>> {
     crate::providers::default_model(db::get())

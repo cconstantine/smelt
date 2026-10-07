@@ -1,8 +1,10 @@
 //! Model providers (SME-72): the Anthropic-compatible endpoints the user
 //! configures on `/providers`, the default model, and which model each
 //! conversation uses. Every turn goes to a provider's `/v1/messages`; its
-//! `kind` only decides how its models are listed and described
-//! (`anthropic::models`).
+//! `kind` decides how its models are listed and described
+//! (`anthropic::models`), and which of a turn's controls it's sent: effort
+//! as `output_config` for Anthropic, the chat template's own settings for
+//! llama.cpp (SME-111).
 //!
 //! The wire types here cross to the browser; the rest is server-only.
 
@@ -21,16 +23,20 @@ pub const ASSUMED_CONTEXT_WINDOW: u32 = 200_000;
 pub enum ProviderKind {
     Anthropic,
     Ollama,
+    /// A llama.cpp server (`llama-server`), SME-111.
+    LlamaCpp,
     Other,
 }
 
 impl ProviderKind {
-    pub const ALL: [ProviderKind; 3] = [Self::Anthropic, Self::Ollama, Self::Other];
+    /// In the order the new-provider form lists them.
+    pub const ALL: [ProviderKind; 4] = [Self::Anthropic, Self::Ollama, Self::LlamaCpp, Self::Other];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
             Self::Ollama => "ollama",
+            Self::LlamaCpp => "llama_cpp",
             Self::Other => "other",
         }
     }
@@ -43,6 +49,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "Anthropic",
             Self::Ollama => "Ollama",
+            Self::LlamaCpp => "llama.cpp",
             Self::Other => "Other Anthropic-compatible server",
         }
     }
@@ -52,6 +59,7 @@ impl ProviderKind {
         match self {
             Self::Anthropic => "https://api.anthropic.com",
             Self::Ollama => "http://localhost:11434",
+            Self::LlamaCpp => "http://localhost:8080",
             Self::Other => "https://gateway.example.com",
         }
     }
@@ -61,13 +69,14 @@ impl ProviderKind {
     pub fn default_auth_kind(self) -> AuthKind {
         match self {
             Self::Anthropic | Self::Ollama => AuthKind::ApiKey,
-            Self::Other => AuthKind::Bearer,
+            Self::LlamaCpp | Self::Other => AuthKind::Bearer,
         }
     }
 
     /// Whether the new-provider form starts with prompt caching on: for
     /// Anthropic, which bills cache reads at a tenth of the input price.
-    /// Another server may refuse the `cache_control` field.
+    /// Another server may refuse the `cache_control` field; llama.cpp
+    /// ignores it and keeps its own prefix cache.
     pub fn default_prompt_caching(self) -> bool {
         matches!(self, Self::Anthropic)
     }
@@ -116,7 +125,49 @@ pub struct ProviderSummary {
     pub secret_hint: Option<String>,
     pub prompt_caching: bool,
     pub price_catalog_provider: Option<String>,
+    /// Send llama.cpp's template `preserve_thinking` (SME-111).
+    pub keep_reasoning: bool,
+    /// What a llama.cpp server last said about itself (`/props`).
+    pub server_caps: Option<LlamaServerInfo>,
 }
+
+/// What a llama.cpp server says about itself on `/props` (SME-111): read
+/// with its model list, kept per provider, shown on its page, and read
+/// when a turn starts for which template settings to send.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LlamaServerInfo {
+    /// Each slot's context window.
+    pub n_ctx: Option<u32>,
+    /// How many requests it serves at once.
+    pub total_slots: Option<u32>,
+    pub model_alias: Option<String>,
+    pub build_info: Option<String>,
+    /// The chat template's capabilities (`chat_template_caps`), such as
+    /// `supports_reasoning_effort`.
+    pub template_caps: std::collections::BTreeMap<String, bool>,
+}
+
+impl LlamaServerInfo {
+    /// Whether the chat template reads `reasoning_effort`.
+    pub fn supports_reasoning_effort(&self) -> bool {
+        self.template_caps.get("supports_reasoning_effort") == Some(&true)
+    }
+
+    /// Whether the chat template reads `preserve_thinking`.
+    #[cfg(feature = "server")]
+    pub fn supports_preserve_reasoning(&self) -> bool {
+        self.template_caps.get("supports_preserve_reasoning") == Some(&true)
+    }
+}
+
+/// The efforts a llama.cpp model's row offers (SME-111): its template
+/// decides what each means, and `high` is the top level the user's
+/// template takes (`xhigh` and `max` aren't offered; it refuses `max`).
+pub const LLAMA_CPP_EFFORTS: [crate::anthropic::Effort; 3] = [
+    crate::anthropic::Effort::Low,
+    crate::anthropic::Effort::Medium,
+    crate::anthropic::Effort::High,
+];
 
 /// What the new- and edit-provider forms send. On an edit, an empty
 /// `secret` keeps the stored one.
@@ -131,6 +182,8 @@ pub struct ProviderInput {
     pub prompt_caching: bool,
     /// The catalog provider that prices its calls, or `None` (SME-106).
     pub price_catalog_provider: Option<String>,
+    /// llama.cpp only: keep earlier turns' reasoning (SME-111).
+    pub keep_reasoning: bool,
 }
 
 /// A models.dev catalog provider, for the provider form's "Prices from"
@@ -234,6 +287,13 @@ pub struct ModelInfo {
 pub struct ProviderModels {
     pub models: Vec<ModelInfo>,
     pub listing_error: Option<String>,
+    /// The provider's kind, for which settings its models' rows offer.
+    pub kind: ProviderKind,
+    /// A llama.cpp server's `/props`, as last read (SME-111).
+    pub server_caps: Option<LlamaServerInfo>,
+    /// Why `/props` couldn't be read just now, if it couldn't: the turn
+    /// then uses what was last read (`server_caps`).
+    pub server_error: Option<String>,
 }
 
 /// A provider and model, as the picker shows it.
@@ -303,10 +363,62 @@ mod server {
         pub price_catalog_provider: Option<String>,
         /// The model's effort, for an Anthropic provider only (SME-106).
         pub effort: Option<crate::anthropic::Effort>,
+        /// The provider's kind: which controls a request carries.
+        pub kind: ProviderKind,
+        /// For a llama.cpp provider, the chat template's settings it sends
+        /// (SME-111).
+        pub template: Option<TemplateSettings>,
         pub context_window: u32,
         /// Thinking blocks in messages up to this id were written for
         /// another provider or model, and aren't replayed.
         pub thinking_stripped_through: Option<i64>,
+    }
+
+    /// A llama.cpp model's chat-template settings, already limited to
+    /// what its template supports (`LlamaServerInfo`), so a template that
+    /// doesn't read one is never sent it (SME-111).
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct TemplateSettings {
+        pub effort: Option<crate::anthropic::Effort>,
+        pub preserve_thinking: Option<bool>,
+    }
+
+    impl TurnModel {
+        /// The `chat_template_kwargs` a request to this model carries, with
+        /// thinking on or off: `None` but for a llama.cpp provider, and
+        /// when there's nothing to send.
+        pub fn chat_template_kwargs(&self, thinking: bool) -> Option<crate::anthropic::ChatTemplateKwargs> {
+            if self.kind != ProviderKind::LlamaCpp {
+                return None;
+            }
+            let template = self.template.clone().unwrap_or_default();
+            let kwargs = crate::anthropic::ChatTemplateKwargs {
+                // llama.cpp reads this itself as well as the template.
+                enable_thinking: (!thinking).then_some(false),
+                reasoning_effort: template.effort.filter(|_| thinking),
+                preserve_thinking: template.preserve_thinking,
+            };
+            (!kwargs.is_empty()).then_some(kwargs)
+        }
+    }
+
+    /// The server info stored for `provider`, if it's readable.
+    pub fn server_caps(provider: &db::InferenceProvider) -> Option<LlamaServerInfo> {
+        serde_json::from_value(provider.server_caps.clone()?).ok()
+    }
+
+    /// What a turn on `provider`'s model (`row`) sends its chat template.
+    pub fn template_settings(provider: &db::InferenceProvider, row: Option<&db::ProviderModelRow>) -> TemplateSettings {
+        let Some(caps) = server_caps(provider) else {
+            return TemplateSettings::default();
+        };
+        TemplateSettings {
+            effort: row
+                .and_then(|r| r.effort.as_deref())
+                .and_then(crate::anthropic::Effort::parse)
+                .filter(|_| caps.supports_reasoning_effort()),
+            preserve_thinking: caps.supports_preserve_reasoning().then_some(provider.keep_reasoning),
+        }
     }
 
     pub fn endpoint(provider: &db::InferenceProvider) -> Endpoint {
@@ -326,6 +438,8 @@ mod server {
                 id: provider.id,
                 secret_hint: secret_hint(&provider.secret),
                 prompt_caching: provider.prompt_caching,
+                keep_reasoning: provider.keep_reasoning,
+                server_caps: server_caps(&provider),
                 price_catalog_provider: provider.price_catalog_provider,
                 kind: ProviderKind::parse(&provider.kind).unwrap_or(ProviderKind::Other),
                 auth_kind: AuthKind::parse(&provider.auth_kind).unwrap_or(AuthKind::ApiKey),
@@ -496,15 +610,18 @@ mod server {
         let thinking_stripped_through = db::record_turn_model(pool, conversation_id, &model_key)
             .await
             .map_err(db_error)?;
+        let kind = ProviderKind::parse(&provider.kind).unwrap_or(ProviderKind::Other);
         Ok(Some(TurnModel {
             endpoint: endpoint(&provider),
             provider_id,
             prompt_caching: provider.prompt_caching,
             price_catalog_provider: provider.price_catalog_provider.clone(),
             // Sent to Anthropic only: another server may refuse the field.
-            effort: (ProviderKind::parse(&provider.kind) == Some(ProviderKind::Anthropic))
+            effort: (kind == ProviderKind::Anthropic)
                 .then(|| settings.as_ref().and_then(|r| r.effort.as_deref()).and_then(crate::anthropic::Effort::parse))
                 .flatten(),
+            template: (kind == ProviderKind::LlamaCpp).then(|| template_settings(&provider, settings.as_ref())),
+            kind,
             thinking: thinking(settings.as_ref()),
             context_window: context_window(&model, settings.as_ref()).0,
             thinking_stripped_through,
@@ -571,6 +688,7 @@ mod server {
             &input.secret,
             input.prompt_caching,
             input.price_catalog_provider.as_deref(),
+            input.keep_reasoning,
         )
         .await
         .map_err(|e| save_error(&input.name, e))?;
@@ -607,6 +725,7 @@ mod server {
             secret,
             input.prompt_caching,
             input.price_catalog_provider.as_deref(),
+            input.keep_reasoning,
         )
         .await
         .map_err(|e| save_error(&input.name, e))?
@@ -694,11 +813,16 @@ mod server {
             .ok_or("That provider no longer exists.")?;
         let kind = ProviderKind::parse(&provider.kind).unwrap_or(ProviderKind::Other);
         let endpoint = endpoint(&provider);
-        let (listed, listing_error) =
+        let (mut listed, listing_error) =
             match crate::anthropic::models::list_models(kind, &endpoint).await {
                 Ok(listed) => (listed, None),
                 Err(e) => (Vec::new(), Some(e)),
             };
+        let (server_caps, server_error) = if kind == ProviderKind::LlamaCpp && ask_each {
+            read_llama_props(pool, &provider, &endpoint, &mut listed).await?
+        } else {
+            (server_caps(&provider), None)
+        };
 
         let mut details_errors = std::collections::HashMap::new();
         if kind == ProviderKind::Ollama && ask_each {
@@ -746,7 +870,29 @@ mod server {
                 })
                 .map(|row| model_info(row.model.clone(), None, Some(&row), None)),
         );
-        Ok(ProviderModels { models, listing_error })
+        Ok(ProviderModels { models, listing_error, kind, server_caps, server_error })
+    }
+
+    /// Reads a llama.cpp server's `/props`, keeps it on the provider and
+    /// applies its window and tool support to `listed`. A failure keeps
+    /// what was read before and says why.
+    async fn read_llama_props(
+        pool: &PgPool,
+        provider: &db::InferenceProvider,
+        endpoint: &Endpoint,
+        listed: &mut [crate::anthropic::models::ListedModel],
+    ) -> Result<(Option<LlamaServerInfo>, Option<String>), String> {
+        match crate::anthropic::models::llama_cpp_props(endpoint).await {
+            Ok(info) => {
+                crate::anthropic::models::apply_llama_props(listed, &info);
+                let value = serde_json::to_value(&info).map_err(|e| e.to_string())?;
+                db::set_inference_provider_server_caps(pool, provider.id, &value)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok((Some(info), None))
+            }
+            Err(e) => Ok((server_caps(provider), Some(e))),
+        }
     }
 
     /// Asks the provider about one model and stores what it says. A
@@ -762,7 +908,21 @@ mod server {
             .map_err(|e| e.to_string())?
             .ok_or("That provider no longer exists.")?;
         let kind = ProviderKind::parse(&provider.kind).unwrap_or(ProviderKind::Other);
-        let error = match crate::anthropic::models::model_details(kind, &endpoint(&provider), model).await {
+        let details = match kind {
+            // The listing and `/props` together (SME-111).
+            ProviderKind::LlamaCpp => {
+                let endpoint = endpoint(&provider);
+                match crate::anthropic::models::list_models(kind, &endpoint).await {
+                    Ok(mut listed) => {
+                        read_llama_props(pool, &provider, &endpoint, &mut listed).await?;
+                        Ok(listed.into_iter().find(|m| m.id == model).map(|m| m.details).unwrap_or_default())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            _ => crate::anthropic::models::model_details(kind, &endpoint(&provider), model).await,
+        };
+        let error = match details {
             Ok(details) => {
                 if has_any(&details) {
                     store_details(pool, provider_id, model, &details).await?;
@@ -935,6 +1095,37 @@ mod tests {
         ]
     }
 
+    /// SME-111: a llama.cpp server wants a bearer token if any, and
+    /// ignores `cache_control` (it keeps its own prefix cache).
+    #[test]
+    fn test_a_llama_cpp_provider_starts_with_bearer_auth_and_no_caching() {
+        assert_eq!(ProviderKind::parse("llama_cpp"), Some(ProviderKind::LlamaCpp));
+        assert_eq!(ProviderKind::LlamaCpp.label(), "llama.cpp");
+        assert_eq!(ProviderKind::LlamaCpp.default_auth_kind(), AuthKind::Bearer);
+        assert!(!ProviderKind::LlamaCpp.default_prompt_caching());
+        assert_eq!(
+            ProviderKind::ALL,
+            [ProviderKind::Anthropic, ProviderKind::Ollama, ProviderKind::LlamaCpp, ProviderKind::Other],
+            "listed between Ollama and Other"
+        );
+    }
+
+    /// The server's info goes to the browser on the provider's summary.
+    #[test]
+    fn test_llama_server_info_round_trips_through_json() {
+        let info = LlamaServerInfo {
+            n_ctx: Some(262_144),
+            total_slots: Some(1),
+            model_alias: Some("flash-next".to_string()),
+            build_info: Some("b1".to_string()),
+            template_caps: [("supports_reasoning_effort".to_string(), true)].into_iter().collect(),
+        };
+        let json = serde_json::to_string(&info).expect("serializes");
+        assert_eq!(serde_json::from_str::<LlamaServerInfo>(&json).expect("deserializes"), info);
+        assert!(info.supports_reasoning_effort());
+        assert!(!info.supports_preserve_reasoning(), "not reported");
+    }
+
     #[test]
     fn test_anthropics_own_api_is_priced_as_anthropic() {
         let sources = catalog_sources();
@@ -1027,7 +1218,7 @@ mod tests {
         }
 
         async fn provider(pool: &PgPool, name: &str, auth_kind: &str) -> db::InferenceProvider {
-            db::create_inference_provider(pool, name, "ollama", "http://ollama:11434", auth_kind, "the-secret", false, None)
+            db::create_inference_provider(pool, name, "ollama", "http://ollama:11434", auth_kind, "the-secret", false, None, true)
                 .await
                 .expect("create provider")
         }
@@ -1106,6 +1297,8 @@ mod tests {
                     prompt_caching: false,
                     price_catalog_provider: None,
                     effort: None,
+                    kind: ProviderKind::Ollama,
+                    template: None,
                     context_window: 64_000,
                     thinking_stripped_through: None,
                 }
@@ -1193,6 +1386,7 @@ mod tests {
                 secret: secret.to_string(),
                 prompt_caching: false,
                 price_catalog_provider: None,
+                keep_reasoning: true,
             }
         }
 
@@ -1222,6 +1416,8 @@ mod tests {
                     secret_hint: Some("\u{2026}7890".to_string()),
                     prompt_caching: false,
                     price_catalog_provider: None,
+                    keep_reasoning: true,
+                    server_caps: None,
                 }
             );
             assert!(received(&mut app_events, &crate::events::AppEvent::ProvidersChanged));
@@ -1263,7 +1459,7 @@ mod tests {
         #[sqlx::test]
         async fn test_a_models_effort_is_kept_and_sent_only_to_anthropic(pool: PgPool) {
             use crate::anthropic::Effort;
-            let anthropic = db::create_inference_provider(&pool, "a", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None)
+            let anthropic = db::create_inference_provider(&pool, "a", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None, true)
                 .await
                 .expect("anthropic provider");
             let ollama = provider(&pool, "o", "api_key").await;
@@ -1286,6 +1482,160 @@ mod tests {
             set_model_settings(&pool, anthropic.id, "m", None, None, None).await.expect("clear");
             let turn = resolve_turn_model(&pool, on_anthropic.id).await.expect("resolves");
             assert_eq!(turn.effort, None, "unset sends none");
+        }
+
+        fn llama_turn_model(template: Option<TemplateSettings>) -> TurnModel {
+            TurnModel {
+                endpoint: Endpoint { base_url: "http://llama".to_string(), auth: Auth::Bearer("k".to_string()) },
+                provider_id: 1,
+                model: "flash-next".to_string(),
+                thinking: true,
+                prompt_caching: false,
+                price_catalog_provider: None,
+                effort: None,
+                kind: ProviderKind::LlamaCpp,
+                template,
+                context_window: 262_144,
+                thinking_stripped_through: None,
+            }
+        }
+
+        /// SME-111: what a llama.cpp request tells its chat template, with
+        /// thinking on and off; nothing for any other kind.
+        #[test]
+        fn test_a_llama_cpp_turn_sends_its_template_settings() {
+            use crate::anthropic::{ChatTemplateKwargs, Effort};
+            let set = TemplateSettings { effort: Some(Effort::Low), preserve_thinking: Some(false) };
+            let turn = llama_turn_model(Some(set.clone()));
+            assert_eq!(
+                turn.chat_template_kwargs(true),
+                Some(ChatTemplateKwargs { enable_thinking: None, reasoning_effort: Some(Effort::Low), preserve_thinking: Some(false) })
+            );
+            assert_eq!(
+                turn.chat_template_kwargs(false),
+                Some(ChatTemplateKwargs { enable_thinking: Some(false), reasoning_effort: None, preserve_thinking: Some(false) }),
+                "thinking off says so, and effort means nothing without it"
+            );
+            assert_eq!(llama_turn_model(Some(TemplateSettings::default())).chat_template_kwargs(true), None, "nothing to send");
+            assert_eq!(
+                llama_turn_model(None).chat_template_kwargs(false),
+                Some(ChatTemplateKwargs { enable_thinking: Some(false), ..Default::default() })
+            );
+            for kind in [ProviderKind::Anthropic, ProviderKind::Ollama, ProviderKind::Other] {
+                let other = TurnModel { kind, ..llama_turn_model(Some(set.clone())) };
+                assert_eq!(other.chat_template_kwargs(false), None, "{kind:?} isn't sent them");
+            }
+        }
+
+        fn llama_provider(caps: Option<serde_json::Value>, keep_reasoning: bool) -> db::InferenceProvider {
+            db::InferenceProvider {
+                id: 1,
+                name: "llama".to_string(),
+                kind: "llama_cpp".to_string(),
+                base_url: "http://llama".to_string(),
+                auth_kind: "bearer".to_string(),
+                secret: "k".to_string(),
+                prompt_caching: false,
+                price_catalog_provider: None,
+                keep_reasoning,
+                server_caps: caps,
+                created_at: chrono::NaiveDateTime::default(),
+                updated_at: chrono::NaiveDateTime::default(),
+            }
+        }
+
+        /// SME-111: a setting goes only to a template whose caps say it
+        /// reads it; one with no caps read yet is sent none.
+        #[test]
+        fn test_template_settings_follow_the_templates_caps() {
+            use crate::anthropic::Effort;
+            let row = db::ProviderModelRow { effort: Some("medium".to_string()), ..row(None, None, None, None) };
+            let both = serde_json::json!({"template_caps": {"supports_reasoning_effort": true, "supports_preserve_reasoning": true}});
+            assert_eq!(
+                template_settings(&llama_provider(Some(both.clone()), false), Some(&row)),
+                TemplateSettings { effort: Some(Effort::Medium), preserve_thinking: Some(false) }
+            );
+            assert_eq!(
+                template_settings(&llama_provider(Some(both), true), None),
+                TemplateSettings { effort: None, preserve_thinking: Some(true) }
+            );
+            let neither = serde_json::json!({"template_caps": {"supports_reasoning_effort": false}});
+            assert_eq!(template_settings(&llama_provider(Some(neither), false), Some(&row)), TemplateSettings::default());
+            assert_eq!(template_settings(&llama_provider(None, false), Some(&row)), TemplateSettings::default(), "never read");
+            assert_eq!(
+                template_settings(&llama_provider(Some(serde_json::json!("garbage")), false), Some(&row)),
+                TemplateSettings::default(),
+                "unreadable"
+            );
+        }
+
+        /// A llama.cpp-shaped mock: `/v1/models` lists one model, and
+        /// `/props` answers with the real server's fixture until
+        /// `props_up` is cleared, then fails.
+        async fn mock_llama_cpp(props_up: std::sync::Arc<std::sync::atomic::AtomicBool>) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let app = axum::Router::new()
+                .route(
+                    "/v1/models",
+                    axum::routing::get(|| async {
+                        ([(axum::http::header::CONTENT_TYPE, "application/json")],
+                         include_str!("anthropic/fixtures/llama_cpp_v1_models.json"))
+                    }),
+                )
+                .route(
+                    "/props",
+                    axum::routing::get(move || {
+                        let up = props_up.load(std::sync::atomic::Ordering::SeqCst);
+                        async move {
+                            if up {
+                                (axum::http::StatusCode::OK, include_str!("anthropic/fixtures/llama_cpp_props.json").to_string())
+                            } else {
+                                (axum::http::StatusCode::SERVICE_UNAVAILABLE, "loading model".to_string())
+                            }
+                        }
+                    }),
+                );
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            format!("http://{addr}")
+        }
+
+        /// SME-111: a llama.cpp provider's page reads `/props` with its
+        /// models, keeps it, and a turn sends what its template supports.
+        #[sqlx::test]
+        async fn test_a_llama_cpp_providers_props_are_kept_and_used_by_its_turns(pool: PgPool) {
+            use crate::anthropic::Effort;
+            let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let base = mock_llama_cpp(up.clone()).await;
+            let p = db::create_inference_provider(&pool, "llama", "llama_cpp", &base, "bearer", "k", false, None, false)
+                .await
+                .expect("create");
+            set_model_settings(&pool, p.id, "flash-next", None, None, Some(Effort::Low)).await.expect("effort");
+
+            let listing = provider_models(&pool, p.id, true).await.expect("models");
+            assert_eq!(listing.kind, ProviderKind::LlamaCpp);
+            assert_eq!(listing.server_error, None);
+            let caps = listing.server_caps.clone().expect("read /props");
+            assert_eq!((caps.n_ctx, caps.total_slots), (Some(262_144), Some(1)));
+            let model = &listing.models[0];
+            assert_eq!((model.id.as_str(), model.context_window, model.reported_tools), ("flash-next", 262_144, Some(true)));
+            let summary: ProviderSummary = db::get_inference_provider(&pool, p.id).await.expect("get").expect("exists").into();
+            assert_eq!(summary.server_caps, Some(caps.clone()), "kept on the provider");
+
+            let conversation = db::create_conversation_with_id(&pool, 9_172_000_020).await.expect("conversation");
+            db::set_conversation_model(&pool, conversation.id, p.id, "flash-next").await.expect("pick");
+            let turn = resolve_turn_model(&pool, conversation.id).await.expect("resolves");
+            assert_eq!(turn.kind, ProviderKind::LlamaCpp);
+            assert_eq!(turn.effort, None, "not as output_config");
+            assert_eq!(turn.template, Some(TemplateSettings { effort: Some(Effort::Low), preserve_thinking: Some(false) }));
+
+            // The server is down: the page says why, and keeps what it read.
+            up.store(false, std::sync::atomic::Ordering::SeqCst);
+            let listing = provider_models(&pool, p.id, true).await.expect("models");
+            assert!(listing.server_error.as_deref().is_some_and(|e| e.contains("503")), "{listing:?}");
+            assert_eq!(listing.server_caps, Some(caps));
         }
 
         #[sqlx::test]
@@ -1336,7 +1686,7 @@ mod tests {
         #[sqlx::test]
         async fn test_an_ollama_providers_models_come_with_their_details(pool: PgPool) {
             let base = mock_ollama().await;
-            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None)
+            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None, true)
                 .await
                 .expect("create");
             set_model_settings(&pool, p.id, "typed-by-hand", None, Some(16_384), None).await.expect("set");
@@ -1366,7 +1716,7 @@ mod tests {
         #[sqlx::test]
         async fn test_a_quick_listing_skips_the_per_model_questions(pool: PgPool) {
             let base = mock_ollama().await;
-            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None)
+            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None, true)
                 .await
                 .expect("create");
             let listing = provider_models(&pool, p.id, false).await.expect("models");
@@ -1398,7 +1748,7 @@ mod tests {
         #[sqlx::test]
         async fn test_a_model_the_provider_dropped_isnt_shown(pool: PgPool) {
             let base = mock_ollama().await;
-            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None)
+            let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None, true)
                 .await
                 .expect("create");
             db::set_provider_model_reported(&pool, p.id, "removed", Some(4096), None, Some(true))
@@ -1440,7 +1790,7 @@ mod tests {
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
-            let p = db::create_inference_provider(&pool, "o", "ollama", &format!("http://{addr}"), "api_key", "k", false, None)
+            let p = db::create_inference_provider(&pool, "o", "ollama", &format!("http://{addr}"), "api_key", "k", false, None, true)
                 .await
                 .expect("create");
 
@@ -1453,7 +1803,7 @@ mod tests {
 
         #[sqlx::test]
         async fn test_an_unreachable_providers_models_still_list_what_is_stored(pool: PgPool) {
-            let p = db::create_inference_provider(&pool, "gone", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None)
+            let p = db::create_inference_provider(&pool, "gone", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None, true)
                 .await
                 .expect("create");
             set_model_settings(&pool, p.id, "claude-opus-5", Some(true), None, None).await.expect("set");
@@ -1539,6 +1889,7 @@ pub(crate) mod test_support {
             "test-key",
             false,
             None,
+            true,
         )
         .await
         .expect("create the mock provider");

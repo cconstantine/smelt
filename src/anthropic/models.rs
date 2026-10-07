@@ -7,6 +7,9 @@
 //! - `ollama`: `GET /api/tags` for the names; `POST /api/show` per model
 //!   for its tools and thinking support and a Modelfile's `num_ctx`, then
 //!   `GET /api/ps` for the window it's loaded with if `num_ctx` isn't set.
+//! - `llama_cpp`: `GET /v1/models` as for `other`, and `GET /props` for
+//!   each slot's window, the slot count and the chat template's
+//!   capabilities (SME-111).
 //! - `other`: `GET /v1/models`, reading `max_input_tokens`, or llama.cpp's
 //!   `meta.n_ctx`, when present.
 //!
@@ -16,7 +19,7 @@
 use serde_json::Value;
 
 use super::stream::Endpoint;
-use crate::providers::ProviderKind;
+use crate::providers::{LlamaServerInfo, ProviderKind};
 
 /// The bound on each request here: the same as an MCP server's status
 /// check, the other "is this service there" question the UI asks.
@@ -158,6 +161,55 @@ fn parse_ollama_ps(body: &Value, model: &str) -> Option<u32> {
         .filter(|n| *n > 0)
 }
 
+/// Parses a llama.cpp server's `/props`.
+fn parse_llama_props(body: &Value) -> LlamaServerInfo {
+    let count = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0)
+    };
+    let text = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_string);
+    LlamaServerInfo {
+        n_ctx: count(body.pointer("/default_generation_settings/n_ctx")),
+        total_slots: count(body.get("total_slots")),
+        model_alias: text("model_alias"),
+        build_info: text("build_info"),
+        template_caps: body
+            .get("chat_template_caps")
+            .and_then(Value::as_object)
+            .map(|caps| {
+                caps.iter()
+                    .filter_map(|(name, value)| Some((name.clone(), value.as_bool()?)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Whether a `/props` answer is llama.cpp's: the new-provider form then
+/// suggests the kind (SME-111).
+pub fn looks_like_llama_cpp(body: &Value) -> bool {
+    body.get("chat_template_caps").is_some_and(Value::is_object)
+        || body.pointer("/default_generation_settings/n_ctx").is_some()
+}
+
+/// Applies a llama.cpp server's `/props` to its listing: the slot's window
+/// and the template's tool support go to the model it serves (its alias,
+/// or the only one listed). A server in router mode lists several, and its
+/// `/props` isn't any one of theirs.
+pub fn apply_llama_props(listed: &mut [ListedModel], info: &LlamaServerInfo) {
+    let only_one = listed.len() == 1;
+    let tools = info.template_caps.get("supports_tool_calls").copied();
+    for model in listed
+        .iter_mut()
+        .filter(|m| only_one || info.model_alias.as_deref() == Some(m.id.as_str()))
+    {
+        model.details.context_window = info.n_ctx.or(model.details.context_window);
+        model.details.tools = tools.or(model.details.tools);
+    }
+}
+
 /// `text` as one URL path segment: a model id may hold `/` or `:`.
 fn url_segment(text: &str) -> String {
     text.bytes()
@@ -213,11 +265,41 @@ async fn list_v1_models(endpoint: &Endpoint) -> Result<Vec<ListedModel>, String>
 /// Lists `endpoint`'s models the way its `kind` does.
 pub async fn list_models(kind: ProviderKind, endpoint: &Endpoint) -> Result<Vec<ListedModel>, String> {
     match kind {
-        ProviderKind::Anthropic | ProviderKind::Other => list_v1_models(endpoint).await,
+        ProviderKind::Anthropic | ProviderKind::LlamaCpp | ProviderKind::Other => list_v1_models(endpoint).await,
         ProviderKind::Ollama => {
             let request = endpoint.client()?.get(endpoint.url("/api/tags"));
             parse_ollama_tags(&fetch_json(endpoint, request).await?)
         }
+    }
+}
+
+/// A llama.cpp server's `/props`.
+pub async fn llama_cpp_props(endpoint: &Endpoint) -> Result<LlamaServerInfo, String> {
+    let request = endpoint.client()?.get(endpoint.url("/props"));
+    Ok(parse_llama_props(&fetch_json(endpoint, request).await?))
+}
+
+/// Whether `base_url` answers `/props` as llama.cpp does, asked without
+/// any key: a key entered for one address never goes to another (SME-111).
+pub async fn probe_llama_cpp(base_url: &str) -> bool {
+    let endpoint = Endpoint {
+        base_url: base_url.trim().to_string(),
+        auth: super::stream::Auth::ApiKey(String::new()),
+    };
+    let Ok(client) = endpoint.client() else {
+        return false;
+    };
+    let request = client.get(endpoint.url("/props"));
+    let send = request.send();
+    let Ok(Ok(response)) = tokio::time::timeout(REQUEST_TIMEOUT, send).await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    match tokio::time::timeout(REQUEST_TIMEOUT, response.json::<Value>()).await {
+        Ok(Ok(body)) => looks_like_llama_cpp(&body),
+        _ => false,
     }
 }
 
@@ -284,7 +366,7 @@ pub async fn model_details(
             let body = fetch_json(endpoint, request).await?;
             Ok(parse_v1_model(&body).map(|m| m.details).unwrap_or_default())
         }
-        ProviderKind::Other => Ok(list_v1_models(endpoint)
+        ProviderKind::LlamaCpp | ProviderKind::Other => Ok(list_v1_models(endpoint)
             .await?
             .into_iter()
             .find(|listed| listed.id == model)
@@ -320,6 +402,7 @@ mod tests {
 
     const ANTHROPIC: &str = include_str!("fixtures/anthropic_v1_models.json");
     const LLAMA_CPP: &str = include_str!("fixtures/llama_cpp_v1_models.json");
+    const LLAMA_CPP_PROPS: &str = include_str!("fixtures/llama_cpp_props.json");
     const OLLAMA_TAGS: &str = include_str!("fixtures/ollama_api_tags.json");
     const OLLAMA_SHOW: &str = include_str!("fixtures/ollama_api_show.json");
     const OLLAMA_PS: &str = include_str!("fixtures/ollama_api_ps.json");
@@ -351,6 +434,62 @@ mod tests {
             }]
         );
         assert_eq!(next, None, "no has_more");
+    }
+
+    /// SME-111: the user's real llama-server's `/props`.
+    #[test]
+    fn test_a_real_llama_cpp_props_gives_its_window_slots_and_template_caps() {
+        let info = parse_llama_props(&json(LLAMA_CPP_PROPS));
+        assert_eq!(info.n_ctx, Some(262_144), "default_generation_settings.n_ctx");
+        assert_eq!(info.total_slots, Some(1));
+        assert_eq!(info.model_alias.as_deref(), Some("flash-next"));
+        assert_eq!(info.build_info.as_deref(), Some("b11434-5e03bdd87"));
+        assert!(info.supports_reasoning_effort());
+        assert!(info.supports_preserve_reasoning());
+        assert_eq!(info.template_caps.get("supports_tool_calls"), Some(&true));
+        assert_eq!(info.template_caps.len(), 9, "every cap it reports: {:?}", info.template_caps);
+    }
+
+    #[test]
+    fn test_props_without_the_fields_says_nothing() {
+        let info = parse_llama_props(&json(r#"{"default_generation_settings":{"n_ctx":0},"chat_template_caps":{"supports_tools":"yes"}}"#));
+        assert_eq!(info, LlamaServerInfo::default(), "a zero window and a non-boolean cap aren't anything");
+        assert!(!info.supports_reasoning_effort());
+    }
+
+    #[test]
+    fn test_only_llama_cpps_props_look_like_llama_cpp() {
+        assert!(looks_like_llama_cpp(&json(LLAMA_CPP_PROPS)));
+        assert!(!looks_like_llama_cpp(&json(OLLAMA_SHOW)), "Ollama's /api/show");
+        assert!(!looks_like_llama_cpp(&json(ANTHROPIC)));
+        assert!(!looks_like_llama_cpp(&json(r#"{}"#)));
+        assert!(!looks_like_llama_cpp(&json(r#"[1, 2]"#)));
+    }
+
+    fn listed(id: &str, window: Option<u32>) -> ListedModel {
+        ListedModel {
+            id: id.to_string(),
+            display_name: None,
+            details: ModelDetails { context_window: window, thinking: None, tools: None },
+        }
+    }
+
+    #[test]
+    fn test_props_apply_to_the_model_the_server_serves() {
+        let info = parse_llama_props(&json(LLAMA_CPP_PROPS));
+        let mut one = vec![listed("anything", Some(4096))];
+        apply_llama_props(&mut one, &info);
+        assert_eq!(one[0].details, ModelDetails { context_window: Some(262_144), thinking: None, tools: Some(true) }, "the only one listed");
+
+        let mut several = vec![listed("other", Some(4096)), listed("flash-next", None)];
+        apply_llama_props(&mut several, &info);
+        assert_eq!(several[0].details.context_window, Some(4096), "not the alias: left alone");
+        assert_eq!(several[0].details.tools, None);
+        assert_eq!(several[1].details.context_window, Some(262_144), "the alias");
+
+        let mut router = vec![listed("a", Some(8192)), listed("b", None)];
+        apply_llama_props(&mut router, &info);
+        assert_eq!(router, vec![listed("a", Some(8192)), listed("b", None)], "no model is the alias");
     }
 
     #[test]

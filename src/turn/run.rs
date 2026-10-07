@@ -445,6 +445,7 @@ pub(super) fn run_turn_body<'a>(
                 thinking: turn_model.thinking.then_some(anthropic::ThinkingConfig::Adaptive),
                 prompt_caching: turn_model.prompt_caching,
                 output_config: turn_model.effort.map(|effort| anthropic::OutputConfig { effort }),
+                chat_template_kwargs: turn_model.chat_template_kwargs(turn_model.thinking),
             };
 
             // Every tab watching streams the reply: the text so far is kept
@@ -486,6 +487,7 @@ pub(super) fn run_turn_body<'a>(
                             && is_ollama_thinking_tool_call_corruption(&e) =>
                     {
                         request.thinking = None;
+                        request.chat_template_kwargs = turn_model.chat_template_kwargs(false);
                         last_err = e;
                     }
                     Err(e) => return Err(ServerFnError::new(e)),
