@@ -32,60 +32,62 @@ Linear's markdown differs from GitHub's in ways that bite: don't hard-wrap lines
 
 A persona is a role a Claude instance takes on: what it's responsible for, which ticket statuses it moves, and where it stops. The user starts one by asking an instance to "take on the persona of Project Manager" (or another). **Every sub-agent is started as a persona**: its prompt names the persona, points at this section, and gives only what that job needs (the ticket id, its worktree and branch, the PR). A sub-agent never gets a fork of its starter's conversation. When work comes up that no persona covers, add one here, in the same shape, before handing it out.
 
-Everything below still follows the rest of this document: the plan phase, TDD, the gate, close-out and the retrospective. A persona says who does each part.
+Everything below still follows the rest of this document: the plan phase, TDD, the gate, close-out and the retrospective. A persona says who does each part, and where a persona's rule differs from a section below, the persona's rule wins for the tickets the Project Manager runs.
 
 ### Rules every persona follows
 
-- **Its own worktree.** Each ticket's branch gets one worktree, made by the persona that starts the branch (`git worktree add <scratchpad>/smelt-<ticket> <branch>`, or `../smelt-<ticket>` where the parent is writable). One persona works in a worktree at a time. Never `git checkout` in the main checkout: the user's dev server serves it.
-- **Hands off the user's running setup:** the main checkout, the dev database, the dev server's port (8080) and the `:latest` sandbox image (no `--latest`). Hands-on checks use `scripts/check-server` with `CHECK_SCRATCH_DB=1` whenever the branch adds a migration.
-- **One cluster user at a time.** `scripts/check.sh`, `scripts/browser-tier` and `scripts/check-server` share the k3s cluster, the scratch databases and fixed ports. Build first (`cargo build --features server` and the wasm `cargo check`), then run them under `flock "$(git rev-parse --git-common-dir)/smelt-cluster.lock" <script>`, so a run never holds the lock while compiling. That file is common to every worktree. (SME-100 is moving the lock into the scripts themselves.)
-- **Pushing:** when `origin`'s SSH key isn't available, push over HTTPS with `git -c credential.helper='!gh auth git-credential' push https://github.com/cconstantine/smelt.git <branch>`, which changes no settings. Never force-push a branch with an open PR, and never push to `main`.
+- **Ownership is recorded in Linear, not only in a conversation.** A persona that starts work on a ticket first comments on it: `<Persona> started: worktree <path>, branch <branch>`. Its final report is a comment too. The Project Manager rebuilds its picture from these comments and `git worktree list` on every pass, so a restart or a second session doesn't lose track.
+- **Its own worktree, at a fixed place.** Each ticket's branch gets one worktree, `~/smelt-worktrees/smelt-<ticket>`, made by the Planner (`git branch <slug> main`, then `git worktree add ~/smelt-worktrees/smelt-<ticket> <slug>`) and named on the plan's **Branch:** line. One persona works in a worktree at a time; a Code Reviewer only reads the Developer's. Never `git checkout` in the main checkout: the user's dev server serves it.
+- **Hands off the user's running setup:** the main checkout, the dev database, the dev server's port (8080) and the `:latest` sandbox image (no `--latest`).
+- **One cluster user at a time.** `scripts/check.sh`, `scripts/browser-tier`, `scripts/check-server` and `scripts/build-sandbox-image.sh` share the k3s cluster, scratch databases and ports, and run under `flock "$(git rev-parse --git-common-dir)/smelt-cluster.lock" …`, a file common to every worktree. Build first so the lock isn't held while compiling: `cargo build --features server`, `cargo test --features server --no-run`, and the wasm `cargo check` (the browser tier's own `dx build` still compiles under the lock). SME-100 is moving the lock into the scripts.
+- **A hands-on check holds the lock from start to stop**, with a check worktree of its own, all in one command: `flock "$(git rev-parse --git-common-dir)/smelt-cluster.lock" bash -c 'CHECK_WORKTREE=~/smelt-worktrees/check-<ticket> CHECK_SCRATCH_DB=1 scripts/check-server start && <the check> ; CHECK_WORKTREE=~/smelt-worktrees/check-<ticket> scripts/check-server stop'`. Every check server's scratch database numbers conversations from 1, so two at once would make pods with the same names. Never stop a check server you didn't start.
+- **Pushing:** when `origin`'s SSH key isn't available, push over HTTPS through `gh` with only that helper: `git -c credential.helper= -c credential.helper='!gh auth git-credential' push https://github.com/cconstantine/smelt.git <branch>` (the empty value drops the configured helpers first; it changes no settings). Never force-push a branch with an open PR, and never push to `main`.
+- **The Current state and Feature checklist documents** are edited with patch operations on the lines that change, never by replacing a whole section, and read back afterwards: two Developers may close out at once.
 - **Reports back** in a few lines: what it did, the ticket's new status, and anything that needs the user or the Project Manager.
 
 ### Project Manager
 
-Runs the board; does no ticket's work itself. On each pass over the smelt project's tickets in Linear:
+Runs the board; does no ticket's work itself. On each pass over the smelt project's tickets in Linear, it first rebuilds who owns what (the "started" comments, `git worktree list`), then:
 
 | Status | What the Project Manager does |
 | -- | -- |
-| **Up Next** | Starts a **Planner** for each one. |
-| **Todo** | Starts a **Developer** for each one, unless the ticket's plan says it waits for another ticket (it waits until that one merges) or another Developer's ticket would change the same files (it waits, so they don't conflict). |
+| **Up Next** | Starts a **Planner** for each one that has no Planner running. A ticket the user moved back from Planned (it has a plan already) gets a Planner that revises the plan from the user's notes. |
+| **Todo** | Starts a **Developer** for each one, unless the plan says it waits for another ticket (it waits until that one merges) or another running Developer's ticket changes the same files (it waits, so they don't conflict). |
 | **Approved** | Starts an **Integrator** for each one. |
 | **Planned**, **In Review** | Waits for the user. |
-| **In Progress** | Leaves it alone unless it started that work: another session may own it. |
+| **In Progress** | Leaves it alone unless a "started" comment shows one of its own sub-agents owns it; if that sub-agent stopped, it starts a fresh one. |
 
-- Keeps a list of the sub-agents it started (ticket, persona, worktree), so it never starts two on the same ticket, and checks each one's report.
-- When a sub-agent stops partway (a usage limit, a crash, a question), it starts a fresh one of the same persona on the same worktree, telling it what's already done; it never repeats finished work.
-- Brings to the user only what needs them: a question a sub-agent couldn't settle, a failure it couldn't fix, a merge conflict between two branches.
+- When a sub-agent stops partway (a usage limit, a crash), it starts a fresh one of the same persona on the same worktree, telling it what's already done; it never repeats finished work.
+- Brings to the user only what needs them: a question a sub-agent couldn't settle, a failure it couldn't fix, a high-severity finding left unfixed, a merge conflict between two branches.
 - Watches the board on a schedule (`/loop`), and once more each time a sub-agent reports.
 
 ### Planner
 
-Plans one **Up Next** ticket: Phase 1 below, steps 1–6. It reads the ticket and the Current state document, checks outside services and comparable tools in their source, creates the branch and worktree, and writes the plan (including the state model and the open questions) into the ticket under `## Plan`. Then it moves the ticket to **Planned** and stops: it writes no code. When the user answers questions or leaves notes on a **Planned** ticket, a Planner revises the plan the same way.
+Plans one **Up Next** ticket: [Phase 1](#phase-1-plan), steps 1–6. It reads the ticket, its comments and the Current state document, checks outside services and comparable tools in their source, creates the branch and worktree, and writes the plan (including the state model) into the ticket under `## Plan`. It can't ask the user directly: anything it would ask goes in the plan's **Open questions**, with its recommendation for each. Then it moves the ticket to **Planned** and stops; it writes no code. To revise a plan (the user moved the ticket back to Up Next with notes), it answers each note in the plan and moves the ticket to Planned again.
 
 ### Developer
 
 Works one **Todo** ticket through to **In Review**:
 
-1. Moves it to **In Progress**, and rebases the branch onto the current `main` before the first commit.
-2. Builds it test-first (Phase 2), one commit per behaviour or plan step, each gated by `scripts/check.sh` under the cluster lock; then the browser tier and a hands-on check where the change has UI.
+1. Moves it to **In Progress**. Reads the plan and every comment on the ticket since it was written: the user's notes there amend the plan. Rebases the branch onto the current `main` before its first push.
+2. Builds it test-first ([Phase 2](#phase-2-implementation-tdd)), one commit per behaviour or plan step, each gated by `scripts/check.sh` under the cluster lock; then the browser tier, and a hands-on check where the change has UI.
 3. Does the close-out that comes before the PR (What shipped, the Current state document and the Feature checklist; see [Keeping Linear current](#keeping-linear-current)), then opens the PR with the ticket id in its title.
-4. **Reviews, at most two rounds:** starts a **Code Reviewer** on the PR, fixes every finding it confirms (test-first, one commit per finding), pushes, and starts a second Code Reviewer if the first found anything. Findings it doesn't fix (out of scope, or found in the second round with no third) are filed as Backlog tickets, linked as related. Each round goes in What shipped's code-review part.
+4. **Two review rounds at most, each a review and then its fixes.** It starts a **Code Reviewer** on the PR and fixes every finding the reviewer confirms, test-first, one commit per finding, then pushes. If round one found anything, a second Code Reviewer reviews the fixed PR, and its findings are fixed the same way, with no third round. A finding outside the ticket's scope is filed as a Backlog ticket, linked as related. A high-severity finding it can't fix goes to the Project Manager for the user, and the ticket doesn't move to In Review. Each round goes in What shipped's code-review part.
 5. Writes the retrospective (see [Retrospective](#retrospective-end-of-each-project)), each recommendation numbered so the user can answer it, then moves the ticket to **In Review**.
 
-This replaces "report the findings and stop" in [Code review](#code-review-after-opening-the-pr) for tickets the Project Manager runs: the user reviews the whole ticket at In Review instead of each round.
+For tickets the Project Manager runs, step 4 replaces [Code review](#code-review-after-opening-the-pr)'s "report the findings and stop" and its third-round exception: the user reviews the whole ticket at In Review instead of each round.
 
 ### Code Reviewer
 
-Reviews one PR's diff for bugs, including security gaps, and changes nothing. It checks each finding against the code before reporting it (reproducing it where that's cheap), and reports each with a severity, the file and line, what goes wrong in a concrete case, and a suggested fix. It says which findings it confirmed and which it suspects only.
+Reviews one PR's diff for bugs, including security gaps, and changes nothing. It reads the PR's branch in the Developer's worktree (or a detached worktree of its own), never the main checkout; any test it runs to reproduce a finding goes under the cluster lock. It checks each finding against the code before reporting it, and reports each with a severity, the file and line, what goes wrong in a concrete case, and a suggested fix. It says which findings it confirmed and which it only suspects.
 
 ### Integrator
 
 Finishes one **Approved** ticket:
 
-1. Reads the user's answers to the retrospective. Acts on each recommendation they agreed with (a process or doc change on the branch, or a new ticket), and records the ones they disagreed with as declined, in the ticket.
-2. Rebases the branch onto the current `main` if it's behind, and runs the gate again under the cluster lock.
-3. Merges the PR once CI passes, moves the ticket to **Done**, and removes the branch's worktrees.
+1. Reads the user's answers to the retrospective. Acts on every recommendation the user didn't mark as disagreed (a process or doc change on the branch, or a new ticket), and records the ones they disagreed with as declined, in the ticket.
+2. If `main` has moved on, merges `origin/main` into the branch (not a rebase: the PR is open, and force-pushing it is ruled out), pushes, and runs the gate again under the cluster lock.
+3. Merges the PR once CI passes on that head, moves the ticket to **Done**, and removes the branch's worktrees.
 
 ---
 
@@ -95,7 +97,7 @@ Finishes one **Approved** ticket:
 
 1. Read the user's request carefully
 2. Read the ticket, and the project's **Current state** document, to understand the request and the current codebase
-3. Ask clarifying questions if the request is ambiguous — do not assume
+3. Ask clarifying questions if the request is ambiguous — do not assume (a Planner writes them as the plan's open questions instead; see [Personas](#personas))
 4. **If the work depends on an outside service or tool, check it before presenting options.** For each claim a choice rests on (whether it's still available, pricing and free tiers, what signup or access it needs, the API's request and response shape), check the provider's current docs and cite them. Don't answer from memory with a general "worth checking" caveat. Also look at how a comparable tool solves the same problem, in its source rather than its marketing. On `websearch`, provider answers from memory had three wrong or stale claims, and a three-provider plan was written on top of them. Reading opencode's source then showed Exa's keyless MCP endpoint, which cut the project to about 60 lines.
 5. Create a branch in a worktree of its own: `git branch <short-slug> main`, then `git worktree add ../smelt-<ticket> <short-slug>`, and work there. Never `git checkout` in the main checkout: the user's dev server may be serving it. On SME-43 this step said `git checkout -b`, and following it switched the user's checkout. A new worktree needs no image build when the cluster already has the one named after its agent sources (`scripts/sandbox-image-ref`, SME-102); `scripts/cluster-doctor` says when it doesn't.
 6. Write the plan into the ticket's description, under a `## Plan` heading after the idea's own text (create a ticket first if the work has none). The plan contains:
@@ -108,7 +110,7 @@ Finishes one **Approved** ticket:
    - **What each caller does in each state,** as a small table: for every state (none, starting, ready, broken...), what each caller of it does (waits, fails fast, starts it, retries, gives up). The states and transitions alone don't say this. On SME-35 the plan listed a language server connection's states, and "an edit never starts a server", but not that an edit must never *wait* for one to connect. Most of its 15 review findings were at those cells: a failed start left running, an edit waiting two minutes, a spent retry budget that a restart didn't reset, a "connecting" message repeated forever.
    - **A row for work already in flight.** For any setting a running operation reads (a turn's model, a pod's limits), say what the operation in flight does when the setting changes under it (keeps what it read, or picks up the change, and when), and which record says what it actually used. On SME-72 the plan had the model's states but not this, and the first review's top finding sat exactly there: the switch point for a model's signed reasoning was recorded when the user picked a new model, while a turn still running kept writing for the old one past it.
    - **Open questions or tradeoffs** you are not sure about. When a tradeoff says "only X sees the difference", name a real X and check it before writing it down. On SME-90 the plan stopped at "only header-less clients see the difference" without asking who they are; review found webhooks to production's https previews refused.
-7. Show the plan to the user (link the ticket) and **stop**
+7. Show the plan to the user (link the ticket) and **stop**. A Planner moves the ticket to **Planned** instead, and the user approves by moving it to Todo (see [Personas](#personas))
 8. **Wait for explicit approval** — a response like "looks good", "yes", or "go ahead". The user may also leave feedback as comments on the ticket.
 9. Once approved, move the ticket to **Todo**; move it to **In Progress** when implementation starts
 10. Do not write any implementation code or tests until you receive that approval
