@@ -72,7 +72,7 @@ pub(crate) async fn shared_browser() -> Result<&'static Browser, String> {
 /// is only one runtime, but each `#[tokio::test]` has its own, so a second
 /// test using the browser broke (SME-40, found when the app's browser tier
 /// started opening browsing sessions).
-#[expect(clippy::expect_used, reason = "startup of the shared browser: without its runtime nothing that browses can work")]
+#[expect(clippy::expect_used, reason = "not startup: built on the first fetch or browse, and a failure poisons it for every later one (SME-119)")]
 static BROWSER_RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

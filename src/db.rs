@@ -120,7 +120,7 @@ async fn create_message_on(
     role: &str,
     content: &[ContentBlock],
 ) -> Result<Message, sqlx::Error> {
-    #[expect(clippy::expect_used, reason = "ContentBlock has no non-string map keys and no floats, so it always serializes")]
+    #[expect(clippy::expect_used, reason = "a ContentBlock always serializes: its map keys are strings, and a serde_json::Value holds only finite numbers")]
     let content_json = serde_json::to_string(content)
         .expect("ContentBlock always serializes: no non-string map keys, no floats");
 
