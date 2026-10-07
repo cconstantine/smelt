@@ -68,21 +68,35 @@ scratch_url=postgres://u@localhost/smelt_scratch_worktree
 check_server stop >/dev/null
 : >"$SQLX_CALLS"
 
-# start with a scratch database: both state files written.
-if ! out=$(CHECK_SCRATCH_DB=1 check_server start HEAD); then
+# start with a scratch database is refused until SME-115's fix lands: a
+# server on an empty database deletes the dev server's sandbox claims. It
+# creates no database, writes no state file and starts nothing.
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+if out=$(CHECK_SCRATCH_DB=1 check_server start HEAD); then
+    fail "start with CHECK_SCRATCH_DB=1 succeeded: $out"
+fi
+grep -q "SME-115" <<<"$out" || fail "the refusal doesn't name SME-115: $out"
+[ -s "$SQLX_CALLS" ] && fail "a refused start called sqlx: $(cat "$SQLX_CALLS")"
+[ -s "$pid_file" ] && fail "a refused start wrote a pid file: '$(cat "$pid_file")'"
+[ -s "$scratch_file" ] && fail "a refused start wrote a scratch file: '$(cat "$scratch_file")'"
+[ "$(check_server status)" = "not running" ] || fail "status after a refused start: $(check_server status)"
+
+# start without a scratch database: the pid file written, no scratch file.
+if ! out=$(check_server start HEAD); then
     fail "start: $out"
 fi
 pgid=$(cat "$pid_file" 2>/dev/null)
 [ -n "$pgid" ] && pgrep -g "$pgid" >/dev/null || fail "after start, the pid file names no live group: '$pgid'"
-[ "$(cat "$scratch_file" 2>/dev/null)" = "$scratch_url" ] || fail "after start, the scratch file holds '$(cat "$scratch_file" 2>/dev/null)'"
-grep -qx "database create --database-url $scratch_url" "$SQLX_CALLS" || fail "start didn't create the scratch database: $(cat "$SQLX_CALLS")"
+[ -s "$scratch_file" ] && fail "a start without CHECK_SCRATCH_DB left '$(cat "$scratch_file")' to drop"
 case "$(check_server status)" in running*) ;; *) fail "status after start: $(check_server status)" ;; esac
 
-# stop: the group gone, the database dropped, both files kept and empty.
+# stop: the group gone, nothing to drop, both files kept and empty.
 : >"$SQLX_CALLS"
 out=$(check_server stop)
 [ -n "$pgid" ] && pgrep -g "$pgid" >/dev/null && fail "after stop, group $pgid is still running"
-grep -qx "database drop -y --database-url $scratch_url" "$SQLX_CALLS" || fail "stop didn't drop the scratch database: $(cat "$SQLX_CALLS")"
+[ -s "$SQLX_CALLS" ] && fail "stop with no scratch database called sqlx: $(cat "$SQLX_CALLS")"
 for file in "$pid_file" "$scratch_file"; do
     if [ ! -e "$file" ]; then
         fail "stop removed $(basename "$file")"
@@ -97,13 +111,6 @@ done
 out=$(check_server stop)
 grep -q "no check server running" <<<"$out" || fail "a second stop said: $out"
 [ -s "$SQLX_CALLS" ] && fail "a second stop called sqlx: $(cat "$SQLX_CALLS")"
-
-# start again, without a scratch database, over the emptied files.
-if ! out=$(check_server start HEAD); then
-    fail "a second start: $out"
-fi
-[ -s "$scratch_file" ] && fail "a start without CHECK_SCRATCH_DB left '$(cat "$scratch_file")' to drop"
-check_server stop >/dev/null
 
 # A crashed run: a pid file naming a dead group, and a scratch database
 # never dropped. status says not running, stop drops the database, and a
