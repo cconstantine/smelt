@@ -530,6 +530,25 @@ fn test_a_missing_stream_is_a_no_stream_error_naming_it() {
 }
 
 #[test]
+fn test_a_metrics_request_for_an_invalid_namespace_is_an_error_not_a_panic() {
+    let result = pod_metrics_request("bad namespace");
+    assert!(
+        matches!(result, Err(SandboxError::Kube(kube::Error::HttpError(_)))),
+        "a space isn't a URI character: expected an HttpError, got {result:?}"
+    );
+}
+
+#[test]
+fn test_the_metrics_request_names_the_namespaces_pods() {
+    let request = pod_metrics_request(NAMESPACE).expect("the namespace makes a valid request");
+    assert_eq!(request.method(), http::Method::GET);
+    assert_eq!(
+        request.uri().to_string(),
+        format!("/apis/metrics.k8s.io/v1beta1/namespaces/{NAMESPACE}/pods")
+    );
+}
+
+#[test]
 fn test_docker_pvc_spec_is_named_labelled_and_sized_for_the_conversation() {
     let [(pvc_name, pvc), (workspace_name, workspace)] = conversation_pvc_specs(42);
     assert_eq!(workspace_name, "sandbox-workspace-42", "each claim's name comes beside its spec");

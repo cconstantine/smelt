@@ -623,12 +623,17 @@ pub async fn pod_details(pod_id: i64) -> Result<Option<PodDetails>, SandboxError
 /// `metrics.k8s.io` group (`k8s/smelt-park-rbac.yaml`); without it this is
 /// a 403 error, which callers treat as "usage unavailable".
 pub async fn pod_metrics_list() -> Result<serde_json::Value, SandboxError> {
-    let request = http::Request::get(format!(
-        "/apis/metrics.k8s.io/v1beta1/namespaces/{NAMESPACE}/pods"
-    ))
-    .body(Vec::new())
-    .expect("a static, well-formed request");
+    let request = pod_metrics_request(NAMESPACE)?;
     Ok(get()?.client.request::<serde_json::Value>(request).await?)
+}
+
+/// The metrics API request for `namespace`'s pods. `NAMESPACE` is always a
+/// valid path segment, but the builder's error is returned rather than
+/// unwrapped (SME-95).
+pub(super) fn pod_metrics_request(namespace: &str) -> Result<http::Request<Vec<u8>>, SandboxError> {
+    http::Request::get(format!("/apis/metrics.k8s.io/v1beta1/namespaces/{namespace}/pods"))
+        .body(Vec::new())
+        .map_err(|e| SandboxError::Kube(kube::Error::HttpError(e)))
 }
 
 pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInfo>, SandboxError> {
