@@ -310,11 +310,15 @@ pub async fn record_model_call(pool: &PgPool, call: &ModelCall<'_>) -> Result<()
     sqlx::query(
         // The provider as it is now: a turn reads it when it starts, and the
         // user may delete it before the reply finishes. A deleted one gives
-        // null, as the deletion's own SET NULL would (code review 1).
+        // null, as the deletion's own SET NULL would (code review 1). `FOR
+        // KEY SHARE` waits for a delete still in progress and then reads
+        // null; without it the id is read, and the foreign key fails once
+        // the delete commits (code review 2).
         "INSERT INTO model_call_usage
              (conversation_id, provider_id, model, kind, input_tokens, output_tokens,
               cache_creation_input_tokens, cache_read_input_tokens, cost_usd)
-         VALUES ($1, (SELECT id FROM inference_providers WHERE id = $2), $3, $4, $5, $6, $7, $8, $9)",
+         VALUES ($1, (SELECT id FROM inference_providers WHERE id = $2 FOR KEY SHARE),
+                 $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(call.conversation_id)
     .bind(call.provider_id)
@@ -4386,6 +4390,71 @@ mod tests {
                 .expect("the row");
         assert_eq!(provider_id, None);
         assert_eq!(get_conversation_usage(&pool, conversation.id).await.expect("usage"), Some(usage(10, 1, 0, 0)));
+    }
+
+    /// The same, with the delete still uncommitted when the call is recorded:
+    /// the record waits for it and then sees no provider, rather than taking
+    /// the id and failing the foreign key once the delete commits (code
+    /// review 2).
+    #[sqlx::test]
+    async fn test_a_call_recorded_while_its_provider_is_being_deleted_is_recorded_without_it(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let provider = test_provider(&pool, "going").await;
+
+        let mut deleting = pool.begin().await.expect("begin the delete");
+        sqlx::query("DELETE FROM inference_providers WHERE id = $1")
+            .bind(provider.id)
+            .execute(&mut *deleting)
+            .await
+            .expect("delete, uncommitted");
+
+        let record = tokio::spawn({
+            let pool = pool.clone();
+            let (conversation_id, provider_id) = (conversation.id, provider.id);
+            async move {
+                record_model_call(
+                    &pool,
+                    &ModelCall {
+                        conversation_id,
+                        provider_id,
+                        model: "m",
+                        kind: ModelCallKind::Turn,
+                        usage: usage(10, 1, 0, 0),
+                        cost_usd: None,
+                    },
+                )
+                .await
+            }
+        });
+        // Commit only once the record is waiting on the delete's row lock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                  WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("pg_stat_activity");
+            if waiting > 0 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the record never waited on the delete");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        deleting.commit().await.expect("commit the delete");
+
+        record
+            .await
+            .expect("record task")
+            .expect("a provider deleted while the call is recorded doesn't fail the turn");
+        let provider_id: Option<i64> =
+            sqlx::query_scalar("SELECT provider_id FROM model_call_usage WHERE conversation_id = $1")
+                .bind(conversation.id)
+                .fetch_one(&pool)
+                .await
+                .expect("the row");
+        assert_eq!(provider_id, None);
     }
 
     /// Mechanical CRUD, mirroring the MCP server table's: a characterization
