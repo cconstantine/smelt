@@ -1248,9 +1248,7 @@ mod tests {
         /// RFC 6749 §2.3.1's HTTP Basic client authentication, as oauth2
         /// sends it: each part form-urlencoded, then base64.
         fn basic_auth(client_id: &str, secret: &str) -> String {
-            let encode = |s: &str| -> String {
-                percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).collect()
-            };
+            let encode = |s: &str| -> String { url::form_urlencoded::byte_serialize(s.as_bytes()).collect() };
             let raw = format!("{}:{}", encode(client_id), encode(secret));
             const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
             let mut out = String::new();
@@ -1476,6 +1474,28 @@ mod tests {
 
         assert_eq!(result, Ok("called with access-2".to_string()));
         assert_eq!(mock.refresh_count(), 1, "the saved token was used, not refreshed again");
+        evict(server.id).await;
+    }
+
+    /// SME-113, GitHub's case: a pre-registered client's refresh must
+    /// authenticate with its client secret. The code exchange sent it, but
+    /// a manager rebuilt from the stored grant knew only the client id, so
+    /// GitHub refused every refresh and the server stayed Unreachable
+    /// until a Reconnect.
+    #[sqlx::test]
+    async fn test_a_preregistered_client_refreshes_with_its_client_secret(pool: sqlx::PgPool) {
+        let mock = oauth_http::spawn().await;
+        *mock.required_secret.lock().unwrap() =
+            Some(("gh-client".to_string(), "gh-secret".to_string()));
+        let server = oauth_http::create_server(&pool, &mock, Some(("gh-client", "gh-secret"))).await;
+        oauth_http::save_grant(&pool, server.id, &mock, "gh-client").await;
+        oauth_http::age_token(&pool, server.id).await;
+        let config = oauth_http::config(&pool, server.id).await;
+
+        let result = call_tool(&pool, &config, "echo", serde_json::json!({})).await;
+
+        assert_eq!(result, Ok("called with access-2".to_string()));
+        assert_eq!(mock.refresh_count(), 1);
         evict(server.id).await;
     }
 }

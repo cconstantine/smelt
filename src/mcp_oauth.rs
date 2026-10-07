@@ -16,7 +16,7 @@ use std::sync::LazyLock;
 
 use rmcp::transport::auth::{
     AuthError, AuthorizationManager, AuthorizationRequest, CredentialStore, InMemoryStateStore,
-    OAuthState, StateStore, StoredAuthorizationState, StoredCredentials,
+    OAuthClientConfig, OAuthState, StateStore, StoredAuthorizationState, StoredCredentials,
 };
 use sqlx::PgPool;
 use tokio::sync::Mutex as AsyncMutex;
@@ -189,6 +189,33 @@ pub async fn connection_manager(
             "MCP server {:?} has no usable sign-in — use the Connect button on its edit page",
             config.name
         ));
+    }
+    // rmcp configures the client from the stored client id alone, so a
+    // pre-registered client's refresh went out without its secret, and
+    // GitHub refuses that (`invalid_client`). The secret goes back on the
+    // same way `start` gives it to the code exchange, for the grant that
+    // client was issued.
+    let stored_client_id = config
+        .oauth_credentials
+        .as_ref()
+        .and_then(|json| json.0.get("client_id"))
+        .and_then(|id| id.as_str());
+    if let (Some(client_id), Some(secret)) = (
+        config.oauth_client_id.as_deref(),
+        config.oauth_client_secret.as_deref(),
+    ) && stored_client_id == Some(client_id)
+    {
+        let mut client = OAuthClientConfig::new(client_id, config.url.as_str())
+            .with_client_secret(secret);
+        // Keep the manager's own application type, as rmcp does when it
+        // configures a stored client.
+        client.application_type = None;
+        manager.configure_client(client).map_err(|e| {
+            format!(
+                "failed to configure the OAuth client for MCP server {:?}: {e}",
+                config.name
+            )
+        })?;
     }
     Ok(manager)
 }
