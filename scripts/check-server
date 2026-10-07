@@ -23,7 +23,7 @@
 #                   another branch, which stop smelt starting: on SME-65 every
 #                   page was a 500 because SME-35's branch had applied one.
 #                   Nothing from the dev database is copied into it.
-#                   Refused for a REF without SME-115's fix: such a server
+#                   Refused for a REF without SME-115's fix (6c9f03c): such a server
 #                   on a scratch database deletes the sandbox claims (each
 #                   conversation's /workspace) of every conversation on the
 #                   dev server.
@@ -157,9 +157,12 @@ start() {
     # smelt from before the fix sweeps the shared sandbox namespace for
     # claims whose conversation isn't in its own database, so one on an
     # empty database deletes the dev server's conversations' /workspace.
-    # The fix came with the smelt_instance migration.
+    # The fix is complete from 6c9f03c on (fresh ids): a commit partway
+    # through it has the smelt_instance migration but still sweeps every
+    # claim, so ancestry is the test, not the migration (SME-115 review).
+    # A repository without that commit refuses too.
     if [ "${CHECK_SCRATCH_DB:-}" = 1 ] &&
-        ! git -C "$repo" cat-file -e "$commit:migrations/20261007200000_smelt_instance.sql" 2>/dev/null; then
+        ! git -C "$repo" merge-base --is-ancestor 6c9f03c "$commit" 2>/dev/null; then
         echo "CHECK_SCRATCH_DB=1 is refused for $ref ($commit): it predates SME-115's fix, so a server serving it on a scratch database deletes the dev server's sandbox claims" >&2
         exit 1
     fi

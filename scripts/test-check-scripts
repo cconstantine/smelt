@@ -85,6 +85,16 @@ grep -q "$old_ref" <<<"$out" || fail "the refusal doesn't name the ref: $out"
 [ -s "$scratch_file" ] && fail "a refused start wrote a scratch file: '$(cat "$scratch_file")'"
 [ "$(check_server status)" = "not running" ] || fail "status after a refused start: $(check_server status)"
 
+# The same for a commit of SME-115's own branch that has the instance
+# migration but not yet the fix (its sweep isn't scoped yet).
+: >"$SQLX_CALLS"
+if out=$(CHECK_SCRATCH_DB=1 check_server start 7dc5248); then
+    fail "start with CHECK_SCRATCH_DB=1 for a commit partway through the fix succeeded: $out"
+fi
+grep -q "SME-115" <<<"$out" || fail "the partway refusal doesn't name SME-115: $out"
+[ -s "$SQLX_CALLS" ] && fail "a refused partway start called sqlx: $(cat "$SQLX_CALLS")"
+[ -s "$scratch_file" ] && fail "a refused partway start wrote a scratch file: '$(cat "$scratch_file")'"
+
 # start with a scratch database, for a ref with the fix: both state files
 # written.
 if ! out=$(CHECK_SCRATCH_DB=1 check_server start HEAD); then
