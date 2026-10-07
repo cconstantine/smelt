@@ -531,10 +531,12 @@ fn test_a_missing_stream_is_a_no_stream_error_naming_it() {
 
 #[test]
 fn test_docker_pvc_spec_is_named_labelled_and_sized_for_the_conversation() {
-    let [pvc, workspace] = conversation_pvc_specs(42);
-    assert_eq!(workspace.metadata.name.as_deref(), Some("sandbox-workspace-42"));
+    let [(pvc_name, pvc), (workspace_name, workspace)] = conversation_pvc_specs(42);
+    assert_eq!(workspace_name, "sandbox-workspace-42", "each claim's name comes beside its spec");
+    assert_eq!(workspace.metadata.name.as_deref(), Some(workspace_name.as_str()));
     assert_eq!(workspace.metadata.labels, pvc.metadata.labels);
-    assert_eq!(pvc.metadata.name.as_deref(), Some("sandbox-docker-42"));
+    assert_eq!(pvc_name, "sandbox-docker-42", "each claim's name comes beside its spec");
+    assert_eq!(pvc.metadata.name.as_deref(), Some(pvc_name.as_str()));
     assert_eq!(
         pvc.metadata
             .labels

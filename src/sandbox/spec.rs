@@ -290,20 +290,17 @@ pub(super) fn default_workspace_storage_size() -> String {
 }
 
 /// A conversation's claims: its Docker data and its /workspace (SME-32),
-/// both kept across its pods and deleted with it.
-pub(super) fn conversation_pvc_specs(conversation_id: i64) -> [PersistentVolumeClaim; 2] {
+/// both kept across its pods and deleted with it. Each comes with its
+/// name, so a caller needn't read it back out of the spec's `Option`.
+pub(super) fn conversation_pvc_specs(conversation_id: i64) -> [(String, PersistentVolumeClaim); 2] {
     [
-        build_conversation_pvc_spec(
-            docker_pvc_name(conversation_id),
-            conversation_id,
-            default_docker_storage_size(),
-        ),
-        build_conversation_pvc_spec(
-            workspace_pvc_name(conversation_id),
-            conversation_id,
-            default_workspace_storage_size(),
-        ),
+        (docker_pvc_name(conversation_id), default_docker_storage_size()),
+        (workspace_pvc_name(conversation_id), default_workspace_storage_size()),
     ]
+    .map(|(name, size)| {
+        let spec = build_conversation_pvc_spec(name.clone(), conversation_id, size);
+        (name, spec)
+    })
 }
 
 pub(super) fn build_conversation_pvc_spec(name: String, conversation_id: i64, size: String) -> PersistentVolumeClaim {
