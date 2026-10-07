@@ -1345,6 +1345,9 @@ mod tests {
             /// Answer every refresh with `invalid_grant`, as a provider
             /// does for a revoked or expired refresh token.
             pub reject_refreshes: AtomicBool,
+            /// Refuse refreshes the way GitHub does: HTTP 200 with
+            /// `{"error": "bad_refresh_token"}` in the body.
+            pub reject_refreshes_like_github: AtomicBool,
             /// A pre-registered client's `(client_id, client_secret)`: a
             /// refresh that doesn't authenticate with it is refused, as
             /// GitHub refuses one without `client_secret`.
@@ -1499,6 +1502,9 @@ mod tests {
                         return token_error(StatusCode::UNAUTHORIZED, "invalid_client");
                     }
                 }
+                if mock.reject_refreshes_like_github.load(Ordering::SeqCst) {
+                    return token_error(StatusCode::OK, "bad_refresh_token");
+                }
                 if mock.reject_refreshes.load(Ordering::SeqCst) {
                     return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
                 }
@@ -1537,6 +1543,7 @@ mod tests {
                 initializes: AtomicU32::new(0),
                 registered: AtomicU32::new(0),
                 reject_refreshes: AtomicBool::new(false),
+                reject_refreshes_like_github: AtomicBool::new(false),
                 required_secret: StdMutex::new(None),
                 refresh_client_ids: StdMutex::new(Vec::new()),
                 refresh_gate: StdMutex::new(None),
@@ -1910,6 +1917,25 @@ mod tests {
         let first = oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
         mock.revoke(&first);
         mock.reject_refreshes.store(true, Ordering::SeqCst);
+        let config = oauth_http::config(&pool, server.id).await;
+
+        let checked = connection_check(&pool, &config).await;
+
+        assert!(matches!(&checked, Err(CheckError::SignInExpired(_))), "{checked:?}");
+        evict(server.id).await;
+    }
+
+    /// SME-113 review 1: GitHub refuses a dead refresh token with HTTP 200
+    /// and `error=bad_refresh_token`, not a 400 `invalid_grant`, so rmcp
+    /// took it for a failed request and the server read Unreachable, with
+    /// Connect, instead of Sign-in expired.
+    #[sqlx::test]
+    async fn test_a_refresh_github_refuses_is_reported_as_expired(pool: sqlx::PgPool) {
+        let mock = oauth_http::spawn().await;
+        let server = oauth_http::create_server(&pool, &mock, None).await;
+        oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+        oauth_http::age_token(&pool, server.id).await;
+        mock.reject_refreshes_like_github.store(true, Ordering::SeqCst);
         let config = oauth_http::config(&pool, server.id).await;
 
         let checked = connection_check(&pool, &config).await;

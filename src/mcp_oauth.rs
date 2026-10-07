@@ -12,7 +12,7 @@
 //! before every request, refreshing it when it's expiring (SME-113).
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use rmcp::transport::auth::{
     AuthError, AuthorizationManager, AuthorizationRequest, CredentialStore, InMemoryStateStore,
@@ -199,14 +199,21 @@ pub async fn connection_manager(
         ));
     }
     crate::mcp::install_crypto_provider();
-    let mut manager = AuthorizationManager::new(config.url.as_str())
-        .await
-        .map_err(|e| {
-            format!(
-                "failed to initialize OAuth for MCP server {:?}: {e}",
-                config.name
-            )
-        })?;
+    let http_client = ProviderHttpClient::new().map_err(|e| {
+        format!(
+            "failed to initialize OAuth for MCP server {:?}: {e}",
+            config.name
+        )
+    })?;
+    let mut manager =
+        AuthorizationManager::new_with_oauth_http_client(config.url.as_str(), Arc::new(http_client))
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to initialize OAuth for MCP server {:?}: {e}",
+                    config.name
+                )
+            })?;
     manager.set_credential_store(PgCredentialStore::for_refreshes(pool.clone(), config.id));
     let restored = manager.initialize_from_store().await.map_err(|e| {
         format!(
@@ -250,6 +257,106 @@ pub async fn connection_manager(
         })?;
     }
     Ok(manager)
+}
+
+/// The HTTP client a connection's `AuthorizationManager` talks to its
+/// provider through: what rmcp's own default does (a 30 s timeout, the
+/// redirect policy each request asks for, a 1 MiB cap on a reply), plus
+/// one repair (SME-113 review 1). GitHub answers a refused token request
+/// with HTTP 200 and an `error` in the body, and names a dead refresh token
+/// `bad_refresh_token`, where RFC 6749 §5.2 has a 400 and `invalid_grant`.
+/// oauth2 then can't parse a token from the 200 and rmcp reports a failed
+/// request (`TokenRefreshFailed`), so a sign-in that needs a Reconnect read
+/// as Unreachable. A POST's 200 carrying an `error` and no `access_token` is
+/// passed on as the 400 it means, with `bad_refresh_token` as
+/// `invalid_grant`, which rmcp turns into `AuthorizationRequired`.
+struct ProviderHttpClient {
+    follow_redirects: reqwest_rmcp::Client,
+    stop_redirects: reqwest_rmcp::Client,
+}
+
+const PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_PROVIDER_REPLY_BYTES: usize = 1024 * 1024;
+
+impl ProviderHttpClient {
+    fn new() -> Result<Self, reqwest_rmcp::Error> {
+        Ok(Self {
+            follow_redirects: reqwest_rmcp::Client::builder()
+                .timeout(PROVIDER_TIMEOUT)
+                .build()?,
+            stop_redirects: reqwest_rmcp::Client::builder()
+                .timeout(PROVIDER_TIMEOUT)
+                .redirect(reqwest_rmcp::redirect::Policy::none())
+                .build()?,
+        })
+    }
+}
+
+/// RFC 6749 §5.2's shape for a token request GitHub refused with a 200:
+/// `Some(body)` to pass on as a 400, `None` to leave the reply alone.
+fn as_token_error(status: http::StatusCode, body: &[u8]) -> Option<Vec<u8>> {
+    if status != http::StatusCode::OK {
+        return None;
+    }
+    let mut reply: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(body).ok()?;
+    if reply.contains_key("access_token") || !reply.get("error")?.is_string() {
+        return None;
+    }
+    if reply.get("error").and_then(|e| e.as_str()) == Some("bad_refresh_token") {
+        reply.insert("error".to_string(), "invalid_grant".into());
+    }
+    serde_json::to_vec(&reply).ok()
+}
+
+impl rmcp::transport::auth::OAuthHttpClient for ProviderHttpClient {
+    fn execute(
+        &self,
+        request: rmcp::transport::auth::OAuthHttpRequest,
+    ) -> rmcp::transport::auth::OAuthHttpClientFuture<'_> {
+        use futures_util::StreamExt;
+        use rmcp::transport::auth::{OAuthHttpClientError, OAuthHttpRedirectPolicy};
+        Box::pin(async move {
+            let client = match request.redirect_policy {
+                OAuthHttpRedirectPolicy::Stop => &self.stop_redirects,
+                _ => &self.follow_redirects,
+            };
+            let is_post = request.request.method() == http::Method::POST;
+            let request = reqwest_rmcp::Request::try_from(request.request)
+                .map_err(|e| Box::new(e) as OAuthHttpClientError)?;
+            let response = client
+                .execute(request)
+                .await
+                .map_err(|e| Box::new(e) as OAuthHttpClientError)?;
+            let status = response.status();
+            let mut builder = http::Response::builder()
+                .status(status)
+                .version(response.version());
+            // The body is passed on whole, and may be replaced below, so
+            // its length isn't copied.
+            for (name, value) in response.headers() {
+                if name != http::header::CONTENT_LENGTH {
+                    builder = builder.header(name, value);
+                }
+            }
+            let mut body = Vec::new();
+            let mut chunks = response.bytes_stream();
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk.map_err(|e| Box::new(e) as OAuthHttpClientError)?;
+                if chunk.len() > MAX_PROVIDER_REPLY_BYTES - body.len() {
+                    return Err(format!(
+                        "the OAuth provider's reply is over {MAX_PROVIDER_REPLY_BYTES} bytes"
+                    )
+                    .into());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            if is_post && let Some(error) = as_token_error(status, &body) {
+                builder = builder.status(http::StatusCode::BAD_REQUEST);
+                body = error;
+            }
+            builder.body(body).map_err(|e| Box::new(e) as OAuthHttpClientError)
+        })
+    }
 }
 
 /// Completes an in-flight authorization attempt — pops `server_id`'s
@@ -440,6 +547,27 @@ mod tests {
     use axum::Json;
     use axum::body::Bytes;
     use axum::routing::{get, post};
+
+    /// SME-113 review 1: GitHub's refusals, as its docs give them
+    /// (`error_description` and `error_uri` included), become RFC 6749's
+    /// 400; a token, and a reply that isn't a 200, pass untouched.
+    #[test]
+    fn test_a_token_error_sent_with_a_200_becomes_a_400_invalid_grant() {
+        let github = br#"{"error":"bad_refresh_token","error_description":"The refresh token passed is incorrect or expired.","error_uri":"https://docs.github.com"}"#;
+        let fixed = as_token_error(http::StatusCode::OK, github).expect("a refusal");
+        let fixed: serde_json::Value = serde_json::from_slice(&fixed).expect("json");
+        assert_eq!(fixed["error"], "invalid_grant");
+        assert_eq!(fixed["error_description"], "The refresh token passed is incorrect or expired.");
+
+        let other = br#"{"error":"incorrect_client_credentials"}"#;
+        let fixed = as_token_error(http::StatusCode::OK, other).expect("a refusal");
+        assert!(String::from_utf8_lossy(&fixed).contains("incorrect_client_credentials"));
+
+        let token = br#"{"access_token":"t","token_type":"bearer"}"#;
+        assert_eq!(as_token_error(http::StatusCode::OK, token), None);
+        assert_eq!(as_token_error(http::StatusCode::BAD_REQUEST, github), None);
+        assert_eq!(as_token_error(http::StatusCode::OK, b"not json"), None);
+    }
 
     /// `SMELT_BASE_URL` is process-global and only this test touches it —
     /// no cross-test lock needed. Save/restore around the body
