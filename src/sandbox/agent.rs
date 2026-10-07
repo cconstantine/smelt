@@ -31,9 +31,7 @@ impl AgentDialer for ClusterDialer {
     fn dial(&self, pod_id: i64) -> BoxFuture<'_, Result<Box<dyn AgentIo>, SandboxError>> {
         Box::pin(async move {
             let mut forward = pods_api(&self.0).portforward(&pod_name(pod_id), &[AGENT_PORT]).await?;
-            let stream = forward.take_stream(AGENT_PORT).ok_or_else(|| {
-                SandboxError::Io(std::io::Error::other("the port-forward has no stream for the agent's port"))
-            })?;
+            let stream = require_stream(forward.take_stream(AGENT_PORT), "the agent port's port-forward")?;
             Ok(Box::new(stream) as Box<dyn AgentIo>)
         })
     }

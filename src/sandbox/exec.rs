@@ -103,18 +103,14 @@ pub(crate) async fn exec_with(
         .await?;
     if let Some(input) = stdin {
         use tokio::io::AsyncWriteExt;
-        let mut writer = attached.stdin().expect("stdin requested above");
+        let mut writer = require_stream(attached.stdin(), "the exec's stdin")?;
         writer.write_all(input).await.map_err(SandboxError::Io)?;
         writer.shutdown().await.map_err(SandboxError::Io)?;
         drop(writer);
     }
 
-    let mut stdout_reader = attached
-        .stdout()
-        .expect("stdout requested by AttachParams::default()");
-    let mut stderr_reader = attached
-        .stderr()
-        .expect("stderr requested by AttachParams::default()");
+    let mut stdout_reader = require_stream(attached.stdout(), "the exec's stdout")?;
+    let mut stderr_reader = require_stream(attached.stderr(), "the exec's stderr")?;
     // Bytes, decoded leniently: a file's contents need not be UTF-8, and
     // a `head -c` cut can split a character (SME-32).
     let mut stdout = Vec::new();

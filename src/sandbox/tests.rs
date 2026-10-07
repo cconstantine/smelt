@@ -516,6 +516,20 @@ fn test_pod_container_limits_include_the_docker_sidecar() {
 }
 
 #[test]
+fn test_a_missing_stream_is_a_no_stream_error_naming_it() {
+    let err = require_stream::<u8>(None, "the exec's stdout").expect_err("no stream should be an error");
+    assert!(
+        matches!(&err, SandboxError::NoStream(what) if what == "the exec's stdout"),
+        "expected NoStream naming the stream, got {err:?}"
+    );
+    assert_eq!(err.to_string(), "kube gave no stream for the exec's stdout");
+    assert_eq!(
+        require_stream(Some(7u8), "the exec's stdout").expect("a stream kube gave is passed through"),
+        7
+    );
+}
+
+#[test]
 fn test_docker_pvc_spec_is_named_labelled_and_sized_for_the_conversation() {
     let [pvc, workspace] = conversation_pvc_specs(42);
     assert_eq!(workspace.metadata.name.as_deref(), Some("sandbox-workspace-42"));

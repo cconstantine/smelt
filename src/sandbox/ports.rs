@@ -89,9 +89,8 @@ pub(super) async fn dial_pod(
         .portforward(pod, &[forward_to])
         .await
         .map_err(|e| TerminalError::Sandbox(SandboxError::Kube(e)))?;
-    let mut stream = forwarder
-        .take_stream(forward_to)
-        .expect("stream requested for the forwarded port");
+    let mut stream = require_stream(forwarder.take_stream(forward_to), &format!("port {forward_to}'s port-forward"))
+        .map_err(TerminalError::Sandbox)?;
     if let PodHost::Container(ip) = host {
         // The relay's one line, then its answer once it has connected
         // (`RELAY_CONNECTED` in src/bin/sandbox_agent.rs). A target it
