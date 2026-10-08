@@ -126,11 +126,11 @@ already gone.
 `src/sandbox/pod_lifecycle_tests.rs` runs the sandbox's own operations against real pods, one feature per test: pod creation and its guards, terminals, a finished command waking the model, the file tools, glob and grep, repos and project instructions, crash detection, the user's stop, the pods view, `watch_pods`, claims and volumes. A failure names the feature, and the rest still run. Each test:
 
 - starts with `own_sandbox(&pool)`: `db::test_support::start_ids_clear_of_other_runs` moves its conversation, pod and volume ids to a base no other test or run shares (pods, claims and labels are named after them, in one shared namespace), and `use_test_manager` gives `sandbox::get()` on the test's thread a manager of its own (see the cross-runtime hazard below);
-- runs its scenario through `run_then_tear_down(&pool, &client, limit, async { ... })`, which bounds it in time, then deletes every pod and claim of its database's conversations and every volume's claim, pass, fail or timeout, before re-raising;
+- runs its scenario through `run_then_tear_down(&pool, &client, limit, async { ... })`, which bounds it in time, then deletes every pod and claim of its database's conversations, every volume's claim and anything else labelled with its database's instance, pass, fail or timeout, before re-raising. First it takes each conversation's pod-start lock and keeps it: `create_pod` starts a pod in a task of its own, which a cut-off scenario leaves running, and it would otherwise make its pod after the deletes;
 - sets up the state it needs itself, never what another test left;
 - waits its turn: at most four run their scenarios at once (`SCENARIOS_AT_ONCE`, outside the time limit). A dozen pods with Docker sidecars starting together on one node outran a pod start's 90 s wait, failing these and the other real-cluster tests.
 
-They don't take the turn-test lock: their conversations' ids are clear of every other test's. Something made outside a conversation (the volume test's pod) is deleted by the test itself before it asserts. A killed run leaves its objects in its own id range, which no later run reuses and nothing sweeps yet.
+They don't take the turn-test lock: their conversations' ids are clear of every other test's. The volume test's pod, made outside a conversation, is deleted by the test itself before it asserts, and by the instance sweep if it doesn't get that far. A killed run leaves its objects in its own id range, which no later run reuses and nothing sweeps yet.
 
 ### Docker in the sandbox (SME-33)
 
