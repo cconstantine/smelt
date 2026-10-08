@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The checks every commit must pass (docs/development-process.md, "Every
 # commit builds for both targets"): the web build and the server build,
-# each with no warnings, no unexplained expect() outside tests
+# each with no warnings, no unexplained expect() or unwrap() outside tests
 # (scripts/lint-expects), and the server tests, run against this working
 # tree's own sandbox image (SANDBOX_IMAGE, see scripts/sandbox-image-ref).
 # Exits non-zero on any failure, so it can gate a commit:
@@ -40,10 +40,10 @@ if grep -qE '^(warning|error)' <<<"$server_output"; then
     exit 1
 fi
 
-# No new expect() outside tests without a reason (SME-95).
+# No new expect() or unwrap() outside tests without a reason (SME-95, SME-119).
 lint_output=$(scripts/lint-expects 2>&1) || {
     echo "$lint_output" | grep -E '^(warning|error)' -A8
-    echo "an expect() in production code: handle the error, or say why it can't fail (scripts/lint-expects)"
+    echo "an expect() or unwrap() in production code: handle the error, or say why it can't fail (scripts/lint-expects)"
     exit 1
 }
 
