@@ -446,6 +446,21 @@ fn test_judge_image_compares_a_pods_image_with_a_new_pods() {
     assert_eq!(judge_image(None, new), PodImage::Unknown);
 }
 
+/// Review 1: Kubernetes keeps a pod's image as written, so a pod made
+/// under `docker.io/library/smelt-sandbox:latest` and a `SANDBOX_IMAGE` of
+/// `smelt-sandbox:latest` name one image, and recreating can't help.
+#[test]
+fn test_judge_image_takes_short_and_full_names_of_one_image_as_the_same() {
+    let full = "docker.io/library/smelt-sandbox:latest";
+    for short in ["smelt-sandbox:latest", "smelt-sandbox", "library/smelt-sandbox:latest", "docker.io/smelt-sandbox"] {
+        assert!(matches!(judge_image(Some(full), short), PodImage::SameAsNew(_)), "{short}");
+        assert!(matches!(judge_image(Some(short), full), PodImage::SameAsNew(_)), "{short}");
+    }
+    assert_eq!(judge_image(Some("smelt-sandbox:v0"), full), PodImage::Older);
+    assert_eq!(judge_image(Some("registry.example:5000/smelt-sandbox:latest"), full), PodImage::Older);
+    assert_eq!(judge_image(Some("localhost/smelt-sandbox:latest"), full), PodImage::Older);
+}
+
 /// Silence could be an old agent with nothing to say, or a slow link, so
 /// it fails this attempt but isn't remembered.
 #[sqlx::test]

@@ -65,6 +65,35 @@ impl AgentDialer for ClusterDialer {
     }
 }
 
+/// `reference` the way containerd names it: Docker Hub's `docker.io` and
+/// `library/` filled in, and `:latest` when it has neither tag nor digest
+/// (`smelt-sandbox` is `docker.io/library/smelt-sandbox:latest`).
+pub(super) fn full_image_name(reference: &str) -> String {
+    let (name, digest) = match reference.split_once('@') {
+        Some((name, digest)) => (name, Some(digest)),
+        None => (reference, None),
+    };
+    let first = name.split('/').next().unwrap_or_default();
+    let has_registry = name.contains('/') && (first.contains('.') || first.contains(':') || first == "localhost");
+    let mut full = if has_registry {
+        match name.strip_prefix("docker.io/") {
+            Some(path) if !path.contains('/') => format!("docker.io/library/{path}"),
+            _ => name.to_string(),
+        }
+    } else if name.contains('/') {
+        format!("docker.io/{name}")
+    } else {
+        format!("docker.io/library/{name}")
+    };
+    let last = full.rsplit('/').next().unwrap_or_default();
+    match digest {
+        Some(digest) => full = format!("{full}@{digest}"),
+        None if !last.contains(':') => full.push_str(":latest"),
+        None => {}
+    }
+    full
+}
+
 /// The image of `pod`'s `sandbox` container.
 pub(super) fn sandbox_container_image(pod: &Pod) -> Option<String> {
     let spec = pod.spec.as_ref()?;
@@ -246,10 +275,10 @@ impl Outdated {
 }
 
 /// How a refused pod's `image` compares with `new`, the image a new pod
-/// gets.
+/// gets, by their full names: Kubernetes keeps a pod's image as written.
 pub(super) fn judge_image(image: Option<&str>, new: &str) -> PodImage {
     match image {
-        Some(image) if image == new => PodImage::SameAsNew(image.to_string()),
+        Some(image) if full_image_name(image) == full_image_name(new) => PodImage::SameAsNew(image.to_string()),
         Some(_) => PodImage::Older,
         None => PodImage::Unknown,
     }
