@@ -1996,6 +1996,36 @@ async fn test_whole_calls_before_a_cut_one_are_kept_with_a_not_run_result(pool: 
     assert_eq!(sent[2]["content"][0]["content"], CUT_OFF_TOOL_CALL);
 }
 
+/// SME-126 review 1: a cut-off reply's whole calls get their "not run"
+/// results right after the reply is saved, so a failure after that (here
+/// recording the call's usage) doesn't leave them to be answered as
+/// stopped mid-run, which they weren't.
+#[sqlx::test]
+async fn test_not_run_results_are_saved_before_anything_that_can_fail(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let body = cut_off_in_a_call_body(&[todowrite_events(0, "toolu_whole", WHOLE_TODOS), todowrite_events(1, "toolu_cut", CUT_TODOS)]);
+    start_recording_mock_upstream(&pool, vec![body]).await;
+    sqlx::query("ALTER TABLE model_call_usage RENAME TO model_call_usage_gone")
+        .execute(&pool)
+        .await
+        .expect("make recording the call fail");
+
+    run_turn(&pool, conversation.id, hello()).await.expect_err("recording the call fails the turn");
+
+    let saved = db::list_messages(&pool, conversation.id).await.expect("messages");
+    let roles: Vec<&str> = saved.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "user"], "the message, the reply and its results: {saved:?}");
+    assert_eq!(
+        saved[2].blocks().expect("blocks"),
+        vec![anthropic::ContentBlock::ToolResult {
+            tool_use_id: "toolu_whole".to_string(),
+            content: CUT_OFF_TOOL_CALL.to_string(),
+            is_error: Some(true),
+        }]
+    );
+}
+
 /// SME-126: a reply that is nothing but the cut call saves no assistant
 /// message (the API refuses an empty one); the notice follows the
 /// user's message alone.

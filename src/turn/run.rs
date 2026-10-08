@@ -524,6 +524,31 @@ pub(super) fn run_turn_body<'a>(
             // Saved (and about to be published as a message), so no longer
             // "in progress".
             clear_reply_in_progress(conversation_id);
+            // A cut-off reply's whole calls don't run (its `stop_reason`
+            // isn't `tool_use`), and each says so, rather than looking
+            // finished with no result. Saved straight after the reply, so
+            // a failure after it can't leave them to be answered as
+            // stopped mid-run (SME-126 review 1).
+            if cut_off {
+                let not_run: Vec<anthropic::ContentBlock> = turn
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        anthropic::ContentBlock::ToolUse { id, .. } => Some(anthropic::ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: CUT_OFF_TOOL_CALL.to_string(),
+                            is_error: Some(true),
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                if !not_run.is_empty() {
+                    let saved = db::create_message(pool, conversation_id, "user", &not_run)
+                        .await
+                        .map_err(ServerFnError::new)?;
+                    record_saved(conversation_id, &mut persisted, saved);
+                }
+            }
 
             // Real usage from this call is the ground truth for "how much
             // context is actually being used" — persisted so
@@ -572,10 +597,8 @@ pub(super) fn run_turn_body<'a>(
             // (SME-111 review 1).
             // The window stops a reply short of its budget: the notice
             // says what it wrote (SME-111 review 2).
-            // A cut-off reply's whole calls don't run (its `stop_reason`
-            // isn't `tool_use`), and each says so, rather than looking
-            // finished with no result; the call it was cut in was dropped
-            // by the stream, and the notice names it (SME-126).
+            // The call a reply was cut in was dropped by the stream, and
+            // the notice names it (SME-126).
             let cut_off_by = match turn.stop_reason.as_str() {
                 _ if !cut_off => None,
                 "model_context_window_exceeded" => Some((
@@ -593,24 +616,6 @@ pub(super) fn run_turn_body<'a>(
                 })),
             };
             if let Some((tokens, limit)) = cut_off_by {
-                let not_run: Vec<anthropic::ContentBlock> = turn
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        anthropic::ContentBlock::ToolUse { id, .. } => Some(anthropic::ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: CUT_OFF_TOOL_CALL.to_string(),
-                            is_error: Some(true),
-                        }),
-                        _ => None,
-                    })
-                    .collect();
-                if !not_run.is_empty() {
-                    let saved = db::create_message(pool, conversation_id, "user", &not_run)
-                        .await
-                        .map_err(ServerFnError::new)?;
-                    record_saved(conversation_id, &mut persisted, saved);
-                }
                 let notice = [anthropic::ContentBlock::Text {
                     text: crate::api::chat::cut_off_notice(tokens, limit, turn.cut_off_call.as_deref()),
                 }];
