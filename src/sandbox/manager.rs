@@ -312,6 +312,13 @@ thread_local! {
 /// cleanup task ends with the runtime, and a test makes one.
 #[cfg(test)]
 pub(super) fn use_test_manager(client: kube::Client) -> &'static SandboxManager {
+    // On a multi-thread runtime, a task on another worker would read
+    // `MANAGER` instead, and fail as `NotInitialized` (SME-94 review 1).
+    debug_assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread,
+        "use_test_manager needs a current-thread runtime, as #[sqlx::test] and #[tokio::test] give"
+    );
     let manager: &'static SandboxManager = Box::leak(Box::new(SandboxManager::new(client)));
     TEST_MANAGER.with(|cell| cell.set(Some(manager)));
     manager

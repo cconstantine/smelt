@@ -3410,3 +3410,16 @@ async fn test_sandbox_futures_stay_small() {
         assert!(size <= bound, "{name}'s future is {size} bytes, over its bound of {bound}");
     }
 }
+
+/// SME-94 review 1: `use_test_manager` refuses a multi-thread runtime,
+/// where a task on another worker would read the process-wide manager.
+#[test]
+fn test_a_test_manager_on_a_multi_thread_runtime_is_refused() {
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("a runtime");
+    let refused = std::thread::spawn(move || {
+        runtime.block_on(async { std::panic::catch_unwind(|| use_test_manager(unreachable_client())).is_err() })
+    })
+    .join()
+    .expect("the test thread");
+    assert!(refused, "use_test_manager accepted a multi-thread runtime");
+}
