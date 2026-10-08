@@ -104,6 +104,16 @@ async fn main() {
         .expect("failed to run database migrations");
     tracing::info!("database initialized and migrations applied");
 
+    // This database's instance (SME-115): every sandbox call reads it, and
+    // without it adoption, the pod watch and the claim sweep would all
+    // skip, leaving a server that serves with no pod watch at all. A
+    // database that can't give it stops the server, like a failed
+    // migration.
+    if let Err(e) = db::smelt_instance(pool).await {
+        tracing::error!(error = %e, "couldn't read this database's smelt_instance (SME-115)");
+        std::process::exit(1);
+    }
+
     // A fresh database (a scratch check server's) names its pods and claims
     // far from the dev server's (SME-115). Ownership checks still hold if
     // this fails; a name that meets another database's is refused.
