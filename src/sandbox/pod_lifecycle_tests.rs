@@ -27,15 +27,23 @@ pub(super) async fn own_sandbox(pool: &PgPool) -> kube::Client {
     client
 }
 
+/// How many of these tests run their scenarios at once. Each starts a pod
+/// or more, with a Docker sidecar each; a dozen starting together on one
+/// node took longer than a pod start may (90 s), failing these and the
+/// other real-cluster tests alike. CI runs four tests at a time anyway.
+static SCENARIOS_AT_ONCE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 /// Runs `scenario` for at most `limit`, then deletes everything the test's
 /// database made in the cluster, whether it passed, failed or ran out of
-/// time, and only then reports how it went.
+/// time, and only then reports how it went. Waits its turn first (see
+/// `SCENARIOS_AT_ONCE`), which `limit` doesn't count.
 pub(super) async fn run_then_tear_down(
     pool: &PgPool,
     client: &kube::Client,
     limit: Duration,
     scenario: impl Future<Output = ()>,
 ) {
+    let _turn = SCENARIOS_AT_ONCE.acquire().await.expect("the semaphore is never closed");
     // On the heap: a test thread's stack is small, and a scenario's future
     // holds every value it keeps across an await.
     let outcome = AssertUnwindSafe(Box::pin(tokio::time::timeout(limit, scenario)))
@@ -629,6 +637,209 @@ async fn test_volumes_are_backed_by_claims_and_mounted_into_pods(pool: PgPool) {
         })
         .await;
         assert!(pvc_gone.is_ok(), "delete_volume should delete the backing claim");
+    })
+    .await;
+}
+
+/// A pod gone (deleted, evicted, node lost) while smelt still thinks it's
+/// live: the next call to it gets `AgentUnreachable`, and the same crash
+/// cleanup a failed connect runs closes its terminals and the pod's record,
+/// so the conversation has no live pod left.
+#[sqlx::test]
+async fn test_a_pod_deleted_behind_smelts_back_is_cleaned_up_on_next_use(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        let terminal = create_terminal(&pool, conversation.id).await.expect("create_terminal");
+
+        pods_api(&client).delete(&pod_name(pod), &immediate_delete_params()).await.expect("delete the pod directly");
+        deregister(pod);
+
+        let err = terminate_terminal(&pool, terminal).await;
+        assert!(matches!(err, Err(TerminalError::AgentUnreachable)), "expected AgentUnreachable, got {err:?}");
+        let live = db::list_sandbox_terminals_for_pod(&pool, pod).await.expect("list_sandbox_terminals_for_pod");
+        assert!(
+            live.is_empty(),
+            "crash cleanup should close the terminal even though the pod was never found, not just on a failed connect"
+        );
+        let already_gone = terminate_pod(&pool, conversation.id).await;
+        assert!(
+            matches!(already_gone, Err(TerminalError::NoPod)),
+            "a confirmed crash should already have closed the pod's record, got {already_gone:?}"
+        );
+    })
+    .await;
+}
+
+/// A healthy pod whose connection smelt lost (a restart, simulated with
+/// `forget_connection`; the pod is left alone) shows its terminal
+/// connected again once `try_reconnect` runs, without waiting for some
+/// other tool call.
+#[sqlx::test]
+async fn test_try_reconnect_restores_a_lost_connection_to_a_healthy_pod(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        let terminal = create_terminal(&pool, conversation.id).await.expect("create_terminal");
+        forget_connection(pod);
+
+        let status_of = |listed: Vec<TerminalInfo>| {
+            listed.into_iter().find(|t| t.terminal_id == terminal).map(|t| t.status)
+        };
+        let disconnected = list_terminals(&pool, conversation.id).await.expect("list_terminals");
+        assert_eq!(
+            status_of(disconnected).as_deref(),
+            Some("disconnected"),
+            "a forgotten connection should list its terminal as disconnected"
+        );
+
+        try_reconnect(&pool, pod).await;
+
+        let reconnected = list_terminals(&pool, conversation.id).await.expect("list_terminals");
+        assert_eq!(
+            status_of(reconnected).as_deref(),
+            Some("connected"),
+            "try_reconnect should reconnect to the still-healthy pod"
+        );
+    })
+    .await;
+}
+
+/// Makes a repo in pod `pod` whose `AGENTS.md` says `Run make test.`, as
+/// a bare origin at `origin`, and returns its commit. The commit names its
+/// own author: the test stores no git identity.
+async fn make_origin(client: &kube::Client, pod: i64, origin: &str) -> String {
+    let script = format!(
+        "set -e; git init -q -b main /tmp/src; cd /tmp/src; echo 'Run make test.' > AGENTS.md; \
+         git add AGENTS.md; git -c user.name=t -c user.email=t@example.com commit -qm one; git clone -q --bare /tmp/src {origin}; git rev-parse HEAD"
+    );
+    let made = exec_with(client, &pod_name(pod), "sandbox", &["sh", "-c", &script], None)
+        .await
+        .expect("exec make origin");
+    assert_eq!(made.exit_code, 0, "make origin: {}{}", made.stdout, made.stderr);
+    made.stdout.trim().to_string()
+}
+
+/// Runs `script` in pod `pod`'s sandbox container, and asserts it worked.
+async fn sh(client: &kube::Client, pod: i64, script: &str) {
+    let ran = exec_with(client, &pod_name(pod), "sandbox", &["sh", "-c", script], None)
+        .await
+        .expect("exec");
+    assert_eq!(ran.exit_code, 0, "{script}: {}", ran.stderr);
+}
+
+/// SME-32: `/workspace` is the conversation's own. The next pod has the
+/// checkouts, their uncommitted work, the repo list and the instructions
+/// loaded from them.
+#[sqlx::test]
+async fn test_a_conversations_workspace_outlives_its_pod(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        make_origin(&client, pod, "/tmp/origin.git").await;
+        for dir in [None, Some("again")] {
+            crate::git::clone_repo(&pool, conversation.id, "file:///tmp/origin.git", None, dir)
+                .await
+                .expect("clone_repo");
+        }
+        // Loaded, then edited in the checkout, alongside a file not
+        // committed yet.
+        crate::git::load_instructions(&pool, conversation.id, "/workspace/origin/AGENTS.md")
+            .await
+            .expect("load_instructions");
+        let repos = crate::git::list_repos(&pool, conversation.id).await.expect("list repos");
+        let shown = &repos[0].trust_requests[0];
+        crate::git::decide_trust(&pool, conversation.id, shown.id, &shown.hash, true).await.expect("trust");
+        sh(
+            &client,
+            pod,
+            "echo 'not pushed yet' > /workspace/origin/uncommitted.txt && echo 'Run make lint too.' >> /workspace/origin/AGENTS.md",
+        )
+        .await;
+        terminate_pod(&pool, conversation.id).await.expect("terminate the first pod");
+
+        let next = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("a second pod");
+        let kept = exec_with(
+            &client,
+            &pod_name(next),
+            "sandbox",
+            &["sh", "-c", "cat /workspace/origin/uncommitted.txt && git -C /workspace/origin status --porcelain"],
+            None,
+        )
+        .await
+        .expect("exec check workspace");
+        assert_eq!(
+            (kept.exit_code, kept.stdout.as_str()),
+            (0, "not pushed yet\n M AGENTS.md\n?? uncommitted.txt\n"),
+            "the checkout and its uncommitted file survive the pod: {}",
+            kept.stderr
+        );
+        let repos = crate::git::list_repos(&pool, conversation.id).await.expect("list repos");
+        assert_eq!(repos.len(), 2, "origin, again: {repos:?}");
+        assert_eq!(repos[0].status, crate::git::RepoStatus::Ready, "{repos:?}");
+        assert_eq!(repos[0].loaded_instructions, vec!["AGENTS.md".to_string()], "{repos:?}");
+        assert_eq!(repos[1].status, crate::git::RepoStatus::Ready, "{repos:?}");
+        terminate_pod(&pool, conversation.id).await.expect("terminate the second pod");
+        let pods_after = list_pods(&pool, conversation.id).await.expect("list_pods");
+        assert!(pods_after.is_empty(), "no pods should be listed after terminating it, got {pods_after:?}");
+    })
+    .await;
+}
+
+/// SME-32, SME-49: "work on a repo" and the model's `clone_repo`, on a
+/// conversation with no sandbox, each start one. The repo is recorded
+/// first, so a turn started while the sandbox starts waits for the clone.
+#[sqlx::test]
+async fn test_attach_repo_and_clone_repo_start_a_sandbox_when_there_is_none(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    // Three pod starts, one after another.
+    run_then_tear_down(&pool, &client, Duration::from_secs(300), async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        // An origin in /workspace, which outlives this pod, for the model's
+        // clone below.
+        let setup = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        make_origin(&client, setup, "/workspace/seed.git").await;
+        terminate_pod(&pool, conversation.id).await.expect("terminate the setup pod");
+
+        let attaching = tokio::spawn({
+            let pool = pool.clone();
+            let id = conversation.id;
+            async move { crate::git::attach_repo(&pool, id, "file:///tmp/missing.git", None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !crate::git::wait_for_clones(&pool, conversation.id, Duration::ZERO).await,
+            "a turn started while the sandbox starts should see the clone coming"
+        );
+        let attached = attaching.await.expect("attach task").expect_err("this origin doesn't exist");
+        assert!(attached.contains("does not appear to be a git repository"), "{attached}");
+        // The user named it, so it counts as trusted.
+        assert_eq!(db::get_repo_trust(&pool, "file/tmp/missing").await.expect("trust"), Some(true));
+        assert_eq!(list_pods(&pool, conversation.id).await.expect("list_pods").len(), 1, "attach_repo started a sandbox");
+        terminate_pod(&pool, conversation.id).await.expect("terminate the attach pod");
+
+        let cloning = tokio::spawn({
+            let pool = pool.clone();
+            let id = conversation.id;
+            async move { crate::git::clone_repo(&pool, id, "file:///workspace/seed.git", None, None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !crate::git::wait_for_clones(&pool, conversation.id, Duration::ZERO).await,
+            "a turn started while the sandbox starts should see the clone coming"
+        );
+        let seed = cloning.await.expect("clone task").expect("clone_repo starts the sandbox and clones");
+        assert_eq!(seed.path, "/workspace/seed");
+        assert_eq!(seed.status, crate::git::RepoStatus::Ready, "{seed:?}");
+        assert_eq!(list_pods(&pool, conversation.id).await.expect("list_pods").len(), 1, "clone_repo started a sandbox");
+        terminate_pod(&pool, conversation.id).await.expect("terminate the clone pod");
+        assert!(
+            list_terminals(&pool, conversation.id).await.expect("list_terminals").is_empty(),
+            "no terminals should be listed after terminating all of them"
+        );
     })
     .await;
 }

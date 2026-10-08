@@ -2929,12 +2929,6 @@ async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
     let conversation_b = db::create_conversation(&pool)
         .await
         .expect("create conversation b");
-    let conversation_c = db::create_conversation(&pool)
-        .await
-        .expect("create conversation c");
-    let conversation_d = db::create_conversation(&pool)
-        .await
-        .expect("create conversation d");
 
     run_then_tear_down(&pool, &client, Duration::from_secs(400), async {
         // --- Guards fire before there's anything to guard against yet ---
@@ -3466,71 +3460,6 @@ async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
         );
         assert_eq!(filtered_grep.matches[0].path, "/tmp/file-tools-test/glob-grep/nested/two.rs");
 
-        // --- Pod vanishes out from under us (deleted, evicted, node
-        // lost) while smelt still thinks it's live — connect_with_retry
-        // should run the same crash cleanup a failed `connect()` already
-        // did, not just error out and leave the terminal wedged forever
-        // — and now also fully terminate the pod itself (not just its
-        // terminals), so a confirmed crash (OOM-killed, or any other
-        // early exit) always leaves `sandbox_pods` correctly marked
-        // terminated, the same as an exhausted-retries "gave up
-        // without ever confirming" crash already did. A separate
-        // conversation, since conversation_a's one pod slot is already
-        // in use. ---
-        let pod_c = create_pod(&pool, conversation_c.id, PodLimitOverrides::default()).await.expect("create_pod (c) should succeed");
-        let terminal_c1 = create_terminal(&pool, conversation_c.id).await.expect("create_terminal (c1) should succeed");
-
-        let pods = pods_api(&get().expect("set above").client);
-        pods.delete(&pod_name(pod_c), &immediate_delete_params()).await.expect("delete pod_c directly");
-        deregister(pod_c);
-
-        let err = terminate_terminal(&pool, terminal_c1).await;
-        assert!(matches!(err, Err(TerminalError::AgentUnreachable)), "expected AgentUnreachable, got {err:?}");
-
-        let live_c = db::list_sandbox_terminals_for_pod(&pool, pod_c).await.expect("list_sandbox_terminals_for_pod");
-        assert!(
-            live_c.is_empty(),
-            "crash cleanup should have marked terminal_c1 terminated even though the pod was never found, not just on a failed connect"
-        );
-
-        // The confirmed crash above already fully terminated pod_c
-        // itself (not just its terminal) — terminate_pod now correctly
-        // finds no live pod left for conversation_c to resolve.
-        let already_gone = terminate_pod(&pool, conversation_c.id).await;
-        assert!(
-            matches!(already_gone, Err(TerminalError::NoPod)),
-            "terminate_pod (c) should find no live pod left — a confirmed crash already terminated it, got {already_gone:?}"
-        );
-
-        // --- try_reconnect: a still-healthy pod that just lost its
-        // in-memory registry entry (e.g. a smelt restart, simulated
-        // here with `forget_connection` — the k8s pod itself is left
-        // alone) should flip back to "connected" once try_reconnect
-        // runs, not need an unrelated tool call to happen first.
-        // Another separate conversation, same reason as pod_c. ---
-        let pod_d = create_pod(&pool, conversation_d.id, PodLimitOverrides::default()).await.expect("create_pod (d) should succeed");
-        let terminal_d1 = create_terminal(&pool, conversation_d.id).await.expect("create_terminal (d1) should succeed");
-        forget_connection(pod_d);
-
-        let disconnected = list_terminals(&pool, conversation_d.id).await.expect("list_terminals");
-        assert_eq!(
-            disconnected.iter().find(|t| t.terminal_id == terminal_d1).map(|t| t.status.as_str()),
-            Some("disconnected"),
-            "deregistering should make list_terminals report this terminal as disconnected"
-        );
-
-        try_reconnect(&pool, pod_d).await;
-
-        let reconnected = list_terminals(&pool, conversation_d.id).await.expect("list_terminals");
-        assert_eq!(
-            reconnected.iter().find(|t| t.terminal_id == terminal_d1).map(|t| t.status.as_str()),
-            Some("connected"),
-            "try_reconnect should have re-established the connection to the still-healthy pod"
-        );
-
-        terminate_terminal(&pool, terminal_d1).await.expect("terminate_terminal (d1)");
-        terminate_pod(&pool, conversation_d.id).await.expect("terminate_pod (d)");
-
         // --- Full teardown: terminate remaining terminal, then the pod.
         // terminate_pod is no longer idempotent on repeat now that it's
         // resolved via conversation_pod_id (live pods only) instead of
@@ -3544,105 +3473,6 @@ async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
             matches!(repeat, Err(TerminalError::NoPod)),
             "terminate_pod should no longer be idempotent — a second call resolves to NoPod, got {repeat:?}"
         );
-
-        // /workspace is the conversation's own: the next pod has the
-        // checkout, uncommitted work included.
-        let pod_a2 = create_pod(&pool, conversation_a.id, PodLimitOverrides::default())
-            .await
-            .expect("a second pod for conversation a");
-        let kept = exec_with(
-            &client,
-            &pod_name(pod_a2),
-            "sandbox",
-            &["sh", "-c", "cat /workspace/origin/uncommitted.txt && git -C /workspace/origin status --porcelain"],
-            None,
-        )
-        .await
-        .expect("exec check workspace");
-        assert_eq!(
-            (kept.exit_code, kept.stdout.as_str()),
-            (0, "not pushed yet\n M AGENTS.md\n?? uncommitted.txt\n"),
-            "the checkout and its uncommitted file survive the pod: {}",
-            kept.stderr
-        );
-        let repos = crate::git::list_repos(&pool, conversation_a.id).await.expect("list repos");
-        assert_eq!(repos.len(), 4, "origin, retry, mywork, empty: {repos:?}");
-        assert_eq!(repos[0].status, crate::git::RepoStatus::Ready, "{repos:?}");
-        assert_eq!(repos[0].loaded_instructions, vec!["AGENTS.md".to_string()], "{repos:?}");
-        assert_eq!(repos[1].status, crate::git::RepoStatus::Ready, "{repos:?}");
-        // An origin that outlives the pod, for the model's clone below.
-        let seeded = exec_with(
-            &client,
-            &pod_name(pod_a2),
-            "sandbox",
-            &["git", "clone", "-q", "--bare", "/workspace/origin", "/workspace/seed.git"],
-            None,
-        )
-        .await
-        .expect("exec seed origin");
-        assert_eq!(seeded.exit_code, 0, "{}", seeded.stderr);
-        terminate_pod(&pool, conversation_a.id).await.expect("terminate the second pod (a)");
-
-        let pods_after = list_pods(&pool, conversation_a.id).await.expect("list_pods");
-        assert!(pods_after.is_empty(), "no pods should be listed after terminating it, got {pods_after:?}");
-
-        // "Work on a repo" on a conversation with no sandbox starts one.
-        // The repo is recorded first, so a message sent while the
-        // sandbox starts waits for the clone (SME-32 code review,
-        // finding 3).
-        let attaching = tokio::spawn({
-            let pool = pool.clone();
-            let id = conversation_a.id;
-            async move { crate::git::attach_repo(&pool, id, "file:///tmp/missing.git", None).await }
-        });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !crate::git::wait_for_clones(&pool, conversation_a.id, Duration::ZERO).await,
-            "a turn started while the sandbox starts should see the clone coming"
-        );
-        let attached = attaching
-            .await
-            .expect("attach task")
-            .expect_err("this origin doesn't exist");
-        assert!(attached.contains("does not appear to be a git repository"), "{attached}");
-        // The user named it, so it counts as trusted.
-        assert_eq!(
-            db::get_repo_trust(&pool, "file/tmp/missing").await.expect("trust"),
-            Some(true)
-        );
-        assert_eq!(
-            list_pods(&pool, conversation_a.id).await.expect("list_pods").len(),
-            1,
-            "attach_repo started a sandbox"
-        );
-        terminate_pod(&pool, conversation_a.id).await.expect("terminate the attach pod (a)");
-
-        // The model's clone_repo on a conversation with no sandbox starts
-        // one too, recording the repo first (SME-49).
-        let cloning = tokio::spawn({
-            let pool = pool.clone();
-            let id = conversation_a.id;
-            async move { crate::git::clone_repo(&pool, id, "file:///workspace/seed.git", None, None).await }
-        });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !crate::git::wait_for_clones(&pool, conversation_a.id, Duration::ZERO).await,
-            "a turn started while the sandbox starts should see the clone coming"
-        );
-        let seed = cloning
-            .await
-            .expect("clone task")
-            .expect("clone_repo starts the sandbox and clones");
-        assert_eq!(seed.path, "/workspace/seed");
-        assert_eq!(seed.status, crate::git::RepoStatus::Ready, "{seed:?}");
-        assert_eq!(
-            list_pods(&pool, conversation_a.id).await.expect("list_pods").len(),
-            1,
-            "clone_repo started a sandbox"
-        );
-        terminate_pod(&pool, conversation_a.id).await.expect("terminate the clone pod (a)");
-        let terminals_after = list_terminals(&pool, conversation_a.id).await.expect("list_terminals");
-        assert!(terminals_after.is_empty(), "no terminals should be listed after terminating all of them");
 
         // A conversation that never had a pod at all: the same NoPod, not a panic.
         let unknown = terminate_pod(&pool, 999_999_999).await;
