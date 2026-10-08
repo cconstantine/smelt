@@ -228,6 +228,14 @@ pub(super) fn system_notice(text: &str, commands: &HashMap<String, String>) -> O
     if text == crate::api::chat::STOP_NOTICE {
         return Some("Stopped.".to_string());
     }
+    if let Some((tokens, limit)) = crate::api::chat::parse_cut_off_notice(text) {
+        return Some(format!(
+            "The reply was cut off at its limit of {} tokens ({}). {}",
+            crate::frontend::pages::providers::group_digits(tokens),
+            limit.reason(),
+            limit.hint()
+        ));
+    }
     if text.starts_with("The user stopped sandbox pod ") {
         return Some(
             "You stopped the sandbox; its terminals are gone, and /workspace is kept".to_string(),

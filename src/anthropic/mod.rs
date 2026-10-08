@@ -14,7 +14,7 @@ pub use types::{ContentBlock, Effort, TokenUsage, ToolDefinition};
 // above) — the `web` (browser) build never touches them, only the shared
 // types above.
 #[cfg(feature = "server")]
-pub use types::{AnthropicMessage, CreateMessageRequest, OutputConfig, ThinkingConfig};
+pub use types::{AnthropicMessage, ChatTemplateKwargs, CreateMessageRequest, OutputConfig, ThinkingConfig};
 
 /// Known context-window size (real token count) for a recognized
 /// `claude-*` model id — nothing in the Messages API surfaces this, so it

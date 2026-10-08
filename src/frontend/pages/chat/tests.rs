@@ -492,6 +492,22 @@ fn test_a_stop_reads_as_stopped() {
     );
 }
 
+/// SME-111: a cut-off reply's notice reads as a sentence naming its limit,
+/// what bound it and what to change, for each limit.
+#[test]
+fn test_a_cut_off_notice_reads_as_a_sentence() {
+    use crate::api::chat::{ReplyLimit, cut_off_notice};
+    assert_eq!(
+        system_notice(&cut_off_notice(131_072, ReplyLimit::HalfWindow), &HashMap::new()).as_deref(),
+        Some("The reply was cut off at its limit of 131,072 tokens (half the context window). A reply can be at most half the context window: lower the model's effort or reasoning budget on its provider's page, or ask for less at once.")
+    );
+    for limit in ReplyLimit::ALL {
+        let shown = system_notice(&cut_off_notice(16_384, limit), &HashMap::new()).expect("a notice");
+        assert!(shown.contains("16,384") && shown.contains(limit.reason()) && shown.contains(limit.hint()), "{shown}");
+    }
+    assert_eq!(system_notice("Your last reply was cut off: it reached its limit of lots", &HashMap::new()), None);
+}
+
 #[test]
 fn test_system_notices_read_as_short_sentences() {
     let commands = HashMap::from([("abc123".to_string(), "python3 primes.py".to_string())]);

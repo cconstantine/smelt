@@ -808,6 +808,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             output_config: None,
+            chat_template_kwargs: None,
         };
         let result = stream_anthropic_message(&endpoint, &request, |_| {}).await;
         assert!(result.is_err(), "a redirect isn't a reply");
@@ -1041,6 +1042,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             output_config: None,
+            chat_template_kwargs: None,
         };
 
         stream_anthropic_message(&test_endpoint(addr), &request, on_delta).await
@@ -1105,6 +1107,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             output_config: None,
+            chat_template_kwargs: None,
         };
         let result = stream_anthropic_message(&test_endpoint(addr), &request, |_| {}).await;
         (result, count.load(std::sync::atomic::Ordering::SeqCst))
@@ -1248,6 +1251,7 @@ mod tests {
             thinking,
             prompt_caching: false,
             output_config: None,
+            chat_template_kwargs: None,
         }
     }
 
@@ -2010,6 +2014,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             output_config: None,
+            chat_template_kwargs: None,
         };
 
         let result = tokio::time::timeout(
@@ -2073,6 +2078,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             output_config: None,
+            chat_template_kwargs: None,
         };
 
         let endpoint = Endpoint {
@@ -2136,6 +2142,7 @@ mod tests {
                 thinking: None,
                 prompt_caching: false,
                 output_config: None,
+                chat_template_kwargs: None,
             },
             Binding::AsIs,
             std::time::Duration::from_secs(5),

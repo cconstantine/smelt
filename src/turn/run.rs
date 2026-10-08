@@ -41,11 +41,13 @@ pub(super) const MAX_TURNS: usize = 10_000;
 #[cfg(feature = "server")]
 pub(super) const CLONE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Every real turn's requested reply budget — shared with the
-/// auto-compaction trigger below, which reserves at least this much
-/// headroom off the context window before deciding a request is too big.
+/// The smallest reply budget a turn asks for (SME-111, until then every
+/// turn's fixed `max_tokens`): the auto-compaction trigger reserves at
+/// least this much off the context window before deciding a request is
+/// too big, so a turn that doesn't compact has room for it. The budget
+/// itself grows with the room left (`reply_budget`).
 #[cfg(feature = "server")]
-pub(super) const MAX_TOKENS: u32 = 16_384;
+pub(super) const MIN_REPLY_TOKENS: u32 = 16_384;
 
 /// Runs one full tool-use round trip for `conversation_id`: persists
 /// `new_message`, then loops calling the real Anthropic API — executing any
@@ -420,6 +422,9 @@ pub(super) fn run_turn_body<'a>(
                 turn_model.context_window,
             ) {
                 compact_conversation(pool, conversation_id, turn_model).await?;
+                // The last usage measured the history just summarized: the
+                // reply budget below estimates the new one instead.
+                last_known_usage = None;
             }
 
             let history = history_for_request(
@@ -432,20 +437,32 @@ pub(super) fn run_turn_body<'a>(
 
             let mut request = anthropic::CreateMessageRequest {
                 model: turn_model.model.clone(),
-                // Raised alongside `thinking`: adaptive thinking shares
-                // this budget with the actual reply, and 4096 left no
-                // headroom for both once thinking turned on.
-                max_tokens: MAX_TOKENS,
+                // Set below, once the request's size is known.
+                max_tokens: MIN_REPLY_TOKENS,
                 system: Some(system_prompt(
                     &prompt_environment(pool, conversation_id, &turn_model.model).await,
                 )),
                 messages: history,
                 stream: true,
                 tools: anthropic::tools::tool_definitions(pool).await,
-                thinking: turn_model.thinking.then_some(anthropic::ThinkingConfig::Adaptive),
+                // Set below, with the reply budget it's a share of.
+                thinking: None,
                 prompt_caching: turn_model.prompt_caching,
                 output_config: turn_model.effort.map(|effort| anthropic::OutputConfig { effort }),
+                chat_template_kwargs: turn_model.chat_template_kwargs(turn_model.thinking),
             };
+
+            // As long as the conversation has room for, computed per
+            // request: each tool round's from its own usage (SME-111).
+            // Thinking shares it with the reply.
+            let projected = projected_input(last_known_usage.as_ref(), estimate_tokens(&pending_new_content))
+                .unwrap_or_else(|| estimate_request_tokens(&request));
+            let budget = reply_budget(turn_model.context_window, projected, turn_model.output_cap);
+            request.max_tokens = budget.tokens;
+            request.thinking = turn_model.thinking_config(request.max_tokens);
+            // A budget with no room to think in turned thinking off: the
+            // template is told too (SME-111 review 1).
+            request.chat_template_kwargs = turn_model.chat_template_kwargs(request.thinking.is_some());
 
             // Every tab watching streams the reply: the text so far is kept
             // for a tab that connects mid-reply, and each delta published.
@@ -486,6 +503,7 @@ pub(super) fn run_turn_body<'a>(
                             && is_ollama_thinking_tool_call_corruption(&e) =>
                     {
                         request.thinking = None;
+                        request.chat_template_kwargs = turn_model.chat_template_kwargs(false);
                         last_err = e;
                     }
                     Err(e) => return Err(ServerFnError::new(e)),
@@ -538,6 +556,41 @@ pub(super) fn run_turn_body<'a>(
             );
             last_known_usage = Some(turn.usage);
             pending_new_content.clear();
+
+            // Cut off at its budget: said once, after the reply, to the
+            // model and to every tab (SME-111). Not continued: Claude
+            // refuses a prefilled partial reply, and a local model would
+            // start its reasoning over.
+            // The context window stopping it (Claude 4.5+'s own stop
+            // reason) is the room running out, whatever bound the budget
+            // (SME-111 review 1).
+            // The window stops a reply short of its budget: the notice
+            // says what it wrote (SME-111 review 2).
+            let cut_off_by = match turn.stop_reason.as_str() {
+                "max_tokens" => Some((budget.tokens, match budget.limit {
+                    crate::api::chat::ReplyLimit::OutputCap if turn_model.output_cap_is_models_own => {
+                        crate::api::chat::ReplyLimit::ModelMaximum
+                    }
+                    limit => limit,
+                })),
+                "model_context_window_exceeded" => Some((
+                    u32::try_from(turn.usage.output_tokens)
+                        .ok()
+                        .filter(|written| *written > 0)
+                        .unwrap_or(budget.tokens),
+                    crate::api::chat::ReplyLimit::RoomLeft,
+                )),
+                _ => None,
+            };
+            if let Some((tokens, limit)) = cut_off_by {
+                let notice = [anthropic::ContentBlock::Text {
+                    text: crate::api::chat::cut_off_notice(tokens, limit),
+                }];
+                let saved = db::create_message(pool, conversation_id, "user", &notice)
+                    .await
+                    .map_err(ServerFnError::new)?;
+                record_saved(conversation_id, &mut persisted, saved);
+            }
 
             if turn.stop_reason != "tool_use" {
                 return Ok(persisted);

@@ -723,6 +723,7 @@ async fn test_end_to_end_browser_scenarios() {
         "test-key",
         false,
         None,
+        true,
     )
     .await
     .expect("save the mock provider");
@@ -764,6 +765,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "switch_resets_context_detail", 30, Box::pin(scenario_switch_resets_context_detail(&t))).await;
     run_scenario(&t, only, r, k, "model_picker", 60, Box::pin(scenario_model_picker(&t))).await;
     run_scenario(&t, only, r, k, "oauth_headers", 30, Box::pin(scenario_oauth_headers(&t))).await;
+    run_scenario(&t, only, r, k, "oauth_sign_in_expired", 30, Box::pin(scenario_oauth_sign_in_expired(&t))).await;
     run_scenario(&t, only, r, k, "stale_bundle", 60, Box::pin(scenario_stale_bundle(&t))).await;
     run_scenario(&t, only, r, k, "transcript_scroll", 60, Box::pin(scenario_transcript_scroll(&t))).await;
     run_scenario(&t, only, r, k, "context_from_the_keyboard", 60, Box::pin(scenario_context_from_the_keyboard(&t))).await;
@@ -778,6 +780,8 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "markdown_long_reply", 90, Box::pin(scenario_markdown_long_reply(&t))).await;
     run_scenario(&t, only, r, k, "streaming_into_a_long_transcript", 120, Box::pin(scenario_streaming_into_a_long_transcript(&t))).await;
     run_scenario(&t, only, r, k, "unreadable_message", 30, Box::pin(scenario_unreadable_message(&t))).await;
+    run_scenario(&t, only, r, k, "cut_off_notice", 30, Box::pin(scenario_cut_off_notice(&t))).await;
+    run_scenario(&t, only, r, k, "llama_cpp_provider", 60, Box::pin(scenario_llama_cpp_provider(&t))).await;
     run_scenario(&t, only, r, k, "chat_errors_are_alerts", 30, Box::pin(scenario_chat_errors_are_alerts(&t))).await;
     run_scenario(&t, only, r, k, "message_box_label", 30, Box::pin(scenario_message_box_label(&t))).await;
     run_scenario(&t, only, r, k, "conversation_rows_by_keyboard", 60, Box::pin(scenario_conversation_rows_by_keyboard(&t))).await;
@@ -2279,6 +2283,83 @@ async fn scenario_model_picker(t: &Scenario<'_>) {
     assert_eq!(stored.model.as_deref(), Some("other-model"));
 }
 
+/// SME-113: an OAuth server whose sign-in can't be refreshed (here an
+/// expired token with no refresh token) shows "Sign-in expired", its own
+/// status, on the list and the edit page, which offers Reconnect and
+/// Disconnect. Before, it read Connected until a tool call failed.
+async fn scenario_oauth_sign_in_expired(t: &Scenario<'_>) {
+    let pool = t.pool;
+    // The provider: nothing to discover (rmcp falls back to its default
+    // endpoints), and no refresh is ever attempted without a refresh token.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the provider");
+    let addr = listener.local_addr().expect("provider address");
+    let provider = tokio::spawn(async move {
+        let _ = axum::serve(listener, axum::Router::new()).await;
+    });
+    let server = db::create_mcp_server_config(
+        pool,
+        &unique_id("sign-in-expired"),
+        &format!("http://{addr}/mcp"),
+        &std::collections::HashMap::new(),
+        "oauth",
+        None,
+        None,
+    )
+    .await
+    .expect("create an OAuth server");
+    db::set_mcp_server_oauth_credentials(
+        pool,
+        server.id,
+        Some(serde_json::json!({
+            "client_id": "client",
+            "token_response": {"access_token": "expired", "token_type": "bearer", "expires_in": 60},
+            "granted_scopes": [],
+            "token_received_at": 1_000_000_000u64,
+        })),
+    )
+    .await
+    .expect("store an expired grant");
+
+    let list = t.tab(t.url("mcp-servers")).await;
+    let badge_selector = format!("a[href='/mcp-servers/{}'] .mcp-status", server.id);
+    let badge_text = format!(
+        "(() => {{ const b = document.querySelector({badge_selector:?}); return b ? b.className + '|' + b.innerText : ''; }})()"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let badge = loop {
+        let badge: String = list
+            .evaluate(badge_text.as_str())
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok())
+            .unwrap_or_default();
+        if !badge.contains("checking") && !badge.is_empty() || tokio::time::Instant::now() >= deadline {
+            break badge;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    let edit = t.tab(t.url(&format!("mcp-servers/{}", server.id))).await;
+    let status_shown = wait_for_text(&edit, "Sign-in expired \u{2014} use Reconnect below.", Duration::from_secs(15)).await;
+    let buttons: Vec<String> = edit
+        .evaluate("Array.from(document.querySelectorAll('.mcp-oauth-actions button')).map(b => b.innerText)")
+        .await
+        .ok()
+        .and_then(|v| v.into_value().ok())
+        .unwrap_or_default();
+
+    // Deleted before the checks, so a failing one doesn't leave it behind.
+    db::delete_mcp_server_config(pool, server.id).await.expect("delete the OAuth server");
+    crate::mcp::evict(server.id).await;
+    provider.abort();
+    assert!(
+        badge.contains("mcp-status-needs-reconnect") && badge.ends_with("|Sign-in expired"),
+        "the list's badge: {badge:?}"
+    );
+    assert!(status_shown, "the edit page should say the sign-in expired");
+    assert_eq!(buttons, vec!["Reconnect".to_string(), "Disconnect".to_string()]);
+}
+
 /// Scenario 25 (SME-76): an OAuth server takes extra headers too, such as
 /// GitHub's `X-MCP-Toolsets` (which turns on the tools that read CI logs).
 /// The edit page only showed its header editor to static-header servers.
@@ -2983,6 +3064,134 @@ async fn scenario_unreadable_message(t: &Scenario<'_>) {
     assert_eq!(colours["got"], colours["want"], "an unreadable message should be in the error colour: {colours}");
 }
 
+/// SME-111: a reply cut off at its budget is followed by a notice; a tab
+/// already open shows it live, as the transcript's notice line naming the
+/// limit and what to change, not as the user talking.
+async fn scenario_cut_off_notice(t: &Scenario<'_>) {
+    use crate::api::chat::{ReplyLimit, cut_off_notice};
+    let conversation = t.conversation().await;
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    // Live: the tab's event stream is open before the messages are saved.
+    assert!(
+        wait_until(|| async { crate::events::subscriber_count(conversation.id) > 0 }, Duration::from_secs(10)).await,
+        "the tab never subscribed to its conversation"
+    );
+    for (role, text) in [("assistant", "Half a tho".to_string()), ("user", cut_off_notice(131_072, ReplyLimit::HalfWindow))] {
+        let saved = db::create_message(t.pool, conversation.id, role, &[crate::anthropic::ContentBlock::Text { text }])
+            .await
+            .expect("save a message");
+        crate::events::publish(
+            conversation.id,
+            crate::events::ConversationEvent::MessagesAppended { messages: vec![saved] },
+        );
+    }
+    wait_for_element(&page, ".system-notice", Duration::from_secs(10)).await;
+    let shown: String = page
+        .evaluate("document.querySelector('.system-notice').innerText")
+        .await
+        .expect("read the notice")
+        .into_value()
+        .expect("a string");
+    assert!(
+        shown.contains("cut off at its limit of 131,072 tokens (half the context window)") && shown.contains("reasoning budget"),
+        "{shown}"
+    );
+    let bubbles: usize = page
+        .evaluate("[...document.querySelectorAll('.message')].filter(m => m.innerText.includes('Your last reply')).length")
+        .await
+        .expect("count raw notices")
+        .into_value()
+        .expect("a number");
+    assert_eq!(bubbles, 0, "not shown as the user's own words");
+}
+
+/// A mock llama.cpp server answering `/v1/models` and `/props` with the
+/// user's real server's (fixtures). Returns its address.
+async fn serve_mock_llama_cpp() -> String {
+    let app = axum::Router::new()
+        .route("/v1/models", axum::routing::get(|| async {
+            ([(axum::http::header::CONTENT_TYPE, "application/json")], include_str!("anthropic/fixtures/llama_cpp_v1_models.json"))
+        }))
+        .route("/props", axum::routing::get(|| async {
+            ([(axum::http::header::CONTENT_TYPE, "application/json")], include_str!("anthropic/fixtures/llama_cpp_props.json"))
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the mock llama.cpp server");
+    let address = format!("http://{}", listener.local_addr().expect("its address"));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    address
+}
+
+/// SME-111: the new-provider form suggests the llama.cpp kind for an
+/// address that answers like one, and switches only when asked; a
+/// llama.cpp provider's page shows what its server said and offers its
+/// template's efforts and a reasoning budget.
+async fn scenario_llama_cpp_provider(t: &Scenario<'_>) {
+    let address = serve_mock_llama_cpp().await;
+    let form = t.tab(t.url("providers/new")).await;
+    // Hydrated: the form asks for the price list from the browser.
+    wait_for_resource(&form, "/api/price-sources").await;
+    let url_field = wait_for_element(&form, "#provider-url", Duration::from_secs(10)).await;
+    url_field.focus().await.expect("focus the address");
+    url_field.type_str(&address).await.expect("type the address");
+    let typed: String = form
+        .evaluate("document.querySelector('#provider-url').value")
+        .await
+        .expect("read the address")
+        .into_value()
+        .expect("a string");
+    assert_eq!(typed, address);
+    // Leaving the field commits it, which asks the address.
+    wait_for_element(&form, "#provider-name", Duration::from_secs(5))
+        .await
+        .focus()
+        .await
+        .expect("focus the name");
+    if !wait_for_text(&form, "This looks like a llama.cpp server", Duration::from_secs(10)).await {
+        let state: serde_json::Value = form
+            .evaluate("({ url: document.querySelector('#provider-url').value, probes: performance.getEntriesByType('resource').filter(e => e.name.includes('probe')).map(e => e.name + ' ' + e.responseStatus), active: document.activeElement?.id })")
+            .await
+            .expect("read the form")
+            .into_value()
+            .expect("json");
+        panic!("no llama.cpp suggestion: {state}");
+    }
+    let kind = |page: &chromiumoxide::Page| {
+        let page = page.clone();
+        async move {
+            page.evaluate("document.querySelector('#provider-kind').value")
+                .await
+                .expect("read the kind")
+                .into_value::<String>()
+                .expect("a string")
+        }
+    };
+    assert_eq!(kind(&form).await, "anthropic", "suggested, not switched");
+    click_when_present(&form, ".provider-kind-suggestion button", Duration::from_secs(5)).await;
+    wait_for_element(&form, "#provider-keep-reasoning", Duration::from_secs(5)).await;
+    assert_eq!(kind(&form).await, "llama_cpp");
+
+    let provider = db::create_inference_provider(t.pool, &unique_id("llama"), "llama_cpp", &address, "bearer", "key", false, None, true)
+        .await
+        .expect("create a llama.cpp provider");
+    let page = t.tab(t.url(&format!("providers/{}", provider.id))).await;
+    assert!(
+        wait_for_text(&page, "flash-next \u{b7} 1 slot \u{b7} 262,144-token window", Duration::from_secs(15)).await,
+        "the server's /props isn't shown"
+    );
+    let efforts: Vec<String> = page
+        .evaluate("[...document.querySelector('select[aria-label=\"Effort for flash-next\"]').options].map(o => o.text)")
+        .await
+        .expect("read the efforts")
+        .into_value()
+        .expect("strings");
+    assert_eq!(efforts, vec!["template's default", "low", "medium", "high"]);
+    wait_for_element(&page, "input[aria-label=\"Reasoning budget for flash-next\"]", Duration::from_secs(5)).await;
+    wait_for_element(&page, "input[aria-label=\"Max reply tokens for flash-next\"]", Duration::from_secs(5)).await;
+    db::delete_inference_provider(t.pool, provider.id).await.expect("delete the llama.cpp provider");
+}
+
 /// A server that answers every request after `delay` with an SVG image of
 /// `height` pixels, so an image in a reply grows its bubble after the
 /// reply has rendered. Returns its address.
@@ -3415,7 +3624,7 @@ async fn scenario_settings_two_step(t: &Scenario<'_>) {
         "the language server should be deleted"
     );
 
-    let provider = db::create_inference_provider(pool, &unique_id("two-step"), "anthropic", "http://127.0.0.1:9", "api_key", "key", false, None)
+    let provider = db::create_inference_provider(pool, &unique_id("two-step"), "anthropic", "http://127.0.0.1:9", "api_key", "key", false, None, true)
         .await
         .expect("create a provider");
     let page = t.tab(t.url(&format!("providers/{}", provider.id))).await;
