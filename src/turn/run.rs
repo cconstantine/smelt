@@ -584,7 +584,7 @@ pub(super) fn run_turn_body<'a>(
             };
             if let Some((tokens, limit)) = cut_off_by {
                 let notice = [anthropic::ContentBlock::Text {
-                    text: crate::api::chat::cut_off_notice(tokens, limit),
+                    text: crate::api::chat::cut_off_notice(tokens, limit, None),
                 }];
                 let saved = db::create_message(pool, conversation_id, "user", &notice)
                     .await

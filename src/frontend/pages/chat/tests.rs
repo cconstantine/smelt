@@ -498,14 +498,38 @@ fn test_a_stop_reads_as_stopped() {
 fn test_a_cut_off_notice_reads_as_a_sentence() {
     use crate::api::chat::{ReplyLimit, cut_off_notice};
     assert_eq!(
-        system_notice(&cut_off_notice(131_072, ReplyLimit::HalfWindow), &HashMap::new()).as_deref(),
+        system_notice(&cut_off_notice(131_072, ReplyLimit::HalfWindow, None), &HashMap::new()).as_deref(),
         Some("The reply was cut off at its limit of 131,072 tokens (half the context window). A reply can be at most half the context window: lower the model's effort or reasoning budget on its provider's page, or ask for less at once.")
     );
     for limit in ReplyLimit::ALL {
-        let shown = system_notice(&cut_off_notice(16_384, limit), &HashMap::new()).expect("a notice");
+        let shown = system_notice(&cut_off_notice(16_384, limit, None), &HashMap::new()).expect("a notice");
         assert!(shown.contains("16,384") && shown.contains(limit.reason()) && shown.contains(limit.hint()), "{shown}");
     }
     assert_eq!(system_notice("Your last reply was cut off: it reached its limit of lots", &HashMap::new()), None);
+}
+
+/// SME-126: a notice for a reply cut off in the middle of a tool call
+/// names the call, for the model and in the chat, and round-trips; a
+/// notice saved before SME-126 still parses and reads as it did.
+#[test]
+fn test_a_cut_off_notice_names_the_call_it_was_cut_in() {
+    use crate::api::chat::{ReplyLimit, cut_off_notice, parse_cut_off_notice};
+    let notice = cut_off_notice(16_384, ReplyLimit::OutputCap, Some("write_file"));
+    assert_eq!(
+        notice,
+        "Your last reply was cut off: it reached its limit of 16384 tokens (the model's maximum reply length) before it finished. It stopped in the middle of a call to `write_file`, which was dropped and not run."
+    );
+    assert_eq!(parse_cut_off_notice(&notice), Some((16_384, ReplyLimit::OutputCap, Some("write_file".to_string()))));
+    assert_eq!(
+        system_notice(&notice, &HashMap::new()).as_deref(),
+        Some("The reply was cut off at its limit of 16,384 tokens (the model's maximum reply length) in the middle of a `write_file` call, which didn't run. Raise \u{201c}Max reply tokens\u{201d} for this model on its provider's page, or lower its effort or reasoning budget.")
+    );
+
+    let old = "Your last reply was cut off: it reached its limit of 8192 tokens (half the context window) before it finished.";
+    assert_eq!(cut_off_notice(8_192, ReplyLimit::HalfWindow, None), old);
+    assert_eq!(parse_cut_off_notice(old), Some((8_192, ReplyLimit::HalfWindow, None)));
+    assert_eq!(parse_cut_off_notice(&format!("{old} It stopped in the middle of a call to ``, which was dropped and not run.")), None);
+    assert_eq!(parse_cut_off_notice(&format!("{old} And more.")), None);
 }
 
 #[test]

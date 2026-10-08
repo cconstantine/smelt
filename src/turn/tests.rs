@@ -1847,7 +1847,7 @@ async fn test_a_cut_off_reply_is_followed_by_a_notice(pool: PgPool) {
 
     let saved = run_turn(&pool, conversation.id, hello()).await.expect("a cut-off turn still succeeds");
 
-    let notice = cut_off_notice(16_384, ReplyLimit::OutputCap);
+    let notice = cut_off_notice(16_384, ReplyLimit::OutputCap, None);
     let texts: Vec<(String, String)> = saved
         .iter()
         .map(|m| (m.role.clone(), m.content.clone()))
@@ -1862,7 +1862,7 @@ async fn test_a_cut_off_reply_is_followed_by_a_notice(pool: PgPool) {
     assert_eq!(notice_text, notice);
     assert_eq!(
         crate::api::chat::parse_cut_off_notice(&notice_text),
-        Some((16_384, ReplyLimit::OutputCap)),
+        Some((16_384, ReplyLimit::OutputCap, None)),
         "an unsized Anthropic model's cap bound it"
     );
     let mut published = false;
@@ -1902,7 +1902,7 @@ async fn test_a_reply_at_the_models_own_cap_doesnt_say_raise_it(pool: PgPool) {
         [anthropic::ContentBlock::Text { text }] => text.clone(),
         other => panic!("one text block: {other:?}"),
     };
-    assert_eq!(parse_cut_off_notice(&notice), Some((8_192, ReplyLimit::ModelMaximum)));
+    assert_eq!(parse_cut_off_notice(&notice), Some((8_192, ReplyLimit::ModelMaximum, None)));
 }
 
 /// SME-111 review 1: a reply the context window stopped
@@ -1929,7 +1929,7 @@ async fn test_a_reply_the_window_stopped_gets_a_room_left_notice(pool: PgPool) {
     };
     assert_eq!(
         parse_cut_off_notice(&notice),
-        Some((9_000, ReplyLimit::RoomLeft)),
+        Some((9_000, ReplyLimit::RoomLeft, None)),
         "what it wrote, not the budget it didn't reach (review 2)"
     );
 }

@@ -131,18 +131,36 @@ pub const CUT_OFF_NOTICE_START: &str = "Your last reply was cut off: it reached 
 /// Saved in the conversation after a reply that hit its `max_tokens`
 /// (SME-111), so the model knows its reply is incomplete and every tab
 /// shows that it was cut off (`parse_cut_off_notice`).
+/// `cut_call` names the tool call the reply stopped in the middle of,
+/// which was dropped and not run (SME-126).
 #[cfg(any(feature = "server", test))]
-pub fn cut_off_notice(tokens: u32, limit: ReplyLimit) -> String {
-    format!("{CUT_OFF_NOTICE_START}{tokens} tokens ({}) before it finished.", limit.reason())
+pub fn cut_off_notice(tokens: u32, limit: ReplyLimit, cut_call: Option<&str>) -> String {
+    let call = cut_call.map(|name| format!("{CUT_CALL_START}{name}{CUT_CALL_END}")).unwrap_or_default();
+    format!("{CUT_OFF_NOTICE_START}{tokens} tokens ({}) before it finished.{call}", limit.reason())
 }
 
-/// A cut-off notice's limit and what bound it.
-pub fn parse_cut_off_notice(text: &str) -> Option<(u32, ReplyLimit)> {
+/// How a cut-off notice names the call it was cut in (`cut_off_notice`).
+const CUT_CALL_START: &str = " It stopped in the middle of a call to `";
+const CUT_CALL_END: &str = "`, which was dropped and not run.";
+
+/// A cut-off notice's limit, what bound it, and the call it was cut in.
+/// A notice saved before SME-126 names no call.
+pub fn parse_cut_off_notice(text: &str) -> Option<(u32, ReplyLimit, Option<String>)> {
     let rest = text.strip_prefix(CUT_OFF_NOTICE_START)?;
     let (tokens, rest) = rest.split_once(" tokens (")?;
     let (reason, rest) = rest.split_once(')')?;
     let limit = ReplyLimit::ALL.into_iter().find(|limit| limit.reason() == reason)?;
-    (rest == " before it finished.").then_some((tokens.parse().ok()?, limit))
+    let rest = rest.strip_prefix(" before it finished.")?;
+    let cut_call = if rest.is_empty() {
+        None
+    } else {
+        let name = rest.strip_prefix(CUT_CALL_START)?.strip_suffix(CUT_CALL_END)?;
+        if name.is_empty() {
+            return None;
+        }
+        Some(name.to_string())
+    };
+    Some((tokens.parse().ok()?, limit, cut_call))
 }
 
 /// The conversation's last failed turn's error, if the user hasn't written

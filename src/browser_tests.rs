@@ -3076,7 +3076,7 @@ async fn scenario_cut_off_notice(t: &Scenario<'_>) {
         wait_until(|| async { crate::events::subscriber_count(conversation.id) > 0 }, Duration::from_secs(10)).await,
         "the tab never subscribed to its conversation"
     );
-    for (role, text) in [("assistant", "Half a tho".to_string()), ("user", cut_off_notice(131_072, ReplyLimit::HalfWindow))] {
+    for (role, text) in [("assistant", "Half a tho".to_string()), ("user", cut_off_notice(131_072, ReplyLimit::HalfWindow, None))] {
         let saved = db::create_message(t.pool, conversation.id, role, &[crate::anthropic::ContentBlock::Text { text }])
             .await
             .expect("save a message");
