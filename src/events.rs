@@ -351,12 +351,6 @@ mod server {
         APP_BUS.subscribe()
     }
 
-    /// How many live app-wide subscriptions there are.
-    #[cfg(test)]
-    pub fn app_subscriber_count() -> usize {
-        APP_BUS.receiver_count()
-    }
-
     /// How many live subscriptions `conversation_id` has.
     #[cfg(test)]
     pub fn subscriber_count(conversation_id: i64) -> usize {
@@ -640,7 +634,7 @@ mod server {
 #[cfg(feature = "server")]
 pub use server::{forget, publish, publish_app, subscribe, subscribe_app};
 #[cfg(all(feature = "server", test))]
-pub use server::{app_subscriber_count, has_channel, subscriber_count};
+pub use server::{has_channel, subscriber_count};
 
 #[cfg(test)]
 mod wire_tests {
