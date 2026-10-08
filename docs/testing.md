@@ -177,6 +177,8 @@ Most server logic takes `pool: &PgPool` explicitly and uses `#[sqlx::test]`, per
 
 When testing a code path that could plausibly deadlock (a lock re-acquired somewhere non-obvious, a channel nobody drains), wrap the call in `tokio::time::timeout(...)` and assert it doesn't elapse — a hung test otherwise just stalls the suite with no useful failure message. The pattern was first needed when a tool pushed a notification via an *awaited* `run_turn` call, which deadlocked against the per-conversation lock the *calling* `run_turn` was already holding; the fix was spawning that push instead.
 
+**A test gate built on a semaphore lets one request through per permit only if each permit is consumed:** `gate.acquire().await?.forget()`. A `let _permit = gate.acquire().await?;` inside a block hands the permit back when the block ends, so one `add_permits(1)` lets every later request through. And a race test that passes only once debug output is added is a sign its ordering isn't the one it claims: on SME-113 a refresh-race test passed only with logging slowing it down, and debugging that pass found this gate bug and a real window the fix can't close.
+
 ## Tests that touch per-conversation state
 
 Some state is process-wide and keyed by conversation id: the turn lock, a stop, the pause after a stop, and whether a turn is running (one `ConversationRuntime` per conversation in `turn::state`, SME-52), and the event channels. The locks, stop counters and channels are freed when unused (SME-91), so a test checking one is gone has to drop its own handles first (a `conversation_lock`, an `events::subscribe`). But every `#[sqlx::test]` database numbers conversations from 1, and tests run in parallel, so two tests' "conversation 1" are the same key.

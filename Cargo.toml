@@ -139,6 +139,11 @@ url = { version = "2", optional = true }
 serde_norway = { version = "0.9", optional = true }
 toml = { version = "1", optional = true }
 rmcp = { version = "3.1.2", default-features = false, features = ["client", "reqwest-tls-no-provider", "transport-streamable-http-client-reqwest", "auth"], optional = true }
+# The reqwest 0.13 rmcp itself uses, by another name: an OAuth server's
+# transport is rmcp's `AuthClient<reqwest::Client>` (SME-113), which needs
+# a 0.13 `Client` to wrap, and smelt's own `reqwest` is 0.12. No features
+# of its own, so Cargo unifies it with rmcp's: nothing new is compiled.
+reqwest_rmcp = { package = "reqwest", version = "0.13", default-features = false, optional = true }
 
 # For src/git.rs: generating ed25519 SSH keys and parsing imported ones
 # (OpenSSH format) for the git settings page — see SME-32.
@@ -170,6 +175,7 @@ server = [
     "dep:regex",
     "dep:globset",
     "dep:rmcp",
+    "dep:reqwest_rmcp",
     "dep:http",
     "dep:async-trait",
     "dep:hyper",

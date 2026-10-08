@@ -6,7 +6,7 @@ A single-user, 100%-Rust AI chat agent talking to Claude. Dioxus fullstack (SSR 
 
 | Topic | File |
 |---|---|
-| Build, run, env vars | [docs/setup.md](docs/setup.md) |
+| Build, run, deploy, env vars | [docs/setup.md](docs/setup.md) |
 | Module map, request flow, feature flags | [docs/architecture.md](docs/architecture.md) |
 | sqlx pool, query pattern, `db::get()`, schema (every table) | [docs/database.md](docs/database.md) |
 | Server functions (`#[get]`/`#[post]`), `send_message`/`ServerEvents` streaming | [docs/api.md](docs/api.md) |
