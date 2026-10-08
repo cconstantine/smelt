@@ -18,7 +18,7 @@ use super::*;
 /// labels are named after them, in a namespace they all share) and a
 /// sandbox manager of its own, which `get()` returns on the test's thread.
 /// Returns the manager's client.
-pub(super) async fn own_sandbox(pool: &PgPool) -> kube::Client {
+async fn own_sandbox(pool: &PgPool) -> kube::Client {
     db::test_support::start_ids_clear_of_other_runs(pool)
         .await
         .expect("ids clear of other runs");
@@ -37,7 +37,7 @@ static SCENARIOS_AT_ONCE: tokio::sync::Semaphore = tokio::sync::Semaphore::const
 /// database made in the cluster, whether it passed, failed or ran out of
 /// time, and only then reports how it went. Waits its turn first (see
 /// `SCENARIOS_AT_ONCE`), which `limit` doesn't count.
-pub(super) async fn run_then_tear_down(
+async fn run_then_tear_down(
     pool: &PgPool,
     client: &kube::Client,
     limit: Duration,
@@ -84,7 +84,7 @@ async fn tear_down(pool: &PgPool, client: &kube::Client) {
 
 /// Creates and sends a command in one step, waits for it to finish,
 /// returns its `command_id`.
-pub(super) async fn run_and_wait(
+async fn run_and_wait(
     pool: &PgPool,
     conversation_id: i64,
     terminal_id: i64,
@@ -101,14 +101,14 @@ pub(super) async fn run_and_wait(
     command_id.to_string()
 }
 
-pub(super) async fn first_stdout_line(pool: &PgPool, command_id: &str) -> String {
+async fn first_stdout_line(pool: &PgPool, command_id: &str) -> String {
     let lines = db::read_terminal_output(pool, command_id, &["stdout"], 0, 1)
         .await
         .expect("read_terminal_output");
     lines.first().map(|l| l.data.clone()).unwrap_or_default()
 }
 
-pub(super) async fn poll_until_finished(pool: &PgPool, command_id: &str) -> db::TerminalCommandStatus {
+async fn poll_until_finished(pool: &PgPool, command_id: &str) -> db::TerminalCommandStatus {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let status = db::terminal_command_status(pool, command_id)
@@ -128,7 +128,7 @@ pub(super) async fn poll_until_finished(pool: &PgPool, command_id: &str) -> db::
 
 /// Whether a `PodsChanged` arrives on `rx` within a few seconds,
 /// skipping any older ones still queued.
-pub(super) async fn received_pods_changed(
+async fn received_pods_changed(
     rx: &mut tokio::sync::broadcast::Receiver<events::AppEvent>,
 ) -> bool {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -145,7 +145,7 @@ pub(super) async fn received_pods_changed(
     .unwrap_or(false)
 }
 
-pub(super) async fn any_message_contains(pool: &PgPool, conversation_id: i64, needle: &str) -> bool {
+async fn any_message_contains(pool: &PgPool, conversation_id: i64, needle: &str) -> bool {
     db::list_messages(pool, conversation_id)
         .await
         .expect("list_messages")
@@ -1199,6 +1199,170 @@ async fn test_glob_and_grep_find_files_and_matches(pool: PgPool) {
             .expect("grep should succeed");
         assert_eq!(filtered_grep.matches.len(), 1, "grep's glob filter should narrow the search to just the matching file");
         assert_eq!(filtered_grep.matches[0].path, format!("{dir}/nested/two.rs"));
+    })
+    .await;
+}
+
+/// SME-11, SME-32: one live pod per conversation. A terminal can't open
+/// before there's a pod; a new pod has the stored SSH key and git identity
+/// and a `/workspace` the sandbox user owns; a second `create_pod` is
+/// refused and one pod is listed, Running. `terminate_pod` is refused
+/// while a terminal is open, works once it's closed, and finds no pod the
+/// second time, as for a conversation that never had one.
+#[sqlx::test]
+async fn test_create_pod_sets_up_one_live_pod_per_conversation(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let id = conversation.id;
+        let too_early = create_terminal(&pool, id).await;
+        assert!(
+            matches!(too_early, Err(TerminalError::NoPod)),
+            "create_terminal before any pod exists should fail with NoPod, got {too_early:?}"
+        );
+
+        // A stored key and commit identity reach every new pod (SME-32).
+        let key = crate::git::generate_key("lifecycle");
+        db::create_ssh_key(&pool, "lifecycle", &key.public_key, &key.private_key).await.expect("store key");
+        db::set_git_identity(
+            &pool,
+            &crate::git::GitIdentity { name: "Lifecycle Test".to_string(), email: "lifecycle@example.com".to_string() },
+        )
+        .await
+        .expect("store identity");
+        let pod = create_pod(&pool, id, PodLimitOverrides::default()).await.expect("create_pod");
+        let git_check = exec_with(
+            &client,
+            &pod_name(pod),
+            "sandbox",
+            &["sh", "-c", "test -s /etc/smelt/keys/lifecycle && git config user.email"],
+            None,
+        )
+        .await
+        .expect("exec git check");
+        assert_eq!(
+            (git_check.exit_code, git_check.stdout.trim()),
+            (0, "lifecycle@example.com"),
+            "a new pod has the stored key and identity"
+        );
+        // /workspace is the conversation's claim, whose root the
+        // provisioner owns; the sandbox user gets it (SME-32 code review 2,
+        // finding 6).
+        let owner = exec_with(&client, &pod_name(pod), "sandbox", &["stat", "-c", "%U:%G", "/workspace"], None)
+            .await
+            .expect("exec stat");
+        assert_eq!(owner.stdout.trim(), "sandbox:sandbox", "/workspace belongs to the sandbox user");
+
+        let duplicate = create_pod(&pool, id, PodLimitOverrides::default()).await;
+        assert!(
+            matches!(duplicate, Err(SandboxError::PodAlreadyExists)),
+            "create_pod should refuse a second live pod for the same conversation, got {duplicate:?}"
+        );
+        let pods_listed = list_pods(&pool, id).await.expect("list_pods should succeed");
+        assert_eq!(pods_listed.len(), 1, "exactly the one pod should be listed");
+        assert_eq!(pods_listed[0].status, "Running");
+
+        let terminal = create_terminal(&pool, id).await.expect("create_terminal");
+        let blocked = terminate_pod(&pool, id).await;
+        assert!(
+            matches!(blocked, Err(TerminalError::TerminalStillExists)),
+            "terminate_pod should refuse while a terminal exists, got {blocked:?}"
+        );
+        terminate_terminal(&pool, terminal).await.expect("terminate_terminal");
+        terminate_pod(&pool, id).await.expect("terminate_pod should succeed once its terminal is gone");
+        // Resolved through the conversation's live pod, so a second call
+        // finds none, as for a conversation that never had one.
+        let repeat = terminate_pod(&pool, id).await;
+        assert!(
+            matches!(repeat, Err(TerminalError::NoPod)),
+            "a second terminate_pod should find no pod, got {repeat:?}"
+        );
+        let never = db::create_conversation(&pool).await.expect("create conversation");
+        let unknown = terminate_pod(&pool, never.id).await;
+        assert!(
+            matches!(unknown, Err(TerminalError::NoPod)),
+            "terminate_pod on a conversation that never had a pod should be NoPod, got {unknown:?}"
+        );
+    })
+    .await;
+}
+
+/// Terminals in one pod: each `create_terminal` makes a distinct one,
+/// listed and connected. They keep their own working directories, a long
+/// command in one doesn't hold up the other, and one can't be closed while
+/// a command runs in it. Closing one leaves the other, and closing it again
+/// is fine. Command history is per terminal, and outlives it.
+#[sqlx::test]
+async fn test_terminals_in_one_pod_run_independently_and_are_guarded(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let id = conversation.id;
+        let pod = create_pod(&pool, id, PodLimitOverrides::default()).await.expect("create_pod");
+        let terminal_1 = create_terminal(&pool, id).await.expect("create_terminal (1)");
+        let terminal_2 = create_terminal(&pool, id).await.expect("create_terminal (2)");
+        assert_ne!(terminal_1, terminal_2, "every create_terminal call should make a distinct terminal");
+        let listed = list_terminals(&pool, id).await.expect("list_terminals");
+        assert_eq!(listed.len(), 2, "both terminals in the one pod should be listed");
+        assert!(listed.iter().all(|t| t.status == "connected"));
+        assert!(listed.iter().all(|t| t.pod_id == pod));
+
+        // Their own working directories.
+        run_and_wait(&pool, id, terminal_1, "cd-1", "cd /tmp").await;
+        run_and_wait(&pool, id, terminal_2, "cd-2", "cd /var").await;
+        let pwd_1 = run_and_wait(&pool, id, terminal_1, "pwd-1", "pwd").await;
+        let pwd_2 = run_and_wait(&pool, id, terminal_2, "pwd-2", "pwd").await;
+        assert_eq!(first_stdout_line(&pool, &pwd_1).await, "/tmp");
+        assert_eq!(first_stdout_line(&pool, &pwd_2).await, "/var");
+
+        // A long command in one doesn't hold up the other.
+        db::create_terminal_command(&pool, id, terminal_1, "long-1", "sleep 5").await.expect("create_terminal_command");
+        send_command(&pool, terminal_1, "long-1", "sleep 5").await.expect("send_command");
+        tokio::time::sleep(Duration::from_millis(300)).await; // let it start
+        db::create_terminal_command(&pool, id, terminal_2, "quick-2", "echo still_alive")
+            .await
+            .expect("create_terminal_command");
+        send_command(&pool, terminal_2, "quick-2", "echo still_alive").await.expect("send_command");
+        let quick_status = poll_until_finished(&pool, "quick-2").await;
+        assert_eq!(
+            quick_status.status, "finished",
+            "terminal 2 should finish a command while terminal 1's sleep is still running"
+        );
+        send_signal(&pool, terminal_1, "long-1", "KILL").await.expect("send_signal");
+        poll_until_finished(&pool, "long-1").await;
+
+        // terminate_terminal is refused while a command runs in it.
+        db::create_terminal_command(&pool, id, terminal_2, "blocking-2", "sleep 30").await.expect("create_terminal_command");
+        send_command(&pool, terminal_2, "blocking-2", "sleep 30").await.expect("send_command");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let blocked_terminate = terminate_terminal(&pool, terminal_2).await;
+        assert!(
+            matches!(blocked_terminate, Err(TerminalError::CommandStillRunning)),
+            "terminate_terminal should refuse while a command is running, got {blocked_terminate:?}"
+        );
+        send_signal(&pool, terminal_2, "blocking-2", "KILL").await.expect("send_signal");
+        poll_until_finished(&pool, "blocking-2").await;
+
+        // Closing terminal 2 leaves terminal 1 as it was; closing it again
+        // is fine.
+        terminate_terminal(&pool, terminal_2).await.expect("terminate_terminal should succeed once no command is running");
+        terminate_terminal(&pool, terminal_2).await.expect("terminate_terminal should be idempotent");
+        let still_pwd = run_and_wait(&pool, id, terminal_1, "pwd-1-again", "pwd").await;
+        assert_eq!(
+            first_stdout_line(&pool, &still_pwd).await,
+            "/tmp",
+            "terminal 1 should be unaffected by closing its sibling"
+        );
+
+        // Command history is per terminal, and outlives it.
+        let history_2 = db::list_terminal_commands(&pool, terminal_2, 10)
+            .await
+            .expect("list_terminal_commands should still work for a closed terminal");
+        assert!(history_2.iter().any(|c| c.command_id == "blocking-2"));
+        assert!(
+            !history_2.iter().any(|c| c.command_id == "cd-1"),
+            "list_commands should not leak another terminal's history"
+        );
     })
     .await;
 }
