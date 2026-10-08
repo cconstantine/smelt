@@ -14,6 +14,8 @@ use std::panic::AssertUnwindSafe;
 use super::tests::test_client;
 use super::*;
 
+mod sweep;
+
 /// Gives the test ids clear of every other test and run (pods, claims and
 /// labels are named after them, in a namespace they all share) and a
 /// sandbox manager of its own, which `get()` returns on the test's thread.
