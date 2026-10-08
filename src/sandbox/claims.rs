@@ -300,31 +300,48 @@ pub(super) async fn ensure_conversation_pvcs(
 ) -> Result<(), SandboxError> {
     let pvcs = pvc_api(client);
     for (name, spec) in conversation_pvc_specs(conversation_id, &instance.id) {
-        let existing = match pvcs.get_opt(&name).await? {
-            Some(claim) => claim,
-            None => match pvcs.create(&PostParams::default(), &spec).await {
-                Ok(_) => continue,
-                // Another create got there first: whose is it?
-                Err(kube::Error::Api(e)) if e.code == 409 => pvcs.get(&name).await?,
-                Err(e) => return Err(e.into()),
-            },
-        };
-        // Never another database's /workspace (SME-115). One from before
-        // the fix that startup missed is adopted now, by its owner only.
-        match ownership(&existing.metadata, &instance.id) {
-            Ownership::Ours => {}
-            Ownership::Unlabelled if instance.owns_unlabelled => {
-                let this_conversation = std::collections::HashSet::from([conversation_id]);
-                let none = std::collections::HashSet::new();
-                let decide = |meta: &ObjectMeta| should_adopt(meta, instance, &this_conversation, &none);
-                if !adopt_one(&pvcs, existing, &instance.id, decide).await {
-                    return Err(SandboxError::NotOurs { name, ownership: Ownership::Unlabelled });
-                }
-            }
-            other => return Err(SandboxError::NotOurs { name, ownership: other }),
-        }
+        // Boxed: each claim's reads, create and rare adoption hold two
+        // claims across awaits, which inline doubled this function's
+        // future in a debug build (SME-115 review 1).
+        Box::pin(ensure_conversation_claim(&pvcs, name, spec, conversation_id, instance)).await?;
     }
     Ok(())
+}
+
+/// One of `ensure_conversation_pvcs`' claims: made if missing, and
+/// refused unless it's ours.
+async fn ensure_conversation_claim(
+    pvcs: &Api<PersistentVolumeClaim>,
+    name: String,
+    spec: PersistentVolumeClaim,
+    conversation_id: i64,
+    instance: &db::SmeltInstance,
+) -> Result<(), SandboxError> {
+    let existing = match pvcs.get_opt(&name).await? {
+        Some(claim) => claim,
+        None => match pvcs.create(&PostParams::default(), &spec).await {
+            Ok(_) => return Ok(()),
+            // Another create got there first: whose is it?
+            Err(kube::Error::Api(e)) if e.code == 409 => pvcs.get(&name).await?,
+            Err(e) => return Err(e.into()),
+        },
+    };
+    // Never another database's /workspace (SME-115). One from before the
+    // fix that startup missed is adopted now, by its owner only.
+    match ownership(&existing.metadata, &instance.id) {
+        Ownership::Ours => Ok(()),
+        Ownership::Unlabelled if instance.owns_unlabelled => {
+            let this_conversation = std::collections::HashSet::from([conversation_id]);
+            let none = std::collections::HashSet::new();
+            let decide = |meta: &ObjectMeta| should_adopt(meta, instance, &this_conversation, &none);
+            if adopt_one(pvcs, existing, &instance.id, decide).await {
+                Ok(())
+            } else {
+                Err(SandboxError::NotOurs { name, ownership: Ownership::Unlabelled })
+            }
+        }
+        other => Err(SandboxError::NotOurs { name, ownership: other }),
+    }
 }
 
 /// Best-effort, like the rest of conversation teardown: logged, never

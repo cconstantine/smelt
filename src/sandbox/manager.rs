@@ -17,31 +17,45 @@ pub(super) async fn ensure_volume_claims(
 ) -> Result<(), SandboxError> {
     let pvcs = pvc_api(client);
     for volume in volumes {
-        let claim = sandbox_volume_pvc_name(volume.id);
-        match pvcs.get_opt(&claim).await? {
-            None => {
-                tracing::warn!(claim = %claim, "volume claim missing; recreating it");
-                pvcs.create(&PostParams::default(), &build_volume_pvc_spec(volume.id, &instance.id))
-                    .await?;
-            }
-            // Never another database's volume (SME-115).
-            Some(existing) => match ownership(&existing.metadata, &instance.id) {
-                Ownership::Ours => {}
-                // One from before the fix that startup missed: its owner
-                // adopts it now.
-                Ownership::Unlabelled if instance.owns_unlabelled => {
-                    let none = std::collections::HashSet::new();
-                    let this_volume = std::collections::HashSet::from([volume.id]);
-                    let decide = |meta: &ObjectMeta| should_adopt(meta, instance, &none, &this_volume);
-                    if !adopt_one(&pvcs, existing, &instance.id, decide).await {
-                        return Err(SandboxError::NotOurs { name: claim, ownership: Ownership::Unlabelled });
-                    }
-                }
-                other => return Err(SandboxError::NotOurs { name: claim, ownership: other }),
-            },
-        }
+        // Boxed, like `ensure_conversation_pvcs`' claims (SME-115 review 1).
+        Box::pin(ensure_volume_claim(&pvcs, volume.id, instance)).await?;
     }
     Ok(())
+}
+
+/// One of `ensure_volume_claims`' claims: made if missing, and refused
+/// unless it's ours.
+async fn ensure_volume_claim(
+    pvcs: &Api<PersistentVolumeClaim>,
+    volume_id: i64,
+    instance: &db::SmeltInstance,
+) -> Result<(), SandboxError> {
+    let claim = sandbox_volume_pvc_name(volume_id);
+    match pvcs.get_opt(&claim).await? {
+        None => {
+            tracing::warn!(claim = %claim, "volume claim missing; recreating it");
+            pvcs.create(&PostParams::default(), &build_volume_pvc_spec(volume_id, &instance.id))
+                .await?;
+            Ok(())
+        }
+        // Never another database's volume (SME-115).
+        Some(existing) => match ownership(&existing.metadata, &instance.id) {
+            Ownership::Ours => Ok(()),
+            // One from before the fix that startup missed: its owner
+            // adopts it now.
+            Ownership::Unlabelled if instance.owns_unlabelled => {
+                let none = std::collections::HashSet::new();
+                let this_volume = std::collections::HashSet::from([volume_id]);
+                let decide = |meta: &ObjectMeta| should_adopt(meta, instance, &none, &this_volume);
+                if adopt_one(pvcs, existing, &instance.id, decide).await {
+                    Ok(())
+                } else {
+                    Err(SandboxError::NotOurs { name: claim, ownership: Ownership::Unlabelled })
+                }
+            }
+            other => Err(SandboxError::NotOurs { name: claim, ownership: other }),
+        },
+    }
 }
 
 /// The Kubernetes client every sandbox operation uses.
