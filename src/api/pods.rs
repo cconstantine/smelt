@@ -50,7 +50,8 @@ pub enum AgentStatus {
     /// Another major, or (`None`) an agent from before versioning: the
     /// terminals and file tools don't work until the pod is replaced.
     /// `rebuild_image` when the pod already runs the image a new pod would
-    /// get, so replacing it won't help until that image is rebuilt (SME-121).
+    /// get, so replacing it won't help until that image is rebuilt, and is
+    /// needed after (SME-121).
     RestartRequired {
         version: Option<String>,
         #[serde(default)]
@@ -69,7 +70,9 @@ impl AgentStatus {
                     Some(version) => format!("agent {version}"),
                     None => "old agent".to_string(),
                 };
-                let fix = if *rebuild_image { "image needs rebuilding" } else { "restart required" };
+                // The pod runs the old build even once the image is rebuilt
+                // under the same name, so it still needs a restart after.
+                let fix = if *rebuild_image { "rebuild the image, then restart" } else { "restart required" };
                 format!("{agent}, {fix}")
             }
         }
@@ -416,11 +419,11 @@ mod tests {
         // SME-121: a new pod would run the same image, so a restart can't help.
         assert_eq!(
             AgentStatus::RestartRequired { version: Some("2.0".into()), rebuild_image: true }.describe(),
-            "agent 2.0, image needs rebuilding"
+            "agent 2.0, rebuild the image, then restart"
         );
         assert_eq!(
             AgentStatus::RestartRequired { version: None, rebuild_image: true }.describe(),
-            "old agent, image needs rebuilding"
+            "old agent, rebuild the image, then restart"
         );
     }
 

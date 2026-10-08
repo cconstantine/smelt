@@ -281,7 +281,8 @@ impl std::fmt::Display for TerminalError {
                         " Its image {image} is the one a new pod would get, so recreating the pod won't help. \
                          Don't retry: tell the user the sandbox image needs rebuilding with \
                          scripts/build-sandbox-image.sh (with --latest if SANDBOX_IMAGE names \
-                         smelt-sandbox:latest)."
+                         smelt-sandbox:latest). Once it's rebuilt, call terminate_pod, then create_pod: \
+                         this pod still runs the old build. /workspace is kept."
                     ),
                     PodImage::Older => {
                         write!(f, " Call terminate_pod, then create_pod, for a sandbox that works; /workspace is kept.")

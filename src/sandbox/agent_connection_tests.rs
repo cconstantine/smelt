@@ -396,7 +396,7 @@ async fn test_a_refused_pod_on_an_older_image_is_told_to_recreate(pool: PgPool) 
 /// SME-121: a refused pod that already runs the image a new pod would get
 /// can't be fixed by recreating it, so the error says not to retry and to
 /// have the image rebuilt, now and on every later call; `/pods` says the
-/// image needs rebuilding.
+/// image needs rebuilding, then a restart.
 #[sqlx::test]
 async fn test_a_refused_pod_on_the_image_a_new_pod_gets_says_to_rebuild_it(pool: PgPool) {
     let (_, pod_id) = pod_row(&pool).await;
@@ -414,6 +414,9 @@ async fn test_a_refused_pod_on_the_image_a_new_pod_gets_says_to_rebuild_it(pool:
         let text = err.to_string();
         assert!(text.contains(&image), "{attempt}: names the image: {text}");
         assert!(text.contains("won't help") && text.contains("Don't retry"), "{attempt}: {text}");
+        // Review 1: the image is rebuilt under the same name, and the pod
+        // still runs the old one, so the advice says what to do after.
+        assert!(text.contains("Once it's rebuilt, call terminate_pod, then create_pod"), "{attempt}: {text}");
         assert!(text.contains("scripts/build-sandbox-image.sh"), "{attempt}: {text}");
         assert!(!text.contains("Call terminate_pod, then create_pod"), "{attempt}: {text}");
     }
