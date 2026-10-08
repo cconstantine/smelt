@@ -184,8 +184,7 @@ impl SandboxManager {
                 // return, which never happens on this path. Left alone,
                 // it sits forever — worse, a caller that derives this same
                 // pod name deterministically (as `sandbox_volume_pvc_name`
-                // does; see `test_terminal_lifecycle_end_to_end`'s own
-                // precheck) collides with it on every subsequent attempt.
+                // does) collides with it on every subsequent attempt.
                 pods.delete(&name, &pod_delete_params()).await.ok();
             }
             return Err(e);

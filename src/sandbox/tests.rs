@@ -1056,7 +1056,7 @@ async fn http_get_over(stream: &mut Box<dyn PodIo>, path: &str) -> String {
 async fn test_open_pod_port_reaches_the_conversations_own_pod(pool: PgPool) {
     // Pod names are `sandbox-{pod_id}`, and every `#[sqlx::test]`
     // database restarts ids at 1 — start this one's ids far from the
-    // low range `test_terminal_lifecycle_end_to_end` wipes and uses.
+    // low range.
     let first_id = (uuid_like().parse::<u128>().unwrap() % 1_000_000_000) as i64 + 1_000_000;
     sqlx::query("SELECT setval(pg_get_serial_sequence('sandbox_pods', 'id'), $1)")
         .bind(first_id)
@@ -1066,7 +1066,7 @@ async fn test_open_pod_port_reaches_the_conversations_own_pod(pool: PgPool) {
     // Its own client and manager, never the process-global one: a
     // manager set here would die with this test's runtime and break
     // every later test that uses `get()` (seen as `Kube(Service(Closed))`
-    // in `test_terminal_lifecycle_end_to_end`). The pod is created
+    // on SME-42). The pod is created
     // under the name the database row gives it, as `create_pod` would.
     let client = test_client().await;
     let manager = SandboxManager::new(client.clone());
@@ -3308,18 +3308,12 @@ async fn test_pod_death_reason_reflects_a_real_pod_then_its_absence() {
     std::mem::forget(sandbox);
 }
 
-// No standalone `force_terminate_pod` test: it's a private helper only
-// reachable through `terminate_pod`, which `test_terminal_lifecycle_end_to_end`
-// already exercises six times over. A second test independently racing
-// to set the process-global `MANAGER` singleton is actively harmful,
-// not just redundant — `kube::Client`'s internals are tied to whichever
-// tokio runtime first constructed it, and `#[sqlx::test]`/`#[tokio::test]`
-// each get their own runtime; whichever test's runtime tears down first
-// kills the shared client for every other test still relying on it via
-// `get()`. Confirmed live: adding this test back made
-// `test_terminal_lifecycle_end_to_end` fail with `Kube(Service(Closed))`
-// every time it ran after this one, even though neither test touches
-// the other's data.
+// No standalone `force_terminate_pod` test: it's reached through
+// `terminate_pod`, which `pod_lifecycle_tests` exercise many times over.
+// A test of it would never set the process-global `MANAGER` (a kube
+// client works only while the runtime that built it runs, and each test
+// has its own: on SME-42 that broke the lifecycle test with
+// `Kube(Service(Closed))`); it would call `use_test_manager` instead.
 
 #[tokio::test]
 async fn test_manager_delete_removes_the_pod() {

@@ -2146,7 +2146,8 @@ pub(crate) mod test_support {
 
     use crate::db;
 
-    /// Serializes the tests that run turns, here and in `sandbox.rs`. They
+    /// Serializes the tests that run turns, here and in `sandbox`'s
+    /// Docker-restart notice test. They
     /// share process-wide state keyed by conversation id (the turn lock,
     /// the reply so far, a stop or pause), and every `#[sqlx::test]`
     /// database numbers conversations from 1. Recovers from poisoning, so
