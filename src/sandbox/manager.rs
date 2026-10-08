@@ -287,9 +287,35 @@ pub async fn init() -> Result<&'static SandboxManager, SandboxError> {
     get()
 }
 
-/// The process-wide manager, or `NotInitialized` before `init()`.
+/// The process-wide manager, or `NotInitialized` before `init()`. In a
+/// test, the test's own manager once it has called `use_test_manager`.
 pub fn get() -> Result<&'static SandboxManager, SandboxError> {
+    #[cfg(test)]
+    if let Some(manager) = TEST_MANAGER.with(std::cell::Cell::get) {
+        return Ok(manager);
+    }
     manager_in(&MANAGER)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's test's manager (SME-94). Per thread because each
+    /// `#[sqlx::test]` runs on a thread of its own, on a current-thread
+    /// runtime that runs every task it spawns there too, and a kube client
+    /// works only while the runtime that built it runs: one manager shared
+    /// between tests fails with `Kube(Service(Closed))` once the test that
+    /// built it ends (SME-42).
+    static TEST_MANAGER: std::cell::Cell<Option<&'static SandboxManager>> = const { std::cell::Cell::new(None) };
+}
+
+/// Gives every later `get()` on this thread a manager of its own on
+/// `client`, built on this test's runtime, and returns it. It's leaked: its
+/// cleanup task ends with the runtime, and a test makes one.
+#[cfg(test)]
+pub(super) fn use_test_manager(client: kube::Client) -> &'static SandboxManager {
+    let manager: &'static SandboxManager = Box::leak(Box::new(SandboxManager::new(client)));
+    TEST_MANAGER.with(|cell| cell.set(Some(manager)));
+    manager
 }
 
 /// `get` on a given cell, so a test can read one of its own.

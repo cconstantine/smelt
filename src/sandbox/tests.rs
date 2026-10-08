@@ -1,6 +1,10 @@
 use super::*;
+use super::pod_lifecycle_tests::{
+    any_message_contains, first_stdout_line, own_sandbox, poll_until_finished, received_pods_changed,
+    run_and_wait, run_then_tear_down,
+};
 
-async fn test_client() -> kube::Client {
+pub(super) async fn test_client() -> kube::Client {
     // Same call `main()` makes before building any TLS-using client
     // (see its own comment) — but `main()` never runs under `cargo
     // test`, so without this, the first `kube::Client` built here hits
@@ -1236,13 +1240,34 @@ async fn test_conversation_pod_id_resolves_the_live_pod_and_errors_with_no_pod_o
 }
 
 /// The manager before `init()`: an error saying so, not a panic (SME-56).
-/// Read from a cell of the test's own, since
-/// `test_terminal_lifecycle_end_to_end` sets the process-wide one.
+/// Read from a cell of the test's own, so it holds whatever else runs.
 #[test]
 fn test_the_manager_before_init_is_not_initialized() {
     let cell = OnceLock::new();
     let result = manager_in(&cell);
     assert!(matches!(result, Err(SandboxError::NotInitialized)), "expected NotInitialized");
+}
+
+/// A client for a cluster that isn't there: nothing is sent until a
+/// request is made, so it builds a manager without a cluster.
+fn unreachable_client() -> kube::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let url = "http://127.0.0.1:9".parse().expect("a url");
+    kube::Client::try_from(kube::Config::new(url)).expect("a client")
+}
+
+/// SME-94: a test's own manager is what `get()` returns on the test's
+/// thread, where `#[sqlx::test]`'s current-thread runtime runs the test
+/// and every task it spawns, and nowhere else.
+#[tokio::test]
+async fn test_a_test_manager_is_what_get_returns_on_its_own_thread_only() {
+    let manager = use_test_manager(unreachable_client());
+    let here = get().map(|got| std::ptr::eq(got, manager));
+    let elsewhere = std::thread::spawn(|| matches!(get(), Err(SandboxError::NotInitialized)))
+        .join()
+        .expect("the other thread");
+    assert!(matches!(here, Ok(true)), "get() on the test's thread isn't the test's manager");
+    assert!(elsewhere, "another thread sees the test's manager");
 }
 
 fn unique_session_id(label: &str) -> String {
@@ -2896,86 +2921,23 @@ async fn test_ensure_docker_pvc_creates_once_and_delete_removes_it() {
     assert!(gone.is_ok(), "delete_docker_pvc should remove {name}");
 }
 
-/// A single, comprehensive, real-cluster-and-real-Postgres integration
-/// test covering the terminal *and* file-tool lifecycle end to end,
-/// including the one-pod-per-conversation guard — deliberately one
-/// large test, not many small ones: the free functions (`create_pod`,
-/// `create_terminal`, ...) reach through the process-global `MANAGER`
-/// singleton (mirroring `db::init()`/`db::get()`), and initializing it
-/// from more than one `#[tokio::test]`/`#[sqlx::test]` function would
-/// risk the same cross-runtime-reuse hazard `docs/testing.md` documents
-/// for `PgPool` (each test gets its own tokio runtime) — this is the
-/// one place in the whole suite that touches `MANAGER` at all, so
-/// there's nothing to race with. Pod isolation, previously shown via
-/// two pods in one conversation, now uses two separate conversations —
-/// a conversation can have at most one live pod, see
-/// SME-11's "One pod per conversation."
+/// The terminal and file-tool lifecycle end to end, against a real
+/// cluster and a real Postgres, on a sandbox manager and ids of its own
+/// (`own_sandbox`). Being split into `pod_lifecycle_tests`, one test per
+/// feature (SME-94).
 #[sqlx::test]
 async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
-    // Every terminal command that finishes during this test triggers a
-    // `turn::notify` wake (see SME-13). This
-    // test's database has no model provider (SME-72), so each one
-    // fails at once without reaching any model.
-    // Those wakes touch process-wide turn state keyed by conversation
-    // id, as the chat tests' turns do.
-    let _turns = crate::providers::test_support::lock_turn_tests();
-
-    let client = test_client().await;
-    MANAGER.set(SandboxManager::new(client.clone())).ok();
-
-    // pod_id/terminal_id are now DB-generated (see SME-9's "How") —
-    // each `#[sqlx::test]` run gets a *fresh* isolated Postgres database
-    // whose identity sequences restart at 1, but this test still talks
-    // to the one *real, shared* k3s cluster, so a from-scratch pod_id
-    // sequence would collide with k8s pod names ("sandbox-1",
-    // "sandbox-2", ...) left over from a previous or concurrent run of
-    // *this specific test* — no other test function creates pods this
-    // way (the rest all use `manager.create` directly with
-    // nanosecond-entropy session ids, producing "sandbox-test-*"
-    // names, untouched by this). A small pre-emptive wipe of the low
-    // integer range this run will actually use is enough.
+    // Ids clear of other tests and runs, and a manager of its own: no
+    // lock against the turn tests (SME-94), whose conversations are
+    // numbered from 1, and no wipe of a low id range.
+    let client = own_sandbox(&pool).await;
     let pods_precheck = pods_api(&client);
-    for n in 1..=30i64 {
-        pods_precheck
-            .delete(&pod_name(n), &immediate_delete_params())
-            .await
-            .ok();
-    }
-    // Same reasoning as the pod-name wipe above, for
-    // `create_volume`/`delete_volume`'s PVCs (`sandbox-volume-{id}`) —
-    // this test's own `sandbox_volumes` row always lands on a
-    // low integer id in a fresh `#[sqlx::test]` database, but a
-    // previous run's PVC of the same k8s name can still be sitting
-    // around if that run failed before reaching its own cleanup.
-    let pvcs_precheck = pvc_api(&client);
-    for n in 1..=30i64 {
-        pvcs_precheck
-            .delete(&sandbox_volume_pvc_name(n), &DeleteParams::default())
-            .await
-            .ok();
-        pvcs_precheck
-            .delete(&docker_pvc_name(n), &DeleteParams::default())
-            .await
-            .ok();
-        pvcs_precheck
-            .delete(&workspace_pvc_name(n), &DeleteParams::default())
-            .await
-            .ok();
-    }
-    // Same reasoning again, for the volume-mount pod itself
-    // (`unique_session_id(VOLUME_MOUNT_SESSION_LABEL)`) — its name
-    // carries a nanosecond suffix, not a low integer, so a fixed-range
-    // wipe like the two above can't cover it; list and filter by
-    // prefix instead. A previous run's pod here is what actually
-    // starved the PVC precheck above of its point: `local-path`'s
-    // `WaitForFirstConsumer` binding waits on *a* pod using the claim
-    // reaching `Scheduled`, and a pile of these left `Pending` forever
-    // (nothing schedules them — SandboxManager::create now cleans up
-    // its own timeout, but this covers every prior run before that
-    // fix, and any future failure mode that leaves one behind again)
-    // starves that wait indefinitely. Safe to sweep unconditionally:
-    // this is the only place in the whole suite that uses this label,
-    // so nothing concurrently running can collide with it.
+    // Earlier runs' volume-mount pods (`unique_session_id(
+    // VOLUME_MOUNT_SESSION_LABEL)`), found by prefix since each name ends
+    // in a nanosecond suffix. A pile of them left `Pending` once starved
+    // `local-path`'s `WaitForFirstConsumer` binding, which waits on *a*
+    // pod using the claim reaching `Scheduled`. Safe to sweep: nothing
+    // else in the suite uses this label.
     let volume_mount_pod_prefix = format!("sandbox-test-{VOLUME_MOUNT_SESSION_LABEL}-");
     if let Ok(existing) = pods_precheck.list(&ListParams::default()).await {
         for pod in existing.items {
@@ -3003,7 +2965,7 @@ async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
         .await
         .expect("create conversation d");
 
-    let outcome = tokio::time::timeout(Duration::from_secs(400), async {
+    run_then_tear_down(&pool, &client, Duration::from_secs(400), async {
         // --- Guards fire before there's anything to guard against yet ---
         let too_early = create_terminal(&pool, conversation_a.id).await;
         assert!(
@@ -4161,102 +4123,6 @@ async fn test_terminal_lifecycle_end_to_end(pool: PgPool) {
         assert!(pvc_gone.is_ok(), "delete_volume should delete the backing PVC");
     })
     .await;
-
-    // Best-effort cleanup regardless of pass/fail, matching this file's
-    // existing convention (real-cluster tests, no automatic isolation).
-    let pods = pods_api(&get().expect("set above").client);
-    for n in 1..=20i64 {
-        pods.delete(&pod_name(n), &immediate_delete_params())
-            .await
-            .ok();
-    }
-    // Each conversation's docker data claim (SME-33); ids are small here.
-    let pvcs = pvc_api(&get().expect("set above").client);
-    for n in 1..=30i64 {
-        pvcs.delete(&docker_pvc_name(n), &DeleteParams::default()).await.ok();
-    }
-
-    outcome.expect(
-        "terminal lifecycle integration test should complete within the timeout, not hang",
-    );
-}
-
-/// Creates and sends a command in one step, waits for it to finish,
-/// returns its `command_id` — most of this test's steps are this exact
-/// shape, this just cuts the repetition.
-async fn run_and_wait(
-    pool: &PgPool,
-    conversation_id: i64,
-    terminal_id: i64,
-    command_id: &str,
-    command: &str,
-) -> String {
-    db::create_terminal_command(pool, conversation_id, terminal_id, command_id, command)
-        .await
-        .expect("create_terminal_command");
-    send_command(pool, terminal_id, command_id, command)
-        .await
-        .expect("send_command");
-    poll_until_finished(pool, command_id).await;
-    command_id.to_string()
-}
-
-async fn first_stdout_line(pool: &PgPool, command_id: &str) -> String {
-    let lines = db::read_terminal_output(pool, command_id, &["stdout"], 0, 1)
-        .await
-        .expect("read_terminal_output");
-    lines.first().map(|l| l.data.clone()).unwrap_or_default()
-}
-
-async fn poll_until_finished(pool: &PgPool, command_id: &str) -> db::TerminalCommandStatus {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        let status = db::terminal_command_status(pool, command_id)
-            .await
-            .expect("terminal_command_status")
-            .expect("command should exist");
-        if status.status != "running" {
-            return status;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "command {command_id} did not finish in time"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-/// Whether a `PodsChanged` arrives on `rx` within a few seconds,
-/// skipping any older ones still queued from earlier scenarios.
-async fn received_pods_changed(
-    rx: &mut tokio::sync::broadcast::Receiver<events::AppEvent>,
-) -> bool {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match rx.recv().await {
-                Ok(events::AppEvent::PodsChanged) => return true,
-                Ok(_) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => return false,
-            }
-        }
-    })
-    .await
-    .unwrap_or(false)
-}
-
-async fn any_message_contains(pool: &PgPool, conversation_id: i64, needle: &str) -> bool {
-    db::list_messages(pool, conversation_id)
-        .await
-        .expect("list_messages")
-        .iter()
-        .any(|m| {
-            m.blocks().ok().is_some_and(|blocks| {
-                blocks
-                    .iter()
-                    .any(|b| matches!(b, crate::anthropic::ContentBlock::Text { text } if text.contains(needle)))
-            })
-        })
 }
 
 #[tokio::test]

@@ -373,6 +373,11 @@ mod tests;
 
 /// smelt's side of the agent connection against a fake agent on a loopback
 /// port (SME-53): requests and their errors, the hello, and one connection
-/// per pod. The real agent and cluster are `test_terminal_lifecycle_end_to_end`'s.
+/// per pod. The real agent and cluster are `pod_lifecycle_tests`'.
 #[cfg(test)]
 mod agent_connection_tests;
+
+/// The sandbox's lifecycle against a real cluster, one feature per test
+/// (SME-94).
+#[cfg(test)]
+mod pod_lifecycle_tests;
