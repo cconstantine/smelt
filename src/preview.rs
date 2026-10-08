@@ -155,11 +155,15 @@ impl PreviewTemplate {
         if authority.matches(PORT).count() != 1 || authority.matches(CONVERSATION).count() != 1 {
             return Err(format!("{template:?} must hold {PORT} and {CONVERSATION} once each"));
         }
+        #[expect(clippy::expect_used, reason = "both placeholders were counted exactly once above")]
         let port_at = authority.find(PORT).expect("counted above");
+        #[expect(clippy::expect_used, reason = "both placeholders were counted exactly once above")]
         let conversation_at = authority.find(CONVERSATION).expect("counted above");
         let port_first = port_at < conversation_at;
         let (first, second) = if port_first { (PORT, CONVERSATION) } else { (CONVERSATION, PORT) };
+        #[expect(clippy::expect_used, reason = "both placeholders were counted exactly once above")]
         let (before, rest) = authority.split_once(first).expect("found above");
+        #[expect(clippy::expect_used, reason = "both placeholders were counted exactly once above")]
         let (between, after) = rest.split_once(second).expect("found above");
         // Something that isn't a digit must separate the two numbers, or
         // "3000" + "42" can't be told from "300" + "042".
@@ -396,6 +400,7 @@ mod server {
         // host check (Vite's, for one) accepts the request: `localhost`, or
         // the container's own address, as from a Linux host (SME-33).
         let local = local_authority(pod_host, port);
+        #[expect(clippy::expect_used, reason = "local_authority is localhost or an IP, then a port: always a valid header value")]
         request.headers_mut().insert(HOST, HeaderValue::from_str(&local).expect("a valid Host"));
         let downstream_upgrade = request
             .headers()

@@ -1087,19 +1087,23 @@ async fn create_terminal(state: &Arc<AppState>, terminal_id: String) -> Reply {
             return reply_error(&format!("failed to spawn shell: {e}"));
         }
     };
+    #[expect(clippy::expect_used, reason = "a child that hasn't been waited on always has its pid")]
     let bash_pid = child
         .id()
         .expect("bash should have a pid immediately after spawn");
+    #[expect(clippy::expect_used, reason = "the shell was spawned with stdin piped, and this is its one take")]
     let mut stdin = child
         .stdin
         .take()
         .expect("stdin requested via Stdio::piped()");
+    #[expect(clippy::expect_used, reason = "the shell was spawned with stdout piped, and this is its one take")]
     let stdout = BufReader::new(
         child
             .stdout
             .take()
             .expect("stdout requested via Stdio::piped()"),
     );
+    #[expect(clippy::expect_used, reason = "the shell was spawned with stderr piped, and this is its one take")]
     let stderr = BufReader::new(
         child
             .stderr
@@ -1744,13 +1748,16 @@ async fn main() {
     // spawning any shell, so every terminal's `bash` starts with them
     // deliverable whatever launched the agent.
     unsafe {
+        #[expect(clippy::expect_used, reason = "startup: without its signals reset, no terminal's commands can be interrupted")]
         signal::signal(Signal::SIGINT, signal::SigHandler::SigDfl)
             .expect("reset SIGINT to default disposition");
+        #[expect(clippy::expect_used, reason = "startup: without its signals reset, no terminal's commands can be interrupted")]
         signal::signal(Signal::SIGQUIT, signal::SigHandler::SigDfl)
             .expect("reset SIGQUIT to default disposition");
         // As PID 1 with no handler, SIGTERM would be ignored, and every
         // deleted pod would wait out its whole grace period before being
         // killed. The pod is going away: exit at once (SME-51 B6).
+        #[expect(clippy::expect_used, reason = "startup: as PID 1, an agent that can't handle SIGTERM holds up every pod delete")]
         signal::signal(Signal::SIGTERM, signal::SigHandler::Handler(exit_on_sigterm))
             .expect("handle SIGTERM");
     }
@@ -1765,6 +1772,7 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("failed to bind {LISTEN_ADDR}: {e}"));
     tracing::info!("sandbox_agent listening on {LISTEN_ADDR}");
+    #[expect(clippy::expect_used, reason = "serving is the agent's whole job: when it ends, the pod does")]
     axum::serve(listener, app).await.expect("server error");
 }
 

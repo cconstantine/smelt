@@ -29,6 +29,8 @@ mod mcp_oauth;
 mod models;
 #[cfg(feature = "server")]
 mod preview;
+#[cfg(feature = "server")]
+mod pricing;
 mod providers;
 mod questions;
 #[cfg(feature = "server")]
@@ -95,6 +97,7 @@ async fn main() {
     }
 
     let pool = db::init().await;
+    #[expect(clippy::expect_used, reason = "startup: smelt can't run on a schema it couldn't migrate")]
     sqlx::migrate!()
         .run(pool)
         .await
@@ -129,16 +132,22 @@ async fn main() {
     // its own (SME-42).
     preview::start(pool.clone()).await;
 
+    // Model prices for each call's cost: the saved copy, then models.dev
+    // now and hourly (SME-106).
+    pricing::start(pool.clone());
+
     let router = build_router();
 
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
+    #[expect(clippy::expect_used, reason = "startup: smelt can't run without its listener")]
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .expect("failed to bind listener");
     tracing::info!("listening on {}", listener.local_addr().unwrap());
+    #[expect(clippy::expect_used, reason = "serving is the process's whole job: when it ends, the process does")]
     axum::serve(listener, router).await.expect("server error");
 }
 

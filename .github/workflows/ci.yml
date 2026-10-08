@@ -153,6 +153,12 @@ jobs:
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo check --no-default-features --features web --target wasm32-unknown-unknown
 
+      - name: No expect() in production code without a reason (SME-95)
+        run: |
+          docker compose run --rm \
+            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
+            smelt scripts/lint-expects
+
       - name: Browser test setup (chrome-headless-shell)
         run: |
           docker compose run --rm \

@@ -856,6 +856,7 @@ mod server {
     ) -> Result<ClonePlan, String> {
         let key = remote_key(url).ok_or_else(|| format!("{url} isn't a git URL smelt can clone."))?;
         let named_dir = dir.map(str::trim).filter(|d| !d.is_empty());
+        #[expect(clippy::expect_used, reason = "remote_key parsed the URL just above, so it has a default directory")]
         let dir = match named_dir {
             Some(dir) => dir.to_string(),
             None => default_checkout_dir(url).expect("remote_key parsed it"),
@@ -1297,6 +1298,7 @@ mod server {
 
     /// A new ed25519 key, commented `smelt:<name>` so it's recognisable in
     /// GitHub's key list.
+    #[expect(clippy::expect_used, reason = "ed25519 generation and encoding a fresh key don't fail")]
     pub fn generate_key(name: &str) -> KeyPair {
         let mut key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
             .expect("ed25519 generation doesn't fail");

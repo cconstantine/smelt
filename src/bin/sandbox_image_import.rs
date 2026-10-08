@@ -268,9 +268,11 @@ async fn exec_capture(
     let mut attached = pods
         .exec(pod_name, command.iter().copied(), &AttachParams::default())
         .await?;
+    #[expect(clippy::expect_used, reason = "AttachParams::default() asks for stdout")]
     let mut stdout_reader = attached
         .stdout()
         .expect("stdout requested by AttachParams::default()");
+    #[expect(clippy::expect_used, reason = "AttachParams::default() asks for stderr")]
     let mut stderr_reader = attached
         .stderr()
         .expect("stderr requested by AttachParams::default()");

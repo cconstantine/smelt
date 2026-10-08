@@ -721,6 +721,8 @@ async fn test_end_to_end_browser_scenarios() {
         &format!("http://{}", mock.addr),
         "api_key",
         "test-key",
+        false,
+        None,
     )
     .await
     .expect("save the mock provider");
@@ -3491,7 +3493,7 @@ async fn scenario_settings_two_step(t: &Scenario<'_>) {
         "the language server should be deleted"
     );
 
-    let provider = db::create_inference_provider(pool, &unique_id("two-step"), "anthropic", "http://127.0.0.1:9", "api_key", "key")
+    let provider = db::create_inference_provider(pool, &unique_id("two-step"), "anthropic", "http://127.0.0.1:9", "api_key", "key", false, None)
         .await
         .expect("create a provider");
     let page = t.tab(t.url(&format!("providers/{}", provider.id))).await;

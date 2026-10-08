@@ -463,6 +463,7 @@ pub async fn operate(
             }
             Operation::Hover => ops::format_hover(&request("textDocument/hover", position()?).await?),
             Operation::DocumentSymbols => {
+                #[expect(clippy::expect_used, reason = "operate refused a missing path above for every operation but WorkspaceSymbols")]
                 let (path, text, _) = file.as_ref().expect("a path");
                 let result = request("textDocument/documentSymbol", json!({"textDocument": {"uri": session::file_uri(path)}})).await?;
                 let lines: Vec<&str> = text.lines().collect();
@@ -475,6 +476,7 @@ pub async fn operate(
                 ops::format_symbols(&result, None, &mut |p, l| files.get(p).and_then(|lines| lines.get(l as usize).cloned()))
             }
             Operation::Diagnostics => {
+                #[expect(clippy::expect_used, reason = "operate refused a missing path above for every operation but WorkspaceSymbols")]
                 let (path, text, version) = file.as_ref().expect("a path");
                 // Anything published since the server was last told this
                 // text: without a version, older ones may be for other text.
