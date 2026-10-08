@@ -176,6 +176,11 @@ fn move_late_results(history: &mut Vec<anthropic::AnthropicMessage>, i: usize, c
 #[cfg(feature = "server")]
 pub(super) const UNFINISHED_TOOL_CALL: &str = "This tool call didn't finish: the turn was stopped (by the user, or by a server restart) before it returned. Its effects, if any, are unknown.";
 
+/// The error result each whole tool call in a cut-off reply gets: none of
+/// a cut-off reply's calls run (SME-126).
+#[cfg(feature = "server")]
+pub(super) const CUT_OFF_TOOL_CALL: &str = "Not run: your reply was cut off before it finished, so none of its tool calls ran. Make the call again if it's still needed.";
+
 /// The fixed part of every turn's system prompt: who the model is, how its
 /// sandbox and tools work, and how its replies are shown. Kept as prose in
 /// its own file so it reads and edits like prose.

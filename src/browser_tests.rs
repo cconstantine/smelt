@@ -781,6 +781,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "streaming_into_a_long_transcript", 120, Box::pin(scenario_streaming_into_a_long_transcript(&t))).await;
     run_scenario(&t, only, r, k, "unreadable_message", 30, Box::pin(scenario_unreadable_message(&t))).await;
     run_scenario(&t, only, r, k, "cut_off_notice", 30, Box::pin(scenario_cut_off_notice(&t))).await;
+    run_scenario(&t, only, r, k, "cut_off_in_a_call", 30, Box::pin(scenario_cut_off_in_a_call(&t))).await;
     run_scenario(&t, only, r, k, "llama_cpp_provider", 60, Box::pin(scenario_llama_cpp_provider(&t))).await;
     run_scenario(&t, only, r, k, "chat_errors_are_alerts", 30, Box::pin(scenario_chat_errors_are_alerts(&t))).await;
     run_scenario(&t, only, r, k, "message_box_label", 30, Box::pin(scenario_message_box_label(&t))).await;
@@ -3076,7 +3077,7 @@ async fn scenario_cut_off_notice(t: &Scenario<'_>) {
         wait_until(|| async { crate::events::subscriber_count(conversation.id) > 0 }, Duration::from_secs(10)).await,
         "the tab never subscribed to its conversation"
     );
-    for (role, text) in [("assistant", "Half a tho".to_string()), ("user", cut_off_notice(131_072, ReplyLimit::HalfWindow))] {
+    for (role, text) in [("assistant", "Half a tho".to_string()), ("user", cut_off_notice(131_072, ReplyLimit::HalfWindow, None))] {
         let saved = db::create_message(t.pool, conversation.id, role, &[crate::anthropic::ContentBlock::Text { text }])
             .await
             .expect("save a message");
@@ -3103,6 +3104,74 @@ async fn scenario_cut_off_notice(t: &Scenario<'_>) {
         .into_value()
         .expect("a number");
     assert_eq!(bubbles, 0, "not shown as the user's own words");
+}
+
+/// SME-126: a real turn whose reply llama.cpp cut off in the middle of a
+/// `write_file` call (the captured stream) shows its text and the notice
+/// naming the call, live, and no row for the call.
+async fn scenario_cut_off_in_a_call(t: &Scenario<'_>) {
+    let app = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                include_str!("anthropic/fixtures/llama_cpp_messages_stream_cut_off.sse"),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the cut-off upstream");
+    let address = format!("http://{}", listener.local_addr().expect("its address"));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let provider = db::create_inference_provider(t.pool, &unique_id("cut-off"), "anthropic", &address, "api_key", "key", false, None, true)
+        .await
+        .expect("save the cut-off provider");
+    let conversation = t.conversation().await;
+    db::set_conversation_model(t.pool, conversation.id, provider.id, "flash-next")
+        .await
+        .expect("put the conversation on it");
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+
+    let turn = crate::turn::run_turn(
+        t.pool,
+        conversation.id,
+        anthropic::AnthropicMessage {
+            role: "user".to_string(),
+            content: vec![anthropic::ContentBlock::Text { text: "Write me a poem.".to_string() }],
+        },
+    )
+    .await;
+    let mock = *MOCK_PROVIDER.get().expect("the mock provider");
+    db::set_conversation_model(t.pool, conversation.id, mock, MOCK_MODEL)
+        .await
+        .expect("put the conversation back");
+    db::delete_inference_provider(t.pool, provider.id).await.expect("delete the cut-off provider");
+    turn.expect("a reply cut off in a call doesn't fail the turn");
+
+    assert!(
+        wait_for_text(&page, "I will write a short poem about rivers to a file.", Duration::from_secs(10)).await,
+        "the reply's text isn't shown"
+    );
+    wait_for_element(&page, ".system-notice", Duration::from_secs(10)).await;
+    let shown: String = page
+        .evaluate("document.querySelector('.system-notice').innerText")
+        .await
+        .expect("read the notice")
+        .into_value()
+        .expect("a string");
+    assert!(
+        shown.contains("cut off at its limit of 16,384 tokens") && shown.contains("write_file") && shown.contains("which didn't run"),
+        "{shown}"
+    );
+    let rows: usize = page
+        .evaluate("document.querySelectorAll('.tool-row').length")
+        .await
+        .expect("count tool rows")
+        .into_value()
+        .expect("a number");
+    assert_eq!(rows, 0, "the dropped call has no row");
 }
 
 /// A mock llama.cpp server answering `/v1/models` and `/props` with the
