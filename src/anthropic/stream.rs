@@ -20,6 +20,9 @@ pub struct StreamedTurn {
     /// treatment `stop_reason` itself already gets). See
     /// SME-18.
     pub usage: TokenUsage,
+    /// The tool call a cut-off reply stopped in the middle of, by name
+    /// (SME-126): dropped from `content`, never run.
+    pub cut_off_call: Option<String>,
 }
 
 /// How a request authenticates to a provider (SME-72).
@@ -250,33 +253,62 @@ enum PartialBlock {
     },
 }
 
-impl PartialBlock {
-    fn finalize(self) -> Result<ContentBlock, String> {
+/// A finished block. A tool call whose input doesn't parse is kept until
+/// the reply's `stop_reason` is known (SME-126): a reply cut off at its
+/// limit stops every block before saying so, and the call it was cut in
+/// is dropped rather than failing the reply. Any other is the error it
+/// always was.
+#[derive(Debug)]
+enum Finished {
+    Block(ContentBlock),
+    UnparsedCall { name: String, error: String },
+}
+
+impl Finished {
+    fn tool_name(&self) -> Option<&str> {
         match self {
-            PartialBlock::Text(text) => Ok(ContentBlock::Text { text }),
+            Finished::Block(ContentBlock::ToolUse { name, .. }) | Finished::UnparsedCall { name, .. } => Some(name),
+            Finished::Block(_) => None,
+        }
+    }
+}
+
+impl PartialBlock {
+    fn finalize(self) -> Finished {
+        match self {
+            PartialBlock::Text(text) => Finished::Block(ContentBlock::Text { text }),
             PartialBlock::ToolUse {
                 id,
                 name,
                 partial_json,
             } => {
-                let input = if partial_json.is_empty() {
-                    Value::Object(serde_json::Map::new())
-                } else {
-                    serde_json::from_str(&partial_json).map_err(|e| {
-                        format!("failed to parse tool_use input JSON for {name}: {e}")
-                    })?
-                };
-                Ok(ContentBlock::ToolUse { id, name, input })
+                if partial_json.is_empty() {
+                    let input = Value::Object(serde_json::Map::new());
+                    return Finished::Block(ContentBlock::ToolUse { id, name, input });
+                }
+                match serde_json::from_str(&partial_json) {
+                    Ok(input) => Finished::Block(ContentBlock::ToolUse { id, name, input }),
+                    Err(e) => Finished::UnparsedCall {
+                        error: format!("failed to parse tool_use input JSON for {name}: {e}"),
+                        name,
+                    },
+                }
             }
             PartialBlock::Thinking {
                 thinking,
                 signature,
-            } => Ok(ContentBlock::Thinking {
+            } => Finished::Block(ContentBlock::Thinking {
                 thinking,
                 signature,
             }),
         }
     }
+}
+
+/// Whether a reply with this `stop_reason` was cut off at its limit
+/// rather than finished (SME-111): its budget, or the context window.
+pub fn is_cut_off(stop_reason: &str) -> bool {
+    matches!(stop_reason, "max_tokens" | "model_context_window_exceeded")
 }
 
 /// A reply's content blocks as they stream, keyed by each event's `index`
@@ -290,7 +322,7 @@ struct Blocks {
     open: std::collections::BTreeMap<usize, PartialBlock>,
     /// Finished blocks by (index, order finished): a block reopened at an
     /// index already finished lands right after the first.
-    done: std::collections::BTreeMap<(usize, usize), ContentBlock>,
+    done: std::collections::BTreeMap<(usize, usize), Finished>,
     last: Option<usize>,
 }
 
@@ -301,7 +333,7 @@ impl Blocks {
 
     /// Opens `block` at `index` (or after every block seen, without one).
     /// A block still open there is finished first.
-    fn start(&mut self, index: Option<usize>, block: PartialBlock) -> Result<(), String> {
+    fn start(&mut self, index: Option<usize>, block: PartialBlock) {
         let index = index.unwrap_or_else(|| {
             let seen = self.open.keys().chain(self.done.keys().map(|(i, _)| i));
             seen.max().map_or(0, |i| i.saturating_add(1))
@@ -314,42 +346,40 @@ impl Blocks {
         {
             name.clone_from(new_name);
             self.last = Some(index);
-            return Ok(());
+            return;
         }
         if self.open.contains_key(&index) || self.done.keys().any(|(i, _)| *i == index) {
             tracing::warn!(index, "the model provider reused a content block's index");
         }
-        self.stop(Some(index))?;
+        self.stop(Some(index));
         self.open.insert(index, block);
         self.last = Some(index);
-        Ok(())
     }
 
     /// Finishes the block at `index` (or the one opened last). A stop
     /// for a block that isn't open is ignored.
-    fn stop(&mut self, index: Option<usize>) -> Result<(), String> {
+    fn stop(&mut self, index: Option<usize>) {
         let Some(index) = index.or(self.last) else {
-            return Ok(());
+            return;
         };
         if let Some(block) = self.open.remove(&index) {
             let order = self.done.len();
-            self.done.insert((index, order), block.finalize()?);
+            self.done.insert((index, order), block.finalize());
         }
-        Ok(())
     }
 
-    fn text(&mut self, index: Option<usize>, text: String) -> Result<(), String> {
+    fn text(&mut self, index: Option<usize>, text: String) {
         if let Some(PartialBlock::Text(existing)) = self.open_at(index) {
             existing.push_str(&text);
-            return Ok(());
+            return;
         }
-        self.start(index, PartialBlock::Text(text))
+        self.start(index, PartialBlock::Text(text));
     }
 
-    fn thinking(&mut self, index: Option<usize>, thinking: String) -> Result<(), String> {
+    fn thinking(&mut self, index: Option<usize>, thinking: String) {
         if let Some(PartialBlock::Thinking { thinking: existing, .. }) = self.open_at(index) {
             existing.push_str(&thinking);
-            return Ok(());
+            return;
         }
         self.start(
             index,
@@ -357,7 +387,7 @@ impl Blocks {
                 thinking,
                 signature: String::new(),
             },
-        )
+        );
     }
 
     /// Dropped unless its index holds an open thinking block.
@@ -374,12 +404,32 @@ impl Blocks {
         }
     }
 
-    /// Finishes every block still open and returns them all in index order.
-    fn finish(mut self) -> Result<Vec<ContentBlock>, String> {
+    /// Finishes every block still open and returns them all in index
+    /// order. When the reply was cut off (`is_cut_off`) and its last block
+    /// is a tool call, that call is dropped, whether or not its input
+    /// parsed, and its name returned (SME-126). A call left whose input
+    /// doesn't parse fails the reply.
+    fn finish(mut self, stop_reason: &str) -> Result<(Vec<ContentBlock>, Option<String>), String> {
         while let Some(&index) = self.open.keys().next() {
-            self.stop(Some(index))?;
+            self.stop(Some(index));
         }
-        Ok(self.done.into_values().collect())
+        let mut cut_off_call = None;
+        if is_cut_off(stop_reason)
+            && let Some(last) = self.done.last_entry()
+            && let Some(name) = last.get().tool_name()
+        {
+            cut_off_call = Some(name.to_string());
+            last.remove();
+        }
+        let content = self
+            .done
+            .into_values()
+            .map(|finished| match finished {
+                Finished::Block(block) => Ok(block),
+                Finished::UnparsedCall { error, .. } => Err(error),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok((content, cut_off_call))
     }
 }
 
@@ -705,13 +755,13 @@ pub async fn stream_anthropic_message(
             match interpret_stream_event(&value) {
                 StreamOutcome::TextDelta(text) => {
                     on_delta(&text);
-                    blocks.text(index, text)?;
+                    blocks.text(index, text);
                 }
                 // Not passed to `on_delta` — thinking is never part of the
                 // live-typed reply, only shown (collapsed) once the full
                 // block lands with the finished message. No live "typing"
                 // effect for it, unlike text.
-                StreamOutcome::ThinkingDelta(thinking) => blocks.thinking(index, thinking)?,
+                StreamOutcome::ThinkingDelta(thinking) => blocks.thinking(index, thinking),
                 StreamOutcome::ThinkingSignatureDelta(signature) => blocks.signature(index, &signature),
                 StreamOutcome::ToolUseStart { id, name } => blocks.start(
                     index,
@@ -720,9 +770,9 @@ pub async fn stream_anthropic_message(
                         name,
                         partial_json: String::new(),
                     },
-                )?,
+                ),
                 StreamOutcome::ToolUseInputDelta(partial_json) => blocks.tool_input(index, &partial_json),
-                StreamOutcome::BlockStop => blocks.stop(index)?,
+                StreamOutcome::BlockStop => blocks.stop(index),
                 StreamOutcome::StopReason {
                     reason,
                     output_tokens,
@@ -743,10 +793,12 @@ pub async fn stream_anthropic_message(
         }
     }
 
+    let (content, cut_off_call) = blocks.finish(&stop_reason)?;
     Ok(StreamedTurn {
-        content: blocks.finish()?,
+        content,
         stop_reason,
         usage,
+        cut_off_call,
     })
 }
 
@@ -1711,6 +1763,7 @@ mod tests {
     /// llama.cpp's reply: thinking, commentary and a tool call, each block
     /// opened without closing the one before, every stop at the end.
     const LLAMA_CPP_STREAM: &str = include_str!("fixtures/llama_cpp_messages_stream.sse");
+    const LLAMA_CPP_CUT_OFF_STREAM: &str = include_str!("fixtures/llama_cpp_messages_stream_cut_off.sse");
 
     /// SME-112: commentary before a tool call was lost on llama.cpp, whose
     /// blocks overlap. Every block is kept, in index order.
@@ -1884,6 +1937,97 @@ mod tests {
         }
     }
 
+    fn cut_off_end(reason: &str) -> [serde_json::Value; 2] {
+        [
+            serde_json::json!({"type": "message_delta", "delta": {"stop_reason": reason}, "usage": {"output_tokens": 60}}),
+            serde_json::json!({"type": "message_stop"}),
+        ]
+    }
+
+    /// SME-126: a reply cut off at its limit in the middle of a tool
+    /// call's input keeps what came before, drops the call and names it,
+    /// whichever limit cut it (Anthropic's order: each block stopped
+    /// before the next starts).
+    #[tokio::test]
+    async fn test_a_call_cut_off_mid_input_is_dropped_and_named() {
+        for reason in ["max_tokens", "model_context_window_exceeded"] {
+            let [start, input] = tool_at(1, "call_a", r#"{"a":"#);
+            let [delta, stop] = cut_off_end(reason);
+            let body = sse(&[text_at(0, "Adding."), stop_at(0), start, input, stop_at(1), delta, stop]);
+            let turn = run_against_mock_upstream(body, |_| {}).await.expect("a cut-off call doesn't fail the reply");
+            assert_eq!(turn.content, vec![text("Adding.")], "{reason}");
+            assert_eq!(turn.cut_off_call.as_deref(), Some("add"), "{reason}");
+            assert_eq!(turn.stop_reason, reason);
+            assert_eq!(turn.usage.output_tokens, 60);
+        }
+    }
+
+    /// llama.cpp's real stream for a reply cut inside a `write_file`
+    /// call: text and call both open, both stopped at the end, then
+    /// `max_tokens` (see `fixtures/README.md`).
+    #[tokio::test]
+    async fn test_llama_cpps_reply_cut_off_in_a_call_keeps_its_text() {
+        let mut deltas = Vec::new();
+        let turn = run_against_mock_upstream(LLAMA_CPP_CUT_OFF_STREAM, |d| deltas.push(d.to_string()))
+            .await
+            .expect("a cut-off call doesn't fail the reply");
+        let said = "I will write a short poem about rivers to a file.\n\n";
+        assert_eq!(deltas.concat(), said);
+        assert_eq!(turn.content, vec![text(said)]);
+        assert_eq!(turn.cut_off_call.as_deref(), Some("write_file"));
+        assert_eq!(turn.stop_reason, "max_tokens");
+        assert_eq!(turn.usage.output_tokens, 80);
+    }
+
+    /// The reply's last call is dropped when the reply was cut off even
+    /// if its input is empty (llama.cpp's start sent at EOF, Anthropic's
+    /// buffered parameter) or happens to parse; a whole call before it is
+    /// kept.
+    #[tokio::test]
+    async fn test_a_cut_off_replys_last_call_is_dropped_even_if_it_parses() {
+        let [start, _] = tool_at(0, "call_a", "");
+        let [delta, stop] = cut_off_end("max_tokens");
+        let turn = run_against_mock_upstream(sse(&[start, stop_at(0), delta, stop]), |_| {})
+            .await
+            .expect("an empty cut-off call doesn't fail the reply");
+        assert_eq!((turn.content, turn.cut_off_call.as_deref()), (vec![], Some("add")));
+
+        let [start_a, input_a] = tool_at(0, "call_a", r#"{"a":1}"#);
+        let [start_b, input_b] = tool_at(1, "call_b", r#"{"a":2}"#);
+        let [delta, stop] = cut_off_end("max_tokens");
+        let turn = run_against_mock_upstream(sse(&[start_a, input_a, start_b, input_b, delta, stop]), |_| {})
+            .await
+            .expect("a parsed cut-off call doesn't fail the reply");
+        assert_eq!(turn.content, vec![add_call("call_a", 1)]);
+        assert_eq!(turn.cut_off_call.as_deref(), Some("add"));
+    }
+
+    /// Only the reply's last block can be the cut one: an unparseable
+    /// call before it still fails, cut off or not; and a reply that
+    /// wasn't cut off, or was cut off in text, drops nothing.
+    #[tokio::test]
+    async fn test_only_a_cut_off_replys_last_call_is_forgiven() {
+        let [start, input] = tool_at(0, "call_a", r#"{"a":"#);
+        let [delta, stop] = cut_off_end("max_tokens");
+        let err = run_against_mock_upstream(sse(&[start, input, stop_at(0), text_at(1, "And"), delta, stop]), |_| {})
+            .await
+            .expect_err("a broken call that isn't last fails");
+        assert!(err.contains("failed to parse tool_use input JSON for add"), "{err}");
+
+        let [delta, stop] = cut_off_end("max_tokens");
+        let turn = run_against_mock_upstream(sse(&[text_at(0, "Half a tho"), delta, stop]), |_| {})
+            .await
+            .expect("stream should succeed");
+        assert_eq!((turn.content, turn.cut_off_call), (vec![text("Half a tho")], None));
+
+        let [start, input] = tool_at(0, "call_a", r#"{"a":1}"#);
+        let [delta, stop] = tool_use_end();
+        let turn = run_against_mock_upstream(sse(&[start, input, delta, stop]), |_| {})
+            .await
+            .expect("stream should succeed");
+        assert_eq!((turn.content, turn.cut_off_call), (vec![add_call("call_a", 1)], None));
+    }
+
     #[test]
     fn test_block_index_reads_the_events_index() {
         assert_eq!(block_index(&serde_json::json!({"type": "content_block_start", "index": 2})), Some(2));
@@ -1898,17 +2042,15 @@ mod tests {
     #[test]
     fn test_blocks_without_an_index_follow_one_another() {
         let mut blocks = Blocks::default();
-        blocks.thinking(None, "Hm".to_string()).expect("thinking");
+        blocks.thinking(None, "Hm".to_string());
         blocks.signature(None, "sig");
-        blocks.stop(None).expect("stop");
-        blocks.text(None, "A".to_string()).expect("text");
-        blocks.text(None, "B".to_string()).expect("text");
-        blocks
-            .start(None, PartialBlock::ToolUse { id: "t".to_string(), name: "add".to_string(), partial_json: String::new() })
-            .expect("start");
+        blocks.stop(None);
+        blocks.text(None, "A".to_string());
+        blocks.text(None, "B".to_string());
+        blocks.start(None, PartialBlock::ToolUse { id: "t".to_string(), name: "add".to_string(), partial_json: String::new() });
         blocks.tool_input(None, r#"{"a":1}"#);
         assert_eq!(
-            blocks.finish().expect("finish"),
+            blocks.finish("end_turn").expect("finish").0,
             vec![
                 ContentBlock::Thinking { thinking: "Hm".to_string(), signature: "sig".to_string() },
                 text("AB"),
@@ -1922,13 +2064,13 @@ mod tests {
     #[test]
     fn test_a_delta_after_its_blocks_stop_is_kept_after_it() {
         let mut blocks = Blocks::default();
-        blocks.text(Some(0), "first".to_string()).expect("text");
-        blocks.stop(Some(0)).expect("stop");
-        blocks.stop(Some(7)).expect("a stray stop is ignored");
-        blocks.text(Some(1), "second".to_string()).expect("text");
-        blocks.stop(Some(1)).expect("stop");
-        blocks.text(Some(0), "late".to_string()).expect("text");
-        assert_eq!(blocks.finish().expect("finish"), vec![text("first"), text("late"), text("second")]);
+        blocks.text(Some(0), "first".to_string());
+        blocks.stop(Some(0));
+        blocks.stop(Some(7));
+        blocks.text(Some(1), "second".to_string());
+        blocks.stop(Some(1));
+        blocks.text(Some(0), "late".to_string());
+        assert_eq!(blocks.finish("end_turn").expect("finish").0, vec![text("first"), text("late"), text("second")]);
     }
 
     /// A provider's index at `usize::MAX`, then an event without one, must
@@ -1936,10 +2078,10 @@ mod tests {
     #[test]
     fn test_a_block_at_the_largest_index_doesnt_overflow_the_next() {
         let mut blocks = Blocks::default();
-        blocks.text(Some(usize::MAX), "last".to_string()).expect("text");
-        blocks.thinking(None, "Hm".to_string()).expect("thinking");
+        blocks.text(Some(usize::MAX), "last".to_string());
+        blocks.thinking(None, "Hm".to_string());
         assert_eq!(
-            blocks.finish().expect("finish"),
+            blocks.finish("end_turn").expect("finish").0,
             vec![
                 text("last"),
                 ContentBlock::Thinking { thinking: "Hm".to_string(), signature: String::new() },
@@ -1954,17 +2096,17 @@ mod tests {
     fn test_a_tool_call_started_twice_stays_one_call() {
         let call = || PartialBlock::ToolUse { id: "t".to_string(), name: "add".to_string(), partial_json: String::new() };
         let mut empty = Blocks::default();
-        empty.start(Some(0), call()).expect("start");
-        empty.start(Some(0), call()).expect("start again");
+        empty.start(Some(0), call());
+        empty.start(Some(0), call());
         empty.tool_input(Some(0), r#"{"a":1}"#);
-        assert_eq!(empty.finish().expect("finish"), vec![add_call("t", 1)]);
+        assert_eq!(empty.finish("end_turn").expect("finish").0, vec![add_call("t", 1)]);
 
         let mut partial = Blocks::default();
-        partial.start(Some(0), call()).expect("start");
+        partial.start(Some(0), call());
         partial.tool_input(Some(0), "{");
-        partial.start(Some(0), call()).expect("start again");
+        partial.start(Some(0), call());
         partial.tool_input(Some(0), r#""a":1}"#);
-        assert_eq!(partial.finish().expect("finish"), vec![add_call("t", 1)]);
+        assert_eq!(partial.finish("end_turn").expect("finish").0, vec![add_call("t", 1)]);
     }
 
     /// A signature or tool input with no block of its kind open is
@@ -1974,10 +2116,10 @@ mod tests {
         let mut blocks = Blocks::default();
         blocks.signature(Some(0), "sig");
         blocks.tool_input(Some(0), "{}");
-        blocks.text(Some(1), "hi".to_string()).expect("text");
+        blocks.text(Some(1), "hi".to_string());
         blocks.signature(Some(1), "sig");
         blocks.tool_input(Some(1), "{}");
-        assert_eq!(blocks.finish().expect("finish"), vec![text("hi")]);
+        assert_eq!(blocks.finish("end_turn").expect("finish").0, vec![text("hi")]);
     }
 
     /// Regression test for SME-8's retrospective's hung
