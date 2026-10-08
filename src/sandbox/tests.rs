@@ -802,6 +802,39 @@ fn test_pod_startup_failure_reports_a_container_that_cannot_start() {
     assert!(failure.contains("Back-off pulling image"), "got {failure}");
 }
 
+/// The kubelet's own words for an image that isn't on the node, with
+/// `imagePullPolicy: Never`: the pod would wait out the whole running
+/// timeout, so it's a startup failure at once, naming the image and the
+/// command that builds it, which the model can't run itself (SME-121).
+const NEVER_PULL_MESSAGE: &str =
+    "Container image \"docker.io/library/smelt-sandbox:src-0123456789abcdef\" is not present with pull policy of Never";
+
+#[test]
+fn test_a_missing_image_is_a_startup_failure_that_says_how_to_build_it() {
+    let failure = pod_startup_failure(&pod_waiting("ErrImageNeverPull", NEVER_PULL_MESSAGE))
+        .expect("an image that isn't on the node is a startup failure");
+    assert!(failure.contains("smelt-sandbox:src-0123456789abcdef"), "names the image: {failure}");
+    assert!(failure.contains("scripts/build-sandbox-image.sh"), "says how to build it: {failure}");
+    assert!(failure.contains("tell the user"), "the model can't build it itself: {failure}");
+}
+
+/// The Docker sidecar is an init container, delivered by the same script:
+/// a missing `docker:29-dind` fails the same way.
+#[test]
+fn test_a_sidecar_whose_image_is_missing_is_a_startup_failure() {
+    let mut pod = pod_waiting("ErrImageNeverPull", NEVER_PULL_MESSAGE);
+    let status = pod.status.as_mut().expect("status");
+    status.init_container_statuses = status.container_statuses.take();
+    let failure = pod_startup_failure(&pod).expect("a sidecar that can't start is a startup failure");
+    assert!(failure.contains("scripts/build-sandbox-image.sh"), "{failure}");
+
+    // A sidecar crashing while it starts is left to its own restarts.
+    let mut crashing = pod_waiting("CrashLoopBackOff", "back-off restarting failed container");
+    let status = crashing.status.as_mut().expect("status");
+    status.init_container_statuses = status.container_statuses.take();
+    assert_eq!(pod_startup_failure(&crashing), None);
+}
+
 /// What a pod waiting on a volume claim that doesn't exist actually
 /// reports (seen on this cluster): no container status yet, just an
 /// unschedulable `PodScheduled` condition.

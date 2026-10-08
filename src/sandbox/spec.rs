@@ -55,7 +55,7 @@ pub(super) fn pod_pending_detail(pod: &Pod) -> Option<String> {
 /// Container waiting states that never resolve on their own — once a pod's
 /// container is in one of these, waiting for `Running` only ends in a
 /// timeout that hides the reason.
-pub(super) const FATAL_WAITING_REASONS: [&str; 7] = [
+pub(super) const FATAL_WAITING_REASONS: [&str; 8] = [
     "CreateContainerError",
     "CreateContainerConfigError",
     "RunContainerError",
@@ -63,20 +63,42 @@ pub(super) const FATAL_WAITING_REASONS: [&str; 7] = [
     "ImagePullBackOff",
     "InvalidImageName",
     "CrashLoopBackOff",
+    // `imagePullPolicy: Never` and the image isn't on the node: never
+    // built for these sources, or deleted by the kubelet (SME-121).
+    "ErrImageNeverPull",
 ];
 
+/// What to do about `ErrImageNeverPull`. Sandbox pods' images are delivered
+/// into the node by `scripts/build-sandbox-image.sh` on smelt's host, which
+/// the model can't run, so it says so rather than retrying.
+const IMAGE_NEVER_PULL_ADVICE: &str = "The cluster's node doesn't have this image, and sandbox pods never pull \
+     one: it's built on smelt's host with scripts/build-sandbox-image.sh (from the checkout smelt runs \
+     from), which can't be run from a sandbox. Don't retry create_pod: tell the user to run that script.";
+
+/// The fatal reasons that are about the image, which no restart fixes.
+/// Only these count for an init container (the Docker sidecar): a sidecar
+/// that crashes while starting is left to its own restarts, as before.
+const IMAGE_WAITING_REASONS: [&str; 4] = ["ErrImagePull", "ImagePullBackOff", "InvalidImageName", "ErrImageNeverPull"];
+
 /// Why `pod` can't start, if one of its containers is stuck in a state that
-/// won't recover (see `FATAL_WAITING_REASONS`); `None` while it's still
-/// starting normally.
+/// won't recover (see `FATAL_WAITING_REASONS`), or its Docker sidecar (an
+/// init container) has no image; `None` while it's still starting normally.
 pub(super) fn pod_startup_failure(pod: &Pod) -> Option<String> {
-    let statuses = pod.status.as_ref()?.container_statuses.as_ref()?;
-    statuses.iter().find_map(|status| {
+    let status = pod.status.as_ref()?;
+    let init = status.init_container_statuses.iter().flatten().map(|s| (s, &IMAGE_WAITING_REASONS[..]));
+    let main = status.container_statuses.iter().flatten().map(|s| (s, &FATAL_WAITING_REASONS[..]));
+    init.chain(main).find_map(|(status, fatal)| {
         let waiting = status.state.as_ref()?.waiting.as_ref()?;
         let reason = waiting.reason.as_deref()?;
-        FATAL_WAITING_REASONS.contains(&reason).then(|| {
-            match waiting.message.as_deref().filter(|m| !m.is_empty()) {
+        fatal.contains(&reason).then(|| {
+            let failure = match waiting.message.as_deref().filter(|m| !m.is_empty()) {
                 Some(message) => format!("{reason}: {message}"),
                 None => reason.to_string(),
+            };
+            if reason == "ErrImageNeverPull" {
+                format!("{failure}. {IMAGE_NEVER_PULL_ADVICE}")
+            } else {
+                failure
             }
         })
     })
