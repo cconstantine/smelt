@@ -172,16 +172,41 @@ pub struct OutputConfig {
     pub effort: Effort,
 }
 
-/// `{"type": "adaptive"}` — the model manages its own thinking budget
-/// within `max_tokens` rather than a caller-specified `budget_tokens`
-/// (deprecated on current models). The only variant smelt sends; kept as
-/// an enum rather than a bare string so an unsupported value can't be
-/// constructed by mistake.
+/// `chat_template_kwargs`: settings a llama.cpp server passes to the
+/// model's chat template through its Anthropic endpoint (SME-111). Each is
+/// left out when unset, leaving the template's own default.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ChatTemplateKwargs {
+    /// `false` turns the template's reasoning off; llama.cpp reads it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<Effort>,
+    /// Whether earlier turns' reasoning is rendered into the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserve_thinking: Option<bool>,
+}
+
+#[cfg(feature = "server")]
+impl ChatTemplateKwargs {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `thinking`: `{"type": "adaptive"}`, the model managing its own thinking
+/// within `max_tokens`, for every kind but llama.cpp; Anthropic refuses
+/// `budget_tokens` on current models. `{"type": "enabled", "budget_tokens":
+/// N}` for llama.cpp only, which forces the end of thinking at N tokens
+/// (SME-111). An enum rather than a bare string so an unsupported value
+/// can't be constructed by mistake.
 #[cfg(feature = "server")]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThinkingConfig {
     Adaptive,
+    Enabled { budget_tokens: u32 },
 }
 
 #[cfg(feature = "server")]
@@ -199,6 +224,9 @@ pub struct CreateMessageRequest {
     pub thinking: Option<ThinkingConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_config: Option<OutputConfig>,
+    /// For a llama.cpp provider only (SME-111).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
     /// Mark the request for prompt caching (SME-106); see `to_body`. Not a
     /// wire field itself.
     #[serde(skip)]
@@ -356,6 +384,14 @@ mod tests {
     }
 
     #[test]
+    fn test_an_enabled_thinking_budget_wire_shape() {
+        assert_eq!(
+            serde_json::to_value(ThinkingConfig::Enabled { budget_tokens: 98_304 }).unwrap(),
+            serde_json::json!({"type": "enabled", "budget_tokens": 98_304})
+        );
+    }
+
+    #[test]
     fn test_request_omits_thinking_when_none() {
         let req = CreateMessageRequest {
             model: "claude-opus-4-8".to_string(),
@@ -367,6 +403,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             output_config: None,
+            chat_template_kwargs: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert!(
@@ -387,6 +424,7 @@ mod tests {
             thinking: Some(ThinkingConfig::Adaptive),
             prompt_caching: false,
             output_config: None,
+            chat_template_kwargs: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -462,6 +500,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             output_config: None,
+            chat_template_kwargs: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert!(
@@ -499,6 +538,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             output_config: None,
+            chat_template_kwargs: None,
         };
         let value = serde_json::to_value(&req).unwrap();
         assert!(
@@ -518,6 +558,7 @@ mod tests {
             thinking: None,
             prompt_caching,
             output_config: None,
+            chat_template_kwargs: None,
         }
     }
 
@@ -532,6 +573,29 @@ mod tests {
             assert_eq!(serde_json::to_value(effort).expect("encodes"), serde_json::json!(effort.as_str()));
         }
         assert_eq!(Effort::parse("extreme"), None);
+    }
+
+    /// SME-111: llama.cpp's template settings go in `chat_template_kwargs`,
+    /// each left out when unset, and the whole object when none is set.
+    #[test]
+    fn test_template_kwargs_are_sent_only_when_set() {
+        let mut request = caching_request(false);
+        assert!(request.to_body().expect("encodes").get("chat_template_kwargs").is_none());
+        request.chat_template_kwargs = Some(ChatTemplateKwargs {
+            enable_thinking: None,
+            reasoning_effort: Some(Effort::Medium),
+            preserve_thinking: Some(false),
+        });
+        assert_eq!(
+            request.to_body().expect("encodes")["chat_template_kwargs"],
+            serde_json::json!({"reasoning_effort": "medium", "preserve_thinking": false})
+        );
+        request.chat_template_kwargs = Some(ChatTemplateKwargs { enable_thinking: Some(false), ..Default::default() });
+        assert_eq!(
+            request.to_body().expect("encodes")["chat_template_kwargs"],
+            serde_json::json!({"enable_thinking": false})
+        );
+        assert!(ChatTemplateKwargs::default().is_empty());
     }
 
     #[test]

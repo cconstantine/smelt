@@ -459,9 +459,70 @@ fn test_should_compact_false_comfortably_under_ceiling() {
 
 #[test]
 fn test_should_compact_true_when_projected_crosses_reserved_ceiling() {
-    // ceiling = 200_000 - max(MAX_TOKENS, COMPACTION_SAFETY_BUFFER) = 183_616
+    // ceiling = 200_000 - max(MIN_REPLY_TOKENS, COMPACTION_SAFETY_BUFFER) = 183_616
     let last = usage(183_000, 0, 0, 0);
     assert!(should_compact(Some(&last), 1_000, 200_000));
+}
+
+/// SME-111: the reply budget is the smallest of the model's cap, the room
+/// left and half the window, never below what every turn asked for.
+#[test]
+fn test_the_reply_budget_grows_with_the_room_left() {
+    // The user's llama.cpp model at the start of a conversation.
+    assert_eq!(reply_budget(262_144, 35_000, None).tokens, 131_072, "half the window");
+    // A model whose output cap is the smallest.
+    assert_eq!(reply_budget(1_000_000, 35_000, Some(128_000)).tokens, 128_000);
+    assert_eq!(reply_budget(200_000, 35_000, Some(16_384)).tokens, 16_384, "an unknown Claude cap");
+    // Room left is the smallest: the request must fit.
+    assert_eq!(reply_budget(262_144, 220_000, None).tokens, 262_144 - 220_000 - COMPACTION_SAFETY_BUFFER);
+    // Less room than the floor: what every turn asked for before.
+    assert_eq!(reply_budget(262_144, 250_000, None).tokens, MIN_REPLY_TOKENS);
+    assert_eq!(reply_budget(262_144, 400_000, None).tokens, MIN_REPLY_TOKENS, "past the window");
+    // A small window: at most half of it.
+    assert_eq!(reply_budget(4_096, 1_000, None).tokens, 2_048);
+    assert_eq!(reply_budget(4_096, 1_000, Some(1_024)).tokens, 1_024, "the cap wins over the floor");
+    assert_eq!(reply_budget(0, 0, None).tokens, 1, "never zero, which the API refuses");
+}
+
+/// SME-111: a budget says what bound it, for a cut-off notice.
+#[test]
+fn test_the_reply_budget_says_what_bound_it() {
+    use crate::api::chat::ReplyLimit;
+    assert_eq!(reply_budget(262_144, 35_000, None).limit, ReplyLimit::HalfWindow);
+    assert_eq!(reply_budget(1_000_000, 35_000, Some(128_000)).limit, ReplyLimit::OutputCap);
+    assert_eq!(reply_budget(262_144, 220_000, None).limit, ReplyLimit::RoomLeft);
+    assert_eq!(reply_budget(262_144, 250_000, None).limit, ReplyLimit::RoomLeft, "the floor: nearly full");
+    assert_eq!(reply_budget(262_144, 250_000, Some(8_192)).limit, ReplyLimit::OutputCap);
+    assert_eq!(reply_budget(4_096, 1_000, None).limit, ReplyLimit::HalfWindow);
+}
+
+#[test]
+fn test_a_requests_estimate_counts_its_messages_system_and_tools() {
+    let request = anthropic::CreateMessageRequest {
+        model: "m".to_string(),
+        max_tokens: 1,
+        system: Some("s".repeat(400)),
+        messages: vec![anthropic::AnthropicMessage { role: "user".to_string(), content: vec![text_block(&"a".repeat(800))] }],
+        stream: true,
+        tools: vec![anthropic::ToolDefinition {
+            name: "t".repeat(20),
+            description: "d".repeat(380),
+            input_schema: serde_json::json!({}),
+        }],
+        thinking: None,
+        output_config: None,
+        chat_template_kwargs: None,
+        prompt_caching: false,
+    };
+    let tools = serde_json::to_string(&request.tools).expect("tools encode").len() as u64 / 4;
+    assert_eq!(estimate_request_tokens(&request), 100 + 200 + tools);
+    assert!(tools >= 100);
+}
+
+#[test]
+fn test_projected_input_needs_a_measured_usage() {
+    assert_eq!(projected_input(None, 500), None);
+    assert_eq!(projected_input(Some(&usage(1_000, 200, 30, 4_000)), 500), Some(5_730));
 }
 
 #[test]
@@ -800,6 +861,7 @@ async fn test_a_bearer_providers_turn_sends_its_token_as_a_bearer_header(pool: P
         "hf-token",
         false,
         None,
+        true,
     )
     .await
     .expect("create provider");
@@ -1586,6 +1648,330 @@ async fn test_a_models_effort_is_sent_on_its_turns(pool: PgPool) {
     assert_eq!(requests.len(), 2);
     assert!(requests[0].get("output_config").is_none(), "unset sends none: {}", requests[0]);
     assert_eq!(requests[1]["output_config"], serde_json::json!({"effort": "low"}));
+}
+
+/// SME-111: a llama.cpp provider's turn tells the chat template its
+/// settings in `chat_template_kwargs`, never as `output_config`, and its
+/// compaction turns the template's reasoning off.
+#[sqlx::test]
+async fn test_a_llama_cpp_turn_sends_template_settings_and_compaction_turns_thinking_off(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    db::create_message(
+        &pool,
+        conversation.id,
+        "user",
+        &[anthropic::ContentBlock::Text { text: "earlier message".to_string() }],
+    )
+    .await
+    .expect("seed earlier message");
+    db::upsert_conversation_usage(
+        &pool,
+        conversation.id,
+        &anthropic::TokenUsage { input_tokens: 190_000, ..Default::default() },
+    )
+    .await
+    .expect("seed usage");
+    let requests = start_recording_mock_upstream(&pool, vec![
+        text_reply_body("Summary: nothing live."),
+        text_reply_body("Hi"),
+    ])
+    .await;
+    sqlx::query(
+        "UPDATE inference_providers SET kind = 'llama_cpp', keep_reasoning = false,
+         server_caps = '{\"template_caps\": {\"supports_reasoning_effort\": true, \"supports_preserve_reasoning\": true}}'",
+    )
+    .execute(&pool)
+    .await
+    .expect("make the mock a llama.cpp server");
+    sqlx::query("INSERT INTO provider_models (provider_id, model, effort) SELECT id, $1, 'high' FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .execute(&pool)
+        .await
+        .expect("set the mock model's effort");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("turn");
+
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests.len(), 2, "a compaction call, then the real turn");
+    assert_eq!(
+        requests[0]["chat_template_kwargs"],
+        serde_json::json!({"enable_thinking": false, "preserve_thinking": false}),
+        "the summary isn't spent on reasoning: {}",
+        requests[0]
+    );
+    assert_eq!(
+        requests[1]["chat_template_kwargs"],
+        serde_json::json!({"reasoning_effort": "high", "preserve_thinking": false})
+    );
+    assert!(requests[1].get("output_config").is_none(), "{}", requests[1]);
+}
+
+/// SME-111: a turn asks for a reply as long as the conversation has room
+/// for: half a llama.cpp model's window at the start, and after a
+/// compaction the new, smaller history's room, not the old one's.
+#[sqlx::test]
+async fn test_a_turns_reply_budget_grows_with_the_room_left(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    db::create_message(
+        &pool,
+        conversation.id,
+        "user",
+        &[anthropic::ContentBlock::Text { text: "earlier message".to_string() }],
+    )
+    .await
+    .expect("seed earlier message");
+    db::upsert_conversation_usage(
+        &pool,
+        conversation.id,
+        &anthropic::TokenUsage { input_tokens: 250_000, ..Default::default() },
+    )
+    .await
+    .expect("seed usage near the window");
+    let requests = start_recording_mock_upstream(&pool, vec![
+        text_reply_body("Summary: nothing live."),
+        with_usage(&text_reply_body("Hi"), 40_000, 0, 10),
+        text_reply_body("Again"),
+    ])
+    .await;
+    sqlx::query("UPDATE inference_providers SET kind = 'llama_cpp'")
+        .execute(&pool)
+        .await
+        .expect("make the mock a llama.cpp server");
+    sqlx::query("INSERT INTO provider_models (provider_id, model, reported_context_window) SELECT id, $1, 262144 FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .execute(&pool)
+        .await
+        .expect("size the mock model");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("first turn");
+    run_turn(&pool, conversation.id, hello()).await.expect("second turn");
+
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests.len(), 3, "a compaction, then two turns");
+    assert_eq!(requests[0]["max_tokens"], 2048, "the summary's own");
+    assert_eq!(requests[1]["max_tokens"], 131_072, "half the window, after compacting: {}", requests[1]["max_tokens"]);
+    // 262,144 - (40,010 measured + "hello") - 4,096 of headroom.
+    let second = requests[2]["max_tokens"].as_u64().expect("a number");
+    assert!((131_072 - 1..=131_072).contains(&second), "still half the window: {second}");
+}
+
+/// SME-111: the user's "Max reply tokens" caps a turn's reply budget.
+#[sqlx::test]
+async fn test_a_models_max_reply_tokens_caps_its_turns(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
+    sqlx::query("UPDATE inference_providers SET kind = 'llama_cpp'")
+        .execute(&pool)
+        .await
+        .expect("make the mock a llama.cpp server");
+    sqlx::query("INSERT INTO provider_models (provider_id, model, reported_context_window, max_output) SELECT id, $1, 262144, 8192 FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .execute(&pool)
+        .await
+        .expect("cap the mock model");
+    run_turn(&pool, conversation.id, hello()).await.expect("turn");
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests[0]["max_tokens"], 8192);
+}
+
+/// SME-111: a llama.cpp model's turn caps its thinking at three quarters
+/// of the reply budget, or the model's reasoning budget; an Anthropic
+/// one's thinking stays adaptive.
+#[sqlx::test]
+async fn test_a_llama_cpp_turn_sends_a_thinking_budget(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("on Anthropic");
+    sqlx::query("UPDATE inference_providers SET kind = 'llama_cpp'")
+        .execute(&pool)
+        .await
+        .expect("make the mock a llama.cpp server");
+    sqlx::query("INSERT INTO provider_models (provider_id, model, reported_context_window) SELECT id, $1, 262144 FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .execute(&pool)
+        .await
+        .expect("size the mock model");
+    run_turn(&pool, conversation.id, hello()).await.expect("automatic budget");
+    sqlx::query("UPDATE provider_models SET reasoning_budget = 20000")
+        .execute(&pool)
+        .await
+        .expect("cap its reasoning");
+    run_turn(&pool, conversation.id, hello()).await.expect("capped budget");
+    sqlx::query("UPDATE provider_models SET thinking = false")
+        .execute(&pool)
+        .await
+        .expect("thinking off");
+    run_turn(&pool, conversation.id, hello()).await.expect("thinking off");
+
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests[0]["thinking"], serde_json::json!({"type": "adaptive"}));
+    let budget = requests[1]["max_tokens"].as_u64().expect("a number");
+    assert_eq!(
+        requests[1]["thinking"],
+        serde_json::json!({"type": "enabled", "budget_tokens": budget * 3 / 4}),
+        "three quarters of {budget}"
+    );
+    assert_eq!(requests[2]["thinking"], serde_json::json!({"type": "enabled", "budget_tokens": 20000}));
+    assert!(requests[3].get("thinking").is_none(), "{}", requests[3]);
+    assert_eq!(requests[3]["chat_template_kwargs"], serde_json::json!({"enable_thinking": false}));
+}
+
+fn cut_off_reply_body(text: &str) -> String {
+    text_reply_body(text).replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"max_tokens""#)
+}
+
+/// SME-111: a reply that hits its `max_tokens` is kept, followed by a
+/// notice every tab gets live, naming the limit and what bound it; a
+/// reply that finishes gets none.
+#[sqlx::test]
+async fn test_a_cut_off_reply_is_followed_by_a_notice(pool: PgPool) {
+    use crate::api::chat::{ReplyLimit, cut_off_notice};
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![cut_off_reply_body("Half a tho"), text_reply_body("Done.")]).await;
+    let mut events = crate::events::subscribe(conversation.id);
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("a cut-off turn still succeeds");
+
+    let notice = cut_off_notice(16_384, ReplyLimit::OutputCap);
+    let texts: Vec<(String, String)> = saved
+        .iter()
+        .map(|m| (m.role.clone(), m.content.clone()))
+        .collect();
+    assert_eq!(texts.len(), 3, "the message, the reply and the notice: {texts:?}");
+    assert!(texts[1].1.contains("Half a tho"), "the reply is kept: {texts:?}");
+    assert_eq!(texts[2].0, "user");
+    let notice_text = match saved[2].blocks().expect("blocks").as_slice() {
+        [anthropic::ContentBlock::Text { text }] => text.clone(),
+        other => panic!("one text block: {other:?}"),
+    };
+    assert_eq!(notice_text, notice);
+    assert_eq!(
+        crate::api::chat::parse_cut_off_notice(&notice_text),
+        Some((16_384, ReplyLimit::OutputCap)),
+        "an unsized Anthropic model's cap bound it"
+    );
+    let mut published = false;
+    while let Ok(event) = events.try_recv() {
+        if let crate::events::ConversationEvent::MessagesAppended { messages } = event {
+            published |= messages.iter().any(|m| m.id == saved[2].id);
+        }
+    }
+    assert!(published, "every tab is told");
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("a finished turn");
+    assert_eq!(saved.len(), 2, "no notice after a finished reply");
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests[0]["max_tokens"], 16_384);
+}
+
+/// SME-111 review 2: a reply bound by an Anthropic model's own reported
+/// cap, which "Max reply tokens" can't raise, says it's the model's own
+/// maximum rather than telling the user to raise the setting.
+#[sqlx::test]
+async fn test_a_reply_at_the_models_own_cap_doesnt_say_raise_it(pool: PgPool) {
+    use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    start_recording_mock_upstream(&pool, vec![cut_off_reply_body("Half a tho")]).await;
+    sqlx::query("INSERT INTO provider_models (provider_id, model, reported_max_output, max_output) SELECT id, $1, 8192, 64000 FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .execute(&pool)
+        .await
+        .expect("a reported cap below the user's");
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("turn");
+
+    let notice = match saved[2].blocks().expect("blocks").as_slice() {
+        [anthropic::ContentBlock::Text { text }] => text.clone(),
+        other => panic!("one text block: {other:?}"),
+    };
+    assert_eq!(parse_cut_off_notice(&notice), Some((8_192, ReplyLimit::ModelMaximum)));
+}
+
+/// SME-111 review 1: a reply the context window stopped
+/// (`model_context_window_exceeded`, Claude 4.5+) is cut off too, and the
+/// notice says the conversation ran out of room, whatever bound the budget.
+#[sqlx::test]
+async fn test_a_reply_the_window_stopped_gets_a_room_left_notice(pool: PgPool) {
+    use crate::api::chat::{ReplyLimit, parse_cut_off_notice};
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    // Stopped by the window after 9,000 tokens, well short of its budget.
+    let body = with_usage(&text_reply_body("Half a tho"), 100, 0, 9_000)
+        .replace(r#""stop_reason":"end_turn""#, r#""stop_reason":"model_context_window_exceeded""#);
+    start_recording_mock_upstream(&pool, vec![body]).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("the turn still succeeds");
+
+    assert_eq!(saved.len(), 3, "the message, the reply and a notice: {saved:?}");
+    let notice = match saved[2].blocks().expect("blocks").as_slice() {
+        [anthropic::ContentBlock::Text { text }] => text.clone(),
+        other => panic!("one text block: {other:?}"),
+    };
+    assert_eq!(
+        parse_cut_off_notice(&notice),
+        Some((9_000, ReplyLimit::RoomLeft)),
+        "what it wrote, not the budget it didn't reach (review 2)"
+    );
+}
+
+/// SME-111 review 1: a llama.cpp reply budget too small to think in
+/// (4,096 or less) turns thinking off, said plainly, instead of sending a
+/// reasoning budget of 0 while thinking is on.
+#[sqlx::test]
+async fn test_a_reply_budget_too_small_to_think_in_turns_thinking_off(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
+    sqlx::query("UPDATE inference_providers SET kind = 'llama_cpp'")
+        .execute(&pool)
+        .await
+        .expect("make the mock a llama.cpp server");
+    sqlx::query("INSERT INTO provider_models (provider_id, model, reported_context_window, max_output) SELECT id, $1, 262144, 4096 FROM inference_providers")
+        .bind(crate::providers::test_support::MOCK_MODEL)
+        .execute(&pool)
+        .await
+        .expect("a small reply cap");
+    run_turn(&pool, conversation.id, hello()).await.expect("turn");
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests[0]["max_tokens"], 4096);
+    assert!(requests[0].get("thinking").is_none(), "{}", requests[0]);
+    assert_eq!(requests[0]["chat_template_kwargs"], serde_json::json!({"enable_thinking": false}));
+}
+
+/// A model on an Anthropic provider that nothing sized keeps the reply
+/// budget every turn had: a Claude model refuses one above its own cap.
+#[sqlx::test]
+async fn test_an_unsized_anthropic_models_reply_budget_stays_as_it_was(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Hi!")]).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("turn");
+    let requests = requests.lock().expect("the request log");
+    assert_eq!(requests[0]["max_tokens"], 16_384);
 }
 
 /// The detail view shows exactly the system prompt a turn sends.
@@ -2962,7 +3348,7 @@ async fn test_run_turn_compacts_before_sending_when_usage_is_near_the_ceiling(po
 
     // A prior turn's persisted message plus usage close enough to the
     // reserved ceiling (200_000 - 16_384 = 183_616 for the default
-    // "claude-opus-4-8" model — see `context_window_for`/`MAX_TOKENS`)
+    // "claude-opus-4-8" model — see `context_window_for`/`MIN_REPLY_TOKENS`)
     // that the very next turn must compact before sending, regardless
     // of how small the new message's own estimate is.
     db::create_message(

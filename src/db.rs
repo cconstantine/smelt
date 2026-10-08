@@ -2052,6 +2052,10 @@ pub struct InferenceProvider {
     pub prompt_caching: bool,
     /// The models.dev provider that prices its calls (SME-106).
     pub price_catalog_provider: Option<String>,
+    /// llama.cpp only: send the template's `preserve_thinking` (SME-111).
+    pub keep_reasoning: bool,
+    /// llama.cpp only: its `/props`, as `providers::LlamaServerInfo`.
+    pub server_caps: Option<serde_json::Value>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -2067,6 +2071,8 @@ impl std::fmt::Debug for InferenceProvider {
             .field("auth_kind", &self.auth_kind)
             .field("prompt_caching", &self.prompt_caching)
             .field("price_catalog_provider", &self.price_catalog_provider)
+            .field("keep_reasoning", &self.keep_reasoning)
+            .field("server_caps", &self.server_caps)
             .field("secret", &"..")
             .finish_non_exhaustive()
     }
@@ -2081,10 +2087,11 @@ pub async fn create_inference_provider(
     secret: &str,
     prompt_caching: bool,
     price_catalog_provider: Option<&str>,
+    keep_reasoning: bool,
 ) -> Result<InferenceProvider, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
-        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret, prompt_caching, price_catalog_provider)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
+        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret, prompt_caching, price_catalog_provider, keep_reasoning)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *",
     )
     .bind(name)
     .bind(kind)
@@ -2093,6 +2100,7 @@ pub async fn create_inference_provider(
     .bind(secret)
     .bind(prompt_caching)
     .bind(price_catalog_provider)
+    .bind(keep_reasoning)
     .fetch_one(pool)
     .await
 }
@@ -2125,11 +2133,15 @@ pub async fn update_inference_provider(
     secret: Option<&str>,
     prompt_caching: bool,
     price_catalog_provider: Option<&str>,
+    keep_reasoning: bool,
 ) -> Result<Option<InferenceProvider>, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
         "UPDATE inference_providers
          SET name = $2, kind = $3, base_url = $4, auth_kind = $5,
              secret = COALESCE($6, secret), prompt_caching = $7, price_catalog_provider = $8,
+             keep_reasoning = $9,
+             -- Another server's caps don't describe this one (SME-111 review 2).
+             server_caps = CASE WHEN kind = $3 AND base_url = $4 THEN server_caps END,
              updated_at = now()
          WHERE id = $1 RETURNING *",
     )
@@ -2141,8 +2153,23 @@ pub async fn update_inference_provider(
     .bind(secret)
     .bind(prompt_caching)
     .bind(price_catalog_provider)
+    .bind(keep_reasoning)
     .fetch_optional(pool)
     .await
+}
+
+/// Keeps what a llama.cpp server last said about itself (SME-111).
+pub async fn set_inference_provider_server_caps(
+    pool: &PgPool,
+    id: i64,
+    server_caps: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE inference_providers SET server_caps = $2 WHERE id = $1")
+        .bind(id)
+        .bind(server_caps)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Deletes a provider, first clearing it as the default and from every
@@ -2185,6 +2212,12 @@ pub struct ProviderModelRow {
     pub reported_tools: Option<bool>,
     /// The user's effort, `anthropic::Effort` as text (SME-106).
     pub effort: Option<String>,
+    /// The user's cap on a reply (SME-111).
+    pub max_output: Option<i32>,
+    /// The provider's cap on a reply, as last reported.
+    pub reported_max_output: Option<i32>,
+    /// The user's cap on a reply's thinking, llama.cpp only (SME-111).
+    pub reasoning_budget: Option<i32>,
     /// Added on the provider's page as a model its listing doesn't show,
     /// so it's shown even when the listing works and lacks it.
     pub added_by_hand: bool,
@@ -2239,18 +2272,22 @@ pub async fn set_provider_model_overrides(
     thinking: Option<bool>,
     context_window: Option<i32>,
     effort: Option<&str>,
+    max_output: Option<i32>,
+    reasoning_budget: Option<i32>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO provider_models (provider_id, model, thinking, context_window, effort)
-         VALUES ($1, $2, $3, $4, $5)
+        "INSERT INTO provider_models (provider_id, model, thinking, context_window, effort, max_output, reasoning_budget)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (provider_id, model) DO UPDATE
-         SET thinking = $3, context_window = $4, effort = $5",
+         SET thinking = $3, context_window = $4, effort = $5, max_output = $6, reasoning_budget = $7",
     )
     .bind(provider_id)
     .bind(model)
     .bind(thinking)
     .bind(context_window)
     .bind(effort)
+    .bind(max_output)
+    .bind(reasoning_budget)
     .execute(pool)
     .await?;
     Ok(())
@@ -2258,7 +2295,8 @@ pub async fn set_provider_model_overrides(
 
 /// Replaces what the provider reported about a model, leaving the user's
 /// overrides alone. A report without a context window keeps the last one:
-/// Ollama only says while the model is loaded.
+/// Ollama only says while the model is loaded. The same goes for a reply
+/// cap (SME-111).
 pub async fn set_provider_model_reported(
     pool: &PgPool,
     provider_id: i64,
@@ -2266,20 +2304,23 @@ pub async fn set_provider_model_reported(
     context_window: Option<i32>,
     thinking: Option<bool>,
     tools: Option<bool>,
+    max_output: Option<i32>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO provider_models
-             (provider_id, model, reported_context_window, reported_thinking, reported_tools)
-         VALUES ($1, $2, $3, $4, $5)
+             (provider_id, model, reported_context_window, reported_thinking, reported_tools, reported_max_output)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (provider_id, model) DO UPDATE
          SET reported_context_window = COALESCE($3, provider_models.reported_context_window),
-             reported_thinking = $4, reported_tools = $5",
+             reported_thinking = $4, reported_tools = $5,
+             reported_max_output = COALESCE($6, provider_models.reported_max_output)",
     )
     .bind(provider_id)
     .bind(model)
     .bind(context_window)
     .bind(thinking)
     .bind(tools)
+    .bind(max_output)
     .execute(pool)
     .await?;
     Ok(())
@@ -4257,7 +4298,7 @@ mod tests {
     // --- Model providers (SME-72) ---
 
     async fn test_provider(pool: &PgPool, name: &str) -> InferenceProvider {
-        create_inference_provider(pool, name, "anthropic", "https://api.anthropic.com", "api_key", "sk-ant-0123456789", false, None)
+        create_inference_provider(pool, name, "anthropic", "https://api.anthropic.com", "api_key", "sk-ant-0123456789", false, None, true)
             .await
             .expect("create provider")
     }
@@ -4491,7 +4532,7 @@ mod tests {
         let created = test_provider(&pool, "anthropic").await;
         assert_eq!(list_inference_providers(&pool).await.expect("list"), vec![created.clone()]);
 
-        let renamed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", None, false, None)
+        let renamed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", None, false, None, true)
             .await
             .expect("update")
             .expect("exists");
@@ -4501,7 +4542,7 @@ mod tests {
         );
         assert_eq!(renamed.secret, "sk-ant-0123456789", "no new secret keeps the stored one");
 
-        let rekeyed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", Some("new-secret"), true, Some("anthropic"))
+        let rekeyed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", Some("new-secret"), true, Some("anthropic"), true)
             .await
             .expect("update")
             .expect("exists");
@@ -4513,9 +4554,35 @@ mod tests {
         );
 
         assert_eq!(
-            update_inference_provider(&pool, 999_999, "x", "other", "u", "bearer", None, false, None).await.expect("update"),
+            update_inference_provider(&pool, 999_999, "x", "other", "u", "bearer", None, false, None, true).await.expect("update"),
             None
         );
+    }
+
+    /// SME-111 review 2: what a llama.cpp server said about itself goes
+    /// when the provider points at another address or becomes another
+    /// kind, so a turn never sends settings for the old server's template.
+    #[sqlx::test]
+    async fn test_a_providers_server_caps_go_when_its_address_or_kind_changes(pool: PgPool) {
+        let caps = serde_json::json!({"template_caps": {"supports_reasoning_effort": true}});
+        let p = create_inference_provider(&pool, "llama", "llama_cpp", "http://one", "bearer", "k", false, None, true)
+            .await
+            .expect("create");
+        let caps_after = |name: &'static str, kind: &'static str, url: &'static str| {
+            let pool = pool.clone();
+            let caps = caps.clone();
+            async move {
+                set_inference_provider_server_caps(&pool, p.id, &caps).await.expect("caps");
+                update_inference_provider(&pool, p.id, name, kind, url, "bearer", None, false, None, false)
+                    .await
+                    .expect("update")
+                    .expect("exists")
+                    .server_caps
+            }
+        };
+        assert_eq!(caps_after("renamed", "llama_cpp", "http://one").await, Some(caps.clone()), "same server");
+        assert_eq!(caps_after("renamed", "llama_cpp", "http://two").await, None, "another address");
+        assert_eq!(caps_after("renamed", "other", "http://two").await, None, "another kind");
     }
 
     #[sqlx::test]
@@ -4637,18 +4704,19 @@ mod tests {
     #[sqlx::test]
     async fn test_a_report_without_a_window_keeps_the_last_one(pool: PgPool) {
         let provider = test_provider(&pool, "p").await;
-        set_provider_model_reported(&pool, provider.id, "m", Some(8192), Some(true), Some(true)).await.expect("loaded");
-        set_provider_model_reported(&pool, provider.id, "m", None, Some(false), Some(true)).await.expect("unloaded");
+        set_provider_model_reported(&pool, provider.id, "m", Some(8192), Some(true), Some(true), Some(4096)).await.expect("loaded");
+        set_provider_model_reported(&pool, provider.id, "m", None, Some(false), Some(true), None).await.expect("unloaded");
         let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
         assert_eq!((row.reported_context_window, row.reported_thinking), (Some(8192), Some(false)));
+        assert_eq!(row.reported_max_output, Some(4096), "kept like the window (SME-111)");
     }
 
     #[sqlx::test]
     async fn test_model_overrides_and_reported_details_leave_each_other_alone(pool: PgPool) {
         let provider = test_provider(&pool, "p").await;
-        set_provider_model_reported(&pool, provider.id, "m", Some(4096), Some(false), Some(true)).await.expect("reported");
-        set_provider_model_overrides(&pool, provider.id, "m", Some(true), Some(32_768), None).await.expect("overrides");
-        set_provider_model_reported(&pool, provider.id, "m", Some(8192), None, Some(true)).await.expect("reported");
+        set_provider_model_reported(&pool, provider.id, "m", Some(4096), Some(false), Some(true), Some(1024)).await.expect("reported");
+        set_provider_model_overrides(&pool, provider.id, "m", Some(true), Some(32_768), None, Some(2048), Some(1024)).await.expect("overrides");
+        set_provider_model_reported(&pool, provider.id, "m", Some(8192), None, Some(true), Some(4096)).await.expect("reported");
 
         let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
         assert_eq!(
@@ -4662,6 +4730,9 @@ mod tests {
                 reported_thinking: None,
                 reported_tools: Some(true),
                 effort: None,
+                max_output: Some(2048),
+                reported_max_output: Some(4096),
+                reasoning_budget: Some(1024),
                 added_by_hand: false,
             }
         );

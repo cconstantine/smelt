@@ -6,12 +6,13 @@ use dioxus::prelude::*;
 use crate::api::chat::{get_conversation_model, set_conversation_model};
 use crate::api::providers::{
     add_provider_model, create_provider, delete_provider, get_default_model, get_provider, get_recent_spend, list_price_sources,
-    list_provider_models, list_providers, refresh_model_details, set_default_model, set_model_settings, update_provider,
+    list_provider_models, list_providers, probe_llama_cpp, refresh_model_details, set_default_model, set_model_settings,
+    update_provider,
 };
 use crate::frontend::Route;
 use crate::providers::{
-    suggest_price_source, AuthKind, ConversationModel, ModelChoice, ModelInfo, PriceSource, ProviderInput, ProviderKind,
-    ProviderSummary, ASSUMED_CONTEXT_WINDOW,
+    suggest_price_source, AuthKind, ConversationModel, LlamaServerInfo, ModelChoice, ModelInfo, ModelSettings, PriceSource, ProviderInput,
+    ProviderKind, ProviderSummary, ASSUMED_CONTEXT_WINDOW, LLAMA_CPP_EFFORTS,
 };
 
 use super::server_error_message;
@@ -472,6 +473,8 @@ struct ProviderForm {
     price_source: Option<String>,
     /// Picked by the user: no longer follows the address.
     price_source_chosen: bool,
+    /// llama.cpp only (SME-111).
+    keep_reasoning: bool,
 }
 
 impl ProviderForm {
@@ -485,6 +488,7 @@ impl ProviderForm {
             prompt_caching: kind.default_prompt_caching(),
             price_source: None,
             price_source_chosen: false,
+            keep_reasoning: true,
         }
     }
 
@@ -498,6 +502,7 @@ impl ProviderForm {
             prompt_caching: provider.prompt_caching,
             price_source: provider.price_catalog_provider.clone(),
             price_source_chosen: true,
+            keep_reasoning: provider.keep_reasoning,
         }
     }
 
@@ -510,6 +515,7 @@ impl ProviderForm {
             secret: self.secret.clone(),
             prompt_caching: self.prompt_caching,
             price_catalog_provider: self.price_source.clone(),
+            keep_reasoning: self.keep_reasoning,
         }
     }
 
@@ -526,6 +532,12 @@ impl ProviderForm {
 fn ProviderFields(
     form: Signal<ProviderForm>,
     is_new: bool,
+    /// Suggest the llama.cpp kind when the address answers like one: a new
+    /// provider, or one saved as Other (SME-111).
+    suggest_kind: bool,
+    /// The saved address, asked about when the form opens; empty for a
+    /// new provider.
+    saved_base_url: String,
     secret_hint: Option<String>,
     save_label: &'static str,
     error: Option<String>,
@@ -534,6 +546,27 @@ fn ProviderFields(
     let mut form = form;
     let sources = use_resource(|| async { list_price_sources().await.unwrap_or_default() });
     let source_list = move || sources().unwrap_or_default();
+    // The address that last answered `/props` as llama.cpp does: the form
+    // then suggests the kind, and never switches by itself (SME-111).
+    let mut llama_cpp_at: Signal<Option<String>> = use_signal(|| None);
+    let probe = move |url: String| {
+        if !suggest_kind || url.is_empty() {
+            return;
+        }
+        // The answer is for the address it asked about, if the field
+        // still holds it (SME-111 review 1).
+        spawn(async move {
+            let found = probe_llama_cpp(url.clone()).await.unwrap_or(false);
+            let shown = after_probe(llama_cpp_at.peek().clone(), url, found, &form.peek().base_url);
+            llama_cpp_at.set(shown);
+        });
+    };
+    // A saved address is asked about once, when the form opens.
+    use_hook(move || probe(saved_base_url.trim().to_string()));
+    let suggest_llama_cpp = move || {
+        let f = form();
+        suggest_kind && f.kind != ProviderKind::LlamaCpp && llama_cpp_at().as_deref() == Some(f.base_url.trim())
+    };
     let submit = move |event: Event<FormData>| {
         event.prevent_default();
         on_save.call(form().input());
@@ -567,6 +600,7 @@ fn ProviderFields(
                 match form().kind {
                     ProviderKind::Anthropic => "Anthropic's API. Its model list says each model's context window.",
                     ProviderKind::Ollama => "An Ollama server. smelt asks it which models it has, what each can do, and each model's context window where it can tell.",
+                    ProviderKind::LlamaCpp => "A llama.cpp server (llama-server). smelt reads its /v1/models and /props for the model, its context window and what its chat template supports.",
                     ProviderKind::Other => "Any other server with an Anthropic-compatible /v1/messages, such as a gateway or llama.cpp. smelt tries its /v1/models for the list.",
                 }
             }
@@ -581,8 +615,26 @@ fn ProviderFields(
                     let mut f = form.write();
                     f.base_url = e.value();
                     f.follow_suggestion(&source_list());
-                } }
+                },
+                onchange: move |e| probe(e.value().trim().to_string()) }
             p { class: "muted", "Turns go to this address's /v1/messages." }
+            if suggest_llama_cpp() {
+                p { class: "provider-kind-suggestion", role: "status",
+                    "This looks like a llama.cpp server. "
+                    button { r#type: "button", class: "model-picker-button",
+                        onclick: move |_| {
+                            let mut f = form.write();
+                            f.kind = ProviderKind::LlamaCpp;
+                            if is_new {
+                                f.auth_kind = ProviderKind::LlamaCpp.default_auth_kind();
+                                f.prompt_caching = ProviderKind::LlamaCpp.default_prompt_caching();
+                            }
+                            f.follow_suggestion(&source_list());
+                        },
+                        "Use the llama.cpp kind"
+                    }
+                }
+            }
 
             label { r#for: "provider-auth", "Sent as" }
             select {
@@ -612,6 +664,17 @@ fn ProviderFields(
             }
             p { class: "muted",
                 "Marks each turn's request so the server can reuse the conversation so far instead of reading it again; on Anthropic a cached read costs a tenth of the input price. Turn it off if this server refuses requests with a cache_control error."
+            }
+
+            if form().kind == ProviderKind::LlamaCpp {
+                label { class: "provider-checkbox",
+                    input { id: "provider-keep-reasoning", r#type: "checkbox", checked: form().keep_reasoning,
+                        onchange: move |e| form.write().keep_reasoning = e.checked() }
+                    "Keep earlier reasoning"
+                }
+                p { class: "muted",
+                    "Sends the chat template preserve_thinking, so the model sees its reasoning from earlier turns. Off keeps only the current reply's tool calls' reasoning: conversations stay smaller, and the server re-reads from the first reasoning it drops, once per new message. Only sent when the server's template supports it."
+                }
             }
 
             label { r#for: "provider-prices", "Prices from" }
@@ -670,7 +733,7 @@ pub fn ProviderNew() -> Element {
                 Link { to: Route::ProvidersRoute {}, class: "mcp-back-link", "\u{2190} Back to model providers" }
                 h1 { "Add a model provider" }
             }
-            ProviderFields { form, is_new: true, secret_hint: None, save_label: "Add provider", error: error(), on_save: save }
+            ProviderFields { form, is_new: true, suggest_kind: true, saved_base_url: String::new(), secret_hint: None, save_label: "Add provider", error: error(), on_save: save }
         }
     }
 }
@@ -733,8 +796,8 @@ pub fn ProviderEdit(id: i64) -> Element {
             match provider() {
                 None => rsx! { p { class: "muted", "Loading..." } },
                 Some(Err(e)) => rsx! { super::ErrorText { message: Some(super::server_error_message(&e)) } },
-                Some(Ok(_)) => rsx! {
-                    ProviderFields { form, is_new: false, secret_hint: secret_hint(), save_label: "Save", error: error(), on_save: save }
+                Some(Ok(p)) => rsx! {
+                    ProviderFields { form, is_new: false, suggest_kind: p.kind == ProviderKind::Other, saved_base_url: p.base_url.clone(), secret_hint: secret_hint(), save_label: "Save", error: error(), on_save: save }
                     if saved() {
                         p { class: "muted provider-saved", "Saved." }
                     }
@@ -775,6 +838,9 @@ fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
                 None => rsx! { p { class: "muted", "Asking the provider\u{2026}" } },
                 Some(Err(e)) => rsx! { super::ErrorText { message: Some(super::server_error_message(&e)) } },
                 Some(Ok(listing)) => rsx! {
+                    if listing.kind == ProviderKind::LlamaCpp {
+                        LlamaServerLine { caps: listing.server_caps.clone(), error: listing.server_error.clone() }
+                    }
                     if let Some(err) = listing.listing_error {
                         p { class: "error", "Couldn't list this provider's models: {err}" }
                     }
@@ -783,7 +849,13 @@ fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
                     }
                     div { class: "provider-model-list",
                         for model in listing.models {
-                            ProviderModelRow { key: "{model.id}", id, model }
+                            ProviderModelRow {
+                                key: "{model.id}",
+                                id,
+                                model,
+                                kind: listing.kind,
+                                efforts: effort_choices(listing.kind, listing.server_caps.as_ref()),
+                            }
                         }
                     }
                 },
@@ -819,9 +891,96 @@ fn ProviderModelsSection(id: i64, refresh: Signal<u64>) -> Element {
     }
 }
 
+/// The address the llama.cpp suggestion is for, once the probe of `asked`
+/// answers `found`: an answer for an address the field no longer holds
+/// (a slow probe finishing after a later one) changes nothing.
+fn after_probe(shown: Option<String>, asked: String, found: bool, current: &str) -> Option<String> {
+    if asked != current.trim() {
+        return shown;
+    }
+    found.then_some(asked)
+}
+
+/// A token-count field's value: blank for none, commas allowed.
+fn token_field(text: &str, name: &str) -> Result<Option<u32>, String> {
+    let text = text.replace(',', "");
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse::<u32>().map(Some).map_err(|_| format!("{name} is a number of tokens."))
+}
+
+/// A llama.cpp server's `/props`, as one line under the models' heading:
+/// its build, model, slots and window, and what its template supports.
 #[component]
-fn ProviderModelRow(id: i64, model: ModelInfo) -> Element {
+fn LlamaServerLine(caps: Option<LlamaServerInfo>, error: Option<String>) -> Element {
+    rsx! {
+        if let Some(caps) = caps.clone() {
+            p { class: "muted provider-server-info", "{llama_server_summary(&caps)}" }
+        }
+        if let Some(err) = error {
+            p { class: "model-picker-warning provider-server-info",
+                if caps.is_some() {
+                    "Couldn't read the server's /props just now ({err}); turns use what it said last time."
+                } else {
+                    "Couldn't read the server's /props ({err}), so turns send its template no settings."
+                }
+            }
+        }
+    }
+}
+
+/// "llama.cpp b11434 · flash-next · 1 slot · 262,144-token window ·
+/// template: preserve reasoning, reasoning effort, tool calls".
+fn llama_server_summary(caps: &LlamaServerInfo) -> String {
+    let mut parts = vec![match &caps.build_info {
+        Some(build) => format!("llama.cpp {}", build.split('-').next().unwrap_or(build)),
+        None => "llama.cpp".to_string(),
+    }];
+    if let Some(alias) = &caps.model_alias {
+        parts.push(alias.clone());
+    }
+    if let Some(slots) = caps.total_slots {
+        parts.push(if slots == 1 { "1 slot".to_string() } else { format!("{slots} slots") });
+    }
+    if let Some(window) = caps.n_ctx {
+        parts.push(format!("{}-token window", group_digits(window)));
+    }
+    let supported: Vec<String> = caps
+        .template_caps
+        .iter()
+        .filter(|(_, on)| **on)
+        .filter_map(|(name, _)| name.strip_prefix("supports_"))
+        .filter(|name| matches!(*name, "reasoning_effort" | "preserve_reasoning" | "tool_calls"))
+        .map(|name| name.replace('_', " "))
+        .collect();
+    parts.push(if supported.is_empty() {
+        "template: no reasoning effort or preserved reasoning".to_string()
+    } else {
+        format!("template: {}", supported.join(", "))
+    });
+    parts.join(" \u{b7} ")
+}
+
+/// The Effort select's levels for a provider's models: every level for
+/// Anthropic's and the other kinds' (ignored but by Anthropic, as before);
+/// for llama.cpp, low to high when its template reads effort, else none,
+/// and the select is hidden (SME-111).
+fn effort_choices(kind: ProviderKind, caps: Option<&LlamaServerInfo>) -> Vec<crate::anthropic::Effort> {
+    match kind {
+        ProviderKind::LlamaCpp if caps.is_some_and(LlamaServerInfo::supports_reasoning_effort) => LLAMA_CPP_EFFORTS.to_vec(),
+        ProviderKind::LlamaCpp => Vec::new(),
+        _ => crate::anthropic::Effort::ALL.to_vec(),
+    }
+}
+
+#[component]
+fn ProviderModelRow(id: i64, model: ModelInfo, kind: ProviderKind, efforts: Vec<crate::anthropic::Effort>) -> Element {
+    let llama_cpp_efforts = kind == ProviderKind::LlamaCpp;
     let mut window = use_signal(|| model.context_window_override.map(|w| w.to_string()).unwrap_or_default());
+    let mut max_output = use_signal(|| model.max_output_override.map(|n| n.to_string()).unwrap_or_default());
+    let mut reasoning = use_signal(|| model.reasoning_budget_override.map(|n| n.to_string()).unwrap_or_default());
     let mut thinking = use_signal(|| model.thinking_override);
     let mut effort = use_signal(|| model.effort_override);
     let mut error: Signal<Option<String>> = use_signal(|| None);
@@ -839,24 +998,33 @@ fn ProviderModelRow(id: i64, model: ModelInfo) -> Element {
     } else {
         format!("unknown, assuming {}", group_digits(ASSUMED_CONTEXT_WINDOW))
     };
+    let max_output_placeholder = match model.max_output {
+        Some(cap) => group_digits(cap),
+        None => "automatic".to_string(),
+    };
     let save = move |event: Event<FormData>| {
         event.prevent_default();
-        let text = window().replace(',', "");
-        let text = text.trim();
-        let context_window = if text.is_empty() {
-            None
-        } else {
-            match text.parse::<u32>() {
-                Ok(n) => Some(n),
-                Err(_) => {
-                    error.set(Some("The context window is a number of tokens.".to_string()));
-                    return;
-                }
+        let (context_window, max_output, reasoning_budget) = match (
+            token_field(&window(), "The context window"),
+            token_field(&max_output(), "Max reply tokens"),
+            token_field(&reasoning(), "The reasoning budget"),
+        ) {
+            (Ok(window), Ok(max_output), Ok(reasoning)) => (window, max_output, reasoning),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                error.set(Some(e));
+                return;
             }
+        };
+        let settings = ModelSettings {
+            thinking: thinking(),
+            context_window,
+            effort: effort(),
+            max_output,
+            reasoning_budget,
         };
         let model_id = model_id.clone();
         spawn(async move {
-            match set_model_settings(id, model_id, thinking(), context_window, effort()).await {
+            match set_model_settings(id, model_id, settings).await {
                 Ok(()) => {
                     error.set(None);
                     saved.set(true);
@@ -880,6 +1048,28 @@ fn ProviderModelRow(id: i64, model: ModelInfo) -> Element {
                         saved.set(false);
                     } }
             }
+            label { class: "provider-model-window",
+                "Max reply tokens "
+                input { r#type: "text", inputmode: "numeric", placeholder: "{max_output_placeholder}", value: "{max_output}",
+                    aria_label: "Max reply tokens for {model.id}",
+                    title: "The most one reply may be, thinking included. Automatic: what the provider reports, else up to half the context window (16,384 on an Anthropic or other provider that reports none, since a Claude model refuses more than its own cap).",
+                    oninput: move |e| {
+                        max_output.set(e.value());
+                        saved.set(false);
+                    } }
+            }
+            if kind == ProviderKind::LlamaCpp {
+                label { class: "provider-model-window",
+                    "Reasoning budget "
+                    input { r#type: "text", inputmode: "numeric", placeholder: "automatic", value: "{reasoning}",
+                        aria_label: "Reasoning budget for {model.id}",
+                        title: "The most a reply may spend thinking before llama.cpp makes the model answer. Automatic: three quarters of the reply's budget, leaving at least 4,096 tokens to answer; a number here caps that. At 10 tokens a second, 100,000 tokens is close to three hours.",
+                        oninput: move |e| {
+                            reasoning.set(e.value());
+                            saved.set(false);
+                        } }
+                }
+            }
             label { class: "provider-model-thinking",
                 "Thinking "
                 select {
@@ -898,22 +1088,37 @@ fn ProviderModelRow(id: i64, model: ModelInfo) -> Element {
                     }
                 }
             }
-            label { class: "provider-model-thinking",
-                "Effort "
-                select {
-                    aria_label: "Effort for {model.id}",
-                    title: "Sent as output_config.effort to an Anthropic provider; other kinds ignore it. Changing it re-reads a conversation's cache once.",
-                    onchange: move |e| {
-                        effort.set(crate::anthropic::Effort::parse(&e.value()));
-                        saved.set(false);
-                    },
-                    option { value: "", selected: effort().is_none(), "model's default" }
-                    for level in crate::anthropic::Effort::ALL {
-                        option {
-                            key: "{level.as_str()}",
-                            value: "{level.as_str()}",
-                            selected: effort() == Some(level),
-                            "{level.as_str()}"
+            if !efforts.is_empty() {
+                label { class: "provider-model-thinking",
+                    "Effort "
+                    select {
+                        aria_label: "Effort for {model.id}",
+                        title: if llama_cpp_efforts {
+                            "Sent to the chat template as reasoning_effort. The template decides what each level means; one it refuses fails the turn with the template's error."
+                        } else {
+                            "Sent as output_config.effort to an Anthropic provider; other kinds ignore it. Changing it re-reads a conversation's cache once."
+                        },
+                        onchange: move |e| {
+                            effort.set(crate::anthropic::Effort::parse(&e.value()));
+                            saved.set(false);
+                        },
+                        option { value: "", selected: effort().is_none(),
+                            if llama_cpp_efforts { "template's default" } else { "model's default" }
+                        }
+                        // Kept when this kind doesn't offer it, so saving
+                        // doesn't drop it.
+                        if let Some(level) = effort().filter(|level| !efforts.contains(level)) {
+                            option { value: "{level.as_str()}", selected: true,
+                                if llama_cpp_efforts { "{level.as_str()} (not sent)" } else { "{level.as_str()}" }
+                            }
+                        }
+                        for level in efforts.clone() {
+                            option {
+                                key: "{level.as_str()}",
+                                value: "{level.as_str()}",
+                                selected: effort() == Some(level),
+                                "{level.as_str()}"
+                            }
                         }
                     }
                 }
@@ -968,6 +1173,65 @@ mod tests {
         assert_eq!(thinking_label("default", Some(false)), "Provider's default (off)");
     }
 
+    /// SME-111: llama.cpp's Effort offers what its template takes, and
+    /// only when its template reads effort at all.
+    #[test]
+    fn test_effort_choices_follow_the_kind_and_the_template() {
+        use crate::anthropic::Effort;
+        let caps = |effort: bool| LlamaServerInfo {
+            template_caps: [("supports_reasoning_effort".to_string(), effort)].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(effort_choices(ProviderKind::LlamaCpp, Some(&caps(true))), vec![Effort::Low, Effort::Medium, Effort::High]);
+        assert!(effort_choices(ProviderKind::LlamaCpp, Some(&caps(false))).is_empty());
+        assert!(effort_choices(ProviderKind::LlamaCpp, None).is_empty(), "never read");
+        assert_eq!(effort_choices(ProviderKind::Anthropic, None), Effort::ALL.to_vec());
+    }
+
+    #[test]
+    fn test_a_llama_cpp_servers_line_says_what_it_reported() {
+        let caps = LlamaServerInfo {
+            n_ctx: Some(262_144),
+            total_slots: Some(1),
+            model_alias: Some("flash-next".to_string()),
+            build_info: Some("b11434-5e03bdd87".to_string()),
+            template_caps: [
+                ("supports_reasoning_effort".to_string(), true),
+                ("supports_preserve_reasoning".to_string(), true),
+                ("supports_tool_calls".to_string(), true),
+                ("supports_system_role".to_string(), true),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(
+            llama_server_summary(&caps),
+            "llama.cpp b11434 \u{b7} flash-next \u{b7} 1 slot \u{b7} 262,144-token window \u{b7} template: preserve reasoning, reasoning effort, tool calls"
+        );
+        assert_eq!(
+            llama_server_summary(&LlamaServerInfo::default()),
+            "llama.cpp \u{b7} template: no reasoning effort or preserved reasoning"
+        );
+    }
+
+    /// SME-111 review 1: a slow probe of an old address doesn't hide the
+    /// suggestion for the address in the field.
+    #[test]
+    fn test_only_the_current_addresss_probe_counts() {
+        let b = "http://b".to_string();
+        assert_eq!(after_probe(None, b.clone(), true, "http://b"), Some(b.clone()));
+        assert_eq!(after_probe(Some(b.clone()), "http://a".to_string(), false, "http://b"), Some(b.clone()), "a stale no");
+        assert_eq!(after_probe(None, "http://a".to_string(), true, "http://b"), None, "a stale yes");
+        assert_eq!(after_probe(Some(b.clone()), b, false, "http://b"), None, "the current address said no");
+    }
+
+    #[test]
+    fn test_a_token_field_is_blank_or_a_number() {
+        assert_eq!(token_field("  ", "Max reply tokens"), Ok(None));
+        assert_eq!(token_field("131,072", "Max reply tokens"), Ok(Some(131_072)));
+        assert_eq!(token_field("lots", "Max reply tokens"), Err("Max reply tokens is a number of tokens.".to_string()));
+    }
+
     #[test]
     fn test_digits_are_grouped_by_thousands() {
         assert_eq!(group_digits(0), "0");
@@ -985,6 +1249,9 @@ mod tests {
             thinking_override: None,
             context_window_override: None,
             effort_override: None,
+            max_output_override: None,
+            reasoning_budget_override: None,
+            max_output: None,
             reported_context_window: None,
             reported_tools: tools,
             thinking: true,

@@ -2,12 +2,10 @@
 
 use super::*;
 
-/// Extra headroom reserved on top of `MAX_TOKENS`, in case a smaller
-/// `max_tokens` is ever configured per-request in the future — mirrors
-/// opencode's own `max(output reserve, buffer)` term. Not currently
-/// reachable as its own binding factor since `MAX_TOKENS` already exceeds
-/// it, but kept as a named floor rather than assuming `MAX_TOKENS` always
-/// will. See SME-18.
+/// Headroom for the token estimate's error: kept off the context window
+/// on top of the reply (`reply_budget`), and the compaction trigger's
+/// floor should `MIN_REPLY_TOKENS` ever be smaller — mirrors opencode's
+/// own `max(output reserve, buffer)` term. See SME-18.
 #[cfg(feature = "server")]
 pub(super) const COMPACTION_SAFETY_BUFFER: u32 = 4096;
 
@@ -64,18 +62,72 @@ pub(super) fn should_compact(
     new_content_estimate: u64,
     context_window: u32,
 ) -> bool {
-    let Some(last_usage) = last_usage else {
+    let Some(projected) = projected_input(last_usage, new_content_estimate) else {
         return false;
     };
+    let reserved = MIN_REPLY_TOKENS.max(COMPACTION_SAFETY_BUFFER) as u64;
+    let ceiling = (context_window as u64).saturating_sub(reserved);
+    projected >= ceiling
+}
+
+/// The next request's input as the last real usage measured it, plus an
+/// estimate of what's new since: everything the last call read and wrote.
+/// `None` when nothing has been measured since the history last changed
+/// shape (a first request, or one just after a compaction).
+#[cfg(feature = "server")]
+pub(super) fn projected_input(last_usage: Option<&anthropic::TokenUsage>, new_content_estimate: u64) -> Option<u64> {
+    let last_usage = last_usage?;
     let already_used = (last_usage.input_tokens
         + last_usage.output_tokens
         + last_usage.cache_creation_input_tokens
         + last_usage.cache_read_input_tokens)
         .max(0) as u64;
-    let projected = already_used + new_content_estimate;
-    let reserved = MAX_TOKENS.max(COMPACTION_SAFETY_BUFFER) as u64;
-    let ceiling = (context_window as u64).saturating_sub(reserved);
-    projected >= ceiling
+    Some(already_used + new_content_estimate)
+}
+
+/// An estimate of a whole request's input: its messages, system prompt
+/// and tool definitions, at `estimate_tokens`' 4 characters a token. For a
+/// request no usage measured (`projected_input`).
+#[cfg(feature = "server")]
+pub(super) fn estimate_request_tokens(request: &anthropic::CreateMessageRequest) -> u64 {
+    let messages: u64 = request.messages.iter().map(|m| estimate_tokens(&m.content)).sum();
+    let system = request.system.as_ref().map_or(0, |s| s.len() / 4) as u64;
+    let tools = serde_json::to_string(&request.tools).map_or(0, |t| t.len() / 4) as u64;
+    messages + system + tools
+}
+
+/// How many tokens a reply may use (SME-111): the smallest of the model's
+/// output cap, where known; the room the request leaves in the window,
+/// less `COMPACTION_SAFETY_BUFFER`; and half the window, so a single reply
+/// can't crowd the rest of the history out of the next compaction. Never
+/// below `MIN_REPLY_TOKENS` (or half a smaller window), as every turn
+/// asked for before; the compaction trigger keeps that much room.
+#[cfg(feature = "server")]
+pub(super) fn reply_budget(context_window: u32, projected_input: u64, output_cap: Option<u32>) -> ReplyBudget {
+    let half = context_window / 2;
+    let room = (context_window as u64)
+        .saturating_sub(projected_input)
+        .saturating_sub(COMPACTION_SAFETY_BUFFER as u64);
+    let room = u32::try_from(room).unwrap_or(u32::MAX);
+    let budget = room.min(half).max(MIN_REPLY_TOKENS.min(half));
+    let tokens = output_cap.map_or(budget, |cap| budget.min(cap)).max(1);
+    let limit = if output_cap == Some(tokens) {
+        crate::api::chat::ReplyLimit::OutputCap
+    } else if tokens == half {
+        crate::api::chat::ReplyLimit::HalfWindow
+    } else {
+        // The room left, or the floor kept when there's even less.
+        crate::api::chat::ReplyLimit::RoomLeft
+    };
+    ReplyBudget { tokens, limit }
+}
+
+/// A reply's budget, and what bound it (for a cut-off notice).
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReplyBudget {
+    pub(super) tokens: u32,
+    pub(super) limit: crate::api::chat::ReplyLimit,
 }
 
 /// Whether it's safe to end a compaction's covered range right after a
@@ -380,6 +432,9 @@ pub(super) async fn compact_conversation(
         thinking: None,
         prompt_caching: false,
         output_config: None,
+        // Thinking off, said so a llama.cpp template doesn't reason
+        // anyway and spend the summary's tokens on it (SME-111).
+        chat_template_kwargs: turn_model.chat_template_kwargs(false),
     };
 
     let mut discard_deltas = |_: &str| {};
