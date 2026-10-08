@@ -571,17 +571,52 @@ fn test_forget_conversation_lock_drops_it() {
 /// the same stream.
 #[tokio::test]
 async fn test_a_conversation_stream_relays_pods_changed() {
-    use futures_util::StreamExt;
     let stream = conversation_event_stream(9_000_000_011);
     futures_util::pin_mut!(stream);
+    // Another test's app event first, as one running alongside can
+    // publish.
+    events::publish_app(events::AppEvent::TurnsChanged);
     events::publish_app(events::AppEvent::PodsChanged);
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
-        .await
-        .expect("PodsChanged should arrive on the conversation stream");
+    let event = next_skipping_other_app_relays(&mut stream, |e| {
+        matches!(e, events::ConversationEvent::PodsChanged {})
+    })
+    .await;
     assert!(
         matches!(event, Some(Ok(events::ConversationEvent::PodsChanged {}))),
         "got {event:?}"
     );
+}
+
+/// Whether `event` is one a conversation's stream relays from the
+/// app-wide channel, which every test running alongside can publish to.
+fn is_app_relay(event: &events::ConversationEvent) -> bool {
+    matches!(
+        event,
+        events::ConversationEvent::PodsChanged {}
+            | events::ConversationEvent::TurnsChanged {}
+            | events::ConversationEvent::QuestionsChanged {}
+            | events::ConversationEvent::ProvidersChanged {}
+    )
+}
+
+/// The stream's next item that is `wanted`, or isn't a relayed app
+/// event at all: another test's app events aren't this test's to judge
+/// (SME-135). Gives up after a second.
+async fn next_skipping_other_app_relays(
+    stream: &mut (impl futures_util::Stream<Item = Result<events::ConversationEvent, axum::BoxError>> + Unpin),
+    wanted: impl Fn(&events::ConversationEvent) -> bool,
+) -> Option<Result<events::ConversationEvent, axum::BoxError>> {
+    use futures_util::StreamExt;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match stream.next().await {
+                Some(Ok(event)) if is_app_relay(&event) && !wanted(&event) => continue,
+                other => return other,
+            }
+        }
+    })
+    .await
+    .expect("the wanted event should arrive on the conversation stream")
 }
 
 /// SME-51 B3: each delta says where it starts, measured against the
@@ -617,13 +652,16 @@ async fn test_a_stream_that_falls_behind_ends_instead_of_skipping() {
             events::ConversationEvent::ReplyDelta { text: format!("{i} "), offset: 0 },
         );
     }
+    // An app event another test can publish meanwhile (the providers
+    // tests do), which the stream relays.
+    events::publish_app(events::AppEvent::ProvidersChanged);
     let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match stream.next().await {
                 None => return true,
-                // App-wide events from tests running alongside.
-                Some(Ok(events::ConversationEvent::PodsChanged {}))
-                | Some(Ok(events::ConversationEvent::TurnsChanged {})) => continue,
+                // App-wide events, this test's own and those of tests
+                // running alongside: all four kinds the stream relays.
+                Some(Ok(event)) if is_app_relay(&event) => continue,
                 Some(_) => return false,
             }
         }
@@ -668,13 +706,16 @@ async fn test_a_running_turn_marks_its_conversation_busy() {
 
 #[tokio::test]
 async fn test_a_conversation_stream_relays_turns_changed() {
-    use futures_util::StreamExt;
     let stream = conversation_event_stream(9_000_000_042);
     futures_util::pin_mut!(stream);
+    // Another test's app event first, as one running alongside can
+    // publish (a sandbox test's pod going away, say).
+    events::publish_app(events::AppEvent::PodsChanged);
     events::publish_app(events::AppEvent::TurnsChanged);
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
-        .await
-        .expect("TurnsChanged should arrive on the conversation stream");
+    let event = next_skipping_other_app_relays(&mut stream, |e| {
+        matches!(e, events::ConversationEvent::TurnsChanged {})
+    })
+    .await;
     assert!(
         matches!(event, Some(Ok(events::ConversationEvent::TurnsChanged {}))),
         "got {event:?}"

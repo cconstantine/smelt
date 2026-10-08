@@ -438,12 +438,22 @@ mod server {
         #[tokio::test]
         async fn test_publish_app_reaches_app_subscribers() {
             let mut rx = subscribe_app();
+            // Another test's app event first, as one running alongside
+            // can publish.
+            publish_app(super::super::AppEvent::TurnsChanged);
             publish_app(super::super::AppEvent::PodsChanged);
-            let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-                .await
-                .expect("an app event should arrive")
-                .expect("the channel stays open");
-            assert_eq!(received, super::super::AppEvent::PodsChanged);
+            // The app-wide channel is shared with every test running
+            // alongside: wait for this one, skipping theirs (SME-135).
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let received = rx.recv().await.expect("the channel stays open");
+                    if received == super::super::AppEvent::PodsChanged {
+                        return;
+                    }
+                }
+            })
+            .await
+            .expect("PodsChanged should arrive");
         }
 
         #[tokio::test]
