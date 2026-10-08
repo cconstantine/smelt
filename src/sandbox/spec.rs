@@ -269,6 +269,61 @@ pub(crate) fn workspace_pvc_name(conversation_id: i64) -> String {
 /// that mounts that PVC.
 pub(super) const CONVERSATION_LABEL: &str = "smelt/conversation";
 
+/// Label naming the database an object belongs to: its `smelt_instance`
+/// id (SME-115). Every smelt server shares the namespace and names its
+/// objects after its own database's ids, so this is what tells one
+/// server's `sandbox-workspace-7` from another's.
+pub(crate) const INSTANCE_LABEL: &str = "smelt/instance";
+
+/// The instance tests' own ephemeral pods carry: they have no database.
+#[cfg(test)]
+pub(crate) const TEST_INSTANCE: &str = "smelt-tests";
+
+/// The instance of the tests' own pods, as a database's would read.
+#[cfg(test)]
+pub(crate) fn test_instance() -> db::SmeltInstance {
+    db::SmeltInstance { id: TEST_INSTANCE.to_string(), owns_unlabelled: false }
+}
+
+/// Whose a cluster object is, from one server's side (SME-115).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ownership {
+    /// Labelled with this server's instance.
+    Ours,
+    /// No instance label: made before SME-115. Only adoption touches it.
+    Unlabelled,
+    /// Another database's.
+    Foreign,
+}
+
+/// Whose `meta`'s object is, for a server of `instance`. Only `Ours` may
+/// be deleted, reused or mounted.
+pub fn ownership(meta: &ObjectMeta, instance: &str) -> Ownership {
+    match meta.labels.as_ref().and_then(|labels| labels.get(INSTANCE_LABEL)) {
+        None => Ownership::Unlabelled,
+        // An empty instance (never read) is nobody's.
+        Some(label) if !instance.is_empty() && label == instance => Ownership::Ours,
+        Some(_) => Ownership::Foreign,
+    }
+}
+
+/// Whether a pod counts as this database's for reading it and for keeping
+/// its record open: ours, or one from before SME-115 while this database
+/// owns those (adoption missed it: it may still be ours). Another
+/// database's pod reads as absent.
+pub fn counts_as_ours(meta: &ObjectMeta, instance: &db::SmeltInstance) -> bool {
+    match ownership(meta, &instance.id) {
+        Ownership::Ours => true,
+        Ownership::Unlabelled => instance.owns_unlabelled,
+        Ownership::Foreign => false,
+    }
+}
+
+/// The labels every object a server of `instance` creates carries.
+pub(super) fn instance_labels(instance: &str) -> std::collections::BTreeMap<String, String> {
+    [(INSTANCE_LABEL.to_string(), instance.to_string())].into()
+}
+
 /// `SANDBOX_DOCKER_STORAGE_SIZE`, default `"20Gi"` — see
 /// `default_memory_limit`. Each conversation's Docker data PVC requests
 /// this much.
@@ -292,21 +347,26 @@ pub(super) fn default_workspace_storage_size() -> String {
 /// A conversation's claims: its Docker data and its /workspace (SME-32),
 /// both kept across its pods and deleted with it. Each comes with its
 /// name, so a caller needn't read it back out of the spec's `Option`.
-pub(super) fn conversation_pvc_specs(conversation_id: i64) -> [(String, PersistentVolumeClaim); 2] {
+pub(super) fn conversation_pvc_specs(conversation_id: i64, instance: &str) -> [(String, PersistentVolumeClaim); 2] {
     [
         (docker_pvc_name(conversation_id), default_docker_storage_size()),
         (workspace_pvc_name(conversation_id), default_workspace_storage_size()),
     ]
     .map(|(name, size)| {
-        let spec = build_conversation_pvc_spec(name.clone(), conversation_id, size);
+        let spec = build_conversation_pvc_spec(name.clone(), conversation_id, size, instance);
         (name, spec)
     })
 }
 
-pub(super) fn build_conversation_pvc_spec(name: String, conversation_id: i64, size: String) -> PersistentVolumeClaim {
+pub(super) fn build_conversation_pvc_spec(
+    name: String,
+    conversation_id: i64,
+    size: String,
+    instance: &str,
+) -> PersistentVolumeClaim {
     let mut requests = std::collections::BTreeMap::new();
     requests.insert("storage".to_string(), Quantity(size));
-    let mut labels = std::collections::BTreeMap::new();
+    let mut labels = instance_labels(instance);
     labels.insert(
         CONVERSATION_LABEL.to_string(),
         conversation_id.to_string(),
@@ -356,6 +416,7 @@ pub(super) fn build_pod_spec(
     memory: &str,
     docker: &DockerSidecar,
     volumes: &[db::SandboxVolume],
+    instance: &str,
 ) -> Pod {
     let (mut pod_volumes, user_mounts) = volume_mounts_for(volumes);
     pod_volumes.extend([
@@ -375,19 +436,20 @@ pub(super) fn build_pod_spec(
 
     // Only a pod on a conversation's claim needs finding by conversation:
     // see `wait_for_conversation_pods_gone`.
-    let labels = match docker.storage {
-        PodStorage::Conversation(conversation_id) => Some(
-            [(CONVERSATION_LABEL.to_string(), conversation_id.to_string())].into(),
-        ),
+    let mut labels = instance_labels(instance);
+    match docker.storage {
+        PodStorage::Conversation(conversation_id) => {
+            labels.insert(CONVERSATION_LABEL.to_string(), conversation_id.to_string());
+        }
         #[cfg(test)]
-        PodStorage::Ephemeral => None,
-    };
+        PodStorage::Ephemeral => {}
+    }
 
     Pod {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(NAMESPACE.to_string()),
-            labels,
+            labels: Some(labels),
             ..Default::default()
         },
         spec: Some(PodSpec {
@@ -596,7 +658,7 @@ pub(super) fn default_volume_storage_size() -> String {
         .unwrap_or_else(|| "10Gi".to_string())
 }
 
-pub(super) fn build_volume_pvc_spec(volume_id: i64) -> PersistentVolumeClaim {
+pub(super) fn build_volume_pvc_spec(volume_id: i64, instance: &str) -> PersistentVolumeClaim {
     let mut requests = std::collections::BTreeMap::new();
     requests.insert(
         "storage".to_string(),
@@ -607,6 +669,7 @@ pub(super) fn build_volume_pvc_spec(volume_id: i64) -> PersistentVolumeClaim {
         metadata: ObjectMeta {
             name: Some(sandbox_volume_pvc_name(volume_id)),
             namespace: Some(NAMESPACE.to_string()),
+            labels: Some(instance_labels(instance)),
             ..Default::default()
         },
         spec: Some(PersistentVolumeClaimSpec {

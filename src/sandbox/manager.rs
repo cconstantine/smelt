@@ -13,17 +13,49 @@ use super::*;
 pub(super) async fn ensure_volume_claims(
     client: &kube::Client,
     volumes: &[db::SandboxVolume],
+    instance: &db::SmeltInstance,
 ) -> Result<(), SandboxError> {
     let pvcs = pvc_api(client);
     for volume in volumes {
-        let claim = sandbox_volume_pvc_name(volume.id);
-        if pvcs.get_opt(&claim).await?.is_none() {
-            tracing::warn!(claim = %claim, "volume claim missing; recreating it");
-            pvcs.create(&PostParams::default(), &build_volume_pvc_spec(volume.id))
-                .await?;
-        }
+        // Boxed, like `ensure_conversation_pvcs`' claims (SME-115 review 1).
+        Box::pin(ensure_volume_claim(&pvcs, volume.id, instance)).await?;
     }
     Ok(())
+}
+
+/// One of `ensure_volume_claims`' claims: made if missing, and refused
+/// unless it's ours.
+async fn ensure_volume_claim(
+    pvcs: &Api<PersistentVolumeClaim>,
+    volume_id: i64,
+    instance: &db::SmeltInstance,
+) -> Result<(), SandboxError> {
+    let claim = sandbox_volume_pvc_name(volume_id);
+    match pvcs.get_opt(&claim).await? {
+        None => {
+            tracing::warn!(claim = %claim, "volume claim missing; recreating it");
+            pvcs.create(&PostParams::default(), &build_volume_pvc_spec(volume_id, &instance.id))
+                .await?;
+            Ok(())
+        }
+        // Never another database's volume (SME-115).
+        Some(existing) => match ownership(&existing.metadata, &instance.id) {
+            Ownership::Ours => Ok(()),
+            // One from before the fix that startup missed: its owner
+            // adopts it now.
+            Ownership::Unlabelled if instance.owns_unlabelled => {
+                let none = std::collections::HashSet::new();
+                let this_volume = std::collections::HashSet::from([volume_id]);
+                let decide = |meta: &ObjectMeta| should_adopt(meta, instance, &none, &this_volume);
+                if adopt_one(pvcs, existing, &instance.id, decide).await {
+                    Ok(())
+                } else {
+                    Err(SandboxError::NotOurs { name: claim, ownership: Ownership::Unlabelled })
+                }
+            }
+            other => Err(SandboxError::NotOurs { name: claim, ownership: other }),
+        },
+    }
 }
 
 /// The Kubernetes client every sandbox operation uses.
@@ -56,7 +88,7 @@ impl SandboxManager {
             memory: "512Mi".to_string(),
             storage: PodStorage::Ephemeral,
         };
-        self.create_with_docker(session_id, memory, &docker, volumes).await
+        self.create_with_docker(session_id, memory, &docker, volumes, &test_instance()).await
     }
 
     /// `memory` is an already-resolved value (the caller's own
@@ -67,13 +99,15 @@ impl SandboxManager {
     /// `volumes` is every currently-configured `sandbox_volumes` row —
     /// every pod gets every one of them mounted, unconditionally (see
     /// SME-17's Phase 4); an empty slice is fine for callers (mostly
-    /// tests) that don't care.
+    /// tests) that don't care. `instance` is the database's (SME-115):
+    /// the pod is labelled with it.
     pub async fn create_with_docker(
         &self,
         session_id: &str,
         memory: &str,
         docker: &DockerSidecar,
         volumes: &[db::SandboxVolume],
+        instance: &db::SmeltInstance,
     ) -> Result<Sandbox, SandboxError> {
         self.create_with_running_timeout(
             session_id,
@@ -81,6 +115,7 @@ impl SandboxManager {
             docker,
             volumes,
             running_wait_timeout(),
+            instance,
         )
         .await
     }
@@ -99,6 +134,7 @@ impl SandboxManager {
         docker: &DockerSidecar,
         volumes: &[db::SandboxVolume],
         running_timeout: Duration,
+        instance: &db::SmeltInstance,
     ) -> Result<Sandbox, SandboxError> {
         let pods = pods_api(&self.client);
         let name = format!("sandbox-{session_id}");
@@ -109,6 +145,14 @@ impl SandboxManager {
         // pod's non-`Running` status could be a transient blip on
         // something another part of the system still depends on.
         let just_created = match pods.get_opt(&name).await? {
+            // Never another database's pod (SME-115): its agent runs
+            // commands for whoever connects.
+            Some(pod) if ownership(&pod.metadata, &instance.id) != Ownership::Ours => {
+                return Err(SandboxError::NotOurs {
+                    name,
+                    ownership: ownership(&pod.metadata, &instance.id),
+                });
+            }
             Some(pod) => {
                 let phase = pod.status.and_then(|s| s.phase).unwrap_or_default();
                 if phase != "Running" {
@@ -123,10 +167,10 @@ impl SandboxManager {
                 false
             }
             None => {
-                ensure_volume_claims(&self.client, volumes).await?;
+                ensure_volume_claims(&self.client, volumes, instance).await?;
                 pods.create(
                     &PostParams::default(),
-                    &build_pod_spec(&name, memory, docker, volumes),
+                    &build_pod_spec(&name, memory, docker, volumes, &instance.id),
                 )
                 .await?;
                 true
@@ -322,8 +366,13 @@ pub(super) fn decide_pod_death_reason(pod: Option<Pod>) -> Option<Option<String>
 /// `pods.get_opt` fetch, handed straight to the pure decision function.
 /// An API call that itself fails is treated the same as "inconclusive"
 /// (`None`), never as confirmation either way — see SME-12's "How."
-pub(super) async fn pod_death_reason(pods: &Api<Pod>, name: &str) -> Option<Option<String>> {
-    match pods.get_opt(name).await {
+/// Another database's pod of that name reads as gone (SME-115).
+pub(super) async fn pod_death_reason(
+    pods: &Api<Pod>,
+    name: &str,
+    instance: &db::SmeltInstance,
+) -> Option<Option<String>> {
+    match read_our_pod(pods, name, instance).await {
         Ok(pod) => decide_pod_death_reason(pod),
         Err(_) => None,
     }
@@ -393,7 +442,10 @@ where
 /// id its pods and claims are labelled with (the same, outside tests).
 pub(super) async fn clean_up_after_failed_start(pool: &PgPool, client: &kube::Client, conversation_id: i64, label_id: i64) {
     if !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
-        teardown_conversation_with(client, label_id, &[]).await;
+        match db::smelt_instance(pool).await {
+            Ok(instance) => teardown_conversation_with(client, label_id, &[], &instance).await,
+            Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't read this database's instance to clean up"),
+        }
     }
 }
 
@@ -404,7 +456,9 @@ pub(super) async fn create_pod_now(
     conversation_id: i64,
     limits: PodLimitOverrides,
 ) -> Result<i64, SandboxError> {
-    let result = create_pod_attempt(pool, conversation_id, limits).await;
+    // Boxed: the attempt's future is large, and a caller awaiting it in
+    // a debug build holds it on its own stack frame (SME-115).
+    let result = Box::pin(create_pod_attempt(pool, conversation_id, limits)).await;
     // Only a deleted conversation needs the cluster touched; a refused
     // start for a live one (a pod already exists, say) doesn't.
     if result.is_err() && !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
@@ -428,6 +482,7 @@ pub(super) async fn create_pod_attempt(
     let (memory, docker) = limits.resolve(conversation_id);
 
     let manager = get()?;
+    let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
     // The database's own one-live-pod rule backs up the check above.
     let row = db::create_sandbox_pod(pool, conversation_id).await.map_err(|e| {
         if e.as_database_error().is_some_and(|d| d.is_unique_violation()) {
@@ -447,18 +502,18 @@ pub(super) async fn create_pod_attempt(
     // `SandboxManager::delete` itself already uses for the same reason.
     // A pod terminate_pod just stopped can still hold the Docker claim.
     if let Err(e) =
-        wait_for_conversation_pods_gone(&manager.client, conversation_id, running_wait_timeout())
+        wait_for_conversation_pods_gone(&manager.client, conversation_id, running_wait_timeout(), &instance.id)
             .await
     {
         let _ = db::terminate_sandbox_pod(pool, row.id).await;
         return Err(e);
     }
-    if let Err(e) = ensure_conversation_pvcs(&manager.client, conversation_id).await {
+    if let Err(e) = ensure_conversation_pvcs(&manager.client, conversation_id, &instance).await {
         let _ = db::terminate_sandbox_pod(pool, row.id).await;
         return Err(e);
     }
     match manager
-        .create_with_docker(&row.id.to_string(), &memory, &docker, &volumes)
+        .create_with_docker(&row.id.to_string(), &memory, &docker, &volumes, &instance)
         .await
     {
         Ok(sandbox) => {
@@ -475,7 +530,7 @@ pub(super) async fn create_pod_attempt(
             // The conversation may have been deleted while this pod was
             // starting; its teardown had nothing to find yet (SME-51 B5).
             if !db::conversation_exists(pool, conversation_id).await.unwrap_or(true) {
-                teardown_conversation_with(&manager.client, conversation_id, &[]).await;
+                teardown_conversation_with(&manager.client, conversation_id, &[], &instance).await;
                 return Err(SandboxError::StartFailed(
                     "the conversation was deleted while its sandbox was starting".to_string(),
                 ));
@@ -549,15 +604,79 @@ pub(super) async fn force_terminate_pod(
     pool: &PgPool,
     pod_id: i64,
 ) -> Result<Option<db::SandboxPod>, SandboxError> {
-    terminate_pod_with(pool, pod_id, async {
-        let pods = pods_api(&get()?.client);
-        let name = pod_name(pod_id);
-        if pods.get_opt(&name).await?.is_some() {
-            pods.delete(&name, &pod_delete_params()).await?;
+    terminate_pod_with(pool, pod_id, async { Box::pin(delete_terminated_pod(pool, &get()?.client, pod_id)).await }).await
+}
+
+/// `force_terminate_pod` on `client`.
+pub(super) async fn force_terminate_pod_with(
+    pool: &PgPool,
+    client: &kube::Client,
+    pod_id: i64,
+) -> Result<Option<db::SandboxPod>, SandboxError> {
+    terminate_pod_with(pool, pod_id, Box::pin(delete_terminated_pod(pool, client, pod_id))).await
+}
+
+/// The cluster's part of terminating `pod_id`: deletes its pod if it's
+/// still there and ours (SME-115). Another database's pod of that name,
+/// or one from before the fix, is left; its record is closed all the same.
+async fn delete_terminated_pod(pool: &PgPool, client: &kube::Client, pod_id: i64) -> Result<(), SandboxError> {
+    let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
+    let pods = pods_api(client);
+    let name = pod_name(pod_id);
+    // Only its ownership and uid are kept: a whole `Pod` held across the
+    // delete below made every caller's future twice the size, which
+    // overflowed a debug build's stack (SME-115).
+    let (mut owner, mut uid) = match pods.get_opt(&name).await? {
+        Some(pod) => (ownership(&pod.metadata, &instance.id), pod.metadata.uid),
+        None => return Ok(()),
+    };
+    // One from before SME-115 that startup's adoption missed: adopted now
+    // if it's this record's conversation's, so it's stopped rather than
+    // left running with its record closed (SME-115 review 1).
+    if owner == Ownership::Unlabelled && instance.owns_unlabelled {
+        match Box::pin(adopt_record_pod(pool, &pods, pod_id, &instance)).await {
+            RecordPodAdoption::Adopted => {
+                (owner, uid) = match pods.get_opt(&name).await? {
+                    Some(pod) => (ownership(&pod.metadata, &instance.id), pod.metadata.uid),
+                    None => return Ok(()),
+                };
+            }
+            RecordPodAdoption::NotOurs => {}
+            // Ours but not labelled: an error keeps the record open, so
+            // the pod isn't left running with no record (SME-115 review 2).
+            RecordPodAdoption::Failed => {
+                return Err(SandboxError::NotOurs { name, ownership: Ownership::Unlabelled });
+            }
         }
-        Ok(())
-    })
-    .await
+    }
+    match owner {
+        Ownership::Ours => {
+            let params = DeleteParams {
+                preconditions: Some(kube::api::Preconditions { uid, resource_version: None }),
+                ..pod_delete_params()
+            };
+            match pods.delete(&name, &params).await {
+                Ok(_) => Ok(()),
+                // Gone, or replaced since it was read: not ours to delete.
+                Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        }
+        other => {
+            tracing::warn!(pod = %name, ownership = ?other, "closed the record of a pod that isn't this database's; the pod is left");
+            Ok(())
+        }
+    }
+}
+
+/// `name`'s pod if it counts as this database's (`counts_as_ours`);
+/// `None` when there's none, or it's another database's.
+pub(super) async fn read_our_pod(
+    pods: &Api<Pod>,
+    name: &str,
+    instance: &db::SmeltInstance,
+) -> Result<Option<Pod>, kube::Error> {
+    Ok(pods.get_opt(name).await?.filter(|pod| counts_as_ours(&pod.metadata, instance)))
 }
 
 /// `force_terminate_pod` with the cluster's delete passed in, so a test can
@@ -604,10 +723,12 @@ pub struct PodDetails {
     pub cpu_limits: Vec<String>,
 }
 
-/// `pod_id`'s phase and limits, or `None` if Kubernetes has no such pod.
-pub async fn pod_details(pod_id: i64) -> Result<Option<PodDetails>, SandboxError> {
+/// `pod_id`'s phase and limits, or `None` if Kubernetes has no such pod
+/// of this database's (SME-115).
+pub async fn pod_details(pool: &PgPool, pod_id: i64) -> Result<Option<PodDetails>, SandboxError> {
     let pods = pods_api(&get()?.client);
-    let Some(pod) = pods.get_opt(&pod_name(pod_id)).await? else {
+    let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
+    let Some(pod) = read_our_pod(&pods, &pod_name(pod_id), &instance).await? else {
         return Ok(None);
     };
     let (memory_limits, cpu_limits) = pod_container_limits(&pod);
@@ -642,11 +763,11 @@ pub async fn list_pods(pool: &PgPool, conversation_id: i64) -> Result<Vec<PodInf
     let rows = db::list_sandbox_pods(pool, conversation_id)
         .await
         .map_err(SandboxError::Db)?;
+    let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
     let mut result = Vec::with_capacity(rows.len());
     for row in rows {
         let name = pod_name(row.id);
-        let status = pods
-            .get_opt(&name)
+        let status = read_our_pod(&pods, &name, &instance)
             .await?
             .and_then(|p| p.status)
             .and_then(|s| s.phase)
@@ -676,13 +797,14 @@ pub async fn create_volume(
     validate_mount_path(&resolved_path).map_err(SandboxError::InvalidMountPath)?;
     // Before the row, so a missing manager leaves nothing behind.
     let manager = get()?;
+    let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
     let row = db::create_sandbox_volume(pool, name, &resolved_path)
         .await
         .map_err(SandboxError::Db)?;
 
     let pvcs = pvc_api(&manager.client);
     if let Err(e) = pvcs
-        .create(&PostParams::default(), &build_volume_pvc_spec(row.id))
+        .create(&PostParams::default(), &build_volume_pvc_spec(row.id, &instance.id))
         .await
     {
         let _ = db::delete_sandbox_volume(pool, row.id).await;
@@ -696,15 +818,61 @@ pub async fn create_volume(
 /// there" tolerance `force_terminate_pod` already has for its own pod.
 pub async fn delete_volume(pool: &PgPool, id: i64) -> Result<(), SandboxError> {
     let manager = get()?;
-    let pvcs = pvc_api(&manager.client);
-    let pvc_name = sandbox_volume_pvc_name(id);
-    if pvcs.get_opt(&pvc_name).await?.is_some() {
-        pvcs.delete(&pvc_name, &DeleteParams::default()).await?;
-    }
+    let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
+    delete_volume_claim(&manager.client, id, &instance).await?;
     db::delete_sandbox_volume(pool, id)
         .await
         .map_err(SandboxError::Db)?;
     Ok(())
+}
+
+/// Deletes volume `id`'s claim if it's ours (SME-115), only while it's
+/// still the object read. Another database's claim of that name, or one
+/// from before the fix, is left and logged.
+pub(super) async fn delete_volume_claim(
+    client: &kube::Client,
+    id: i64,
+    instance: &db::SmeltInstance,
+) -> Result<(), SandboxError> {
+    let pvcs = pvc_api(client);
+    let name = sandbox_volume_pvc_name(id);
+    let Some(mut claim) = pvcs.get_opt(&name).await? else {
+        return Ok(());
+    };
+    // One from before SME-115 that startup missed: its owner adopts it
+    // first, or the volume's data would stay in the cluster for good once
+    // its row is gone (SME-115 review 2). Failing that, the row stays.
+    if instance.owns_unlabelled && ownership(&claim.metadata, &instance.id) == Ownership::Unlabelled {
+        let none = std::collections::HashSet::new();
+        let this_volume = std::collections::HashSet::from([id]);
+        let decide = |meta: &ObjectMeta| should_adopt(meta, instance, &none, &this_volume);
+        if !Box::pin(adopt_one(&pvcs, claim, &instance.id, decide)).await {
+            return Err(SandboxError::NotOurs { name, ownership: Ownership::Unlabelled });
+        }
+        claim = match pvcs.get_opt(&name).await? {
+            Some(claim) => claim,
+            None => return Ok(()),
+        };
+    }
+    let instance = instance.id.as_str();
+    match (ownership(&claim.metadata, instance), claim.metadata.uid) {
+        (Ownership::Ours, Some(uid)) => {
+            let params = DeleteParams {
+                preconditions: Some(kube::api::Preconditions { uid: Some(uid), resource_version: None }),
+                ..Default::default()
+            };
+            match pvcs.delete(&name, &params).await {
+                Ok(_) => Ok(()),
+                // Gone, or replaced since it was read: not ours to delete.
+                Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        }
+        (other, _) => {
+            tracing::warn!(claim = %name, ownership = ?other, "left a volume claim that isn't this database's");
+            Ok(())
+        }
+    }
 }
 
 /// Whether sandbox pod `pod_id` still exists in the cluster (terminating
@@ -727,10 +895,24 @@ pub(crate) async fn pod_exists(pod_id: i64) -> bool {
 /// here: `db::delete_conversation`'s `ON DELETE CASCADE` chain removes
 /// `sandbox_pods`/`sandbox_terminals`/`terminal_commands` for real right
 /// after this runs.
-pub async fn teardown_conversation(conversation_id: i64, pod_ids: &[i64]) {
-    match get() {
-        Ok(manager) => teardown_conversation_with(&manager.client, conversation_id, pod_ids).await,
-        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't tear down the conversation's sandbox"),
+pub async fn teardown_conversation(pool: &PgPool, conversation_id: i64, pod_ids: &[i64]) {
+    let manager = match get() {
+        Ok(manager) => manager,
+        Err(e) => {
+            tracing::warn!(conversation_id, error = %e, "couldn't tear down the conversation's sandbox");
+            return;
+        }
+    };
+    // Without it nothing can be told ours: leave it all (SME-115). The
+    // startup sweep gets the claims; the pods are logged.
+    match db::smelt_instance(pool).await {
+        Ok(instance) => teardown_conversation_with(&manager.client, conversation_id, pod_ids, &instance).await,
+        Err(e) => tracing::warn!(
+            conversation_id,
+            ?pod_ids,
+            error = %e,
+            "couldn't read this database's instance; the conversation's sandbox is left running"
+        ),
     }
 }
 
@@ -738,42 +920,99 @@ pub async fn teardown_conversation(conversation_id: i64, pod_ids: &[i64]) {
 /// conversation label: a `create_pod` racing the conversation's deletion
 /// makes a pod whose record the delete then cascades away (SME-51 B5).
 /// `pod_ids`, the conversation's live pod records read before the delete,
-/// name the rest (SME-88).
-pub(super) async fn teardown_conversation_with(client: &kube::Client, conversation_id: i64, pod_ids: &[i64]) {
+/// name the rest (SME-88). Only objects labelled with `instance` are
+/// deleted: another database's conversation of the same id, or one from
+/// before SME-115, is left alone.
+pub(super) async fn teardown_conversation_with(
+    client: &kube::Client,
+    conversation_id: i64,
+    pod_ids: &[i64],
+    instance: &db::SmeltInstance,
+) {
     let pods = pods_api(client);
+    // What startup's adoption missed is this conversation's too: adopted
+    // now, by the database that owns such objects, so it goes below
+    // instead of being left for good (SME-115 review 1).
+    if instance.owns_unlabelled {
+        Box::pin(adopt_conversation_objects(client, conversation_id, pod_ids, instance)).await;
+    }
+    let instance = instance.id.as_str();
     // Its sandbox pods, and its language server pods (SME-35).
     for label in [CONVERSATION_LABEL, crate::lsp::pods::LSP_OF_LABEL] {
-        let selector = ListParams::default().labels(&format!("{label}={conversation_id}"));
-        delete_listed(&pods, &selector, conversation_id).await;
+        let selector =
+            ListParams::default().labels(&format!("{label}={conversation_id},{INSTANCE_LABEL}={instance}"));
+        delete_listed(&pods, &selector, conversation_id, instance).await;
     }
-    // And the pods its records name, labelled or not (one from before
-    // SME-33 has no label; SME-88). A pod deleted above is already gone.
+    // And the pods its records name, without a conversation label (one
+    // from before SME-33; SME-88). A pod deleted above is already gone.
     for &pod_id in pod_ids {
         deregister(pod_id);
-        match pods.delete(&pod_name(pod_id), &pod_delete_params()).await {
-            Ok(_) => {}
-            Err(kube::Error::Api(e)) if e.code == 404 => {}
-            Err(e) => tracing::warn!(pod_id, error = %e, "failed to delete pod during conversation teardown"),
-        }
+        delete_pod_if_ours(&pods, &pod_name(pod_id), instance).await;
     }
     // After the pods: Kubernetes holds a claim until no pod mounts it.
-    delete_conversation_pvcs(client, conversation_id).await;
+    delete_conversation_pvcs(client, conversation_id, instance).await;
 }
 
-pub(super) async fn delete_listed(pods: &Api<Pod>, selector: &ListParams, conversation_id: i64) {
+pub(super) async fn delete_listed(pods: &Api<Pod>, selector: &ListParams, conversation_id: i64, instance: &str) {
     match pods.list(selector).await {
         Ok(list) => {
             for pod in list {
+                // Whatever the selector: only ours (SME-115).
+                if ownership(&pod.metadata, instance) != Ownership::Ours {
+                    continue;
+                }
                 if let Some(pod_id) = watched_pod_id(&pod) {
                     deregister(pod_id);
                 }
-                let Some(name) = pod.metadata.name else { continue };
-                if let Err(e) = pods.delete(&name, &pod_delete_params()).await {
-                    tracing::warn!(pod = %name, error = %e, "failed to delete pod during conversation teardown");
-                }
+                let (Some(name), Some(uid)) = (pod.metadata.name, pod.metadata.uid) else { continue };
+                delete_pod_if_unchanged(pods, &name, &uid).await;
             }
         }
         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't list a deleted conversation's pods"),
+    }
+}
+
+/// Deletes pod `name` if it's ours (SME-115), only while it's still the
+/// object that was read. Another database's pod of the same name, or one
+/// from before the fix, is left and logged. Best-effort.
+pub(super) async fn delete_pod_if_ours(pods: &Api<Pod>, name: &str, instance: &str) {
+    // Only its ownership and uid are kept across the delete (see
+    // `delete_terminated_pod`).
+    let (owner, uid) = match pods.get_opt(name).await {
+        Ok(Some(pod)) => (ownership(&pod.metadata, instance), pod.metadata.uid),
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(pod = %name, error = %e, "couldn't read a pod to delete");
+            return;
+        }
+    };
+    match (owner, uid) {
+        (Ownership::Ours, Some(uid)) => delete_pod_if_unchanged(pods, name, &uid).await,
+        (Ownership::Ours, None) => tracing::warn!(pod = %name, "a pod with no uid; left alone"),
+        (Ownership::Unlabelled, _) => {
+            tracing::warn!(pod = %name, "left a pod with no smelt/instance label (made before SME-115)")
+        }
+        (Ownership::Foreign, _) => tracing::info!(pod = %name, "left another smelt database's pod of the same name"),
+    }
+}
+
+/// Deletes pod `name` with smelt's grace period, only while it's still
+/// the object with `uid`. Best-effort: logged, never returned.
+pub(super) async fn delete_pod_if_unchanged(pods: &Api<Pod>, name: &str, uid: &str) {
+    let params = DeleteParams {
+        preconditions: Some(kube::api::Preconditions {
+            uid: Some(uid.to_string()),
+            resource_version: None,
+        }),
+        ..pod_delete_params()
+    };
+    match pods.delete(name, &params).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(e)) if e.code == 404 => {}
+        Err(kube::Error::Api(e)) if e.code == 409 => {
+            tracing::info!(pod = %name, "a pod was replaced since it was read; left alone")
+        }
+        Err(e) => tracing::warn!(pod = %name, error = %e, "failed to delete a pod"),
     }
 }
 

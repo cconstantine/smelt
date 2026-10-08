@@ -31,6 +31,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use crate::docker_net::{DOCKER_BRIDGE_IP, DOCKER_NETWORK_POOL};
 use crate::{db, events};
 
+mod adopt;
 mod agent;
 mod claims;
 mod exec;
@@ -40,6 +41,7 @@ mod ports;
 mod spec;
 mod watch;
 
+pub use self::adopt::*;
 pub use self::agent::*;
 pub use self::claims::*;
 pub use self::exec::*;
@@ -111,6 +113,10 @@ pub enum SandboxError {
     /// for every stream requested, so this is a kube upgrade changing that,
     /// failing the one request rather than panicking (SME-95).
     NoStream(String),
+    /// A pod or claim of the name smelt was about to use isn't this
+    /// database's (SME-115): another smelt database's, or one from before
+    /// the fix that wasn't adopted. Never mounted, reused or deleted.
+    NotOurs { name: String, ownership: Ownership },
 }
 
 impl std::fmt::Display for SandboxError {
@@ -147,6 +153,18 @@ impl std::fmt::Display for SandboxError {
                 write!(f, "the sandbox isn't set up yet (sandbox::init() hasn't run)")
             }
             SandboxError::NoStream(what) => write!(f, "kube gave no stream for {what}"),
+            SandboxError::NotOurs { name, ownership } => match ownership {
+                Ownership::Unlabelled => write!(
+                    f,
+                    "{name} has no smelt/instance label: it was made before SME-115 and this smelt \
+                     database hasn't adopted it, so it isn't used. Restarting smelt retries the adoption."
+                ),
+                _ => write!(
+                    f,
+                    "{name} belongs to another smelt database sharing this cluster, so this sandbox \
+                     can't use it (SME-115)"
+                ),
+            },
         }
     }
 }

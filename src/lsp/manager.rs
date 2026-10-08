@@ -46,7 +46,15 @@ pub async fn sandbox_ref(pool: &PgPool, client: &kube::Client, conversation_id: 
         .get(&pod_name)
         .await
         .map_err(|e| format!("Couldn't find the sandbox pod: {e}"))?;
+    let instance = crate::db::smelt_instance(pool).await.map_err(|e| e.to_string())?;
+    // Servers mount the sandbox's /workspace: never another database's
+    // (SME-115).
+    let ownership = crate::sandbox::ownership(&pod.metadata, &instance.id);
+    if ownership != crate::sandbox::Ownership::Ours {
+        return Err(crate::sandbox::SandboxError::NotOurs { name: pod_name, ownership }.to_string());
+    }
     Ok(SandboxRef {
+        instance: instance.id,
         conversation_id,
         pod_id,
         pod_uid: pod.metadata.uid.clone().ok_or("the sandbox pod has no uid")?,
@@ -70,7 +78,7 @@ async fn configs(pool: &PgPool) -> Result<Vec<(LanguageServerConfig, String)>, S
 
 /// The ready server pods next to `sandbox`, by server name.
 async fn ready_servers(client: &kube::Client, sandbox: &SandboxRef) -> Result<Vec<String>, String> {
-    Ok(pods::list_with(client, sandbox.conversation_id)
+    Ok(pods::list_with(client, sandbox.conversation_id, &sandbox.instance)
         .await?
         .into_iter()
         .filter(|p| p.state == ServerState::Ready && p.pod_name == pods::server_pod_name(sandbox.pod_id, &p.name))
@@ -86,7 +94,7 @@ pub async fn servers_summary(pool: &PgPool, client: &kube::Client, sandbox: Opti
         return Ok("No language servers are configured. The user adds them on the Language servers page.".to_string());
     }
     let running = match sandbox {
-        Some(sandbox) => pods::list_with(client, sandbox.conversation_id)
+        Some(sandbox) => pods::list_with(client, sandbox.conversation_id, &sandbox.instance)
             .await?
             .into_iter()
             .filter(|p| p.pod_name == pods::server_pod_name(sandbox.pod_id, &p.name))
@@ -127,12 +135,12 @@ pub async fn start(pool: &PgPool, client: &kube::Client, sandbox: &SandboxRef, n
         return Err(format!("{name} is disabled on the Language servers page."));
     }
     // A pod started with older settings is restarted.
-    let stale = pods::list_with(client, sandbox.conversation_id)
+    let stale = pods::list_with(client, sandbox.conversation_id, &sandbox.instance)
         .await?
         .into_iter()
         .any(|p| p.name == name && p.config_version != *version && p.pod_name == pods::server_pod_name(sandbox.pod_id, name));
     if stale {
-        pods::stop_everywhere_in(client, sandbox.conversation_id, name).await?;
+        pods::stop_everywhere_in(client, sandbox.conversation_id, name, &sandbox.instance).await?;
     }
     match pods::start_with(client, sandbox, config, version).await? {
         pods::Started::Started => {

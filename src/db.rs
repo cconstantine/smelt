@@ -1223,6 +1223,107 @@ pub async fn set_git_identity(
     Ok(())
 }
 
+// --- This database's identity in the cluster (SME-115) ---
+
+/// Which database a cluster object belongs to. Every smelt server shares
+/// the sandbox namespace, and its objects are named after this database's
+/// ids, so each one is labelled `smelt/instance=<id>` and a server only
+/// deletes, reuses, mounts or watches objects carrying its own id.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SmeltInstance {
+    /// A UUID, made when the database was migrated.
+    pub id: String,
+    /// Whether this database owns the objects made before SME-115, which
+    /// carry no instance label: true only for a database that already had
+    /// conversations or volumes when it migrated (the dev and production
+    /// databases), fixed then. Only such a database adopts them.
+    pub owns_unlabelled: bool,
+}
+
+/// The migration that made `smelt_instance` (its version).
+#[cfg(test)]
+const SMELT_INSTANCE_MIGRATION: i64 = 20261007200000;
+
+/// This database's `smelt_instance` row.
+pub async fn smelt_instance(pool: &PgPool) -> Result<SmeltInstance, sqlx::Error> {
+    let (id, owns_unlabelled): (String, bool) =
+        sqlx::query_as("SELECT instance_id::text, owns_unlabelled FROM smelt_instance")
+            .fetch_one(pool)
+            .await?;
+    Ok(SmeltInstance { id, owns_unlabelled })
+}
+
+/// Starts a fresh database's conversation, sandbox pod and sandbox volume
+/// ids at a high base of their own (SME-115), and returns it; `None`, and
+/// nothing changed, for a database any of them was ever used in (the dev
+/// and production databases). Cluster objects are named after these ids,
+/// and every smelt server shares the namespace: a scratch database
+/// counting from 1 would name its claims and pods like the dev server's.
+pub async fn start_ids_clear_if_fresh(pool: &PgPool) -> Result<Option<i64>, sqlx::Error> {
+    // Each sequence's last value: null until its first one.
+    let sequences: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT t.name, s.last_value
+         FROM unnest($1::text[]) AS t(name)
+         JOIN pg_sequences s ON format('%I.%I', s.schemaname, s.sequencename) = pg_get_serial_sequence(t.name, 'id')",
+    )
+    .bind(&CLEAR_ID_TABLES[..])
+    .fetch_all(pool)
+    .await?;
+    // Any id ever handed out below the base: a used database, left alone.
+    // One already at or above it was moved by an earlier start; a move
+    // that failed partway (`setval` isn't transactional) is finished now
+    // (SME-115 review 2).
+    if sequences.len() != CLEAR_ID_TABLES.len()
+        || sequences.iter().any(|(_, last)| last.is_some_and(|last| last < CLEAR_IDS_BASE))
+    {
+        return Ok(None);
+    }
+    let unused: Vec<&str> = sequences.iter().filter(|(_, last)| last.is_none()).map(|(name, _)| name.as_str()).collect();
+    if unused.is_empty() {
+        return Ok(None);
+    }
+    let base = clear_ids_base();
+    for table in unused {
+        sqlx::query("SELECT setval(pg_get_serial_sequence($1, 'id'), $2)")
+            .bind(table)
+            .bind(base)
+            .execute(pool)
+            .await?;
+    }
+    Ok(Some(base))
+}
+
+/// The tables whose ids name cluster objects: claims and pod labels after
+/// the conversation, `sandbox-{id}` pods, volume claims.
+const CLEAR_ID_TABLES: [&str; 3] = ["conversations", "sandbox_pods", "sandbox_volumes"];
+
+/// Far above the low ids a database counts from (the dev database is in
+/// the thousands, every fresh `#[sqlx::test]` one starts at 1, and some
+/// unit tests move their own pod ids to the millions).
+const CLEAR_IDS_BASE: i64 = 2_000_000_000;
+
+/// `CLEAR_IDS_BASE` plus nanoseconds since the epoch folded into a
+/// billion-wide window: a fresh base every call, and still far inside
+/// BIGINT and anything a name or a browser's number can hold.
+fn clear_ids_base() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
+    CLEAR_IDS_BASE + i64::try_from(nanos % 1_000_000_000).unwrap_or_default()
+}
+
+/// Moves `CLEAR_ID_TABLES`' id sequences to `base`: the next id is above it.
+#[cfg(test)]
+async fn move_id_sequences(pool: &PgPool, base: i64) -> Result<(), sqlx::Error> {
+    for table in CLEAR_ID_TABLES {
+        sqlx::query("SELECT setval(pg_get_serial_sequence($1, 'id'), $2)")
+            .bind(table)
+            .bind(base)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 // --- A conversation's git repos (SME-32) ---
 
 #[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
@@ -4739,6 +4840,97 @@ mod tests {
         assert_eq!(list_provider_models(&pool, provider.id).await.expect("list"), vec![row]);
     }
 
+    /// SME-115: an empty database (a scratch, test or fresh one) migrates
+    /// to an instance of its own that owns no unlabelled cluster object.
+    #[sqlx::test]
+    async fn test_an_empty_database_gets_an_instance_that_owns_nothing_unlabelled(pool: PgPool) {
+        let instance = smelt_instance(&pool).await.expect("the instance row");
+        assert_eq!(instance.id.len(), 36, "a UUID: {:?}", instance.id);
+        assert!(!instance.owns_unlabelled, "an empty database must never adopt another's objects");
+        assert_eq!(smelt_instance(&pool).await.expect("read again"), instance, "fixed once made");
+    }
+
+    /// SME-115: a database that already had conversations when it
+    /// migrated (the dev database) owns the objects made before the fix.
+    #[sqlx::test(migrations = false)]
+    async fn test_a_database_with_conversations_before_the_migration_owns_unlabelled_objects(pool: PgPool) {
+        let all = sqlx::migrate!();
+        let before = sqlx::migrate::Migrator {
+            migrations: std::borrow::Cow::Owned(
+                all.iter().filter(|m| m.version < SMELT_INSTANCE_MIGRATION).cloned().collect(),
+            ),
+            ..sqlx::migrate!()
+        };
+        assert!(before.iter().count() < all.iter().count(), "the instance migration is in the set");
+        before.run(&pool).await.expect("migrate up to the instance migration");
+        create_conversation(&pool).await.expect("a conversation from before the fix");
+        all.run(&pool).await.expect("the rest of the migrations");
+
+        let instance = smelt_instance(&pool).await.expect("the instance row");
+        assert!(instance.owns_unlabelled);
+        assert_eq!(instance.id.len(), 36, "a UUID: {:?}", instance.id);
+    }
+
+    /// SME-115: a fresh database (a scratch check server's) starts its
+    /// ids far above the dev database's, so its pods and claims are never
+    /// named like the dev server's; once started, it isn't moved again.
+    #[sqlx::test]
+    async fn test_a_fresh_database_starts_its_ids_clear(pool: PgPool) {
+        let base = start_ids_clear_if_fresh(&pool).await.expect("move them").expect("a fresh database is moved");
+        assert!(base >= 2_000_000_000, "base {base}");
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let pod = create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+        let volume = create_sandbox_volume(&pool, "sme-115", "/data").await.expect("volume row");
+        for (what, id) in [("conversation", conversation.id), ("sandbox pod", pod.id), ("sandbox volume", volume.id)] {
+            assert!(id > base, "the next {what} id is {id}, not above {base}");
+        }
+        assert_eq!(start_ids_clear_if_fresh(&pool).await.expect("again"), None, "moved twice");
+    }
+
+    /// SME-115 review 2: a move that failed partway (one sequence moved,
+    /// the others not) is finished at the next start, instead of leaving
+    /// the rest counting from 1 for good.
+    #[sqlx::test]
+    async fn test_a_partly_moved_database_finishes_the_move(pool: PgPool) {
+        sqlx::query("SELECT setval(pg_get_serial_sequence('conversations', 'id'), 2000000005)")
+            .execute(&pool)
+            .await
+            .expect("move one sequence");
+        let base = start_ids_clear_if_fresh(&pool).await.expect("move them").expect("the rest are moved");
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let pod = create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+        let volume = create_sandbox_volume(&pool, "sme-115", "/data").await.expect("volume row");
+        assert_eq!(conversation.id, 2_000_000_006, "the moved sequence is kept");
+        for (what, id) in [("sandbox pod", pod.id), ("sandbox volume", volume.id)] {
+            assert!(id > base && base >= 2_000_000_000, "the next {what} id is {id}, base {base}");
+        }
+    }
+
+    /// SME-115: a database whose ids were ever used (the dev or production
+    /// database) is left as it is.
+    #[sqlx::test]
+    async fn test_a_used_database_keeps_its_ids(pool: PgPool) {
+        let first = create_conversation(&pool).await.expect("conversation");
+        assert_eq!(start_ids_clear_if_fresh(&pool).await.expect("check"), None);
+        let next = create_conversation(&pool).await.expect("conversation");
+        assert_eq!(next.id, first.id + 1);
+    }
+
+    /// One instance per database: the table takes no second row.
+    #[sqlx::test]
+    async fn test_the_instance_table_holds_one_row(pool: PgPool) {
+        smelt_instance(&pool).await.expect("the instance row");
+        let second = sqlx::query("INSERT INTO smelt_instance (owns_unlabelled) VALUES (false)")
+            .execute(&pool)
+            .await;
+        let refused = second.expect_err("a second instance row was accepted");
+        assert!(
+            refused.as_database_error().is_some_and(|d| d.is_unique_violation()),
+            "refused for the wrong reason: {refused}"
+        );
+    }
+
+
     /// SME-99: the browser tier's ids start clear of every other run's,
     /// for each table whose ids name cluster objects.
     #[sqlx::test]
@@ -4763,34 +4955,16 @@ mod tests {
 pub(crate) mod test_support {
     use sqlx::PgPool;
 
-    /// Where `start_ids_clear_of_other_runs` puts the id sequences: far
-    /// above the low ids every fresh `#[sqlx::test]` database starts at,
-    /// and above the 1,000,000+ range some unit tests move their own pod
-    /// ids to.
-    const CLEAR_IDS_BASE: i64 = 2_000_000_000;
-
     /// Moves the conversation, sandbox pod and sandbox volume id
     /// sequences to a base of their own, different on every call, and
-    /// returns it. Cluster objects are named after these ids (pod labels
-    /// and claims after the conversation, `sandbox-{id}` pods, volume
-    /// claims), and the browser tier shares its namespace with the
+    /// returns it, used or not (unlike `start_ids_clear_if_fresh`, which
+    /// `main` runs). The browser tier shares its namespace with the
     /// real-cluster unit tests, whose databases also count from 1: a run
     /// that met a pod an earlier run was still stopping waited it out
     /// and failed (SME-99).
     pub(crate) async fn start_ids_clear_of_other_runs(pool: &PgPool) -> Result<i64, sqlx::Error> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        // Nanoseconds since the epoch, folded into a billion-wide window
-        // above the base: a fresh base every call, and still far inside
-        // BIGINT and anything a name or a browser's number can hold.
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
-        let base = CLEAR_IDS_BASE + i64::try_from(nanos % 1_000_000_000).unwrap_or_default();
-        for table in ["conversations", "sandbox_pods", "sandbox_volumes"] {
-            sqlx::query("SELECT setval(pg_get_serial_sequence($1, 'id'), $2)")
-                .bind(table)
-                .bind(base)
-                .execute(pool)
-                .await?;
-        }
+        let base = super::clear_ids_base();
+        super::move_id_sequences(pool, base).await?;
         Ok(base)
     }
 }

@@ -104,6 +104,25 @@ async fn main() {
         .expect("failed to run database migrations");
     tracing::info!("database initialized and migrations applied");
 
+    // This database's instance (SME-115): every sandbox call reads it, and
+    // without it adoption, the pod watch and the claim sweep would all
+    // skip, leaving a server that serves with no pod watch at all. A
+    // database that can't give it stops the server, like a failed
+    // migration.
+    if let Err(e) = db::smelt_instance(pool).await {
+        tracing::error!(error = %e, "couldn't read this database's smelt_instance (SME-115)");
+        std::process::exit(1);
+    }
+
+    // A fresh database (a scratch check server's) names its pods and claims
+    // far from the dev server's (SME-115). Ownership checks still hold if
+    // this fails; a name that meets another database's is refused.
+    match db::start_ids_clear_if_fresh(pool).await {
+        Ok(Some(base)) => tracing::info!(base, "a fresh database: its ids start clear of other smelt databases'"),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "couldn't move a fresh database's ids clear of other smelt databases'"),
+    }
+
     mcp::ensure_default_servers(pool).await;
 
     if let Err(e) = sandbox::init().await {
@@ -111,6 +130,11 @@ async fn main() {
         std::process::exit(1);
     }
     tracing::info!("sandbox manager initialized");
+
+    // The dev or production database labels the cluster objects it made
+    // before SME-115 as its own, before the pod watch and the claim sweep,
+    // which see only labelled ones. Awaited: the watch must see them.
+    sandbox::adopt_unlabelled_objects(pool).await;
 
     // Keeps pod records in step with the cluster, so the sidebar's dots
     // and /pods match it. Only here, never in the browser test harness:

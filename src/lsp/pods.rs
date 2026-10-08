@@ -38,6 +38,8 @@ pub struct SandboxRef {
     pub pod_name: String,
     pub pod_uid: String,
     pub node: String,
+    /// The database's instance (SME-115): the server pod is labelled with it.
+    pub instance: String,
 }
 
 /// `lsp-<pod id>-<server>`.
@@ -71,6 +73,7 @@ pub fn server_pod_spec(sandbox: &SandboxRef, config: &LanguageServerConfig, conf
                 LSP_OF_LABEL: sandbox.conversation_id.to_string(),
                 LSP_SERVER_LABEL: config.name,
                 LSP_POD_LABEL: sandbox.pod_id.to_string(),
+                crate::sandbox::INSTANCE_LABEL: sandbox.instance,
             },
             "annotations": {CONFIG_VERSION_ANNOTATION: config_version},
             "ownerReferences": [{
@@ -153,6 +156,16 @@ pub async fn start_with(
     let pods = crate::sandbox::pods_api(client);
     let name = server_pod_name(sandbox.pod_id, &config.name);
     let existing = pods.get_opt(&name).await.map_err(|e| e.to_string())?;
+    // Never another database's pod of the same name (SME-115).
+    if let Some(pod) = &existing
+        && crate::sandbox::ownership(&pod.metadata, &sandbox.instance) != crate::sandbox::Ownership::Ours
+    {
+        return Err(crate::sandbox::SandboxError::NotOurs {
+            name,
+            ownership: crate::sandbox::ownership(&pod.metadata, &sandbox.instance),
+        }
+        .to_string());
+    }
     let created = match existing {
         Some(pod) if pod.metadata.deletion_timestamp.is_none() && !has_stopped(&pod) => false,
         stale => {
@@ -292,9 +305,11 @@ async fn install_rc(client: &kube::Client, name: &str) -> Option<String> {
 }
 
 /// The server pods working for `conversation_id`.
-pub async fn list_with(client: &kube::Client, conversation_id: i64) -> Result<Vec<ServerPod>, String> {
+/// Only this database's (`instance`, SME-115).
+pub async fn list_with(client: &kube::Client, conversation_id: i64, instance: &str) -> Result<Vec<ServerPod>, String> {
     let pods = crate::sandbox::pods_api(client);
-    let selector = kube::api::ListParams::default().labels(&format!("{LSP_OF_LABEL}={conversation_id}"));
+    let selector = kube::api::ListParams::default()
+        .labels(&format!("{LSP_OF_LABEL}={conversation_id},{}={instance}", crate::sandbox::INSTANCE_LABEL));
     let mut servers = Vec::new();
     for pod in pods.list(&selector).await.map_err(|e| e.to_string())? {
         if pod.metadata.deletion_timestamp.is_some() {
@@ -334,11 +349,13 @@ pub async fn list_with(client: &kube::Client, conversation_id: i64) -> Result<Ve
 }
 
 /// Deletes every pod of server `name`, in every conversation: its config
-/// was deleted or disabled.
-pub async fn stop_everywhere_with(client: &kube::Client, name: &str) -> Result<(), String> {
+/// was deleted or disabled. Only this database's (`instance`, SME-115):
+/// another smelt sharing the namespace has its own config.
+pub async fn stop_everywhere_with(client: &kube::Client, name: &str, instance: &str) -> Result<(), String> {
     // One by one: smelt's role can delete pods, not collections of them.
     let pods = crate::sandbox::pods_api(client);
-    let selector = kube::api::ListParams::default().labels(&format!("{LSP_SERVER_LABEL}={name}"));
+    let selector = kube::api::ListParams::default()
+        .labels(&format!("{LSP_SERVER_LABEL}={name},{}={instance}", crate::sandbox::INSTANCE_LABEL));
     for pod in pods.list(&selector).await.map_err(|e| e.to_string())? {
         if let Some(pod_name) = pod.metadata.name {
             pods.delete(&pod_name, &crate::sandbox::pod_delete_params()).await.map_err(|e| e.to_string())?;
@@ -349,10 +366,17 @@ pub async fn stop_everywhere_with(client: &kube::Client, name: &str) -> Result<(
 
 /// Deletes server `name`'s pod for `conversation_id` (to restart it with
 /// newer settings).
-pub async fn stop_everywhere_in(client: &kube::Client, conversation_id: i64, name: &str) -> Result<(), String> {
+pub async fn stop_everywhere_in(
+    client: &kube::Client,
+    conversation_id: i64,
+    name: &str,
+    instance: &str,
+) -> Result<(), String> {
     let pods = crate::sandbox::pods_api(client);
-    let selector = kube::api::ListParams::default()
-        .labels(&format!("{LSP_SERVER_LABEL}={name},{LSP_OF_LABEL}={conversation_id}"));
+    let selector = kube::api::ListParams::default().labels(&format!(
+        "{LSP_SERVER_LABEL}={name},{LSP_OF_LABEL}={conversation_id},{}={instance}",
+        crate::sandbox::INSTANCE_LABEL
+    ));
     for pod in pods.list(&selector).await.map_err(|e| e.to_string())? {
         if let Some(pod_name) = pod.metadata.name {
             pods.delete(&pod_name, &crate::sandbox::pod_delete_params()).await.map_err(|e| e.to_string())?;
@@ -446,6 +470,7 @@ pub(crate) mod tests {
             pod_name: "sandbox-7".to_string(),
             pod_uid: "uid-7".to_string(),
             node: "node-a".to_string(),
+            instance: "instance-a".to_string(),
         }
     }
 
@@ -474,6 +499,7 @@ pub(crate) mod tests {
         assert_eq!(labels.get(LSP_SERVER_LABEL).map(String::as_str), Some("rust-analyzer"));
         assert_eq!(labels.get(LSP_POD_LABEL).map(String::as_str), Some("7"));
         assert!(!labels.contains_key("smelt/conversation"), "the sandbox pod's own label would make create_pod wait on it");
+        assert_eq!(labels.get(crate::sandbox::INSTANCE_LABEL).map(String::as_str), Some("instance-a"), "SME-115");
         assert_eq!(
             meta.annotations.as_ref().and_then(|a| a.get(CONFIG_VERSION_ANNOTATION)).map(String::as_str),
             Some("2026-09-28T08:00:00")
@@ -790,6 +816,7 @@ pub(crate) mod tests {
                         pod_name: name.to_string(),
                         pod_uid: p.metadata.uid.clone().ok_or("the Running pod has no uid")?,
                         node: p.spec.as_ref().and_then(|s| s.node_name.clone()).ok_or("the Running pod has no node")?,
+                        instance: crate::sandbox::TEST_INSTANCE.to_string(),
                     });
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -958,7 +985,7 @@ pub(crate) mod tests {
             outcomes.sort_by_key(|o| format!("{o:?}"));
             assert_eq!(outcomes, vec![Ok(Started::AlreadyRunning), Ok(Started::Started)], "{first:?} {second:?}");
 
-            let listed = list_with(&client, sandbox.conversation_id).await.expect("list");
+            let listed = list_with(&client, sandbox.conversation_id, &sandbox.instance).await.expect("list");
             assert_eq!(listed.len(), 1);
             assert_eq!((listed[0].name.as_str(), &listed[0].state, listed[0].config_version.as_str()), ("echo", &ServerState::Ready, "v1"));
             let pod = crate::sandbox::pods_api(&client).get(&listed[0].pod_name).await.expect("pod");
@@ -981,7 +1008,7 @@ pub(crate) mod tests {
                 .expect("delete the sandbox");
             let mut gone = false;
             for _ in 0..120 {
-                if list_with(&client, sandbox.conversation_id).await.expect("list").is_empty() {
+                if list_with(&client, sandbox.conversation_id, &sandbox.instance).await.expect("list").is_empty() {
                     gone = true;
                     break;
                 }
@@ -997,7 +1024,7 @@ pub(crate) mod tests {
         async fn test_a_failed_install_says_why_and_leaves_nothing() {
             with_sandbox(|client, sandbox| async move {
             let result = start_with(&client, &sandbox, &echo_server("broken", "echo no such package >&2; exit 3"), "v1").await;
-            let listed = list_with(&client, sandbox.conversation_id).await.expect("list");
+            let listed = list_with(&client, sandbox.conversation_id, &sandbox.instance).await.expect("list");
             let error = result.expect_err("the install failed");
             assert!(error.contains("no such package") && error.contains('3'), "{error}");
             assert!(listed.is_empty(), "the failed server's pod was left: {listed:?}");
@@ -1028,7 +1055,7 @@ pub(crate) mod tests {
 
             let mut state = None;
             for _ in 0..120 {
-                state = list_with(&client, sandbox.conversation_id).await.expect("list").pop().map(|p| p.state);
+                state = list_with(&client, sandbox.conversation_id, &sandbox.instance).await.expect("list").pop().map(|p| p.state);
                 if matches!(state, Some(ServerState::Stopped(_))) {
                     break;
                 }
@@ -1042,6 +1069,73 @@ pub(crate) mod tests {
             assert_eq!(start_with(&client, &sandbox, &config, "v1").await, Ok(Started::Started));
             })
             .await;
+        }
+
+        /// SME-115: a server pod of the same name that is another
+        /// database's is refused and left alone, never reused or replaced.
+        #[tokio::test]
+        async fn test_another_databases_server_pod_is_left_alone() {
+            let client = client().await;
+            let pods = crate::sandbox::pods_api(&client);
+            let id = unique();
+            let sandbox = SandboxRef {
+                conversation_id: id,
+                pod_id: id,
+                pod_name: crate::sandbox::pod_name(id),
+                pod_uid: "unused".to_string(),
+                node: "unused".to_string(),
+                instance: crate::sandbox::TEST_INSTANCE.to_string(),
+            };
+            let name = server_pod_name(id, "theirs");
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "metadata": {"name": name, "labels": {
+                    LSP_OF_LABEL: id.to_string(),
+                    LSP_SERVER_LABEL: "theirs",
+                    crate::sandbox::INSTANCE_LABEL: "another-smelt-database",
+                }},
+                "spec": {"containers": [{"name": "server", "image": "smelt.invalid/none:0"}]},
+            }))
+            .expect("pod");
+            pods.create(&PostParams::default(), &pod).await.expect("create pod");
+
+            let started = start_with(&client, &sandbox, &echo_server("theirs", ""), "v1").await;
+            let kept = pods.get_opt(&name).await.expect("read").is_some_and(|p| p.metadata.deletion_timestamp.is_none());
+
+            pods.delete(&name, &DeleteParams { grace_period_seconds: Some(0), ..Default::default() }).await.ok();
+            assert!(started.as_ref().is_err_and(|e| e.contains("SME-115")), "{started:?}");
+            assert!(kept, "another database's server pod was deleted");
+        }
+
+        /// SME-115: stopping a server everywhere (its config was deleted)
+        /// stops only this database's pods of it: another smelt sharing the
+        /// namespace has its own config of that name.
+        #[tokio::test]
+        async fn test_stopping_a_server_everywhere_leaves_another_databases() {
+            let client = client().await;
+            let pods = crate::sandbox::pods_api(&client);
+            let id = unique();
+            let server = format!("stop-{id}");
+            let name = server_pod_name(id, &server);
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "metadata": {"name": name, "labels": {
+                    LSP_OF_LABEL: id.to_string(),
+                    LSP_SERVER_LABEL: server,
+                    crate::sandbox::INSTANCE_LABEL: "another-smelt-database",
+                }},
+                "spec": {"containers": [{"name": "server", "image": "smelt.invalid/none:0"}]},
+            }))
+            .expect("pod");
+            pods.create(&PostParams::default(), &pod).await.expect("create pod");
+
+            let stopped = stop_everywhere_with(&client, &server, crate::sandbox::TEST_INSTANCE).await;
+            let stopped_in = stop_everywhere_in(&client, id, &server, crate::sandbox::TEST_INSTANCE).await;
+            let listed = list_with(&client, id, crate::sandbox::TEST_INSTANCE).await;
+            let kept = pods.get_opt(&name).await.expect("read").is_some_and(|p| p.metadata.deletion_timestamp.is_none());
+
+            pods.delete(&name, &DeleteParams { grace_period_seconds: Some(0), ..Default::default() }).await.ok();
+            assert_eq!((stopped, stopped_in), (Ok(()), Ok(())));
+            assert_eq!(listed, Ok(Vec::new()), "another database's server pod was listed as ours");
+            assert!(kept, "stopping a server everywhere deleted another database's pod");
         }
 
         /// Closing a server's stdin over `pods/exec` reaches the process in
@@ -1091,10 +1185,10 @@ pub(crate) mod tests {
             with_sandbox(|client, sandbox| async move {
             let name = format!("gone-{}", sandbox.conversation_id % 100_000);
             start_with(&client, &sandbox, &echo_server(&name, ""), "v1").await.expect("start");
-            stop_everywhere_with(&client, &name).await.expect("stop");
+            stop_everywhere_with(&client, &name, crate::sandbox::TEST_INSTANCE).await.expect("stop");
             let mut gone = false;
             for _ in 0..120 {
-                if list_with(&client, sandbox.conversation_id).await.expect("list").is_empty() {
+                if list_with(&client, sandbox.conversation_id, &sandbox.instance).await.expect("list").is_empty() {
                     gone = true;
                     break;
                 }

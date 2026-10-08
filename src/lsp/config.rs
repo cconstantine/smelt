@@ -37,7 +37,7 @@ pub fn servers_to_stop(before: Option<&LanguageServerConfig>, after: Option<&Lan
 
 /// Stops the pods `servers_to_stop` names, logging (not failing on) a
 /// cluster that can't be reached: the config change itself is saved.
-pub async fn stop_servers(names: Vec<String>) {
+pub async fn stop_servers(pool: &sqlx::PgPool, names: Vec<String>) {
     let client = match crate::sandbox::kube_client() {
         Ok(client) => client,
         Err(e) => {
@@ -45,8 +45,15 @@ pub async fn stop_servers(names: Vec<String>) {
             return;
         }
     };
+    let instance = match crate::db::smelt_instance(pool).await {
+        Ok(instance) => instance.id,
+        Err(e) => {
+            tracing::warn!(servers = ?names, error = %e, "couldn't read this database's instance to stop language servers");
+            return;
+        }
+    };
     for name in names {
-        if let Err(e) = crate::lsp::pods::stop_everywhere_with(&client, &name).await {
+        if let Err(e) = crate::lsp::pods::stop_everywhere_with(&client, &name, &instance).await {
             tracing::warn!(server = %name, error = %e, "couldn't stop a language server's pods");
         }
     }
