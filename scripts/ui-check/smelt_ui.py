@@ -15,9 +15,15 @@ then a short script of your own:
         t.send("In one short line: what is today's date?")
         t.wait_idle()
         log(t.last_messages(1))
-        t.delete_conversation(cid)
 
     run(check)
+
+`run` deletes every conversation its tabs started, in a `finally`, even when
+the check fails or times out: a conversation's sandbox pod and claims carry
+the check server's scratch-database instance, so once `check-server stop`
+drops that database no server ever deletes them (SME-126 left one behind
+this way). Prefer asks that don't start a sandbox unless the check is about
+one, and give a local model time: `wait_idle` waits 15 minutes by default.
 
 Things that cost a rerun on SME-51, handled here:
 - A conversation page keeps an event stream open, so waiting for "network
@@ -48,8 +54,11 @@ def log(*parts):
 class Tab:
     """One browser tab on the app."""
 
-    def __init__(self, page):
+    def __init__(self, page, started=None):
         self.page = page
+        # Conversation ids this check started, shared by every tab of one
+        # `run`, which deletes them at the end.
+        self.started = started if started is not None else []
 
     # --- Navigation ---
 
@@ -64,7 +73,10 @@ class Tab:
         self.page.click(".new-conversation")
         self.page.wait_for_url(re.compile(r".*/conversation/\d+"), timeout=15000)
         self.page.wait_for_timeout(1000)
-        return self.conversation_id()
+        conversation_id = self.conversation_id()
+        if conversation_id is not None:
+            self.started.append(conversation_id)
+        return conversation_id
 
     def conversation_id(self):
         match = re.search(r"/conversation/(\d+)", self.page.url)
@@ -80,6 +92,8 @@ class Tab:
         self.page.wait_for_timeout(300)
         button.click()
         self.page.wait_for_timeout(2500)
+        if conversation_id in self.started:
+            self.started.remove(conversation_id)
         return True
 
     # --- Turns ---
@@ -149,25 +163,47 @@ class Tab:
 
 def run(check, width=1400, height=900, color_scheme="light"):
     """Runs `check(tab, context)` in a fresh browser. `tab()` opens a new tab
-    in the same browser context, for two-tab checks. Console errors are
-    printed at the end."""
+    in the same browser context, for two-tab checks. Every conversation a tab
+    started with `new_conversation` and didn't delete is deleted at the end,
+    even if the check raised. Console errors are printed at the end."""
     with sync_playwright() as p:
         browser = p.chromium.launch()
         context = browser.new_context(viewport={"width": width, "height": height}, color_scheme=color_scheme)
         errors = []
+        started = []
 
         def tab():
             page = context.new_page()
             page.on("console", lambda m: errors.append(f"console: {m.text}") if m.type == "error" else None)
             page.on("pageerror", lambda e: errors.append(f"page error: {e}"))
-            return Tab(page)
+            return Tab(page, started)
 
         try:
             check(tab, context)
         finally:
+            _delete_started(tab, started)
             if errors:
                 log("browser errors:\n  " + "\n  ".join(errors[:20]))
             browser.close()
+
+
+def _delete_started(tab, started):
+    """Deletes the conversations a check left behind, from a fresh tab."""
+    if not started:
+        return
+    try:
+        cleaner = tab().goto("/")
+    except Exception as e:  # noqa: BLE001 - report and carry on to close the browser
+        log(f"cleanup: couldn't open a tab to delete conversations {started}: {e}")
+        return
+    for conversation_id in list(started):
+        try:
+            if cleaner.delete_conversation(conversation_id):
+                log(f"cleanup: deleted conversation {conversation_id}")
+            else:
+                log(f"cleanup: conversation {conversation_id} not in the sidebar; delete it by hand")
+        except Exception as e:  # noqa: BLE001
+            log(f"cleanup: deleting conversation {conversation_id} failed: {e}")
 
 
 if __name__ == "__main__":
