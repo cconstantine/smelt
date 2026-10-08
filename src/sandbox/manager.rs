@@ -314,7 +314,7 @@ thread_local! {
 pub(super) fn use_test_manager(client: kube::Client) -> &'static SandboxManager {
     // On a multi-thread runtime, a task on another worker would read
     // `MANAGER` instead, and fail as `NotInitialized` (SME-94 review 1).
-    debug_assert_eq!(
+    assert_eq!(
         tokio::runtime::Handle::current().runtime_flavor(),
         tokio::runtime::RuntimeFlavor::CurrentThread,
         "use_test_manager needs a current-thread runtime, as #[sqlx::test] and #[tokio::test] give"
