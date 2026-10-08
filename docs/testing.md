@@ -197,6 +197,20 @@ cargo test --features server -- --exact sandbox::tests::test_name   # exactly on
 
 A name filter matches every test whose path contains it, and several filters are OR'd, so a filter meant for one unit test can also pick up real-cluster tests (on SME-85, `test_a_` matched a claims test that creates pods). To run one test, name it with `--exact` and its full path.
 
+**A real-cluster test runs only this way, under the cluster lock** (see [development-process.md](development-process.md#rules)): on SME-115 a substring filter run outside the lock picked up a new test whose unfixed form was the bug being fixed, and it marked another run's claims in `smelt-park-test` for deletion.
+
+**Gate from a detached gate worktree** when the lock queue is long, so writing the next commit goes on while a gate waits, and nothing edits the tree being gated (see [development-process.md](development-process.md#rules)). A worktree has its own `target/`, so the gate's build never shares artefacts with the branch's:
+
+```bash
+git worktree add --detach ~/smelt-worktrees/gate-<ticket> <commit>
+cd ~/smelt-worktrees/gate-<ticket>
+cargo build --features server && cargo test --features server --no-run   # build outside the lock
+flock "$(git rev-parse --git-common-dir)/smelt-cluster.lock" scripts/check.sh > <scratchpad>/sme-N/gate-<commit>.log 2>&1; rc=$?   # act on rc, not on the log
+git checkout --detach <next commit>   # the next gate, once this one is back
+```
+
+Commit on top of a commit only once its gate passed. Run the browser tier from the gate worktree too. Remove the gate worktree (`git worktree remove`) when the branch merges, with its other worktrees.
+
 Most logic lives behind the `server` feature; plain `cargo test` compiles but skips it.
 
 `scripts/check.sh` is what every commit is gated on (`scripts/check.sh && git commit ...`, see [development-process.md](development-process.md#rules)): the web build (`cargo check` for `wasm32-unknown-unknown`), the server binary build, and the server tests. It fails on any failure, including a warning in either build. It doesn't run the browser tier. The server tests' full log is kept at `target/check/server-tests.log` until the next run.
