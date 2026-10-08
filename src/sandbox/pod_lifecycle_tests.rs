@@ -57,9 +57,13 @@ async fn run_then_tear_down(
     }
 }
 
-/// Deletes every conversation's pods and claims, and every volume's claim,
-/// in the test's database. Best-effort: a failure here mustn't hide the
-/// scenario's own.
+/// Longer than a pod start can take: its claims, then up to 90 s for the
+/// pod to run, then its git setup.
+const POD_START_WAIT: Duration = Duration::from_secs(150);
+
+/// Deletes every conversation's pods and claims, every volume's claim, and
+/// anything else labelled with the test database's instance. Best-effort:
+/// a failure here mustn't hide the scenario's own.
 async fn tear_down(pool: &PgPool, client: &kube::Client) {
     let Ok(instance) = db::smelt_instance(pool).await else {
         eprintln!("couldn't read the test database's instance; its cluster objects are left");
@@ -69,6 +73,18 @@ async fn tear_down(pool: &PgPool, client: &kube::Client) {
         .fetch_all(pool)
         .await
         .unwrap_or_default();
+    // `create_pod` starts a pod in a task of its own, holding the
+    // conversation's start lock, which a cut-off scenario leaves running:
+    // it would make its claims and pod after the deletes below (SME-94
+    // review 1). Wait each start out, and keep its lock for the rest of
+    // the test, so one still queued never runs. No other test shares these
+    // conversation ids.
+    for &conversation_id in &conversations {
+        match tokio::time::timeout(POD_START_WAIT, pod_start_lock(conversation_id).lock_owned()).await {
+            Ok(held) => std::mem::forget(held),
+            Err(_) => eprintln!("conversation {conversation_id}'s pod start outlasted {POD_START_WAIT:?}"),
+        }
+    }
     let pods: Vec<(i64, i64)> = sqlx::query_as("SELECT conversation_id, id FROM sandbox_pods")
         .fetch_all(pool)
         .await
@@ -80,6 +96,59 @@ async fn tear_down(pool: &PgPool, client: &kube::Client) {
     for volume in db::list_sandbox_volumes(pool).await.unwrap_or_default() {
         delete_volume_claim(client, volume.id, &instance).await.ok();
     }
+    // Anything else of this database's: a pod made outside a conversation
+    // (`create_with_docker` with the database's instance), say.
+    let ours = ListParams::default().labels(&format!("{INSTANCE_LABEL}={}", instance.id));
+    let pods = pods_api(client);
+    for name in pods.list(&ours).await.map(|l| l.items).unwrap_or_default().into_iter().filter_map(|p| p.metadata.name) {
+        pods.delete(&name, &pod_delete_params()).await.ok();
+    }
+    let claims = pvc_api(client);
+    for name in claims.list(&ours).await.map(|l| l.items).unwrap_or_default().into_iter().filter_map(|c| c.metadata.name) {
+        claims.delete(&name, &DeleteParams::default()).await.ok();
+    }
+}
+
+/// This database's pods and claims still in the cluster and not being
+/// deleted, by name.
+async fn kept_objects(pool: &PgPool, client: &kube::Client) -> Vec<String> {
+    let instance = db::smelt_instance(pool).await.expect("instance");
+    let ours = ListParams::default().labels(&format!("{INSTANCE_LABEL}={}", instance.id));
+    let pods = pods_api(client).list(&ours).await.expect("list pods").items.into_iter().map(|p| p.metadata);
+    let claims = pvc_api(client).list(&ours).await.expect("list claims").items.into_iter().map(|c| c.metadata);
+    pods.chain(claims)
+        .filter(|meta| meta.deletion_timestamp.is_none())
+        .filter_map(|meta| meta.name)
+        .collect()
+}
+
+/// SME-94 review 1: a scenario cut off while `create_pod`'s start runs in
+/// its own task (here by the time limit) leaves nothing behind. Teardown
+/// waits the start out and keeps its lock, so nothing the start makes
+/// outlives the deletes.
+#[sqlx::test]
+async fn test_teardown_waits_out_a_pod_start_the_scenario_left_running(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    // Cut off as soon as the start is spawned.
+    let cut_off = AssertUnwindSafe(run_then_tear_down(&pool, &client, Duration::ZERO, async {
+        let _ = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await;
+    }))
+    .catch_unwind()
+    .await;
+    // A start still running would make its pod within seconds.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let start_held = pod_start_lock(conversation.id).try_lock().is_err();
+    let kept = kept_objects(&pool, &client).await;
+
+    // This test's own cleanup, whatever happened above.
+    for name in &kept {
+        pods_api(&client).delete(name, &immediate_delete_params()).await.ok();
+        pvc_api(&client).delete(name, &DeleteParams::default()).await.ok();
+    }
+    assert!(cut_off.is_err(), "the scenario should have run out of time");
+    assert!(start_held, "teardown should keep the conversation's pod-start lock, so no start runs after it");
+    assert!(kept.is_empty(), "teardown left a pod start's {kept:?}");
 }
 
 /// Creates and sends a command in one step, waits for it to finish,
