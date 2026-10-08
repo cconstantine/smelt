@@ -472,8 +472,10 @@ mod server {
 
         #[tokio::test]
         async fn test_publish_with_no_subscribers_is_a_noop() {
+            // An id of its own: an event on a shared "conversation 1"
+            // would reach every other test listening on theirs (SME-135).
             publish(
-                1,
+                9_135_000_001,
                 ConversationEvent::SandboxCommandUpdate {
                     terminal_id: 1,
                     command_id: "t1".to_string(),
@@ -491,7 +493,7 @@ mod server {
 
         #[tokio::test]
         async fn test_subscribe_then_publish_delivers_event() {
-            let mut rx = subscribe(2);
+            let mut rx = subscribe(9_135_000_002);
             let event = ConversationEvent::SandboxCommandUpdate {
                 terminal_id: 1,
                 command_id: "t1".to_string(),
@@ -502,15 +504,15 @@ mod server {
                 latest_output: Some("count: 1/5".to_string()),
                 position: None,
             };
-            publish(2, event.clone());
+            publish(9_135_000_002, event.clone());
 
             assert_eq!(rx.recv().await.expect("event should be delivered"), event);
         }
 
         #[tokio::test]
         async fn test_two_subscribers_both_receive_same_event() {
-            let mut rx1 = subscribe(3);
-            let mut rx2 = subscribe(3);
+            let mut rx1 = subscribe(9_135_000_003);
+            let mut rx2 = subscribe(9_135_000_003);
             let event = ConversationEvent::SandboxCommandUpdate {
                 terminal_id: 1,
                 command_id: "t1".to_string(),
@@ -521,7 +523,7 @@ mod server {
                 latest_output: None,
                 position: None,
             };
-            publish(3, event.clone());
+            publish(9_135_000_003, event.clone());
 
             assert_eq!(rx1.recv().await.expect("rx1 should receive"), event);
             assert_eq!(rx2.recv().await.expect("rx2 should receive"), event);
@@ -529,7 +531,7 @@ mod server {
 
         #[tokio::test]
         async fn test_events_are_scoped_per_conversation() {
-            let mut rx_a = subscribe(4);
+            let mut rx_a = subscribe(9_135_000_004);
             let rx_b_event = ConversationEvent::SandboxCommandUpdate {
                 terminal_id: 1,
                 command_id: "t1".to_string(),
@@ -540,7 +542,7 @@ mod server {
                 latest_output: None,
                 position: None,
             };
-            publish(5, rx_b_event);
+            publish(9_135_000_005, rx_b_event);
 
             let a_event = ConversationEvent::SandboxCommandUpdate {
                 terminal_id: 1,
@@ -552,12 +554,12 @@ mod server {
                 latest_output: None,
                 position: None,
             };
-            publish(4, a_event.clone());
+            publish(9_135_000_004, a_event.clone());
 
             assert_eq!(
                 rx_a.recv()
                     .await
-                    .expect("conversation 4's subscriber should see its own event"),
+                    .expect("conversation 9_135_000_004's subscriber should see its own event"),
                 a_event
             );
         }
@@ -569,14 +571,14 @@ mod server {
         /// and is delivered back equal to what was sent).
         #[tokio::test]
         async fn test_sandbox_variants_round_trip_the_bus() {
-            let mut rx = subscribe(6);
+            let mut rx = subscribe(9_135_000_006);
 
             let pod_event = ConversationEvent::SandboxPodUpdate {
                 pod_id: 1,
                 status: "Running".to_string(),
                 terminated: false,
             };
-            publish(6, pod_event.clone());
+            publish(9_135_000_006, pod_event.clone());
             assert_eq!(
                 rx.recv().await.expect("pod event should be delivered"),
                 pod_event
@@ -588,7 +590,7 @@ mod server {
                 status: "connected".to_string(),
                 terminated: false,
             };
-            publish(6, terminal_event.clone());
+            publish(9_135_000_006, terminal_event.clone());
             assert_eq!(
                 rx.recv().await.expect("terminal event should be delivered"),
                 terminal_event
@@ -604,7 +606,7 @@ mod server {
                 latest_output: Some("hi".to_string()),
                 position: None,
             };
-            publish(6, command_event.clone());
+            publish(9_135_000_006, command_event.clone());
             assert_eq!(
                 rx.recv().await.expect("command event should be delivered"),
                 command_event
@@ -613,7 +615,7 @@ mod server {
             let failure_event = ConversationEvent::NotificationDeliveryFailed {
                 detail: "No model is chosen for this conversation.".to_string(),
             };
-            publish(6, failure_event.clone());
+            publish(9_135_000_006, failure_event.clone());
             assert_eq!(
                 rx.recv()
                     .await
@@ -630,7 +632,7 @@ mod server {
                 },
                 context_window: 200_000,
             };
-            publish(6, context_usage_event.clone());
+            publish(9_135_000_006, context_usage_event.clone());
             assert_eq!(
                 rx.recv()
                     .await
