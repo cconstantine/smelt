@@ -22,6 +22,9 @@ pub(super) trait AgentDialer: Send + Sync {
     /// `Some(reason)` once the cluster says the pod is dead, `None` while it
     /// may still be alive. See `pod_death_reason`.
     fn death_reason(&self, pod_id: i64) -> BoxFuture<'_, Option<Option<String>>>;
+    /// The image the pod's sandbox container runs, `None` if that can't be
+    /// read (SME-121).
+    fn image(&self, pod_id: i64) -> BoxFuture<'_, Option<String>>;
 }
 
 /// A port-forward to the agent's port in the pod. Another database's pod
@@ -53,6 +56,19 @@ impl AgentDialer for ClusterDialer {
     fn death_reason(&self, pod_id: i64) -> BoxFuture<'_, Option<Option<String>>> {
         Box::pin(async move { pod_death_reason(&pods_api(&self.0), &pod_name(pod_id), &self.1).await })
     }
+
+    fn image(&self, pod_id: i64) -> BoxFuture<'_, Option<String>> {
+        Box::pin(async move {
+            let pod = read_our_pod(&pods_api(&self.0), &pod_name(pod_id), &self.1).await.ok()??;
+            sandbox_container_image(&pod)
+        })
+    }
+}
+
+/// The image of `pod`'s `sandbox` container.
+pub(super) fn sandbox_container_image(pod: &Pod) -> Option<String> {
+    let spec = pod.spec.as_ref()?;
+    spec.containers.iter().find(|c| c.name == "sandbox")?.image.clone()
 }
 
 /// The dialer for `pod_id`: the cluster, unless a test put a fake agent in
@@ -204,9 +220,39 @@ pub(super) struct Registry {
     pub(super) connections: HashMap<i64, Arc<TerminalConnection>>,
     /// Pod ids never come back, so this is never cleared.
     pub(super) torn_down: std::collections::HashSet<i64>,
-    /// Pods whose agent speaks another major (or none): `found` from its
-    /// hello. The image can't change under a pod, so it doesn't expire.
-    pub(super) outdated: HashMap<i64, Option<ProtocolVersion>>,
+    /// Pods whose agent speaks another major (or none), and the image each
+    /// runs. The image can't change under a pod, so it doesn't expire.
+    pub(super) outdated: HashMap<i64, Outdated>,
+}
+
+/// What smelt learned from a pod whose agent it refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Outdated {
+    /// From its hello; `None` for an agent from before versioning.
+    pub(super) found: Option<ProtocolVersion>,
+    /// The image its sandbox container runs, if it could be read.
+    pub(super) image: Option<String>,
+}
+
+impl Outdated {
+    /// The error a caller gets, its advice decided by comparing the pod's
+    /// image with the one a new pod gets now.
+    pub(super) fn error(&self) -> TerminalError {
+        TerminalError::AgentOutdated {
+            found: self.found,
+            image: judge_image(self.image.as_deref(), &default_sandbox_image()),
+        }
+    }
+}
+
+/// How a refused pod's `image` compares with `new`, the image a new pod
+/// gets.
+pub(super) fn judge_image(image: Option<&str>, new: &str) -> PodImage {
+    match image {
+        Some(image) if image == new => PodImage::SameAsNew(image.to_string()),
+        Some(_) => PodImage::Older,
+        None => PodImage::Unknown,
+    }
 }
 
 pub(super) static REGISTRY: LazyLock<StdMutex<Registry>> = LazyLock::new(Default::default);
@@ -293,9 +339,9 @@ pub(super) fn deregister_if_current(pod_id: i64, conn: &Arc<TerminalConnection>)
     }
 }
 
-/// `Some(found)` if the pod's agent is known to be outdated.
-pub(super) fn outdated(pod_id: i64) -> Option<Option<ProtocolVersion>> {
-    registry().outdated.get(&pod_id).copied()
+/// What smelt knows of the pod's agent, if it's known to be outdated.
+pub(super) fn outdated(pod_id: i64) -> Option<Outdated> {
+    registry().outdated.get(&pod_id).cloned()
 }
 
 /// How an agent on `agent` compares with a smelt on `smelt` of the same
@@ -314,9 +360,10 @@ pub(super) fn classify_agent(agent: ProtocolVersion, smelt: ProtocolVersion) -> 
 /// or that it's outdated. `None` while smelt holds no connection to it.
 pub fn agent_status(pod_id: i64) -> Option<crate::api::pods::AgentStatus> {
     let registry = registry();
-    if let Some(found) = registry.outdated.get(&pod_id) {
+    if let Some(outdated) = registry.outdated.get(&pod_id) {
         return Some(crate::api::pods::AgentStatus::RestartRequired {
-            version: found.map(|version| version.to_string()),
+            version: outdated.found.map(|version| version.to_string()),
+            rebuild_image: matches!(outdated.error(), TerminalError::AgentOutdated { image: PodImage::SameAsNew(_), .. }),
         });
     }
     let conn = registry.connections.get(&pod_id)?;
@@ -392,8 +439,8 @@ pub(super) fn connect_with_retry(
     mode: ConnectMode,
 ) -> BoxFuture<'static, Result<Arc<TerminalConnection>, TerminalError>> {
     Box::pin(async move {
-        if let Some(found) = outdated(pod_id) {
-            return Err(TerminalError::AgentOutdated { found });
+        if let Some(outdated) = outdated(pod_id) {
+            return Err(outdated.error());
         }
         let lock = pod_connect_lock(pod_id);
         let _connecting = lock.lock().await;
@@ -402,8 +449,8 @@ pub(super) fn connect_with_retry(
         if let Some(conn) = registry_get(pod_id) {
             return Ok(conn);
         }
-        if let Some(found) = outdated(pod_id) {
-            return Err(TerminalError::AgentOutdated { found });
+        if let Some(outdated) = outdated(pod_id) {
+            return Err(outdated.error());
         }
 
         let instance = db::smelt_instance(&pool).await?;
@@ -431,13 +478,14 @@ pub(super) fn connect_with_retry(
             };
             match failure {
                 ConnectError::Outdated { found, certain } => {
-                    tracing::warn!(pod_id, ?found, certain, "the sandbox agent is outdated");
+                    let outdated = Outdated { found, image: dialer.image(pod_id).await };
+                    tracing::warn!(pod_id, ?found, certain, image = ?outdated.image, "the sandbox agent is outdated");
                     // Silence might be a slow link rather than an old agent,
                     // so only a message that says so is remembered.
                     if certain {
-                        registry().outdated.insert(pod_id, found);
+                        registry().outdated.insert(pod_id, outdated.clone());
                     }
-                    return Err(TerminalError::AgentOutdated { found });
+                    return Err(outdated.error());
                 }
                 ConnectError::Failed(e) => {
                     tracing::info!(pod_id, attempt, error = %e, "couldn't connect to the sandbox agent");

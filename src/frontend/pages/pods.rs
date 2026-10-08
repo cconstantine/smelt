@@ -259,8 +259,12 @@ mod tests {
             "Running \u{b7} agent 1.0"
         );
         assert_eq!(
-            status_text(Some("Running"), Some(&AgentStatus::RestartRequired { version: None })),
+            status_text(Some("Running"), Some(&AgentStatus::RestartRequired { version: None, rebuild_image: false })),
             "Running \u{b7} old agent, restart required"
+        );
+        assert_eq!(
+            status_text(Some("Running"), Some(&AgentStatus::RestartRequired { version: None, rebuild_image: true })),
+            "Running \u{b7} old agent, image needs rebuilding"
         );
     }
 
