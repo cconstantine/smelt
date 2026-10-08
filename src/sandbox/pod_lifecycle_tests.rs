@@ -772,6 +772,9 @@ async fn test_try_reconnect_restores_a_lost_connection_to_a_healthy_pod(pool: Pg
             Some("connected"),
             "try_reconnect should reconnect to the still-healthy pod"
         );
+        // And the connection works: the terminal and pod close through it.
+        terminate_terminal(&pool, terminal).await.expect("terminate_terminal over the new connection");
+        terminate_pod(&pool, conversation.id).await.expect("terminate_pod after reconnecting");
     })
     .await;
 }
@@ -814,6 +817,10 @@ async fn test_a_conversations_workspace_outlives_its_pod(pool: PgPool) {
                 .await
                 .expect("clone_repo");
         }
+        // A failed clone's record outlives the pod too.
+        crate::git::clone_repo(&pool, conversation.id, "file:///tmp/origin.git", Some("nope"), Some("failed"))
+            .await
+            .expect_err("there's no branch nope");
         // Loaded, then edited in the checkout, alongside a file not
         // committed yet.
         crate::git::load_instructions(&pool, conversation.id, "/workspace/origin/AGENTS.md")
@@ -847,10 +854,11 @@ async fn test_a_conversations_workspace_outlives_its_pod(pool: PgPool) {
             kept.stderr
         );
         let repos = crate::git::list_repos(&pool, conversation.id).await.expect("list repos");
-        assert_eq!(repos.len(), 2, "origin, again: {repos:?}");
+        assert_eq!(repos.len(), 3, "origin, again, failed: {repos:?}");
         assert_eq!(repos[0].status, crate::git::RepoStatus::Ready, "{repos:?}");
         assert_eq!(repos[0].loaded_instructions, vec!["AGENTS.md".to_string()], "{repos:?}");
         assert_eq!(repos[1].status, crate::git::RepoStatus::Ready, "{repos:?}");
+        assert_eq!(repos[2].status, crate::git::RepoStatus::Failed, "{repos:?}");
         terminate_pod(&pool, conversation.id).await.expect("terminate the second pod");
         let pods_after = list_pods(&pool, conversation.id).await.expect("list_pods");
         assert!(pods_after.is_empty(), "no pods should be listed after terminating it, got {pods_after:?}");
@@ -1346,12 +1354,16 @@ async fn test_create_pod_sets_up_one_live_pod_per_conversation(pool: PgPool) {
             matches!(repeat, Err(TerminalError::NoPod)),
             "a second terminate_pod should find no pod, got {repeat:?}"
         );
+        // A conversation that never had a pod, and an id with no
+        // conversation at all.
         let never = db::create_conversation(&pool).await.expect("create conversation");
-        let unknown = terminate_pod(&pool, never.id).await;
-        assert!(
-            matches!(unknown, Err(TerminalError::NoPod)),
-            "terminate_pod on a conversation that never had a pod should be NoPod, got {unknown:?}"
-        );
+        for unknown_id in [never.id, 999_999_999] {
+            let unknown = terminate_pod(&pool, unknown_id).await;
+            assert!(
+                matches!(unknown, Err(TerminalError::NoPod)),
+                "terminate_pod on {unknown_id}, which never had a pod, should be NoPod, got {unknown:?}"
+            );
+        }
     })
     .await;
 }
