@@ -2431,6 +2431,25 @@ async fn test_a_record_whose_pod_is_another_databases_is_closed_and_the_pod_left
     assert!(kept, "closing the record deleted another database's pod");
 }
 
+/// SME-115 review 2: the adoption patch holds the object to its identity
+/// (its uid: the API server refuses a patch carrying another uid, 422),
+/// not its whole version: a new pod's status changes several times a
+/// second, and a `resourceVersion` precondition failed both tries and
+/// left it unadopted.
+#[test]
+fn test_the_adoption_patch_is_held_to_the_objects_uid_not_its_version() {
+    let meta = ObjectMeta {
+        name: Some("sandbox-401".to_string()),
+        uid: Some("uid-401".to_string()),
+        resource_version: Some("12345".to_string()),
+        ..Default::default()
+    };
+    let patch = adoption_patch(&meta, "ours");
+    assert_eq!(patch["metadata"]["labels"][INSTANCE_LABEL], "ours");
+    assert_eq!(patch["metadata"]["uid"], "uid-401");
+    assert!(patch["metadata"].get("resourceVersion").is_none(), "{patch}");
+}
+
 fn owner() -> db::SmeltInstance {
     db::SmeltInstance { id: "ours".to_string(), owns_unlabelled: true }
 }

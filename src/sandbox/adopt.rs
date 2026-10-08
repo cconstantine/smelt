@@ -122,10 +122,25 @@ pub(super) async fn adopt_unlabelled_objects_with(client: &kube::Client, pool: &
     }
 }
 
+/// The merge patch that labels `meta`'s object with `instance`, held to
+/// the object's identity: the API server refuses a patch carrying another
+/// uid (422), so an object deleted and made again since it was read isn't
+/// labelled. Not its `resourceVersion`: a pod's status changes several
+/// times a second while it starts, which failed every try (SME-115
+/// review 2). Adding one label overwrites nothing else.
+pub(super) fn adoption_patch(meta: &ObjectMeta, instance: &str) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": {
+            "labels": {INSTANCE_LABEL: instance},
+            "uid": meta.uid,
+        }
+    })
+}
+
 /// Labels `object` with `instance` if `decide` says so; otherwise leaves
-/// it, logged. The patch carries the object's `resourceVersion`, so one
-/// changed since it was listed fails the patch instead of being
-/// overwritten: it's read again and decided again, once.
+/// it, logged. The patch is held to the object's uid (`adoption_patch`):
+/// one replaced since it was listed fails it, and is read again and
+/// decided again, once.
 async fn adopt_if<K>(api: &Api<K>, object: K, instance: &str, decide: impl Fn(&ObjectMeta) -> bool)
 where
     K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
@@ -134,24 +149,23 @@ where
     for attempt in 0..2 {
         let meta = object.meta();
         let Some(name) = meta.name.clone() else { return };
+        if meta.uid.is_none() {
+            tracing::warn!(object = %name, "an object with no uid; not adopted");
+            return;
+        }
         if !decide(meta) {
             if attempt == 0 {
                 tracing::info!(object = %name, "left an object with no smelt/instance label: not this database's to adopt");
             }
             return;
         }
-        let patch = serde_json::json!({
-            "metadata": {
-                "labels": {INSTANCE_LABEL: instance},
-                "resourceVersion": meta.resource_version,
-            }
-        });
+        let patch = adoption_patch(meta, instance);
         match api.patch(&name, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&patch)).await {
             Ok(_) => {
                 tracing::info!(object = %name, "adopted an object made before SME-115");
                 return;
             }
-            Err(kube::Error::Api(e)) if e.code == 409 && attempt == 0 => match api.get_opt(&name).await {
+            Err(kube::Error::Api(e)) if (e.code == 409 || e.code == 422) && attempt == 0 => match api.get_opt(&name).await {
                 Ok(Some(fresh)) => object = fresh,
                 Ok(None) => return,
                 Err(e) => {
