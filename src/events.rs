@@ -271,6 +271,8 @@ mod server {
     /// the first subscriber; the last one to go takes it away again
     /// (`Subscription`'s drop).
     pub fn subscribe(conversation_id: i64) -> Subscription {
+        #[cfg(test)]
+        refuse_an_id_test_databases_share(conversation_id);
         let mut buses = BUSES.lock().unwrap_or_else(|e| e.into_inner());
         let sender = buses
             .entry(conversation_id)
@@ -351,9 +353,31 @@ mod server {
         APP_BUS.subscribe()
     }
 
+    /// Below this, a conversation id is one every `#[sqlx::test]`
+    /// database hands out: each numbers conversations from 1, and tests run
+    /// alongside each other in one process, so two tests' "conversation 1"
+    /// are one channel. No test database gets near it; the ids tests pick
+    /// by hand, and `db::test_support::start_ids_clear_of_other_runs`'s
+    /// bases, are far above it (SME-135).
+    #[cfg(test)]
+    pub(crate) const TEST_SHARED_IDS_END: i64 = 100_000;
+
+    /// In tests, refuses to listen on an id another test's database also
+    /// hands out: what such a test hears, or counts, depends on what runs
+    /// alongside it. Before the map's lock, so the panic can't poison it.
+    #[cfg(test)]
+    fn refuse_an_id_test_databases_share(conversation_id: i64) {
+        assert!(
+            conversation_id >= TEST_SHARED_IDS_END,
+            "conversation {conversation_id}: tests subscribe only on a conversation id of their own; \
+             see docs/testing.md, Tests that touch per-conversation state"
+        );
+    }
+
     /// How many live subscriptions `conversation_id` has.
     #[cfg(test)]
     pub fn subscriber_count(conversation_id: i64) -> usize {
+        refuse_an_id_test_databases_share(conversation_id);
         BUSES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -364,6 +388,7 @@ mod server {
     /// Whether `conversation_id` has a channel at all.
     #[cfg(test)]
     pub fn has_channel(conversation_id: i64) -> bool {
+        refuse_an_id_test_databases_share(conversation_id);
         BUSES.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&conversation_id)
     }
 
@@ -371,6 +396,26 @@ mod server {
     mod tests {
         use super::super::TokenUsage;
         use super::*;
+
+        /// SME-135: a test listening on an id every test database hands
+        /// out (conversation 1, say) would hear, or count, other tests'
+        /// events depending on what runs alongside it; it's refused.
+        #[test]
+        #[should_panic(expected = "tests subscribe only on a conversation id of their own")]
+        fn test_subscribing_on_an_id_test_databases_share_is_refused() {
+            let _subscription = subscribe(1);
+        }
+
+        /// The ids tests do pick, by hand or from
+        /// `start_ids_clear_of_other_runs`, are all above the shared range.
+        #[test]
+        fn test_an_id_above_the_shared_range_can_be_subscribed() {
+            let conversation_id = TEST_SHARED_IDS_END;
+            let subscription = subscribe(conversation_id);
+            assert_eq!(subscriber_count(conversation_id), 1);
+            drop(subscription);
+            assert!(!has_channel(conversation_id));
+        }
 
         /// SME-91: a conversation's channel (about 150 KB) goes with its
         /// last subscriber, rather than staying for good.
