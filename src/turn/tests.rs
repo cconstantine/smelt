@@ -1847,7 +1847,7 @@ async fn test_a_cut_off_reply_is_followed_by_a_notice(pool: PgPool) {
 
     let saved = run_turn(&pool, conversation.id, hello()).await.expect("a cut-off turn still succeeds");
 
-    let notice = cut_off_notice(16_384, ReplyLimit::OutputCap);
+    let notice = cut_off_notice(16_384, ReplyLimit::OutputCap, None);
     let texts: Vec<(String, String)> = saved
         .iter()
         .map(|m| (m.role.clone(), m.content.clone()))
@@ -1862,7 +1862,7 @@ async fn test_a_cut_off_reply_is_followed_by_a_notice(pool: PgPool) {
     assert_eq!(notice_text, notice);
     assert_eq!(
         crate::api::chat::parse_cut_off_notice(&notice_text),
-        Some((16_384, ReplyLimit::OutputCap)),
+        Some((16_384, ReplyLimit::OutputCap, None)),
         "an unsized Anthropic model's cap bound it"
     );
     let mut published = false;
@@ -1877,6 +1877,171 @@ async fn test_a_cut_off_reply_is_followed_by_a_notice(pool: PgPool) {
     assert_eq!(saved.len(), 2, "no notice after a finished reply");
     let requests = requests.lock().expect("the request log");
     assert_eq!(requests[0]["max_tokens"], 16_384);
+}
+
+/// A reply cut off at `max_tokens` (60 tokens written): `blocks` in
+/// Anthropic's order, each a content block's SSE events.
+fn cut_off_in_a_call_body(blocks: &[[String; 3]]) -> String {
+    let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}"#;
+    let end = r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":60}}"#;
+    std::iter::once(start)
+        .chain(blocks.iter().flatten().map(String::as_str))
+        .chain([end, r#"{"type":"message_stop"}"#])
+        .map(|data| format!("data: {data}\n\n"))
+        .collect()
+}
+
+/// A text block at `index`, started, written and stopped.
+fn text_events(index: usize, text: &str) -> [String; 3] {
+    [
+        format!(r#"{{"type":"content_block_start","index":{index},"content_block":{{"type":"text","text":""}}}}"#),
+        format!(r#"{{"type":"content_block_delta","index":{index},"delta":{{"type":"text_delta","text":"{text}"}}}}"#),
+        format!(r#"{{"type":"content_block_stop","index":{index}}}"#),
+    ]
+}
+
+/// A `todowrite` call at `index` with `input` (escaped for a JSON string)
+/// as its input so far, started, written and stopped.
+fn todowrite_events(index: usize, id: &str, input: &str) -> [String; 3] {
+    [
+        format!(r#"{{"type":"content_block_start","index":{index},"content_block":{{"type":"tool_use","id":"{id}","name":"todowrite","input":{{}}}}}}"#),
+        format!(r#"{{"type":"content_block_delta","index":{index},"delta":{{"type":"input_json_delta","partial_json":"{input}"}}}}"#),
+        format!(r#"{{"type":"content_block_stop","index":{index}}}"#),
+    ]
+}
+
+const WHOLE_TODOS: &str = r#"{\"todos\":[{\"content\":\"a\",\"status\":\"pending\"}]}"#;
+const CUT_TODOS: &str = r#"{\"todos\":[{\"content\":\"a long"#;
+
+fn only_text(message: &crate::models::Message) -> String {
+    match message.blocks().expect("blocks").as_slice() {
+        [anthropic::ContentBlock::Text { text }] => text.clone(),
+        other => panic!("one text block: {other:?}"),
+    }
+}
+
+/// SME-126: a reply cut off at its limit in the middle of a tool call
+/// keeps its text and gets the notice naming the call, which never runs;
+/// its usage is recorded, and the next request sends the reply, the
+/// notice and the next message, and is accepted.
+#[sqlx::test]
+async fn test_a_reply_cut_off_in_a_call_keeps_its_text_and_names_the_call(pool: PgPool) {
+    use crate::api::chat::{ReplyLimit, cut_off_notice};
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let body = cut_off_in_a_call_body(&[text_events(0, "Writing the list."), todowrite_events(1, "toolu_cut", CUT_TODOS)]);
+    let requests = start_recording_mock_upstream(&pool, vec![body, text_reply_body("Done.")]).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("a call cut off doesn't fail the turn");
+
+    let roles: Vec<&str> = saved.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "user"], "{saved:?}");
+    assert_eq!(only_text(&saved[1]), "Writing the list.", "the reply's text, without the call");
+    assert_eq!(only_text(&saved[2]), cut_off_notice(16_384, ReplyLimit::OutputCap, Some("todowrite")));
+    assert!(db::get_conversation_todos(&pool, conversation.id).await.expect("todos").is_empty(), "the cut call never ran");
+    let output: Vec<i64> = sqlx::query_scalar("SELECT output_tokens FROM model_call_usage WHERE conversation_id = $1")
+        .bind(conversation.id)
+        .fetch_all(&pool)
+        .await
+        .expect("the recorded calls");
+    assert_eq!(output, [60], "the cut-off call's usage is recorded");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the next turn is accepted");
+    let requests = requests.lock().expect("the request log");
+    let sent: Vec<(String, serde_json::Value)> = requests[1]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|m| (m["role"].as_str().expect("a role").to_string(), m["content"].clone()))
+        .collect();
+    let roles: Vec<&str> = sent.iter().map(|(role, _)| role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "user", "user"], "{sent:?}");
+    assert_eq!(sent[1].1, serde_json::json!([{"type": "text", "text": "Writing the list."}]));
+    assert!(sent[2].1.to_string().contains("in the middle of a call to `todowrite`"), "{sent:?}");
+    assert!(!requests[1].to_string().contains("toolu_cut"), "the dropped call appears nowhere");
+}
+
+/// SME-126: complete calls before the cut one are kept, not run, and
+/// each gets a saved "not run" result, sent right after the call.
+#[sqlx::test]
+async fn test_whole_calls_before_a_cut_one_are_kept_with_a_not_run_result(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let body = cut_off_in_a_call_body(&[todowrite_events(0, "toolu_whole", WHOLE_TODOS), todowrite_events(1, "toolu_cut", CUT_TODOS)]);
+    let requests = start_recording_mock_upstream(&pool, vec![body, text_reply_body("Done.")]).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("a call cut off doesn't fail the turn");
+
+    let roles: Vec<&str> = saved.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "user", "user"], "the message, the reply, its results, the notice: {saved:?}");
+    assert!(
+        matches!(saved[1].blocks().expect("blocks").as_slice(), [anthropic::ContentBlock::ToolUse { id, .. }] if id == "toolu_whole"),
+        "{saved:?}"
+    );
+    assert_eq!(
+        saved[2].blocks().expect("blocks"),
+        vec![anthropic::ContentBlock::ToolResult {
+            tool_use_id: "toolu_whole".to_string(),
+            content: CUT_OFF_TOOL_CALL.to_string(),
+            is_error: Some(true),
+        }]
+    );
+    assert!(crate::api::chat::parse_cut_off_notice(&only_text(&saved[3])).is_some(), "{saved:?}");
+    assert!(db::get_conversation_todos(&pool, conversation.id).await.expect("todos").is_empty(), "neither call ran");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the next turn is accepted");
+    let requests = requests.lock().expect("the request log");
+    let sent = requests[1]["messages"].as_array().expect("messages");
+    assert_eq!(sent[2]["content"][0]["tool_use_id"], "toolu_whole", "the result follows the call: {sent:?}");
+    assert_eq!(sent[2]["content"][0]["content"], CUT_OFF_TOOL_CALL);
+}
+
+/// SME-126 review 1: a cut-off reply's whole calls get their "not run"
+/// results right after the reply is saved, so a failure after that (here
+/// recording the call's usage) doesn't leave them to be answered as
+/// stopped mid-run, which they weren't.
+#[sqlx::test]
+async fn test_not_run_results_are_saved_before_anything_that_can_fail(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let body = cut_off_in_a_call_body(&[todowrite_events(0, "toolu_whole", WHOLE_TODOS), todowrite_events(1, "toolu_cut", CUT_TODOS)]);
+    start_recording_mock_upstream(&pool, vec![body]).await;
+    sqlx::query("ALTER TABLE model_call_usage RENAME TO model_call_usage_gone")
+        .execute(&pool)
+        .await
+        .expect("make recording the call fail");
+
+    run_turn(&pool, conversation.id, hello()).await.expect_err("recording the call fails the turn");
+
+    let saved = db::list_messages(&pool, conversation.id).await.expect("messages");
+    let roles: Vec<&str> = saved.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "user"], "the message, the reply and its results: {saved:?}");
+    assert_eq!(
+        saved[2].blocks().expect("blocks"),
+        vec![anthropic::ContentBlock::ToolResult {
+            tool_use_id: "toolu_whole".to_string(),
+            content: CUT_OFF_TOOL_CALL.to_string(),
+            is_error: Some(true),
+        }]
+    );
+}
+
+/// SME-126: a reply that is nothing but the cut call saves no assistant
+/// message (the API refuses an empty one); the notice follows the
+/// user's message alone.
+#[sqlx::test]
+async fn test_a_reply_that_is_only_the_cut_call_saves_just_the_notice(pool: PgPool) {
+    use crate::api::chat::{ReplyLimit, cut_off_notice};
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let body = cut_off_in_a_call_body(&[todowrite_events(0, "toolu_cut", CUT_TODOS)]);
+    start_recording_mock_upstream(&pool, vec![body]).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("a call cut off doesn't fail the turn");
+
+    let roles: Vec<&str> = saved.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user", "user"], "{saved:?}");
+    assert_eq!(only_text(&saved[1]), cut_off_notice(16_384, ReplyLimit::OutputCap, Some("todowrite")));
 }
 
 /// SME-111 review 2: a reply bound by an Anthropic model's own reported
@@ -1902,7 +2067,7 @@ async fn test_a_reply_at_the_models_own_cap_doesnt_say_raise_it(pool: PgPool) {
         [anthropic::ContentBlock::Text { text }] => text.clone(),
         other => panic!("one text block: {other:?}"),
     };
-    assert_eq!(parse_cut_off_notice(&notice), Some((8_192, ReplyLimit::ModelMaximum)));
+    assert_eq!(parse_cut_off_notice(&notice), Some((8_192, ReplyLimit::ModelMaximum, None)));
 }
 
 /// SME-111 review 1: a reply the context window stopped
@@ -1929,7 +2094,7 @@ async fn test_a_reply_the_window_stopped_gets_a_room_left_notice(pool: PgPool) {
     };
     assert_eq!(
         parse_cut_off_notice(&notice),
-        Some((9_000, ReplyLimit::RoomLeft)),
+        Some((9_000, ReplyLimit::RoomLeft, None)),
         "what it wrote, not the budget it didn't reach (review 2)"
     );
 }

@@ -228,9 +228,10 @@ pub(super) fn system_notice(text: &str, commands: &HashMap<String, String>) -> O
     if text == crate::api::chat::STOP_NOTICE {
         return Some("Stopped.".to_string());
     }
-    if let Some((tokens, limit)) = crate::api::chat::parse_cut_off_notice(text) {
+    if let Some((tokens, limit, cut_call)) = crate::api::chat::parse_cut_off_notice(text) {
+        let call = cut_call.map(|name| format!(" in the middle of a `{name}` call, which didn't run")).unwrap_or_default();
         return Some(format!(
-            "The reply was cut off at its limit of {} tokens ({}). {}",
+            "The reply was cut off at its limit of {} tokens ({}){call}. {}",
             crate::frontend::pages::providers::group_digits(tokens),
             limit.reason(),
             limit.hint()
