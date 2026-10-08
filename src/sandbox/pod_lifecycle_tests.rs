@@ -44,8 +44,6 @@ async fn run_then_tear_down(
     scenario: impl Future<Output = ()>,
 ) {
     let _turn = SCENARIOS_AT_ONCE.acquire().await.expect("the semaphore is never closed");
-    // On the heap: a test thread's stack is small, and a scenario's future
-    // holds every value it keeps across an await.
     let outcome = AssertUnwindSafe(Box::pin(tokio::time::timeout(limit, scenario)))
         .catch_unwind()
         .await;
