@@ -120,7 +120,7 @@ async fn runtime_in(
         };
         Err(format!(
             "couldn't start the shared browser (the OS refused its threads: {reason}); \
-             nothing was fetched, and the next call tries again"
+             nothing was loaded, and the next call tries again"
         ))
     })
     .await
@@ -654,6 +654,12 @@ mod tests {
         let failed = runtime_in(&CELL, || Err(std::io::Error::other("no threads"))).await;
         let error = failed.err().expect("a failed build should be an error");
         assert!(error.contains("no threads"), "the OS's reason should reach the model: {error}");
+        // The same error reaches the browsing tools and the live panel's
+        // open, so it doesn't say "fetched" (round 1's finding 2).
+        assert!(
+            error.contains("nothing was loaded") && !error.contains("fetched"),
+            "the error should fit a browse as well as a fetch: {error}"
+        );
         assert!(CELL.get().is_none(), "a failed build should store nothing");
 
         let runtime = runtime_in(&CELL, build_browser_runtime)
