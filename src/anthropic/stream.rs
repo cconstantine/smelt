@@ -418,7 +418,8 @@ impl Blocks {
             && let Some(last) = self.done.last_entry()
             && let Some(name) = last.get().tool_name()
         {
-            cut_off_call = Some(name.to_string());
+            // A nameless call is dropped all the same, unnamed.
+            cut_off_call = Some(name.to_string()).filter(|name| !name.is_empty());
             last.remove();
         }
         let content = self
@@ -2000,6 +2001,20 @@ mod tests {
             .expect("a parsed cut-off call doesn't fail the reply");
         assert_eq!(turn.content, vec![add_call("call_a", 1)]);
         assert_eq!(turn.cut_off_call.as_deref(), Some("add"));
+    }
+
+    /// A cut call with no name is still dropped, but names nothing: a
+    /// notice naming "``" wouldn't parse, and would show as the user's
+    /// own words (review round 1).
+    #[tokio::test]
+    async fn test_a_cut_call_with_no_name_is_dropped_unnamed() {
+        let start = serde_json::json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "call_a", "name": ""}});
+        let input = serde_json::json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"a\":"}});
+        let [delta, stop] = cut_off_end("max_tokens");
+        let turn = run_against_mock_upstream(sse(&[text_at(0, "Adding."), start, input, delta, stop]), |_| {})
+            .await
+            .expect("a cut-off call doesn't fail the reply");
+        assert_eq!((turn.content, turn.cut_off_call), (vec![text("Adding.")], None));
     }
 
     /// Only the reply's last block can be the cut one: an unparseable
