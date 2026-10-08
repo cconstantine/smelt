@@ -638,7 +638,9 @@ async fn test_create_pod_finishes_when_its_caller_goes_away(pool: PgPool) {
             tokio::time::timeout(Duration::from_secs(2), create_pod(&pool, conversation.id, PodLimitOverrides::default()))
                 .await;
         assert!(dropped.is_err(), "the create should still be under way after 2s");
-        let announced = tokio::time::timeout(Duration::from_secs(90), async {
+        // As long as smelt itself waits for the pod to run (CI raises it),
+        // plus time for the git setup that comes before the announcement.
+        let announced = tokio::time::timeout(running_wait_timeout() + Duration::from_secs(30), async {
             loop {
                 if let Ok(events::ConversationEvent::SandboxPodUpdate { status, .. }) = conversation_events.recv().await
                     && status == "Running"

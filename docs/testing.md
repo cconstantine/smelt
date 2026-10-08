@@ -132,6 +132,8 @@ already gone.
 
 They don't take the turn-test lock: their conversations' ids are clear of every other test's. The volume test's pod, made outside a conversation, is deleted by the test itself before it asserts, and by the instance sweep if it doesn't get that far. A killed run leaves its objects in its own id range, which no later run reuses and nothing sweeps yet.
 
+**A test-side wait for something smelt bounds by an env-configurable timeout is computed from that timeout,** never a literal sized from the local default: CI raises some of them (`SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120` in `ci.yml`). Teardown's wait for a pod start is `2 * running_wait_timeout()` plus a minute for this reason; on SME-94 a literal 150 s, sized from the local default, was shorter than a start can take in CI.
+
 ### Docker in the sandbox (SME-33)
 
 - `test_docker_in_a_sandbox_pod_works_and_stays_inside_the_pod` and `test_an_oom_in_a_nested_container_restarts_only_the_docker_sidecar` run real containers. Their base image is the sandbox's own files (`sudo tar -C / -c bin sbin lib lib64 usr etc | docker import - local/base`), so no test pulls from Docker Hub. Leave out `usr/lib64` or `etc` and a container fails with `exec /usr/bin/sh: no such file or directory`.
