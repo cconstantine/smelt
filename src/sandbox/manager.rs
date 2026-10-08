@@ -836,9 +836,24 @@ pub(super) async fn delete_volume_claim(
 ) -> Result<(), SandboxError> {
     let pvcs = pvc_api(client);
     let name = sandbox_volume_pvc_name(id);
-    let Some(claim) = pvcs.get_opt(&name).await? else {
+    let Some(mut claim) = pvcs.get_opt(&name).await? else {
         return Ok(());
     };
+    // One from before SME-115 that startup missed: its owner adopts it
+    // first, or the volume's data would stay in the cluster for good once
+    // its row is gone (SME-115 review 2). Failing that, the row stays.
+    if instance.owns_unlabelled && ownership(&claim.metadata, &instance.id) == Ownership::Unlabelled {
+        let none = std::collections::HashSet::new();
+        let this_volume = std::collections::HashSet::from([id]);
+        let decide = |meta: &ObjectMeta| should_adopt(meta, instance, &none, &this_volume);
+        if !Box::pin(adopt_one(&pvcs, claim, &instance.id, decide)).await {
+            return Err(SandboxError::NotOurs { name, ownership: Ownership::Unlabelled });
+        }
+        claim = match pvcs.get_opt(&name).await? {
+            Some(claim) => claim,
+            None => return Ok(()),
+        };
+    }
     let instance = instance.id.as_str();
     match (ownership(&claim.metadata, instance), claim.metadata.uid) {
         (Ownership::Ours, Some(uid)) => {

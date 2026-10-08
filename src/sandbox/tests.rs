@@ -2748,6 +2748,27 @@ async fn test_the_owner_handles_a_pod_with_no_labels_named_by_its_record(pool: P
     assert_eq!(label.as_deref(), Some(owner.id.as_str()), "startup didn't adopt a live record's pod");
 }
 
+/// SME-115 review 2: deleting a volume whose claim startup's adoption
+/// missed deletes the claim for the database that owns it, instead of
+/// leaving the user's data in the cluster for good once the row is gone.
+#[tokio::test]
+async fn test_the_owner_deletes_a_volume_claim_adoption_missed() {
+    let client = test_client().await;
+    let id = unused_conversation_id();
+    let name = sandbox_volume_pvc_name(id);
+    let mut spec = build_volume_pvc_spec(id, "unused");
+    spec.metadata.labels = None;
+    pvc_api(&client).create(&PostParams::default(), &spec).await.expect("create the claim");
+    let owner = db::SmeltInstance { id: TEST_INSTANCE.to_string(), owns_unlabelled: true };
+
+    let deleted = delete_volume_claim(&client, id, &owner).await;
+    let kept = claim_kept(&client, &name).await;
+
+    pvc_api(&client).delete(&name, &DeleteParams::default()).await.ok();
+    assert!(deleted.is_ok(), "{deleted:?}");
+    assert!(!kept, "the owning database left its own volume's claim");
+}
+
 /// SME-115: a new pod waits out the conversation's stopping pods, ours
 /// and ones from before the fix, but never another database's pod
 /// labelled with the same conversation.
