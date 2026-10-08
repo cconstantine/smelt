@@ -55,9 +55,25 @@ async fn run_then_tear_down(
     }
 }
 
-/// Longer than a pod start can take: its claims, then up to 90 s for the
-/// pod to run, then its git setup.
-const POD_START_WAIT: Duration = Duration::from_secs(150);
+/// How long teardown waits for a pod start to finish: a start can wait
+/// out a stopping pod and then its own pod each for the running wait, then
+/// do its git setup.
+fn pod_start_wait() -> Duration {
+    2 * running_wait_timeout() + Duration::from_secs(60)
+}
+
+/// SME-94 review 2: teardown's wait outlasts a pod start, which can wait
+/// out a stopping pod and then its own pod each for the running wait (120
+/// s in CI), then do its git setup.
+#[test]
+fn test_teardown_waits_longer_than_a_pod_start_can_take() {
+    assert!(
+        pod_start_wait() > 2 * running_wait_timeout(),
+        "{:?} is shorter than two running waits of {:?}",
+        pod_start_wait(),
+        running_wait_timeout()
+    );
+}
 
 /// Deletes every conversation's pods and claims, every volume's claim, and
 /// anything else labelled with the test database's instance. Best-effort:
@@ -74,13 +90,14 @@ async fn tear_down(pool: &PgPool, client: &kube::Client) {
     // `create_pod` starts a pod in a task of its own, holding the
     // conversation's start lock, which a cut-off scenario leaves running:
     // it would make its claims and pod after the deletes below (SME-94
-    // review 1). Wait each start out, and keep its lock for the rest of
-    // the test, so one still queued never runs. No other test shares these
-    // conversation ids.
+    // review 1). Wait out each start running or queued, and keep the lock
+    // for the rest of the test, so no start asked for later runs. Past the
+    // wait, give up and say so. No other test shares these conversation
+    // ids.
     for &conversation_id in &conversations {
-        match tokio::time::timeout(POD_START_WAIT, pod_start_lock(conversation_id).lock_owned()).await {
+        match tokio::time::timeout(pod_start_wait(), pod_start_lock(conversation_id).lock_owned()).await {
             Ok(held) => std::mem::forget(held),
-            Err(_) => eprintln!("conversation {conversation_id}'s pod start outlasted {POD_START_WAIT:?}"),
+            Err(_) => eprintln!("conversation {conversation_id}'s pod start outlasted {:?}", pod_start_wait()),
         }
     }
     let pods: Vec<(i64, i64)> = sqlx::query_as("SELECT conversation_id, id FROM sandbox_pods")
