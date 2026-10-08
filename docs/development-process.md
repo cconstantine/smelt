@@ -69,20 +69,20 @@ Runs the board; does no ticket's work itself. On each pass over the smelt projec
 | **Planned**, **In Review** | Waits for the user. |
 | **In Progress** | Leaves it alone unless a "started" comment shows one of its sub-agents owns it; if that sub-agent stopped without a report, it starts a fresh one. |
 | **Any** status with a "blocked, needs the user" report as its latest persona comment | Starts nothing until the user has commented after it, then starts the same persona again. |
-| **Backlog**, when nothing is in Up Next or Todo | Picks the ticket that should be next and moves it to **Up Next**, so the pass then starts its Planner. See "Choosing what's next" below. |
+| **Backlog**, when nothing is in Up Next | Picks the ticket that should be next and moves it to **Up Next**, so the pass then starts its Planner. See "Choosing what's next" below. |
 
 - When a sub-agent stops partway (a usage limit, a crash), it starts a fresh one of the same persona on the same worktree, telling it what's already done; it never repeats finished work.
 - Brings to the user only what needs them: a question a sub-agent couldn't settle, a failure it couldn't fix, a high-severity finding left unfixed, a merge conflict between two branches.
 - Watches the board on a schedule (`/loop`), and once more each time a sub-agent reports.
 - Before a PR that adds or changes a guard in a repo script merges (a refusal in `check-server`, say), tells the Developers on branches cut before it to merge `origin/main` before they rely on the guard: each branch runs its own copy of the script. On SME-115, the branches of SME-111, SME-113 and SME-94 had `check-server`s with no refusal.
 
-**Choosing what's next.** When Up Next and Todo are both empty, the Project Manager reads the Backlog and moves one ticket to Up Next. It weighs:
+**Choosing what's next.** Whenever Up Next is empty, even while other tickets wait in Planned or Todo, the Project Manager reads the Backlog and moves one ticket to Up Next. It weighs:
 - what's hurting the user's real use of smelt now, with bugs they've hit first;
 - whether a bug bash or design review is due (see [Bug bash](#bug-bash-every-few-projects) and [Design review](#design-review-every-few-projects-alternating-with-bug-bashes));
 - whether the ticket is unblocked, and whether it would change the same files as a ticket still in progress;
 - what's small enough to finish soon.
 
-It comments on the ticket, `Project Manager: moved to Up Next because …`, naming the runners-up. It tells the user in its next report, so they can swap the pick before the plan is approved. The user's own moves always take precedence: a ticket they put in Up Next or Todo means the Backlog isn't read.
+It comments on the ticket, `Project Manager: moved to Up Next because …`, naming the runners-up. It tells the user in its next report, so they can swap the pick before the plan is approved. The user's own moves always take precedence: a ticket they put in Up Next means the Backlog isn't read.
 
 ### Planner
 
