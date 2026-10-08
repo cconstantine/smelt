@@ -633,14 +633,21 @@ async fn delete_terminated_pod(pool: &PgPool, client: &kube::Client, pod_id: i64
     // One from before SME-115 that startup's adoption missed: adopted now
     // if it's this record's conversation's, so it's stopped rather than
     // left running with its record closed (SME-115 review 1).
-    if owner == Ownership::Unlabelled
-        && instance.owns_unlabelled
-        && Box::pin(adopt_record_pod(pool, &pods, pod_id, &instance)).await
-    {
-        (owner, uid) = match pods.get_opt(&name).await? {
-            Some(pod) => (ownership(&pod.metadata, &instance.id), pod.metadata.uid),
-            None => return Ok(()),
-        };
+    if owner == Ownership::Unlabelled && instance.owns_unlabelled {
+        match Box::pin(adopt_record_pod(pool, &pods, pod_id, &instance)).await {
+            RecordPodAdoption::Adopted => {
+                (owner, uid) = match pods.get_opt(&name).await? {
+                    Some(pod) => (ownership(&pod.metadata, &instance.id), pod.metadata.uid),
+                    None => return Ok(()),
+                };
+            }
+            RecordPodAdoption::NotOurs => {}
+            // Ours but not labelled: an error keeps the record open, so
+            // the pod isn't left running with no record (SME-115 review 2).
+            RecordPodAdoption::Failed => {
+                return Err(SandboxError::NotOurs { name, ownership: Ownership::Unlabelled });
+            }
+        }
     }
     match owner {
         Ownership::Ours => {
@@ -812,7 +819,7 @@ pub async fn create_volume(
 pub async fn delete_volume(pool: &PgPool, id: i64) -> Result<(), SandboxError> {
     let manager = get()?;
     let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
-    delete_volume_claim(&manager.client, id, &instance.id).await?;
+    delete_volume_claim(&manager.client, id, &instance).await?;
     db::delete_sandbox_volume(pool, id)
         .await
         .map_err(SandboxError::Db)?;
@@ -822,12 +829,17 @@ pub async fn delete_volume(pool: &PgPool, id: i64) -> Result<(), SandboxError> {
 /// Deletes volume `id`'s claim if it's ours (SME-115), only while it's
 /// still the object read. Another database's claim of that name, or one
 /// from before the fix, is left and logged.
-pub(super) async fn delete_volume_claim(client: &kube::Client, id: i64, instance: &str) -> Result<(), SandboxError> {
+pub(super) async fn delete_volume_claim(
+    client: &kube::Client,
+    id: i64,
+    instance: &db::SmeltInstance,
+) -> Result<(), SandboxError> {
     let pvcs = pvc_api(client);
     let name = sandbox_volume_pvc_name(id);
     let Some(claim) = pvcs.get_opt(&name).await? else {
         return Ok(());
     };
+    let instance = instance.id.as_str();
     match (ownership(&claim.metadata, instance), claim.metadata.uid) {
         (Ownership::Ours, Some(uid)) => {
             let params = DeleteParams {
@@ -907,7 +919,7 @@ pub(super) async fn teardown_conversation_with(
     // now, by the database that owns such objects, so it goes below
     // instead of being left for good (SME-115 review 1).
     if instance.owns_unlabelled {
-        Box::pin(adopt_conversation_objects(client, conversation_id, instance)).await;
+        Box::pin(adopt_conversation_objects(client, conversation_id, pod_ids, instance)).await;
     }
     let instance = instance.id.as_str();
     // Its sandbox pods, and its language server pods (SME-35).

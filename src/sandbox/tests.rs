@@ -2366,7 +2366,7 @@ async fn test_another_databases_volume_claim_is_refused_and_left() {
     };
 
     let mounted = ensure_volume_claims(&client, std::slice::from_ref(&volume), &test_instance()).await;
-    let deleted = delete_volume_claim(&client, id, TEST_INSTANCE).await;
+    let deleted = delete_volume_claim(&client, id, &test_instance()).await;
     let kept = claim_kept(&client, &name).await;
 
     pvcs.delete(&name, &DeleteParams::default()).await.ok();
@@ -2692,6 +2692,60 @@ async fn test_the_owner_terminates_a_pod_adoption_missed(pool: PgPool) {
     pods.delete(&name, &immediate_delete_params()).await.ok();
     assert!(closed.is_ok(), "{closed:?}");
     assert!(!kept, "the owning database closed the record and left its pod running");
+}
+
+/// A pod from before SME-33 as the dev database left it: no labels at all.
+async fn make_bare_pod(client: &kube::Client, name: &str) {
+    let spec: Pod = serde_json::from_value(serde_json::json!({
+        "metadata": {"name": name},
+        "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
+    }))
+    .expect("pod");
+    pods_api(client).create(&PostParams::default(), &spec).await.expect("create pod");
+}
+
+/// Whether pod `name` is still there and not being deleted.
+async fn pod_kept(client: &kube::Client, name: &str) -> bool {
+    pods_api(client).get_opt(name).await.expect("read").is_some_and(|p| p.metadata.deletion_timestamp.is_none())
+}
+
+/// SME-115 review 2: a pod from before SME-33 has no labels at all (SME-88).
+/// The database that owns such objects still stops it, tears it down with
+/// its conversation, and adopts it at startup while its record is live:
+/// the record names it.
+#[sqlx::test]
+async fn test_the_owner_handles_a_pod_with_no_labels_named_by_its_record(pool: PgPool) {
+    let client = test_client().await;
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    sqlx::query("UPDATE smelt_instance SET owns_unlabelled = true").execute(&pool).await.expect("an owning database");
+    let owner = db::smelt_instance(&pool).await.expect("instance");
+    let conversation = db::create_conversation(&pool).await.expect("conversation");
+    let stopped = db::create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+    make_bare_pod(&client, &pod_name(stopped.id)).await;
+    let closed = force_terminate_pod_with(&pool, &client, stopped.id).await;
+    let stopped_kept = pod_kept(&client, &pod_name(stopped.id)).await;
+
+    // Torn down with its conversation, named by the record read before
+    // the delete.
+    let torn = db::create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+    make_bare_pod(&client, &pod_name(torn.id)).await;
+    teardown_conversation_with(&client, conversation.id, &[torn.id], &owner).await;
+    let torn_kept = pod_kept(&client, &pod_name(torn.id)).await;
+
+    // Adopted at startup while its record is live.
+    let other = db::create_conversation(&pool).await.expect("conversation");
+    let live = db::create_sandbox_pod(&pool, other.id).await.expect("pod row");
+    make_bare_pod(&client, &pod_name(live.id)).await;
+    adopt_unlabelled_objects_with(&client, &pool).await;
+    let label = instance_of(&pods_api(&client), &pod_name(live.id)).await;
+
+    for id in [stopped.id, torn.id, live.id] {
+        pods_api(&client).delete(&pod_name(id), &immediate_delete_params()).await.ok();
+    }
+    assert!(closed.is_ok(), "{closed:?}");
+    assert!(!stopped_kept, "stopping its record left the pod running");
+    assert!(!torn_kept, "deleting its conversation left the pod");
+    assert_eq!(label.as_deref(), Some(owner.id.as_str()), "startup didn't adopt a live record's pod");
 }
 
 /// SME-115: a new pod waits out the conversation's stopping pods, ours

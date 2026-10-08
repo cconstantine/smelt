@@ -48,6 +48,20 @@ pub(super) fn should_adopt_server(
             .is_some_and(|id| sandbox_pods.contains(&id))
 }
 
+/// Whether this database adopts the unlabelled pod `meta`, named by one of
+/// its pod records of `conversation_id`: only with `owns_unlabelled`, and
+/// only one labelled with that conversation or with no conversation label
+/// at all (a pod from before SME-33, SME-88), never another conversation's.
+pub(super) fn should_adopt_record_pod(meta: &ObjectMeta, instance: &db::SmeltInstance, conversation_id: i64) -> bool {
+    if !instance.owns_unlabelled || ownership(meta, &instance.id) != Ownership::Unlabelled {
+        return false;
+    }
+    match meta.labels.as_ref().and_then(|l| l.get(CONVERSATION_LABEL)) {
+        None => true,
+        Some(label) => label.parse() == Ok(conversation_id),
+    }
+}
+
 /// Adopts the unlabelled objects this database owns; see the module's doc.
 pub async fn adopt_unlabelled_objects(pool: &PgPool) {
     match get() {
@@ -119,6 +133,23 @@ pub(super) async fn adopt_unlabelled_objects_with(client: &kube::Client, pool: &
     };
     for server in servers {
         adopt_if(&pods, server, &instance.id, |meta| should_adopt_server(meta, &instance, &sandbox_pods)).await;
+    }
+    // A pod from before SME-33 has no conversation label; its live record
+    // names it (SME-115 review 2).
+    match db::list_live_pods(pool).await {
+        Ok(rows) => {
+            for row in rows {
+                match pods.get_opt(&pod_name(row.pod_id)).await {
+                    Ok(Some(pod)) if ownership(&pod.metadata, &instance.id) == Ownership::Unlabelled => {
+                        adopt_if(&pods, pod, &instance.id, |meta| should_adopt_record_pod(meta, &instance, row.conversation_id))
+                            .await
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(pod_id = row.pod_id, error = %e, "couldn't read a live record's pod to adopt"),
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "couldn't list live pod records to adopt their pods"),
     }
 }
 
@@ -197,7 +228,12 @@ where
 /// missed them, and the conversation's record is already gone, so the
 /// next start never would. Language server pods go with their sandbox pod
 /// (`ownerReferences`).
-pub(super) async fn adopt_conversation_objects(client: &kube::Client, conversation_id: i64, instance: &db::SmeltInstance) {
+pub(super) async fn adopt_conversation_objects(
+    client: &kube::Client,
+    conversation_id: i64,
+    pod_ids: &[i64],
+    instance: &db::SmeltInstance,
+) {
     let this_conversation = std::collections::HashSet::from([conversation_id]);
     let none = std::collections::HashSet::new();
     let decide = |meta: &ObjectMeta| should_adopt(meta, instance, &this_conversation, &none);
@@ -211,6 +247,17 @@ pub(super) async fn adopt_conversation_objects(client: &kube::Client, conversati
         }
         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't list a conversation's unlabelled pods to adopt"),
     }
+    // And the pods its records name, with no conversation label (from
+    // before SME-33; SME-115 review 2).
+    for &pod_id in pod_ids {
+        match pods.get_opt(&pod_name(pod_id)).await {
+            Ok(Some(pod)) if ownership(&pod.metadata, &instance.id) == Ownership::Unlabelled => {
+                adopt_if(&pods, pod, &instance.id, |meta| should_adopt_record_pod(meta, instance, conversation_id)).await
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(pod_id, error = %e, "couldn't read a record's pod to adopt"),
+        }
+    }
     let pvcs = pvc_api(client);
     for name in [docker_pvc_name(conversation_id), workspace_pvc_name(conversation_id)] {
         match pvcs.get_opt(&name).await {
@@ -223,27 +270,49 @@ pub(super) async fn adopt_conversation_objects(client: &kube::Client, conversati
     }
 }
 
-/// Adopts the unlabelled pod named by `pod_id`'s record if it's labelled
-/// with that record's conversation, for the database that owns objects
-/// from before SME-115. True once it's ours.
-pub(super) async fn adopt_record_pod(pool: &PgPool, pods: &Api<Pod>, pod_id: i64, instance: &db::SmeltInstance) -> bool {
+/// What `adopt_record_pod` did.
+#[derive(Debug, PartialEq)]
+pub(super) enum RecordPodAdoption {
+    /// It's now ours.
+    Adopted,
+    /// Not this record's to adopt: another conversation's, no record, or
+    /// this database doesn't own objects from before SME-115.
+    NotOurs,
+    /// It should be ours, but labelling it failed (it's retried at the
+    /// next start).
+    Failed,
+}
+
+/// Adopts the unlabelled pod named by `pod_id`'s record, for the database
+/// that owns objects from before SME-115 (`should_adopt_record_pod`).
+pub(super) async fn adopt_record_pod(
+    pool: &PgPool,
+    pods: &Api<Pod>,
+    pod_id: i64,
+    instance: &db::SmeltInstance,
+) -> RecordPodAdoption {
     let conversation_id = match db::sandbox_pod_conversation_id(pool, pod_id).await {
         Ok(Some(id)) => id,
-        Ok(None) => return false,
+        Ok(None) => return RecordPodAdoption::NotOurs,
         Err(e) => {
             tracing::warn!(pod_id, error = %e, "couldn't read a pod record's conversation to adopt its pod");
-            return false;
+            return RecordPodAdoption::Failed;
         }
     };
     let pod = match pods.get_opt(&pod_name(pod_id)).await {
         Ok(Some(pod)) => pod,
-        Ok(_) => return false,
+        Ok(None) => return RecordPodAdoption::NotOurs,
         Err(e) => {
             tracing::warn!(pod_id, error = %e, "couldn't read a pod to adopt");
-            return false;
+            return RecordPodAdoption::Failed;
         }
     };
-    let this_conversation = std::collections::HashSet::from([conversation_id]);
-    let none = std::collections::HashSet::new();
-    adopt_one(pods, pod, &instance.id, |meta| should_adopt(meta, instance, &this_conversation, &none)).await
+    if !should_adopt_record_pod(&pod.metadata, instance, conversation_id) {
+        return RecordPodAdoption::NotOurs;
+    }
+    if adopt_one(pods, pod, &instance.id, |meta| should_adopt_record_pod(meta, instance, conversation_id)).await {
+        RecordPodAdoption::Adopted
+    } else {
+        RecordPodAdoption::Failed
+    }
 }
