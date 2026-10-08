@@ -3423,3 +3423,23 @@ fn test_a_test_manager_on_a_multi_thread_runtime_is_refused() {
     .expect("the test thread");
     assert!(refused, "use_test_manager accepted a multi-thread runtime");
 }
+
+/// A server with no `SANDBOX_IMAGE` runs the image named after its own
+/// agent sources, the one `scripts/sandbox-image-ref` prints and
+/// `scripts/build-sandbox-image.sh` builds, never a `:latest` that only a
+/// manual rebuild moves (SME-121). Compares with the script itself, so
+/// `build.rs`'s hash can't drift from it.
+#[test]
+fn test_with_no_setting_the_image_is_the_one_named_after_this_trees_agent_sources() {
+    let out = std::process::Command::new("scripts/sandbox-image-ref").output().expect("run scripts/sandbox-image-ref");
+    assert!(out.status.success(), "scripts/sandbox-image-ref failed: {}", String::from_utf8_lossy(&out.stderr));
+    let script = String::from_utf8(out.stdout).expect("utf-8");
+    assert_eq!(sandbox_image_from(None), script.trim());
+    assert_eq!(sandbox_image_from(Some(String::new())), script.trim(), "an empty setting is no setting");
+}
+
+#[test]
+fn test_a_sandbox_image_setting_names_the_image() {
+    let image = "docker.io/library/smelt-sandbox:latest";
+    assert_eq!(sandbox_image_from(Some(image.to_string())), image);
+}

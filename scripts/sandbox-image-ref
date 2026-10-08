@@ -4,7 +4,9 @@
 # hex of scripts/agent-sources-hash>` (SME-102). scripts/build-sandbox-image.sh
 # builds and imports it; check.sh, browser-tier, check-server and CI run the
 # tests against it through SANDBOX_IMAGE; cluster-doctor checks the node has
-# it. Two checkouts with the same agent sources share one image.
+# it; and a server built from the same tree runs it when SANDBOX_IMAGE is
+# unset (build.rs computes the same name, and a test keeps the two equal;
+# SME-121). Two checkouts with the same agent sources share one image.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 hash=$(scripts/agent-sources-hash)

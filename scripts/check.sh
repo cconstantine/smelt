@@ -48,7 +48,8 @@ lint_output=$(scripts/lint-expects 2>&1) || {
 }
 
 # The tests' pods run this working tree's own agent, from the image named
-# after its sources (SME-102), not the shared `:latest` the dev server uses.
+# after its sources (SME-102), the image a server built from this tree runs
+# by default too (SME-121).
 SANDBOX_IMAGE=${SANDBOX_IMAGE:-$(scripts/sandbox-image-ref)}
 export SANDBOX_IMAGE
 

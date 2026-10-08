@@ -472,9 +472,11 @@ async fn run_import(pods: &Api<Pod>, loader: &str) -> Result<(), BoxError> {
 /// The images sandbox pods start from, as containerd names them. Pods use
 /// `imagePullPolicy: Never`, so a missing one fails every pod
 /// (`ErrImageNeverPull`); the kubelet deletes unused images when the node's
-/// disk passes its garbage-collection threshold.
+/// disk passes its garbage-collection threshold. The sandbox image is the
+/// one named after this build's agent sources (`build.rs`), which a server
+/// built from the same tree runs when `SANDBOX_IMAGE` is unset (SME-121).
 const SANDBOX_IMAGES: &[&str] = &[
-    "docker.io/library/smelt-sandbox:latest",
+    env!("SMELT_SANDBOX_IMAGE"),
     "docker.io/library/docker:29-dind",
 ];
 
@@ -530,9 +532,10 @@ mod tests {
 
     #[test]
     fn test_missing_images_names_each_wanted_image_not_listed() {
-        let listed = "docker.io/library/smelt-sandbox:latest\nsha256:0123abcd\ndocker.io/rancher/mirrored-pause:3.6\n";
-        assert_eq!(missing_images(listed, SANDBOX_IMAGES), vec!["docker.io/library/docker:29-dind".to_string()]);
-        assert!(missing_images("docker.io/library/smelt-sandbox:latest\ndocker.io/library/docker:29-dind\n", SANDBOX_IMAGES).is_empty());
+        let sandbox = SANDBOX_IMAGES[0];
+        let listed = format!("{sandbox}\nsha256:0123abcd\ndocker.io/rancher/mirrored-pause:3.6\n");
+        assert_eq!(missing_images(&listed, SANDBOX_IMAGES), vec!["docker.io/library/docker:29-dind".to_string()]);
+        assert!(missing_images(&format!("{sandbox}\ndocker.io/library/docker:29-dind\n"), SANDBOX_IMAGES).is_empty());
         assert_eq!(missing_images("", SANDBOX_IMAGES).len(), 2);
     }
 
@@ -677,10 +680,21 @@ mod tests {
         assert_eq!(check_targets(&[]), SANDBOX_IMAGES.iter().map(|s| s.to_string()).collect::<Vec<_>>());
     }
 
+    /// With no references given, `--check` looks for the sandbox image a
+    /// server built from this tree runs with no `SANDBOX_IMAGE`, the one
+    /// named after its agent sources, not `:latest` (SME-121).
+    #[test]
+    fn test_check_by_default_looks_for_this_trees_own_sandbox_image() {
+        let targets = check_targets(&[]);
+        assert!(targets.contains(&env!("SMELT_SANDBOX_IMAGE").to_string()), "{targets:?}");
+        assert!(!targets.iter().any(|t| t.ends_with(":latest")), "{targets:?}");
+    }
+
     /// A tag that only starts like a wanted one isn't it.
     #[test]
     fn test_missing_images_matches_whole_references() {
-        let listed = "docker.io/library/smelt-sandbox:latest-old\ndocker.io/library/docker:29-dind\n";
-        assert_eq!(missing_images(listed, SANDBOX_IMAGES), vec!["docker.io/library/smelt-sandbox:latest".to_string()]);
+        let sandbox = SANDBOX_IMAGES[0];
+        let listed = format!("{sandbox}-old\ndocker.io/library/docker:29-dind\n");
+        assert_eq!(missing_images(&listed, SANDBOX_IMAGES), vec![sandbox.to_string()]);
     }
 }

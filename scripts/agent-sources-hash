@@ -6,7 +6,9 @@
 # Over-broad on purpose: any dependency change renames the image, at the
 # cost of one rebuild. scripts/sandbox-image-ref names the sandbox image
 # after it (`smelt-sandbox:src-<first 16 hex>`), so the image in the
-# cluster says which sources built it (SME-102).
+# cluster says which sources built it (SME-102). build.rs hashes the same
+# files in the same order for the server's default image (SME-121): change
+# the list in both.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cat src/bin/sandbox_agent.rs src/agent_protocol.rs src/docker_net.rs docker/sandbox/Dockerfile \

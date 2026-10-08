@@ -166,25 +166,37 @@ pub(super) fn default_memory_limit() -> String {
         .unwrap_or_else(|| "8Gi".to_string())
 }
 
-/// `SANDBOX_IMAGE`, default `"docker.io/library/smelt-sandbox:latest"` —
-/// same pattern as `default_memory_limit`. The custom image
-/// `scripts/build-sandbox-image.sh` builds and delivers with no registry
-/// involved (see SME-17) — its
-/// own `ENTRYPOINT` is the sandbox agent, which is what makes the agent
-/// the pod's real PID 1 rather than something injected and launched after
-/// the fact. The fully-qualified default (not just `smelt-sandbox:latest`)
-/// matches exactly what `ctr images import` registers the image as —
-/// confirmed by spike, not assumed. `:latest` is what a server with no
-/// setting (the dev server) runs; `scripts/check.sh`, `browser-tier`,
-/// `check-server` and CI set `SANDBOX_IMAGE` to the image named after the
-/// working tree's agent sources (`scripts/sandbox-image-ref`, SME-102), and
-/// tests that build their own pod specs read it here too.
+/// `SANDBOX_IMAGE`, default `OWN_SANDBOX_IMAGE` (the image named after
+/// this build's agent sources) — same pattern as `default_memory_limit`.
+/// The custom image `scripts/build-sandbox-image.sh` builds and delivers
+/// with no registry involved (see SME-17) — its own `ENTRYPOINT` is the
+/// sandbox agent, which is what makes the agent the pod's real PID 1
+/// rather than something injected and launched after the fact. The
+/// fully-qualified name (not just `smelt-sandbox:src-…`) matches exactly
+/// what `ctr images import` registers the image as — confirmed by spike,
+/// not assumed. A server with no setting (the dev server) runs its own
+/// sources' image, so it can't drift onto an older agent the way a
+/// `:latest` that only a manual rebuild moved did (SME-121); a node without
+/// that image fails `create_pod` with `ErrImageNeverPull` and the command
+/// that builds it. `scripts/check.sh`, `browser-tier`, `check-server` and
+/// CI set `SANDBOX_IMAGE` to the working tree's image
+/// (`scripts/sandbox-image-ref`, SME-102), and tests that build their own
+/// pod specs read it here too.
 pub(crate) fn default_sandbox_image() -> String {
-    std::env::var("SANDBOX_IMAGE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "docker.io/library/smelt-sandbox:latest".to_string())
+    sandbox_image_from(std::env::var("SANDBOX_IMAGE").ok())
 }
+
+/// The image for a `SANDBOX_IMAGE` of `setting`: it, unless unset or empty.
+pub(super) fn sandbox_image_from(setting: Option<String>) -> String {
+    setting
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| OWN_SANDBOX_IMAGE.to_string())
+}
+
+/// The sandbox image named after the agent sources this server was built
+/// from, `docker.io/library/smelt-sandbox:src-<hash>` (`build.rs`, the same
+/// name `scripts/sandbox-image-ref` prints).
+pub(crate) const OWN_SANDBOX_IMAGE: &str = env!("SMELT_SANDBOX_IMAGE");
 
 /// `SANDBOX_RUNNING_WAIT_TIMEOUT_SECS`, default `90` — same pattern as
 /// `default_memory_limit`. How long `wait_for_running` waits for a pod to

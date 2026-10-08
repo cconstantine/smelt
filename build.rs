@@ -2,6 +2,10 @@
 //! same for the server binary and the web bundle when both are built from
 //! one tree. A tab compares its own with the server's to notice it's
 //! running an older bundle than the server (SME-43).
+//!
+//! Also sets `SMELT_SANDBOX_IMAGE`: the sandbox image named after the
+//! agent's sources, the reference `scripts/sandbox-image-ref` prints, which
+//! a server with no `SANDBOX_IMAGE` runs (SME-121).
 
 use std::path::{Path, PathBuf};
 
@@ -10,6 +14,17 @@ use sha2::{Digest, Sha256};
 /// What the build id covers. A directory is walked; cargo also watches
 /// one recursively for `rerun-if-changed`.
 const INPUTS: [&str; 4] = ["src", "assets", "Cargo.toml", "Cargo.lock"];
+
+/// What the sandbox image is built from, in `scripts/agent-sources-hash`'s
+/// order: that script hashes these files run together, and so does this.
+const AGENT_SOURCES: [&str; 6] = [
+    "src/bin/sandbox_agent.rs",
+    "src/agent_protocol.rs",
+    "src/docker_net.rs",
+    "docker/sandbox/Dockerfile",
+    "Cargo.toml",
+    "Cargo.lock",
+];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut files = Vec::new();
@@ -31,6 +46,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let id: String = hasher.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect();
     println!("cargo:rustc-env=SMELT_BUILD_ID={id}");
+
+    // The Dockerfile is the one agent source outside INPUTS.
+    println!("cargo:rerun-if-changed=docker/sandbox/Dockerfile");
+    let mut agent = Sha256::new();
+    for file in AGENT_SOURCES {
+        agent.update(std::fs::read(file)?);
+    }
+    let hash: String = agent.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect();
+    println!("cargo:rustc-env=SMELT_SANDBOX_IMAGE=docker.io/library/smelt-sandbox:src-{hash}");
     Ok(())
 }
 

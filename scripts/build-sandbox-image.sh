@@ -15,12 +15,15 @@
 #
 # The image is named after the agent sources it's built from,
 # `smelt-sandbox:src-<hash>` (scripts/sandbox-image-ref; SME-102), which is
-# what check.sh, browser-tier, check-server and CI run their tests against.
-# `smelt-sandbox:latest`, what a server with no SANDBOX_IMAGE uses (the dev
-# server), moves only with --latest: run that after pulling a change to the
-# agent, not to test a branch. Both tags go in one tar and one import, so
-# they can't end up pointing at different builds. Other arguments go to
-# scripts/build-sandbox-agent.sh (e.g. --release).
+# what check.sh, browser-tier, check-server and CI run their tests against,
+# and what a server built from the same tree runs with no SANDBOX_IMAGE (the
+# dev server; build.rs computes the same name, SME-121). Run it after
+# pulling a change to the agent's sources or the Cargo files if no gate has
+# built that image yet. --latest also tags it `smelt-sandbox:latest`, which
+# nothing uses by default (only a server whose SANDBOX_IMAGE names it); both
+# tags go in one tar and one import, so they can't end up pointing at
+# different builds. Other arguments go to scripts/build-sandbox-agent.sh
+# (e.g. --release).
 set -eu
 
 cd "$(dirname "$0")/.."
