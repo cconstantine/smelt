@@ -1089,6 +1089,9 @@ async fn test_wake_conversation_second_call_is_a_noop_once_the_first_drained_eve
 #[sqlx::test]
 async fn test_a_wake_with_no_model_still_saves_the_notice(pool: PgPool) {
     let _guard = lock_turn_tests();
+    // An id no other test's database hands out: what this test hears on
+    // its conversation's channel mustn't be another test's (SME-135).
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool)
         .await
         .expect("create conversation");
@@ -1137,6 +1140,9 @@ async fn test_a_wake_with_nothing_pending_leaves_the_model_alone(pool: PgPool) {
 #[sqlx::test]
 async fn test_wake_conversation_publishes_notification_delivery_failed_on_error(pool: PgPool) {
     let _guard = lock_turn_tests();
+    // An id no other test's database hands out: what this test hears on
+    // its conversation's channel mustn't be another test's (SME-135).
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool)
         .await
         .expect("create conversation");
@@ -1885,6 +1891,9 @@ fn cut_off_reply_body(text: &str) -> String {
 async fn test_a_cut_off_reply_is_followed_by_a_notice(pool: PgPool) {
     use crate::api::chat::{ReplyLimit, cut_off_notice};
     let _guard = lock_turn_tests();
+    // An id no other test's database hands out: what this test hears on
+    // its conversation's channel mustn't be another test's (SME-135).
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool)
         .await
         .expect("create conversation");
@@ -2403,6 +2412,9 @@ async fn test_subscribing_to_a_missing_conversation_is_refused(pool: PgPool) {
     assert!(open_conversation_events(&pool, missing).await.is_err());
     assert!(!events::has_channel(missing), "a refused subscription leaves no channel");
 
+    // An id no other test's database hands out: what this test hears on
+    // its conversation's channel mustn't be another test's (SME-135).
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let stream = open_conversation_events(&pool, conversation.id).await;
     assert!(stream.is_ok(), "an existing conversation's events open");
@@ -3553,6 +3565,9 @@ async fn test_a_compaction_forgets_the_usage_that_triggered_it(pool: PgPool) {
 #[sqlx::test]
 async fn test_run_turn_compacts_before_sending_when_usage_is_near_the_ceiling(pool: PgPool) {
     let _guard = lock_turn_tests();
+    // An id no other test's database hands out: what this test hears on
+    // its conversation's channel mustn't be another test's (SME-135).
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool)
         .await
         .expect("create conversation");
