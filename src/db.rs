@@ -2011,6 +2011,28 @@ pub async fn set_mcp_server_oauth_credentials(
     Ok(())
 }
 
+/// Saves a refreshed grant only while the row still holds a grant for the
+/// same client: a refresh that finishes after a Disconnect, a URL change
+/// or a new Connect mustn't write back over what they wrote (SME-113).
+/// `false` when nothing matched.
+pub async fn save_refreshed_mcp_server_oauth_credentials(
+    pool: &PgPool,
+    id: i64,
+    client_id: &str,
+    credentials: serde_json::Value,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE mcp_servers SET oauth_credentials = $3, updated_at = now() \
+         WHERE id = $1 AND oauth_credentials->>'client_id' = $2",
+    )
+    .bind(id)
+    .bind(client_id)
+    .bind(sqlx::types::Json(credentials))
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected() == 1)
+}
+
 // --- Model providers (SME-72) ---
 // Configuration a person edits on /providers, like mcp_servers: plain
 // CRUD. `kind` and `auth_kind` are plain strings, the table's `CHECK`s

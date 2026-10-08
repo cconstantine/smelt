@@ -65,6 +65,13 @@ pub enum McpConnectionStatus {
     /// because there's no network problem to report, just nothing to
     /// connect with yet.
     NotConnected,
+    /// An OAuth server whose sign-in can't be refreshed any more (the
+    /// provider refused the refresh token, or there isn't one): only a
+    /// Reconnect brings it back (SME-113). Its own status rather than
+    /// `Unreachable`, since nothing is wrong with the network.
+    NeedsReconnect {
+        error: String,
+    },
 }
 
 #[get("/api/mcp-servers")]
@@ -100,7 +107,12 @@ pub async fn mcp_server_status(id: i64) -> ServerFnResult<McpConnectionStatus> {
     Ok(
         match crate::mcp::connection_check(db::get(), &config).await {
             Ok(tool_names) => McpConnectionStatus::Connected { tool_names },
-            Err(error) => McpConnectionStatus::Unreachable { error },
+            Err(crate::mcp::CheckError::Unreachable(error)) => {
+                McpConnectionStatus::Unreachable { error }
+            }
+            Err(crate::mcp::CheckError::SignInExpired(error)) => {
+                McpConnectionStatus::NeedsReconnect { error }
+            }
         },
     )
 }
@@ -213,6 +225,28 @@ pub async fn disconnect_mcp_server_oauth(id: i64) -> ServerFnResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every status crosses to the browser as a server function's result.
+    #[test]
+    fn test_every_connection_status_round_trips_through_json() {
+        let statuses = [
+            McpConnectionStatus::Connected {
+                tool_names: vec!["echo".to_string()],
+            },
+            McpConnectionStatus::Unreachable {
+                error: "refused".to_string(),
+            },
+            McpConnectionStatus::NotConnected,
+            McpConnectionStatus::NeedsReconnect {
+                error: "use Reconnect".to_string(),
+            },
+        ];
+        for status in statuses {
+            let json = serde_json::to_string(&status).expect("serialize");
+            let back: McpConnectionStatus = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, status);
+        }
+    }
 
     #[test]
     fn test_mcp_server_summary_exposes_header_names_but_not_values() {

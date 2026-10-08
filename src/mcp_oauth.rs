@@ -7,17 +7,16 @@
 //! restart (`rmcp`'s own default is in-memory only), and the
 //! start/callback/disconnect lifecycle the `/mcp-servers` UI and the
 //! `/oauth/mcp-callback/{id}` route (`main.rs`) drive. `src/mcp.rs`'s
-//! `connect()` is the other half — it fetches a fresh access token through
-//! the same `PgCredentialStore` and feeds it into the existing
-//! static-header transport path rather than wiring OAuth into the
-//! transport's HTTP client directly.
+//! `connect()` is the other half: its transport's HTTP client is rmcp's
+//! `AuthClient`, which gets a token from `connection_manager`'s manager
+//! before every request, refreshing it when it's expiring (SME-113).
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use rmcp::transport::auth::{
     AuthError, AuthorizationManager, AuthorizationRequest, CredentialStore, InMemoryStateStore,
-    OAuthState, StateStore, StoredAuthorizationState, StoredCredentials,
+    OAuthClientConfig, OAuthState, StateStore, StoredAuthorizationState, StoredCredentials,
 };
 use sqlx::PgPool;
 use tokio::sync::Mutex as AsyncMutex;
@@ -25,9 +24,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::db::{self, McpServerConfig};
 
 /// Postgres-backed `CredentialStore` for one server's OAuth grant, bound to
-/// a single `mcp_servers.id`. Plugged into a fresh `AuthorizationManager`
-/// every time one is built (`start`, and `crate::mcp::connect`'s OAuth
-/// branch) rather than kept alive across requests itself. Takes its pool
+/// a single `mcp_servers.id`. Plugged into each `AuthorizationManager`
+/// smelt builds (`start`, and `connection_manager` for connections); it
+/// keeps nothing in memory, so every load reads the row fresh. Takes its pool
 /// explicitly rather than reaching for `db::get()` internally — same
 /// testable-all-the-way-down convention every other `db.rs`-touching
 /// function in this codebase already follows (see `anthropic::tools`'
@@ -37,11 +36,21 @@ use crate::db::{self, McpServerConfig};
 pub struct PgCredentialStore {
     pool: PgPool,
     server_id: i64,
+    /// Set for a connection's manager, whose only saves are refreshes:
+    /// see `save`.
+    refresh_only: bool,
 }
 
 impl PgCredentialStore {
+    /// The store a login attempt saves its new grant through,
+    /// unconditionally.
     pub fn new(pool: PgPool, server_id: i64) -> Self {
-        Self { pool, server_id }
+        Self { pool, server_id, refresh_only: false }
+    }
+
+    /// The store a connection's manager refreshes through (SME-113).
+    fn for_refreshes(pool: PgPool, server_id: i64) -> Self {
+        Self { pool, server_id, refresh_only: true }
     }
 }
 
@@ -62,9 +71,31 @@ impl CredentialStore for PgCredentialStore {
         }
     }
 
+    /// A refresh saves only over a grant for the same client, so one that
+    /// finishes after a Disconnect, a URL change or a new Connect doesn't
+    /// bring the old grant back. It then fails, so the request it was for
+    /// doesn't go on with a grant the user removed or replaced (SME-113).
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
         let value = serde_json::to_value(&credentials)
             .map_err(|e| AuthError::InternalError(e.to_string()))?;
+        if self.refresh_only {
+            let saved = db::save_refreshed_mcp_server_oauth_credentials(
+                &self.pool,
+                self.server_id,
+                &credentials.client_id,
+                value,
+            )
+            .await
+            .map_err(|e| AuthError::InternalError(e.to_string()))?;
+            return if saved {
+                Ok(())
+            } else {
+                Err(AuthError::InternalError(
+                    "the sign-in was removed or replaced while its token was being refreshed"
+                        .to_string(),
+                ))
+            };
+        }
         db::set_mcp_server_oauth_credentials(&self.pool, self.server_id, Some(value))
             .await
             .map_err(|e| AuthError::InternalError(e.to_string()))
@@ -150,6 +181,182 @@ pub async fn start(
         .await
         .insert(config.id, PendingAttempt { state, stored });
     Ok(url)
+}
+
+/// The `AuthorizationManager` a server's connections get their tokens
+/// from (SME-113): built from the stored grant, so its client is the one
+/// that grant was issued to. rmcp's `AuthClient` asks it for a token
+/// before every request, and it refreshes one that's expiring, saving the
+/// result through `PgCredentialStore`.
+pub async fn connection_manager(
+    pool: &PgPool,
+    config: &McpServerConfig,
+) -> Result<AuthorizationManager, String> {
+    if config.oauth_credentials.is_none() {
+        return Err(format!(
+            "MCP server {:?} is configured for OAuth but has never connected — use the Connect button on its edit page",
+            config.name
+        ));
+    }
+    crate::mcp::install_crypto_provider();
+    let http_client = ProviderHttpClient::new().map_err(|e| {
+        format!(
+            "failed to initialize OAuth for MCP server {:?}: {e}",
+            config.name
+        )
+    })?;
+    let mut manager =
+        AuthorizationManager::new_with_oauth_http_client(config.url.as_str(), Arc::new(http_client))
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to initialize OAuth for MCP server {:?}: {e}",
+                    config.name
+                )
+            })?;
+    manager.set_credential_store(PgCredentialStore::for_refreshes(pool.clone(), config.id));
+    let restored = manager.initialize_from_store().await.map_err(|e| {
+        format!(
+            "failed to load stored OAuth credentials for MCP server {:?}: {e}",
+            config.name
+        )
+    })?;
+    if !restored {
+        // No token stored, or rmcp discarded one bound to a provider whose
+        // issuer has since changed.
+        return Err(format!(
+            "MCP server {:?} has no usable sign-in — use the Connect button on its edit page",
+            config.name
+        ));
+    }
+    // rmcp configures the client from the stored client id alone, so a
+    // pre-registered client's refresh went out without its secret, and
+    // GitHub refuses that (`invalid_client`). The secret goes back on the
+    // same way `start` gives it to the code exchange, for the grant that
+    // client was issued.
+    let stored_client_id = config
+        .oauth_credentials
+        .as_ref()
+        .and_then(|json| json.0.get("client_id"))
+        .and_then(|id| id.as_str());
+    if let (Some(client_id), Some(secret)) = (
+        config.oauth_client_id.as_deref(),
+        config.oauth_client_secret.as_deref(),
+    ) && stored_client_id == Some(client_id)
+    {
+        let mut client = OAuthClientConfig::new(client_id, config.url.as_str())
+            .with_client_secret(secret);
+        // Keep the manager's own application type, as rmcp does when it
+        // configures a stored client.
+        client.application_type = None;
+        manager.configure_client(client).map_err(|e| {
+            format!(
+                "failed to configure the OAuth client for MCP server {:?}: {e}",
+                config.name
+            )
+        })?;
+    }
+    Ok(manager)
+}
+
+/// The HTTP client a connection's `AuthorizationManager` talks to its
+/// provider through: what rmcp's own default does (a 30 s timeout, the
+/// redirect policy each request asks for, a 1 MiB cap on a reply), plus
+/// one repair (SME-113 review 1). GitHub answers a refused token request
+/// with HTTP 200 and an `error` in the body, and names a dead refresh token
+/// `bad_refresh_token`, where RFC 6749 §5.2 has a 400 and `invalid_grant`.
+/// oauth2 then can't parse a token from the 200 and rmcp reports a failed
+/// request (`TokenRefreshFailed`), so a sign-in that needs a Reconnect read
+/// as Unreachable. A POST's 200 carrying an `error` and no `access_token` is
+/// passed on as the 400 it means, with `bad_refresh_token` as
+/// `invalid_grant`, which rmcp turns into `AuthorizationRequired`.
+struct ProviderHttpClient {
+    follow_redirects: reqwest_rmcp::Client,
+    stop_redirects: reqwest_rmcp::Client,
+}
+
+const PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_PROVIDER_REPLY_BYTES: usize = 1024 * 1024;
+
+impl ProviderHttpClient {
+    fn new() -> Result<Self, reqwest_rmcp::Error> {
+        Ok(Self {
+            follow_redirects: reqwest_rmcp::Client::builder()
+                .timeout(PROVIDER_TIMEOUT)
+                .build()?,
+            stop_redirects: reqwest_rmcp::Client::builder()
+                .timeout(PROVIDER_TIMEOUT)
+                .redirect(reqwest_rmcp::redirect::Policy::none())
+                .build()?,
+        })
+    }
+}
+
+/// RFC 6749 §5.2's shape for a token request GitHub refused with a 200:
+/// `Some(body)` to pass on as a 400, `None` to leave the reply alone.
+fn as_token_error(status: http::StatusCode, body: &[u8]) -> Option<Vec<u8>> {
+    if status != http::StatusCode::OK {
+        return None;
+    }
+    let mut reply: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(body).ok()?;
+    if reply.contains_key("access_token") || !reply.get("error")?.is_string() {
+        return None;
+    }
+    if reply.get("error").and_then(|e| e.as_str()) == Some("bad_refresh_token") {
+        reply.insert("error".to_string(), "invalid_grant".into());
+    }
+    serde_json::to_vec(&reply).ok()
+}
+
+impl rmcp::transport::auth::OAuthHttpClient for ProviderHttpClient {
+    fn execute(
+        &self,
+        request: rmcp::transport::auth::OAuthHttpRequest,
+    ) -> rmcp::transport::auth::OAuthHttpClientFuture<'_> {
+        use futures_util::StreamExt;
+        use rmcp::transport::auth::{OAuthHttpClientError, OAuthHttpRedirectPolicy};
+        Box::pin(async move {
+            let client = match request.redirect_policy {
+                OAuthHttpRedirectPolicy::Stop => &self.stop_redirects,
+                _ => &self.follow_redirects,
+            };
+            let is_post = request.request.method() == http::Method::POST;
+            let request = reqwest_rmcp::Request::try_from(request.request)
+                .map_err(|e| Box::new(e) as OAuthHttpClientError)?;
+            let response = client
+                .execute(request)
+                .await
+                .map_err(|e| Box::new(e) as OAuthHttpClientError)?;
+            let status = response.status();
+            let mut builder = http::Response::builder()
+                .status(status)
+                .version(response.version());
+            // The body is passed on whole, and may be replaced below, so
+            // its length isn't copied.
+            for (name, value) in response.headers() {
+                if name != http::header::CONTENT_LENGTH {
+                    builder = builder.header(name, value);
+                }
+            }
+            let mut body = Vec::new();
+            let mut chunks = response.bytes_stream();
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk.map_err(|e| Box::new(e) as OAuthHttpClientError)?;
+                if chunk.len() > MAX_PROVIDER_REPLY_BYTES - body.len() {
+                    return Err(format!(
+                        "the OAuth provider's reply is over {MAX_PROVIDER_REPLY_BYTES} bytes"
+                    )
+                    .into());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            if is_post && let Some(error) = as_token_error(status, &body) {
+                builder = builder.status(http::StatusCode::BAD_REQUEST);
+                body = error;
+            }
+            builder.body(body).map_err(|e| Box::new(e) as OAuthHttpClientError)
+        })
+    }
 }
 
 /// Completes an in-flight authorization attempt — pops `server_id`'s
@@ -340,6 +547,27 @@ mod tests {
     use axum::Json;
     use axum::body::Bytes;
     use axum::routing::{get, post};
+
+    /// SME-113 review 1: GitHub's refusals, as its docs give them
+    /// (`error_description` and `error_uri` included), become RFC 6749's
+    /// 400; a token, and a reply that isn't a 200, pass untouched.
+    #[test]
+    fn test_a_token_error_sent_with_a_200_becomes_a_400_invalid_grant() {
+        let github = br#"{"error":"bad_refresh_token","error_description":"The refresh token passed is incorrect or expired.","error_uri":"https://docs.github.com"}"#;
+        let fixed = as_token_error(http::StatusCode::OK, github).expect("a refusal");
+        let fixed: serde_json::Value = serde_json::from_slice(&fixed).expect("json");
+        assert_eq!(fixed["error"], "invalid_grant");
+        assert_eq!(fixed["error_description"], "The refresh token passed is incorrect or expired.");
+
+        let other = br#"{"error":"incorrect_client_credentials"}"#;
+        let fixed = as_token_error(http::StatusCode::OK, other).expect("a refusal");
+        assert!(String::from_utf8_lossy(&fixed).contains("incorrect_client_credentials"));
+
+        let token = br#"{"access_token":"t","token_type":"bearer"}"#;
+        assert_eq!(as_token_error(http::StatusCode::OK, token), None);
+        assert_eq!(as_token_error(http::StatusCode::BAD_REQUEST, github), None);
+        assert_eq!(as_token_error(http::StatusCode::OK, b"not json"), None);
+    }
 
     /// `SMELT_BASE_URL` is process-global and only this test touches it —
     /// no cross-test lock needed. Save/restore around the body
@@ -811,8 +1039,8 @@ mod tests {
         );
 
         // `get_access_token` on a fresh manager built from the same store
-        // mirrors exactly what `crate::mcp::oauth_headers` does on every
-        // `connect()` — proves both persistence and transparent refresh
+        // mirrors what `connection_manager`'s manager does before each
+        // request — proves both persistence and transparent refresh
         // (the initial token's `expires_in: 0` forces this).
         let mut manager = rmcp::transport::auth::AuthorizationManager::new(base_url.as_str())
             .await
