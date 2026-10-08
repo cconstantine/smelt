@@ -3279,7 +3279,10 @@ async fn next_turn_error(
 #[sqlx::test]
 async fn test_stopping_a_woken_turn_is_not_reported_as_a_failure(pool: PgPool) {
     let _guard = lock_turn_tests();
-    let conversation = db::create_conversation_with_id(&pool, 9_100_000_014)
+    // Not `test_a_turn_error_is_still_there_after_a_reload`'s id: that
+    // test's stop leaves its conversation paused for the rest of the
+    // process, and a wake there starts no turn (SME-135).
+    let conversation = db::create_conversation_with_id(&pool, 9_135_000_014)
         .await
         .expect("create conversation");
     unnotified_finished_command(&pool, conversation.id, "cmd-woken").await;
@@ -3294,9 +3297,15 @@ async fn test_stopping_a_woken_turn_is_not_reported_as_a_failure(pool: PgPool) {
     stop_turn_now(conversation.id);
     let _ = wake.await;
 
-    let reported = drain_events(&mut rx)
-        .await
-        .into_iter()
+    let seen = drain_events(&mut rx).await;
+    // A wake that never started a turn (its conversation left paused by
+    // another test's stop, say) would pass the check below untested.
+    assert!(
+        seen.iter().any(|e| matches!(e, events::ConversationEvent::TurnState { running: true })),
+        "the wake should have started a turn: {seen:?}"
+    );
+    let reported = seen
+        .iter()
         .any(|e| matches!(e, events::ConversationEvent::NotificationDeliveryFailed { .. }));
     assert!(!reported, "a stop isn't a failed notification");
 }
