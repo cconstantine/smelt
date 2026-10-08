@@ -1260,20 +1260,36 @@ pub async fn smelt_instance(pool: &PgPool) -> Result<SmeltInstance, sqlx::Error>
 /// and every smelt server shares the namespace: a scratch database
 /// counting from 1 would name its claims and pods like the dev server's.
 pub async fn start_ids_clear_if_fresh(pool: &PgPool) -> Result<Option<i64>, sqlx::Error> {
-    // Never used: `last_value` is null until a sequence's first value.
-    let fresh: bool = sqlx::query_scalar(
-        "SELECT count(*) = 3 AND bool_and(s.last_value IS NULL)
+    // Each sequence's last value: null until its first one.
+    let sequences: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT t.name, s.last_value
          FROM unnest($1::text[]) AS t(name)
          JOIN pg_sequences s ON format('%I.%I', s.schemaname, s.sequencename) = pg_get_serial_sequence(t.name, 'id')",
     )
     .bind(&CLEAR_ID_TABLES[..])
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await?;
-    if !fresh {
+    // Any id ever handed out below the base: a used database, left alone.
+    // One already at or above it was moved by an earlier start; a move
+    // that failed partway (`setval` isn't transactional) is finished now
+    // (SME-115 review 2).
+    if sequences.len() != CLEAR_ID_TABLES.len()
+        || sequences.iter().any(|(_, last)| last.is_some_and(|last| last < CLEAR_IDS_BASE))
+    {
+        return Ok(None);
+    }
+    let unused: Vec<&str> = sequences.iter().filter(|(_, last)| last.is_none()).map(|(name, _)| name.as_str()).collect();
+    if unused.is_empty() {
         return Ok(None);
     }
     let base = clear_ids_base();
-    move_id_sequences(pool, base).await?;
+    for table in unused {
+        sqlx::query("SELECT setval(pg_get_serial_sequence($1, 'id'), $2)")
+            .bind(table)
+            .bind(base)
+            .execute(pool)
+            .await?;
+    }
     Ok(Some(base))
 }
 
@@ -1296,6 +1312,7 @@ fn clear_ids_base() -> i64 {
 }
 
 /// Moves `CLEAR_ID_TABLES`' id sequences to `base`: the next id is above it.
+#[cfg(test)]
 async fn move_id_sequences(pool: &PgPool, base: i64) -> Result<(), sqlx::Error> {
     for table in CLEAR_ID_TABLES {
         sqlx::query("SELECT setval(pg_get_serial_sequence($1, 'id'), $2)")
@@ -4775,6 +4792,25 @@ mod tests {
             assert!(id > base, "the next {what} id is {id}, not above {base}");
         }
         assert_eq!(start_ids_clear_if_fresh(&pool).await.expect("again"), None, "moved twice");
+    }
+
+    /// SME-115 review 2: a move that failed partway (one sequence moved,
+    /// the others not) is finished at the next start, instead of leaving
+    /// the rest counting from 1 for good.
+    #[sqlx::test]
+    async fn test_a_partly_moved_database_finishes_the_move(pool: PgPool) {
+        sqlx::query("SELECT setval(pg_get_serial_sequence('conversations', 'id'), 2000000005)")
+            .execute(&pool)
+            .await
+            .expect("move one sequence");
+        let base = start_ids_clear_if_fresh(&pool).await.expect("move them").expect("the rest are moved");
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let pod = create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+        let volume = create_sandbox_volume(&pool, "sme-115", "/data").await.expect("volume row");
+        assert_eq!(conversation.id, 2_000_000_006, "the moved sequence is kept");
+        for (what, id) in [("sandbox pod", pod.id), ("sandbox volume", volume.id)] {
+            assert!(id > base && base >= 2_000_000_000, "the next {what} id is {id}, base {base}");
+        }
     }
 
     /// SME-115: a database whose ids were ever used (the dev or production
