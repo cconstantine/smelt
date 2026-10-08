@@ -686,6 +686,11 @@ async fn test_a_conversation_stream_relays_turns_changed() {
 /// listening on the conversation's channel.
 #[sqlx::test]
 async fn test_a_dropped_event_subscription_stops_listening(pool: PgPool) {
+    // An id no other test's conversation has: subscriptions are counted
+    // per id across the process, and every test database counts from 1
+    // (it failed twice in SME-94's gates, with turn tests running
+    // alongside once nothing held their lock for minutes).
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
     // What `subscribe_conversation_events` answers, on this test's pool.
     let subscription = ServerEvents::from_stream(
