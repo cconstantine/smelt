@@ -4730,3 +4730,37 @@ async fn test_dropping_without_delete_still_cleans_up_via_drain_task() {
         "drain task should have deleted the pod within the timeout"
     );
 }
+
+/// The futures of the sandbox calls that sit deepest in the dev server's
+/// and the tests' call stacks stay small. A debug build runs them on a
+/// 2 MB stack: on SME-115 holding a whole `Pod` across an await doubled
+/// `force_terminate_pod`'s future and every caller's, and the first sign
+/// was `test_terminal_lifecycle_end_to_end` overflowing its stack. Each
+/// bound is about twice the size when this test was written; a failure
+/// here means keep large values out of an await's scope or `Box::pin`
+/// the large sub-future, not raise the bound. Nothing is polled, so this
+/// needs neither a cluster nor a database.
+#[tokio::test]
+async fn test_sandbox_futures_stay_small() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+        .expect("lazy pool");
+    let client = kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().expect("url"))).expect("client");
+    let instance = db::SmeltInstance { id: "size-test".to_string(), owns_unlabelled: true };
+
+    let sizes = [
+        ("force_terminate_pod", std::mem::size_of_val(&force_terminate_pod(&pool, 1)), 1200),
+        ("force_terminate_pod_with", std::mem::size_of_val(&force_terminate_pod_with(&pool, &client, 1)), 600),
+        ("close_if_gone", std::mem::size_of_val(&watch::close_if_gone(&pool, 1)), 4200),
+        ("close_if_gone_with", std::mem::size_of_val(&watch::close_if_gone_with(&pool, &client, 1)), 4000),
+        ("create_pod", std::mem::size_of_val(&create_pod(&pool, 1, PodLimitOverrides::default())), 15000),
+        ("ensure_conversation_pvcs", std::mem::size_of_val(&claims::ensure_conversation_pvcs(&client, 1, &instance)), 6700),
+    ];
+    for (name, size, bound) in sizes {
+        println!("{name}: {size} bytes (bound {bound})");
+    }
+    for (name, size, bound) in sizes {
+        assert!(size <= bound, "{name}'s future is {size} bytes, over its bound of {bound}");
+    }
+}
