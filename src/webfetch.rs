@@ -99,19 +99,42 @@ fn build_browser_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 /// caller then makes its own attempt (tokio's documented behaviour,
 /// checked in 1.53.1's source). A built runtime is stored in the static
 /// and never dropped: dropping one inside an async context panics.
+///
+/// When the OS refuses a worker thread, tokio 1.53.1's `build()` doesn't
+/// return an `Err`: it panics ("OS can't spawn worker thread: …",
+/// `runtime/blocking/pool.rs`); only driver setup comes back as one. So the
+/// build runs under `catch_unwind`, and its panic becomes the same error.
+/// Unwinding out of a half-built runtime is safe here: its blocking pool's
+/// drop sees `thread::panicking()` in an async context and returns without
+/// waiting (`runtime/blocking/shutdown.rs`). A worker thread that did start
+/// before the refusal is left behind, idle.
 async fn runtime_in(
     cell: &'static OnceCell<tokio::runtime::Runtime>,
     build: fn() -> std::io::Result<tokio::runtime::Runtime>,
 ) -> Result<&'static tokio::runtime::Runtime, String> {
     cell.get_or_try_init(|| async move {
-        build().map_err(|e| {
-            format!(
-                "couldn't start the shared browser (the OS refused its threads: {e}); \
-                 nothing was fetched, and the next call tries again"
-            )
-        })
+        let reason = match std::panic::catch_unwind(build) {
+            Ok(Ok(runtime)) => return Ok(runtime),
+            Ok(Err(e)) => e.to_string(),
+            Err(panic) => panic_message(panic.as_ref()),
+        };
+        Err(format!(
+            "couldn't start the shared browser (the OS refused its threads: {reason}); \
+             nothing was fetched, and the next call tries again"
+        ))
     })
     .await
+}
+
+/// A caught panic's message, when it's a string (as tokio's are).
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        message.to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "the runtime's build panicked".to_string()
+    }
 }
 
 /// A browser context from `new_isolated_page`, plus the sandbox-route
@@ -631,6 +654,34 @@ mod tests {
         let failed = runtime_in(&CELL, || Err(std::io::Error::other("no threads"))).await;
         let error = failed.err().expect("a failed build should be an error");
         assert!(error.contains("no threads"), "the OS's reason should reach the model: {error}");
+        assert!(CELL.get().is_none(), "a failed build should store nothing");
+
+        let runtime = runtime_in(&CELL, build_browser_runtime)
+            .await
+            .expect("the next call should build the runtime");
+        let answer = runtime.spawn(async { 42 }).await.expect("a task on the built runtime");
+        assert_eq!(answer, 42);
+    }
+
+    /// When the OS refuses a worker thread, tokio 1.53.1's `Builder::build`
+    /// doesn't return an `Err`: it panics with this message
+    /// (`runtime/blocking/pool.rs`). That call must still fail as an error
+    /// the model can read, and the next one build the runtime (SME-119,
+    /// review round 1).
+    #[tokio::test]
+    async fn test_a_browser_runtime_build_that_panics_fails_only_that_call() {
+        static CELL: OnceCell<tokio::runtime::Runtime> = OnceCell::const_new();
+        let failed = runtime_in(&CELL, || {
+            // Formatted, as tokio's is, so the payload is a `String`.
+            let refused = std::io::Error::from_raw_os_error(11);
+            panic!("OS can't spawn worker thread: {refused}")
+        })
+        .await;
+        let error = failed.err().expect("a panicking build should be an error");
+        assert!(
+            error.contains("Resource temporarily unavailable"),
+            "the OS's reason should reach the model: {error}"
+        );
         assert!(CELL.get().is_none(), "a failed build should store nothing");
 
         let runtime = runtime_in(&CELL, build_browser_runtime)
