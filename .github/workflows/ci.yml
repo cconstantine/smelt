@@ -97,7 +97,7 @@ jobs:
 
       # The sandbox tests create real pods against the compose-provided k3s
       # cluster. Two of them (test_dropping_without_delete_still_cleans_up_via_drain_task,
-      # test_terminal_lifecycle_end_to_end) reliably timed out here in CI —
+      # the sandbox lifecycle test, since split up) reliably timed out here in CI —
       # neither raising SANDBOX_RUNNING_WAIT_TIMEOUT_SECS to 120s nor
       # lowering SANDBOX_CPU_LIMIT to 250m fixed it. The diagnostics step
       # below (added when those two didn't work) found the real cause:
