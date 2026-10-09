@@ -12,7 +12,7 @@
 
 use dioxus::prelude::*;
 use linkify::{LinkFinder, LinkKind};
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
 
 use crate::highlight::{self, Span};
 
@@ -358,10 +358,18 @@ impl Builder {
                         Tag::Emphasis => Container::Emphasis(Vec::new()),
                         Tag::Strong => Container::Strong(Vec::new()),
                         Tag::Strikethrough => Container::Strike(Vec::new()),
-                        Tag::Link { dest_url, .. } => Container::Link {
-                            url: allowed_url(&dest_url, &["http", "https", "mailto"]).then(|| dest_url.to_string()),
-                            content: Vec::new(),
-                        },
+                        Tag::Link { link_type, dest_url, .. } => {
+                            // pulldown-cmark gives `<me@e.com>` no `mailto:`.
+                            let dest = if link_type == LinkType::Email {
+                                format!("mailto:{dest_url}")
+                            } else {
+                                dest_url.to_string()
+                            };
+                            Container::Link {
+                                url: allowed_url(&dest, &["http", "https", "mailto"]).then_some(dest),
+                                content: Vec::new(),
+                            }
+                        }
                         _ => Container::Transparent { block: false },
                     }
                 }
@@ -1127,6 +1135,17 @@ mod tests {
             "an address with a dot in its name is found whole"
         );
         assert_eq!(links_in("root@localhost"), pairs(&[]), "a domain without a dot stays text");
+    }
+
+    /// SME-104: `<me@e.com>` came through with no `mailto:`, so it was
+    /// refused as a link; an angle-bracket URL stays one link.
+    #[test]
+    fn test_angle_bracket_autolinks() {
+        assert_eq!(
+            parse("<me@e.com>"),
+            vec![Block::Paragraph(vec![link("mailto:me@e.com", "me@e.com")])]
+        );
+        assert_eq!(parse("<https://e.com>"), vec![Block::Paragraph(vec![link("https://e.com", "https://e.com")])]);
     }
 
     /// SME-104: code, raw HTML blocks, image alt text and an existing
