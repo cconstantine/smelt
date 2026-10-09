@@ -791,6 +791,9 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "chat_errors_are_alerts", 30, Box::pin(scenario_chat_errors_are_alerts(&t))).await;
     run_scenario(&t, only, r, k, "message_box_label", 30, Box::pin(scenario_message_box_label(&t))).await;
     run_scenario(&t, only, r, k, "conversation_rows_by_keyboard", 60, Box::pin(scenario_conversation_rows_by_keyboard(&t))).await;
+    run_scenario(&t, only, r, k, "markdown_bare_urls", 60, Box::pin(scenario_markdown_bare_urls(&t))).await;
+    run_scenario(&t, only, r, k, "markdown_bare_urls_streaming", 60, Box::pin(scenario_markdown_bare_urls_streaming(&t))).await;
+    run_scenario(&t, only, r, k, "markdown_link_bidi_isolated", 60, Box::pin(scenario_markdown_link_bidi_isolated(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -5119,4 +5122,146 @@ async fn find_leftovers(
         }
     }
     leftovers
+}
+
+/// Every link in the first element matching `selector`: its `href`, words,
+/// `target` and `rel`.
+fn link_facts_script(selector: &str) -> String {
+    format!(
+        "Array.from(document.querySelector('{selector}')?.querySelectorAll('a') ?? []).map(a => \
+         [a.getAttribute('href'), a.innerText, a.getAttribute('target'), a.getAttribute('rel')])"
+    )
+}
+
+/// SME-104: a bare URL, a `www.` address and an email address in a reply
+/// become links that open in a new tab, with `noopener noreferrer`, their
+/// words unchanged; a URL in inline code, in a code block or with another
+/// scheme stays text, and a markdown link stays one link.
+async fn scenario_markdown_bare_urls(t: &Scenario<'_>) {
+    let conversation = t.conversation().await;
+    let reply = "See https://example.com/bare, www.example.org or mail me@example.com.\n\n\
+        Not `https://example.com/code` nor ftp://example.com/x, but [the docs](https://example.com/docs).\n\n\
+        ```\nhttps://example.com/block\n```\n";
+    db::create_message(t.pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: reply.into() }])
+        .await
+        .expect("seed the reply");
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    wait_for_element(&page, ".message-assistant .markdown a", Duration::from_secs(10)).await;
+    let links: Vec<(String, String, String, String)> = page
+        .evaluate(link_facts_script(".message-assistant .markdown"))
+        .await
+        .expect("read the reply's links")
+        .into_value()
+        .expect("links");
+    let tab = |href: &str, words: &str| {
+        (href.to_string(), words.to_string(), "_blank".to_string(), "noopener noreferrer".to_string())
+    };
+    assert_eq!(
+        links,
+        vec![
+            tab("https://example.com/bare", "https://example.com/bare"),
+            tab("https://www.example.org", "www.example.org"),
+            tab("mailto:me@example.com", "me@example.com"),
+            tab("https://example.com/docs", "the docs"),
+        ]
+    );
+    let text: String = page
+        .evaluate("document.querySelector('.message-assistant .markdown').innerText")
+        .await
+        .expect("read the reply")
+        .into_value()
+        .expect("text");
+    for kept in ["https://example.com/code", "ftp://example.com/x", "https://example.com/block"] {
+        assert!(text.contains(kept), "{kept} should still show as text: {text}");
+    }
+}
+
+/// SME-104: a bare URL that arrives over two deltas is one link once it's
+/// whole, and the reply looks the same once it's saved.
+async fn scenario_markdown_bare_urls_streaming(t: &Scenario<'_>) {
+    use crate::events::{ConversationEvent, publish};
+    let conversation = t.conversation().await;
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    publish(conversation.id, ConversationEvent::ReplyReset {});
+    let first = "The guide is at https://exa";
+    publish(conversation.id, ConversationEvent::ReplyDelta { text: first.into(), offset: 0 });
+    wait_for_element(&page, ".message-streaming .markdown a", Duration::from_secs(10)).await;
+    let rest = "mple.com/guide. Read it.";
+    publish(conversation.id, ConversationEvent::ReplyDelta { text: rest.into(), offset: first.len() });
+    wait_for_element(&page, ".message-streaming .markdown a[href='https://example.com/guide']", Duration::from_secs(10))
+        .await;
+    let links: Vec<(String, String, String, String)> = page
+        .evaluate(link_facts_script(".message-streaming .markdown"))
+        .await
+        .expect("read the streamed links")
+        .into_value()
+        .expect("links");
+    let guide = "https://example.com/guide".to_string();
+    assert_eq!(
+        links,
+        vec![(guide.clone(), guide, "_blank".to_string(), "noopener noreferrer".to_string())],
+        "one link for the whole URL"
+    );
+    let streamed: String = page
+        .evaluate("document.querySelector('.message-streaming .markdown').innerHTML.replace(/ data-dioxus-id=\"\\d+\"/g, '')")
+        .await
+        .expect("read the streamed reply")
+        .into_value()
+        .expect("html");
+    let saved = db::create_message(
+        t.pool,
+        conversation.id,
+        "assistant",
+        &[anthropic::ContentBlock::Text { text: format!("{first}{rest}") }],
+    )
+    .await
+    .expect("save the reply");
+    publish(conversation.id, ConversationEvent::MessagesAppended { messages: vec![saved] });
+    assert!(
+        wait_for_count(&page, ".message-streaming", 0, Duration::from_secs(10)).await,
+        "the saved reply should replace its streaming copy"
+    );
+    let saved_html: String = page
+        .evaluate("document.querySelector('.message-assistant .markdown').innerHTML.replace(/ data-dioxus-id=\"\\d+\"/g, '')")
+        .await
+        .expect("read the saved reply")
+        .into_value()
+        .expect("html");
+    assert_eq!(saved_html, streamed, "the reply changed when it was saved");
+}
+
+/// SME-104 review 2: a bidi control in the text before a link doesn't
+/// reverse how the link shows. An RLO (U+202E) left open in a reply
+/// reordered a following bare link `https://evil.com/moc.knab//:sptth`
+/// to read `https://bank.com/moc.live//:sptth`. The link's first character
+/// must show to the left of its last.
+async fn scenario_markdown_link_bidi_isolated(t: &Scenario<'_>) {
+    let conversation = t.conversation().await;
+    let reply = "Go to \u{202E}https://evil.com/moc.knab//:sptth now, or [this](https://evil.com/x) one.\n";
+    db::create_message(t.pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: reply.into() }])
+        .await
+        .expect("seed the reply");
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    wait_for_element(&page, ".message-assistant .markdown a", Duration::from_secs(10)).await;
+    // For each link: its words, and the on-screen x of its first and last
+    // characters.
+    let order: Vec<(String, f64, f64)> = page
+        .evaluate(
+            "Array.from(document.querySelectorAll('.message-assistant .markdown a')).map(a => { \
+               const node = a.firstChild.nodeType === 3 ? a.firstChild : a.firstChild.firstChild; \
+               const at = i => { const r = document.createRange(); r.setStart(node, i); r.setEnd(node, i + 1); \
+                 return r.getBoundingClientRect().left; }; \
+               return [a.innerText, at(0), at(node.length - 1)]; })",
+        )
+        .await
+        .expect("measure the links")
+        .into_value()
+        .expect("links");
+    assert_eq!(order.len(), 2, "two links: {order:?}");
+    for (words, first, last) in &order {
+        assert!(first < last, "{words:?} shows reversed: its first character is at x={first}, its last at x={last}");
+    }
 }

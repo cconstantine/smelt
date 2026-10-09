@@ -459,6 +459,9 @@ body {
 
 .markdown a {
     color: var(--accent);
+    /* A bidi control in the text around a link (an RLO the reply left
+       open) mustn't reorder how the link shows (SME-104). */
+    unicode-bidi: isolate;
 }
 
 .markdown .md-inline-code {
