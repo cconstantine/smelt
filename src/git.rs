@@ -1226,7 +1226,7 @@ mod server {
             Ok((shell, cloned)) => {
                 // What the model can load with load_instructions.
                 let files = list_agents_files(&shell, &repo.dir).await.map_err(|e| {
-                    tracing::warn!(repo = %repo.url, error = %e, "couldn't list AGENTS.md files");
+                    tracing::warn!(repo = %crate::telemetry::scrub_urls(&repo.url), error = %e, "couldn't list AGENTS.md files");
                     e.to_string()
                 });
                 record_cloned(pool, repo, &cloned, files, guard).await

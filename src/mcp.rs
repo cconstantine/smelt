@@ -561,7 +561,10 @@ pub async fn tool_definitions_for(
             match tokio::time::timeout(TOOL_LIST_WAIT, task).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(e))) => {
-                    tracing::warn!(server = %name, error = %e, "MCP server unreachable this turn; its tools are unavailable");
+                    // Its URL's query can hold the server's key, and this
+                    // line is exported with the turn's span (SME-137).
+                    let error = crate::telemetry::scrub_urls(&e.to_string());
+                    tracing::warn!(server = %name, %error, "MCP server unreachable this turn; its tools are unavailable");
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(server = %name, error = %e, "MCP connect task failed");
@@ -1214,6 +1217,28 @@ mod tests {
         let caller = spans.iter().find(|span| span.name == "caller").expect("the caller's span");
         let connect = spans.iter().find(|span| span.name == "mcp connect").expect("a connect span");
         assert_eq!(connect.parent_span_id, caller.span_context.span_id());
+    }
+
+    /// Review 1: a failed connect's error quotes the server's URL, and a
+    /// query can hold its key (`?apiKey=`). Neither a span's status nor the
+    /// tool list's warning exports it.
+    #[tokio::test]
+    async fn test_a_failed_connect_exports_no_query_from_the_servers_url() {
+        let mut config = test_config(-137_004, "keyed");
+        config.url = "http://127.0.0.1:1/mcp?apiKey=SECRET-KEY".to_string();
+        let (_, spans) = crate::telemetry::capture_spans(async {
+            crate::telemetry::in_span(tracing::info_span!("caller"), async {
+                let _ = connection_check(&test_pool(), &config).await;
+                evict(config.id).await;
+                lock_failures().remove(&config.id);
+                tool_definitions_for(&test_pool(), std::slice::from_ref(&config)).await
+            })
+            .await
+        })
+        .await;
+        assert!(spans.iter().any(|span| span.name == "mcp connect"), "{spans:?}");
+        let exported = format!("{spans:?}");
+        assert!(!exported.contains("SECRET-KEY"), "{exported}");
     }
 
     #[tokio::test]

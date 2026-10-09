@@ -63,13 +63,42 @@ pub(crate) fn resource_attributes(env: impl Fn(&str) -> Option<String>) -> Vec<K
     attributes
 }
 
-/// Marks `span` as failed with `message` (cut to
+/// `text` with every URL in it cut to its scheme, host and path: userinfo,
+/// query and fragment can hold a key or a token. A cut query shows as `?…`.
+pub(crate) fn scrub_urls(text: &str) -> String {
+    static URL: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"[A-Za-z][A-Za-z0-9+.-]*://[^\s()<>"'`]+"#).ok()
+    });
+    // A pattern that can't compile can't scrub: say nothing rather than leak.
+    let Some(url) = URL.as_ref() else { return "(error text withheld)".to_string() };
+    url.replace_all(text, |found: &regex::Captures<'_>| {
+        let whole = &found[0];
+        // Sentence punctuation after a URL isn't part of it.
+        let token = whole.trim_end_matches(['.', ',', ';', ':', '!']);
+        let tail = &whole[token.len()..];
+        let (scheme, rest) = token.split_once("://").unwrap_or(("", token));
+        let cut_at = rest.find(['?', '#']).unwrap_or(rest.len());
+        let (address, cut) = rest.split_at(cut_at);
+        let address = match address.find('/') {
+            Some(slash) => {
+                let (authority, path) = address.split_at(slash);
+                format!("{}{path}", authority.rsplit('@').next().unwrap_or(authority))
+            }
+            None => address.rsplit('@').next().unwrap_or(address).to_string(),
+        };
+        let query = if cut.starts_with('?') { "?…" } else { "" };
+        format!("{scheme}://{address}{query}{tail}")
+    })
+    .into_owned()
+}
+
+/// Marks `span` as failed with `message` (its URLs scrubbed, cut to
 /// [`STATUS_DESCRIPTION_LIMIT`] characters), without logging an event: a
 /// failed tool call is the model's to handle, not a new console line. The
 /// span must declare `otel.status_code` and `otel.status_description` (as
 /// `tracing::field::Empty`), or the record is dropped.
 pub(crate) fn mark_error(span: &Span, message: &str) {
-    let description: String = message.chars().take(STATUS_DESCRIPTION_LIMIT).collect();
+    let description: String = scrub_urls(message).chars().take(STATUS_DESCRIPTION_LIMIT).collect();
     span.record("otel.status_code", "ERROR");
     // After the code: the description is what sets the status's text.
     span.record("otel.status_description", description.as_str());
@@ -533,6 +562,37 @@ mod tests {
         assert_eq!(names, ["work"]);
         let events: Vec<_> = spans[0].events.iter().map(|event| event.name.to_string()).collect();
         assert_eq!(events, ["a dependency's warning"]);
+    }
+
+    /// Review 1: an error's text quotes URLs (reqwest's `for url (…)`, smelt's
+    /// own `failed to load {url}`), and a query or userinfo can hold a key.
+    #[test]
+    fn test_urls_in_text_lose_their_userinfo_query_and_fragment() {
+        let scrubbed = scrub_urls(
+            "error sending request for url (http://me:pw@127.0.0.1:1/mcp?apiKey=SECRET-KEY#frag); \
+             then https://example.com/a/b?token=SECRET2 and wss://h/x?y=SECRET3.",
+        );
+        assert!(!scrubbed.contains("SECRET"), "{scrubbed}");
+        assert!(!scrubbed.contains("me:pw"), "{scrubbed}");
+        assert!(scrubbed.contains("(http://127.0.0.1:1/mcp?…)"), "{scrubbed}");
+        assert!(scrubbed.contains("https://example.com/a/b?…"), "{scrubbed}");
+        assert!(scrubbed.ends_with("wss://h/x?…."), "{scrubbed}");
+        assert_eq!(scrub_urls("no url here: 404 at /a?b"), "no url here: 404 at /a?b");
+    }
+
+    #[tokio::test]
+    async fn test_mark_error_scrubs_urls() {
+        let ((), spans) = capture_spans(async {
+            let span = tracing::info_span!(
+                "work",
+                otel.status_code = tracing::field::Empty,
+                otel.status_description = tracing::field::Empty,
+            );
+            mark_error(&span, "failed for url (http://h/mcp?apiKey=SECRET-KEY)");
+        })
+        .await;
+        let [span] = spans.as_slice() else { panic!("one span: {spans:?}") };
+        assert!(!format!("{:?}", span.status).contains("SECRET"), "{:?}", span.status);
     }
 
     #[tokio::test]
