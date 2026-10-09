@@ -654,3 +654,24 @@ async fn test_try_reconnect_does_not_wait_for_a_connect_in_progress(pool: PgPool
     assert!(started.elapsed() < Duration::from_millis(500), "try_reconnect waited {:?}", started.elapsed());
     connecting.await.expect("join").expect("the first connect still succeeds");
 }
+
+/// Review 2: the rebuild advice for a pod on the image a new pod gets
+/// names the way to get that image, as the missing-image advice does: the
+/// build script makes only this tree's own image, and `:latest` only with
+/// `--latest`.
+#[test]
+fn test_the_rebuild_advice_fits_the_image() {
+    let advice = |image: &str| {
+        TerminalError::AgentOutdated { found: None, image: PodImage::SameAsNew(image.to_string()) }.to_string()
+    };
+    let own = advice(OWN_SANDBOX_IMAGE);
+    assert!(own.contains("with scripts/build-sandbox-image.sh") && !own.contains("--latest"), "{own}");
+    let latest = advice("smelt-sandbox:latest");
+    assert!(latest.contains("scripts/build-sandbox-image.sh --latest"), "{latest}");
+    let other = advice("registry.example/team/sandbox:1");
+    assert!(other.contains("SANDBOX_IMAGE or SANDBOX_DOCKER_IMAGE names it"), "{other}");
+    assert!(!other.contains("with scripts/build-sandbox-image.sh"), "{other}");
+    for text in [own, latest, other] {
+        assert!(text.contains("Once it's rebuilt, call terminate_pod, then create_pod"), "{text}");
+    }
+}
