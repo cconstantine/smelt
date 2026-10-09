@@ -788,7 +788,21 @@ pub(super) fn Transcript(
     let copies = use_memo(move || reply_parts(&messages.read(), turn_running()));
     // The reply whose Copy reply button is pointed at, focused or showing
     // its feedback: its bubbles are outlined.
-    let lit_reply = use_signal(|| None::<i64>);
+    let mut lit_reply = use_signal(|| None::<i64>);
+    // A lit reply whose button is gone (another conversation opened, or the
+    // turn started again) isn't lit any more: the button can't say so
+    // itself once it's unmounted (code review 1).
+    use_effect(move || {
+        let lit = *lit_reply.peek();
+        let has_button = |reply: i64| copies.read().get(&reply).is_some_and(|part| part.copy.is_some());
+        // Subscribe to the parts even when nothing is lit.
+        let _ = copies.read();
+        if let Some(reply) = lit
+            && !has_button(reply)
+        {
+            lit_reply.set(None);
+        }
+    });
     rsx! {
         div {
             class: "messages",

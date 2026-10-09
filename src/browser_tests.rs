@@ -2884,6 +2884,9 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
     let reply = db::create_message(t.pool, conversation.id, "assistant", &[text(part_two)]).await.expect("seed part two").id;
     seed_user_message(t.pool, conversation.id, "Thanks").await;
     let later = db::create_message(t.pool, conversation.id, "assistant", &[text(second_reply)]).await.expect("seed a second reply").id;
+    // A conversation to switch to and back (the outline mustn't outlast
+    // its button, code review 1).
+    let elsewhere = t.conversation().await;
     // Checks added in code review 1, collected so one run shows each.
     let mut problems: Vec<String> = Vec::new();
     let path = format!("conversation/{}", conversation.id);
@@ -2954,6 +2957,20 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
     }
     page.evaluate("document.activeElement?.blur()").await.expect("blur");
     wait_for_outlined(&page, &[], Duration::from_secs(3)).await;
+
+    // Switching away while "Copied" shows, then back: the outline went
+    // with its button (code review 1, L3).
+    click_when_present(&page, &reply_copy_button(later), Duration::from_secs(5)).await;
+    assert_eq!(wait_for_copy_label(&page, later, "Copied", Duration::from_secs(5)).await, "Copied");
+    page.move_mouse(chromiumoxide::layout::Point::new(5.0, 5.0)).await.expect("point away");
+    click_conversation(&page, elsewhere.id).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    click_conversation(&page, conversation.id).await;
+    assert!(wait_for_count(&page, ".reply-copy", 2, Duration::from_secs(10)).await, "back on the conversation");
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    if let Err(why) = outlined_within(&page, &[], Duration::from_secs(1)).await {
+        problems.push(format!("an outline outlived its button: {why}"));
+    }
 
     // A refused copy says so: writeText rejecting and execCommand failing.
     page.evaluate(
