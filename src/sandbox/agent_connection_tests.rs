@@ -744,3 +744,88 @@ fn test_the_rebuild_advice_fits_the_image() {
         assert!(text.contains("Once it's rebuilt, call terminate_pod, then create_pod"), "{text}");
     }
 }
+
+/// The `SandboxCommandUpdate`s `events` carries for `command_id`, as
+/// (started?, status, exit code), until one that isn't `running` or
+/// `deadline` passes.
+async fn command_updates(
+    events: &mut tokio::sync::broadcast::Receiver<crate::events::ConversationEvent>,
+    command_id: &str,
+    deadline: Duration,
+) -> Vec<(bool, String, Option<i32>)> {
+    let mut seen = Vec::new();
+    let _ = tokio::time::timeout(deadline, async {
+        loop {
+            match events.recv().await {
+                Ok(crate::events::ConversationEvent::SandboxCommandUpdate {
+                    command_id: id, command, status, exit_code, ..
+                }) if id == command_id => {
+                    let done = status != "running";
+                    seen.push((command.is_some(), status, exit_code));
+                    if done {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(_) => return,
+            }
+        }
+    })
+    .await;
+    seen
+}
+
+/// SME-144: a command the agent finishes at once (`true`) is announced as
+/// started before its finish, so an open tab doesn't apply the finish to
+/// the previous command and then show this one running for good. The
+/// start is published before the send, so no scheduling between the send
+/// and the publish can put the finish first.
+#[sqlx::test]
+async fn test_a_command_is_announced_before_its_finish(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (conversation_id, pod_id) = pod_row(&pool).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod_id).await.expect("terminal row");
+    let mut agent = fake_agent(pod_id, current(), Duration::ZERO).await;
+    let mut events = crate::events::subscribe(conversation_id);
+
+    let run = tokio::spawn({
+        let pool = pool.clone();
+        async move { run_command(&pool, conversation_id, terminal.id, "cmd-fast", "true").await }
+    });
+    let mut fake = agent.next_connection().await;
+    let ClientMessage::Command { id, terminal_id, .. } = fake.next_request().await else {
+        panic!("expected the command");
+    };
+    let _ = fake.send.send(Out::Message(AgentMessage::Exit { id, terminal_id, code: 0 }));
+    run.await.expect("join").expect("the command was sent");
+
+    let updates = command_updates(&mut *events, "cmd-fast", Duration::from_secs(5)).await;
+    assert_eq!(
+        updates,
+        vec![(true, "running".to_string(), None), (false, "finished".to_string(), Some(0))],
+        "the start must come before the finish"
+    );
+}
+
+/// SME-144: a send that fails marks the command lost and says so to open
+/// tabs, after announcing it, so the panel shows `lost` live rather than
+/// the previous command's status.
+#[sqlx::test]
+async fn test_a_failed_send_announces_the_command_lost(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (conversation_id, pod_id) = pod_row(&pool).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod_id).await.expect("terminal row");
+    // An agent on another major: the connect, and so the send, fails.
+    let next_major = ProtocolVersion { major: PROTOCOL_VERSION.major + 1, minor: 0 };
+    let _agent = fake_agent(pod_id, Greeting::Hello(next_major), Duration::ZERO).await;
+    let mut events = crate::events::subscribe(conversation_id);
+
+    let result = run_command(&pool, conversation_id, terminal.id, "cmd-unsent", "echo hi").await;
+    assert!(matches!(result, Err(RunCommandError::Failed(_))), "{result:?}");
+
+    let updates = command_updates(&mut *events, "cmd-unsent", Duration::from_secs(3)).await;
+    assert_eq!(updates, vec![(true, "running".to_string(), None), (false, "lost".to_string(), None)]);
+    let row = db::get_terminal_command(&pool, "cmd-unsent").await.expect("read").expect("the row");
+    assert_eq!(row.status, "lost");
+}
