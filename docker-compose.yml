@@ -201,7 +201,9 @@ services:
   # http://localhost:8182: Tempo's traces, e.g. Explore → Tempo → TraceQL
   # `{ name = "turn" }`. No login: anyone who reaches it is an anonymous
   # Editor, enough for Explore but not to add data sources (an Admin could
-  # point one at postgres or the docker daemon). Localhost only, and it
+  # point one at postgres or the docker daemon). Alerting is off: an
+  # Editor could otherwise make Grafana send webhooks to any host on the
+  # compose network, the docker daemon included. Localhost only, and it
   # answers only to the name localhost, redirecting any other Host, so a
   # page on another site can't reach it by DNS rebinding (smelt's own
   # request_guard does the same, SME-51). Its data source is provisioned
@@ -217,6 +219,7 @@ services:
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Editor
       - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_UNIFIED_ALERTING_ENABLED=false
       - GF_ANALYTICS_REPORTING_ENABLED=false
       - GF_ANALYTICS_CHECK_FOR_UPDATES=false
     volumes:
