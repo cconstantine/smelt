@@ -557,6 +557,59 @@ body {
     text-align: right;
 }
 
+/* A finished reply's last bubble: its Copy reply button left of the
+   timestamp (SME-105). Wraps rather than widening a narrow bubble. */
+.message-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 4px 12px;
+    margin-top: 4px;
+}
+
+.message-footer .timestamp {
+    margin-top: 0;
+    margin-left: auto;
+}
+
+/* Like a code block's Copy, but its hover is the page's surface: the
+   bubble is already `--subtle`. */
+.reply-copy {
+    border: 0;
+    background: none;
+    color: var(--text-2);
+    font: inherit;
+    font-size: 12px;
+    line-height: 1.2;
+    padding: 2px 6px;
+    margin-left: -6px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.reply-copy:hover,
+.reply-copy:focus-visible {
+    background: var(--surface);
+    color: var(--ink);
+}
+
+.reply-copy:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+/* The outline the button draws round what it copies is `ReplyOutline`'s
+   rule in transcript.rs: an `outline`, which no bubble has otherwise. */
+
+@media (pointer: coarse) {
+    .reply-copy {
+        min-height: 32px;
+        padding: 6px 10px;
+        margin-left: -10px;
+    }
+}
+
 .tool-call-header .timestamp,
 .tool-result-header .timestamp {
     margin-left: auto;
