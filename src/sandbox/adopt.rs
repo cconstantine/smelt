@@ -107,7 +107,8 @@ pub(super) async fn adopt_unlabelled_objects_with(client: &kube::Client, pool: &
     match pvc_api(client).list(&unlabelled).await {
         Ok(claims) => {
             for claim in claims {
-                tally.count(adopt_if(&pvc_api(client), claim, &instance.id, decide).await);
+                let uid = claim.metadata.uid.clone();
+                tally.count(uid, adopt_if(&pvc_api(client), claim, &instance.id, decide).await);
             }
         }
         Err(e) => tracing::warn!(error = %e, "couldn't list unlabelled claims to adopt"),
@@ -126,7 +127,8 @@ pub(super) async fn adopt_unlabelled_objects_with(client: &kube::Client, pool: &
         pod.metadata.labels.as_ref().is_some_and(|l| l.contains_key(crate::lsp::pods::LSP_POD_LABEL))
     });
     for pod in others {
-        tally.count(adopt_if(&pods, pod, &instance.id, decide).await);
+        let uid = pod.metadata.uid.clone();
+        tally.count(uid, adopt_if(&pods, pod, &instance.id, decide).await);
     }
     let ours = ListParams::default().labels(&format!("{CONVERSATION_LABEL},{INSTANCE_LABEL}={}", instance.id));
     let sandbox_pods = match pods.list(&ours).await {
@@ -137,7 +139,8 @@ pub(super) async fn adopt_unlabelled_objects_with(client: &kube::Client, pool: &
         }
     };
     for server in servers {
-        tally.count(adopt_if(&pods, server, &instance.id, |meta| should_adopt_server(meta, &instance, &sandbox_pods)).await);
+        let uid = server.metadata.uid.clone();
+        tally.count(uid, adopt_if(&pods, server, &instance.id, |meta| should_adopt_server(meta, &instance, &sandbox_pods)).await);
     }
     // A pod from before SME-33 has no conversation label; its live record
     // names it (SME-115 review 2).
@@ -146,6 +149,7 @@ pub(super) async fn adopt_unlabelled_objects_with(client: &kube::Client, pool: &
             for row in rows {
                 match pods.get_opt(&pod_name(row.pod_id)).await {
                     Ok(Some(pod)) if ownership(&pod.metadata, &instance.id) == Ownership::Unlabelled => tally.count(
+                        pod.metadata.uid.clone(),
                         adopt_if(&pods, pod, &instance.id, |meta| should_adopt_record_pod(meta, &instance, row.conversation_id))
                             .await,
                     ),
@@ -159,27 +163,38 @@ pub(super) async fn adopt_unlabelled_objects_with(client: &kube::Client, pool: &
     // Last, so its absence says adoption didn't finish.
     tracing::info!(
         instance = %instance.id,
-        adopted = tally.adopted,
-        left = tally.left,
+        adopted = tally.adopted(),
+        left = tally.left(),
         "adopted objects made before SME-115"
     );
 }
 
 /// How many objects startup's adoption labelled, and how many it left
-/// unlabelled (not this database's, or a patch that failed).
+/// unlabelled (not this database's, or a patch that failed). Counted by
+/// uid: a pod from before SME-33 is left by the conversation-label pass
+/// and adopted by the record pass, and is one adopted object (SME-117
+/// review 1).
 #[derive(Default)]
 struct AdoptionTally {
-    adopted: usize,
-    left: usize,
+    seen: std::collections::HashSet<String>,
+    adopted: std::collections::HashSet<String>,
 }
 
 impl AdoptionTally {
-    fn count(&mut self, adopted: bool) {
+    fn count(&mut self, uid: Option<String>, adopted: bool) {
+        let Some(uid) = uid else { return };
         if adopted {
-            self.adopted += 1;
-        } else {
-            self.left += 1;
+            self.adopted.insert(uid.clone());
         }
+        self.seen.insert(uid);
+    }
+
+    fn adopted(&self) -> usize {
+        self.adopted.len()
+    }
+
+    fn left(&self) -> usize {
+        self.seen.len() - self.adopted.len()
     }
 }
 
@@ -358,6 +373,18 @@ mod log_tests {
     use super::*;
     use crate::sandbox::claims::log_tests::{line_with, logged};
     use crate::sandbox::tests::test_client;
+
+    /// One object left by one pass and adopted by a later one (a pod from
+    /// before SME-33 that its live record names) counts once, as adopted
+    /// (SME-117 review 1).
+    #[test]
+    fn test_the_tally_counts_objects_not_decisions() {
+        let mut tally = AdoptionTally::default();
+        tally.count(Some("uid-a".to_string()), false);
+        tally.count(Some("uid-a".to_string()), true);
+        tally.count(Some("uid-b".to_string()), false);
+        assert_eq!((tally.adopted(), tally.left()), (1, 1));
+    }
 
     #[sqlx::test]
     async fn test_adoption_on_a_fresh_database_says_there_is_nothing_to_adopt(pool: PgPool) {
