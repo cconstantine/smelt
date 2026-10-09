@@ -2765,21 +2765,29 @@ async fn scenario_terminal_follow_after_switch(t: &Scenario<'_>) {
     // mid-stream is a user gesture, and the follow must stop and stay put
     // (SME-83's semantics, now distinguished from a resize by *how* the
     // position moved rather than by merely being off the bottom).
-    let updown_id = unique_id("cmd-updown");
+    //
+    // The gesture happens while nothing is arriving, and the streaming starts
+    // after it. A `scrollTop` write and a follow-scroll inside the same frame
+    // coalesce into ONE scroll event describing only the final position, so the
+    // app can miss the scroll-up entirely — which is what this phase did, now
+    // and then, at 50 ms a line. Quiet first keeps the check watching the follow
+    // instead of racing the event loop.
+    let fill_id = unique_id("cmd-updown-fill");
     anthropic::tools::execute(
         t.pool,
         conversation.id,
-        &updown_id,
+        &fill_id,
         "run_terminal_command",
         &serde_json::json!({"terminal_id": terminal,
-            "command": "for i in $(seq -w 1 200); do echo \\\"updown-$i\\\"; sleep 0.05; done"}),
+            "command": "for i in $(seq -w 1 200); do echo \\\"updown-$i\\\"; done"}),
     )
     .await
-    .expect("run_terminal_command for the scroll-up check");
+    .expect("run_terminal_command to fill the terminal for the scroll-up check");
     assert!(
-        wait_for_text(&page, "updown-010", Duration::from_secs(20)).await,
-        "the output should be streaming"
+        wait_for_text(&page, "updown-200", Duration::from_secs(30)).await,
+        "the fill command's output should arrive"
     );
+    wait_command_finished(t.pool, terminal).await;
     settle_terminal_bottom(&page, 8).await;
     let up = page
         .evaluate(
@@ -2792,12 +2800,29 @@ async fn scenario_terminal_follow_after_switch(t: &Scenario<'_>) {
         .into_value::<f64>()
         .expect("a number");
     assert!((300.0..=500.0).contains(&up), "the scroll-up should have landed ~400px up, got {up}");
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // A beat for the app to take the scroll event in before anything else can
+    // move the view.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let stream_id = unique_id("cmd-updown-stream");
+    anthropic::tools::execute(
+        t.pool,
+        conversation.id,
+        &stream_id,
+        "run_terminal_command",
+        &serde_json::json!({"terminal_id": terminal,
+            "command": "for i in $(seq -w 1 100); do echo \\\"stream-$i\\\"; sleep 0.1; done"}),
+    )
+    .await
+    .expect("run_terminal_command to stream while the user reads");
+    tokio::time::sleep(Duration::from_millis(2000)).await;
     let still = terminal_distance_from_bottom(&page).await;
     assert!(
         (300.0..=1e5).contains(&still),
         "output arrived while the user had scrolled up and yanked the view to the bottom: \
-         {still}px from the bottom (was ~400px)"
+         {still}px from the bottom (was ~400px, scrollTop/scrollHeight/clientHeight: {}, scroll \
+         events: {})",
+        terminal_scroll_facts(&page).await,
+        terminal_scroll_events(&page).await
     );
     // Back to the bottom is following again: scroll down, and the follow
     // resumes on the next line rather than needing the command to finish.
@@ -2810,8 +2835,136 @@ async fn scenario_terminal_follow_after_switch(t: &Scenario<'_>) {
     tokio::time::sleep(Duration::from_millis(500)).await;
     settle_terminal_bottom(&page, 8).await;
     assert!(
-        wait_for_text(&page, "updown-200", Duration::from_secs(60)).await,
-        "the command should finish"
+        wait_for_text(&page, "stream-100", Duration::from_secs(60)).await,
+        "the streaming command should finish"
+    );
+    wait_command_finished(t.pool, terminal).await;
+    settle_terminal_bottom(&page, 8).await;
+
+    // Phase G — the other direction on the same rule, which the first fix left
+    // as it found it: growing the window *shrinks* the scroll range, so a reader
+    // close enough to the bottom gets clamped down onto it, landing inside the
+    // slack. Position alone then reads as "at the bottom", and the follow comes
+    // back to life for someone who asked, a moment ago, not to be followed. A
+    // clamp is geometry; only the user moving back down asks again. The gesture
+    // happens while output is quiet, for the reason F4 gives, and the output
+    // then comes one line every 200 ms so the reader's drift stays well under
+    // the ~580 px the body's client height gains — or the resize wouldn't reach
+    // them and the phase would prove nothing.
+    let up = page
+        .evaluate(
+            "(() => { const b = document.querySelector('.task-terminal-body'); \
+             b.scrollTop = b.scrollHeight - b.clientHeight - 100; \
+             return Math.round(b.scrollHeight - b.scrollTop - b.clientHeight); })()",
+        )
+        .await
+        .expect("scroll the terminal up 100px to read")
+        .into_value::<f64>()
+        .expect("a number");
+    assert!((60.0..=200.0).contains(&up), "the scroll-up should have landed ~100px up, got {up}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let restick_id = unique_id("cmd-restick");
+    anthropic::tools::execute(
+        t.pool,
+        conversation.id,
+        &restick_id,
+        "run_terminal_command",
+        &serde_json::json!({"terminal_id": terminal,
+            "command": "for i in $(seq -w 1 100); do echo \\\"restick-$i\\\"; sleep 0.2; done"}),
+    )
+    .await
+    .expect("run_terminal_command for the re-stick check");
+    // That scroll-up really did turn the follow off: lines arrive and the view
+    // drifts away from the bottom instead of being held on it. Without this the
+    // check below couldn't tell "woken by the clamp" from "never switched off
+    // at all".
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let reading = terminal_distance_from_bottom(&page).await;
+    assert!(
+        reading > 60.0,
+        "output yanked the reader along before any resize: {reading}px from the bottom, it should \
+         have kept drifting away (scrollTop/scrollHeight/clientHeight: {})",
+        terminal_scroll_facts(&page).await
+    );
+    // Tag the body element first: a rebuilt body arrives with a brand-new
+    // `StickyBottom`, which starts out following, whatever the one it replaced
+    // had decided — so whether the resize replaced it decides what the check
+    // below is actually measuring.
+    page.evaluate(
+        "(() => { const b = document.querySelector('.task-terminal-body'); \
+         b.__sme108tag = 'before-grow'; })()",
+    )
+    .await
+    .expect("tag the terminal body before the resize");
+    // Grow the window by far more than the ~100 px they have drifted: the new
+    // scroll range no longer reaches where they were, so the browser clamps them
+    // down onto its bottom edge — once. A beat later they should already be back
+    // above it, by about as many lines as arrived in that beat: the follow is
+    // off, nothing scrolls them, and the output piles up below. That is *not*
+    // what the browser does by default — Chrome's scroll anchoring keeps a
+    // scroller that sits at its end pinned onto every new bottom, which looks
+    // exactly like a follow and which no scroll logic can undo; the body's
+    // `overflow-anchor: none` (assets/chat.css) is what stops it, and the growth
+    // checked below is what it stops.
+    page.execute(
+        chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(1400, 900, 1.0, false),
+    )
+    .await
+    .expect("grow the window while they read");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after_grow = terminal_distance_from_bottom(&page).await;
+    assert!(
+        after_grow <= 120.0,
+        "the window grow didn't reach the reader to clamp them onto the new bottom (they were \
+         already {after_grow}px above it), so this phase measures nothing \
+         (scrollTop/scrollHeight/clientHeight: {})",
+        terminal_scroll_facts(&page).await
+    );
+    let same_element: bool = page
+        .evaluate(
+            "(() => { const b = document.querySelector('.task-terminal-body'); \
+             return !!b && b.__sme108tag === 'before-grow'; })()",
+        )
+        .await
+        .expect("ask whether the resize kept the same terminal body element")
+        .into_value()
+        .expect("a bool");
+    // Lines keep arriving: left alone, the view stays where the clamp put it and
+    // the gap only grows. A follow woken by the clamp — or a browser pinning the
+    // clamped scroller onto each new bottom — keeps it at 0 instead. Confirm the
+    // command is still running first, or the growth below would only prove the
+    // output had stopped.
+    let still_streaming = db::terminal_command_is_running(t.pool, terminal)
+        .await
+        .expect("the re-stick command's running state")
+        .is_some();
+    assert!(
+        still_streaming,
+        "the re-stick command had already finished by the time of the resize, so nothing was \
+         arriving to follow"
+    );
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let drifted = terminal_distance_from_bottom(&page).await;
+    assert!(
+        drifted > after_grow + 60.0,
+        "a window grow left the reader being followed after all: {drifted}px from the bottom \
+         after 2.5s of streaming, when it was {after_grow}px at the start of that window — the \
+         gap should have kept growing by a line every 200 ms (same element through the resize: \
+         {same_element}; scrollTop/scrollHeight/clientHeight: {}, scroll events: {})",
+        terminal_scroll_facts(&page).await,
+        terminal_scroll_events(&page).await
+    );
+    // And the user asking to be back at the bottom does bring the follow back.
+    page.evaluate(
+        "(() => { const b = document.querySelector('.task-terminal-body'); \
+         b.scrollTop = b.scrollHeight; })()",
+    )
+    .await
+    .expect("scroll back to the bottom");
+    settle_terminal_bottom(&page, 8).await;
+    assert!(
+        wait_for_text(&page, "restick-100", Duration::from_secs(60)).await,
+        "the re-stick command should finish"
     );
     wait_command_finished(t.pool, terminal).await;
     settle_terminal_bottom(&page, 8).await;
@@ -2915,6 +3068,18 @@ async fn terminal_scroll_events(page: &chromiumoxide::Page) -> String {
     .expect("read the scroll event ring")
     .into_value::<String>()
     .expect("a string")
+}
+
+/// TEMPORARY (SME-108): what the app's own `StickyBottom::scrolled` saw and
+/// decided at each scroll event — the numbers it was handed (which are not
+/// necessarily the ones the sampler read off the element) and which branch it
+/// took. The browser tier's only way in to the app's side of the story.
+async fn sticky_probe(page: &chromiumoxide::Page) -> String {
+    page.evaluate("(() => JSON.stringify(window.__smeltSticky || []))()")
+        .await
+        .expect("read the app's sticky-event trace")
+        .into_value::<String>()
+        .expect("a string")
 }
 
 /// The terminal following its last line: the distance from the bottom settling
