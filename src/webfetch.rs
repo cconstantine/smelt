@@ -76,11 +76,14 @@ pub(crate) async fn shared_browser() -> Result<&'static Browser, String> {
 static BROWSER_RUNTIME: OnceCell<tokio::runtime::Runtime> = OnceCell::const_new();
 
 /// `BROWSER_RUNTIME`, built on the first fetch or browse. A build that
-/// fails (the OS refusing its threads) fails only that call, with an error
-/// the model reads as the tool's result; nothing is stored, so the next
-/// call tries again. It was a `LazyLock` built with `expect()`, whose
-/// panic killed the turn and poisoned it for every later fetch or browse
-/// until a restart (SME-119).
+/// fails fails only that call, with an error the model reads as the tool's
+/// result; nothing is stored, so the next call tries again. It was a
+/// `LazyLock` built with `expect()`, whose panic killed the turn and
+/// poisoned it for every later fetch or browse until a restart (SME-119).
+/// A thread refusal is a panic inside tokio, caught by `runtime_in`, which
+/// only works where panics unwind: the release profile
+/// (`.cargo/config.toml`) has `panic = "abort"`, so there it still ends the
+/// process (SME-139).
 async fn browser_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
     runtime_in(&BROWSER_RUNTIME, build_browser_runtime).await
 }
@@ -104,6 +107,9 @@ fn build_browser_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 /// return an `Err`: it panics ("OS can't spawn worker thread: …",
 /// `runtime/blocking/pool.rs`); only driver setup comes back as one. So the
 /// build runs under `catch_unwind`, and its panic becomes the same error.
+/// That needs an unwinding build (`dx serve`, the tests): under the release
+/// profile's `panic = "abort"` the panic ends the process before
+/// `catch_unwind` sees it (SME-139).
 /// Unwinding out of a half-built runtime is safe here: its blocking pool's
 /// drop sees `thread::panicking()` in an async context and returns without
 /// waiting (`runtime/blocking/shutdown.rs`). A worker thread that did start

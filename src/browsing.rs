@@ -165,7 +165,9 @@ mod server {
     /// over (the worst is a viewer count one too high, so a screencast
     /// runs until its session closes, or a leaked context), so carrying on
     /// with it as it was left is safe. `clear_poison` makes the warning
-    /// once per panic, not once per call.
+    /// once per panic, not once per call. A lock is only ever poisoned
+    /// where panics unwind (`dx serve`, the tests): the release profile has
+    /// `panic = "abort"`, so there any panic ends the process (SME-139).
     fn sessions() -> MutexGuard<'static, HashMap<i64, Session>> {
         SESSIONS.lock().unwrap_or_else(|poisoned| {
             tracing::warn!(
