@@ -153,6 +153,16 @@ reqwest_rmcp = { package = "reqwest", version = "0.13", default-features = false
 # (OpenSSH format) for the git settings page — see SME-32.
 ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519", "ecdsa", "rand_core", "getrandom"], optional = true }
 
+# OpenTelemetry tracing (SME-137): spans go over OTLP/HTTP to Tempo when
+# OTEL_EXPORTER_OTLP_ENDPOINT is set, and nothing is built otherwise (see
+# src/telemetry.rs). The blocking reqwest client runs on the exporter's own
+# thread, so building it inside the tokio runtime is safe; "internal-logs"
+# keeps a failed export visible on the console.
+opentelemetry = { version = "0.33", optional = true }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "internal-logs"], optional = true }
+tracing-opentelemetry = { version = "0.34", default-features = false, optional = true }
+
 # Web-only: a wasm-compatible timer (tokio::time has no driver in a browser
 # tab — there's no tokio runtime on the WASM client at all).
 gloo-timers = { version = "0.4.0", features = ["futures"], optional = true }
@@ -190,6 +200,10 @@ server = [
     "dep:ssh-key",
     "dep:serde_norway",
     "dep:toml",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
 ]
 # Separate from `server` so the default `cargo test --features server` loop
 # stays exactly as fast as it is today — src/browser_tests.rs's one
@@ -230,6 +244,10 @@ tokio = { version = "1", features = ["test-util"] }
 # syntect's CSS generation, for the test in src/highlight.rs that checks
 # assets/highlight.css still matches the themes (SME-30): tests only.
 syntect = { version = "5.3", default-features = false, features = ["html"] }
+
+# An in-memory span exporter, for the tests that check what a span records
+# (src/telemetry.rs's `capture_spans`, SME-137).
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
 
 [build-dependencies]
 # `build.rs` hashes the sources into `SMELT_BUILD_ID` (SME-43).

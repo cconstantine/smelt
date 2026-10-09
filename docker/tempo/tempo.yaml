@@ -1,0 +1,37 @@
+# Tempo for the dev stack (SME-137): one process (`-target=all`), local
+# storage in the `tempo-data` volume. smelt sends OTLP/HTTP to
+# http://tempo:4318 (OTEL_EXPORTER_OTLP_ENDPOINT); Grafana reads it at
+# http://tempo:3200. No host port is published, so 0.0.0.0 here is the
+# compose network only. Based on grafana/tempo v3.1.0's
+# example/docker-compose/single-binary/tempo.yaml, without its metrics
+# generator (no Prometheus here).
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  log_level: info
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: "0.0.0.0:4317"
+        http:
+          endpoint: "0.0.0.0:4318"
+
+backend_worker:
+  compaction:
+    # A week of traces is plenty for debugging a dev server.
+    block_retention: 168h
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+usage_report:
+  reporting_enabled: false

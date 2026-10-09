@@ -396,6 +396,30 @@ pub(super) async fn compact_conversation(
     conversation_id: i64,
     turn_model: &crate::providers::TurnModel,
 ) -> ServerFnResult<()> {
+    use tracing::field::Empty;
+    // Its model call is its child (SME-137).
+    let span = tracing::info_span!(
+        "compaction",
+        conversation_id,
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+    );
+    crate::telemetry::in_span(span.clone(), async move {
+        let result = compact(pool, conversation_id, turn_model).await;
+        if let Err(e) = &result {
+            crate::telemetry::mark_error(&span, &e.to_string());
+        }
+        result
+    })
+    .await
+}
+
+/// `compact_conversation`'s work, in its span.
+async fn compact(
+    pool: &PgPool,
+    conversation_id: i64,
+    turn_model: &crate::providers::TurnModel,
+) -> ServerFnResult<()> {
     let messages = db::list_messages(pool, conversation_id)
         .await
         .map_err(ServerFnError::new)?;

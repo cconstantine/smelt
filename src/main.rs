@@ -38,6 +38,8 @@ mod request_guard;
 #[cfg(feature = "server")]
 mod sandbox;
 #[cfg(feature = "server")]
+mod telemetry;
+#[cfg(feature = "server")]
 mod turn;
 #[cfg(feature = "server")]
 mod webfetch;
@@ -64,7 +66,12 @@ fn build_router() -> axum::Router {
         // No login, so another site's page mustn't be able to act as the
         // user (SME-51 B1).
         .layer(axum::middleware::from_fn(request_guard::guard))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        // Path only, never the query string or headers (SME-137).
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http()
+                .make_span_with(telemetry::make_http_span)
+                .on_response(telemetry::on_http_response),
+        )
 }
 
 #[cfg(feature = "server")]
@@ -80,11 +87,20 @@ async fn main() {
     // auto-install for. Must happen before any kube::Client is built.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter_directives(
-            &std::env::var("RUST_LOG").unwrap_or_default(),
-        )))
-        .init();
+    // The console log, filtered by RUST_LOG, and the OTLP export when
+    // OTEL_EXPORTER_OTLP_ENDPOINT is set (SME-137). Held for the process's
+    // life: dropping it flushes the export.
+    let _telemetry = telemetry::init();
+    let listener = telemetry::in_span(tracing::info_span!("startup"), start_up(dotenv_problem)).await;
+    let router = build_router();
+    #[expect(clippy::expect_used, reason = "serving is the process's whole job: when it ends, the process does")]
+    axum::serve(listener, router).await.expect("server error");
+}
+
+/// Everything from loading `.env` to listening, in the `startup` span
+/// (SME-137).
+#[cfg(feature = "server")]
+async fn start_up(dotenv_problem: Option<String>) -> tokio::net::TcpListener {
     if let Some(problem) = dotenv_problem {
         tracing::error!("{problem}");
     }
@@ -158,7 +174,9 @@ async fn main() {
     // Docker data claims whose conversation deletion didn't reach them (SME-33).
     tokio::spawn({
         let pool = pool.clone();
-        async move { sandbox::sweep_orphaned_conversation_claims(&pool).await }
+        telemetry::in_span(tracing::info_span!("claim_sweep"), async move {
+            sandbox::sweep_orphaned_conversation_claims(&pool).await
+        })
     });
 
     // Each sandbox's dev servers, for the user's browser, on a listener of
@@ -168,8 +186,6 @@ async fn main() {
     // Model prices for each call's cost: the saved copy, then models.dev
     // now and hourly (SME-106).
     pricing::start(pool.clone());
-
-    let router = build_router();
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -184,8 +200,7 @@ async fn main() {
         Ok(addr) => tracing::info!("listening on {addr}"),
         Err(e) => tracing::info!("listening on port {port} (couldn't read the bound address: {e})"),
     }
-    #[expect(clippy::expect_used, reason = "serving is the process's whole job: when it ends, the process does")]
-    axum::serve(listener, router).await.expect("server error");
+    listener
 }
 
 /// The `EnvFilter` directives to log with, given `RUST_LOG`'s value.
@@ -271,6 +286,42 @@ mod request_guard_tests {
             .await
             .expect("a response, not a dropped connection");
         assert_eq!(response.status(), 403);
+    }
+}
+
+/// SME-137 review 1: the request guard's refusal line is exported with the
+/// request's span, so it names the path, never the query string.
+#[cfg(all(test, feature = "server"))]
+mod request_span_tests {
+    #[tokio::test]
+    async fn test_a_refused_requests_exported_span_has_no_query() {
+        let public = std::env::temp_dir().join("smelt-request-guard-public");
+        std::fs::create_dir_all(&public).expect("public dir");
+        // SAFETY: only the browser tier sets this too, and it runs apart.
+        unsafe { std::env::set_var("DIOXUS_PUBLIC_PATH", &public) };
+        let (status, spans) = crate::telemetry::capture_spans(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move { axum::serve(listener, super::build_router()).await.ok() });
+            let response = reqwest::Client::new()
+                .post(format!("http://{addr}/api/conversations?code=SECRET-CODE&state=S"))
+                .header("sec-fetch-site", "cross-site")
+                .header("origin", "https://evil.example")
+                .send()
+                .await
+                .expect("a response");
+            // The span ends at the response, then exports.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            response.status()
+        })
+        .await;
+        assert_eq!(status, 403);
+        let span = spans.iter().find(|span| span.name == "POST /api/conversations").expect("the request's span");
+        assert!(
+            span.events.iter().any(|event| event.name == "refused a request"),
+            "the refusal is on the span: {span:?}"
+        );
+        assert!(!format!("{spans:?}").contains("SECRET-CODE"), "{spans:?}");
     }
 }
 

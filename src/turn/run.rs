@@ -149,20 +149,45 @@ pub(super) fn run_turn_bounded<'a>(
     from_user: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TurnResult> + Send + 'a>>
 {
+    use tracing::field::Empty;
     Box::pin(async move {
-        // Before the stop receiver, so it's dropped after it: the last turn
-        // ending frees the stop counter once nothing listens to it.
-        let _in_flight = TurnInFlight::start(conversation_id);
-        let mut stop = stop_receiver(conversation_id);
-        // Any new turn replaces the last failure (SME-51 code review 1).
-        let generation = new_turn_generation(conversation_id);
-        let result = run_turn_stoppable(pool, conversation_id, new_message, max_turns, from_user, &mut stop).await;
-        // Kept for a tab that reconnects, unless a newer turn has started
-        // since this one did: its outcome is the one to show (SME-91).
-        if keep_error && let Err(TurnFailure::Failed(e)) = &result {
-            keep_turn_error(conversation_id, generation, chat_error_text(e));
-        }
-        result
+        // The turn's span (SME-137), made when the turn starts: its model
+        // calls and tool calls are its children. The model is recorded once
+        // the turn resolves it.
+        let span = tracing::info_span!(
+            "turn",
+            conversation_id,
+            model = Empty,
+            provider_id = Empty,
+            turn.steps = Empty,
+            turn.stopped = Empty,
+            otel.status_code = Empty,
+            otel.status_description = Empty,
+        );
+        crate::telemetry::in_span(span.clone(), async move {
+            // Before the stop receiver, so it's dropped after it: the last turn
+            // ending frees the stop counter once nothing listens to it.
+            let _in_flight = TurnInFlight::start(conversation_id);
+            let mut stop = stop_receiver(conversation_id);
+            // Any new turn replaces the last failure (SME-51 code review 1).
+            let generation = new_turn_generation(conversation_id);
+            let result = run_turn_stoppable(pool, conversation_id, new_message, max_turns, from_user, &mut stop).await;
+            // Kept for a tab that reconnects, unless a newer turn has started
+            // since this one did: its outcome is the one to show (SME-91).
+            if keep_error && let Err(TurnFailure::Failed(e)) = &result {
+                keep_turn_error(conversation_id, generation, chat_error_text(e));
+            }
+            // A stop is the user's choice, not a failure.
+            match &result {
+                Ok(_) => {}
+                Err(TurnFailure::Stopped) => {
+                    span.record("turn.stopped", true);
+                }
+                Err(TurnFailure::Failed(e)) => crate::telemetry::mark_error(&span, &e.to_string()),
+            }
+            result
+        })
+        .await
     })
 }
 
@@ -311,14 +336,28 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text: content }],
     };
-    tokio::spawn(async move {
+    // In the request's span, so the turn's is its child (SME-137).
+    tokio::spawn(tracing::Instrument::in_current_span(async move {
         // Its failure is kept for a reconnecting tab (`keep_error`).
         if let Err(e) = run_turn_bounded(&pool, id, Some(new_message), MAX_TURNS, true, true).await {
             let message = e.message();
             crate::events::publish(id, crate::events::ConversationEvent::TurnError { message });
         }
-    });
+    }));
     Ok(())
+}
+
+/// Records how many model calls a turn made on its span once the turn ends,
+/// whichever way it does (a return, an error, a stop dropping it).
+struct TurnSteps {
+    span: tracing::Span,
+    count: i64,
+}
+
+impl Drop for TurnSteps {
+    fn drop(&mut self) {
+        self.span.record("turn.steps", self.count);
+    }
 }
 
 /// The turn itself, holding the turn lock (`turn_lock`): `persisted` starts
@@ -337,6 +376,9 @@ pub(super) fn run_turn_body<'a>(
     Box::pin(async move {
         // Moved in, so the lock is held for as long as the turn runs.
         let _turn = turn_lock;
+        // The turn's own span, `run_turn_bounded`'s: its model and the
+        // number of model calls it made, recorded however it ends.
+        let mut steps = TurnSteps { span: tracing::Span::current(), count: 0 };
         // Tracks what's been persisted since the last *real* Anthropic
         // response — the compaction trigger's cheap size estimate (see
         // `should_compact`) is computed over exactly this, added to that
@@ -408,6 +450,11 @@ pub(super) fn run_turn_body<'a>(
                     .map_err(ServerFnError::new)?,
             };
             let turn_model = &*resolved_model.insert(turn_model);
+            if steps.count == 0 {
+                steps.span.record("model", turn_model.model.as_str());
+                steps.span.record("provider_id", turn_model.provider_id);
+            }
+            steps.count += 1;
 
             // Proactive, not reactive: checked *before* building the
             // request that would be too big, using the last real

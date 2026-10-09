@@ -163,18 +163,45 @@ impl TerminalConnection {
         self.request_within(ACK_TIMEOUT, build).await
     }
 
+    /// In an `agent request` span (SME-137) naming the request's action and
+    /// timeout, marked failed when it fails. Never the request's content.
     pub(super) async fn request_within(
         &self,
         timeout: Duration,
         build: impl FnOnce(u64) -> ClientMessage,
     ) -> Result<Reply, AgentRequestError> {
         let request_id = self.next_request_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let message = build(request_id);
+        let span = tracing::info_span!(
+            "agent request",
+            conversation_id = self.conversation_id,
+            smelt.agent.action = client_message_action(&message),
+            timeout_s = timeout.as_secs() as i64,
+            otel.status_code = tracing::field::Empty,
+            otel.status_description = tracing::field::Empty,
+        );
+        crate::telemetry::in_span(span.clone(), async move {
+            let result = self.request_message_within(timeout, request_id, message).await;
+            if let Err(e) = &result {
+                crate::telemetry::mark_error(&span, &e.to_string());
+            }
+            result
+        })
+        .await
+    }
+
+    async fn request_message_within(
+        &self,
+        timeout: Duration,
+        request_id: u64,
+        message: ClientMessage,
+    ) -> Result<Reply, AgentRequestError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         match self.pending.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             Some(pending) => pending.insert(request_id, tx),
             None => return Err(AgentRequestError::Disconnected),
         };
-        if let Err(e) = self.send(&build(request_id)) {
+        if let Err(e) = self.send(&message) {
             self.forget(request_id);
             return Err(e);
         }
@@ -642,7 +669,53 @@ pub(super) fn expect_reply<T>(
 /// request). When the socket ends unexpectedly, the reader reconnects, or
 /// confirms a crash. One connection per **pod**, shared by every terminal
 /// it hosts — see SME-9's "Why N pods and N terminals."
+/// A request's `action`, as the agent's protocol names it, for its span.
+fn client_message_action(message: &ClientMessage) -> &'static str {
+    match message {
+        ClientMessage::CreateTerminal { .. } => "create_terminal",
+        ClientMessage::TerminateTerminal { .. } => "terminate_terminal",
+        ClientMessage::Command { .. } => "command",
+        ClientMessage::Signal { .. } => "signal",
+        ClientMessage::ReadFile { .. } => "read_file",
+        ClientMessage::WriteFile { .. } => "write_file",
+        ClientMessage::EditFile { .. } => "edit_file",
+        ClientMessage::ListDirectory { .. } => "list_directory",
+        ClientMessage::Glob { .. } => "glob",
+        ClientMessage::Grep { .. } => "grep",
+    }
+}
+
+/// In an `agent connect` span (SME-137) naming the pod, with the agent's
+/// protocol version once it says hello; marked failed when it can't.
 pub(super) async fn connect(
+    pool: PgPool,
+    pod_id: i64,
+    dialer: Arc<dyn AgentDialer>,
+) -> Result<Arc<TerminalConnection>, ConnectError> {
+    let span = tracing::info_span!(
+        "agent connect",
+        pod = %pod_name(pod_id),
+        smelt.agent.version = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
+    );
+    crate::telemetry::in_span(span.clone(), async move {
+        let result = connect_unspanned(pool, pod_id, dialer).await;
+        match &result {
+            Ok(conn) => {
+                span.record("smelt.agent.version", tracing::field::display(conn.agent_version));
+            }
+            Err(ConnectError::Failed(e)) => crate::telemetry::mark_error(&span, &e.to_string()),
+            Err(ConnectError::Outdated { found, .. }) => {
+                crate::telemetry::mark_error(&span, &format!("the agent is outdated (it said {found:?})"))
+            }
+        }
+        result
+    })
+    .await
+}
+
+async fn connect_unspanned(
     pool: PgPool,
     pod_id: i64,
     dialer: Arc<dyn AgentDialer>,
