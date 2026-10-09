@@ -534,7 +534,12 @@ pub(super) fn connect_with_retry(
                     // Silence might be a slow link rather than an old agent,
                     // so only a message that says so is remembered.
                     if certain {
-                        registry().outdated.insert(pod_id, outdated.clone());
+                        let mut registry = registry();
+                        // A teardown while the image was read leaves nothing
+                        // to remember, and nothing would ever clear it.
+                        if !registry.torn_down.contains(&pod_id) {
+                            registry.outdated.insert(pod_id, outdated.clone());
+                        }
                     }
                     return Err(outdated.error());
                 }

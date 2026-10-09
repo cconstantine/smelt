@@ -80,9 +80,24 @@ impl AgentDialer for FakeDialer {
     }
 
     fn image(&self, pod_id: i64) -> BoxFuture<'_, Option<String>> {
-        let image = fake_images().lock().unwrap_or_else(|e| e.into_inner()).get(&pod_id).cloned();
-        Box::pin(async move { image })
+        let held = image_reads_held().lock().unwrap_or_else(|e| e.into_inner()).get(&pod_id).cloned();
+        Box::pin(async move {
+            if let Some((reading, release)) = held {
+                reading.notify_one();
+                release.notified().await;
+            }
+            fake_images().lock().unwrap_or_else(|e| e.into_inner()).get(&pod_id).cloned()
+        })
     }
+}
+
+/// Pods whose image read waits: it signals the first `Notify` once it has
+/// started, then waits for the second.
+#[allow(clippy::type_complexity)]
+fn image_reads_held() -> &'static StdMutex<HashMap<i64, (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>> {
+    static HELD: LazyLock<StdMutex<HashMap<i64, (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>> =
+        LazyLock::new(Default::default);
+    &HELD
 }
 
 /// The image each fake pod "runs", by pod id; a pod with none reads as
@@ -653,6 +668,29 @@ async fn test_try_reconnect_does_not_wait_for_a_connect_in_progress(pool: PgPool
     try_reconnect(&pool, pod_id).await;
     assert!(started.elapsed() < Duration::from_millis(500), "try_reconnect waited {:?}", started.elapsed());
     connecting.await.expect("join").expect("the first connect still succeeds");
+}
+
+/// Review 2: a pod torn down while its refused agent's image is read
+/// isn't remembered as outdated afterwards (nothing would ever clear it).
+#[sqlx::test]
+async fn test_a_pod_torn_down_during_the_image_read_isnt_remembered(pool: PgPool) {
+    let (_, pod_id) = pod_row(&pool).await;
+    let (reading, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+    image_reads_held().lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, (reading.clone(), release.clone()));
+    let v0_line = r#"{"id":"cmd-1","terminal_id":"3","stream":"stdout","seq":1,"data":"hi"}"#;
+    let _agent = fake_agent(pod_id, Greeting::Raw(v0_line.into()), Duration::ZERO).await;
+
+    let connecting = tokio::spawn({
+        let pool = pool.clone();
+        async move { reconnect_if_needed(&pool, pod_id).await.map(|_| ()) }
+    });
+    tokio::time::timeout(Duration::from_secs(5), reading.notified()).await.expect("the image read started");
+    deregister(pod_id);
+    release.notify_one();
+    let result = connecting.await.expect("join");
+    assert!(matches!(result, Err(TerminalError::AgentOutdated { .. })), "{result:?}");
+    assert_eq!(outdated(pod_id), None, "a torn-down pod is remembered as outdated");
+    assert_eq!(agent_status(pod_id), None);
 }
 
 /// Review 2: `index.docker.io` is Docker Hub, a first part with capitals
