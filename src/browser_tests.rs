@@ -773,7 +773,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "transcript_scroll", 60, Box::pin(scenario_transcript_scroll(&t))).await;
     run_scenario(&t, only, r, k, "terminal_follow_after_switch", 180, Box::pin(scenario_terminal_follow_after_switch(&t))).await;
     run_scenario(&t, only, r, k, "context_from_the_keyboard", 60, Box::pin(scenario_context_from_the_keyboard(&t))).await;
-    run_scenario(&t, only, r, k, "address_bar_after_session_closes", 60, Box::pin(scenario_address_bar_after_session_closes(&t))).await;
+    run_scenario(&t, only, r, k, "address_bar_after_session_closes", 90, Box::pin(scenario_address_bar_after_session_closes(&t))).await;
     run_scenario(&t, only, r, k, "error_text", 60, Box::pin(scenario_error_text(&t))).await;
     run_scenario(&t, only, r, k, "settings_two_step", 60, Box::pin(scenario_settings_two_step(&t))).await;
     run_scenario(&t, only, r, k, "pointer_keeps_text_still", 120, Box::pin(scenario_pointer_keeps_text_still(&t))).await;
@@ -4707,9 +4707,13 @@ async fn scenario_address_bar_after_session_closes(t: &Scenario<'_>) {
         if !wait_for_count(&page, ".browsing-address-input", 1, Duration::from_secs(10)).await {
             return Err("the browsing panel should come back when the session reopens".to_string());
         }
-        // The navigation ends when the page answers or the closed page
-        // fails it, at the latest on `browsing`'s own 20 s NAV_TIMEOUT.
-        // With its spawn dropped along with the panel, it never ends.
+        // The navigation ends on `browsing`'s own 20 s NAV_TIMEOUT: the
+        // page was released only after its context was disposed, so it
+        // never answers, and chromiumoxide 0.7 drops a destroyed target
+        // without resolving its `goto` (`Handler::on_target_destroyed`).
+        // So this wait takes about 20 s, and the scenario's limit allows
+        // for it. With the spawn dropped along with the panel, the bar
+        // never comes back.
         if !wait_for_count(&page, ".browsing-address-input:not([disabled])", 1, Duration::from_secs(25)).await {
             return Err(
                 "the address bar is still disabled after the session closed mid-navigation and reopened".to_string(),
