@@ -3779,8 +3779,17 @@ async fn test_sandbox_futures_stay_small() {
         // the wait for `Running` holds; these two do (SME-132 review 1).
         // The wait's bound is tighter than twice its 2760 bytes: its
         // timed-out report, unboxed, takes it to 4520.
-        ("create_pod_attempt", std::mem::size_of_val(&create_pod_attempt(&pool, 1, PodLimitOverrides::default())), 19000),
-        ("wait_for_running_with_timeout", std::mem::size_of_val(&wait_for_running_with_timeout(&pods_api(&client), "sandbox-1", Duration::from_secs(1))), 3600),
+        // SME-137: these two are their spans' wrappers, which box the work,
+        // so they stay small (unboxed, the wait's was 5984 bytes); the
+        // work's own futures, `_unspanned`, keep the bounds they had.
+        ("create_pod_attempt", std::mem::size_of_val(&create_pod_attempt(&pool, 1, PodLimitOverrides::default())), 1000),
+        ("wait_for_running_with_timeout", std::mem::size_of_val(&wait_for_running_with_timeout(&pods_api(&client), "sandbox-1", Duration::from_secs(1))), 1000),
+        ("wait_for_running_unspanned", std::mem::size_of_val(&wait_for_running_unspanned(&pods_api(&client), "sandbox-1", Duration::from_secs(1))), 3600),
+        ("create_pod_attempt_unspanned", std::mem::size_of_val(&create_pod_attempt_unspanned(&pool, 1, PodLimitOverrides::default())), 19000),
+        // Given spans on SME-137 (7664, 840 and 7200 bytes then).
+        ("start_or_get_pod", std::mem::size_of_val(&start_or_get_pod(&pool, 1)), 15400),
+        ("terminate_pod", std::mem::size_of_val(&terminate_pod(&pool, 1)), 1700),
+        ("teardown_conversation", std::mem::size_of_val(&teardown_conversation(&pool, 1, &[])), 14400),
     ];
     for (name, size, bound) in sizes {
         println!("{name}: {size} bytes (bound {bound})");
@@ -3788,6 +3797,43 @@ async fn test_sandbox_futures_stay_small() {
     for (name, size, bound) in sizes {
         assert!(size <= bound, "{name}'s future is {size} bytes, over its bound of {bound}");
     }
+}
+
+/// SME-137: a wait for `Running` is a `wait_for_running` span naming its
+/// pod and timeout, failed when the wait fails.
+#[tokio::test]
+async fn test_a_wait_that_cant_reach_the_cluster_is_a_failed_span() {
+    let client = unreachable_client();
+    let (waited, spans) = crate::telemetry::capture_spans(wait_for_running_with_timeout(
+        &pods_api(&client),
+        "sandbox-9137000001",
+        Duration::from_secs(5),
+    ))
+    .await;
+    assert!(waited.is_err());
+    let span = spans.iter().find(|span| span.name == "wait_for_running").expect("the wait's span");
+    assert!(span.attributes.iter().any(|kv| kv.key.as_str() == "pod" && kv.value == "sandbox-9137000001".into()), "{span:?}");
+    assert!(span.attributes.iter().any(|kv| kv.key.as_str() == "timeout_s" && kv.value == 5_i64.into()), "{span:?}");
+    assert!(matches!(span.status, opentelemetry::trace::Status::Error { .. }), "{:?}", span.status);
+}
+
+/// SME-137: a pod event the watch acts on is a short `pod_event` span with
+/// the pod and its phase.
+#[tokio::test]
+async fn test_a_pod_event_span_names_the_pod_and_phase() {
+    let mut pod = Pod::default();
+    pod.metadata.name = Some("sandbox-9137000002".to_string());
+    pod.status = Some(k8s_openapi::api::core::v1::PodStatus { phase: Some("Failed".to_string()), ..Default::default() });
+    let ((), spans) = crate::telemetry::capture_spans(async {
+        crate::telemetry::in_span(watch::pod_event_span("finished", &pod), async {}).await;
+    })
+    .await;
+    let [span] = spans.as_slice() else { panic!("one span: {spans:?}") };
+    assert_eq!(span.name, "pod_event");
+    let attribute = |key: &str| span.attributes.iter().find(|kv| kv.key.as_str() == key).map(|kv| kv.value.clone());
+    assert_eq!(attribute("pod"), Some("sandbox-9137000002".into()));
+    assert_eq!(attribute("phase"), Some("Failed".into()));
+    assert_eq!(attribute("event"), Some("finished".into()));
 }
 
 /// SME-94 review 1: `use_test_manager` refuses a multi-thread runtime,
@@ -3845,8 +3891,16 @@ mod cluster {
         });
         pods.create(&PostParams::default(), &pod).await.expect("create the pod");
 
-        let waited = wait_for_running_with_timeout(&pods, &name, Duration::from_secs(20)).await;
+        let (waited, spans) =
+            crate::telemetry::capture_spans(wait_for_running_with_timeout(&pods, &name, Duration::from_secs(20))).await;
         pods.delete(&name, &immediate_delete_params()).await.ok();
+
+        // SME-137: the timed-out wait is a failed span naming the pod.
+        let span = spans.iter().find(|span| span.name == "wait_for_running").expect("the wait's span");
+        assert!(span.attributes.iter().any(|kv| kv.key.as_str() == "pod" && kv.value == name.clone().into()), "{span:?}");
+        assert!(span.attributes.iter().any(|kv| kv.key.as_str() == "timeout_s" && kv.value == 20_i64.into()), "{span:?}");
+        let opentelemetry::trace::Status::Error { description } = &span.status else { panic!("{:?}", span.status) };
+        assert!(description.contains("FailedMount"), "the wait's detail: {description}");
 
         let detail = match waited {
             Err(SandboxError::Timeout(Some(detail))) => detail,

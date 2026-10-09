@@ -223,7 +223,34 @@ pub(super) async fn wait_for_running(pods: &Api<Pod>, name: &str) -> Result<(), 
     wait_for_running_with_timeout(pods, name, running_wait_timeout()).await
 }
 
+/// Waits up to `timeout` for pod `name` to reach `Running`, in a
+/// `wait_for_running` span (SME-137) marked failed, with the wait's detail,
+/// when it doesn't.
 pub(super) async fn wait_for_running_with_timeout(
+    pods: &Api<Pod>,
+    name: &str,
+    timeout: Duration,
+) -> Result<(), SandboxError> {
+    let span = tracing::info_span!(
+        "wait_for_running",
+        pod = %name,
+        timeout_s = timeout.as_secs() as i64,
+        otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
+    );
+    crate::telemetry::in_span(span.clone(), async move {
+        // Boxed: the wait's future is large, and this span's would hold it
+        // (see `test_sandbox_futures_stay_small`).
+        let result = Box::pin(wait_for_running_unspanned(pods, name, timeout)).await;
+        if let Err(e) = &result {
+            crate::telemetry::mark_error(&span, &e.to_string());
+        }
+        result
+    })
+    .await
+}
+
+pub(super) async fn wait_for_running_unspanned(
     pods: &Api<Pod>,
     name: &str,
     timeout: Duration,
@@ -726,13 +753,39 @@ pub async fn create_pod(
 /// The conversation's running pod, starting one if it has none. Waits for
 /// a pod that's still starting rather than taking its record early
 /// (SME-51 B7).
+/// In a `start_or_get_pod` span (SME-137) that says whether it reused a pod.
 pub async fn start_or_get_pod(pool: &PgPool, conversation_id: i64) -> Result<i64, SandboxError> {
+    use tracing::field::Empty;
+    let span = tracing::info_span!(
+        "start_or_get_pod",
+        conversation_id,
+        pod_id = Empty,
+        smelt.pod.reused = Empty,
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+    );
     let pool = pool.clone();
-    run_pod_start(conversation_id, async move {
-        if let Ok(pod_id) = live_pod_id(&pool, conversation_id).await {
-            return Ok(pod_id);
+    crate::telemetry::in_span(span.clone(), async move {
+        let reused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = run_pod_start(conversation_id, {
+            let reused = reused.clone();
+            async move {
+                if let Ok(pod_id) = live_pod_id(&pool, conversation_id).await {
+                    reused.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(pod_id);
+                }
+                create_pod_now(&pool, conversation_id, PodLimitOverrides::default()).await
+            }
+        })
+        .await;
+        match &result {
+            Ok(pod_id) => {
+                span.record("pod_id", *pod_id);
+                span.record("smelt.pod.reused", reused.load(std::sync::atomic::Ordering::Relaxed));
+            }
+            Err(e) => crate::telemetry::mark_error(&span, &e.to_string()),
         }
-        create_pod_now(&pool, conversation_id, PodLimitOverrides::default()).await
+        result
     })
     .await
 }
@@ -747,10 +800,11 @@ where
     F: std::future::Future<Output = Result<i64, SandboxError>> + Send + 'static,
 {
     let lock = pod_start_lock(conversation_id);
-    tokio::spawn(async move {
+    // In the caller's span, so the start's spans are its children (SME-137).
+    tokio::spawn(tracing::Instrument::in_current_span(async move {
         let _starting = lock.lock().await;
         start.await
-    })
+    }))
     .await
     .unwrap_or_else(|e| Err(SandboxError::StartFailed(format!("starting the sandbox failed: {e}"))))
 }
@@ -788,7 +842,30 @@ pub(super) async fn create_pod_now(
     result
 }
 
+/// One attempt at a pod, in a `create_pod_attempt` span (SME-137).
 pub(super) async fn create_pod_attempt(
+    pool: &PgPool,
+    conversation_id: i64,
+    limits: PodLimitOverrides,
+) -> Result<i64, SandboxError> {
+    let span = tracing::info_span!(
+        "create_pod_attempt",
+        conversation_id,
+        otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
+    );
+    crate::telemetry::in_span(span.clone(), async move {
+        // Boxed: the attempt's future is large (SME-115).
+        let result = Box::pin(create_pod_attempt_unspanned(pool, conversation_id, limits)).await;
+        if let Err(e) = &result {
+            crate::telemetry::mark_error(&span, &e.to_string());
+        }
+        result
+    })
+    .await
+}
+
+pub(super) async fn create_pod_attempt_unspanned(
     pool: &PgPool,
     conversation_id: i64,
     limits: PodLimitOverrides,
@@ -897,7 +974,25 @@ pub async fn live_pod_id(pool: &PgPool, conversation_id: i64) -> Result<i64, Ter
 /// second call fails clearly with `NoPod` ("call create_pod first") rather
 /// than silently succeeding again. See SME-11's "How." Refuses if the
 /// pod still has a live terminal.
+/// In a `terminate_pod` span (SME-137).
 pub async fn terminate_pod(pool: &PgPool, conversation_id: i64) -> Result<(), TerminalError> {
+    let span = tracing::info_span!(
+        "terminate_pod",
+        conversation_id,
+        otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
+    );
+    crate::telemetry::in_span(span.clone(), async move {
+        let result = terminate_pod_unspanned(pool, conversation_id).await;
+        if let Err(e) = &result {
+            crate::telemetry::mark_error(&span, &e.to_string());
+        }
+        result
+    })
+    .await
+}
+
+async fn terminate_pod_unspanned(pool: &PgPool, conversation_id: i64) -> Result<(), TerminalError> {
     let pod_id = conversation_pod_id(pool, conversation_id).await?;
     let live_terminals = db::list_sandbox_terminals_for_pod(pool, pod_id).await?;
     if !live_terminals.is_empty() {
@@ -1224,7 +1319,16 @@ pub(crate) async fn pod_exists(pod_id: i64) -> bool {
 /// here: `db::delete_conversation`'s `ON DELETE CASCADE` chain removes
 /// `sandbox_pods`/`sandbox_terminals`/`terminal_commands` for real right
 /// after this runs.
+/// In a `teardown_conversation` span (SME-137).
 pub async fn teardown_conversation(pool: &PgPool, conversation_id: i64, pod_ids: &[i64]) {
+    crate::telemetry::in_span(
+        tracing::info_span!("teardown_conversation", conversation_id),
+        teardown_conversation_unspanned(pool, conversation_id, pod_ids),
+    )
+    .await
+}
+
+async fn teardown_conversation_unspanned(pool: &PgPool, conversation_id: i64, pod_ids: &[i64]) {
     let manager = match get() {
         Ok(manager) => manager,
         Err(e) => {
