@@ -123,7 +123,9 @@ pub(crate) fn CopyButton(
     let mut feedback = use_signal(CopyFeedback::default);
     let mut hovered = use_signal(|| false);
     let mut keyboard_focus = use_signal(|| false);
-    // A press focuses the button too; that focus isn't the keyboard's.
+    // A press focuses the button too (in Chrome; not in Safari or Firefox
+    // on macOS); that focus isn't the keyboard's. Cleared when the press
+    // ends, so a later Tab onto the button counts (code review 1).
     let mut pressed = use_signal(|| false);
     let mut highlighted = use_signal(|| false);
     let mut report = move || {
@@ -167,6 +169,8 @@ pub(crate) fn CopyButton(
                 report();
             },
             onpointerdown: move |_| pressed.set(true),
+            onpointerup: move |_| pressed.set(false),
+            onpointercancel: move |_| pressed.set(false),
             onfocus: move |_| {
                 if !*pressed.peek() {
                     keyboard_focus.set(true);

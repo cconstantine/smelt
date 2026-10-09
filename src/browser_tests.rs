@@ -2824,6 +2824,21 @@ async fn wait_for_outlined(page: &chromiumoxide::Page, expected: &[&str], timeou
     }
 }
 
+/// `wait_for_outlined`, as a result rather than a panic.
+async fn outlined_within(page: &chromiumoxide::Page, expected: &[&str], timeout: Duration) -> Result<(), String> {
+    let page = page.clone();
+    let expected: Vec<String> = expected.iter().map(|e| e.to_string()).collect();
+    tokio::spawn(async move {
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        wait_for_outlined(&page, &expected, timeout).await;
+    })
+    .await
+    .map_err(|e| {
+        let panic = e.into_panic();
+        panic.downcast_ref::<String>().cloned().unwrap_or_else(|| "failed".to_string())
+    })
+}
+
 /// Waits until the button in reply `reply`'s bubble reads `label`.
 async fn wait_for_copy_label(page: &chromiumoxide::Page, reply: i64, label: &str, timeout: Duration) -> String {
     let js = format!("document.querySelector('.message[data-reply=\"{reply}\"] .reply-copy')?.innerText ?? ''");
@@ -2869,6 +2884,8 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
     let reply = db::create_message(t.pool, conversation.id, "assistant", &[text(part_two)]).await.expect("seed part two").id;
     seed_user_message(t.pool, conversation.id, "Thanks").await;
     let later = db::create_message(t.pool, conversation.id, "assistant", &[text(second_reply)]).await.expect("seed a second reply").id;
+    // Checks added in code review 1, collected so one run shows each.
+    let mut problems: Vec<String> = Vec::new();
     let path = format!("conversation/{}", conversation.id);
     let page = t.tab(t.url(&path)).await;
     wait_for_live_client(&page, conversation.id).await;
@@ -2920,6 +2937,22 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
         "Copy reply (2 parts)",
         "the label goes back after a moment"
     );
+    wait_for_outlined(&page, &[], Duration::from_secs(3)).await;
+
+    // A press that doesn't focus the button (Safari, Firefox on macOS),
+    // then focus from the keyboard: still outlined (code review 1, L4).
+    page.evaluate(format!(
+        "(() => {{ document.activeElement?.blur(); const b = document.querySelector({:?}); \
+         b.dispatchEvent(new PointerEvent('pointerdown', {{ bubbles: true }})); \
+         b.dispatchEvent(new PointerEvent('pointerup', {{ bubbles: true }})); b.focus(); }})()",
+        reply_copy_button(reply)
+    ))
+    .await
+    .expect("press without focusing, then focus");
+    if let Err(why) = outlined_within(&page, &[part_one, "Todos"], Duration::from_secs(2)).await {
+        problems.push(format!("keyboard focus after a press that didn't focus: {why}"));
+    }
+    page.evaluate("document.activeElement?.blur()").await.expect("blur");
     wait_for_outlined(&page, &[], Duration::from_secs(3)).await;
 
     // A refused copy says so: writeText rejecting and execCommand failing.
@@ -3138,6 +3171,7 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
     assert!(lines.iter().any(|l| l.contains("smelt console probe")), "the console listener heard nothing: {lines:?}");
     let console_errors: Vec<&String> = lines.iter().filter(|l| !l.contains("smelt console probe")).collect();
     assert!(console_errors.is_empty(), "console errors around a reload mid-turn: {console_errors:?}");
+    assert!(problems.is_empty(), "{} problem(s): {problems:#?}", problems.len());
 }
 
 /// SME-30: a long reply (about 30 KB, ten code blocks) keeps up while it
