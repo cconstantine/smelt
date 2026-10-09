@@ -77,20 +77,27 @@ pub(super) async fn sweep_orphaned_conversation_claims_with(client: &kube::Clien
             return;
         }
     };
+    let listed = claims.len();
+    let mut deleted = 0;
     for orphan in orphaned_docker_claims(&claims, &live, &instance) {
         tracing::info!(
             claim = %orphan.name,
             conversation_id = orphan.conversation_id,
             "deleting a deleted conversation's claim"
         );
-        delete_claim_if_unchanged(client, &orphan.name, &orphan.uid).await;
+        if delete_claim_if_unchanged(client, &orphan.name, &orphan.uid).await {
+            deleted += 1;
+        }
     }
+    // Always, so a check server's log says the sweep ran and what it
+    // touched, and its absence says it didn't finish (SME-117).
+    tracing::info!(%instance, listed, deleted, "swept orphaned conversation claims");
 }
 
 /// Deletes claim `name` only while it's still the object with `uid`: one
 /// deleted and made again since (by another server, say) is left alone.
-/// Best-effort: logged, never returned.
-pub(super) async fn delete_claim_if_unchanged(client: &kube::Client, name: &str, uid: &str) {
+/// Best-effort: logged, and true only when the delete was accepted.
+pub(super) async fn delete_claim_if_unchanged(client: &kube::Client, name: &str, uid: &str) -> bool {
     let params = DeleteParams {
         preconditions: Some(kube::api::Preconditions {
             uid: Some(uid.to_string()),
@@ -99,13 +106,18 @@ pub(super) async fn delete_claim_if_unchanged(client: &kube::Client, name: &str,
         ..Default::default()
     };
     match pvc_api(client).delete(name, &params).await {
-        Ok(_) => {}
+        Ok(_) => {
+            // The record of what this server deleted (SME-117).
+            tracing::info!(claim = %name, %uid, "deleted claim");
+            return true;
+        }
         Err(kube::Error::Api(e)) if e.code == 404 => {}
         Err(kube::Error::Api(e)) if e.code == 409 => {
             tracing::info!(claim = %name, "a claim was replaced since it was read; left alone")
         }
         Err(e) => tracing::warn!(claim = %name, error = %e, "failed to delete a claim"),
     }
+    false
 }
 
 /// The pod's Docker sidecar's status, if it has one yet.
@@ -360,7 +372,9 @@ pub(super) async fn delete_conversation_pvcs(client: &kube::Client, conversation
             }
         };
         match (owner, uid) {
-            (Ownership::Ours, Some(uid)) => delete_claim_if_unchanged(client, &name, &uid).await,
+            (Ownership::Ours, Some(uid)) => {
+                delete_claim_if_unchanged(client, &name, &uid).await;
+            }
             (Ownership::Ours, None) => tracing::warn!(claim = %name, "a claim with no uid; left alone"),
             (Ownership::Unlabelled, _) => {
                 tracing::warn!(claim = %name, "left a claim with no smelt/instance label (made before SME-115)")
@@ -369,5 +383,213 @@ pub(super) async fn delete_conversation_pvcs(client: &kube::Client, conversation
                 tracing::info!(claim = %name, "left another smelt database's claim of the same name")
             }
         }
+    }
+}
+
+/// What startup and teardown log at info about what they delete (SME-117):
+/// a check server's log is the only record of what its sweep and
+/// teardowns did to the shared namespace. Real-cluster tests, in
+/// `smelt-park-test`, each with ids no other test or run uses.
+#[cfg(test)]
+pub(super) mod log_tests {
+    use super::*;
+    use crate::sandbox::tests::test_client;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `future`'s output, and what it logged at info and above, without
+    /// colour, as a check server's log has it.
+    pub(in crate::sandbox) async fn logged<T>(future: impl std::future::Future<Output = T>) -> (T, String) {
+        use tracing::instrument::WithSubscriber;
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let output = future.with_subscriber(subscriber).await;
+        let text = String::from_utf8(captured.0.lock().expect("log buffer").clone()).expect("utf-8 log");
+        (output, text)
+    }
+
+    /// The line of `log` holding every one of `parts`, if any.
+    pub(in crate::sandbox) fn line_with<'a>(log: &'a str, parts: &[&str]) -> Option<&'a str> {
+        log.lines().find(|line| parts.iter().all(|part| line.contains(part)))
+    }
+
+    /// A conversation id no other test or run uses (as `tests.rs`'s).
+    fn unused_conversation_id() -> i64 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        3_000_000_000 + i64::try_from(nanos % 1_000_000_000).unwrap_or_default()
+    }
+
+    /// A small claim for `conversation_id` labelled with `instance`; its uid.
+    async fn make_claim(client: &kube::Client, name: &str, conversation_id: i64, instance: &str) -> String {
+        let mut spec = build_conversation_pvc_spec(name.to_string(), conversation_id, "1Mi".to_string(), "unused");
+        spec.metadata.labels.get_or_insert_default().insert(INSTANCE_LABEL.to_string(), instance.to_string());
+        let made = pvc_api(client).create(&PostParams::default(), &spec).await.expect("create a claim");
+        made.metadata.uid.expect("a new claim's uid")
+    }
+
+    /// A pod that never starts (an image that doesn't exist), labelled
+    /// with `labels`; its uid.
+    async fn make_pending_pod(client: &kube::Client, name: &str, labels: serde_json::Value) -> String {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": name, "labels": labels},
+            "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
+        }))
+        .expect("pod");
+        let made = pods_api(client).create(&PostParams::default(), &pod).await.expect("create pod");
+        made.metadata.uid.expect("a new pod's uid")
+    }
+
+    /// The sweep always says what it did, even when it found nothing, and
+    /// names each claim it deleted with its uid.
+    #[sqlx::test]
+    async fn test_the_claim_sweep_logs_a_summary_and_each_claim_it_deletes(pool: PgPool) {
+        let client = test_client().await;
+        let ours = db::smelt_instance(&pool).await.expect("instance").id;
+        let ((), nothing) = logged(sweep_orphaned_conversation_claims_with(&client, &pool)).await;
+
+        let conversation_id = unused_conversation_id();
+        let orphan = workspace_pvc_name(conversation_id);
+        let uid = make_claim(&client, &orphan, conversation_id, &ours).await;
+        let ((), swept) = logged(sweep_orphaned_conversation_claims_with(&client, &pool)).await;
+        pvc_api(&client).delete(&orphan, &DeleteParams::default()).await.ok();
+
+        let instance = format!("instance={ours}");
+        assert!(
+            line_with(&nothing, &["swept orphaned conversation claims", &instance, "listed=0", "deleted=0"]).is_some(),
+            "a sweep with nothing to do logged: {nothing}"
+        );
+        assert!(
+            line_with(&swept, &["swept orphaned conversation claims", &instance, "listed=1", "deleted=1"]).is_some(),
+            "the sweep's summary: {swept}"
+        );
+        assert!(
+            line_with(&swept, &["deleted claim", &format!("claim={orphan}"), &format!("uid={uid}")]).is_some(),
+            "the sweep didn't log the claim it deleted: {swept}"
+        );
+    }
+
+    /// A conversation's teardown says it started, then names each pod and
+    /// claim it deleted with its uid. Another database's claim of the same
+    /// name is only "left".
+    #[tokio::test]
+    async fn test_a_conversations_teardown_logs_what_it_deletes() {
+        let client = test_client().await;
+        let conversation_id = unused_conversation_id();
+        let pod = pod_name(conversation_id);
+        let pod_uid = make_pending_pod(
+            &client,
+            &pod,
+            serde_json::json!({CONVERSATION_LABEL: conversation_id.to_string(), INSTANCE_LABEL: TEST_INSTANCE}),
+        )
+        .await;
+        let claims = [docker_pvc_name(conversation_id), workspace_pvc_name(conversation_id)];
+        let mut claim_uids = Vec::new();
+        for claim in &claims {
+            claim_uids.push(make_claim(&client, claim, conversation_id, TEST_INSTANCE).await);
+        }
+        // Another database's conversation of the next id.
+        let theirs_id = conversation_id + 1;
+        let theirs = workspace_pvc_name(theirs_id);
+        make_claim(&client, &theirs, theirs_id, "another-smelt-database").await;
+
+        let ((), log) = logged(teardown_conversation_with(&client, conversation_id, &[], &test_instance())).await;
+        let ((), their_log) = logged(teardown_conversation_with(&client, theirs_id, &[], &test_instance())).await;
+
+        pods_api(&client).delete(&pod, &immediate_delete_params()).await.ok();
+        for claim in claims.iter().chain([&theirs]) {
+            pvc_api(&client).delete(claim, &DeleteParams::default()).await.ok();
+        }
+        assert!(
+            line_with(
+                &log,
+                &["tearing down a conversation's sandbox", &format!("conversation_id={conversation_id}"), &format!("instance={TEST_INSTANCE}")]
+            )
+            .is_some(),
+            "no opening line: {log}"
+        );
+        assert!(
+            line_with(&log, &["deleted pod", &format!("pod={pod}"), &format!("uid={pod_uid}")]).is_some(),
+            "the pod's delete wasn't logged: {log}"
+        );
+        for (claim, uid) in claims.iter().zip(&claim_uids) {
+            assert!(
+                line_with(&log, &["deleted claim", &format!("claim={claim}"), &format!("uid={uid}")]).is_some(),
+                "{claim}'s delete wasn't logged: {log}"
+            );
+        }
+        assert!(
+            line_with(&their_log, &["left another smelt database's claim", &format!("claim={theirs}")]).is_some(),
+            "another database's claim: {their_log}"
+        );
+        assert!(!their_log.contains("deleted claim"), "another database's claim logged as deleted: {their_log}");
+    }
+
+    /// Stopping a pod logs its delete with its uid.
+    #[sqlx::test]
+    async fn test_a_terminated_pods_delete_is_logged(pool: PgPool) {
+        let client = test_client().await;
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        let ours = db::smelt_instance(&pool).await.expect("instance").id;
+        let conversation = db::create_conversation(&pool).await.expect("conversation");
+        let row = db::create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
+        let name = pod_name(row.id);
+        let uid = make_pending_pod(
+            &client,
+            &name,
+            serde_json::json!({CONVERSATION_LABEL: conversation.id.to_string(), INSTANCE_LABEL: ours}),
+        )
+        .await;
+
+        let (closed, log) = logged(force_terminate_pod_with(&pool, &client, row.id)).await;
+
+        pods_api(&client).delete(&name, &immediate_delete_params()).await.ok();
+        assert!(closed.is_ok(), "{closed:?}");
+        assert!(
+            line_with(&log, &["deleted pod", &format!("pod={name}"), &format!("uid={uid}")]).is_some(),
+            "the terminated pod's delete wasn't logged: {log}"
+        );
+    }
+
+    /// Deleting a volume logs its claim's delete with its uid.
+    #[tokio::test]
+    async fn test_a_volume_claims_delete_is_logged() {
+        let client = test_client().await;
+        let id = unused_conversation_id();
+        let name = sandbox_volume_pvc_name(id);
+        let made = pvc_api(&client)
+            .create(&PostParams::default(), &build_volume_pvc_spec(id, TEST_INSTANCE))
+            .await
+            .expect("create the claim");
+        let uid = made.metadata.uid.expect("a new claim's uid");
+
+        let (deleted, log) = logged(delete_volume_claim(&client, id, &test_instance())).await;
+
+        pvc_api(&client).delete(&name, &DeleteParams::default()).await.ok();
+        assert!(deleted.is_ok(), "{deleted:?}");
+        assert!(
+            line_with(&log, &["deleted volume claim", &format!("claim={name}"), &format!("uid={uid}")]).is_some(),
+            "the volume claim's delete wasn't logged: {log}"
+        );
     }
 }
