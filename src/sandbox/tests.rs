@@ -3587,3 +3587,65 @@ fn test_a_test_manager_on_a_multi_thread_runtime_is_refused() {
     .expect("the test thread");
     assert!(refused, "use_test_manager accepted a multi-thread runtime");
 }
+
+/// Real-cluster tests, apart from the pure ones so a filter on a pure
+/// test's path can't run them (SME-134). Each runs only by exact name,
+/// under the cluster lock.
+mod cluster {
+    use super::*;
+    use k8s_openapi::api::core::v1::ConfigMapVolumeSource;
+
+    /// The flake's stage, held on purpose (SME-132): a pod whose volume
+    /// names a ConfigMap that doesn't exist stays at
+    /// `PodReadyToStartContainers: False` with `FailedMount` events, every
+    /// time, on an idle node. A timed-out wait says so, the containers'
+    /// states and the event naming the ConfigMap included.
+    ///
+    /// Harmless if killed: a unique name, the tests' instance, no
+    /// conversation label, and `activeDeadlineSeconds`, so the kubelet
+    /// fails a leftover (`DeadlineExceeded`). It checks the deadline only
+    /// once its 2-minute wait for the mount gives up: a run killed after
+    /// the create left a pod that failed at 127 s. The sweep (SME-134)
+    /// removes the object.
+    #[tokio::test]
+    async fn test_a_pod_stuck_before_its_containers_says_what_it_waits_on() {
+        let client = test_client().await;
+        let pods = pods_api(&client);
+        let name = format!("sandbox-{}", unique_session_id("stuck-at-mount"));
+        let missing = format!("sme-132-missing-{}", uuid_like());
+        let docker = DockerSidecar { memory: "1Gi".to_string(), storage: PodStorage::Ephemeral };
+        let mut pod = build_pod_spec(&name, "1Gi", &docker, &[], TEST_INSTANCE);
+        let spec = pod.spec.as_mut().expect("a pod spec");
+        spec.active_deadline_seconds = Some(60);
+        spec.volumes.get_or_insert_with(Vec::new).push(Volume {
+            name: "missing".to_string(),
+            config_map: Some(ConfigMapVolumeSource { name: missing.clone(), ..Default::default() }),
+            ..Default::default()
+        });
+        // The kubelet mounts only the volumes a container uses.
+        spec.containers[0].volume_mounts.get_or_insert_with(Vec::new).push(VolumeMount {
+            name: "missing".to_string(),
+            mount_path: "/sme-132-missing".to_string(),
+            ..Default::default()
+        });
+        pods.create(&PostParams::default(), &pod).await.expect("create the pod");
+
+        let waited = wait_for_running_with_timeout(&pods, &name, Duration::from_secs(20)).await;
+        pods.delete(&name, &immediate_delete_params()).await.ok();
+
+        let detail = match waited {
+            Err(SandboxError::Timeout(Some(detail))) => detail,
+            other => panic!("expected a timeout with a detail, got {other:?}"),
+        };
+        println!("{detail}");
+        assert!(detail.contains("PodReadyToStartContainers"), "got {detail}");
+        assert!(detail.contains("FailedMount"), "got {detail}");
+        assert!(detail.contains(&missing), "got {detail}");
+        for container in ["docker", "sandbox"] {
+            assert!(
+                detail.contains(&format!("{container} not created")) || detail.contains(&format!("{container} waiting")),
+                "{container}'s state is missing: {detail}"
+            );
+        }
+    }
+}

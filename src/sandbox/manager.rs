@@ -243,7 +243,46 @@ pub(super) async fn wait_for_running_with_timeout(
         }
     })
     .await;
-    waited.map_err(|_| SandboxError::Timeout(last_detail))?
+    match waited {
+        Ok(result) => result,
+        // Boxed: a `Pod` and its events are large, and this path is rare
+        // (see `test_sandbox_futures_stay_small`).
+        Err(_) => Err(SandboxError::Timeout(Box::pin(timed_out_detail(pods, name, last_detail)).await)),
+    }
+}
+
+/// How long `timed_out_detail` waits for each of its two reads.
+const REPORT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A timed-out start's detail: `pod_start_report` on a fresh read of the
+/// pod and its events (SME-132). It runs before `create_with_running_timeout`
+/// deletes the pod. When the pod can't be read, the last poll's
+/// `pod_pending_detail` stands.
+async fn timed_out_detail(pods: &Api<Pod>, name: &str, last_detail: Option<String>) -> Option<String> {
+    let Ok(Ok(pod)) = tokio::time::timeout(REPORT_READ_TIMEOUT, pods.get(name)).await else {
+        return last_detail;
+    };
+    let events = pod_events(pods, &pod).await;
+    Some(pod_start_report(&pod, events.as_deref().map_err(String::as_str), Timestamp::now()))
+}
+
+/// `pod`'s events, or why they couldn't be listed. The `park` Role may
+/// list events in both namespaces (`k8s/smelt-park-rbac.yaml`).
+async fn pod_events(pods: &Api<Pod>, pod: &Pod) -> Result<Vec<Event>, String> {
+    let client = pods.clone().into_client();
+    let events: Api<Event> = match pods.namespace() {
+        Some(namespace) => Api::namespaced(client, namespace),
+        None => Api::all(client),
+    };
+    let mut selector = format!("involvedObject.name={}", pod.metadata.name.as_deref().unwrap_or_default());
+    if let Some(uid) = &pod.metadata.uid {
+        selector.push_str(&format!(",involvedObject.uid={uid}"));
+    }
+    match tokio::time::timeout(REPORT_READ_TIMEOUT, events.list(&ListParams::default().fields(&selector))).await {
+        Ok(Ok(list)) => Ok(list.items),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("no answer in {} s", REPORT_READ_TIMEOUT.as_secs())),
+    }
 }
 
 /// The most events `pod_start_report` lists.
@@ -258,7 +297,6 @@ const REPORT_MAX_MESSAGE_CHARS: usize = 200;
 /// stages it passed, each container's state, and up to 5 of its events,
 /// `Warning`s first, then the newest. `events` is `Err` with why when
 /// they couldn't be listed; the rest is reported anyway.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn pod_start_report(pod: &Pod, events: Result<&[Event], &str>, now: Timestamp) -> String {
     let created = pod.metadata.creation_timestamp.as_ref().map(|t| t.0);
     let conditions = pod.status.as_ref().and_then(|s| s.conditions.as_deref()).unwrap_or_default();
@@ -307,7 +345,7 @@ fn whole_seconds(from: Timestamp, to: Timestamp) -> String {
 
 /// Each condition that went `True`, as an offset from the pod's creation,
 /// in the order they happened: "scheduled +0 s, sandbox ready +1 s".
-pub(super) fn pod_start_timeline(pod: &Pod) -> String {
+fn pod_start_timeline(pod: &Pod) -> String {
     let Some(created) = pod.metadata.creation_timestamp.as_ref().map(|t| t.0) else {
         return String::new();
     };
