@@ -140,6 +140,8 @@ They don't take the turn-test lock: their conversations' ids are clear of every 
 
 `test_the_sweep_names_only_the_test_namespace` and `test_the_sweep_never_chooses_an_object_outside_the_test_namespace` pin guards 2 and 3. The sweep's own real-cluster tests label what they make with a value of their own and sweep only that label, so even an age of zero reaches nothing of another run's.
 
+**A real-cluster test that judges an object's age compares its `creationTimestamp` with another time from the API server** (such as another object's `creationTimestamp`), never the runner's clock. Kubernetes cuts `creationTimestamp` to the whole second, so against the runner's clock an object can read as up to a second older than it is (and as younger when the runner's clock is behind the API server's). On SME-143 the sweep's made-between-listings test swept with a 1 s age limit against `Timestamp::now()`; on CI's slower runners its young pod read as old once the next whole second passed, and was deleted with its claim, in 3 of 7 runs. `sweep_with` takes the time to judge age at for this reason: that test passes its claim's `creationTimestamp` plus 1 s.
+
 **A test-side wait for something smelt bounds by an env-configurable timeout is computed from that timeout,** never a literal sized from the local default: CI raises some of them (`SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120` in `ci.yml`). Teardown's wait for a pod start is `2 * running_wait_timeout()` plus a minute for this reason; on SME-94 a literal 150 s, sized from the local default, was shorter than a start can take in CI.
 
 ### Docker in the sandbox (SME-33)
