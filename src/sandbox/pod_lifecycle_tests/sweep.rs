@@ -538,8 +538,10 @@ mod tests {
     }
 
     /// SME-134 review 1: a pod made between the sweep's two listings,
-    /// mounting a claim the sweep lists, is seen with it: the claim isn't
-    /// deleted from under a pod the sweep doesn't know about.
+    /// mounting an old claim the sweep lists, is seen with it, and the
+    /// young pod keeps the claim: it isn't deleted from under a pod the
+    /// sweep doesn't know about. (Review 2: an old claim and a young pod,
+    /// the case itself, rather than both old.)
     #[tokio::test]
     async fn test_the_sweep_sees_a_pod_made_between_its_listings() {
         let client = crate::sandbox::tests::test_client().await;
@@ -547,14 +549,18 @@ mod tests {
         let claim_name = format!("{run}-claim");
         let pod_name = format!("{run}-pod");
         create_claim(&client, &claim_name, &run).await;
+        // Creation times are to the second: the claim is then over a
+        // second old, and the pod made during the sweep under one.
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
-        let swept = sweep_with(&client, Duration::ZERO, Some(&selector), create_pod(&client, &pod_name, &run, &claim_name)).await;
+        let made_between =
+            sweep_with(&client, Duration::from_secs(1), Some(&selector), create_pod(&client, &pod_name, &run, &claim_name));
+        let swept = made_between.await;
         let left = live(&client, &selector).await;
 
         clean_up(&client, &selector).await;
-        assert_ne!(left, vec![pod_name.clone()], "the claim was deleted from under a pod the sweep didn't see");
-        assert_eq!(swept, Ok(Swept { pods: 1, claims: 1, ..Swept::default() }));
-        assert_eq!(left, Vec::<String>::new());
+        assert_eq!(left, vec![claim_name, pod_name], "the claim was deleted from under a pod the sweep didn't see");
+        assert_eq!(swept, Ok(Swept { kept_claims: 1, ..Swept::default() }));
     }
 
     /// SME-134 review 2: a claim the sweep chose with its old pod is kept
