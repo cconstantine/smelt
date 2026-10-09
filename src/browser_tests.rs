@@ -3013,6 +3013,16 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
         .into_value()
         .expect("facts");
     assert_eq!(focus, serde_json::json!({ "button": true, "areas": 0 }), "focus goes back to the button");
+    // The fallback's focus moves aren't keyboard focus: once the pointer
+    // leaves and "Copied" is over, the outline goes (code review 1, L2).
+    insecure.move_mouse(chromiumoxide::layout::Point::new(5.0, 5.0)).await.expect("point away");
+    assert_eq!(
+        wait_for_copy_label(&insecure, reply, "Copy reply (2 parts)", Duration::from_secs(4)).await,
+        "Copy reply (2 parts)"
+    );
+    if let Err(why) = outlined_within(&insecure, &[], Duration::from_secs(2)).await {
+        problems.push(format!("the outline stayed after a plain-HTTP copy: {why}"));
+    }
     // What reached the real clipboard, read from the secure origin.
     t.harness
         .browser

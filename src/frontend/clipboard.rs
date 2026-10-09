@@ -128,6 +128,12 @@ pub(crate) fn CopyButton(
     // ends, so a later Tab onto the button counts (code review 1).
     let mut pressed = use_signal(|| false);
     let mut highlighted = use_signal(|| false);
+    // Set while the copy script's synchronous part runs: the fallback
+    // focuses its textarea and then this button again, inside the click,
+    // and dioxus-web runs those focus and blur handlers there and then.
+    // They aren't the user's (code review 1).
+    // Read with `peek`, so nothing re-renders for it.
+    let mut copying = use_signal(|| false);
     let mut report = move || {
         let on = *hovered.peek() || *keyboard_focus.peek() || feedback.peek().outcome().is_some();
         if on != *highlighted.peek() {
@@ -139,7 +145,9 @@ pub(crate) fn CopyButton(
     };
     let copy = move |_| {
         let generation = feedback.write().clicked();
+        copying.set(true);
         let copied = copy_text(&text);
+        copying.set(false);
         spawn(async move {
             let copied = copied.await;
             feedback.write().finished(generation, copied);
@@ -172,12 +180,15 @@ pub(crate) fn CopyButton(
             onpointerup: move |_| pressed.set(false),
             onpointercancel: move |_| pressed.set(false),
             onfocus: move |_| {
-                if !*pressed.peek() {
+                if !*pressed.peek() && !*copying.peek() {
                     keyboard_focus.set(true);
                     report();
                 }
             },
             onblur: move |_| {
+                if *copying.peek() {
+                    return;
+                }
                 pressed.set(false);
                 keyboard_focus.set(false);
                 report();
