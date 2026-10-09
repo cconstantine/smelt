@@ -655,6 +655,19 @@ async fn test_try_reconnect_does_not_wait_for_a_connect_in_progress(pool: PgPool
     connecting.await.expect("join").expect("the first connect still succeeds");
 }
 
+/// Review 2: `index.docker.io` is Docker Hub, a first part with capitals
+/// is a registry (as Docker's reference parser takes it), and spaces
+/// around a setting don't make it another image.
+#[test]
+fn test_full_image_name_follows_dockers_reference_rules() {
+    assert_eq!(full_image_name("index.docker.io/library/smelt-sandbox:latest"), "docker.io/library/smelt-sandbox:latest");
+    assert_eq!(full_image_name("index.docker.io/smelt-sandbox"), "docker.io/library/smelt-sandbox:latest");
+    assert_eq!(full_image_name("Registry/team/sandbox:1"), "Registry/team/sandbox:1");
+    assert_eq!(full_image_name(" smelt-sandbox:latest\n"), "docker.io/library/smelt-sandbox:latest");
+    assert_eq!(full_image_name("localhost:5000/sandbox"), "localhost:5000/sandbox:latest");
+    assert_eq!(full_image_name("smelt-sandbox@sha256:abc"), "docker.io/library/smelt-sandbox@sha256:abc");
+}
+
 /// Review 2: the rebuild advice for a pod on the image a new pod gets
 /// names the way to get that image, as the missing-image advice does: the
 /// build script makes only this tree's own image, and `:latest` only with

@@ -69,12 +69,19 @@ impl AgentDialer for ClusterDialer {
 /// `library/` filled in, and `:latest` when it has neither tag nor digest
 /// (`smelt-sandbox` is `docker.io/library/smelt-sandbox:latest`).
 pub(super) fn full_image_name(reference: &str) -> String {
+    let reference = reference.trim();
     let (name, digest) = match reference.split_once('@') {
         Some((name, digest)) => (name, Some(digest)),
         None => (reference, None),
     };
+    // `index.docker.io` is Docker Hub's old name for `docker.io`.
+    let renamed = name.strip_prefix("index.docker.io/").map(|path| format!("docker.io/{path}"));
+    let name = renamed.as_deref().unwrap_or(name);
+    // Docker's reference parser takes a first part with a dot, a port,
+    // capitals, or `localhost` as a registry.
     let first = name.split('/').next().unwrap_or_default();
-    let has_registry = name.contains('/') && (first.contains('.') || first.contains(':') || first == "localhost");
+    let has_registry = name.contains('/')
+        && (first.contains('.') || first.contains(':') || first == "localhost" || first.chars().any(|c| c.is_ascii_uppercase()));
     let mut full = if has_registry {
         match name.strip_prefix("docker.io/") {
             Some(path) if !path.contains('/') => format!("docker.io/library/{path}"),
