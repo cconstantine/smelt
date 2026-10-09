@@ -170,7 +170,11 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .expect("failed to bind listener");
-    tracing::info!("listening on {}", listener.local_addr().unwrap());
+    // A log line isn't worth a panic (SME-119).
+    match listener.local_addr() {
+        Ok(addr) => tracing::info!("listening on {addr}"),
+        Err(e) => tracing::info!("listening on port {port} (couldn't read the bound address: {e})"),
+    }
     #[expect(clippy::expect_used, reason = "serving is the process's whole job: when it ends, the process does")]
     axum::serve(listener, router).await.expect("server error");
 }
