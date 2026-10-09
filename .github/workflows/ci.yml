@@ -153,7 +153,7 @@ jobs:
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt cargo check --no-default-features --features web --target wasm32-unknown-unknown
 
-      - name: No expect() in production code without a reason (SME-95)
+      - name: No expect() or unwrap() in production code without a reason (SME-95, SME-119)
         run: |
           docker compose run --rm \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \

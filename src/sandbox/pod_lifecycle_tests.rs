@@ -7,6 +7,10 @@
 //! its scenario through `run_then_tear_down`, which bounds it in time and
 //! deletes what its database made in the cluster, pass or fail. So the
 //! tests run in parallel, and a failure names the feature that broke.
+//!
+//! The first `own_sandbox` in a process also sweeps the test namespace of
+//! every pod and claim more than an hour old (`sweep`, SME-134): what a
+//! killed run or a failed teardown left, which nothing else deletes.
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -14,17 +18,31 @@ use std::panic::AssertUnwindSafe;
 use super::tests::test_client;
 use super::*;
 
+mod sweep;
+
 /// Gives the test ids clear of every other test and run (pods, claims and
 /// labels are named after them, in a namespace they all share) and a
 /// sandbox manager of its own, which `get()` returns on the test's thread.
-/// Returns the manager's client.
+/// Returns the manager's client. The first call in a process sweeps the
+/// test namespace first (`sweep::sweep_once`); later ones wait for it.
 async fn own_sandbox(pool: &PgPool) -> kube::Client {
+    sweep::sweep_once().await;
     db::test_support::start_ids_clear_of_other_runs(pool)
         .await
         .expect("ids clear of other runs");
     let client = test_client().await;
     use_test_manager(client.clone());
     client
+}
+
+/// SME-134: the harness sweeps the namespace of old leftovers once per
+/// process, however many tests start.
+#[sqlx::test]
+async fn test_own_sandbox_sweeps_once_per_process(pool: PgPool) {
+    own_sandbox(&pool).await;
+    own_sandbox(&pool).await;
+
+    assert_eq!(sweep::sweeps_started(), 1);
 }
 
 /// How many of these tests run their scenarios at once. Each starts a pod
