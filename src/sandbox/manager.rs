@@ -229,6 +229,7 @@ pub(super) async fn wait_for_running_with_timeout(
     timeout: Duration,
 ) -> Result<(), SandboxError> {
     let mut last_detail = None;
+    let started = std::time::Instant::now();
     let waited = tokio::time::timeout(timeout, async {
         loop {
             let pod = pods.get(name).await?;
@@ -236,9 +237,21 @@ pub(super) async fn wait_for_running_with_timeout(
                 return Err(SandboxError::StartFailed(reason));
             }
             last_detail = pod_pending_detail(&pod);
-            if pod.status.and_then(|s| s.phase).as_deref() == Some("Running") {
+            if pod.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running") {
+                let took = started.elapsed();
+                if is_slow_start(took, timeout) {
+                    tracing::warn!(
+                        pod = %name,
+                        took_secs = took.as_secs(),
+                        timeout_secs = timeout.as_secs(),
+                        timeline = %pod_start_timeline(&pod),
+                        "a sandbox pod took more than half its start timeout to reach Running"
+                    );
+                }
                 return Ok(());
             }
+            // Not held across the sleep (see `test_sandbox_futures_stay_small`).
+            drop(pod);
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     })
@@ -249,6 +262,13 @@ pub(super) async fn wait_for_running_with_timeout(
         // (see `test_sandbox_futures_stay_small`).
         Err(_) => Err(SandboxError::Timeout(Box::pin(timed_out_detail(pods, name, last_detail)).await)),
     }
+}
+
+/// Whether a start that took `took` came close enough to `timeout` to log.
+/// A start past half its timeout is logged (SME-132), so a dev server's
+/// log shows how close real starts come to the limit.
+pub(super) fn is_slow_start(took: Duration, timeout: Duration) -> bool {
+    took > timeout / 2
 }
 
 /// How long `timed_out_detail` waits for each of its two reads.

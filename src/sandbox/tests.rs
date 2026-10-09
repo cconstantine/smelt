@@ -991,6 +991,17 @@ fn test_pod_start_report_caps_its_events() {
     assert!(!report.contains(&"é".repeat(201)), "got {report}");
 }
 
+/// A start that succeeds after more than half its timeout is slow, and
+/// logged; one at or under half isn't (SME-132).
+#[test]
+fn test_a_start_past_half_its_timeout_is_slow() {
+    let timeout = Duration::from_secs(90);
+    assert!(is_slow_start(Duration::from_secs(46), timeout));
+    assert!(is_slow_start(Duration::from_millis(45_001), timeout));
+    assert!(!is_slow_start(Duration::from_secs(45), timeout));
+    assert!(!is_slow_start(Duration::from_secs(2), timeout));
+}
+
 /// When the events can't be listed, the rest of the report is kept.
 #[test]
 fn test_pod_start_report_keeps_the_rest_when_events_are_unavailable() {
