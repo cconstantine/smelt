@@ -95,6 +95,9 @@ env_file_value() {
     case "$value" in
         \"*) value=${value#\"}; value=${value%%\"*} ;;
         \'*) value=${value#\'}; value=${value%%\'*} ;;
+        # Nothing before a comment: empty, as dotenvy reads it (SME-117
+        # review 2: `RUST_LOG= # note` silenced smelt's log).
+        \#*) value="" ;;
         *)
             value=${value%%[[:space:]]#*}
             value=${value%"${value##*[![:space:]]}"}
