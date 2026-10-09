@@ -212,8 +212,9 @@ pub enum TerminalError {
     /// connection dropped.
     Agent(AgentRequestError),
     /// The pod's agent speaks another major version of the protocol, or
-    /// predates versioning (`found: None`). Only a new pod fixes it.
-    AgentOutdated { found: Option<ProtocolVersion> },
+    /// predates versioning (`found: None`). A new pod fixes it, unless the
+    /// pod already runs the image a new pod would get (`image`, SME-121).
+    AgentOutdated { found: Option<ProtocolVersion>, image: PodImage },
     /// A feature needs a newer minor version than the pod's agent has.
     AgentTooOld { needs: ProtocolVersion, found: ProtocolVersion },
     /// Every attempt to reach the pod's agent failed, so its pod was
@@ -222,6 +223,21 @@ pub enum TerminalError {
     /// A request to open one of the sandbox agent's own ports (`AGENT_PORT`,
     /// `RELAY_PORT`) from a route into the pod — see `check_reachable_port`.
     AgentPort(u16),
+}
+
+/// An outdated pod's image against the one a new pod gets, which decides
+/// whether recreating the pod can help (SME-121).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PodImage {
+    /// Another image (an older build, or `:latest`): a new pod gets a
+    /// newer agent.
+    Older,
+    /// The image a new pod would get, so a new pod would be refused too:
+    /// the image needs rebuilding.
+    SameAsNew(String),
+    /// The pod's image couldn't be read (it's gone, or the cluster didn't
+    /// answer).
+    Unknown,
 }
 
 impl std::fmt::Display for TerminalError {
@@ -248,7 +264,7 @@ impl std::fmt::Display for TerminalError {
                 )
             }
             TerminalError::Agent(e) => write!(f, "{e}"),
-            TerminalError::AgentOutdated { found } => {
+            TerminalError::AgentOutdated { found, image } => {
                 let found = match found {
                     Some(version) => format!("protocol {version}"),
                     None => "an agent from before the protocol was versioned".to_string(),
@@ -256,10 +272,27 @@ impl std::fmt::Display for TerminalError {
                 write!(
                     f,
                     "this sandbox runs an incompatible sandbox agent ({found}; smelt needs protocol {}.x), \
-                     so its terminals and file tools can't be used. Call terminate_pod, then create_pod, \
-                     for a sandbox that works; /workspace is kept.",
+                     so its terminals and file tools can't be used.",
                     PROTOCOL_VERSION.major
-                )
+                )?;
+                match image {
+                    PodImage::SameAsNew(image) => write!(
+                        f,
+                        " Its image {image} is the one a new pod would get, so recreating the pod won't help \
+                         until that image is rebuilt. Don't retry: {} Once it's rebuilt, call terminate_pod, \
+                         then create_pod: this pod still runs the old build. /workspace is kept.",
+                        how_to_build(image)
+                    ),
+                    PodImage::Older => {
+                        write!(f, " Call terminate_pod, then create_pod, for a sandbox that works; /workspace is kept.")
+                    }
+                    PodImage::Unknown => write!(
+                        f,
+                        " Call terminate_pod, then create_pod, for a sandbox that works; /workspace is kept. \
+                         If a new pod is refused too, don't retry: tell the user the sandbox image needs \
+                         rebuilding with scripts/build-sandbox-image.sh."
+                    ),
+                }
             }
             TerminalError::AgentTooOld { needs, found } => write!(
                 f,

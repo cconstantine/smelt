@@ -589,6 +589,65 @@ async fn test_exhausted_reconnects_force_terminate_an_unreachable_pod(pool: PgPo
     .await;
 }
 
+/// SME-121: a pod whose image isn't on the node fails within seconds with
+/// the kubelet's `ErrImageNeverPull`, naming the image and what to do,
+/// instead of waiting out the running timeout. A hand-built pod
+/// with the sandbox's pull policy and an image no one built; its deadline
+/// bounds its life if the test is killed before teardown.
+#[sqlx::test]
+async fn test_a_pod_whose_image_is_missing_fails_fast_saying_how_to_build_it(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let pod = db::create_sandbox_pod(&pool, conversation.id).await.expect("create_sandbox_pod").id;
+        let mut limits = std::collections::BTreeMap::new();
+        limits.insert("cpu".to_string(), Quantity("100m".to_string()));
+        limits.insert("memory".to_string(), Quantity("64Mi".to_string()));
+        let instance = db::smelt_instance(&pool).await.expect("instance");
+        let missing = "docker.io/library/smelt-sandbox:src-sme121neverbuilt";
+        let missing_image_pod = Pod {
+            metadata: ObjectMeta {
+                name: Some(pod_name(pod)),
+                namespace: Some(NAMESPACE.to_string()),
+                labels: Some(instance_labels(&instance.id)),
+                ..Default::default()
+            },
+            spec: Some(PodSpec {
+                containers: vec![Container {
+                    name: "sandbox".to_string(),
+                    image: Some(missing.to_string()),
+                    image_pull_policy: Some("Never".to_string()),
+                    resources: Some(ResourceRequirements { limits: Some(limits), ..Default::default() }),
+                    ..Default::default()
+                }],
+                restart_policy: Some("Never".to_string()),
+                active_deadline_seconds: Some(300),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        pods_api(&client).create(&PostParams::default(), &missing_image_pod).await.expect("create the pod");
+
+        let started = std::time::Instant::now();
+        let result = wait_for_running_with_timeout(&pods_api(&client), &pod_name(pod), Duration::from_secs(60)).await;
+        let Err(SandboxError::StartFailed(reason)) = result else {
+            panic!("expected a startup failure, got {result:?}");
+        };
+        assert!(started.elapsed() < Duration::from_secs(45), "took {:?}", started.elapsed());
+        assert!(reason.contains("ErrImageNeverPull") && reason.contains(missing), "{reason}");
+        // The advice goes by the spec's image; for a container that never
+        // started, the status names the same one.
+        let status_image = pods_api(&client).get(&pod_name(pod)).await.expect("get the pod").status
+            .and_then(|s| s.container_statuses)
+            .and_then(|c| c.into_iter().next())
+            .map(|c| c.image);
+        assert_eq!(status_image.as_deref(), Some(missing));
+        // Not an image the build script makes, so the advice says whose it is.
+        assert!(reason.contains("SANDBOX_IMAGE or SANDBOX_DOCKER_IMAGE"), "{reason}");
+    })
+    .await;
+}
+
 /// SME-33, SME-32: `create_pod` gives the pod its conversation's own
 /// Docker data claim (so its images outlive the pod) and `/workspace`
 /// claim, and `teardown_conversation` deletes both with the pod.

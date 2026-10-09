@@ -49,7 +49,14 @@ pub enum AgentStatus {
     RestartRecommended { version: String },
     /// Another major, or (`None`) an agent from before versioning: the
     /// terminals and file tools don't work until the pod is replaced.
-    RestartRequired { version: Option<String> },
+    /// `rebuild_image` when the pod already runs the image a new pod would
+    /// get, so replacing it won't help until that image is rebuilt, and is
+    /// needed after (SME-121).
+    RestartRequired {
+        version: Option<String>,
+        #[serde(default)]
+        rebuild_image: bool,
+    },
 }
 
 impl AgentStatus {
@@ -58,8 +65,16 @@ impl AgentStatus {
         match self {
             AgentStatus::Current { version } => format!("agent {version}"),
             AgentStatus::RestartRecommended { version } => format!("agent {version}, restart for new features"),
-            AgentStatus::RestartRequired { version: Some(version) } => format!("agent {version}, restart required"),
-            AgentStatus::RestartRequired { version: None } => "old agent, restart required".to_string(),
+            AgentStatus::RestartRequired { version, rebuild_image } => {
+                let agent = match version {
+                    Some(version) => format!("agent {version}"),
+                    None => "old agent".to_string(),
+                };
+                // The pod runs the old build even once the image is rebuilt
+                // under the same name, so it still needs a restart after.
+                let fix = if *rebuild_image { "rebuild the image, then restart" } else { "restart required" };
+                format!("{agent}, {fix}")
+            }
         }
     }
 }
@@ -323,10 +338,17 @@ pub async fn get_live_pod_conversations() -> ServerFnResult<Vec<i64>> {
 /// and the pods view.
 #[get("/api/app-events")]
 pub async fn subscribe_app_events() -> ServerFnResult<ServerEvents<AppEvent>> {
+    Ok(app_events_response(crate::events::subscribe_app()))
+}
+
+/// The response `subscribe_app_events` sends, relaying `rx`. Takes the
+/// receiver so a test can hand it a channel of its own: the app-wide
+/// channel's count moves with every other test subscribing (SME-135).
+#[cfg(feature = "server")]
+fn app_events_response(rx: tokio::sync::broadcast::Receiver<AppEvent>) -> ServerEvents<AppEvent> {
     // `from_stream`, not `ServerEvents::new`, for the same reason as
     // `subscribe_conversation_events`: dropping the response (the tab
     // going away) drops the subscription.
-    let rx = crate::events::subscribe_app();
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
@@ -337,7 +359,7 @@ pub async fn subscribe_app_events() -> ServerFnResult<ServerEvents<AppEvent>> {
             }
         }
     });
-    Ok(ServerEvents::from_stream(stream))
+    ServerEvents::from_stream(stream)
 }
 
 #[cfg(all(test, feature = "server"))]
@@ -366,20 +388,21 @@ mod tests {
     }
 
     /// A subscription belongs to its connection: once the response is
-    /// dropped (the tab closed or reloaded), it stops listening.
+    /// dropped (the tab closed or reloaded), it stops listening. Counted
+    /// on a channel of the test's own: the app-wide one is shared with
+    /// every test running alongside (SME-135).
     #[tokio::test]
     async fn test_a_dropped_app_event_subscription_stops_listening() {
-        let before = crate::events::app_subscriber_count();
-        let subscription = subscribe_app_events().await.expect("subscribe");
+        let (sender, rx) = tokio::sync::broadcast::channel(16);
+        // Another test subscribing to app events meanwhile, as the pod
+        // lifecycle and providers tests do: it mustn't move the count.
+        let _alongside = crate::events::subscribe_app();
+        let subscription = app_events_response(rx);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(crate::events::app_subscriber_count(), before + 1);
+        assert_eq!(sender.receiver_count(), 1);
         drop(subscription);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(
-            crate::events::app_subscriber_count(),
-            before,
-            "a dropped subscription is still listening"
-        );
+        assert_eq!(sender.receiver_count(), 0, "a dropped subscription is still listening");
     }
 
     fn parse_cpu_millicores(quantity: &str) -> Option<u64> {
@@ -394,10 +417,22 @@ mod tests {
             "agent 1.2, restart for new features"
         );
         assert_eq!(
-            AgentStatus::RestartRequired { version: Some("2.0".into()) }.describe(),
+            AgentStatus::RestartRequired { version: Some("2.0".into()), rebuild_image: false }.describe(),
             "agent 2.0, restart required"
         );
-        assert_eq!(AgentStatus::RestartRequired { version: None }.describe(), "old agent, restart required");
+        assert_eq!(
+            AgentStatus::RestartRequired { version: None, rebuild_image: false }.describe(),
+            "old agent, restart required"
+        );
+        // SME-121: a new pod would run the same image, so a restart can't help.
+        assert_eq!(
+            AgentStatus::RestartRequired { version: Some("2.0".into()), rebuild_image: true }.describe(),
+            "agent 2.0, rebuild the image, then restart"
+        );
+        assert_eq!(
+            AgentStatus::RestartRequired { version: None, rebuild_image: true }.describe(),
+            "old agent, rebuild the image, then restart"
+        );
     }
 
     /// `PodOverview` crosses to the browser, so each agent status must
@@ -412,8 +447,9 @@ mod tests {
             None,
             Some(AgentStatus::Current { version: "1.0".into() }),
             Some(AgentStatus::RestartRecommended { version: "1.0".into() }),
-            Some(AgentStatus::RestartRequired { version: Some("2.1".into()) }),
-            Some(AgentStatus::RestartRequired { version: None }),
+            Some(AgentStatus::RestartRequired { version: Some("2.1".into()), rebuild_image: false }),
+            Some(AgentStatus::RestartRequired { version: None, rebuild_image: false }),
+            Some(AgentStatus::RestartRequired { version: None, rebuild_image: true }),
         ] {
             let overview = PodOverview {
                 pod_id: 7,

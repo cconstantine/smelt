@@ -27,9 +27,14 @@ done
 dir=$PWD/target/test-check-scripts
 mkdir -p "$dir/bin"
 
-# dx serve: runs until stopped, like the real one.
+# dx serve: runs until stopped, like the real one. It first records the
+# log settings it was started with (the server it runs inherits them) and
+# writes a line of its own to the log.
 cat >"$dir/bin/dx" <<'EOF'
 #!/usr/bin/env bash
+echo "stub dx started as $$"
+printf 'RUST_LOG=%s\nNO_COLOR=%s\n' "${RUST_LOG-<unset>}" "${NO_COLOR-<unset>}" >"$DX_ENV.tmp"
+mv "$DX_ENV.tmp" "$DX_ENV"
 exec sleep 600
 EOF
 # sqlx: records each call, one per line.
@@ -55,12 +60,18 @@ worktree=$dir/worktree
 [ -d "$worktree/.git" ] || git clone -q --shared --no-checkout "$PWD" "$worktree" || exit 1
 
 export SQLX_CALLS=$dir/sqlx-calls
+export DX_ENV=$dir/dx-env
 pid_file=$worktree/.check-server.pid
 scratch_file=$worktree/.check-server.scratch-db
+log_file=$worktree/.check-server.log
+# Extra VAR=VALUE settings for check_server's environment, set per case.
+extra_env=()
+# The caller's own RUST_LOG and NO_COLOR are dropped, so they can't change
+# the results.
 check_server() {
-    env -u SANDBOX_IMAGE PATH="$dir/bin:$PATH" CHECK_WORKTREE="$worktree" \
+    env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR PATH="$dir/bin:$PATH" CHECK_WORKTREE="$worktree" \
         SANDBOX_IMAGE_IMPORT="$dir/bin/import" DATABASE_URL=postgres://u@localhost/smelt_dev \
-        scripts/check-server "$@" 2>&1
+        "${extra_env[@]}" scripts/check-server "$@" 2>&1
 }
 scratch_url=postgres://u@localhost/smelt_scratch_worktree
 
@@ -83,7 +94,7 @@ grep -q "$old_ref" <<<"$out" || fail "the refusal doesn't name the ref: $out"
 [ -s "$SQLX_CALLS" ] && fail "a refused start called sqlx: $(cat "$SQLX_CALLS")"
 [ -s "$pid_file" ] && fail "a refused start wrote a pid file: '$(cat "$pid_file")'"
 [ -s "$scratch_file" ] && fail "a refused start wrote a scratch file: '$(cat "$scratch_file")'"
-[ "$(check_server status)" = "not running" ] || fail "status after a refused start: $(check_server status)"
+case "$(check_server status)" in "not running"*) ;; *) false ;; esac || fail "status after a refused start: $(check_server status)"
 
 # The same for a commit of SME-115's own branch that has the instance
 # migration but not yet the fix (its sweep isn't scoped yet).
@@ -140,7 +151,7 @@ for file in "$pid_file" "$scratch_file"; do
         fail "after stop, $(basename "$file") holds '$(cat "$file")'"
     fi
 done
-[ "$(check_server status)" = "not running" ] || fail "status after stop: $(check_server status)"
+case "$(check_server status)" in "not running"*) ;; *) false ;; esac || fail "status after stop: $(check_server status)"
 
 # stop again: nothing running, nothing to drop.
 : >"$SQLX_CALLS"
@@ -154,7 +165,7 @@ grep -q "no check server running" <<<"$out" || fail "a second stop said: $out"
 dead=$(bash -c 'echo $$')
 echo "$dead" >"$pid_file"
 echo "$scratch_url" >"$scratch_file"
-[ "$(check_server status)" = "not running" ] || fail "status with a dead pid: $(check_server status)"
+case "$(check_server status)" in "not running"*) ;; *) false ;; esac || fail "status with a dead pid: $(check_server status)"
 : >"$SQLX_CALLS"
 check_server stop >/dev/null
 grep -qx "database drop -y --database-url $scratch_url" "$SQLX_CALLS" || fail "stop after a crash didn't drop the scratch database: $(cat "$SQLX_CALLS")"
@@ -164,6 +175,92 @@ if ! out=$(check_server start HEAD); then
     fail "start over a dead pid: $out"
 fi
 check_server stop >/dev/null
+
+# The log level and colour the server gets (SME-117). Each case starts a
+# check server with extra_env and the given start arguments, then compares
+# what the stub dx recorded, and the level start printed, with what's
+# expected; then stops it. An empty value counts as unset everywhere, since
+# smelt reads an empty RUST_LOG as errors only.
+dx_env_after_start() {
+    for _ in $(seq 1 50); do
+        [ -s "$DX_ENV" ] && break
+        sleep 0.1
+    done
+    cat "$DX_ENV" 2>/dev/null
+}
+expect_log_settings() { # name rust_log no_color printed [start args...]
+    local name=$1 rust_log=$2 no_color=$3 printed=$4 out got
+    shift 4
+    : >"$DX_ENV"
+    if ! out=$(check_server start HEAD "$@"); then
+        fail "$name: start: $out"
+    fi
+    got=$(dx_env_after_start)
+    [ "$got" = "$(printf 'RUST_LOG=%s\nNO_COLOR=%s' "$rust_log" "$no_color")" ] ||
+        fail "$name: the server got: $(tr '\n' ' ' <<<"$got")"
+    grep -qF "RUST_LOG=$rust_log ($printed)" <<<"$out" || fail "$name: start printed: $out"
+    check_server stop >/dev/null
+    extra_env=()
+}
+env_file=$worktree/.env
+: >"$env_file"
+expect_log_settings "no level anywhere" info 1 "check-server's default"
+extra_env=(RUST_LOG=debug)
+expect_log_settings "a level in the environment" debug 1 yours
+extra_env=(RUST_LOG=)
+expect_log_settings "an empty level in the environment" info 1 "check-server's default"
+echo "RUST_LOG=warn" >"$env_file"
+expect_log_settings "a level in .env" warn 1 "from .env"
+# Written the ways dotenvy also reads: spaces around =, a comment after.
+echo "RUST_LOG = warn" >"$env_file"
+expect_log_settings "a level in .env with spaces around =" warn 1 "from .env"
+echo "RUST_LOG=warn # quieter" >"$env_file"
+expect_log_settings "a level in .env with a comment after it" warn 1 "from .env"
+echo 'RUST_LOG="warn # not a comment"' >"$env_file"
+expect_log_settings "a quoted level in .env keeps its #" "warn # not a comment" 1 "from .env"
+# An empty value with a comment after it is empty to dotenvy, so the
+# default applies (SME-117 review 2).
+echo "RUST_LOG= # debug when needed" >"$env_file"
+expect_log_settings "an empty level in .env with a comment" info 1 "check-server's default"
+# dotenvy keeps the first line that sets a name (SME-117 review 2).
+printf 'RUST_LOG=debug\nRUST_LOG=warn\n' >"$env_file"
+expect_log_settings "a level set twice in .env" debug 1 "from .env"
+# dotenvy never overrides a variable that's set, even to "", so an empty
+# one in the environment would hide .env's from smelt.
+echo "RUST_LOG=warn" >"$env_file"
+extra_env=(RUST_LOG=)
+expect_log_settings "a level in .env under an empty one in the environment" warn 1 "from .env"
+: >"$env_file"
+extra_env=(RUST_LOG=debug)
+expect_log_settings "an override over the environment" trace 1 yours -- RUST_LOG=trace
+extra_env=(RUST_LOG=debug)
+expect_log_settings "an empty override" debug 1 yours -- RUST_LOG=
+expect_log_settings "an empty override and nothing else" info 1 "check-server's default" -- RUST_LOG=
+extra_env=(NO_COLOR=yes)
+expect_log_settings "NO_COLOR in the environment" info yes "check-server's default"
+expect_log_settings "NO_COLOR as an override" info no "check-server's default" -- NO_COLOR=no
+: >"$env_file"
+
+# A second start keeps the first run's log as .check-server.log.prev, and
+# stop and status name the log.
+: >"$DX_ENV"
+check_server start HEAD >/dev/null || fail "first start for the log"
+dx_env_after_start >/dev/null
+first_log=$(cat "$log_file")
+grep -q "stub dx started" <<<"$first_log" || fail "the first run's log holds: $first_log"
+out=$(check_server status)
+grep -qF "$log_file" <<<"$out" || fail "status doesn't name the log: $out"
+out=$(check_server stop)
+grep -qF "$log_file" <<<"$out" || fail "stop doesn't name the log: $out"
+: >"$DX_ENV"
+check_server start HEAD >/dev/null || fail "second start for the log"
+dx_env_after_start >/dev/null
+[ "$(cat "$log_file.prev" 2>/dev/null)" = "$first_log" ] ||
+    fail "after a second start, .check-server.log.prev holds: $(cat "$log_file.prev" 2>/dev/null)"
+[ "$(cat "$log_file")" != "$first_log" ] || fail "the second start didn't empty the log"
+check_server stop >/dev/null
+out=$(check_server status)
+grep -qF "$log_file" <<<"$out" || fail "status when stopped doesn't name the log: $out"
 
 if [ "$failures" -gt 0 ]; then
     echo "$failures failure(s)"

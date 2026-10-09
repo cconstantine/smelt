@@ -51,7 +51,7 @@ smelt is one server binary plus a web bundle. It needs Postgres, a single-node k
 docker compose up -d
 docker compose exec smelt bash
 # inside the container:
-scripts/build-sandbox-image.sh --latest
+scripts/build-sandbox-image.sh
 scripts/browser-check/setup.sh
 dx serve --fullstack --addr 0.0.0.0 --port 8080
 ```
