@@ -793,6 +793,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "conversation_rows_by_keyboard", 60, Box::pin(scenario_conversation_rows_by_keyboard(&t))).await;
     run_scenario(&t, only, r, k, "markdown_bare_urls", 60, Box::pin(scenario_markdown_bare_urls(&t))).await;
     run_scenario(&t, only, r, k, "markdown_bare_urls_streaming", 60, Box::pin(scenario_markdown_bare_urls_streaming(&t))).await;
+    run_scenario(&t, only, r, k, "markdown_link_bidi_isolated", 60, Box::pin(scenario_markdown_link_bidi_isolated(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -5229,4 +5230,38 @@ async fn scenario_markdown_bare_urls_streaming(t: &Scenario<'_>) {
         .into_value()
         .expect("html");
     assert_eq!(saved_html, streamed, "the reply changed when it was saved");
+}
+
+/// SME-104 review 2: a bidi control in the text before a link doesn't
+/// reverse how the link shows. An RLO (U+202E) left open in a reply
+/// reordered a following bare link `https://evil.com/moc.knab//:sptth`
+/// to read `https://bank.com/moc.live//:sptth`. The link's first character
+/// must show to the left of its last.
+async fn scenario_markdown_link_bidi_isolated(t: &Scenario<'_>) {
+    let conversation = t.conversation().await;
+    let reply = "Go to \u{202E}https://evil.com/moc.knab//:sptth now, or [this](https://evil.com/x) one.\n";
+    db::create_message(t.pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: reply.into() }])
+        .await
+        .expect("seed the reply");
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    wait_for_element(&page, ".message-assistant .markdown a", Duration::from_secs(10)).await;
+    // For each link: its words, and the on-screen x of its first and last
+    // characters.
+    let order: Vec<(String, f64, f64)> = page
+        .evaluate(
+            "Array.from(document.querySelectorAll('.message-assistant .markdown a')).map(a => { \
+               const node = a.firstChild.nodeType === 3 ? a.firstChild : a.firstChild.firstChild; \
+               const at = i => { const r = document.createRange(); r.setStart(node, i); r.setEnd(node, i + 1); \
+                 return r.getBoundingClientRect().left; }; \
+               return [a.innerText, at(0), at(node.length - 1)]; })",
+        )
+        .await
+        .expect("measure the links")
+        .into_value()
+        .expect("links");
+    assert_eq!(order.len(), 2, "two links: {order:?}");
+    for (words, first, last) in &order {
+        assert!(first < last, "{words:?} shows reversed: its first character is at x={first}, its last at x={last}");
+    }
 }
