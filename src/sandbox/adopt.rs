@@ -80,6 +80,9 @@ pub(super) async fn adopt_unlabelled_objects_with(client: &kube::Client, pool: &
         }
     };
     if !instance.owns_unlabelled {
+        // Every scratch database: said once, so a check server's log shows
+        // adoption ran and touched nothing (SME-117).
+        tracing::info!(instance = %instance.id, "this database owns no objects from before SME-115; nothing to adopt");
         return;
     }
     let conversations = match db::list_conversations(pool).await {
@@ -98,11 +101,14 @@ pub(super) async fn adopt_unlabelled_objects_with(client: &kube::Client, pool: &
     };
     let unlabelled = ListParams::default().labels(&format!("!{INSTANCE_LABEL}"));
     let decide = |meta: &ObjectMeta| should_adopt(meta, &instance, &conversations, &volumes);
+    // What it did, for the summary at the end (SME-117).
+    let mut tally = AdoptionTally::default();
 
     match pvc_api(client).list(&unlabelled).await {
         Ok(claims) => {
             for claim in claims {
-                adopt_if(&pvc_api(client), claim, &instance.id, decide).await;
+                let uid = claim.metadata.uid.clone();
+                tally.count(uid, adopt_if(&pvc_api(client), claim, &instance.id, decide).await);
             }
         }
         Err(e) => tracing::warn!(error = %e, "couldn't list unlabelled claims to adopt"),
@@ -121,7 +127,8 @@ pub(super) async fn adopt_unlabelled_objects_with(client: &kube::Client, pool: &
         pod.metadata.labels.as_ref().is_some_and(|l| l.contains_key(crate::lsp::pods::LSP_POD_LABEL))
     });
     for pod in others {
-        adopt_if(&pods, pod, &instance.id, decide).await;
+        let uid = pod.metadata.uid.clone();
+        tally.count(uid, adopt_if(&pods, pod, &instance.id, decide).await);
     }
     let ours = ListParams::default().labels(&format!("{CONVERSATION_LABEL},{INSTANCE_LABEL}={}", instance.id));
     let sandbox_pods = match pods.list(&ours).await {
@@ -132,7 +139,8 @@ pub(super) async fn adopt_unlabelled_objects_with(client: &kube::Client, pool: &
         }
     };
     for server in servers {
-        adopt_if(&pods, server, &instance.id, |meta| should_adopt_server(meta, &instance, &sandbox_pods)).await;
+        let uid = server.metadata.uid.clone();
+        tally.count(uid, adopt_if(&pods, server, &instance.id, |meta| should_adopt_server(meta, &instance, &sandbox_pods)).await);
     }
     // A pod from before SME-33 has no conversation label; its live record
     // names it (SME-115 review 2).
@@ -140,16 +148,53 @@ pub(super) async fn adopt_unlabelled_objects_with(client: &kube::Client, pool: &
         Ok(rows) => {
             for row in rows {
                 match pods.get_opt(&pod_name(row.pod_id)).await {
-                    Ok(Some(pod)) if ownership(&pod.metadata, &instance.id) == Ownership::Unlabelled => {
+                    Ok(Some(pod)) if ownership(&pod.metadata, &instance.id) == Ownership::Unlabelled => tally.count(
+                        pod.metadata.uid.clone(),
                         adopt_if(&pods, pod, &instance.id, |meta| should_adopt_record_pod(meta, &instance, row.conversation_id))
-                            .await
-                    }
+                            .await,
+                    ),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(pod_id = row.pod_id, error = %e, "couldn't read a live record's pod to adopt"),
                 }
             }
         }
         Err(e) => tracing::warn!(error = %e, "couldn't list live pod records to adopt their pods"),
+    }
+    // Last, so its absence says adoption didn't finish.
+    tracing::info!(
+        instance = %instance.id,
+        adopted = tally.adopted(),
+        left = tally.left(),
+        "adopted objects made before SME-115"
+    );
+}
+
+/// How many objects startup's adoption labelled, and how many it left
+/// unlabelled (not this database's, or a patch that failed). Counted by
+/// uid: a pod from before SME-33 is left by the conversation-label pass
+/// and adopted by the record pass, and is one adopted object (SME-117
+/// review 1).
+#[derive(Default)]
+struct AdoptionTally {
+    seen: std::collections::HashSet<String>,
+    adopted: std::collections::HashSet<String>,
+}
+
+impl AdoptionTally {
+    fn count(&mut self, uid: Option<String>, adopted: bool) {
+        let Some(uid) = uid else { return };
+        if adopted {
+            self.adopted.insert(uid.clone());
+        }
+        self.seen.insert(uid);
+    }
+
+    fn adopted(&self) -> usize {
+        self.adopted.len()
+    }
+
+    fn left(&self) -> usize {
+        self.seen.len() - self.adopted.len()
     }
 }
 
@@ -171,45 +216,49 @@ pub(super) fn adoption_patch(meta: &ObjectMeta, instance: &str) -> serde_json::V
 /// Labels `object` with `instance` if `decide` says so; otherwise leaves
 /// it, logged. The patch is held to the object's uid (`adoption_patch`):
 /// one replaced since it was listed fails it, and is read again and
-/// decided again, once.
-async fn adopt_if<K>(api: &Api<K>, object: K, instance: &str, decide: impl Fn(&ObjectMeta) -> bool)
+/// decided again, once. True when it labelled it.
+async fn adopt_if<K>(api: &Api<K>, object: K, instance: &str, decide: impl Fn(&ObjectMeta) -> bool) -> bool
 where
     K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
 {
     let mut object = object;
     for attempt in 0..2 {
         let meta = object.meta();
-        let Some(name) = meta.name.clone() else { return };
-        if meta.uid.is_none() {
+        let Some(name) = meta.name.clone() else { return false };
+        let Some(uid) = meta.uid.as_deref() else {
             tracing::warn!(object = %name, "an object with no uid; not adopted");
-            return;
-        }
+            return false;
+        };
         if !decide(meta) {
             if attempt == 0 {
-                tracing::info!(object = %name, "left an object with no smelt/instance label: not this database's to adopt");
+                tracing::info!(object = %name, %uid, "left an object with no smelt/instance label: not this database's to adopt");
             }
-            return;
+            return false;
         }
         let patch = adoption_patch(meta, instance);
+        // Read from the patch, which the call holds anyway: nothing more
+        // is kept across its await (SME-115's future sizes).
+        let patch_uid = |patch: &serde_json::Value| patch["metadata"]["uid"].as_str().unwrap_or_default().to_string();
         match api.patch(&name, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&patch)).await {
             Ok(_) => {
-                tracing::info!(object = %name, "adopted an object made before SME-115");
-                return;
+                tracing::info!(object = %name, uid = %patch_uid(&patch), "adopted an object made before SME-115");
+                return true;
             }
             Err(kube::Error::Api(e)) if (e.code == 409 || e.code == 422) && attempt == 0 => match api.get_opt(&name).await {
                 Ok(Some(fresh)) => object = fresh,
-                Ok(None) => return,
+                Ok(None) => return false,
                 Err(e) => {
                     tracing::warn!(object = %name, error = %e, "couldn't re-read an object to adopt");
-                    return;
+                    return false;
                 }
             },
             Err(e) => {
-                tracing::warn!(object = %name, error = %e, "couldn't adopt an object made before SME-115; retried at the next start");
-                return;
+                tracing::warn!(object = %name, uid = %patch_uid(&patch), error = %e, "couldn't adopt an object made before SME-115; retried at the next start");
+                return false;
             }
         }
     }
+    false
 }
 
 /// Adopts one unlabelled object `decide` approves, for a bind point that
@@ -252,7 +301,7 @@ pub(super) async fn adopt_conversation_objects(
     for &pod_id in pod_ids {
         match pods.get_opt(&pod_name(pod_id)).await {
             Ok(Some(pod)) if ownership(&pod.metadata, &instance.id) == Ownership::Unlabelled => {
-                adopt_if(&pods, pod, &instance.id, |meta| should_adopt_record_pod(meta, instance, conversation_id)).await
+                adopt_if(&pods, pod, &instance.id, |meta| should_adopt_record_pod(meta, instance, conversation_id)).await;
             }
             Ok(_) => {}
             Err(e) => tracing::warn!(pod_id, error = %e, "couldn't read a record's pod to adopt"),
@@ -262,7 +311,7 @@ pub(super) async fn adopt_conversation_objects(
     for name in [docker_pvc_name(conversation_id), workspace_pvc_name(conversation_id)] {
         match pvcs.get_opt(&name).await {
             Ok(Some(claim)) if ownership(&claim.metadata, &instance.id) == Ownership::Unlabelled => {
-                adopt_if(&pvcs, claim, &instance.id, decide).await
+                adopt_if(&pvcs, claim, &instance.id, decide).await;
             }
             Ok(_) => {}
             Err(e) => tracing::warn!(claim = %name, error = %e, "couldn't read a conversation's claim to adopt"),
@@ -314,5 +363,53 @@ pub(super) async fn adopt_record_pod(
         RecordPodAdoption::Adopted
     } else {
         RecordPodAdoption::Failed
+    }
+}
+
+/// What adoption logs at info (SME-117): every scratch database owns no
+/// objects from before SME-115, and its log says so rather than nothing.
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use crate::sandbox::claims::log_tests::{line_with, logged};
+    use crate::sandbox::tests::test_client;
+
+    /// One object left by one pass and adopted by a later one (a pod from
+    /// before SME-33 that its live record names) counts once, as adopted
+    /// (SME-117 review 1).
+    #[test]
+    fn test_the_tally_counts_objects_not_decisions() {
+        let mut tally = AdoptionTally::default();
+        tally.count(Some("uid-a".to_string()), false);
+        tally.count(Some("uid-a".to_string()), true);
+        tally.count(Some("uid-b".to_string()), false);
+        assert_eq!((tally.adopted(), tally.left()), (1, 1));
+    }
+
+    #[sqlx::test]
+    async fn test_adoption_on_a_fresh_database_says_there_is_nothing_to_adopt(pool: PgPool) {
+        let client = test_client().await;
+        let instance = db::smelt_instance(&pool).await.expect("instance").id;
+        let ((), log) = logged(adopt_unlabelled_objects_with(&client, &pool)).await;
+        assert!(
+            line_with(&log, &["nothing to adopt", &format!("instance={instance}")]).is_some(),
+            "adoption on a fresh database logged: {log}"
+        );
+    }
+
+    /// The owning database's adoption ends with a summary. With no
+    /// conversations, volumes or pod records nothing here is its to adopt,
+    /// so it changes nothing in the shared namespace.
+    #[sqlx::test]
+    async fn test_adoption_by_the_owning_database_logs_a_summary(pool: PgPool) {
+        let client = test_client().await;
+        sqlx::query("UPDATE smelt_instance SET owns_unlabelled = true").execute(&pool).await.expect("an owning database");
+        let instance = db::smelt_instance(&pool).await.expect("instance").id;
+        let ((), log) = logged(adopt_unlabelled_objects_with(&client, &pool)).await;
+        assert!(
+            line_with(&log, &["adopted objects made before SME-115", &format!("instance={instance}"), "adopted=0", "left="])
+                .is_some(),
+            "the owning database's adoption logged: {log}"
+        );
     }
 }

@@ -688,7 +688,12 @@ async fn delete_terminated_pod(pool: &PgPool, client: &kube::Client, pod_id: i64
                 ..pod_delete_params()
             };
             match pods.delete(&name, &params).await {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    // The record of what this server deleted (SME-117).
+                    let uid = params.preconditions.as_ref().and_then(|p| p.uid.as_deref()).unwrap_or_default();
+                    tracing::info!(pod = %name, %uid, "deleted pod");
+                    Ok(())
+                }
                 // Gone, or replaced since it was read: not ours to delete.
                 Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => Ok(()),
                 Err(e) => Err(e.into()),
@@ -894,7 +899,12 @@ pub(super) async fn delete_volume_claim(
                 ..Default::default()
             };
             match pvcs.delete(&name, &params).await {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    // The record of what this server deleted (SME-117).
+                    let uid = params.preconditions.as_ref().and_then(|p| p.uid.as_deref()).unwrap_or_default();
+                    tracing::info!(claim = %name, %uid, "deleted volume claim");
+                    Ok(())
+                }
                 // Gone, or replaced since it was read: not ours to delete.
                 Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => Ok(()),
                 Err(e) => Err(e.into()),
@@ -961,6 +971,9 @@ pub(super) async fn teardown_conversation_with(
     pod_ids: &[i64],
     instance: &db::SmeltInstance,
 ) {
+    // Before anything is deleted: the lines below are matched to it
+    // (SME-117).
+    tracing::info!(conversation_id, instance = %instance.id, ?pod_ids, "tearing down a conversation's sandbox");
     let pods = pods_api(client);
     // What startup's adoption missed is this conversation's too: adopted
     // now, by the database that owns such objects, so it goes below
@@ -996,6 +1009,11 @@ pub(super) async fn delete_listed(pods: &Api<Pod>, selector: &ListParams, conver
                 if let Some(pod_id) = watched_pod_id(&pod) {
                     deregister(pod_id);
                 }
+                // Already being deleted: nothing to do, or to log again
+                // (SME-117 review 1).
+                if pod.metadata.deletion_timestamp.is_some() {
+                    continue;
+                }
                 let (Some(name), Some(uid)) = (pod.metadata.name, pod.metadata.uid) else { continue };
                 delete_pod_if_unchanged(pods, &name, &uid).await;
             }
@@ -1011,6 +1029,9 @@ pub(super) async fn delete_pod_if_ours(pods: &Api<Pod>, name: &str, instance: &s
     // Only its ownership and uid are kept across the delete (see
     // `delete_terminated_pod`).
     let (owner, uid) = match pods.get_opt(name).await {
+        // Already being deleted (by the label pass of the same teardown,
+        // say): nothing to do, or to log again (SME-117 review 1).
+        Ok(Some(pod)) if pod.metadata.deletion_timestamp.is_some() => return,
         Ok(Some(pod)) => (ownership(&pod.metadata, instance), pod.metadata.uid),
         Ok(None) => return,
         Err(e) => {
@@ -1039,7 +1060,8 @@ pub(super) async fn delete_pod_if_unchanged(pods: &Api<Pod>, name: &str, uid: &s
         ..pod_delete_params()
     };
     match pods.delete(name, &params).await {
-        Ok(_) => {}
+        // The record of what this server deleted (SME-117).
+        Ok(_) => tracing::info!(pod = %name, %uid, "deleted pod"),
         Err(kube::Error::Api(e)) if e.code == 404 => {}
         Err(kube::Error::Api(e)) if e.code == 409 => {
             tracing::info!(pod = %name, "a pod was replaced since it was read; left alone")
