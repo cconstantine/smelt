@@ -43,7 +43,9 @@
 # cluster lock), which the server's process group holds for as long as it
 # runs: a second start on the same port waits for the first to stop. It
 # takes no cluster lock, since nothing it touches is a test run's, and the
-# server never inherits one from its caller (SME-100).
+# server never inherits one from its caller (SME-100). Two at once also
+# need a preview address each (`-- SMELT_PREVIEW_ADDR=0.0.0.0:<port>`):
+# both default to 8181, and the second then runs without previews.
 set -euo pipefail
 
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
@@ -374,7 +376,7 @@ case "${1:-}" in
         fi
         ;;
     *)
-        sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'
         exit 2
         ;;
 esac
