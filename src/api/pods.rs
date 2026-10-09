@@ -338,10 +338,17 @@ pub async fn get_live_pod_conversations() -> ServerFnResult<Vec<i64>> {
 /// and the pods view.
 #[get("/api/app-events")]
 pub async fn subscribe_app_events() -> ServerFnResult<ServerEvents<AppEvent>> {
+    Ok(app_events_response(crate::events::subscribe_app()))
+}
+
+/// The response `subscribe_app_events` sends, relaying `rx`. Takes the
+/// receiver so a test can hand it a channel of its own: the app-wide
+/// channel's count moves with every other test subscribing (SME-135).
+#[cfg(feature = "server")]
+fn app_events_response(rx: tokio::sync::broadcast::Receiver<AppEvent>) -> ServerEvents<AppEvent> {
     // `from_stream`, not `ServerEvents::new`, for the same reason as
     // `subscribe_conversation_events`: dropping the response (the tab
     // going away) drops the subscription.
-    let rx = crate::events::subscribe_app();
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
@@ -352,7 +359,7 @@ pub async fn subscribe_app_events() -> ServerFnResult<ServerEvents<AppEvent>> {
             }
         }
     });
-    Ok(ServerEvents::from_stream(stream))
+    ServerEvents::from_stream(stream)
 }
 
 #[cfg(all(test, feature = "server"))]
@@ -381,20 +388,21 @@ mod tests {
     }
 
     /// A subscription belongs to its connection: once the response is
-    /// dropped (the tab closed or reloaded), it stops listening.
+    /// dropped (the tab closed or reloaded), it stops listening. Counted
+    /// on a channel of the test's own: the app-wide one is shared with
+    /// every test running alongside (SME-135).
     #[tokio::test]
     async fn test_a_dropped_app_event_subscription_stops_listening() {
-        let before = crate::events::app_subscriber_count();
-        let subscription = subscribe_app_events().await.expect("subscribe");
+        let (sender, rx) = tokio::sync::broadcast::channel(16);
+        // Another test subscribing to app events meanwhile, as the pod
+        // lifecycle and providers tests do: it mustn't move the count.
+        let _alongside = crate::events::subscribe_app();
+        let subscription = app_events_response(rx);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(crate::events::app_subscriber_count(), before + 1);
+        assert_eq!(sender.receiver_count(), 1);
         drop(subscription);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(
-            crate::events::app_subscriber_count(),
-            before,
-            "a dropped subscription is still listening"
-        );
+        assert_eq!(sender.receiver_count(), 0, "a dropped subscription is still listening");
     }
 
     fn parse_cpu_millicores(quantity: &str) -> Option<u64> {
