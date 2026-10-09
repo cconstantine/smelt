@@ -571,17 +571,52 @@ fn test_forget_conversation_lock_drops_it() {
 /// the same stream.
 #[tokio::test]
 async fn test_a_conversation_stream_relays_pods_changed() {
-    use futures_util::StreamExt;
     let stream = conversation_event_stream(9_000_000_011);
     futures_util::pin_mut!(stream);
+    // Another test's app event first, as one running alongside can
+    // publish.
+    events::publish_app(events::AppEvent::TurnsChanged);
     events::publish_app(events::AppEvent::PodsChanged);
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
-        .await
-        .expect("PodsChanged should arrive on the conversation stream");
+    let event = next_skipping_other_app_relays(&mut stream, |e| {
+        matches!(e, events::ConversationEvent::PodsChanged {})
+    })
+    .await;
     assert!(
         matches!(event, Some(Ok(events::ConversationEvent::PodsChanged {}))),
         "got {event:?}"
     );
+}
+
+/// Whether `event` is one a conversation's stream relays from the
+/// app-wide channel, which every test running alongside can publish to.
+fn is_app_relay(event: &events::ConversationEvent) -> bool {
+    matches!(
+        event,
+        events::ConversationEvent::PodsChanged {}
+            | events::ConversationEvent::TurnsChanged {}
+            | events::ConversationEvent::QuestionsChanged {}
+            | events::ConversationEvent::ProvidersChanged {}
+    )
+}
+
+/// The stream's next item that is `wanted`, or isn't a relayed app
+/// event at all: another test's app events aren't this test's to judge
+/// (SME-135). Gives up after a second.
+async fn next_skipping_other_app_relays(
+    stream: &mut (impl futures_util::Stream<Item = Result<events::ConversationEvent, axum::BoxError>> + Unpin),
+    wanted: impl Fn(&events::ConversationEvent) -> bool,
+) -> Option<Result<events::ConversationEvent, axum::BoxError>> {
+    use futures_util::StreamExt;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match stream.next().await {
+                Some(Ok(event)) if is_app_relay(&event) && !wanted(&event) => continue,
+                other => return other,
+            }
+        }
+    })
+    .await
+    .expect("the wanted event should arrive on the conversation stream")
 }
 
 /// SME-51 B3: each delta says where it starts, measured against the
@@ -617,13 +652,16 @@ async fn test_a_stream_that_falls_behind_ends_instead_of_skipping() {
             events::ConversationEvent::ReplyDelta { text: format!("{i} "), offset: 0 },
         );
     }
+    // An app event another test can publish meanwhile (the providers
+    // tests do), which the stream relays.
+    events::publish_app(events::AppEvent::ProvidersChanged);
     let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match stream.next().await {
                 None => return true,
-                // App-wide events from tests running alongside.
-                Some(Ok(events::ConversationEvent::PodsChanged {}))
-                | Some(Ok(events::ConversationEvent::TurnsChanged {})) => continue,
+                // App-wide events, this test's own and those of tests
+                // running alongside: all four kinds the stream relays.
+                Some(Ok(event)) if is_app_relay(&event) => continue,
                 Some(_) => return false,
             }
         }
@@ -668,13 +706,16 @@ async fn test_a_running_turn_marks_its_conversation_busy() {
 
 #[tokio::test]
 async fn test_a_conversation_stream_relays_turns_changed() {
-    use futures_util::StreamExt;
     let stream = conversation_event_stream(9_000_000_042);
     futures_util::pin_mut!(stream);
+    // Another test's app event first, as one running alongside can
+    // publish (a sandbox test's pod going away, say).
+    events::publish_app(events::AppEvent::PodsChanged);
     events::publish_app(events::AppEvent::TurnsChanged);
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
-        .await
-        .expect("TurnsChanged should arrive on the conversation stream");
+    let event = next_skipping_other_app_relays(&mut stream, |e| {
+        matches!(e, events::ConversationEvent::TurnsChanged {})
+    })
+    .await;
     assert!(
         matches!(event, Some(Ok(events::ConversationEvent::TurnsChanged {}))),
         "got {event:?}"
@@ -1048,6 +1089,9 @@ async fn test_wake_conversation_second_call_is_a_noop_once_the_first_drained_eve
 #[sqlx::test]
 async fn test_a_wake_with_no_model_still_saves_the_notice(pool: PgPool) {
     let _guard = lock_turn_tests();
+    // An id no other test's database hands out: what this test hears on
+    // its conversation's channel mustn't be another test's (SME-135).
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool)
         .await
         .expect("create conversation");
@@ -1096,6 +1140,9 @@ async fn test_a_wake_with_nothing_pending_leaves_the_model_alone(pool: PgPool) {
 #[sqlx::test]
 async fn test_wake_conversation_publishes_notification_delivery_failed_on_error(pool: PgPool) {
     let _guard = lock_turn_tests();
+    // An id no other test's database hands out: what this test hears on
+    // its conversation's channel mustn't be another test's (SME-135).
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool)
         .await
         .expect("create conversation");
@@ -1844,6 +1891,9 @@ fn cut_off_reply_body(text: &str) -> String {
 async fn test_a_cut_off_reply_is_followed_by_a_notice(pool: PgPool) {
     use crate::api::chat::{ReplyLimit, cut_off_notice};
     let _guard = lock_turn_tests();
+    // An id no other test's database hands out: what this test hears on
+    // its conversation's channel mustn't be another test's (SME-135).
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool)
         .await
         .expect("create conversation");
@@ -2362,6 +2412,9 @@ async fn test_subscribing_to_a_missing_conversation_is_refused(pool: PgPool) {
     assert!(open_conversation_events(&pool, missing).await.is_err());
     assert!(!events::has_channel(missing), "a refused subscription leaves no channel");
 
+    // An id no other test's database hands out: what this test hears on
+    // its conversation's channel mustn't be another test's (SME-135).
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let stream = open_conversation_events(&pool, conversation.id).await;
     assert!(stream.is_ok(), "an existing conversation's events open");
@@ -3187,6 +3240,9 @@ async fn test_a_turn_error_is_still_there_after_a_reload(pool: PgPool) {
     start_turn(pool.clone(), conversation.id, "again".to_string()).await.expect("send");
     assert_eq!(last_turn_error(conversation.id), None, "the next message clears it");
     stop_turn_now(conversation.id);
+    // The stop pauses the conversation for the rest of the process; a
+    // later test on this id would find its wakes starting no turn.
+    resume_turns(conversation.id);
 }
 
 /// SME-51 code review 1: a turn the user didn't send (a finished
@@ -3226,7 +3282,10 @@ async fn next_turn_error(
 #[sqlx::test]
 async fn test_stopping_a_woken_turn_is_not_reported_as_a_failure(pool: PgPool) {
     let _guard = lock_turn_tests();
-    let conversation = db::create_conversation_with_id(&pool, 9_100_000_014)
+    // Not `test_a_turn_error_is_still_there_after_a_reload`'s id: that
+    // test's stop leaves its conversation paused for the rest of the
+    // process, and a wake there starts no turn (SME-135).
+    let conversation = db::create_conversation_with_id(&pool, 9_135_000_014)
         .await
         .expect("create conversation");
     unnotified_finished_command(&pool, conversation.id, "cmd-woken").await;
@@ -3237,7 +3296,21 @@ async fn test_stopping_a_woken_turn_is_not_reported_as_a_failure(pool: PgPool) {
         let pool = pool.clone();
         async move { wake_conversation(&pool, conversation.id).await }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Stop once the turn has started, not after a fixed wait: a stop
+    // landing before the wake checks for a pause leaves nothing to stop,
+    // and a wake that never started a turn (its conversation left paused
+    // by another test's stop, say) would pass the check below untested.
+    let started = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let events::ConversationEvent::TurnState { running: true } =
+                rx.recv().await.expect("event channel should not close")
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(started.is_ok(), "the wake should have started a turn");
     stop_turn_now(conversation.id);
     let _ = wake.await;
 
@@ -3246,6 +3319,8 @@ async fn test_stopping_a_woken_turn_is_not_reported_as_a_failure(pool: PgPool) {
         .into_iter()
         .any(|e| matches!(e, events::ConversationEvent::NotificationDeliveryFailed { .. }));
     assert!(!reported, "a stop isn't a failed notification");
+    // As above: don't leave the conversation paused for later tests.
+    resume_turns(conversation.id);
 }
 
 /// Every tab sees each message as it's saved: the user's own first,
@@ -3512,6 +3587,9 @@ async fn test_a_compaction_forgets_the_usage_that_triggered_it(pool: PgPool) {
 #[sqlx::test]
 async fn test_run_turn_compacts_before_sending_when_usage_is_near_the_ceiling(pool: PgPool) {
     let _guard = lock_turn_tests();
+    // An id no other test's database hands out: what this test hears on
+    // its conversation's channel mustn't be another test's (SME-135).
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
     let conversation = db::create_conversation(&pool)
         .await
         .expect("create conversation");
