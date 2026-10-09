@@ -245,6 +245,8 @@ A name filter matches every test whose path contains it, and several filters are
 git worktree add --detach ~/smelt-worktrees/gate-<ticket> <commit>
 cd ~/smelt-worktrees/gate-<ticket>
 scripts/check.sh > <scratchpad>/sme-N/gate-<commit>.log 2>&1; rc=$?   # act on rc, not on the log; it locks only its test run
+# a commit without scripts/with-cluster-lock (before SME-100) takes no lock: build first, then
+# flock "$(git rev-parse --git-common-dir)/smelt-cluster.lock" scripts/check.sh > … ; rc=$?
 git checkout --detach <next commit>   # the next gate, once this one is back
 ```
 
