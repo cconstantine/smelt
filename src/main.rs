@@ -289,6 +289,42 @@ mod request_guard_tests {
     }
 }
 
+/// SME-137 review 1: the request guard's refusal line is exported with the
+/// request's span, so it names the path, never the query string.
+#[cfg(all(test, feature = "server"))]
+mod request_span_tests {
+    #[tokio::test]
+    async fn test_a_refused_requests_exported_span_has_no_query() {
+        let public = std::env::temp_dir().join("smelt-request-guard-public");
+        std::fs::create_dir_all(&public).expect("public dir");
+        // SAFETY: only the browser tier sets this too, and it runs apart.
+        unsafe { std::env::set_var("DIOXUS_PUBLIC_PATH", &public) };
+        let (status, spans) = crate::telemetry::capture_spans(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move { axum::serve(listener, super::build_router()).await.ok() });
+            let response = reqwest::Client::new()
+                .post(format!("http://{addr}/api/conversations?code=SECRET-CODE&state=S"))
+                .header("sec-fetch-site", "cross-site")
+                .header("origin", "https://evil.example")
+                .send()
+                .await
+                .expect("a response");
+            // The span ends at the response, then exports.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            response.status()
+        })
+        .await;
+        assert_eq!(status, 403);
+        let span = spans.iter().find(|span| span.name == "POST /api/conversations").expect("the request's span");
+        assert!(
+            span.events.iter().any(|event| event.name == "refused a request"),
+            "the refusal is on the span: {span:?}"
+        );
+        assert!(!format!("{spans:?}").contains("SECRET-CODE"), "{spans:?}");
+    }
+}
+
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::log_filter_directives;
