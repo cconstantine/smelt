@@ -112,17 +112,31 @@ fn apis(client: &kube::Client) -> Result<(Api<Pod>, Api<PersistentVolumeClaim>),
     Ok((Api::namespaced(client.clone(), SWEEP_NAMESPACE), Api::namespaced(client.clone(), SWEEP_NAMESPACE)))
 }
 
-/// Lists the namespace's pods and claims (only those matching `selector`,
-/// when given), and deletes those `choose` picks. Pods go first, so a
-/// claim only they mounted can go once they've stopped.
+/// Lists the namespace's claims and then its pods (only those matching
+/// `selector`, when given), and deletes those `choose` picks: pods first,
+/// so a claim only they mounted can go once they've stopped.
 async fn sweep(client: &kube::Client, max_age: Duration, selector: Option<&str>) -> Result<Swept, String> {
+    sweep_with(client, max_age, selector, async {}).await
+}
+
+/// `sweep`, running `between_lists` between its two listings: a test's way
+/// to make an object in that window.
+async fn sweep_with(
+    client: &kube::Client,
+    max_age: Duration,
+    selector: Option<&str>,
+    between_lists: impl std::future::Future<Output = ()>,
+) -> Result<Swept, String> {
     let (pods, claims) = apis(client)?;
     let mut params = ListParams::default();
     if let Some(selector) = selector {
         params = params.labels(selector);
     }
-    let listed_pods = pods.list(&params).await.map_err(|e| format!("listing pods: {e}"))?.items;
+    // Claims first: a pod made after this listing that mounts one of them
+    // is then in the pod listing, and keeps it (review 1).
     let listed_claims = claims.list(&params).await.map_err(|e| format!("listing claims: {e}"))?.items;
+    between_lists.await;
+    let listed_pods = pods.list(&params).await.map_err(|e| format!("listing pods: {e}"))?.items;
     let choice = choose(&listed_pods, &listed_claims, Timestamp::now(), max_age);
     delete_chosen(client, choice).await
 }
@@ -498,6 +512,26 @@ mod tests {
         assert_eq!(left_by_old, Vec::<String>::new(), "the old objects should be deleted or deleting");
         assert_eq!(young, Ok(Swept::default()));
         assert_eq!(left_by_young, vec![format!("{young_run}-claim"), format!("{young_run}-pod")]);
+    }
+
+    /// SME-134 review 1: a pod made between the sweep's two listings,
+    /// mounting a claim the sweep lists, is seen with it: the claim isn't
+    /// deleted from under a pod the sweep doesn't know about.
+    #[tokio::test]
+    async fn test_the_sweep_sees_a_pod_made_between_its_listings() {
+        let client = crate::sandbox::tests::test_client().await;
+        let (run, selector) = scope();
+        let claim_name = format!("{run}-claim");
+        let pod_name = format!("{run}-pod");
+        create_claim(&client, &claim_name, &run).await;
+
+        let swept = sweep_with(&client, Duration::ZERO, Some(&selector), create_pod(&client, &pod_name, &run, &claim_name)).await;
+        let left = live(&client, &selector).await;
+
+        clean_up(&client, &selector).await;
+        assert_ne!(left, vec![pod_name.clone()], "the claim was deleted from under a pod the sweep didn't see");
+        assert_eq!(swept, Ok(Swept { pods: 1, claims: 1, ..Swept::default() }));
+        assert_eq!(left, Vec::<String>::new());
     }
 
     /// A claim deleted and made again under its name between the listing
