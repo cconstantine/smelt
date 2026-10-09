@@ -1055,6 +1055,17 @@ fn test_pod_start_report_reads_an_event_series() {
     assert!(scheduling < mount, "the series was last seen later, so it comes first: {report}");
 }
 
+/// SME-132 review 1: probe and CNI messages are often multi-line; the
+/// report stays on one line, each control character a space.
+#[test]
+fn test_pod_start_report_keeps_a_multi_line_message_on_one_line() {
+    let pod = report_pod(&[("Initialized", "False", 0, "", "")], serde_json::json!([]), serde_json::json!([]));
+    let events = [report_event("Warning", "Unhealthy", 3, 10, "Startup probe failed: line one\nline two\r\tend")];
+    let report = pod_start_report(&pod, Ok(&events), report_now());
+    assert!(!report.chars().any(char::is_control), "got {report:?}");
+    assert!(report.contains("Startup probe failed: line one line two  end"), "got {report:?}");
+}
+
 /// A start that succeeds after more than half its timeout is slow, and
 /// logged; one at or under half isn't (SME-132).
 #[test]

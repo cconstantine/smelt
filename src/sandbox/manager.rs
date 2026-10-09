@@ -473,8 +473,14 @@ fn describe_events(events: &[Event]) -> String {
         .take(REPORT_MAX_EVENTS)
         .map(|e| {
             let message = e.message.as_deref().unwrap_or("");
-            let mut cut: String = message.chars().take(REPORT_MAX_MESSAGE_CHARS).collect();
-            if cut.len() < message.len() {
+            // One line: probe and CNI messages are often several (SME-132
+            // review 1).
+            let mut cut: String = message
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .take(REPORT_MAX_MESSAGE_CHARS)
+                .collect();
+            if message.chars().nth(REPORT_MAX_MESSAGE_CHARS).is_some() {
                 cut.push('…');
             }
             format!("{} (×{}): {cut}", e.reason.as_deref().unwrap_or("no reason"), e.series.as_ref().and_then(|s| s.count).or(e.count).unwrap_or(1))
