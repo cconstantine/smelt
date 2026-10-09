@@ -88,7 +88,7 @@ Helper scripts: `scripts/check.sh` (the checks every commit must pass: both
 builds with no warnings, plus the server tests), `scripts/check-server`
 (`dx serve` from a separate worktree, for hands-on checks), and
 `scripts/clean-test-namespace.sh` (deletes every pod and Docker data claim in the
-`smelt-park-test` namespace at once, a live test run's too, so only when none is going;
+`smelt-park-test` namespace at once; it takes the cluster lock, so it waits for a running test run to finish;
 the tests' own harness already deletes anything there over an hour old, SME-134).
 
 Several smelt servers can share a cluster's `smelt-park` namespace (the dev

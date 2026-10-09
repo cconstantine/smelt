@@ -37,6 +37,17 @@
 # `dx serve` runs its server as a child process, so stopping only the `dx`
 # process leaves the server running (SME-51). This starts `dx` in a process
 # group of its own and stops the whole group.
+#
+# Check servers on different CHECK_PORTs can run at once. start takes a lock
+# on its port ($SMELT_LOCK_DIR/smelt-check-server-<port>.lock, next to the
+# cluster lock), which the server's process group holds for as long as it
+# runs: a second start on the same port waits for the first to stop. It
+# takes no cluster lock, since nothing it touches is a test run's, and the
+# server never inherits one from its caller (SME-100). Two at once also
+# need previews of their own (`-- SMELT_PREVIEW_ADDR=0.0.0.0:<p>
+# SMELT_PREVIEW_URL=http://{port}-{conversation}.preview.localhost:<p>`):
+# both default to 8181, so the second runs without previews and its links
+# point at the first's listener.
 set -euo pipefail
 
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
@@ -49,6 +60,8 @@ else
 fi
 worktree=${CHECK_WORKTREE:-$default_worktree}
 port=${CHECK_PORT:-8081}
+lock_dir=${SMELT_LOCK_DIR:-$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)}
+port_lock=$lock_dir/smelt-check-server-$port.lock
 # The state files are emptied, never removed, so a session can run this
 # unattended (SME-107): an empty or missing one means nothing to stop.
 # Holds the running server's process group id.
@@ -161,6 +174,20 @@ browser_check_cache() {
     return 1
 }
 
+# The directory of a process outside this one's process group with the port
+# lock open: the check server holding the port (its own group, from setsid).
+port_holder() {
+    local own fd pid
+    own=$(ps -o pgid= -p $$ | tr -d ' ')
+    for fd in $(find /proc/[0-9]*/fd -maxdepth 1 -lname "$port_lock" 2>/dev/null); do
+        pid=${fd#/proc/}
+        pid=${pid%%/*}
+        [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$own" ] && continue
+        readlink "/proc/$pid/cwd" && return 0
+    done
+    echo "another worktree"
+}
+
 running_pgid() {
     local file
     file=$(pid_file)
@@ -222,6 +249,16 @@ start() {
         ! git -C "$repo" merge-base --is-ancestor 6c9f03c "$commit" 2>/dev/null; then
         echo "CHECK_SCRATCH_DB=1 is refused for $ref ($commit): it predates SME-115's fix, so a server serving it on a scratch database deletes the dev server's sandbox claims" >&2
         exit 1
+    fi
+    # The port, after the refusals (a refused start never waits) and before
+    # anything is checked out, created or started (a waiting start has
+    # changed nothing). Descriptor 8 is handed to the server below, so its
+    # process group holds the lock while it runs; stop, a crash or a kill
+    # frees it (SME-100).
+    exec 8>>"$port_lock"
+    if ! flock -n 8; then
+        echo "waiting for port $port: a check server from $(port_holder) holds it; scripts/check-server stop there, or use another CHECK_PORT" >&2
+        flock 8
     fi
     if [ -d "$worktree" ]; then
         git -C "$worktree" checkout -q --detach "$commit"
@@ -297,6 +334,13 @@ start() {
     : >"$(log_file)"
     (
         cd "$worktree"
+        # Only the port lock goes on to the server: a descriptor inherited
+        # from the caller, such as an old outer flock's on the cluster lock,
+        # would otherwise be held for as long as the server runs (SME-100).
+        for fd in /proc/$BASHPID/fd/*; do
+            fd=${fd##*/}
+            case $fd in 0 | 1 | 2 | 8 | 255) ;; *) eval "exec $fd>&-" ;; esac
+        done
         exec setsid env "${overrides[@]}" dx serve --fullstack --addr 0.0.0.0 --port "$port" \
             >"$(log_file)" 2>&1 </dev/null
     ) &
@@ -334,7 +378,7 @@ case "${1:-}" in
         fi
         ;;
     *)
-        sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
         exit 2
         ;;
 esac

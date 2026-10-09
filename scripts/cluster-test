@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# A `cargo test` run that needs the cluster lock (SME-100): any run that
+# includes a `#[sqlx::test]` or a real-cluster test, a filtered one too.
+# Builds first, unlocked, then runs the same command under the lock
+# (scripts/with-cluster-lock), so the lock is never held while compiling:
+#
+#   scripts/cluster-test --features server -- --exact sandbox::tests::test_x
+#
+# The arguments are cargo test's own; this adds no features. The build is
+# the same command with --no-run put before the first `--` (or last when
+# there is none). A failed build exits with its status and never locks.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+build=()
+placed=""
+for arg in "$@"; do
+    if [ -z "$placed" ] && [ "$arg" = "--" ]; then
+        build+=(--no-run)
+        placed=1
+    fi
+    build+=("$arg")
+done
+[ -n "$placed" ] || build+=(--no-run)
+
+cargo test "${build[@]}" || exit
+exec scripts/with-cluster-lock cargo test "$@"
