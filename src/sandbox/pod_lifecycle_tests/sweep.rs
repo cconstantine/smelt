@@ -118,16 +118,21 @@ fn apis(client: &kube::Client) -> Result<(Api<Pod>, Api<PersistentVolumeClaim>),
 /// `selector`, when given), and deletes those `choose` picks: pods first,
 /// so a claim only they mounted can go once they've stopped.
 async fn sweep(client: &kube::Client, max_age: Duration, selector: Option<&str>) -> Result<Swept, String> {
-    sweep_with(client, max_age, selector, async {}).await
+    sweep_with(client, max_age, selector, async {}, Timestamp::now).await
 }
 
-/// `sweep`, running `between_lists` between its two listings: a test's way
-/// to make an object in that window.
+/// `sweep`, running `between_lists` between its two listings (a test's way
+/// to make an object in that window), and judging age at the moment `now`
+/// gives once the pods are listed. `sweep` passes the runner's clock; a
+/// test can pass a time read from the API server's own timestamps, which
+/// are to the second, so that its result doesn't hang on how slowly the
+/// runner goes (SME-143).
 async fn sweep_with(
     client: &kube::Client,
     max_age: Duration,
     selector: Option<&str>,
     between_lists: impl std::future::Future<Output = ()>,
+    now: impl FnOnce() -> Timestamp,
 ) -> Result<Swept, String> {
     let (pods, claims) = apis(client)?;
     let mut params = ListParams::default();
@@ -139,7 +144,7 @@ async fn sweep_with(
     let listed_claims = claims.list(&params).await.map_err(|e| format!("listing claims: {e}"))?.items;
     between_lists.await;
     let listed_pods = pods.list(&params).await.map_err(|e| format!("listing pods: {e}"))?.items;
-    let choice = choose(&listed_pods, &listed_claims, Timestamp::now(), max_age);
+    let choice = choose(&listed_pods, &listed_claims, now(), max_age);
     delete_chosen(client, choice).await
 }
 
@@ -524,8 +529,12 @@ mod tests {
             create_claim(&client, &format!("{run}-mounted"), &run).await;
             create_pod(&client, &format!("{run}-pod"), &run, &format!("{run}-mounted")).await;
 
-            // Everything is old to a zero age.
-            let old = sweep(&client, Duration::ZERO, Some(&selector)).await;
+            // Everything is old to a zero age, judged an hour from now: the
+            // API server stamps creation times by its own clock, so they'd
+            // be in the runner's future, and young, if the runner's clock
+            // were behind it (SME-143).
+            let an_hour_on = || Timestamp::now().checked_add(SignedDuration::from_hours(1)).expect("time");
+            let old = sweep_with(&client, Duration::ZERO, Some(&selector), async {}, an_hour_on).await;
             let left_by_old = live(&client, &selector).await;
 
             let (young_run, young_selector) = scope();
@@ -547,19 +556,38 @@ mod tests {
         /// young pod keeps the claim: it isn't deleted from under a pod the
         /// sweep doesn't know about. (Review 2: an old claim and a young pod,
         /// the case itself, rather than both old.)
+        ///
+        /// SME-143: age is judged at the claim's own `creationTimestamp`
+        /// plus 1 s, not the runner's clock. Creation times are cut down to
+        /// the second, so against the runner's clock the pod read as 1 s old
+        /// as soon as the next whole second passed after it was made, and a
+        /// slow runner deleted it with the claim. Both times now come from
+        /// the API server, cut down the same way: the claim is exactly 1 s
+        /// old (old, since exactly `max_age` counts), and the pod, made over
+        /// 2 s after it, is younger than the claim, so never old. The 1.1 s
+        /// wait after making the pod is a slow runner passing that second:
+        /// it made the old test fail every time, and shows this one doesn't.
         #[tokio::test]
         async fn test_the_sweep_sees_a_pod_made_between_its_listings() {
             let client = crate::sandbox::tests::test_client().await;
             let (run, selector) = scope();
             let claim_name = format!("{run}-claim");
             let pod_name = format!("{run}-pod");
-            create_claim(&client, &claim_name, &run).await;
-            // Creation times are to the second: the claim is then over a
-            // second old, and the pod made during the sweep under one.
+            let claim = create_claim(&client, &claim_name, &run).await;
+            let claim_made = claim.metadata.creation_timestamp.expect("the claim's creationTimestamp").0;
+            let judged_at = claim_made.checked_add(SignedDuration::from_secs(1)).expect("time");
+            // The pod is then made over 2 s after the claim, so its creation
+            // second is at least 2 s after the claim's: at `judged_at` it is
+            // made 1 s or more in the future, so young, however slowly the
+            // runner goes.
             tokio::time::sleep(Duration::from_secs(2)).await;
 
+            let between_lists = async {
+                create_pod(&client, &pod_name, &run, &claim_name).await;
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+            };
             let made_between =
-                sweep_with(&client, Duration::from_secs(1), Some(&selector), create_pod(&client, &pod_name, &run, &claim_name));
+                sweep_with(&client, Duration::from_secs(1), Some(&selector), between_lists, move || judged_at);
             let swept = made_between.await;
             let left = live(&client, &selector).await;
 

@@ -913,6 +913,302 @@ fn test_pod_pending_detail_is_none_for_a_running_pod() {
     assert_eq!(pod_pending_detail(&pod_with_phase("Running")), None);
 }
 
+/// When `pod_start_report`'s fixtures were "created".
+const REPORT_CREATED: &str = "2026-10-09T00:00:00Z";
+
+/// `REPORT_CREATED` plus `seconds`, as the API writes a timestamp.
+fn report_at(seconds: i64) -> String {
+    let created: k8s_openapi::jiff::Timestamp = REPORT_CREATED.parse().expect("a timestamp");
+    (created + k8s_openapi::jiff::SignedDuration::from_secs(seconds)).to_string()
+}
+
+/// "Now" for `pod_start_report`'s fixtures: 90 s after creation, when a
+/// 90 s wait gives up.
+fn report_now() -> k8s_openapi::jiff::Timestamp {
+    report_at(90).parse().expect("a timestamp")
+}
+
+/// A smelt pod's shape (init container `docker`, container `sandbox`)
+/// with the given conditions, as (type, status, seconds after creation,
+/// reason, message), and container statuses.
+fn report_pod(
+    conditions: &[(&str, &str, i64, &str, &str)],
+    init_statuses: serde_json::Value,
+    statuses: serde_json::Value,
+) -> Pod {
+    let conditions: Vec<_> = conditions
+        .iter()
+        .map(|(type_, status, at, reason, message)| {
+            let mut condition = serde_json::json!({"type": type_, "status": status, "lastTransitionTime": report_at(*at)});
+            if !reason.is_empty() {
+                condition["reason"] = serde_json::json!(reason);
+            }
+            if !message.is_empty() {
+                condition["message"] = serde_json::json!(message);
+            }
+            condition
+        })
+        .collect();
+    serde_json::from_value(serde_json::json!({
+        "metadata": {"name": "sandbox-report", "creationTimestamp": REPORT_CREATED},
+        "spec": {
+            "initContainers": [{"name": "docker"}],
+            "containers": [{"name": "sandbox"}],
+        },
+        "status": {
+            "phase": "Pending",
+            "conditions": conditions,
+            "initContainerStatuses": init_statuses,
+            "containerStatuses": statuses,
+        },
+    }))
+    .expect("a pod fixture")
+}
+
+/// An event on the fixture pod: (type, reason, count, seconds after
+/// creation it last happened, message).
+fn report_event(type_: &str, reason: &str, count: i32, at: i64, message: &str) -> k8s_openapi::api::core::v1::Event {
+    serde_json::from_value(serde_json::json!({
+        "metadata": {"name": format!("sandbox-report.{reason}.{at}")},
+        "involvedObject": {"kind": "Pod", "name": "sandbox-report"},
+        "type": type_,
+        "reason": reason,
+        "count": count,
+        "firstTimestamp": report_at(at),
+        "lastTimestamp": report_at(at),
+        "message": message,
+    }))
+    .expect("an event fixture")
+}
+
+/// The flake's stage (SME-132): a pod the kubelet can't mount volumes
+/// for. The report says the stage, for how long, that neither container
+/// exists, and the `FailedMount` warning ahead of newer `Normal` events.
+#[test]
+fn test_pod_start_report_for_a_pod_stuck_at_its_volumes() {
+    let pod = report_pod(
+        &[
+            ("PodReadyToStartContainers", "False", 2, "", ""),
+            ("Initialized", "False", 2, "ContainersNotInitialized", "containers with incomplete status: [docker]"),
+            ("Ready", "False", 2, "ContainersNotReady", "containers with unready status: [sandbox]"),
+            ("ContainersReady", "False", 2, "ContainersNotReady", "containers with unready status: [sandbox]"),
+            ("PodScheduled", "True", 0, "", ""),
+        ],
+        serde_json::json!([]),
+        serde_json::json!([]),
+    );
+    let events = [
+        report_event("Normal", "Scheduled", 1, 0, "Successfully assigned smelt-park-test/sandbox-report to node"),
+        report_event("Warning", "FailedMount", 4, 30, "MountVolume.SetUp failed for volume \"missing\" : configmap \"sme-132-missing\" not found"),
+        report_event("Normal", "TaintManagerEviction", 1, 60, "Cancelling deletion of Pod"),
+    ];
+    let report = pod_start_report(&pod, Ok(&events), report_now());
+
+    assert!(report.contains("PodReadyToStartContainers (volumes and sandbox) for 88 s"), "got {report}");
+    assert!(report.contains("pod 90 s old"), "got {report}");
+    assert!(report.contains("scheduled +0 s"), "got {report}");
+    assert!(report.contains("docker not created"), "got {report}");
+    assert!(report.contains("sandbox not created"), "got {report}");
+    assert!(report.contains("FailedMount (×4): MountVolume.SetUp failed"), "got {report}");
+    let failed_mount = report.find("FailedMount").expect("FailedMount listed");
+    let newer_normal = report.find("TaintManagerEviction").expect("the newer Normal event listed");
+    let older_normal = report.find("Scheduled (").expect("the older Normal event listed");
+    assert!(failed_mount < newer_normal, "a Warning comes before a Normal event: {report}");
+    assert!(newer_normal < older_normal, "newer Normal events come first: {report}");
+}
+
+/// A pod past its volumes, waiting on its Docker sidecar's startup probe:
+/// the timeline shows how far it got, and each container's state shows.
+#[test]
+fn test_pod_start_report_for_a_pod_waiting_on_its_sidecar() {
+    let pod = report_pod(
+        &[
+            ("PodReadyToStartContainers", "True", 1, "", ""),
+            ("Initialized", "False", 1, "ContainersNotInitialized", "containers with incomplete status: [docker]"),
+            ("Ready", "False", 1, "ContainersNotReady", "containers with unready status: [sandbox]"),
+            ("ContainersReady", "False", 1, "ContainersNotReady", "containers with unready status: [sandbox]"),
+            ("PodScheduled", "True", 0, "", ""),
+        ],
+        serde_json::json!([{"name": "docker", "image": "docker", "imageID": "", "ready": false, "restartCount": 0,
+            "started": false, "state": {"running": {"startedAt": report_at(2)}}}]),
+        serde_json::json!([{"name": "sandbox", "image": "sandbox", "imageID": "", "ready": false, "restartCount": 0,
+            "state": {"waiting": {"reason": "PodInitializing"}}}]),
+    );
+    let events = [report_event("Warning", "Unhealthy", 40, 89, "Startup probe failed: Cannot connect to the Docker daemon")];
+    let report = pod_start_report(&pod, Ok(&events), report_now());
+
+    assert!(report.contains("Initialized: ContainersNotInitialized"), "got {report}");
+    assert!(report.contains("(Docker sidecar starting) for 89 s"), "got {report}");
+    assert!(report.contains("scheduled +0 s, sandbox ready +1 s"), "got {report}");
+    assert!(report.contains("docker running, not started"), "got {report}");
+    assert!(report.contains("sandbox waiting (PodInitializing)"), "got {report}");
+    assert!(report.contains("Unhealthy (×40): Startup probe failed"), "got {report}");
+}
+
+/// A pod with no conditions yet says so, rather than nothing.
+#[test]
+fn test_pod_start_report_for_a_pod_not_scheduled_yet() {
+    let pod = report_pod(&[], serde_json::json!([]), serde_json::json!([]));
+    let report = pod_start_report(&pod, Ok(&[]), report_now());
+    assert!(report.contains("not scheduled yet"), "got {report}");
+    assert!(report.contains("pod 90 s old"), "got {report}");
+    assert!(report.contains("events: none"), "got {report}");
+}
+
+/// SME-132 review 2: a pod that reached `Running` between the last poll
+/// and the timeout's fresh read has started; the wait succeeds rather
+/// than report a timeout and have the caller delete a running pod.
+#[test]
+fn test_a_pod_running_by_the_timeouts_read_is_a_start() {
+    let mut running = report_pod(&[("Ready", "True", 30, "", "")], serde_json::json!([]), serde_json::json!([]));
+    running.status.as_mut().expect("a status").phase = Some("Running".to_string());
+    assert!(matches!(timed_out_outcome(&running, Ok(&[]), report_now()), Ok(())));
+
+    let pending = report_pod(&[("PodReadyToStartContainers", "False", 2, "", "")], serde_json::json!([]), serde_json::json!([]));
+    match timed_out_outcome(&pending, Ok(&[]), report_now()) {
+        Err(SandboxError::Timeout(Some(detail))) => assert!(detail.contains("PodReadyToStartContainers"), "got {detail}"),
+        other => panic!("expected a timeout with the report, got {other:?}"),
+    }
+}
+
+/// SME-132 review 2: a pending pod with no `False` condition says where it
+/// is rather than "no stage false": scheduled with nothing from the
+/// kubelet yet, or past every stage and not yet `Running`.
+#[test]
+fn test_pod_start_report_names_a_pending_pod_with_no_false_stage() {
+    let scheduled = report_pod(&[("PodScheduled", "True", 0, "", "")], serde_json::json!([]), serde_json::json!([]));
+    let report = pod_start_report(&scheduled, Ok(&[]), report_now());
+    assert!(report.starts_with("scheduled, nothing from the kubelet yet;"), "got {report}");
+
+    let passed = report_pod(
+        &[("PodScheduled", "True", 0, "", ""), ("PodReadyToStartContainers", "True", 1, "", ""), ("Ready", "True", 9, "", "")],
+        serde_json::json!([]),
+        serde_json::json!([]),
+    );
+    let report = pod_start_report(&passed, Ok(&[]), report_now());
+    assert!(report.starts_with("every stage passed, phase Pending;"), "got {report}");
+}
+
+/// SME-132 review 2: `char::is_control` misses the line and paragraph
+/// separators and the bidi controls, which also break the report's one
+/// line or reorder what's shown; each becomes a space too.
+#[test]
+fn test_pod_start_report_replaces_separators_and_bidi_controls() {
+    let pod = report_pod(&[("Initialized", "False", 0, "", "")], serde_json::json!([]), serde_json::json!([]));
+    let message = "a\u{2028}b\u{2029}c\u{202e}d\u{2066}e\u{200f}f";
+    let events = [report_event("Warning", "Unhealthy", 1, 10, message)];
+    let report = pod_start_report(&pod, Ok(&events), report_now());
+    assert!(report.contains("Unhealthy (×1): a b c d e f"), "got {report:?}");
+}
+
+/// At most 5 events, each message cut to 200 characters, on a char
+/// boundary.
+#[test]
+fn test_pod_start_report_caps_its_events() {
+    let pod = report_pod(&[("PodReadyToStartContainers", "False", 0, "", "")], serde_json::json!([]), serde_json::json!([]));
+    let long = "é".repeat(300);
+    let events: Vec<_> = (0..7).map(|i| report_event("Warning", &format!("Reason{i}"), 1, i, &long)).collect();
+    let report = pod_start_report(&pod, Ok(&events), report_now());
+    assert_eq!(report.matches(" (×").count(), 5, "got {report}");
+    assert!(report.contains(&"é".repeat(200)), "got {report}");
+    assert!(!report.contains(&"é".repeat(201)), "got {report}");
+}
+
+/// SME-132 review 1: "now" is smelt's clock and the pod's times are the
+/// node's, so a skewed clock can put "now" before them. The report says
+/// 0 s rather than a negative time.
+#[test]
+fn test_pod_start_report_never_shows_a_negative_time() {
+    let pod = report_pod(
+        &[("PodReadyToStartContainers", "False", 3, "", ""), ("PodScheduled", "True", 2, "", "")],
+        serde_json::json!([]),
+        serde_json::json!([]),
+    );
+    let before_creation = report_at(-5).parse().expect("a timestamp");
+    let report = pod_start_report(&pod, Ok(&[]), before_creation);
+    assert!(!report.contains('-'), "got {report}");
+    assert!(report.contains("for 0 s; pod 0 s old"), "got {report}");
+}
+
+/// SME-132 review 1: the API's times are whole seconds, so stages often
+/// tie, and the API lists conditions in another order than they happen.
+/// Tied stages come out in the order the kubelet passes them.
+#[test]
+fn test_pod_start_timeline_orders_tied_stages_as_they_happen() {
+    let pod = report_pod(
+        &[
+            ("PodReadyToStartContainers", "True", 1, "", ""),
+            ("Initialized", "True", 65, "", ""),
+            ("Ready", "True", 65, "", ""),
+            ("ContainersReady", "True", 65, "", ""),
+            ("PodScheduled", "True", 1, "", ""),
+        ],
+        serde_json::json!([]),
+        serde_json::json!([]),
+    );
+    let report = pod_start_report(&pod, Ok(&[]), report_now());
+    assert!(
+        report.contains("timeline: scheduled +1 s, sandbox ready +1 s, sidecar started +65 s, containers ready +65 s, ready +65 s;"),
+        "got {report}"
+    );
+}
+
+/// SME-132 review 1: an event recorded through `events.k8s.io` (the
+/// scheduler's) reads back through core/v1 with no `count` or
+/// `lastTimestamp`, its repeats in `series`. The report counts and orders
+/// it by the series.
+#[test]
+fn test_pod_start_report_reads_an_event_series() {
+    let pod = report_pod(&[("PodScheduled", "False", 0, "Unschedulable", "")], serde_json::json!([]), serde_json::json!([]));
+    let series: k8s_openapi::api::core::v1::Event = serde_json::from_value(serde_json::json!({
+        "metadata": {"name": "sandbox-report.series"},
+        "involvedObject": {"kind": "Pod", "name": "sandbox-report"},
+        "type": "Warning",
+        "reason": "FailedScheduling",
+        "eventTime": report_at(0).replace('Z', ".000000Z"),
+        "series": {"count": 12, "lastObservedTime": report_at(80).replace('Z', ".000000Z")},
+        "message": "0/1 nodes are available",
+    }))
+    .expect("an event fixture");
+    let newer_once = report_event("Warning", "FailedMount", 1, 40, "once");
+    let report = pod_start_report(&pod, Ok(&[newer_once, series]), report_now());
+    assert!(report.contains("FailedScheduling (×12)"), "got {report}");
+    let scheduling = report.find("FailedScheduling").expect("listed");
+    let mount = report.find("FailedMount").expect("listed");
+    assert!(scheduling < mount, "the series was last seen later, so it comes first: {report}");
+}
+
+/// SME-132 review 1: probe and CNI messages are often multi-line; the
+/// report stays on one line, each control character a space.
+#[test]
+fn test_pod_start_report_keeps_a_multi_line_message_on_one_line() {
+    let pod = report_pod(&[("Initialized", "False", 0, "", "")], serde_json::json!([]), serde_json::json!([]));
+    let events = [report_event("Warning", "Unhealthy", 3, 10, "Startup probe failed: line one\nline two\r\tend")];
+    let report = pod_start_report(&pod, Ok(&events), report_now());
+    assert!(!report.chars().any(char::is_control), "got {report:?}");
+    assert!(report.contains("Startup probe failed: line one line two  end"), "got {report:?}");
+}
+
+/// A start that succeeds after more than half its timeout is slow, and
+/// logged; one at or under half isn't (SME-132).
+#[test]
+fn test_a_start_past_half_its_timeout_is_slow() {
+    let timeout = Duration::from_secs(90);
+    assert!(is_slow_start(Duration::from_secs(46), timeout));
+    assert!(is_slow_start(Duration::from_millis(45_001), timeout));
+    assert!(!is_slow_start(Duration::from_secs(45), timeout));
+    assert!(!is_slow_start(Duration::from_secs(2), timeout));
+}
+
+/// When the events can't be listed, the rest of the report is kept.
+#[test]
+fn test_pod_start_report_keeps_the_rest_when_events_are_unavailable() {
+    let pod = report_pod(&[("PodReadyToStartContainers", "False", 2, "", "")], serde_json::json!([]), serde_json::json!([]));
+    let report = pod_start_report(&pod, Err("forbidden"), report_now());
+    assert!(report.contains("events unavailable: forbidden"), "got {report}");
+    assert!(report.contains("PodReadyToStartContainers (volumes and sandbox) for 88 s"), "got {report}");
+}
+
 #[test]
 fn test_pod_startup_failure_is_none_while_a_pod_is_still_starting() {
     assert_eq!(pod_startup_failure(&pod_waiting("ContainerCreating", "")), None);
@@ -3479,6 +3775,12 @@ async fn test_sandbox_futures_stay_small() {
         ("close_if_gone_with", std::mem::size_of_val(&watch::close_if_gone_with(&pool, &client, 1)), 4000),
         ("create_pod", std::mem::size_of_val(&create_pod(&pool, 1, PodLimitOverrides::default())), 15000),
         ("ensure_conversation_pvcs", std::mem::size_of_val(&claims::ensure_conversation_pvcs(&client, 1, &instance)), 6700),
+        // `create_pod` spawns its work, so its own size can't show what
+        // the wait for `Running` holds; these two do (SME-132 review 1).
+        // The wait's bound is tighter than twice its 2760 bytes: its
+        // timed-out report, unboxed, takes it to 4520.
+        ("create_pod_attempt", std::mem::size_of_val(&create_pod_attempt(&pool, 1, PodLimitOverrides::default())), 19000),
+        ("wait_for_running_with_timeout", std::mem::size_of_val(&wait_for_running_with_timeout(&pods_api(&client), "sandbox-1", Duration::from_secs(1))), 3600),
     ];
     for (name, size, bound) in sizes {
         println!("{name}: {size} bytes (bound {bound})");
@@ -3499,6 +3801,68 @@ fn test_a_test_manager_on_a_multi_thread_runtime_is_refused() {
     .join()
     .expect("the test thread");
     assert!(refused, "use_test_manager accepted a multi-thread runtime");
+}
+
+/// Real-cluster tests, apart from the pure ones so a filter on a pure
+/// test's path can't run them (SME-134). Each runs only by exact name,
+/// under the cluster lock.
+mod cluster {
+    use super::*;
+    use k8s_openapi::api::core::v1::ConfigMapVolumeSource;
+
+    /// The flake's stage, held on purpose (SME-132): a pod whose volume
+    /// names a ConfigMap that doesn't exist stays at
+    /// `PodReadyToStartContainers: False` with `FailedMount` events, every
+    /// time, on an idle node. A timed-out wait says so, the containers'
+    /// states and the event naming the ConfigMap included.
+    ///
+    /// Harmless if killed: a unique name, the tests' instance, no
+    /// conversation label, and `activeDeadlineSeconds`, so the kubelet
+    /// fails a leftover (`DeadlineExceeded`). It checks the deadline only
+    /// once its 2-minute wait for the mount gives up: a run killed after
+    /// the create left a pod that failed at 127 s. The sweep (SME-134)
+    /// removes the object.
+    #[tokio::test]
+    async fn test_a_pod_stuck_before_its_containers_says_what_it_waits_on() {
+        let client = test_client().await;
+        let pods = pods_api(&client);
+        let name = format!("sandbox-{}", unique_session_id("stuck-at-mount"));
+        let missing = format!("sme-132-missing-{}", uuid_like());
+        let docker = DockerSidecar { memory: "1Gi".to_string(), storage: PodStorage::Ephemeral };
+        let mut pod = build_pod_spec(&name, "1Gi", &docker, &[], TEST_INSTANCE);
+        let spec = pod.spec.as_mut().expect("a pod spec");
+        spec.active_deadline_seconds = Some(60);
+        spec.volumes.get_or_insert_with(Vec::new).push(Volume {
+            name: "missing".to_string(),
+            config_map: Some(ConfigMapVolumeSource { name: missing.clone(), ..Default::default() }),
+            ..Default::default()
+        });
+        // The kubelet mounts only the volumes a container uses.
+        spec.containers[0].volume_mounts.get_or_insert_with(Vec::new).push(VolumeMount {
+            name: "missing".to_string(),
+            mount_path: "/sme-132-missing".to_string(),
+            ..Default::default()
+        });
+        pods.create(&PostParams::default(), &pod).await.expect("create the pod");
+
+        let waited = wait_for_running_with_timeout(&pods, &name, Duration::from_secs(20)).await;
+        pods.delete(&name, &immediate_delete_params()).await.ok();
+
+        let detail = match waited {
+            Err(SandboxError::Timeout(Some(detail))) => detail,
+            other => panic!("expected a timeout with a detail, got {other:?}"),
+        };
+        println!("{detail}");
+        assert!(detail.contains("PodReadyToStartContainers"), "got {detail}");
+        assert!(detail.contains("FailedMount"), "got {detail}");
+        assert!(detail.contains(&missing), "got {detail}");
+        for container in ["docker", "sandbox"] {
+            assert!(
+                detail.contains(&format!("{container} not created")) || detail.contains(&format!("{container} waiting")),
+                "{container}'s state is missing: {detail}"
+            );
+        }
+    }
 }
 
 /// A server with no `SANDBOX_IMAGE` runs the image named after its own

@@ -72,6 +72,8 @@ previous pod to go. Test cleanup that needs nothing to stop cleanly uses
 `immediate_delete_params()` (`grace_period_seconds: Some(0)`) instead, so
 tests don't time out waiting.
 
+**To hold a pod at a start-up stage on purpose, block that stage deterministically rather than starving the node.** `sandbox::tests::cluster::test_a_pod_stuck_before_its_containers_says_what_it_waits_on` (SME-132) gives a pod a volume naming a ConfigMap that doesn't exist: the kubelet can't mount it, so the pod stays at `PodReadyToStartContainers: False` with `FailedMount` events every time, which is where SME-132's browser-tier flake timed out, and no container ever starts, so it costs the node nothing. The kubelet mounts only the volumes a container uses, so the volume needs a mount too. The pod has `activeDeadlineSeconds: 60`, so a run killed after the create leaves a pod the kubelet fails with `DeadlineExceeded`. It checks the deadline only once its 2-minute wait for the mount gives up: a killed run's pod failed at 127 s, not 60. Loading the node to reach a stage slows every other gate and the user's dev pods on the one shared node, and reaches the stage only some of the time.
+
 Three about `pods.exec`, the first two proven the hard way on `sandbox-oom` (hit once during that
 project's design spikes, then hit *again*, independently, while writing
 its final integration test — worth internalizing rather than
@@ -139,6 +141,8 @@ They don't take the turn-test lock: their conversations' ids are clear of every 
 3. `choose` drops any object whose own `metadata.namespace` isn't `smelt-park-test`.
 
 `test_the_sweep_names_only_the_test_namespace` and `test_the_sweep_never_chooses_an_object_outside_the_test_namespace` pin guards 2 and 3. The sweep's own real-cluster tests label what they make with a value of their own and sweep only that label, so even an age of zero reaches nothing of another run's.
+
+**A real-cluster test that judges an object's age compares its `creationTimestamp` with another time from the API server** (such as another object's `creationTimestamp`), never the runner's clock. Kubernetes cuts `creationTimestamp` to the whole second, so against the runner's clock an object can read as up to a second older than it is (and as younger when the runner's clock is behind the API server's). On SME-143 the sweep's made-between-listings test swept with a 1 s age limit against `Timestamp::now()`; on CI's slower runners its young pod read as old once the next whole second passed, and was deleted with its claim, in 3 of 7 runs. `sweep_with` takes the time to judge age at for this reason: that test passes its claim's `creationTimestamp` plus 1 s.
 
 **A test-side wait for something smelt bounds by an env-configurable timeout is computed from that timeout,** never a literal sized from the local default: CI raises some of them (`SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120` in `ci.yml`). Teardown's wait for a pod start is `2 * running_wait_timeout()` plus a minute for this reason; on SME-94 a literal 150 s, sized from the local default, was shorter than a start can take in CI.
 
