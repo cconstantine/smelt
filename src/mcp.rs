@@ -553,9 +553,10 @@ pub async fn tool_definitions_for(
     let attempts = configs.iter().map(|config| {
         let (pool, config) = (pool.clone(), config.clone());
         let name = config.name.clone();
-        let task = tokio::spawn(async move {
+        // In the caller's span, so its connect is the turn's child (SME-137).
+        let task = tokio::spawn(tracing::Instrument::in_current_span(async move {
             ensure_connected(&pool, &config, Attempt::SkipRecentFailures).await
-        });
+        }));
         async move {
             match tokio::time::timeout(TOOL_LIST_WAIT, task).await {
                 Ok(Ok(Ok(()))) => {}
@@ -1196,6 +1197,23 @@ mod tests {
         assert_eq!(ok_span.status, opentelemetry::trace::Status::Unset);
         assert!(matches!(refused_span.status, opentelemetry::trace::Status::Error { .. }), "{:?}", refused_span.status);
         assert!(!format!("{spans:?}").contains("SECRET-ARG"), "no arguments in a span");
+    }
+
+    /// The connects a turn's tool list starts run in the background, but
+    /// as the turn's children, not roots of their own.
+    #[tokio::test]
+    async fn test_a_tool_lists_connect_is_a_child_of_its_caller() {
+        let config = test_config(-137_003, "nowhere");
+        let (_, spans) = crate::telemetry::capture_spans(async {
+            crate::telemetry::in_span(tracing::info_span!("caller"), async {
+                tool_definitions_for(&test_pool(), std::slice::from_ref(&config)).await
+            })
+            .await
+        })
+        .await;
+        let caller = spans.iter().find(|span| span.name == "caller").expect("the caller's span");
+        let connect = spans.iter().find(|span| span.name == "mcp connect").expect("a connect span");
+        assert_eq!(connect.parent_span_id, caller.span_context.span_id());
     }
 
     #[tokio::test]
