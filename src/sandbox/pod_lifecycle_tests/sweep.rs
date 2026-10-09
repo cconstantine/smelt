@@ -434,203 +434,209 @@ mod tests {
         assert!(check_namespace("smelt-park", "smelt-park-test").is_err(), "a mismatch with the harness must be refused");
     }
 
-    // --- Against the real cluster, in `smelt-park-test`. Each test labels
-    // what it makes with a value of its own and sweeps only that label, so
-    // even `max_age` zero reaches nothing of another test's or run's.
+    /// The real-cluster tests, in a module of their own so a filter on
+    /// the pure tests' path (`sweep::tests::test_`) can't match them.
+    mod cluster {
+        use super::*;
 
-    /// A label of this test's own, and the selector that picks it.
-    /// The clock alone isn't enough: two tests in parallel once got the
-    /// same nanoseconds and made the same claim name. A counter keeps
-    /// this process's apart, and the process id other processes'.
-    fn scope() -> (String, String) {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let run = format!("{}-{}-{n}", crate::sandbox::tests::unique_session_id("sweep"), std::process::id());
-        let selector = format!("{SWEEP_TEST_LABEL}={run}");
-        (run, selector)
-    }
+        // --- Against the real cluster, in `smelt-park-test`. Each test labels
+        // what it makes with a value of its own and sweeps only that label, so
+        // even `max_age` zero reaches nothing of another test's or run's.
 
-    const SWEEP_TEST_LABEL: &str = "smelt/sweep-test";
-
-    async fn create_claim(client: &kube::Client, name: &str, run: &str) -> PersistentVolumeClaim {
-        let claim: PersistentVolumeClaim = serde_json::from_value(serde_json::json!({
-            "metadata": {"name": name, "labels": {SWEEP_TEST_LABEL: run}},
-            "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Mi"}}},
-        }))
-        .expect("claim");
-        Api::<PersistentVolumeClaim>::namespaced(client.clone(), SWEEP_NAMESPACE)
-            .create(&PostParams::default(), &claim)
-            .await
-            .expect("create claim")
-    }
-
-    /// A pod that mounts `claim` and never schedules (no node matches its
-    /// selector), so nothing is pulled, started or provisioned.
-    async fn create_pod(client: &kube::Client, name: &str, run: &str, claim: &str) {
-        let pod: Pod = serde_json::from_value(serde_json::json!({
-            "metadata": {"name": name, "labels": {SWEEP_TEST_LABEL: run}},
-            "spec": {
-                "nodeSelector": {SWEEP_TEST_LABEL: "no-such-node"},
-                "containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}],
-                "volumes": [{"name": "v", "persistentVolumeClaim": {"claimName": claim}}],
-            },
-        }))
-        .expect("pod");
-        Api::<Pod>::namespaced(client.clone(), SWEEP_NAMESPACE)
-            .create(&PostParams::default(), &pod)
-            .await
-            .expect("create pod");
-    }
-
-    /// The names of `selector`'s pods and claims not being deleted.
-    async fn live(client: &kube::Client, selector: &str) -> Vec<String> {
-        let params = ListParams::default().labels(selector);
-        let pods = Api::<Pod>::namespaced(client.clone(), SWEEP_NAMESPACE).list(&params).await.expect("list pods");
-        let claims =
-            Api::<PersistentVolumeClaim>::namespaced(client.clone(), SWEEP_NAMESPACE).list(&params).await.expect("list claims");
-        let metas = pods.items.into_iter().map(|p| p.metadata).chain(claims.items.into_iter().map(|c| c.metadata));
-        let mut names: Vec<String> = metas.filter(|m| m.deletion_timestamp.is_none()).filter_map(|m| m.name).collect();
-        names.sort();
-        names
-    }
-
-    /// Deletes everything `selector` picks (the role has no
-    /// `deletecollection`, so one by one).
-    async fn clean_up(client: &kube::Client, selector: &str) {
-        let params = ListParams::default().labels(selector);
-        let pods = Api::<Pod>::namespaced(client.clone(), SWEEP_NAMESPACE);
-        let now = DeleteParams { grace_period_seconds: Some(0), ..DeleteParams::default() };
-        for name in pods.list(&params).await.map(|l| l.items).unwrap_or_default().into_iter().filter_map(|p| p.metadata.name) {
-            pods.delete(&name, &now).await.ok();
+        /// A label of this test's own, and the selector that picks it.
+        /// The clock alone isn't enough: two tests in parallel once got the
+        /// same nanoseconds and made the same claim name. A counter keeps
+        /// this process's apart, and the process id other processes'.
+        fn scope() -> (String, String) {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let run = format!("{}-{}-{n}", crate::sandbox::tests::unique_session_id("sweep"), std::process::id());
+            let selector = format!("{SWEEP_TEST_LABEL}={run}");
+            (run, selector)
         }
-        let claims = Api::<PersistentVolumeClaim>::namespaced(client.clone(), SWEEP_NAMESPACE);
-        for name in claims.list(&params).await.map(|l| l.items).unwrap_or_default().into_iter().filter_map(|c| c.metadata.name) {
-            claims.delete(&name, &DeleteParams::default()).await.ok();
+
+        const SWEEP_TEST_LABEL: &str = "smelt/sweep-test";
+
+        async fn create_claim(client: &kube::Client, name: &str, run: &str) -> PersistentVolumeClaim {
+            let claim: PersistentVolumeClaim = serde_json::from_value(serde_json::json!({
+                "metadata": {"name": name, "labels": {SWEEP_TEST_LABEL: run}},
+                "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Mi"}}},
+            }))
+            .expect("claim");
+            Api::<PersistentVolumeClaim>::namespaced(client.clone(), SWEEP_NAMESPACE)
+                .create(&PostParams::default(), &claim)
+                .await
+                .expect("create claim")
         }
-    }
 
-    /// Old pods and claims are deleted, a claim an old pod mounts with
-    /// them; young ones, and a young claim a young pod mounts, are kept.
-    #[tokio::test]
-    async fn test_the_sweep_deletes_old_pods_and_claims_and_keeps_young_ones() {
-        let client = crate::sandbox::tests::test_client().await;
-        let (run, selector) = scope();
-        create_claim(&client, &format!("{run}-alone"), &run).await;
-        create_claim(&client, &format!("{run}-mounted"), &run).await;
-        create_pod(&client, &format!("{run}-pod"), &run, &format!("{run}-mounted")).await;
-
-        // Everything is old to a zero age.
-        let old = sweep(&client, Duration::ZERO, Some(&selector)).await;
-        let left_by_old = live(&client, &selector).await;
-
-        let (young_run, young_selector) = scope();
-        create_claim(&client, &format!("{young_run}-claim"), &young_run).await;
-        create_pod(&client, &format!("{young_run}-pod"), &young_run, &format!("{young_run}-claim")).await;
-        let young = sweep(&client, Duration::from_secs(60 * 60), Some(&young_selector)).await;
-        let left_by_young = live(&client, &young_selector).await;
-
-        clean_up(&client, &selector).await;
-        clean_up(&client, &young_selector).await;
-        assert_eq!(old, Ok(Swept { pods: 1, claims: 2, ..Swept::default() }));
-        assert_eq!(left_by_old, Vec::<String>::new(), "the old objects should be deleted or deleting");
-        assert_eq!(young, Ok(Swept::default()));
-        assert_eq!(left_by_young, vec![format!("{young_run}-claim"), format!("{young_run}-pod")]);
-    }
-
-    /// SME-134 review 1: a pod made between the sweep's two listings,
-    /// mounting an old claim the sweep lists, is seen with it, and the
-    /// young pod keeps the claim: it isn't deleted from under a pod the
-    /// sweep doesn't know about. (Review 2: an old claim and a young pod,
-    /// the case itself, rather than both old.)
-    #[tokio::test]
-    async fn test_the_sweep_sees_a_pod_made_between_its_listings() {
-        let client = crate::sandbox::tests::test_client().await;
-        let (run, selector) = scope();
-        let claim_name = format!("{run}-claim");
-        let pod_name = format!("{run}-pod");
-        create_claim(&client, &claim_name, &run).await;
-        // Creation times are to the second: the claim is then over a
-        // second old, and the pod made during the sweep under one.
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        let made_between =
-            sweep_with(&client, Duration::from_secs(1), Some(&selector), create_pod(&client, &pod_name, &run, &claim_name));
-        let swept = made_between.await;
-        let left = live(&client, &selector).await;
-
-        clean_up(&client, &selector).await;
-        assert_eq!(left, vec![claim_name, pod_name], "the claim was deleted from under a pod the sweep didn't see");
-        assert_eq!(swept, Ok(Swept { kept_claims: 1, ..Swept::default() }));
-    }
-
-    /// SME-134 review 2: a claim the sweep chose with its old pod is kept
-    /// when that pod's delete is refused, because the pod was made again
-    /// under its name since the listing and still mounts the claim.
-    #[tokio::test]
-    async fn test_the_sweep_keeps_a_claim_whose_pod_was_made_again() {
-        let client = crate::sandbox::tests::test_client().await;
-        let (run, selector) = scope();
-        let claim_name = format!("{run}-claim");
-        let pod_name = format!("{run}-pod");
-        let claim = create_claim(&client, &claim_name, &run).await;
-        create_pod(&client, &pod_name, &run, &claim_name).await;
-        let pods = Api::<Pod>::namespaced(client.clone(), SWEEP_NAMESPACE);
-        let listed_pod_uid = pods.get(&pod_name).await.expect("get pod").metadata.uid.expect("uid");
-        pods.delete(&pod_name, &DeleteParams { grace_period_seconds: Some(0), ..DeleteParams::default() })
-            .await
-            .expect("delete pod");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        while pods.get_opt(&pod_name).await.expect("get").is_some() {
-            assert!(tokio::time::Instant::now() < deadline, "the first pod wasn't gone within 30 s");
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        /// A pod that mounts `claim` and never schedules (no node matches its
+        /// selector), so nothing is pulled, started or provisioned.
+        async fn create_pod(client: &kube::Client, name: &str, run: &str, claim: &str) {
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "metadata": {"name": name, "labels": {SWEEP_TEST_LABEL: run}},
+                "spec": {
+                    "nodeSelector": {SWEEP_TEST_LABEL: "no-such-node"},
+                    "containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}],
+                    "volumes": [{"name": "v", "persistentVolumeClaim": {"claimName": claim}}],
+                },
+            }))
+            .expect("pod");
+            Api::<Pod>::namespaced(client.clone(), SWEEP_NAMESPACE)
+                .create(&PostParams::default(), &pod)
+                .await
+                .expect("create pod");
         }
-        create_pod(&client, &pod_name, &run, &claim_name).await;
 
-        let choice = Choice {
-            pods: vec![(pod_name.clone(), listed_pod_uid)],
-            claims: vec![(claim_name.clone(), claim.metadata.uid.clone().expect("uid"))],
-            mounts: vec![(pod_name.clone(), claim_name.clone())],
-            ..Choice::default()
-        };
-        let swept = delete_chosen(&client, choice).await;
-        let left = live(&client, &selector).await;
-
-        clean_up(&client, &selector).await;
-        assert_eq!(left, vec![claim_name, pod_name], "the pod made again, and the claim it mounts, should both be left");
-        assert_eq!(swept, Ok(Swept { kept_claims: 1, skipped: 1, ..Swept::default() }));
-    }
-
-    /// A claim deleted and made again under its name between the listing
-    /// and the delete has a new uid: the delete held to the listed uid is
-    /// refused and skipped, and the new claim stays. One already gone is
-    /// skipped too.
-    #[tokio::test]
-    async fn test_the_sweep_skips_an_object_recreated_under_its_name() {
-        let client = crate::sandbox::tests::test_client().await;
-        let (run, selector) = scope();
-        let name = format!("{run}-claim");
-        let claims = Api::<PersistentVolumeClaim>::namespaced(client.clone(), SWEEP_NAMESPACE);
-        let first = create_claim(&client, &name, &run).await;
-        let listed_uid = first.metadata.uid.clone().expect("uid");
-        claims.delete(&name, &DeleteParams::default()).await.expect("delete");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        while claims.get_opt(&name).await.expect("get").is_some() {
-            assert!(tokio::time::Instant::now() < deadline, "the first claim wasn't gone within 30 s");
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        /// The names of `selector`'s pods and claims not being deleted.
+        async fn live(client: &kube::Client, selector: &str) -> Vec<String> {
+            let params = ListParams::default().labels(selector);
+            let pods = Api::<Pod>::namespaced(client.clone(), SWEEP_NAMESPACE).list(&params).await.expect("list pods");
+            let claims =
+                Api::<PersistentVolumeClaim>::namespaced(client.clone(), SWEEP_NAMESPACE).list(&params).await.expect("list claims");
+            let metas = pods.items.into_iter().map(|p| p.metadata).chain(claims.items.into_iter().map(|c| c.metadata));
+            let mut names: Vec<String> = metas.filter(|m| m.deletion_timestamp.is_none()).filter_map(|m| m.name).collect();
+            names.sort();
+            names
         }
-        let again = create_claim(&client, &name, &run).await;
 
-        let choice = Choice {
-            claims: vec![(name.clone(), listed_uid), (format!("{run}-never-made"), "no-such-uid".to_string())],
-            ..Choice::default()
-        };
-        let swept = delete_chosen(&client, choice).await;
-        let after = claims.get_opt(&name).await.expect("get");
+        /// Deletes everything `selector` picks (the role has no
+        /// `deletecollection`, so one by one).
+        async fn clean_up(client: &kube::Client, selector: &str) {
+            let params = ListParams::default().labels(selector);
+            let pods = Api::<Pod>::namespaced(client.clone(), SWEEP_NAMESPACE);
+            let now = DeleteParams { grace_period_seconds: Some(0), ..DeleteParams::default() };
+            for name in pods.list(&params).await.map(|l| l.items).unwrap_or_default().into_iter().filter_map(|p| p.metadata.name) {
+                pods.delete(&name, &now).await.ok();
+            }
+            let claims = Api::<PersistentVolumeClaim>::namespaced(client.clone(), SWEEP_NAMESPACE);
+            for name in claims.list(&params).await.map(|l| l.items).unwrap_or_default().into_iter().filter_map(|c| c.metadata.name) {
+                claims.delete(&name, &DeleteParams::default()).await.ok();
+            }
+        }
 
-        clean_up(&client, &selector).await;
-        assert_eq!(swept, Ok(Swept { skipped: 2, ..Swept::default() }));
-        let after = after.expect("the claim made again should still be there");
-        assert_eq!(after.metadata.uid, again.metadata.uid);
-        assert!(after.metadata.deletion_timestamp.is_none(), "the claim made again was marked for deletion");
+        /// Old pods and claims are deleted, a claim an old pod mounts with
+        /// them; young ones, and a young claim a young pod mounts, are kept.
+        #[tokio::test]
+        async fn test_the_sweep_deletes_old_pods_and_claims_and_keeps_young_ones() {
+            let client = crate::sandbox::tests::test_client().await;
+            let (run, selector) = scope();
+            create_claim(&client, &format!("{run}-alone"), &run).await;
+            create_claim(&client, &format!("{run}-mounted"), &run).await;
+            create_pod(&client, &format!("{run}-pod"), &run, &format!("{run}-mounted")).await;
+
+            // Everything is old to a zero age.
+            let old = sweep(&client, Duration::ZERO, Some(&selector)).await;
+            let left_by_old = live(&client, &selector).await;
+
+            let (young_run, young_selector) = scope();
+            create_claim(&client, &format!("{young_run}-claim"), &young_run).await;
+            create_pod(&client, &format!("{young_run}-pod"), &young_run, &format!("{young_run}-claim")).await;
+            let young = sweep(&client, Duration::from_secs(60 * 60), Some(&young_selector)).await;
+            let left_by_young = live(&client, &young_selector).await;
+
+            clean_up(&client, &selector).await;
+            clean_up(&client, &young_selector).await;
+            assert_eq!(old, Ok(Swept { pods: 1, claims: 2, ..Swept::default() }));
+            assert_eq!(left_by_old, Vec::<String>::new(), "the old objects should be deleted or deleting");
+            assert_eq!(young, Ok(Swept::default()));
+            assert_eq!(left_by_young, vec![format!("{young_run}-claim"), format!("{young_run}-pod")]);
+        }
+
+        /// SME-134 review 1: a pod made between the sweep's two listings,
+        /// mounting an old claim the sweep lists, is seen with it, and the
+        /// young pod keeps the claim: it isn't deleted from under a pod the
+        /// sweep doesn't know about. (Review 2: an old claim and a young pod,
+        /// the case itself, rather than both old.)
+        #[tokio::test]
+        async fn test_the_sweep_sees_a_pod_made_between_its_listings() {
+            let client = crate::sandbox::tests::test_client().await;
+            let (run, selector) = scope();
+            let claim_name = format!("{run}-claim");
+            let pod_name = format!("{run}-pod");
+            create_claim(&client, &claim_name, &run).await;
+            // Creation times are to the second: the claim is then over a
+            // second old, and the pod made during the sweep under one.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let made_between =
+                sweep_with(&client, Duration::from_secs(1), Some(&selector), create_pod(&client, &pod_name, &run, &claim_name));
+            let swept = made_between.await;
+            let left = live(&client, &selector).await;
+
+            clean_up(&client, &selector).await;
+            assert_eq!(left, vec![claim_name, pod_name], "the claim was deleted from under a pod the sweep didn't see");
+            assert_eq!(swept, Ok(Swept { kept_claims: 1, ..Swept::default() }));
+        }
+
+        /// SME-134 review 2: a claim the sweep chose with its old pod is kept
+        /// when that pod's delete is refused, because the pod was made again
+        /// under its name since the listing and still mounts the claim.
+        #[tokio::test]
+        async fn test_the_sweep_keeps_a_claim_whose_pod_was_made_again() {
+            let client = crate::sandbox::tests::test_client().await;
+            let (run, selector) = scope();
+            let claim_name = format!("{run}-claim");
+            let pod_name = format!("{run}-pod");
+            let claim = create_claim(&client, &claim_name, &run).await;
+            create_pod(&client, &pod_name, &run, &claim_name).await;
+            let pods = Api::<Pod>::namespaced(client.clone(), SWEEP_NAMESPACE);
+            let listed_pod_uid = pods.get(&pod_name).await.expect("get pod").metadata.uid.expect("uid");
+            pods.delete(&pod_name, &DeleteParams { grace_period_seconds: Some(0), ..DeleteParams::default() })
+                .await
+                .expect("delete pod");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while pods.get_opt(&pod_name).await.expect("get").is_some() {
+                assert!(tokio::time::Instant::now() < deadline, "the first pod wasn't gone within 30 s");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            create_pod(&client, &pod_name, &run, &claim_name).await;
+
+            let choice = Choice {
+                pods: vec![(pod_name.clone(), listed_pod_uid)],
+                claims: vec![(claim_name.clone(), claim.metadata.uid.clone().expect("uid"))],
+                mounts: vec![(pod_name.clone(), claim_name.clone())],
+                ..Choice::default()
+            };
+            let swept = delete_chosen(&client, choice).await;
+            let left = live(&client, &selector).await;
+
+            clean_up(&client, &selector).await;
+            assert_eq!(left, vec![claim_name, pod_name], "the pod made again, and the claim it mounts, should both be left");
+            assert_eq!(swept, Ok(Swept { kept_claims: 1, skipped: 1, ..Swept::default() }));
+        }
+
+        /// A claim deleted and made again under its name between the listing
+        /// and the delete has a new uid: the delete held to the listed uid is
+        /// refused and skipped, and the new claim stays. One already gone is
+        /// skipped too.
+        #[tokio::test]
+        async fn test_the_sweep_skips_an_object_recreated_under_its_name() {
+            let client = crate::sandbox::tests::test_client().await;
+            let (run, selector) = scope();
+            let name = format!("{run}-claim");
+            let claims = Api::<PersistentVolumeClaim>::namespaced(client.clone(), SWEEP_NAMESPACE);
+            let first = create_claim(&client, &name, &run).await;
+            let listed_uid = first.metadata.uid.clone().expect("uid");
+            claims.delete(&name, &DeleteParams::default()).await.expect("delete");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while claims.get_opt(&name).await.expect("get").is_some() {
+                assert!(tokio::time::Instant::now() < deadline, "the first claim wasn't gone within 30 s");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            let again = create_claim(&client, &name, &run).await;
+
+            let choice = Choice {
+                claims: vec![(name.clone(), listed_uid), (format!("{run}-never-made"), "no-such-uid".to_string())],
+                ..Choice::default()
+            };
+            let swept = delete_chosen(&client, choice).await;
+            let after = claims.get_opt(&name).await.expect("get");
+
+            clean_up(&client, &selector).await;
+            assert_eq!(swept, Ok(Swept { skipped: 2, ..Swept::default() }));
+            let after = after.expect("the claim made again should still be there");
+            assert_eq!(after.metadata.uid, again.metadata.uid);
+            assert!(after.metadata.deletion_timestamp.is_none(), "the claim made again was marked for deletion");
+        }
     }
 }
