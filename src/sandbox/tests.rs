@@ -3781,6 +3781,8 @@ async fn test_sandbox_futures_stay_small() {
         // timed-out report, unboxed, takes it to 4520.
         ("create_pod_attempt", std::mem::size_of_val(&create_pod_attempt(&pool, 1, PodLimitOverrides::default())), 19000),
         ("wait_for_running_with_timeout", std::mem::size_of_val(&wait_for_running_with_timeout(&pods_api(&client), "sandbox-1", Duration::from_secs(1))), 3600),
+        // SME-144 moved its publishes around the send: 664 bytes then.
+        ("run_command", std::mem::size_of_val(&run_command(&pool, 1, 1, "cmd", "true")), 1300),
     ];
     for (name, size, bound) in sizes {
         println!("{name}: {size} bytes (bound {bound})");

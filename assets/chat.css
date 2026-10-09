@@ -1260,6 +1260,8 @@ body {
 .task-terminal {
     display: flex;
     flex-direction: column;
+    /* The titlebar's container queries (below) measure the card. */
+    container-type: inline-size;
     border-radius: 8px;
     overflow: hidden;
     background: #1e1e1e;
@@ -1307,10 +1309,11 @@ body {
     text-overflow: ellipsis;
     white-space: nowrap;
     max-width: 12ch;
+    margin-right: auto;
 }
 
 .task-terminal-status {
-    margin-left: auto;
+    white-space: nowrap;
     padding: 1px 8px;
     border-radius: 999px;
     font-size: 11px;
@@ -1319,6 +1322,93 @@ body {
     background: #444;
     color: #ddd;
     flex-shrink: 0;
+}
+
+@container (max-width: 240px) {
+    .task-terminal-status {
+        display: none;
+    }
+}
+
+@container (max-width: 160px) {
+    .task-terminal-id {
+        display: none;
+    }
+
+    .task-terminal-dots {
+        margin-right: auto;
+    }
+}
+
+/* The titlebar's pills, pushed right by the terminal's name
+   (`margin-right: auto`): the last command's status (SME-144), then the
+   terminal's connection. The titlebar sits outside .task-terminal-body,
+   the one part that scrolls, so the command's status stays in view however
+   much it prints. In a narrow card (720-1024px with a todo list beside the
+   sandbox, ~137-156px wide) the name shrinks first; below 240px the
+   connection pill is hidden (the titlebar's tooltip still says it), and
+   below 160px the name too. The dots and the command's pill always fit.
+   The terminal's palette is always dark, so these colours serve both
+   themes; each text/background pair is at least 6.5:1. */
+.task-terminal-command,
+.task-terminal-status {
+    box-sizing: border-box;
+    height: 18px;
+    line-height: 16px;
+}
+
+.task-terminal-command {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+    flex-shrink: 0;
+    background: #444;
+    color: #ddd;
+}
+
+.task-terminal-command-glyph {
+    line-height: 1;
+}
+
+.task-terminal-command-running {
+    background: #1f3a5f;
+    color: #9cc7ff;
+}
+
+.task-terminal-command-running .task-terminal-command-glyph {
+    animation: task-terminal-command-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes task-terminal-command-pulse {
+    50% {
+        opacity: 0.35;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .task-terminal-command-running .task-terminal-command-glyph {
+        animation: none;
+    }
+}
+
+.task-terminal-command-ok {
+    background: #1e4620;
+    color: #9be29f;
+}
+
+.task-terminal-command-failed {
+    background: #5c1f1f;
+    color: #ffaaa5;
+}
+
+.task-terminal-command-lost {
+    background: #5a4210;
+    color: #ffd27a;
 }
 
 .task-terminal-body {
