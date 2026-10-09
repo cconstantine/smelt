@@ -24,8 +24,9 @@ The API key is a Linear personal API key (read-only is enough), read from
 file must not be readable by group or others (chmod 600). The key is never
 printed.
 
-Exit status: 0 with one line per change on stdout; 2 when the key is missing
-or the API keeps failing (the message says why); 3 for bad arguments.
+Exit status: 0 with one line per change on stdout; 1 for --once with nothing
+changed; 2 when the key is missing, refused (401/403, no retry) or the API keeps
+failing (the message says why). With --once a failed poll isn't retried.
 
     scripts/pm-wait-for-board                 # wait for the next change
     scripts/pm-wait-for-board --once          # check once: report and exit 0, or exit 1 if nothing changed
@@ -226,9 +227,23 @@ def main():
         try:
             board = fetch_board(key)
             failures = 0
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                fail(
+                    f"Linear refused the key in {key_path()} (HTTP {e.code}). It should be a "
+                    "personal API key, which starts with lin_api_ (Linear > Settings > "
+                    "Security & access > API keys)."
+                )
+            failures += 1
+            if args.once or failures >= MAX_FAILURES:
+                print(f"pm-wait-for-board: giving up after {failures} failed polls: {e}", file=sys.stderr)
+                return 2
+            print(f"pm-wait-for-board: poll failed ({e}); retrying", file=sys.stderr)
+            time.sleep(min(args.interval * failures, 600))
+            continue
         except (urllib.error.URLError, OSError, RuntimeError, KeyError, ValueError) as e:
             failures += 1
-            if failures >= MAX_FAILURES:
+            if args.once or failures >= MAX_FAILURES:
                 print(f"pm-wait-for-board: giving up after {failures} failed polls: {e}", file=sys.stderr)
                 return 2
             print(f"pm-wait-for-board: poll failed ({e}); retrying", file=sys.stderr)
