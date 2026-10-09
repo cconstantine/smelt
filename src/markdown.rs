@@ -93,8 +93,9 @@ pub fn parse(source: &str) -> Vec<Block> {
 /// A link's words are always the text it was found in, so it goes where it
 /// says: `http`/`https` URLs link to themselves, `www.` addresses to
 /// `https://` plus the text, email addresses to `mailto:` plus the text.
-/// Other schemes, and dotted names without `www.` (`main.rs`,
-/// `example.com`), stay text. Code, raw HTML blocks, image alt text and an
+/// Other schemes, dotted names without `www.` (`main.rs`, `example.com`),
+/// and a link that wouldn't go where its text says (see `mailto` and
+/// `has_bidi_control`) stay text. Code, raw HTML blocks, image alt text and an
 /// existing link's words are left alone, so a link never nests in a link.
 fn autolink(blocks: &mut [Block]) {
     let mut www = LinkFinder::new();
@@ -160,14 +161,20 @@ fn split_links(text: &str, finder: &Finders, out: &mut Vec<Inline>) {
     for span in finder.links.spans(text) {
         let found = span.as_str();
         match span.kind() {
-            Some(LinkKind::Url) if allowed_url(found, &["http", "https"]) => push_link(out, found.to_string(), found),
-            Some(LinkKind::Email) => push_link(out, format!("mailto:{found}"), found),
-            // A URL with another scheme stays text, all of it.
+            Some(LinkKind::Url) if allowed_url(found, &["http", "https"]) && !has_bidi_control(found) => {
+                push_link(out, found.to_string(), found)
+            }
+            Some(LinkKind::Email) if let Some(url) = mailto(found) => push_link(out, url, found),
+            // A URL with another scheme, or one that wouldn't go where it
+            // says, stays text, all of it.
             Some(_) => push_inline(out, Inline::Text(found.to_string())),
             None => {
                 for gap in finder.www.spans(found) {
                     let words = gap.as_str();
-                    if gap.kind().is_some() && words.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("www.")) {
+                    if gap.kind().is_some()
+                        && words.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("www."))
+                        && !has_bidi_control(words)
+                    {
                         push_link(out, format!("https://{words}"), words);
                     } else {
                         push_inline(out, Inline::Text(words.to_string()));
@@ -176,6 +183,24 @@ fn split_links(text: &str, finder: &Finders, out: &mut Vec<Inline>) {
             }
         }
     }
+}
+
+/// The `mailto:` link for an email address, or `None` when a mail client
+/// would send it somewhere its text doesn't say: URL syntax in it
+/// (`billing?cc=x@evil.com` is a mail to "billing" copied to x@evil.com,
+/// `x%40evil.com?@bank.com` one to x@evil.com), or bidi controls that
+/// reorder how it shows. RFC 5322 allows `?`, `#`, `%`, `&` and `/` in an
+/// address's name, and linkify finds them; real addresses rarely use them.
+fn mailto(address: &str) -> Option<String> {
+    let url_syntax = address.contains(['?', '#', '%', '&', '/']);
+    (!url_syntax && !has_bidi_control(address)).then(|| format!("mailto:{address}"))
+}
+
+/// Whether `text` holds a bidi control, which reorders how the text
+/// around it shows: a link holding one can show one address and go to
+/// another.
+fn has_bidi_control(text: &str) -> bool {
+    text.chars().any(|c| matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
 }
 
 fn push_link(out: &mut Vec<Inline>, url: String, words: &str) {
@@ -360,13 +385,16 @@ impl Builder {
                         Tag::Strikethrough => Container::Strike(Vec::new()),
                         Tag::Link { link_type, dest_url, .. } => {
                             // pulldown-cmark gives `<me@e.com>` no `mailto:`.
-                            let dest = if link_type == LinkType::Email {
-                                format!("mailto:{dest_url}")
-                            } else {
-                                dest_url.to_string()
+                            // An angle-bracket link shows its own address, so
+                            // it is refused where that address would mislead,
+                            // as a bare one is (`split_links`).
+                            let dest = match link_type {
+                                LinkType::Email => mailto(&dest_url),
+                                LinkType::Autolink if has_bidi_control(&dest_url) => None,
+                                _ => Some(dest_url.to_string()),
                             };
                             Container::Link {
-                                url: allowed_url(&dest, &["http", "https", "mailto"]).then_some(dest),
+                                url: dest.filter(|dest| allowed_url(dest, &["http", "https", "mailto"])),
                                 content: Vec::new(),
                             }
                         }
@@ -1169,6 +1197,35 @@ mod tests {
                 url: "https://b.com".into(),
                 content: vec![text("see "), Inline::Emphasis(vec![text("www.a.com")])],
             }])]
+        );
+    }
+
+    /// SME-104 review 1: an email address whose name holds URL syntax
+    /// (`?`, `#`, `%`, `&`, `/`) would send a `mailto:` somewhere its text
+    /// doesn't say (`billing?cc=x@evil.com` is a mail to "billing" copied to
+    /// x@evil.com), and bidi controls reorder what a link shows; both stay
+    /// text, bare or in angle brackets.
+    #[test]
+    fn test_links_that_would_not_go_where_they_say_stay_text() {
+        for source in [
+            "billing?cc=attacker@evil.com",
+            "attacker%40evil.com?@bank.com",
+            "a#b@e.com",
+            "a&b@e.com",
+            "a/b@e.com",
+            "<billing?cc=attacker@evil.com>",
+            "<https://e.com/\u{202E}moc.knab>",
+            "a\u{202E}b@e.com",
+            "https://e.com/\u{202E}moc.knab",
+            "www.e\u{2066}x.com",
+            "see \u{200F}me@e.com",
+        ] {
+            assert_eq!(links_in(source), pairs(&[]), "{source:?}");
+        }
+        assert_eq!(
+            links_in("mail first.last+tag@e.com"),
+            pairs(&[("mailto:first.last+tag@e.com", "first.last+tag@e.com")]),
+            "an ordinary address still links"
         );
     }
 
