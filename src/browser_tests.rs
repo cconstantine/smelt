@@ -2911,12 +2911,19 @@ async fn scenario_terminal_follow_after_switch(t: &Scenario<'_>) {
     )
     .await
     .expect("grow the window while they read");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let after_grow = terminal_distance_from_bottom(&page).await;
+    // The clamp lands within a frame or two of the grow on a healthy page, but
+    // betting one fixed sleep on it makes this premise itself the flake — poll
+    // for it, and only fail as a premise once the reader has had 3s to clamp.
+    let clamp_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut after_grow = terminal_distance_from_bottom(&page).await;
+    while after_grow > 40.0 && tokio::time::Instant::now() < clamp_deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        after_grow = terminal_distance_from_bottom(&page).await;
+    }
     assert!(
-        after_grow <= 120.0,
+        after_grow <= 40.0,
         "the window grow didn't reach the reader to clamp them onto the new bottom (they were \
-         already {after_grow}px above it), so this phase measures nothing \
+         still {after_grow}px above it after 3s), so this phase measures nothing \
          (scrollTop/scrollHeight/clientHeight: {})",
         terminal_scroll_facts(&page).await
     );
@@ -3068,18 +3075,6 @@ async fn terminal_scroll_events(page: &chromiumoxide::Page) -> String {
     .expect("read the scroll event ring")
     .into_value::<String>()
     .expect("a string")
-}
-
-/// TEMPORARY (SME-108): what the app's own `StickyBottom::scrolled` saw and
-/// decided at each scroll event — the numbers it was handed (which are not
-/// necessarily the ones the sampler read off the element) and which branch it
-/// took. The browser tier's only way in to the app's side of the story.
-async fn sticky_probe(page: &chromiumoxide::Page) -> String {
-    page.evaluate("(() => JSON.stringify(window.__smeltSticky || []))()")
-        .await
-        .expect("read the app's sticky-event trace")
-        .into_value::<String>()
-        .expect("a string")
 }
 
 /// The terminal following its last line: the distance from the bottom settling
