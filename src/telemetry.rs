@@ -75,6 +75,35 @@ pub(crate) fn mark_error(span: &Span, message: &str) {
     span.record("otel.status_description", description.as_str());
 }
 
+/// Runs `future` in `span` and ends the span's export when the future
+/// finishes or is dropped, whoever still holds the span. Use it instead of
+/// `Instrument::instrument` for every exported span: hyper-util spawns each
+/// new pooled connection `in_current_span`, and rmcp its service loop, so a
+/// span that opened a connection would otherwise stay open (and unexported)
+/// for as long as the connection lives, its parents with it.
+pub(crate) async fn in_span<F: std::future::Future>(span: Span, future: F) -> F::Output {
+    use tracing::Instrument;
+    let _end = EndOnDrop(span.clone());
+    future.instrument(span).await
+}
+
+struct EndOnDrop(Span);
+
+impl Drop for EndOnDrop {
+    fn drop(&mut self) {
+        end(&self.0);
+    }
+}
+
+/// Ends `span`'s export now: what it records afterwards is dropped. A no-op
+/// when no export layer is installed.
+pub(crate) fn end(span: &Span) {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    // The SDK ends a span once: tracing's own close, later, is a no-op.
+    span.context().span().end();
+}
+
 /// The span for one HTTP request: `{METHOD} {path}`, a server span with the
 /// method and path only. Never the query string (the OAuth callback's
 /// carries `code` and `state`) or a header.
@@ -93,13 +122,19 @@ pub(crate) fn make_http_span<B>(request: &http::Request<B>) -> Span {
     )
 }
 
-/// Records a response's status on its request's span; a 5xx marks it failed.
+/// Records a response's status on its request's span, a 5xx marking it
+/// failed, and ends the span's export there: its time is the time to the
+/// response's head, and a `ServerEvents` stream's span doesn't wait for the
+/// tab to close.
 pub(crate) fn on_http_response<B>(response: &http::Response<B>, _latency: std::time::Duration, span: &Span) {
     let status = response.status();
     span.record("http.response.status_code", i64::from(status.as_u16()));
     if status.is_server_error() {
         mark_error(span, &status.to_string());
     }
+    // The request is answered: a turn it started, a connection it opened or
+    // an event stream's body would otherwise keep its span from exporting.
+    end(span);
 }
 
 /// Keeps the tracer provider for the process's life; dropping it flushes
@@ -313,6 +348,25 @@ mod tests {
         assert!(!format!("{span:?}").contains("SECRET"), "{span:?}");
     }
 
+    /// A turn the request started (`start_turn`) and a connection it opened
+    /// hold the request's span: it still exports at its response, and an
+    /// event stream's span doesn't wait for the tab to close.
+    #[tokio::test]
+    async fn test_an_http_span_still_held_elsewhere_exports_at_its_response() {
+        let mut held = None;
+        let ((), spans) = capture_spans(async {
+            let request = http::Request::get("/api/conversations/1/events").body(()).expect("request");
+            let span = make_http_span(&request);
+            held = Some(span.clone());
+            let response = http::Response::builder().status(200).body(()).expect("response");
+            on_http_response(&response, std::time::Duration::from_millis(1), &span);
+        })
+        .await;
+        assert!(held.is_some());
+        let names: Vec<_> = spans.iter().map(|span| span.name.to_string()).collect();
+        assert_eq!(names, ["GET /api/conversations/1/events"]);
+    }
+
     #[tokio::test]
     async fn test_a_5xx_response_marks_its_span_failed() {
         let ((), spans) = capture_spans(async {
@@ -324,6 +378,42 @@ mod tests {
         .await;
         let [span] = spans.as_slice() else { panic!("one span: {spans:?}") };
         assert!(matches!(span.status, Status::Error { .. }), "{:?}", span.status);
+    }
+
+    /// A library task that outlives the work (hyper-util spawns each pooled
+    /// connection `in_current_span`, rmcp its service loop) holds the span
+    /// open: it must still export when the work ends.
+    #[tokio::test]
+    async fn test_a_span_held_by_a_lingering_task_still_exports_when_its_work_ends() {
+        let held = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let holder = held.clone();
+        let ((), spans) = capture_spans(async move {
+            in_span(tracing::info_span!("work"), async move {
+                *holder.lock().expect("lock") = Some(Span::current());
+            })
+            .await;
+        })
+        .await;
+        assert!(held.lock().expect("lock").is_some(), "the span is still held");
+        let names: Vec<_> = spans.iter().map(|span| span.name.to_string()).collect();
+        assert_eq!(names, ["work"]);
+    }
+
+    #[tokio::test]
+    async fn test_a_span_whose_work_is_dropped_still_exports() {
+        let ((), spans) = capture_spans(async {
+            let held = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let holder = held.clone();
+            let work = in_span(tracing::info_span!("work"), async move {
+                *holder.lock().expect("lock") = Some(Span::current());
+                std::future::pending::<()>().await
+            });
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), work).await;
+            std::mem::forget(held);
+        })
+        .await;
+        let names: Vec<_> = spans.iter().map(|span| span.name.to_string()).collect();
+        assert_eq!(names, ["work"]);
     }
 
     #[tokio::test]

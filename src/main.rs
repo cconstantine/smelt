@@ -91,7 +91,7 @@ async fn main() {
     // OTEL_EXPORTER_OTLP_ENDPOINT is set (SME-137). Held for the process's
     // life: dropping it flushes the export.
     let _telemetry = telemetry::init();
-    let listener = tracing::Instrument::instrument(start_up(dotenv_problem), tracing::info_span!("startup")).await;
+    let listener = telemetry::in_span(tracing::info_span!("startup"), start_up(dotenv_problem)).await;
     let router = build_router();
     #[expect(clippy::expect_used, reason = "serving is the process's whole job: when it ends, the process does")]
     axum::serve(listener, router).await.expect("server error");
@@ -101,7 +101,6 @@ async fn main() {
 /// (SME-137).
 #[cfg(feature = "server")]
 async fn start_up(dotenv_problem: Option<String>) -> tokio::net::TcpListener {
-    use tracing::Instrument;
     if let Some(problem) = dotenv_problem {
         tracing::error!("{problem}");
     }
@@ -175,8 +174,9 @@ async fn start_up(dotenv_problem: Option<String>) -> tokio::net::TcpListener {
     // Docker data claims whose conversation deletion didn't reach them (SME-33).
     tokio::spawn({
         let pool = pool.clone();
-        async move { sandbox::sweep_orphaned_conversation_claims(&pool).await }
-            .instrument(tracing::info_span!("claim_sweep"))
+        telemetry::in_span(tracing::info_span!("claim_sweep"), async move {
+            sandbox::sweep_orphaned_conversation_claims(&pool).await
+        })
     });
 
     // Each sandbox's dev servers, for the user's browser, on a listener of
