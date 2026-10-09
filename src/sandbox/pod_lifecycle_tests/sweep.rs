@@ -529,8 +529,12 @@ mod tests {
             create_claim(&client, &format!("{run}-mounted"), &run).await;
             create_pod(&client, &format!("{run}-pod"), &run, &format!("{run}-mounted")).await;
 
-            // Everything is old to a zero age.
-            let old = sweep(&client, Duration::ZERO, Some(&selector)).await;
+            // Everything is old to a zero age, judged an hour from now: the
+            // API server stamps creation times by its own clock, so they'd
+            // be in the runner's future, and young, if the runner's clock
+            // were behind it (SME-143).
+            let an_hour_on = || Timestamp::now().checked_add(SignedDuration::from_hours(1)).expect("time");
+            let old = sweep_with(&client, Duration::ZERO, Some(&selector), async {}, an_hour_on).await;
             let left_by_old = live(&client, &selector).await;
 
             let (young_run, young_selector) = scope();
