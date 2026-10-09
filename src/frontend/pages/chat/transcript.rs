@@ -195,7 +195,9 @@ pub(super) struct ReplyCopy {
 /// assistant text block from one thing the user did to the next: a
 /// user-role message holding text (their message, or a notice such as
 /// "Stopped.") or answering an `ask_user` call starts a new one; ordinary
-/// tool results and compaction's placeholders don't. Thinking, tool calls,
+/// tool results and compaction's placeholders don't, nor does a notice
+/// saved right after tool results, inside a turn's tool loop (a command
+/// that finished while the turn went on). Thinking, tool calls,
 /// results and compaction summaries aren't part of the copy, nor is a text
 /// block that is only whitespace. While the turn runs, the newest reply
 /// (the one after the last such message) has none: it may still grow.
@@ -206,19 +208,37 @@ pub(super) fn reply_parts(messages: &[Message], turn_running: bool) -> HashMap<i
     let mut reply: Vec<(i64, usize, &str)> = Vec::new();
     let readable: Vec<(&Message, Vec<ContentBlock>)> =
         messages.iter().filter_map(|m| m.blocks().ok().map(|blocks| (m, blocks))).collect();
+    // Whether the turn is inside its tool loop: the last message was tool
+    // results going back to the model. A notice saved there (a command
+    // finishing, drained at the top of the loop) is part of the same turn,
+    // not a new one (code review 1).
+    let mut in_tool_loop = false;
+    let no_commands = HashMap::new();
     for (message, blocks) in &readable {
         if message.role == "user" {
-            let starts_reply = blocks.iter().any(|block| match block {
-                ContentBlock::Text { .. } => true,
-                ContentBlock::ToolResult { tool_use_id, .. } => {
-                    tool_names.get(tool_use_id).is_some_and(|name| name == ASK_USER)
+            let mut starts_reply = false;
+            let mut tool_results = false;
+            for block in blocks {
+                match block {
+                    ContentBlock::Text { text } => {
+                        let mid_turn_notice = in_tool_loop && system_notice(text, &no_commands).is_some();
+                        starts_reply |= !mid_turn_notice;
+                    }
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        tool_results = true;
+                        starts_reply |= tool_names.get(tool_use_id).is_some_and(|name| name == ASK_USER);
+                    }
+                    _ => {}
                 }
-                _ => false,
-            });
+            }
             if starts_reply {
                 finish_reply(&mut parts, std::mem::take(&mut reply));
+                in_tool_loop = false;
+            } else if tool_results {
+                in_tool_loop = true;
             }
         } else if message.role == "assistant" {
+            in_tool_loop = false;
             for (index, block) in blocks.iter().enumerate() {
                 if let ContentBlock::Text { text } = block
                     && !text.trim().is_empty()

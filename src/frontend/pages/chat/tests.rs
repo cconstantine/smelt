@@ -1793,3 +1793,51 @@ fn test_reply_parts_copy_markdown_byte_for_byte() {
         vec![(2, 0, reply.trim_matches('\n').to_string(), 1)]
     );
 }
+
+#[test]
+fn test_reply_parts_a_command_notice_inside_a_running_turn_does_not_split_its_reply() {
+    // A command that finishes while the turn is still in its tool loop is
+    // saved as a notice right after the tool results, and the turn goes on
+    // (`drain_unnotified_terminal_commands`). Code review 1, M1.
+    let messages = vec![
+        user_text(1, "run the tests"),
+        message_with_blocks(2, "assistant", vec![text("Running the tests."), call("t1", "run_terminal_command")]),
+        message_with_blocks(3, "user", vec![result("t1", "command sent (id: c1)")]),
+        user_text(4, "Terminal command c1 finished: exit code 0."),
+        message_with_blocks(5, "assistant", vec![text("All tests pass.")]),
+    ];
+    assert_eq!(
+        buttons(&reply_parts(&messages, false)),
+        vec![(5, 0, "Running the tests.\n\nAll tests pass.".to_string(), 2)]
+    );
+    assert!(reply_parts(&messages[..4], true).is_empty(), "no button on a reply whose turn still runs");
+}
+
+#[test]
+fn test_reply_parts_a_notice_that_starts_a_turn_still_starts_a_reply() {
+    let messages = vec![
+        user_text(1, "start the build"),
+        message_with_blocks(2, "assistant", vec![text("Started it.")]),
+        user_text(3, "Terminal command c1 finished: exit code 0."),
+        message_with_blocks(4, "assistant", vec![text("The build finished.")]),
+    ];
+    assert_eq!(
+        buttons(&reply_parts(&messages, false)),
+        vec![(2, 0, "Started it.".to_string(), 1), (4, 0, "The build finished.".to_string(), 1)]
+    );
+}
+
+#[test]
+fn test_reply_parts_the_users_own_message_inside_a_tool_loop_still_starts_a_reply() {
+    let messages = vec![
+        user_text(1, "go"),
+        message_with_blocks(2, "assistant", vec![text("Working."), call("t1", "todoread")]),
+        message_with_blocks(3, "user", vec![result("t1", "[]")]),
+        user_text(4, "also check the docs"),
+        message_with_blocks(5, "assistant", vec![text("Checked them.")]),
+    ];
+    assert_eq!(
+        buttons(&reply_parts(&messages, false)),
+        vec![(2, 0, "Working.".to_string(), 1), (5, 0, "Checked them.".to_string(), 1)]
+    );
+}
