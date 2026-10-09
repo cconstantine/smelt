@@ -25,10 +25,12 @@
 #   are passed on to that group and the lock is freed once it's gone, and a
 #   SIGKILL takes the command with it (setpriv --pdeathsig), so no kill of
 #   the holder lets a second run in beside a command still running.
-# - Re-entry: when an ancestor process already holds the lock, the command
-#   runs inside that lock instead of deadlocking on it: silently when the
-#   ancestor is this script, with a notice when it's an old outer `flock`.
-#   Needs /proc/locks (Linux); without it, says re-entry detection is off.
+# - Re-entry: when an ancestor process already holds the lock, or this
+#   process inherited a descriptor that holds it (`exec 9>>LOCK; flock 9`),
+#   the command runs inside that lock instead of deadlocking: silently when
+#   the holder is this script, with a notice when it's an old outer `flock`.
+#   Ancestors are found through /proc/locks (Linux); without it, only the
+#   descriptor form is found, and it says so.
 # - --output FILE: the command's stdout and stderr go to FILE (emptied
 #   first), while this script's own lines stay on its stderr.
 # - The log: each run appends one line to $SMELT_LOCK_DIR/smelt-cluster-lock.log
@@ -97,7 +99,7 @@ if [ "${1:-}" = "--output" ]; then
     shift 2
 fi
 if [ $# -eq 0 ]; then
-    sed -n '2,37p' "$self" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,39p' "$self" | sed 's/^# \{0,1\}//' >&2
     exit 2
 fi
 
@@ -135,28 +137,62 @@ describe() { # pid: its command line and directory
     echo "pid $1, ${cmd% }, in ${cwd:-?}"
 }
 
+# Runs the command inside a lock an enclosing process holds, and logs it.
+reenter() { # holder description ("" for this script itself), command...
+    local holder=$1
+    shift
+    if [ -n "$holder" ]; then
+        echo "the cluster lock is already held by an enclosing $holder; running inside it. The scripts take the lock themselves since SME-100: drop the outer flock." >&2
+    fi
+    run "$@"
+    rc=$?
+    printf '%s reentered held=%d exit=%d worktree=%s cmd=%s\n' "$(utc "$asked")" \
+        $((EPOCHSECONDS - asked)) "$rc" "$(worktree)" "${*:1:3}" >>"$log"
+    exit "$rc"
+}
+
+# A descriptor this process inherited whose open file holds the lock: an
+# enclosing `exec 9>>LOCK; flock 9`, whose short-lived `flock 9` has exited,
+# so /proc/locks doesn't list it at all (SME-100 review 1). Only asked
+# while the lock is held: a non-blocking flock on an inherited descriptor
+# that doesn't hold it would otherwise take it for that descriptor's owner.
+inherited_holder() {
+    local lock_id fd
+    flock -n "$lock" true && return 1
+    lock_id=$(stat -L -c '%d:%i' "$lock")
+    for fd in /proc/$$/fd/*; do
+        fd=${fd##*/}
+        [ "$fd" -gt 2 ] || continue
+        [ "$(stat -L -c '%d:%i' "/proc/$$/fd/$fd" 2>/dev/null)" = "$lock_id" ] || continue
+        flock -n "$fd" && return 0
+    done
+    return 1
+}
+
 asked=$EPOCHSECONDS
+if inherited_holder; then
+    reenter "flock (a lock descriptor this process inherited)" "$@"
+fi
+held_by=""
 if [ -r /proc/locks ]; then
     held_by=$(holders)
     mine=$(ancestors)
     for pid in $held_by; do
         grep -qx "$pid" <<<"$mine" || continue
-        # Inside the lock already: run the command under it.
-        if [ "$pid" != "${SMELT_CLUSTER_LOCK_HOLDER:-}" ]; then
-            echo "the cluster lock is already held by an enclosing $(describe "$pid"); running inside it. The scripts take the lock themselves since SME-100: drop the outer flock." >&2
+        if [ "$pid" = "${SMELT_CLUSTER_LOCK_HOLDER:-}" ]; then
+            reenter "" "$@"
         fi
-        run "$@"
-        rc=$?
-        printf '%s reentered held=%d exit=%d worktree=%s cmd=%s\n' "$(utc "$asked")" \
-            $((EPOCHSECONDS - asked)) "$rc" "$(worktree)" "${*:1:3}" >>"$log"
-        exit "$rc"
-    done
-    for pid in $held_by; do
-        echo "waiting for the cluster lock (held by $(describe "$pid"))" >&2
-        break
+        reenter "$(describe "$pid")" "$@"
     done
 else
-    echo "with-cluster-lock: can't read /proc/locks, so re-entry detection is off: an enclosing flock on $lock would deadlock this" >&2
+    echo "with-cluster-lock: can't read /proc/locks, so an enclosing `flock LOCK command` isn't detected and would deadlock this" >&2
+fi
+for pid in $held_by; do
+    echo "waiting for the cluster lock (held by $(describe "$pid"))" >&2
+    break
+done
+if [ -z "$held_by" ] && ! flock -n "$lock" true; then
+    echo "waiting for the cluster lock (held through a descriptor whose taker has exited, so /proc/locks doesn't say whose; look for a process with $lock open)" >&2
 fi
 
 # flock keeps this pid (exec) and, with -F, execs the second half in it

@@ -358,6 +358,25 @@ if ! out=$(timeout 10 scripts/with-cluster-lock scripts/with-cluster-lock true 2
 fi
 [ -z "$out" ] || fail "with-cluster-lock inside itself printed: $out"
 
+# The descriptor form of an outer lock (`exec 9>>LOCK; flock 9`): the
+# short-lived `flock 9` that took it has exited, so /proc/locks doesn't
+# list it, yet the descriptor this script inherits holds it (SME-100
+# review 1). It re-enters rather than deadlocking.
+if ! out=$( (flock 9 && timeout 10 scripts/with-cluster-lock true) 9>>"$lock" 2>&1); then
+    fail "with-cluster-lock under a descriptor-form outer flock didn't finish (deadlock?): $out"
+fi
+grep -q "drop the outer flock" <<<"$out" || fail "with-cluster-lock under a descriptor-form outer flock printed no notice: $out"
+# And a lock held that way by an unrelated process: it says it waits, though
+# /proc/locks names no holder.
+(flock 9 && sleep 3) 9>>"$lock" &
+outer=$!
+wait_until_held || fail "the descriptor-form holder never took the lock"
+out=$(timeout 2 scripts/with-cluster-lock true 2>&1)
+rc=$?
+wait "$outer"
+[ "$rc" = 124 ] || fail "with-cluster-lock didn't wait for a descriptor-form holder (exit $rc): $out"
+grep -q "waiting for the cluster lock" <<<"$out" || fail "with-cluster-lock waited silently for a holder /proc/locks doesn't list: $out"
+
 # 4. Something the command leaves running doesn't keep the lock.
 bg=$(timeout 20 scripts/with-cluster-lock bash -c 'sleep 30 >/dev/null 2>&1 & echo $!')
 if [ -n "$bg" ] && kill -0 "$bg" 2>/dev/null; then
