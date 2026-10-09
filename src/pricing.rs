@@ -547,8 +547,8 @@ mod tests {
         assert_eq!(restarted.current().map(|c| c.fetched_at), Some(good.fetched_at), "saved copy unchanged");
     }
 
-    /// SME-137: each refresh is a `pricing_refresh` span, failed when the
-    /// refresh fails, so its warning reaches the trace.
+    /// SME-137: each refresh is a `pricing_refresh` span, failed (with the
+    /// reason) when the refresh fails.
     #[sqlx::test]
     async fn test_a_failed_refresh_is_a_failed_span(pool: sqlx::PgPool) {
         let url = catalog_server(vec![(500, "oops".to_string())]).await;

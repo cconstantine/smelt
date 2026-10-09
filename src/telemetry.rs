@@ -28,11 +28,15 @@ use tracing_subscriber::util::SubscriberInitExt;
 pub(crate) const STATUS_DESCRIPTION_LIMIT: usize = 500;
 
 /// The OTLP endpoint to export to, when tracing is on: the value of
-/// `OTEL_EXPORTER_OTLP_ENDPOINT`, unless it's unset or blank. The exporter
+/// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`,
+/// whichever is set and not blank. The exporter
 /// reads the variable itself (adding `/v1/traces`); this only decides
 /// whether to build one.
 pub(crate) fn otel_endpoint(env: impl Fn(&str) -> Option<String>) -> Option<String> {
-    env("OTEL_EXPORTER_OTLP_ENDPOINT").filter(|endpoint| !endpoint.trim().is_empty())
+    // The exporter prefers the traces-only variable, as the spec says.
+    ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT"]
+        .into_iter()
+        .find_map(|name| env(name).filter(|endpoint| !endpoint.trim().is_empty()))
 }
 
 /// The database name in a Postgres URL, without its credentials, host or
@@ -382,6 +386,11 @@ mod tests {
         assert_eq!(
             otel_endpoint(env_of(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo:4318")])),
             Some("http://tempo:4318".to_string())
+        );
+        // The exporter takes the traces-only variable too (review 1).
+        assert_eq!(
+            otel_endpoint(env_of(&[("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://tempo:4318/v1/traces")])),
+            Some("http://tempo:4318/v1/traces".to_string())
         );
     }
 
