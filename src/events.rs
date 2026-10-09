@@ -407,10 +407,14 @@ mod server {
         }
 
         /// The ids tests do pick, by hand or from
-        /// `start_ids_clear_of_other_runs`, are all above the shared range.
+        /// `start_ids_clear_of_other_runs`, are all above the shared range,
+        /// which ends where it says. The boundary is checked without a
+        /// channel: a literal id outside a ticket's block is one a later
+        /// test could pick too.
         #[test]
         fn test_an_id_above_the_shared_range_can_be_subscribed() {
-            let conversation_id = TEST_SHARED_IDS_END;
+            refuse_an_id_test_databases_share(TEST_SHARED_IDS_END);
+            let conversation_id = 9_135_000_100;
             let subscription = subscribe(conversation_id);
             assert_eq!(subscriber_count(conversation_id), 1);
             drop(subscription);
