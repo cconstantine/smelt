@@ -4516,32 +4516,6 @@ impl Drop for HeldPage {
     }
 }
 
-/// A server that answers every request after `delay` with an SVG image of
-/// `height` pixels, so an image in a reply grows its bubble after the
-/// reply has rendered. Returns its address.
-async fn serve_late_image(delay: Duration, height: u32) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the late image");
-    let address = format!("http://{}/", listener.local_addr().expect("the late image's address"));
-    tokio::spawn(async move {
-        while let Ok((mut socket, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let mut request = [0u8; 1024];
-                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
-                tokio::time::sleep(delay).await;
-                let body = format!(
-                    "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='{height}'><rect width='300' height='{height}' fill='#88c'/></svg>"
-                );
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: image/svg+xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, format!("{head}{body}").as_bytes()).await;
-            });
-        }
-    });
-    address
-}
-
 /// SME-30: an image in a reply loads after the reply has rendered and
 /// grows it. With the transcript stuck to its bottom, it stays at its
 /// bottom; with the pointer over the transcript, the text under the
@@ -4549,7 +4523,13 @@ async fn serve_late_image(delay: Duration, height: u32) -> String {
 /// that isn't new content).
 async fn scenario_markdown_late_image(t: &Scenario<'_>) {
     for pointer in [false, true] {
-        let image = serve_late_image(Duration::from_secs(2), 400).await;
+        // Held until the "before" state is recorded, so the image is still
+        // loading then however slow the runner (SME-118).
+        let image = HeldPage::start(
+            "image/svg+xml",
+            "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='400'><rect width='300' height='400' fill='#88c'/></svg>",
+        )
+        .await;
         let conversation = t.conversation().await;
         for i in 0..20 {
             db::create_message(
@@ -4565,7 +4545,7 @@ async fn scenario_markdown_late_image(t: &Scenario<'_>) {
             t.pool,
             conversation.id,
             "assistant",
-            &[anthropic::ContentBlock::Text { text: format!("A picture:\n\n![late]({image})\n\nThe end.") }],
+            &[anthropic::ContentBlock::Text { text: format!("A picture:\n\n![late]({})\n\nThe end.", image.address()) }],
         )
         .await
         .expect("seed the reply with an image");
@@ -4605,6 +4585,7 @@ async fn scenario_markdown_late_image(t: &Scenario<'_>) {
                 .expect("a number");
             before = Some(top);
         }
+        image.release();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             let complete: bool = page
