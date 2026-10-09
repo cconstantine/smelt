@@ -18,7 +18,8 @@ fail() {
 }
 
 # None of the scripts the gate or a hands-on check runs removes a file.
-for script in scripts/check-server scripts/browser-tier scripts/check.sh scripts/lint-expects scripts/build-sandbox-image.sh; do
+for script in scripts/check-server scripts/browser-tier scripts/check.sh scripts/lint-expects scripts/build-sandbox-image.sh \
+    scripts/with-cluster-lock; do
     if found=$(grep -nE '(^|[^[:alnum:]_-])(rm|rmdir|unlink|shred)([[:space:]]|$)|-delete([[:space:]]|$)' "$script" | grep -vE '^[0-9]+:[[:space:]]*#'); then
         fail "$script removes files: $found"
     fi
@@ -26,6 +27,25 @@ done
 
 dir=$PWD/target/test-check-scripts
 mkdir -p "$dir/bin"
+
+# Every lock these scripts take goes here, never the real cluster lock
+# (SME-100): another session's gate may hold that one.
+export SMELT_LOCK_DIR=$dir/locks
+mkdir -p "$SMELT_LOCK_DIR"
+lock=$SMELT_LOCK_DIR/smelt-cluster.lock
+lock_log=$SMELT_LOCK_DIR/smelt-cluster-lock.log
+: >"$lock_log"
+# Whether the cluster lock is free: a fresh open and a non-blocking flock,
+# which fails while any other open of the file holds it.
+lock_is_free() { flock -n "$lock" true; }
+# Waits up to 10 s for the cluster lock to be taken.
+wait_until_held() {
+    for _ in $(seq 1 100); do
+        lock_is_free || return 0
+        sleep 0.1
+    done
+    return 1
+}
 
 # dx serve: runs until stopped, like the real one. It first records the
 # log settings it was started with (the server it runs inherits them) and
@@ -261,6 +281,101 @@ dx_env_after_start >/dev/null
 check_server stop >/dev/null
 out=$(check_server status)
 grep -qF "$log_file" <<<"$out" || fail "status when stopped doesn't name the log: $out"
+
+# scripts/with-cluster-lock (SME-100). Every wait is bounded with timeout,
+# so a deadlock fails a case rather than hanging the run.
+
+# 1. The lock is held for the command, and only for it; its exit status
+# comes back.
+out=$(timeout 20 scripts/with-cluster-lock bash -c 'flock -n "$1" true && echo free || echo held' _ "$lock" 2>&1)
+[ "$out" = held ] || fail "with-cluster-lock: during the command the lock was: $out"
+lock_is_free || fail "with-cluster-lock: the lock is still held after the command"
+timeout 20 scripts/with-cluster-lock true || fail "with-cluster-lock true exited $?"
+timeout 20 scripts/with-cluster-lock bash -c 'exit 3'
+rc=$?
+[ "$rc" = 3 ] || fail "with-cluster-lock didn't pass on the command's exit status 3: $rc"
+
+# 2. A second run waits, naming the holder, and runs once the first ends.
+gate=$dir/lock-gate b_out=$dir/lock-b-out b_err=$dir/lock-b-err
+: >"$gate"
+: >"$b_out"
+# Not under timeout: $! must be with-cluster-lock's own pid, the holder.
+# Each command bounds itself instead.
+scripts/with-cluster-lock bash -c 'for _ in $(seq 1 300); do [ -s "$1" ] && exit 0; sleep 0.1; done; exit 1' _ "$gate" 2>/dev/null &
+a=$!
+wait_until_held || fail "with-cluster-lock: run A never took the lock"
+scripts/with-cluster-lock bash -c 'echo ran >"$1"' _ "$b_out" 2>"$b_err" &
+b=$!
+sleep 1
+grep -q "waiting for the cluster lock (held by pid $a" "$b_err" ||
+    fail "with-cluster-lock: run B didn't say it waits for pid $a: $(cat "$b_err")"
+[ -s "$b_out" ] && fail "with-cluster-lock: run B ran while A held the lock"
+echo go >"$gate"
+wait "$a" || fail "with-cluster-lock: run A failed"
+wait "$b" || fail "with-cluster-lock: run B failed"
+[ -s "$b_out" ] || fail "with-cluster-lock: run B never ran after A finished"
+
+# 3. Re-entry: under an old outer flock it runs inside that lock, with a
+# notice; inside itself, silently.
+if ! out=$(timeout 10 flock "$lock" scripts/with-cluster-lock true 2>&1); then
+    fail "with-cluster-lock under an outer flock didn't finish (deadlock?): $out"
+fi
+grep -q "drop the outer flock" <<<"$out" || fail "with-cluster-lock under an outer flock printed no notice: $out"
+if ! out=$(timeout 10 scripts/with-cluster-lock scripts/with-cluster-lock true 2>&1); then
+    fail "with-cluster-lock inside itself didn't finish (deadlock?): $out"
+fi
+[ -z "$out" ] || fail "with-cluster-lock inside itself printed: $out"
+
+# 4. Something the command leaves running doesn't keep the lock.
+bg=$(timeout 20 scripts/with-cluster-lock bash -c 'sleep 30 >/dev/null 2>&1 & echo $!')
+if [ -n "$bg" ] && kill -0 "$bg" 2>/dev/null; then
+    lock_is_free || fail "with-cluster-lock: a background child of the command kept the lock"
+    kill "$bg"
+else
+    fail "with-cluster-lock: the background sleep isn't running: '$bg'"
+fi
+
+# 5. A killed holder frees the lock.
+child_pid=$dir/lock-child-pid
+: >"$child_pid"
+scripts/with-cluster-lock bash -c 'echo $$ >"$1"; exec sleep 30' _ "$child_pid" &
+holder=$!
+wait_until_held || fail "with-cluster-lock: the holder to kill never took the lock"
+kill -9 "$holder"
+wait "$holder" 2>/dev/null
+sleep 0.2
+lock_is_free || fail "with-cluster-lock: the lock is still held after its holder was killed"
+[ -s "$child_pid" ] && kill "$(cat "$child_pid")" 2>/dev/null
+
+# 6. The log: a line per run with its wait, hold, status and worktree, and
+# re-entered runs marked.
+grep -E "waited=[0-9]+ held=[0-9]+ exit=3 worktree=$PWD " "$lock_log" >/dev/null ||
+    fail "with-cluster-lock's log has no line for the exit-3 run: $(cat "$lock_log")"
+grep -E "reentered held=[0-9]+ exit=0 worktree=$PWD " "$lock_log" >/dev/null ||
+    fail "with-cluster-lock's log has no re-entered line: $(cat "$lock_log")"
+
+# 13. --output: the command's output goes to the file, the waiting line
+# doesn't; and the lock is found from the script's own checkout, not the
+# caller's directory.
+out_file=$dir/lock-output out_err=$dir/lock-output-err
+: >"$out_file"
+timeout 30 flock "$lock" sleep 2 &
+outer=$!
+wait_until_held || fail "--output: the outer holder never took the lock"
+(cd / && timeout 30 "$OLDPWD/scripts/with-cluster-lock" --output "$out_file" bash -c 'echo hello; echo oops >&2') 2>"$out_err" ||
+    fail "with-cluster-lock --output failed: $(cat "$out_err")"
+wait "$outer"
+[ "$(cat "$out_file")" = "$(printf 'hello\noops')" ] || fail "--output wrote: $(cat "$out_file")"
+grep -q "waiting for the cluster lock" "$out_err" || fail "--output: no waiting line on stderr: $(cat "$out_err")"
+grep -q "waiting" "$out_file" && fail "--output: the waiting line went into the output file"
+# A repository of its own: with SMELT_LOCK_DIR unset, the lock is its git
+# common dir's, wherever it's run from.
+fake=$dir/fake-repo
+[ -d "$fake/.git" ] || git init -q "$fake"
+mkdir -p "$fake/scripts"
+cp scripts/with-cluster-lock "$fake/scripts/with-cluster-lock"
+out=$(cd / && env -u SMELT_LOCK_DIR timeout 20 "$fake/scripts/with-cluster-lock" bash -c 'flock -n "$1" true && echo free || echo held' _ "$fake/.git/smelt-cluster.lock" 2>&1)
+[ "$out" = held ] || fail "with-cluster-lock run from / didn't lock its own repository's lock: $out"
 
 if [ "$failures" -gt 0 ]; then
     echo "$failures failure(s)"

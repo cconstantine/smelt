@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Runs one command under the cluster lock and exits with its status (SME-100):
+#
+#   scripts/with-cluster-lock [--output FILE] COMMAND [ARGS...]
+#
+# The lock keeps test runs apart: the real-cluster tests share the
+# `smelt-park-test` namespace, and two runs of the suite on one Postgres
+# server drop each other's `#[sqlx::test]` databases (sqlx names them from
+# the test's path alone). scripts/check.sh, scripts/browser-tier,
+# scripts/cluster-test and scripts/clean-test-namespace.sh take it through
+# this, around their test run only, after building.
+#
+# The lock is `flock` on $SMELT_LOCK_DIR/smelt-cluster.lock. SMELT_LOCK_DIR
+# defaults to the git common dir of the checkout this script is in (not the
+# caller's directory): one file for every worktree, the same one the old
+# outer `flock` convention used. scripts/test-check-scripts sets it, so its
+# cases never touch the real lock.
+#
+# - Waiting: when another process holds the lock, says once who (pid,
+#   command, directory), then waits.
+# - The command doesn't inherit the lock (`flock -o`): something it leaves
+#   running in the background can't keep it once the command ends. Killing
+#   this script (its pid is the holder's) frees it.
+# - Re-entry: when an ancestor process already holds the lock, the command
+#   runs inside that lock instead of deadlocking on it: silently when the
+#   ancestor is this script, with a notice when it's an old outer `flock`.
+#   Needs /proc/locks (Linux); without it, says re-entry detection is off.
+# - --output FILE: the command's stdout and stderr go to FILE (emptied
+#   first), while this script's own lines stay on its stderr.
+# - The log: each run appends one line to $SMELT_LOCK_DIR/smelt-cluster-lock.log
+#   (start, waited, held, exit status, worktree, the command's first words),
+#   written while the lock is still held, so lines never interleave.
+#   Nothing is ever removed (SME-107).
+set -uo pipefail
+
+self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+here=$(dirname "$self")
+
+worktree() { git -C "$here" rev-parse --show-toplevel 2>/dev/null || echo "$here"; }
+utc() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+
+# Runs the command, into --output's file when given; returns its status.
+run() {
+    if [ -n "$output" ]; then
+        "$@" >"$output" 2>&1
+    else
+        "$@"
+    fi
+}
+
+# The second half, run by `flock` below once the lock is taken: runs the
+# command (which never had the lock's descriptor) and logs the run while
+# the lock is still held.
+if [ -n "${_SMELT_LOCK_INNER:-}" ]; then
+    asked=$_SMELT_LOCK_ASKED output=$_SMELT_LOCK_OUTPUT log=$_SMELT_LOCK_LOG
+    unset _SMELT_LOCK_INNER _SMELT_LOCK_ASKED _SMELT_LOCK_OUTPUT _SMELT_LOCK_LOG
+    took=$EPOCHSECONDS
+    run "$@"
+    rc=$?
+    printf '%s waited=%d held=%d exit=%d worktree=%s cmd=%s\n' "$(utc "$asked")" \
+        $((took - asked)) $((EPOCHSECONDS - took)) "$rc" "$(worktree)" "${*:1:3}" >>"$log"
+    exit "$rc"
+fi
+
+output=""
+if [ "${1:-}" = "--output" ]; then
+    [ $# -ge 2 ] || { echo "with-cluster-lock: --output needs a file" >&2; exit 2; }
+    output=$2
+    shift 2
+fi
+if [ $# -eq 0 ]; then
+    sed -n '2,33p' "$self" | sed 's/^# \{0,1\}//' >&2
+    exit 2
+fi
+
+lock_dir=${SMELT_LOCK_DIR:-$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)} || exit 1
+lock=$lock_dir/smelt-cluster.lock
+log=$lock_dir/smelt-cluster-lock.log
+: >>"$lock" || exit 1
+
+# The pids /proc/locks names as holding a flock on the lock file (not the
+# ones waiting for it, whose lines have "->" before FLOCK). A lock whose
+# taker has exited (a short-lived `flock FD`) isn't listed at all.
+holders() {
+    local dev ino
+    read -r dev ino < <(stat -L -c '%Hd:%Ld %i' "$lock") || return 1
+    dev=$(printf '%02x:%02x' "${dev%%:*}" "${dev##*:}")
+    awk -v id="$dev:$ino" '$2 == "FLOCK" && $6 == id { print $5 }' /proc/locks
+}
+
+# This process's ancestors, parent first.
+ancestors() {
+    local pid=$$ ppid
+    while [ "$pid" -gt 1 ]; do
+        # The fields after the command name, which may hold spaces or ")".
+        ppid=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f2)
+        [ -n "$ppid" ] || break
+        echo "$ppid"
+        pid=$ppid
+    done
+}
+
+describe() { # pid: its command line and directory
+    local cmd cwd
+    cmd=$(tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null)
+    cwd=$(readlink "/proc/$1/cwd" 2>/dev/null)
+    echo "pid $1, ${cmd% }, in ${cwd:-?}"
+}
+
+asked=$EPOCHSECONDS
+if [ -r /proc/locks ]; then
+    held_by=$(holders)
+    mine=$(ancestors)
+    for pid in $held_by; do
+        grep -qx "$pid" <<<"$mine" || continue
+        # Inside the lock already: run the command under it.
+        if [ "$pid" != "${SMELT_CLUSTER_LOCK_HOLDER:-}" ]; then
+            echo "the cluster lock is already held by an enclosing $(describe "$pid"); running inside it. The scripts take the lock themselves since SME-100: drop the outer flock." >&2
+        fi
+        run "$@"
+        rc=$?
+        printf '%s reentered held=%d exit=%d worktree=%s cmd=%s\n' "$(utc "$asked")" \
+            $((EPOCHSECONDS - asked)) "$rc" "$(worktree)" "${*:1:3}" >>"$log"
+        exit "$rc"
+    done
+    for pid in $held_by; do
+        echo "waiting for the cluster lock (held by $(describe "$pid"))" >&2
+        break
+    done
+else
+    echo "with-cluster-lock: can't read /proc/locks, so re-entry detection is off: an enclosing flock on $lock would deadlock this" >&2
+fi
+
+# flock keeps this pid (exec), so the holder /proc/locks names is this
+# process, and a run of this script inside the command finds it among its
+# ancestors and in SMELT_CLUSTER_LOCK_HOLDER.
+export SMELT_CLUSTER_LOCK_HOLDER=$$
+_SMELT_LOCK_INNER=1 _SMELT_LOCK_ASKED=$asked _SMELT_LOCK_OUTPUT=$output _SMELT_LOCK_LOG=$log \
+    exec flock -o "$lock" "$self" "$@"
