@@ -271,6 +271,8 @@ mod server {
     /// the first subscriber; the last one to go takes it away again
     /// (`Subscription`'s drop).
     pub fn subscribe(conversation_id: i64) -> Subscription {
+        #[cfg(test)]
+        refuse_an_id_test_databases_share(conversation_id);
         let mut buses = BUSES.lock().unwrap_or_else(|e| e.into_inner());
         let sender = buses
             .entry(conversation_id)
@@ -351,15 +353,31 @@ mod server {
         APP_BUS.subscribe()
     }
 
-    /// How many live app-wide subscriptions there are.
+    /// Below this, a conversation id is one every `#[sqlx::test]`
+    /// database hands out: each numbers conversations from 1, and tests run
+    /// alongside each other in one process, so two tests' "conversation 1"
+    /// are one channel. No test database gets near it; the ids tests pick
+    /// by hand, and `db::test_support::start_ids_clear_of_other_runs`'s
+    /// bases, are far above it (SME-135).
     #[cfg(test)]
-    pub fn app_subscriber_count() -> usize {
-        APP_BUS.receiver_count()
+    pub(crate) const TEST_SHARED_IDS_END: i64 = 100_000;
+
+    /// In tests, refuses to listen on an id another test's database also
+    /// hands out: what such a test hears, or counts, depends on what runs
+    /// alongside it. Before the map's lock, so the panic can't poison it.
+    #[cfg(test)]
+    fn refuse_an_id_test_databases_share(conversation_id: i64) {
+        assert!(
+            conversation_id >= TEST_SHARED_IDS_END,
+            "conversation {conversation_id}: tests subscribe only on a conversation id of their own; \
+             see docs/testing.md, Tests that touch per-conversation state"
+        );
     }
 
     /// How many live subscriptions `conversation_id` has.
     #[cfg(test)]
     pub fn subscriber_count(conversation_id: i64) -> usize {
+        refuse_an_id_test_databases_share(conversation_id);
         BUSES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -370,6 +388,7 @@ mod server {
     /// Whether `conversation_id` has a channel at all.
     #[cfg(test)]
     pub fn has_channel(conversation_id: i64) -> bool {
+        refuse_an_id_test_databases_share(conversation_id);
         BUSES.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&conversation_id)
     }
 
@@ -377,6 +396,30 @@ mod server {
     mod tests {
         use super::super::TokenUsage;
         use super::*;
+
+        /// SME-135: a test listening on an id every test database hands
+        /// out (conversation 1, say) would hear, or count, other tests'
+        /// events depending on what runs alongside it; it's refused.
+        #[test]
+        #[should_panic(expected = "tests subscribe only on a conversation id of their own")]
+        fn test_subscribing_on_an_id_test_databases_share_is_refused() {
+            let _subscription = subscribe(1);
+        }
+
+        /// The ids tests do pick, by hand or from
+        /// `start_ids_clear_of_other_runs`, are all above the shared range,
+        /// which ends where it says. The boundary is checked without a
+        /// channel: a literal id outside a ticket's block is one a later
+        /// test could pick too.
+        #[test]
+        fn test_an_id_above_the_shared_range_can_be_subscribed() {
+            refuse_an_id_test_databases_share(TEST_SHARED_IDS_END);
+            let conversation_id = 9_135_000_100;
+            let subscription = subscribe(conversation_id);
+            assert_eq!(subscriber_count(conversation_id), 1);
+            drop(subscription);
+            assert!(!has_channel(conversation_id));
+        }
 
         /// SME-91: a conversation's channel (about 150 KB) goes with its
         /// last subscriber, rather than staying for good.
@@ -444,12 +487,22 @@ mod server {
         #[tokio::test]
         async fn test_publish_app_reaches_app_subscribers() {
             let mut rx = subscribe_app();
+            // Another test's app event first, as one running alongside
+            // can publish.
+            publish_app(super::super::AppEvent::TurnsChanged);
             publish_app(super::super::AppEvent::PodsChanged);
-            let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-                .await
-                .expect("an app event should arrive")
-                .expect("the channel stays open");
-            assert_eq!(received, super::super::AppEvent::PodsChanged);
+            // The app-wide channel is shared with every test running
+            // alongside: wait for this one, skipping theirs (SME-135).
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let received = rx.recv().await.expect("the channel stays open");
+                    if received == super::super::AppEvent::PodsChanged {
+                        return;
+                    }
+                }
+            })
+            .await
+            .expect("PodsChanged should arrive");
         }
 
         #[tokio::test]
@@ -468,8 +521,10 @@ mod server {
 
         #[tokio::test]
         async fn test_publish_with_no_subscribers_is_a_noop() {
+            // An id of its own: an event on a shared "conversation 1"
+            // would reach every other test listening on theirs (SME-135).
             publish(
-                1,
+                9_135_000_001,
                 ConversationEvent::SandboxCommandUpdate {
                     terminal_id: 1,
                     command_id: "t1".to_string(),
@@ -487,7 +542,7 @@ mod server {
 
         #[tokio::test]
         async fn test_subscribe_then_publish_delivers_event() {
-            let mut rx = subscribe(2);
+            let mut rx = subscribe(9_135_000_002);
             let event = ConversationEvent::SandboxCommandUpdate {
                 terminal_id: 1,
                 command_id: "t1".to_string(),
@@ -498,15 +553,15 @@ mod server {
                 latest_output: Some("count: 1/5".to_string()),
                 position: None,
             };
-            publish(2, event.clone());
+            publish(9_135_000_002, event.clone());
 
             assert_eq!(rx.recv().await.expect("event should be delivered"), event);
         }
 
         #[tokio::test]
         async fn test_two_subscribers_both_receive_same_event() {
-            let mut rx1 = subscribe(3);
-            let mut rx2 = subscribe(3);
+            let mut rx1 = subscribe(9_135_000_003);
+            let mut rx2 = subscribe(9_135_000_003);
             let event = ConversationEvent::SandboxCommandUpdate {
                 terminal_id: 1,
                 command_id: "t1".to_string(),
@@ -517,7 +572,7 @@ mod server {
                 latest_output: None,
                 position: None,
             };
-            publish(3, event.clone());
+            publish(9_135_000_003, event.clone());
 
             assert_eq!(rx1.recv().await.expect("rx1 should receive"), event);
             assert_eq!(rx2.recv().await.expect("rx2 should receive"), event);
@@ -525,7 +580,7 @@ mod server {
 
         #[tokio::test]
         async fn test_events_are_scoped_per_conversation() {
-            let mut rx_a = subscribe(4);
+            let mut rx_a = subscribe(9_135_000_004);
             let rx_b_event = ConversationEvent::SandboxCommandUpdate {
                 terminal_id: 1,
                 command_id: "t1".to_string(),
@@ -536,7 +591,7 @@ mod server {
                 latest_output: None,
                 position: None,
             };
-            publish(5, rx_b_event);
+            publish(9_135_000_005, rx_b_event);
 
             let a_event = ConversationEvent::SandboxCommandUpdate {
                 terminal_id: 1,
@@ -548,12 +603,12 @@ mod server {
                 latest_output: None,
                 position: None,
             };
-            publish(4, a_event.clone());
+            publish(9_135_000_004, a_event.clone());
 
             assert_eq!(
                 rx_a.recv()
                     .await
-                    .expect("conversation 4's subscriber should see its own event"),
+                    .expect("conversation 9_135_000_004's subscriber should see its own event"),
                 a_event
             );
         }
@@ -565,14 +620,14 @@ mod server {
         /// and is delivered back equal to what was sent).
         #[tokio::test]
         async fn test_sandbox_variants_round_trip_the_bus() {
-            let mut rx = subscribe(6);
+            let mut rx = subscribe(9_135_000_006);
 
             let pod_event = ConversationEvent::SandboxPodUpdate {
                 pod_id: 1,
                 status: "Running".to_string(),
                 terminated: false,
             };
-            publish(6, pod_event.clone());
+            publish(9_135_000_006, pod_event.clone());
             assert_eq!(
                 rx.recv().await.expect("pod event should be delivered"),
                 pod_event
@@ -584,7 +639,7 @@ mod server {
                 status: "connected".to_string(),
                 terminated: false,
             };
-            publish(6, terminal_event.clone());
+            publish(9_135_000_006, terminal_event.clone());
             assert_eq!(
                 rx.recv().await.expect("terminal event should be delivered"),
                 terminal_event
@@ -600,7 +655,7 @@ mod server {
                 latest_output: Some("hi".to_string()),
                 position: None,
             };
-            publish(6, command_event.clone());
+            publish(9_135_000_006, command_event.clone());
             assert_eq!(
                 rx.recv().await.expect("command event should be delivered"),
                 command_event
@@ -609,7 +664,7 @@ mod server {
             let failure_event = ConversationEvent::NotificationDeliveryFailed {
                 detail: "No model is chosen for this conversation.".to_string(),
             };
-            publish(6, failure_event.clone());
+            publish(9_135_000_006, failure_event.clone());
             assert_eq!(
                 rx.recv()
                     .await
@@ -626,7 +681,7 @@ mod server {
                 },
                 context_window: 200_000,
             };
-            publish(6, context_usage_event.clone());
+            publish(9_135_000_006, context_usage_event.clone());
             assert_eq!(
                 rx.recv()
                     .await
@@ -640,7 +695,7 @@ mod server {
 #[cfg(feature = "server")]
 pub use server::{forget, publish, publish_app, subscribe, subscribe_app};
 #[cfg(all(feature = "server", test))]
-pub use server::{app_subscriber_count, has_channel, subscriber_count};
+pub use server::{has_channel, subscriber_count};
 
 #[cfg(test)]
 mod wire_tests {
