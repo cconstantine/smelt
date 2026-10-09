@@ -9,7 +9,8 @@
 # The image is SANDBOX_IMAGE when set (scripts/check.sh sets it), else this
 # working tree's own (`scripts/sandbox-image-ref`): named after the agent
 # sources it was built from, so whichever checkout built it, it's this
-# tree's agent (SME-102, SME-84). No record file.
+# tree's agent (SME-102, SME-84). No record file. It's also the image a
+# server built from this tree runs when SANDBOX_IMAGE is unset (SME-121).
 #
 # Run by scripts/check.sh and scripts/browser-tier before their tests;
 # exits non-zero with what to do. SANDBOX_IMAGE_IMPORT replaces the import

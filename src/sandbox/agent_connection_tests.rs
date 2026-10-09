@@ -1,6 +1,7 @@
 use super::*;
 use crate::agent_protocol::{DirEntry, Reply};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::api::pods::AgentStatus;
 
 /// What the fake agent sends first on every connection.
 #[derive(Clone)]
@@ -77,6 +78,33 @@ impl AgentDialer for FakeDialer {
     fn death_reason(&self, _pod_id: i64) -> BoxFuture<'_, Option<Option<String>>> {
         Box::pin(async { None })
     }
+
+    fn image(&self, pod_id: i64) -> BoxFuture<'_, Option<String>> {
+        let held = image_reads_held().lock().unwrap_or_else(|e| e.into_inner()).get(&pod_id).cloned();
+        Box::pin(async move {
+            if let Some((reading, release)) = held {
+                reading.notify_one();
+                release.notified().await;
+            }
+            fake_images().lock().unwrap_or_else(|e| e.into_inner()).get(&pod_id).cloned()
+        })
+    }
+}
+
+/// Pods whose image read waits: it signals the first `Notify` once it has
+/// started, then waits for the second.
+#[allow(clippy::type_complexity)]
+fn image_reads_held() -> &'static StdMutex<HashMap<i64, (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>> {
+    static HELD: LazyLock<StdMutex<HashMap<i64, (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>> =
+        LazyLock::new(Default::default);
+    &HELD
+}
+
+/// The image each fake pod "runs", by pod id; a pod with none reads as
+/// unknown.
+fn fake_images() -> &'static StdMutex<HashMap<i64, String>> {
+    static IMAGES: LazyLock<StdMutex<HashMap<i64, String>>> = LazyLock::new(Default::default);
+    &IMAGES
 }
 
 /// A fake agent for `pod_id`, reached through `dialer_for`.
@@ -336,14 +364,14 @@ async fn test_a_protocol_0_agent_is_outdated_for_good(pool: PgPool) {
     let agent = fake_agent(pod_id, Greeting::Raw(v0_line.into()), Duration::ZERO).await;
 
     let err = reconnect_if_needed(&pool, pod_id).await.map(|_| ()).expect_err("outdated");
-    assert!(matches!(err, TerminalError::AgentOutdated { found: None }), "{err:?}");
+    assert!(matches!(err, TerminalError::AgentOutdated { found: None, .. }), "{err:?}");
     let text = err.to_string();
     assert!(text.contains("terminate_pod") && text.contains("create_pod"), "{text}");
     assert_eq!(agent.dials.load(Ordering::SeqCst), 1, "an outdated agent was retried");
     assert!(db::sandbox_pod_is_live(&pool, pod_id).await.expect("live?"), "the pod was cleaned up as a crash");
 
     let again = reconnect_if_needed(&pool, pod_id).await.map(|_| ());
-    assert!(matches!(again, Err(TerminalError::AgentOutdated { found: None })), "{again:?}");
+    assert!(matches!(again, Err(TerminalError::AgentOutdated { found: None, .. })), "{again:?}");
     assert_eq!(agent.dials.load(Ordering::SeqCst), 1, "the second call dialled again");
 }
 
@@ -353,8 +381,119 @@ async fn test_an_agent_on_another_major_is_outdated(pool: PgPool) {
     let next_major = ProtocolVersion { major: PROTOCOL_VERSION.major + 1, minor: 0 };
     let _agent = fake_agent(pod_id, Greeting::Hello(next_major), Duration::ZERO).await;
     let err = reconnect_if_needed(&pool, pod_id).await.map(|_| ()).expect_err("outdated");
-    assert!(matches!(err, TerminalError::AgentOutdated { found: Some(v) } if v == next_major), "{err:?}");
+    assert!(matches!(err, TerminalError::AgentOutdated { found: Some(v), .. } if v == next_major), "{err:?}");
     assert!(err.to_string().contains(&format!("protocol {next_major}")), "{err}");
+}
+
+/// SME-121: a refused pod that runs another image than a new pod would
+/// (an older build, or `:latest`) is told to recreate, which gets it a
+/// newer agent.
+#[sqlx::test]
+async fn test_a_refused_pod_on_an_older_image_is_told_to_recreate(pool: PgPool) {
+    let (_, pod_id) = pod_row(&pool).await;
+    let older = "docker.io/library/smelt-sandbox:src-0000000000000000";
+    assert_ne!(older, default_sandbox_image());
+    fake_images().lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, older.to_string());
+    let next_major = ProtocolVersion { major: PROTOCOL_VERSION.major + 1, minor: 0 };
+    let _agent = fake_agent(pod_id, Greeting::Hello(next_major), Duration::ZERO).await;
+
+    let err = reconnect_if_needed(&pool, pod_id).await.map(|_| ()).expect_err("outdated");
+    assert!(matches!(err, TerminalError::AgentOutdated { image: PodImage::Older, .. }), "{err:?}");
+    let text = err.to_string();
+    assert!(text.contains("Call terminate_pod, then create_pod"), "{text}");
+    assert!(!text.contains("build-sandbox-image"), "{text}");
+    assert_eq!(
+        agent_status(pod_id),
+        Some(AgentStatus::RestartRequired { version: Some(next_major.to_string()), rebuild_image: false })
+    );
+}
+
+/// SME-121: a refused pod that already runs the image a new pod would get
+/// can't be fixed by recreating it, so the error says not to retry and to
+/// have the image rebuilt, now and on every later call; `/pods` says the
+/// image needs rebuilding, then a restart.
+#[sqlx::test]
+async fn test_a_refused_pod_on_the_image_a_new_pod_gets_says_to_rebuild_it(pool: PgPool) {
+    let (_, pod_id) = pod_row(&pool).await;
+    let image = default_sandbox_image();
+    fake_images().lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, image.clone());
+    let v0_line = r#"{"id":"cmd-1","terminal_id":"3","stream":"stdout","seq":1,"data":"hi"}"#;
+    let _agent = fake_agent(pod_id, Greeting::Raw(v0_line.into()), Duration::ZERO).await;
+
+    for attempt in ["first", "remembered"] {
+        let err = reconnect_if_needed(&pool, pod_id).await.map(|_| ()).expect_err("outdated");
+        assert!(
+            matches!(&err, TerminalError::AgentOutdated { image: PodImage::SameAsNew(i), .. } if *i == image),
+            "{attempt}: {err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains(&image), "{attempt}: names the image: {text}");
+        assert!(text.contains("won't help") && text.contains("Don't retry"), "{attempt}: {text}");
+        // Review 1: the image is rebuilt under the same name, and the pod
+        // still runs the old one, so the advice says what to do after.
+        assert!(text.contains("Once it's rebuilt, call terminate_pod, then create_pod"), "{attempt}: {text}");
+        assert!(text.contains("scripts/build-sandbox-image.sh"), "{attempt}: {text}");
+        assert!(!text.contains("Call terminate_pod, then create_pod"), "{attempt}: {text}");
+    }
+    assert_eq!(agent_status(pod_id), Some(AgentStatus::RestartRequired { version: None, rebuild_image: true }));
+}
+
+/// SME-121: when the pod's image can't be read, the error keeps the
+/// recreate advice and adds what to do if a new pod is refused too.
+#[sqlx::test]
+async fn test_a_refused_pod_whose_image_is_unknown_hedges_its_advice(pool: PgPool) {
+    let (_, pod_id) = pod_row(&pool).await;
+    let next_major = ProtocolVersion { major: PROTOCOL_VERSION.major + 1, minor: 0 };
+    let _agent = fake_agent(pod_id, Greeting::Hello(next_major), Duration::ZERO).await;
+
+    let err = reconnect_if_needed(&pool, pod_id).await.map(|_| ()).expect_err("outdated");
+    assert!(matches!(err, TerminalError::AgentOutdated { image: PodImage::Unknown, .. }), "{err:?}");
+    let text = err.to_string();
+    assert!(text.contains("Call terminate_pod, then create_pod"), "{text}");
+    assert!(text.contains("If a new pod is refused too") && text.contains("scripts/build-sandbox-image.sh"), "{text}");
+}
+
+/// Review 1: an image read that failed isn't remembered as the answer:
+/// the next call reads it again (without dialling the agent again), and
+/// gives the advice that image calls for.
+#[sqlx::test]
+async fn test_an_image_that_couldnt_be_read_is_read_again_next_time(pool: PgPool) {
+    let (_, pod_id) = pod_row(&pool).await;
+    let v0_line = r#"{"id":"cmd-1","terminal_id":"3","stream":"stdout","seq":1,"data":"hi"}"#;
+    let agent = fake_agent(pod_id, Greeting::Raw(v0_line.into()), Duration::ZERO).await;
+
+    let first = reconnect_if_needed(&pool, pod_id).await.map(|_| ()).expect_err("outdated");
+    assert!(matches!(first, TerminalError::AgentOutdated { image: PodImage::Unknown, .. }), "{first:?}");
+
+    let image = default_sandbox_image();
+    fake_images().lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, image.clone());
+    let again = reconnect_if_needed(&pool, pod_id).await.map(|_| ()).expect_err("outdated");
+    assert!(matches!(&again, TerminalError::AgentOutdated { image: PodImage::SameAsNew(i), .. } if *i == image), "{again:?}");
+    assert_eq!(agent_status(pod_id), Some(AgentStatus::RestartRequired { version: None, rebuild_image: true }));
+    assert_eq!(agent.dials.load(Ordering::SeqCst), 1, "the agent was dialled again");
+}
+
+#[test]
+fn test_judge_image_compares_a_pods_image_with_a_new_pods() {
+    let new = "docker.io/library/smelt-sandbox:src-1111111111111111";
+    assert_eq!(judge_image(Some(new), new), PodImage::SameAsNew(new.to_string()));
+    assert_eq!(judge_image(Some("docker.io/library/smelt-sandbox:latest"), new), PodImage::Older);
+    assert_eq!(judge_image(None, new), PodImage::Unknown);
+}
+
+/// Review 1: Kubernetes keeps a pod's image as written, so a pod made
+/// under `docker.io/library/smelt-sandbox:latest` and a `SANDBOX_IMAGE` of
+/// `smelt-sandbox:latest` name one image, and recreating can't help.
+#[test]
+fn test_judge_image_takes_short_and_full_names_of_one_image_as_the_same() {
+    let full = "docker.io/library/smelt-sandbox:latest";
+    for short in ["smelt-sandbox:latest", "smelt-sandbox", "library/smelt-sandbox:latest", "docker.io/smelt-sandbox"] {
+        assert!(matches!(judge_image(Some(full), short), PodImage::SameAsNew(_)), "{short}");
+        assert!(matches!(judge_image(Some(short), full), PodImage::SameAsNew(_)), "{short}");
+    }
+    assert_eq!(judge_image(Some("smelt-sandbox:v0"), full), PodImage::Older);
+    assert_eq!(judge_image(Some("registry.example:5000/smelt-sandbox:latest"), full), PodImage::Older);
+    assert_eq!(judge_image(Some("localhost/smelt-sandbox:latest"), full), PodImage::Older);
 }
 
 /// Silence could be an old agent with nothing to say, or a slow link, so
@@ -364,7 +503,7 @@ async fn test_an_agent_that_says_nothing_is_outdated_but_not_for_good(pool: PgPo
     let (_, pod_id) = pod_row(&pool).await;
     let agent = fake_agent(pod_id, Greeting::Nothing, Duration::ZERO).await;
     let err = reconnect_if_needed(&pool, pod_id).await.map(|_| ()).expect_err("outdated");
-    assert!(matches!(err, TerminalError::AgentOutdated { found: None }), "{err:?}");
+    assert!(matches!(err, TerminalError::AgentOutdated { found: None, .. }), "{err:?}");
     let _ = reconnect_if_needed(&pool, pod_id).await;
     assert_eq!(agent.dials.load(Ordering::SeqCst), 2, "silence was remembered as outdated");
 }
@@ -387,8 +526,6 @@ async fn test_another_minor_connects_and_gates_only_newer_features(pool: PgPool)
 /// The Sandboxes page and `list_pods` say what each pod's agent speaks.
 #[sqlx::test]
 async fn test_agent_status_follows_what_the_agent_said(pool: PgPool) {
-    use crate::api::pods::AgentStatus;
-
     let (_, unconnected) = pod_row(&pool).await;
     let _a = fake_agent(unconnected, current(), Duration::ZERO).await;
     assert_eq!(agent_status(unconnected), None, "not connected yet, so unknown");
@@ -417,7 +554,7 @@ async fn test_agent_status_follows_what_the_agent_said(pool: PgPool) {
     let v0_line = r#"{"id":"c","terminal_id":"1","stream":"stdout","seq":1,"data":"x"}"#;
     let _d = fake_agent(old, Greeting::Raw(v0_line.into()), Duration::ZERO).await;
     let _ = reconnect_if_needed(&pool, old).await;
-    assert_eq!(agent_status(old), Some(AgentStatus::RestartRequired { version: None }));
+    assert_eq!(agent_status(old), Some(AgentStatus::RestartRequired { version: None, rebuild_image: false }));
 }
 
 /// Every `smelt::sandbox` log line from every test in this binary, through
@@ -531,4 +668,79 @@ async fn test_try_reconnect_does_not_wait_for_a_connect_in_progress(pool: PgPool
     try_reconnect(&pool, pod_id).await;
     assert!(started.elapsed() < Duration::from_millis(500), "try_reconnect waited {:?}", started.elapsed());
     connecting.await.expect("join").expect("the first connect still succeeds");
+}
+
+/// Review 2: the Sandboxes page's refresh (`try_reconnect`) reads an
+/// unknown image again too, so the page doesn't say "restart" where only
+/// a rebuild helps; it still never dials the refused agent again.
+#[sqlx::test]
+async fn test_a_page_refresh_reads_an_unknown_image_again(pool: PgPool) {
+    let (_, pod_id) = pod_row(&pool).await;
+    let v0_line = r#"{"id":"cmd-1","terminal_id":"3","stream":"stdout","seq":1,"data":"hi"}"#;
+    let agent = fake_agent(pod_id, Greeting::Raw(v0_line.into()), Duration::ZERO).await;
+    let _ = reconnect_if_needed(&pool, pod_id).await;
+    assert_eq!(agent_status(pod_id), Some(AgentStatus::RestartRequired { version: None, rebuild_image: false }));
+
+    fake_images().lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, default_sandbox_image());
+    try_reconnect(&pool, pod_id).await;
+    assert_eq!(agent_status(pod_id), Some(AgentStatus::RestartRequired { version: None, rebuild_image: true }));
+    try_reconnect(&pool, pod_id).await;
+    assert_eq!(agent.dials.load(Ordering::SeqCst), 1, "the refused agent was dialled again");
+}
+
+/// Review 2: a pod torn down while its refused agent's image is read
+/// isn't remembered as outdated afterwards (nothing would ever clear it).
+#[sqlx::test]
+async fn test_a_pod_torn_down_during_the_image_read_isnt_remembered(pool: PgPool) {
+    let (_, pod_id) = pod_row(&pool).await;
+    let (reading, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+    image_reads_held().lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, (reading.clone(), release.clone()));
+    let v0_line = r#"{"id":"cmd-1","terminal_id":"3","stream":"stdout","seq":1,"data":"hi"}"#;
+    let _agent = fake_agent(pod_id, Greeting::Raw(v0_line.into()), Duration::ZERO).await;
+
+    let connecting = tokio::spawn({
+        let pool = pool.clone();
+        async move { reconnect_if_needed(&pool, pod_id).await.map(|_| ()) }
+    });
+    tokio::time::timeout(Duration::from_secs(5), reading.notified()).await.expect("the image read started");
+    deregister(pod_id);
+    release.notify_one();
+    let result = connecting.await.expect("join");
+    assert!(matches!(result, Err(TerminalError::AgentOutdated { .. })), "{result:?}");
+    assert_eq!(outdated(pod_id), None, "a torn-down pod is remembered as outdated");
+    assert_eq!(agent_status(pod_id), None);
+}
+
+/// Review 2: `index.docker.io` is Docker Hub, a first part with capitals
+/// is a registry (as Docker's reference parser takes it), and spaces
+/// around a setting don't make it another image.
+#[test]
+fn test_full_image_name_follows_dockers_reference_rules() {
+    assert_eq!(full_image_name("index.docker.io/library/smelt-sandbox:latest"), "docker.io/library/smelt-sandbox:latest");
+    assert_eq!(full_image_name("index.docker.io/smelt-sandbox"), "docker.io/library/smelt-sandbox:latest");
+    assert_eq!(full_image_name("Registry/team/sandbox:1"), "Registry/team/sandbox:1");
+    assert_eq!(full_image_name(" smelt-sandbox:latest\n"), "docker.io/library/smelt-sandbox:latest");
+    assert_eq!(full_image_name("localhost:5000/sandbox"), "localhost:5000/sandbox:latest");
+    assert_eq!(full_image_name("smelt-sandbox@sha256:abc"), "docker.io/library/smelt-sandbox@sha256:abc");
+}
+
+/// Review 2: the rebuild advice for a pod on the image a new pod gets
+/// names the way to get that image, as the missing-image advice does: the
+/// build script makes only this tree's own image, and `:latest` only with
+/// `--latest`.
+#[test]
+fn test_the_rebuild_advice_fits_the_image() {
+    let advice = |image: &str| {
+        TerminalError::AgentOutdated { found: None, image: PodImage::SameAsNew(image.to_string()) }.to_string()
+    };
+    let own = advice(OWN_SANDBOX_IMAGE);
+    assert!(own.contains("with scripts/build-sandbox-image.sh") && !own.contains("--latest"), "{own}");
+    let latest = advice("smelt-sandbox:latest");
+    assert!(latest.contains("scripts/build-sandbox-image.sh --latest"), "{latest}");
+    let other = advice("registry.example/team/sandbox:1");
+    assert!(other.contains("SANDBOX_IMAGE or SANDBOX_DOCKER_IMAGE names it"), "{other}");
+    assert!(!other.contains("with scripts/build-sandbox-image.sh"), "{other}");
+    for text in [own, latest, other] {
+        assert!(text.contains("Once it's rebuilt, call terminate_pod, then create_pod"), "{text}");
+    }
 }
