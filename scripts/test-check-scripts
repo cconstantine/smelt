@@ -19,7 +19,7 @@ fail() {
 
 # None of the scripts the gate or a hands-on check runs removes a file.
 for script in scripts/check-server scripts/browser-tier scripts/check.sh scripts/lint-expects scripts/build-sandbox-image.sh \
-    scripts/with-cluster-lock; do
+    scripts/with-cluster-lock scripts/cluster-test; do
     if found=$(grep -nE '(^|[^[:alnum:]_-])(rm|rmdir|unlink|shred)([[:space:]]|$)|-delete([[:space:]]|$)' "$script" | grep -vE '^[0-9]+:[[:space:]]*#'); then
         fail "$script removes files: $found"
     fi
@@ -47,11 +47,36 @@ wait_until_held() {
     return 1
 }
 
+# Each stub below that the gate scripts call appends a line to $CALLS (when
+# set): its arguments, then "locked" or "unlocked", whether another process
+# held the cluster lock at the time (SME-100).
+cat >"$dir/bin/lock-state" <<'EOF'
+#!/usr/bin/env bash
+flock -n "$SMELT_LOCK_DIR/smelt-cluster.lock" true && echo unlocked || echo locked
+EOF
+# cargo: records each call. A test run (not --no-run) prints a result line.
+# CARGO_FAIL: a pattern; a call whose arguments match it fails.
+cat >"$dir/bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+echo "cargo $* $(lock-state)" >>"$CALLS"
+if [ -n "${CARGO_FAIL:-}" ] && [[ "$*" =~ $CARGO_FAIL ]]; then
+    echo "error: stub cargo told to fail"
+    exit 101
+fi
+if [ "$1" = test ] && [[ " $* " != *" --no-run "* ]]; then
+    echo "test result: ok. 1 passed; 0 failed"
+fi
+exit 0
+EOF
 # dx serve: runs until stopped, like the real one. It first records the
 # log settings it was started with (the server it runs inherits them) and
-# writes a line of its own to the log.
+# writes a line of its own to the log. dx build records the call and ends.
 cat >"$dir/bin/dx" <<'EOF'
 #!/usr/bin/env bash
+if [ "$1" = build ]; then
+    echo "dx $* $(lock-state)" >>"$CALLS"
+    exit 0
+fi
 echo "stub dx started as $$"
 printf 'RUST_LOG=%s\nNO_COLOR=%s\n' "${RUST_LOG-<unset>}" "${NO_COLOR-<unset>}" >"$DX_ENV.tmp"
 mv "$DX_ENV.tmp" "$DX_ENV"
@@ -61,6 +86,8 @@ EOF
 cat >"$dir/bin/sqlx" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >>"$SQLX_CALLS"
+[ -n "${CALLS:-}" ] && echo "sqlx $* $(lock-state)" >>"$CALLS"
+exit 0
 EOF
 # curl: the server is up at once.
 cat >"$dir/bin/curl" <<'EOF'
@@ -70,9 +97,10 @@ EOF
 # The image check: the cluster has it.
 cat >"$dir/bin/import" <<'EOF'
 #!/usr/bin/env bash
+[ -n "${CALLS:-}" ] && echo "import $(lock-state)" >>"$CALLS"
 exit 0
 EOF
-chmod +x "$dir/bin/dx" "$dir/bin/sqlx" "$dir/bin/curl" "$dir/bin/import"
+chmod +x "$dir/bin/lock-state" "$dir/bin/cargo" "$dir/bin/dx" "$dir/bin/sqlx" "$dir/bin/curl" "$dir/bin/import"
 
 # The check worktree: a clone sharing this repo's objects, so it can check
 # out any commit here without registering a worktree. Reused across runs.
@@ -376,6 +404,86 @@ mkdir -p "$fake/scripts"
 cp scripts/with-cluster-lock "$fake/scripts/with-cluster-lock"
 out=$(cd / && env -u SMELT_LOCK_DIR timeout 20 "$fake/scripts/with-cluster-lock" bash -c 'flock -n "$1" true && echo free || echo held' _ "$fake/.git/smelt-cluster.lock" 2>&1)
 [ "$out" = held ] || fail "with-cluster-lock run from / didn't lock its own repository's lock: $out"
+
+# The gate scripts with stubs for cargo, dx, sqlx and the image check: what
+# runs before the lock, and what under it. They write their logs to this
+# checkout's target/check and target/browser-tier, as a real run does.
+export CALLS=$dir/calls
+gate_env=(env -u SANDBOX_IMAGE -u CARGO_FAIL PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import"
+    DATABASE_URL=postgres://u@localhost/smelt_dev BROWSER_CHECK_CACHE="$dir")
+# Never the real cargo or dx: that would build, and run the real tests.
+for tool in cargo dx sqlx; do
+    [ "$("${gate_env[@]}" bash -c "command -v $tool")" = "$dir/bin/$tool" ] || {
+        echo "the $tool stub isn't first on PATH; stopping before running any gate script" >&2
+        exit 1
+    }
+done
+wasm_check="cargo check --no-default-features --features web --target wasm32-unknown-unknown"
+lints="-- -D warnings -A clippy::all -D clippy::expect_used -D clippy::unwrap_used"
+
+# 7. check.sh builds, lints, compiles the tests and checks the cluster
+# unlocked, and takes the lock for the test run only.
+: >"$CALLS"
+if ! out=$(timeout 60 "${gate_env[@]}" scripts/check.sh 2>&1); then
+    fail "check.sh with stubs failed: $out"
+fi
+expected="$wasm_check unlocked
+cargo build --features server unlocked
+cargo clippy --version unlocked
+cargo clippy --features server $lints unlocked
+cargo clippy --no-default-features --features web --target wasm32-unknown-unknown $lints unlocked
+cargo test --features server --no-run unlocked
+import unlocked
+cargo test --features server locked"
+[ "$(cat "$CALLS")" = "$expected" ] || fail "check.sh's calls: $(cat "$CALLS")"
+# A test build that fails stops check.sh before the lock.
+: >"$CALLS"
+if out=$(timeout 60 "${gate_env[@]}" CARGO_FAIL="--no-run" scripts/check.sh 2>&1); then
+    fail "check.sh passed with a failing test build: $out"
+fi
+grep -q " locked$" "$CALLS" && fail "check.sh took the lock after a failing test build: $(cat "$CALLS")"
+grep -q "stub cargo told to fail" <<<"$out" || fail "check.sh didn't show the test build's error: $out"
+
+# 8. browser-tier likewise: the bundle, the test build and the scratch
+# database unlocked, the tier's run locked.
+: >"$CALLS"
+if ! out=$(timeout 60 "${gate_env[@]}" scripts/browser-tier 2>&1); then
+    fail "browser-tier with stubs failed: $out"
+fi
+tier_db=postgres://u@localhost/smelt_browser_tier_$(basename "$PWD" | tr -c 'a-zA-Z0-9\n' '_')
+expected="import unlocked
+dx build --platform web unlocked
+cargo test --features server browser-test --no-run unlocked
+sqlx database drop -y --database-url $tier_db unlocked
+sqlx database create --database-url $tier_db unlocked
+cargo test --features server browser-test -- --ignored --test-threads=1 locked
+sqlx database drop -y --database-url $tier_db unlocked"
+[ "$(cat "$CALLS")" = "$expected" ] || fail "browser-tier's calls: $(cat "$CALLS")"
+: >"$CALLS"
+if out=$(timeout 60 "${gate_env[@]}" CARGO_FAIL="--no-run" scripts/browser-tier 2>&1); then
+    fail "browser-tier passed with a failing test build: $out"
+fi
+grep -q " locked$" "$CALLS" && fail "browser-tier took the lock after a failing test build: $(cat "$CALLS")"
+
+# 9. cluster-test: the same cargo test, built with --no-run unlocked (before
+# the first --, or last when there's none), then run locked.
+: >"$CALLS"
+timeout 60 "${gate_env[@]}" scripts/cluster-test --features server -- --exact a::b >/dev/null 2>&1 ||
+    fail "cluster-test failed"
+expected="cargo test --features server --no-run -- --exact a::b unlocked
+cargo test --features server -- --exact a::b locked"
+[ "$(cat "$CALLS")" = "$expected" ] || fail "cluster-test's calls: $(cat "$CALLS")"
+: >"$CALLS"
+timeout 60 "${gate_env[@]}" scripts/cluster-test --features server sweep >/dev/null 2>&1 || fail "cluster-test without -- failed"
+expected="cargo test --features server sweep --no-run unlocked
+cargo test --features server sweep locked"
+[ "$(cat "$CALLS")" = "$expected" ] || fail "cluster-test's calls without --: $(cat "$CALLS")"
+: >"$CALLS"
+timeout 60 "${gate_env[@]}" CARGO_FAIL="--no-run" scripts/cluster-test --features server >/dev/null 2>&1
+rc=$?
+[ "$rc" = 101 ] || fail "cluster-test with a failing build exited $rc, not the build's 101"
+grep -q " locked$" "$CALLS" && fail "cluster-test took the lock after a failing build: $(cat "$CALLS")"
+unset CALLS
 
 if [ "$failures" -gt 0 ]; then
     echo "$failures failure(s)"

@@ -17,6 +17,10 @@
 #   (headless Chrome) in a worktree that lacks one and with the variable
 #   unset (SME-51, SME-69).
 #
+# Takes the cluster lock itself (scripts/with-cluster-lock), around the
+# tier's test run only: the bundle, the test build and the scratch database
+# come first, unlocked (SME-100). Don't wrap it in `flock`.
+#
 # Exits with the tests' status. CI runs the same tests on its own stack
 # (.github/workflows/ci.yml) and doesn't use this.
 set -uo pipefail
@@ -63,6 +67,15 @@ if ! dx build --platform web >"$log" 2>&1; then
     exit 1
 fi
 
+# Compiled before the lock, so the locked run below only runs it (SME-100).
+echo "== browser tier (build)"
+build_log=target/browser-tier/test-build.log
+if ! cargo test --features "server browser-test" --no-run >"$build_log" 2>&1; then
+    grep -E '^error' -A8 "$build_log" | head -40
+    echo "the browser tier doesn't build (full log: $build_log)" >&2
+    exit 1
+fi
+
 echo "== scratch database $name"
 # From empty, even after a run that failed to drop it.
 sqlx database drop -y --database-url "$scratch" >/dev/null 2>&1
@@ -70,4 +83,4 @@ sqlx database create --database-url "$scratch" || exit 1
 trap 'sqlx database drop -y --database-url "$scratch" >/dev/null 2>&1' EXIT
 
 echo "== browser tier"
-DATABASE_URL="$scratch" cargo test --features "server browser-test" -- --ignored --test-threads=1
+DATABASE_URL="$scratch" scripts/with-cluster-lock cargo test --features "server browser-test" -- --ignored --test-threads=1

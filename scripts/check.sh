@@ -8,6 +8,11 @@
 #
 #   scripts/check.sh && git commit ...
 #
+# Takes the cluster lock itself (scripts/with-cluster-lock), around the
+# test run only: everything before it, the test build included, runs
+# unlocked, so a run waiting for the lock has nothing left to compile
+# (SME-100). Don't wrap it in `flock`.
+#
 # The browser tier (`cargo test --features "server browser-test" --
 # --ignored --test-threads=1`) isn't run here: it needs a built web
 # bundle and a real browser, and belongs before calling a change done.
@@ -47,6 +52,21 @@ lint_output=$(scripts/lint-expects 2>&1) || {
     exit 1
 }
 
+# Kept, and overwritten by the next run: this script deletes no files, so a
+# session can run it unattended (SME-107).
+mkdir -p target/check
+
+# The tests compiled before the lock is taken, so the locked run below
+# only runs them (SME-100). Its warnings are the server build's, already
+# checked above.
+echo "== server tests (build)"
+build_log=target/check/server-tests-build.log
+if ! cargo test --features server --no-run >"$build_log" 2>&1; then
+    grep -E '^error' -A8 "$build_log" | head -40
+    echo "the server tests don't build (full log: $build_log)"
+    exit 1
+fi
+
 # The tests' pods run this working tree's own agent, from the image named
 # after its sources (SME-102), the image a server built from this tree runs
 # by default too (SME-121).
@@ -59,11 +79,8 @@ echo "== cluster ($SANDBOX_IMAGE)"
 scripts/cluster-doctor
 
 echo "== server tests"
-# Kept, and overwritten by the next run: this script deletes no files, so a
-# session can run it unattended (SME-107).
-mkdir -p target/check
 log=target/check/server-tests.log
-if ! cargo test --features server >"$log" 2>&1; then
+if ! scripts/with-cluster-lock --output "$log" cargo test --features server; then
     grep -E 'FAILED|panicked|^error' -A3 "$log" | head -40
     echo "server tests failed (full log: $log)"
     exit 1
