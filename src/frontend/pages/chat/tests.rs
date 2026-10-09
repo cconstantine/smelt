@@ -2058,3 +2058,18 @@ fn test_each_command_indicator_has_a_label_class_and_title() {
     }
     assert!(CommandIndicator::Lost.title("x").contains("no exit status"));
 }
+
+/// SME-144 review 1: a long or multi-line command (a heredoc the model
+/// wrote) isn't the whole tooltip and accessible name: its first line, cut
+/// at 120 characters.
+#[test]
+fn test_a_command_indicators_title_shortens_a_long_command() {
+    let long = format!("cat > big.txt <<'EOF'\n{}\nEOF", "x".repeat(5000));
+    let title = CommandIndicator::Running.title(&long);
+    assert_eq!(title, "Last command: cat > big.txt <<'EOF'\u{2026} \u{b7} running");
+    let wide = "y".repeat(300);
+    let title = CommandIndicator::Exited(1).title(&wide);
+    assert_eq!(title, format!("Last command: {}\u{2026} \u{b7} exited with status 1", "y".repeat(120)));
+    assert_eq!(CommandIndicator::Exited(0).title("true"), "Last command: true \u{b7} exited with status 0");
+    assert_eq!(CommandIndicator::Exited(0).title("true\n"), "Last command: true \u{b7} exited with status 0");
+}

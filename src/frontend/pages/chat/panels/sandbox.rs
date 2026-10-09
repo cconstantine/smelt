@@ -114,8 +114,21 @@ impl CommandIndicator {
             }
             Self::Other(status) => status.clone(),
         };
-        format!("Last command: {command} \u{b7} {state}")
+        format!("Last command: {} \u{b7} {state}", short_command(command))
     }
+}
+
+/// How much of a command the pill's tooltip shows: its first line, cut at
+/// 120 characters, with "\u{2026}" when anything was left out. A model-written
+/// heredoc can be many KB, and the tooltip is also the accessible name.
+fn short_command(command: &str) -> String {
+    const MAX: usize = 120;
+    let first = command.lines().next().unwrap_or_default();
+    let mut short: String = first.chars().take(MAX).collect();
+    if first.chars().count() > MAX || command.trim_end().len() > first.len() {
+        short.push('\u{2026}');
+    }
+    short
 }
 
 /// The sandbox panel: the conversation's repos, its pod with a Stop
