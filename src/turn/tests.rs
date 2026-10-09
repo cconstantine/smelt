@@ -3240,6 +3240,9 @@ async fn test_a_turn_error_is_still_there_after_a_reload(pool: PgPool) {
     start_turn(pool.clone(), conversation.id, "again".to_string()).await.expect("send");
     assert_eq!(last_turn_error(conversation.id), None, "the next message clears it");
     stop_turn_now(conversation.id);
+    // The stop pauses the conversation for the rest of the process; a
+    // later test on this id would find its wakes starting no turn.
+    resume_turns(conversation.id);
 }
 
 /// SME-51 code review 1: a turn the user didn't send (a finished
@@ -3316,6 +3319,8 @@ async fn test_stopping_a_woken_turn_is_not_reported_as_a_failure(pool: PgPool) {
         .into_iter()
         .any(|e| matches!(e, events::ConversationEvent::NotificationDeliveryFailed { .. }));
     assert!(!reported, "a stop isn't a failed notification");
+    // As above: don't leave the conversation paused for later tests.
+    resume_turns(conversation.id);
 }
 
 /// Every tab sees each message as it's saved: the user's own first,
