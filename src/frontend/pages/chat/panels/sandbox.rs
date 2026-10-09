@@ -118,17 +118,24 @@ impl CommandIndicator {
     }
 }
 
-/// How much of a command the pill's tooltip shows: its first line, cut at
-/// 120 characters, with "\u{2026}" when anything was left out. A model-written
-/// heredoc can be many KB, and the tooltip is also the accessible name.
+/// How much of a command the pill's tooltip shows: its first line with
+/// anything in it, cut at 120 characters, with "\u{2026}" when anything was
+/// left out. A model-written heredoc can be many KB, and the tooltip is also
+/// the accessible name. Wrapped in a first-strong isolate, so a bidi control
+/// in the command (or one the cut left open) can't reorder the status after
+/// it; "(empty)" for a command with nothing in it (SME-144 review 2).
 fn short_command(command: &str) -> String {
     const MAX: usize = 120;
-    let first = command.lines().next().unwrap_or_default();
+    let trimmed = command.trim();
+    let Some(first) = trimmed.lines().map(str::trim_end).find(|line| !line.trim().is_empty()) else {
+        return "(empty)".to_string();
+    };
+    let first = first.trim_start();
     let mut short: String = first.chars().take(MAX).collect();
-    if first.chars().count() > MAX || command.trim_end().len() > first.len() {
+    if first.chars().count() > MAX || trimmed.len() > first.len() {
         short.push('\u{2026}');
     }
-    short
+    format!("\u{2068}{short}\u{2069}")
 }
 
 /// The sandbox panel: the conversation's repos, its pod with a Stop

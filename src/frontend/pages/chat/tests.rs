@@ -2053,23 +2053,37 @@ fn test_each_command_indicator_has_a_label_class_and_title() {
         assert_eq!(indicator.class(), class);
         assert!(!indicator.glyph().is_empty(), "{indicator:?} has no glyph");
         let title = indicator.title("cargo build --release");
-        assert!(title.starts_with("Last command: cargo build --release"), "{title}");
+        assert!(title.starts_with("Last command: \u{2068}cargo build --release\u{2069}"), "{title}");
         assert!(title.contains(says), "{title}");
     }
     assert!(CommandIndicator::Lost.title("x").contains("no exit status"));
 }
 
 /// SME-144 review 1: a long or multi-line command (a heredoc the model
-/// wrote) isn't the whole tooltip and accessible name: its first line, cut
-/// at 120 characters.
+/// wrote) isn't the whole tooltip and accessible name: its first line with
+/// anything in it, cut at 120 characters, isolated so bidi controls in it
+/// can't reorder the status after it (review 2).
 #[test]
 fn test_a_command_indicators_title_shortens_a_long_command() {
+    let shown = |command: &str| format!("\u{2068}{command}\u{2069}");
     let long = format!("cat > big.txt <<'EOF'\n{}\nEOF", "x".repeat(5000));
-    let title = CommandIndicator::Running.title(&long);
-    assert_eq!(title, "Last command: cat > big.txt <<'EOF'\u{2026} \u{b7} running");
+    assert_eq!(
+        CommandIndicator::Running.title(&long),
+        format!("Last command: {} \u{b7} running", shown("cat > big.txt <<'EOF'\u{2026}"))
+    );
     let wide = "y".repeat(300);
-    let title = CommandIndicator::Exited(1).title(&wide);
-    assert_eq!(title, format!("Last command: {}\u{2026} \u{b7} exited with status 1", "y".repeat(120)));
-    assert_eq!(CommandIndicator::Exited(0).title("true"), "Last command: true \u{b7} exited with status 0");
-    assert_eq!(CommandIndicator::Exited(0).title("true\n"), "Last command: true \u{b7} exited with status 0");
+    assert_eq!(
+        CommandIndicator::Exited(1).title(&wide),
+        format!("Last command: {} \u{b7} exited with status 1", shown(&format!("{}\u{2026}", "y".repeat(120))))
+    );
+    assert_eq!(CommandIndicator::Exited(0).title("true"), format!("Last command: {} \u{b7} exited with status 0", shown("true")));
+    assert_eq!(CommandIndicator::Exited(0).title("true\n"), format!("Last command: {} \u{b7} exited with status 0", shown("true")));
+    // Review 2: leading blank lines are skipped, and say something was.
+    assert_eq!(CommandIndicator::Running.title("\n\necho hi"), format!("Last command: {} \u{b7} running", shown("echo hi")));
+    assert_eq!(CommandIndicator::Running.title("\n  \necho hi\nmore"), format!("Last command: {} \u{b7} running", shown("echo hi\u{2026}")));
+    // An empty or blank command says so, with no stray whitespace.
+    assert_eq!(CommandIndicator::Running.title(""), "Last command: (empty) \u{b7} running");
+    assert_eq!(CommandIndicator::Running.title("\t\n  \n"), "Last command: (empty) \u{b7} running");
+    // A right-to-left override inside stays inside its isolate.
+    assert_eq!(CommandIndicator::Running.title("echo \u{202e}abc"), format!("Last command: {} \u{b7} running", shown("echo \u{202e}abc")));
 }
