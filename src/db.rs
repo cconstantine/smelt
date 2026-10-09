@@ -53,7 +53,7 @@ pub async fn init() -> &'static PgPool {
 
     #[expect(clippy::expect_used, reason = "a second db::init() is a programming error")]
     POOL.set(pool).expect("Database already initialized");
-    POOL.get().unwrap()
+    get()
 }
 
 #[expect(clippy::expect_used, reason = "db::get() before db::init() is a programming error, by design")]

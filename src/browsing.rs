@@ -63,7 +63,7 @@ mod server {
 
     use crate::egress_proxy::SandboxDial;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{LazyLock, Mutex, MutexGuard};
     use std::time::Duration;
 
     use chromiumoxide::Page;
@@ -157,6 +157,27 @@ mod server {
     static SESSIONS: LazyLock<Mutex<HashMap<i64, Session>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
+    /// The session list, locked. Every production use goes through this,
+    /// never `SESSIONS.lock()`: a call that panicked while holding the
+    /// lock poisons it, and without recovery every later browsing call in
+    /// every conversation would panic too, until a restart (SME-119). No
+    /// critical section leaves the map in a state another call would trip
+    /// over (the worst is a viewer count one too high, so a screencast
+    /// runs until its session closes, or a leaked context), so carrying on
+    /// with it as it was left is safe. `clear_poison` makes the warning
+    /// once per panic, not once per call. A lock is only ever poisoned
+    /// where panics unwind (`dx serve`, the tests): the release profile has
+    /// `panic = "abort"`, so there any panic ends the process (SME-139).
+    fn sessions() -> MutexGuard<'static, HashMap<i64, Session>> {
+        SESSIONS.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "a browsing call panicked while holding the session list; carrying on with it as it was left"
+            );
+            SESSIONS.clear_poison();
+            poisoned.into_inner()
+        })
+    }
+
     /// Held across the whole of `open_session` and `close_session`, so an
     /// open's "is one already open?" check and its eventual insert can't
     /// interleave with another open, and a close issued mid-open waits for
@@ -234,7 +255,7 @@ mod server {
     ) -> Result<(), String> {
         let sandbox_routed = sandbox.is_some();
         let _lifecycle = SESSION_LIFECYCLE.lock().await;
-        if SESSIONS.lock().unwrap().contains_key(&conversation_id) {
+        if sessions().contains_key(&conversation_id) {
             return Err(
                 "a browsing session is already open for this conversation — call \
                  close_browser_session first"
@@ -264,7 +285,7 @@ mod server {
         let (frame_tx, latest_frame) = watch::channel(None);
         let (want_screencast, want_rx) = watch::channel(false);
         let screencast_task = tokio::spawn(run_screencast(page.clone(), frame_tx, want_rx));
-        SESSIONS.lock().unwrap().insert(
+        sessions().insert(
             conversation_id,
             Session {
                 id: session_id,
@@ -323,7 +344,7 @@ mod server {
     /// notify, just real CDP/process state to tear down.
     pub async fn close_session(conversation_id: i64) -> Result<(), String> {
         let _lifecycle = SESSION_LIFECYCLE.lock().await;
-        let session = SESSIONS.lock().unwrap().remove(&conversation_id);
+        let session = sessions().remove(&conversation_id);
         if let Some(session) = session {
             session.intercept_task.abort();
             session.screencast_task.abort();
@@ -395,7 +416,7 @@ mod server {
     /// attaches, not when the session itself opens, so a session nobody's
     /// watching never pays continuous encoding/bandwidth cost.
     pub fn subscribe_frames(conversation_id: i64) -> Result<FrameSubscription, String> {
-        let mut sessions = SESSIONS.lock().unwrap();
+        let mut sessions = sessions();
         let session = sessions
             .get_mut(&conversation_id)
             .ok_or_else(|| "no browser session is open for this conversation".to_string())?;
@@ -419,7 +440,7 @@ mod server {
     /// when a *newer* session has since been opened for the same
     /// conversation, whose viewers this one was never part of.
     fn unsubscribe_frames(conversation_id: i64, session_id: u64) {
-        let mut sessions = SESSIONS.lock().unwrap();
+        let mut sessions = sessions();
         let Some(session) = sessions.get_mut(&conversation_id) else {
             return;
         };
@@ -570,7 +591,7 @@ mod server {
 
     fn record_url(conversation_id: i64, session_id: u64, url: String) {
         {
-            let mut sessions = SESSIONS.lock().unwrap();
+            let mut sessions = sessions();
             let Some(session) = sessions.get_mut(&conversation_id) else {
                 return;
             };
@@ -587,9 +608,7 @@ mod server {
 
     /// The session page's current URL, or `None` if no session is open.
     pub fn current_url(conversation_id: i64) -> Option<String> {
-        SESSIONS
-            .lock()
-            .unwrap()
+        sessions()
             .get(&conversation_id)
             .map(|s| s.current_url.clone())
     }
@@ -611,17 +630,13 @@ mod server {
 
     #[cfg(all(test, feature = "browser-test"))]
     fn frame_subscriber_count(conversation_id: i64) -> usize {
-        SESSIONS
-            .lock()
-            .unwrap()
+        sessions()
             .get(&conversation_id)
             .map_or(0, |s| s.frame_subscriber_count)
     }
 
     fn live_page(conversation_id: i64) -> Result<Page, String> {
-        SESSIONS
-            .lock()
-            .unwrap()
+        sessions()
             .get(&conversation_id)
             .map(|s| s.page.clone())
             .ok_or_else(|| {
@@ -843,9 +858,7 @@ mod server {
         // `data:` (or similar) URL, which the request interceptor can't see
         // because it never touches the network. The interceptor still
         // guards everything the page loads after this, redirects included.
-        let (is_addr_allowed, sandbox_routed) = SESSIONS
-            .lock()
-            .unwrap()
+        let (is_addr_allowed, sandbox_routed) = sessions()
             .get(&conversation_id)
             .map_or((fetch_guard::is_safe_fetch_addr as fn(IpAddr) -> bool, false), |s| {
                 (s.is_addr_allowed, s.sandbox_routed)
@@ -1988,6 +2001,47 @@ mod server {
                 "a page from another site reached the sandbox: {:?}",
                 reached.lock().unwrap()
             );
+
+            scenario_open_after_a_poisoned_session_lock().await;
+        }
+
+        /// SME-119: once a browsing call has panicked while holding the
+        /// session list, a real session still opens, loads, reads, takes a
+        /// live-panel viewer and closes: the paths (the insert, `navigate`'s
+        /// guard read) the unit test can't reach without Chrome.
+        async fn scenario_open_after_a_poisoned_session_lock() {
+            let poisoner = std::thread::spawn(|| {
+                let _held = SESSIONS.lock();
+                panic!("a browsing call panics while holding the session list (deliberate, SME-119)");
+            });
+            assert!(poisoner.join().is_err(), "the poisoning thread should have panicked");
+            assert!(SESSIONS.is_poisoned(), "the session list should be poisoned now");
+
+            let conversation_id: i64 = 900_119;
+            let (url, _server) =
+                start_test_server("<html><body><h1>Opened after a poisoning</h1></body></html>").await;
+            open_session_with_guard(conversation_id, allow_loopback_too)
+                .await
+                .expect("a session should open on a recovered lock");
+            let state = navigate(conversation_id, &url)
+                .await
+                .expect("navigate should succeed on a recovered lock");
+            assert!(
+                state.text.contains("Opened after a poisoning"),
+                "expected the rendered text, got: {:?}",
+                state.text
+            );
+            let read_back = read(conversation_id).await.expect("read should succeed");
+            assert!(read_back.text.contains("Opened after a poisoning"));
+            let viewer = subscribe_frames(conversation_id).expect("a viewer should subscribe");
+            assert_eq!(frame_subscriber_count(conversation_id), 1);
+            drop(viewer);
+            assert_eq!(frame_subscriber_count(conversation_id), 0);
+            close_session(conversation_id)
+                .await
+                .expect("close_session should succeed");
+            assert_eq!(current_url(conversation_id), None);
+            assert!(!SESSIONS.is_poisoned(), "the lock should be healthy again");
         }
 
         /// Shows whatever cookie and localStorage value the page can see.
@@ -2377,6 +2431,42 @@ mod server {
             assert!(matches!(stream.next().await, Some(Ok(_))));
             drop(tx);
             assert!(stream.next().await.is_none());
+        }
+
+        /// A call that panics while holding the session list must not
+        /// break every later browsing call (SME-119). The poisoning is
+        /// process-wide on purpose: the frame tests above then also run
+        /// on a recovered lock. One of them, running in parallel, may be
+        /// the call that recovers it, so the test doesn't assert the lock
+        /// is still poisoned once the thread has panicked (std poisons it
+        /// whenever a guard drops during a panic).
+        #[tokio::test]
+        async fn test_a_poisoned_session_lock_does_not_break_the_next_browsing_call() {
+            let poisoner = std::thread::spawn(|| {
+                let _held = SESSIONS.lock();
+                panic!("a browsing call panics while holding the session list (deliberate, SME-119)");
+            });
+            assert!(poisoner.join().is_err(), "the poisoning thread should have panicked");
+
+            let unused: i64 = -119;
+            assert_eq!(current_url(unused), None);
+            let subscribed = subscribe_frames(unused).map(|_| ());
+            assert_eq!(
+                subscribed,
+                Err("no browser session is open for this conversation".to_string())
+            );
+            let navigated = navigate(unused, "https://example.com/").await.map(|_| ());
+            assert!(
+                navigated
+                    .as_ref()
+                    .is_err_and(|e| e.starts_with("no browser session is open")),
+                "expected the ordinary no-session error, got {navigated:?}"
+            );
+            record_url(unused, 0, "https://example.com/".to_string());
+            let (_tx, rx) = watch::channel(None);
+            drop(detached_subscription(rx));
+            assert_eq!(close_session(unused).await, Ok(()));
+            assert!(!SESSIONS.is_poisoned(), "the lock should be healthy again");
         }
     }
 }
