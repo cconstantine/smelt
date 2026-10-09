@@ -617,7 +617,8 @@ async fn test_a_pod_whose_image_is_missing_fails_fast_saying_how_to_build_it(poo
         };
         assert!(started.elapsed() < Duration::from_secs(45), "took {:?}", started.elapsed());
         assert!(reason.contains("ErrImageNeverPull") && reason.contains(missing), "{reason}");
-        // The advice is picked by the image the container's status names.
+        // The advice goes by the spec's image; for a container that never
+        // started, the status names the same one.
         let status_image = pods_api(&client).get(&pod_name(pod)).await.expect("get the pod").status
             .and_then(|s| s.container_statuses)
             .and_then(|c| c.into_iter().next())

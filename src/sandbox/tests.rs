@@ -841,6 +841,27 @@ fn test_a_missing_image_the_script_doesnt_build_gets_its_own_advice() {
     assert!(!failure.contains("with scripts/build-sandbox-image.sh"), "{failure}");
 }
 
+/// Review 2: a container that ran before has its status's image from the
+/// runtime (another tag of it, or a bare `sha256:` id), so the advice goes
+/// by the image the pod's spec names for that container.
+#[test]
+fn test_the_missing_image_advice_goes_by_the_pods_spec() {
+    let mut pod = pod_never_pulling("sha256:0123456789abcdef");
+    for status in pod.status.as_mut().expect("status").container_statuses.iter_mut().flatten() {
+        status.name = "sandbox".to_string();
+    }
+    pod.spec = Some(PodSpec {
+        containers: vec![Container {
+            name: "sandbox".to_string(),
+            image: Some(OWN_SANDBOX_IMAGE.to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let failure = pod_startup_failure(&pod).expect("a startup failure");
+    assert!(failure.contains("with scripts/build-sandbox-image.sh"), "{failure}");
+}
+
 /// The Docker sidecar is an init container, delivered by the same script:
 /// a missing `docker:29-dind` fails the same way.
 #[test]

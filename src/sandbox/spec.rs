@@ -102,6 +102,21 @@ fn image_never_pull_advice(image: &str) -> String {
 /// that crashes while starting is left to its own restarts, as before.
 const IMAGE_WAITING_REASONS: [&str; 4] = ["ErrImagePull", "ImagePullBackOff", "InvalidImageName", "ErrImageNeverPull"];
 
+/// The image `pod`'s spec names for its container `name`, as smelt wrote
+/// it, or `fallback` (the status's) if the spec has no such container. A
+/// status's image comes from the runtime once the container has run: maybe
+/// another tag of it, or a bare `sha256:` id (review 2).
+fn spec_image(pod: &Pod, name: &str, fallback: &str) -> String {
+    let spec = pod.spec.as_ref();
+    let containers = spec.map(|s| s.containers.iter()).into_iter().flatten();
+    let init = spec.and_then(|s| s.init_containers.as_ref()).into_iter().flatten();
+    containers
+        .chain(init)
+        .find(|c| c.name == name)
+        .and_then(|c| c.image.clone())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 /// Why `pod` can't start, if one of its containers is stuck in a state that
 /// won't recover (see `FATAL_WAITING_REASONS`), or its Docker sidecar (an
 /// init container) has no image; `None` while it's still starting normally.
@@ -118,7 +133,7 @@ pub(super) fn pod_startup_failure(pod: &Pod) -> Option<String> {
                 None => reason.to_string(),
             };
             if reason == "ErrImageNeverPull" {
-                format!("{failure}. {}", image_never_pull_advice(&status.image))
+                format!("{failure}. {}", image_never_pull_advice(&spec_image(pod, &status.name, &status.image)))
             } else {
                 failure
             }
