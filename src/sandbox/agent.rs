@@ -259,7 +259,8 @@ pub(super) struct Registry {
 pub(super) struct Outdated {
     /// From its hello; `None` for an agent from before versioning.
     pub(super) found: Option<ProtocolVersion>,
-    /// The image its sandbox container runs, if it could be read.
+    /// The image its sandbox container runs, if it could be read; when it
+    /// couldn't, the next connect reads it again (review 1).
     pub(super) image: Option<String>,
 }
 
@@ -468,7 +469,9 @@ pub(super) fn connect_with_retry(
     mode: ConnectMode,
 ) -> BoxFuture<'static, Result<Arc<TerminalConnection>, TerminalError>> {
     Box::pin(async move {
-        if let Some(outdated) = outdated(pod_id) {
+        if let Some(outdated) = outdated(pod_id)
+            && outdated.image.is_some()
+        {
             return Err(outdated.error());
         }
         let lock = pod_connect_lock(pod_id);
@@ -478,12 +481,24 @@ pub(super) fn connect_with_retry(
         if let Some(conn) = registry_get(pod_id) {
             return Ok(conn);
         }
-        if let Some(outdated) = outdated(pod_id) {
+        let known = outdated(pod_id);
+        if let Some(outdated) = &known
+            && outdated.image.is_some()
+        {
             return Err(outdated.error());
         }
 
         let instance = db::smelt_instance(&pool).await?;
         let dialer = dialer_for(pod_id, instance)?;
+        // Known outdated, but its image couldn't be read last time (a
+        // failed API call isn't the answer): read it again, not the agent.
+        if let Some(mut outdated) = known {
+            outdated.image = dialer.image(pod_id).await;
+            if let Some(entry) = registry().outdated.get_mut(&pod_id) {
+                entry.image.clone_from(&outdated.image);
+            }
+            return Err(outdated.error());
+        }
         if mode == ConnectMode::First && !dialer.is_running(pod_id).await? {
             return Err(TerminalError::NoPod);
         }

@@ -438,6 +438,26 @@ async fn test_a_refused_pod_whose_image_is_unknown_hedges_its_advice(pool: PgPoo
     assert!(text.contains("If a new pod is refused too") && text.contains("scripts/build-sandbox-image.sh"), "{text}");
 }
 
+/// Review 1: an image read that failed isn't remembered as the answer:
+/// the next call reads it again (without dialling the agent again), and
+/// gives the advice that image calls for.
+#[sqlx::test]
+async fn test_an_image_that_couldnt_be_read_is_read_again_next_time(pool: PgPool) {
+    let (_, pod_id) = pod_row(&pool).await;
+    let v0_line = r#"{"id":"cmd-1","terminal_id":"3","stream":"stdout","seq":1,"data":"hi"}"#;
+    let agent = fake_agent(pod_id, Greeting::Raw(v0_line.into()), Duration::ZERO).await;
+
+    let first = reconnect_if_needed(&pool, pod_id).await.map(|_| ()).expect_err("outdated");
+    assert!(matches!(first, TerminalError::AgentOutdated { image: PodImage::Unknown, .. }), "{first:?}");
+
+    let image = default_sandbox_image();
+    fake_images().lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, image.clone());
+    let again = reconnect_if_needed(&pool, pod_id).await.map(|_| ()).expect_err("outdated");
+    assert!(matches!(&again, TerminalError::AgentOutdated { image: PodImage::SameAsNew(i), .. } if *i == image), "{again:?}");
+    assert_eq!(agent_status(pod_id), Some(AgentStatus::RestartRequired { version: None, rebuild_image: true }));
+    assert_eq!(agent.dials.load(Ordering::SeqCst), 1, "the agent was dialled again");
+}
+
 #[test]
 fn test_judge_image_compares_a_pods_image_with_a_new_pods() {
     let new = "docker.io/library/smelt-sandbox:src-1111111111111111";
