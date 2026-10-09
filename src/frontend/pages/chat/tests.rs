@@ -1855,3 +1855,35 @@ fn test_reply_parts_a_refused_ask_user_call_does_not_split_a_reply() {
     ];
     assert_eq!(buttons(&reply_parts(&messages, false)), vec![(4, 0, "Let me ask.\n\nRetrying.".to_string(), 2)]);
 }
+
+#[test]
+fn test_reply_parts_a_cut_off_or_stop_after_tool_results_ends_the_reply() {
+    // A turn cut off mid-call saves the call's "not run" results, then the
+    // cut-off notice, and ends; a later turn (a command finishing wakes
+    // the model) is a new reply. Code review 2, L3.
+    let cut_off = crate::api::chat::cut_off_notice(1024, crate::api::chat::ReplyLimit::ALL[0], Some("todowrite"));
+    let messages = vec![
+        user_text(1, "go"),
+        message_with_blocks(2, "assistant", vec![text("Partway."), call("t1", "todowrite")]),
+        message_with_blocks(3, "user", vec![result("t1", "not run")]),
+        user_text(4, &cut_off),
+        user_text(5, "Terminal command c1 finished: exit code 0."),
+        message_with_blocks(6, "assistant", vec![text("Woken reply.")]),
+    ];
+    assert_eq!(
+        buttons(&reply_parts(&messages, false)),
+        vec![(2, 0, "Partway.".to_string(), 1), (6, 0, "Woken reply.".to_string(), 1)]
+    );
+    let stopped = vec![
+        user_text(1, "go"),
+        message_with_blocks(2, "assistant", vec![text("Working."), call("t1", "todoread")]),
+        message_with_blocks(3, "user", vec![result("t1", "[]")]),
+        user_text(4, crate::api::chat::STOP_NOTICE),
+        user_text(5, "Terminal command c1 finished: exit code 0."),
+        message_with_blocks(6, "assistant", vec![text("After the stop.")]),
+    ];
+    assert_eq!(
+        buttons(&reply_parts(&stopped, false)),
+        vec![(2, 0, "Working.".to_string(), 1), (6, 0, "After the stop.".to_string(), 1)]
+    );
+}

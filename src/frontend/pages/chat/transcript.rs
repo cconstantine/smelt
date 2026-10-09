@@ -195,9 +195,9 @@ pub(super) struct ReplyCopy {
 /// assistant text block from one thing the user did to the next: a
 /// user-role message holding text (their message, or a notice such as
 /// "Stopped.") or answering an `ask_user` call (not refusing it) starts a new one; ordinary
-/// tool results and compaction's placeholders don't, nor does a notice
-/// saved right after tool results, inside a turn's tool loop (a command
-/// that finished while the turn went on). Thinking, tool calls,
+/// tool results and compaction's placeholders don't, nor does a terminal
+/// command's notice saved right after tool results, inside a turn's tool
+/// loop (a command that finished while the turn went on). Thinking, tool calls,
 /// results and compaction summaries aren't part of the copy, nor is a text
 /// block that is only whitespace. While the turn runs, the newest reply
 /// (the one after the last such message) has none: it may still grow.
@@ -217,11 +217,14 @@ pub(super) fn reply_parts(messages: &[Message], turn_running: bool) -> HashMap<i
     // The reply being gathered: (message id, block index, text) per part.
     let mut reply: Vec<(i64, usize, &str)> = Vec::new();
     // Whether the turn is inside its tool loop: the last message was tool
-    // results going back to the model. A notice saved there (a command
-    // finishing, drained at the top of the loop) is part of the same turn,
-    // not a new one (code review 1).
+    // results going back to the model. A terminal command's notice saved
+    // there (drained at the top of the loop) is part of the same turn, not
+    // a new one (code review 1). Only those are drained there: a cut-off
+    // notice or "Stopped." after tool results ends the turn (code review
+    // 2). A turn that failed right after its tool results looks the same
+    // as one still in its loop, so a command finishing after it joins the
+    // failed turn's reply.
     let mut in_tool_loop = false;
-    let no_commands = HashMap::new();
     for (message, blocks) in &readable {
         if message.role == "user" {
             let mut starts_reply = false;
@@ -229,7 +232,7 @@ pub(super) fn reply_parts(messages: &[Message], turn_running: bool) -> HashMap<i
             for block in blocks {
                 match block {
                     ContentBlock::Text { text } => {
-                        let mid_turn_notice = in_tool_loop && system_notice(text, &no_commands).is_some();
+                        let mid_turn_notice = in_tool_loop && text.starts_with("Terminal command ");
                         starts_reply |= !mid_turn_notice;
                     }
                     // An answer to `ask_user` (or the user writing
