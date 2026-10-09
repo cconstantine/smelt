@@ -829,3 +829,36 @@ async fn test_a_failed_send_announces_the_command_lost(pool: PgPool) {
     let row = db::get_terminal_command(&pool, "cmd-unsent").await.expect("read").expect("the row");
     assert_eq!(row.status, "lost");
 }
+
+/// SME-144 review 1: when the send fails and marking the row lost fails
+/// too, the row still says running (and the terminal stays busy), so open
+/// tabs aren't told `lost`: a reload would show running again.
+#[sqlx::test]
+async fn test_a_lost_mark_that_fails_announces_nothing(pool: PgPool) {
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let (conversation_id, pod_id) = pod_row(&pool).await;
+    let terminal = db::create_sandbox_terminal(&pool, pod_id).await.expect("terminal row");
+    // This test database refuses to mark any command lost.
+    sqlx::query(
+        "CREATE FUNCTION refuse_lost() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.status = 'lost' THEN RAISE EXCEPTION 'refused for the test'; END IF; RETURN NEW; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the trigger function");
+    sqlx::query("CREATE TRIGGER refuse_lost BEFORE UPDATE ON terminal_commands FOR EACH ROW EXECUTE FUNCTION refuse_lost()")
+        .execute(&pool)
+        .await
+        .expect("create the trigger");
+    let next_major = ProtocolVersion { major: PROTOCOL_VERSION.major + 1, minor: 0 };
+    let _agent = fake_agent(pod_id, Greeting::Hello(next_major), Duration::ZERO).await;
+    let mut events = crate::events::subscribe(conversation_id);
+
+    let result = run_command(&pool, conversation_id, terminal.id, "cmd-unmarked", "echo hi").await;
+    assert!(matches!(result, Err(RunCommandError::Failed(_))), "{result:?}");
+
+    let updates = command_updates(&mut *events, "cmd-unmarked", Duration::from_secs(2)).await;
+    assert_eq!(updates, vec![(true, "running".to_string(), None)], "lost was announced though the row says running");
+    let row = db::get_terminal_command(&pool, "cmd-unmarked").await.expect("read").expect("the row");
+    assert_eq!(row.status, "running");
+}

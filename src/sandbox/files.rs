@@ -172,9 +172,13 @@ pub async fn run_command(
     if let Err(e) = send_command(pool, terminal_id, command_id, command).await {
         // Nothing is actually running — don't leave a dangling
         // 'running' row with no agent ever going to report on it, and
-        // tell open tabs, which were just told it started (SME-144).
-        let _ = db::mark_terminal_command_lost(pool, command_id).await;
-        publish_command_update(conversation_id, terminal_id, command_id, None, "lost");
+        // tell open tabs, which were just told it started (SME-144). Only
+        // once the row says so: if the mark fails, the row (and a reload)
+        // still say running, so the tabs keep saying it too.
+        match db::mark_terminal_command_lost(pool, command_id).await {
+            Ok(()) => publish_command_update(conversation_id, terminal_id, command_id, None, "lost"),
+            Err(mark) => tracing::error!(command_id, error = %mark, "couldn't mark an unsent command lost"),
+        }
         return Err(RunCommandError::Failed(e.to_string()));
     }
     Ok(())
