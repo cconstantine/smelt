@@ -29,14 +29,15 @@ pub(crate) const STATUS_DESCRIPTION_LIMIT: usize = 500;
 
 /// The OTLP endpoint to export to, when tracing is on: the value of
 /// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`,
-/// whichever is set and not blank. The exporter
+/// the first that is set and not empty, as the exporter reads them (a
+/// blank one is taken, and the exporter then refuses it, logged). The exporter
 /// reads the variable itself (adding `/v1/traces`); this only decides
 /// whether to build one.
 pub(crate) fn otel_endpoint(env: impl Fn(&str) -> Option<String>) -> Option<String> {
     // The exporter prefers the traces-only variable, as the spec says.
     ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT"]
         .into_iter()
-        .find_map(|name| env(name).filter(|endpoint| !endpoint.trim().is_empty()))
+        .find_map(|name| env(name).filter(|endpoint| !endpoint.is_empty()))
 }
 
 /// The database name in a Postgres URL, without its credentials, host or
@@ -382,7 +383,16 @@ mod tests {
     fn test_tracing_is_off_unless_the_endpoint_is_set() {
         assert_eq!(otel_endpoint(env_of(&[])), None);
         assert_eq!(otel_endpoint(env_of(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "")])), None);
-        assert_eq!(otel_endpoint(env_of(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "  ")])), None);
+        // Review 2: as the exporter reads them, only an empty value is unset,
+        // so a blank traces variable doesn't hide the general one from smelt
+        // while the exporter still takes the blank one.
+        assert_eq!(
+            otel_endpoint(env_of(&[
+                ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "  "),
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo:4318"),
+            ])),
+            Some("  ".to_string())
+        );
         assert_eq!(
             otel_endpoint(env_of(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo:4318")])),
             Some("http://tempo:4318".to_string())
