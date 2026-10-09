@@ -55,7 +55,7 @@ pub(super) fn pod_pending_detail(pod: &Pod) -> Option<String> {
 /// Container waiting states that never resolve on their own — once a pod's
 /// container is in one of these, waiting for `Running` only ends in a
 /// timeout that hides the reason.
-pub(super) const FATAL_WAITING_REASONS: [&str; 7] = [
+pub(super) const FATAL_WAITING_REASONS: [&str; 8] = [
     "CreateContainerError",
     "CreateContainerConfigError",
     "RunContainerError",
@@ -63,20 +63,79 @@ pub(super) const FATAL_WAITING_REASONS: [&str; 7] = [
     "ImagePullBackOff",
     "InvalidImageName",
     "CrashLoopBackOff",
+    // `imagePullPolicy: Never` and the image isn't on the node: never
+    // built for these sources, or deleted by the kubelet (SME-121).
+    "ErrImageNeverPull",
 ];
 
+/// Who can make `image`, for advice the model passes on to the user: the
+/// build script makes only this tree's own image and `docker:29-dind`, and
+/// moves `smelt-sandbox:latest` only with `--latest`; any other image is
+/// one a setting names, which the script can't help with (review 1, 2).
+pub(super) fn how_to_build(image: &str) -> &'static str {
+    let full = full_image_name(image);
+    let built_by_script = [OWN_SANDBOX_IMAGE, "docker.io/library/docker:29-dind"].map(full_image_name);
+    if built_by_script.contains(&full) {
+        "tell the user to build it with scripts/build-sandbox-image.sh, from the checkout smelt runs from."
+    } else if full == "docker.io/library/smelt-sandbox:latest" {
+        "tell the user to build it with scripts/build-sandbox-image.sh --latest, from the checkout smelt \
+         runs from, or to unset SANDBOX_IMAGE."
+    } else {
+        "SANDBOX_IMAGE or SANDBOX_DOCKER_IMAGE names it, and scripts/build-sandbox-image.sh doesn't make \
+         it: tell the user to replace or import that image, or to unset the setting."
+    }
+}
+
+/// What to do about `ErrImageNeverPull` for `image`. Sandbox pods' images
+/// are delivered into the node from smelt's host, which the model can't
+/// do, so it says to tell the user rather than retry.
+fn image_never_pull_advice(image: &str) -> String {
+    format!(
+        "The cluster's node doesn't have this image, and sandbox pods never pull one. It can't be built \
+         or imported from a sandbox, so don't retry create_pod: {}",
+        how_to_build(image)
+    )
+}
+
+/// The fatal reasons that are about the image, which no restart fixes.
+/// Only these count for an init container (the Docker sidecar): a sidecar
+/// that crashes while starting is left to its own restarts, as before.
+const IMAGE_WAITING_REASONS: [&str; 4] = ["ErrImagePull", "ImagePullBackOff", "InvalidImageName", "ErrImageNeverPull"];
+
+/// The image `pod`'s spec names for its container `name`, as smelt wrote
+/// it, or `fallback` (the status's) if the spec has no such container. A
+/// status's image comes from the runtime once the container has run: maybe
+/// another tag of it, or a bare `sha256:` id (review 2).
+fn spec_image(pod: &Pod, name: &str, fallback: &str) -> String {
+    let spec = pod.spec.as_ref();
+    let containers = spec.map(|s| s.containers.iter()).into_iter().flatten();
+    let init = spec.and_then(|s| s.init_containers.as_ref()).into_iter().flatten();
+    containers
+        .chain(init)
+        .find(|c| c.name == name)
+        .and_then(|c| c.image.clone())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 /// Why `pod` can't start, if one of its containers is stuck in a state that
-/// won't recover (see `FATAL_WAITING_REASONS`); `None` while it's still
-/// starting normally.
+/// won't recover (see `FATAL_WAITING_REASONS`), or its Docker sidecar (an
+/// init container) has no image; `None` while it's still starting normally.
 pub(super) fn pod_startup_failure(pod: &Pod) -> Option<String> {
-    let statuses = pod.status.as_ref()?.container_statuses.as_ref()?;
-    statuses.iter().find_map(|status| {
+    let status = pod.status.as_ref()?;
+    let init = status.init_container_statuses.iter().flatten().map(|s| (s, &IMAGE_WAITING_REASONS[..]));
+    let main = status.container_statuses.iter().flatten().map(|s| (s, &FATAL_WAITING_REASONS[..]));
+    init.chain(main).find_map(|(status, fatal)| {
         let waiting = status.state.as_ref()?.waiting.as_ref()?;
         let reason = waiting.reason.as_deref()?;
-        FATAL_WAITING_REASONS.contains(&reason).then(|| {
-            match waiting.message.as_deref().filter(|m| !m.is_empty()) {
+        fatal.contains(&reason).then(|| {
+            let failure = match waiting.message.as_deref().filter(|m| !m.is_empty()) {
                 Some(message) => format!("{reason}: {message}"),
                 None => reason.to_string(),
+            };
+            if reason == "ErrImageNeverPull" {
+                format!("{failure}. {}", image_never_pull_advice(&spec_image(pod, &status.name, &status.image)))
+            } else {
+                failure
             }
         })
     })
@@ -166,25 +225,37 @@ pub(super) fn default_memory_limit() -> String {
         .unwrap_or_else(|| "8Gi".to_string())
 }
 
-/// `SANDBOX_IMAGE`, default `"docker.io/library/smelt-sandbox:latest"` —
-/// same pattern as `default_memory_limit`. The custom image
-/// `scripts/build-sandbox-image.sh` builds and delivers with no registry
-/// involved (see SME-17) — its
-/// own `ENTRYPOINT` is the sandbox agent, which is what makes the agent
-/// the pod's real PID 1 rather than something injected and launched after
-/// the fact. The fully-qualified default (not just `smelt-sandbox:latest`)
-/// matches exactly what `ctr images import` registers the image as —
-/// confirmed by spike, not assumed. `:latest` is what a server with no
-/// setting (the dev server) runs; `scripts/check.sh`, `browser-tier`,
-/// `check-server` and CI set `SANDBOX_IMAGE` to the image named after the
-/// working tree's agent sources (`scripts/sandbox-image-ref`, SME-102), and
-/// tests that build their own pod specs read it here too.
+/// `SANDBOX_IMAGE`, default `OWN_SANDBOX_IMAGE` (the image named after
+/// this build's agent sources) — same pattern as `default_memory_limit`.
+/// The custom image `scripts/build-sandbox-image.sh` builds and delivers
+/// with no registry involved (see SME-17) — its own `ENTRYPOINT` is the
+/// sandbox agent, which is what makes the agent the pod's real PID 1
+/// rather than something injected and launched after the fact. The
+/// fully-qualified name (not just `smelt-sandbox:src-…`) matches exactly
+/// what `ctr images import` registers the image as — confirmed by spike,
+/// not assumed. A server with no setting (the dev server) runs its own
+/// sources' image, so it can't drift onto an older agent the way a
+/// `:latest` that only a manual rebuild moved did (SME-121); a node without
+/// that image fails `create_pod` with `ErrImageNeverPull` and the command
+/// that builds it. `scripts/check.sh`, `browser-tier`, `check-server` and
+/// CI set `SANDBOX_IMAGE` to the working tree's image
+/// (`scripts/sandbox-image-ref`, SME-102), and tests that build their own
+/// pod specs read it here too.
 pub(crate) fn default_sandbox_image() -> String {
-    std::env::var("SANDBOX_IMAGE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "docker.io/library/smelt-sandbox:latest".to_string())
+    sandbox_image_from(std::env::var("SANDBOX_IMAGE").ok())
 }
+
+/// The image for a `SANDBOX_IMAGE` of `setting`: it, unless unset or empty.
+pub(super) fn sandbox_image_from(setting: Option<String>) -> String {
+    setting
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| OWN_SANDBOX_IMAGE.to_string())
+}
+
+/// The sandbox image named after the agent sources this server was built
+/// from, `docker.io/library/smelt-sandbox:src-<hash>` (`build.rs`, the same
+/// name `scripts/sandbox-image-ref` prints).
+pub(crate) const OWN_SANDBOX_IMAGE: &str = env!("SMELT_SANDBOX_IMAGE");
 
 /// `SANDBOX_RUNNING_WAIT_TIMEOUT_SECS`, default `90` — same pattern as
 /// `default_memory_limit`. How long `wait_for_running` waits for a pod to
@@ -500,7 +571,8 @@ pub(super) fn build_pod_spec(
             containers: vec![Container {
                 name: "sandbox".to_string(),
                 image: Some(default_sandbox_image()),
-                // `Never`, not the `:latest`-tag default of `Always`: this
+                // `Never`, not Kubernetes' default (`IfNotPresent` for a
+                // tag like `src-<hash>`, `Always` for `:latest`): this
                 // image is delivered straight into the node's local image
                 // store (`ctr images import`, see
                 // scripts/build-sandbox-image.sh) with no registry
