@@ -123,10 +123,9 @@ pub(crate) fn CopyButton(
     let mut feedback = use_signal(CopyFeedback::default);
     let mut hovered = use_signal(|| false);
     let mut keyboard_focus = use_signal(|| false);
-    // A press focuses the button too (in Chrome; not in Safari or Firefox
-    // on macOS); that focus isn't the keyboard's. Cleared when the press
-    // ends, so a later Tab onto the button counts (code review 1).
-    let mut pressed = use_signal(|| false);
+    // Bumped on every focus and blur, so a focus check that resolves after
+    // a later blur is dropped.
+    let mut focus_generation = use_signal(|| 0u32);
     let mut highlighted = use_signal(|| false);
     // Set while the copy script's synchronous part runs: the fallback
     // focuses its textarea and then this button again, inside the click,
@@ -176,20 +175,33 @@ pub(crate) fn CopyButton(
                 hovered.set(false);
                 report();
             },
-            onpointerdown: move |_| pressed.set(true),
-            onpointerup: move |_| pressed.set(false),
-            onpointercancel: move |_| pressed.set(false),
+            // Keyboard focus only: a click, a tap or a script's focus()
+            // focuses the button too. The browser's own `:focus-visible`
+            // says which it was; guessing from pointer events failed on a
+            // tap and after a refused writeText (code review 2).
             onfocus: move |_| {
-                if !*pressed.peek() && !*copying.peek() {
-                    keyboard_focus.set(true);
-                    report();
+                if *copying.peek() {
+                    return;
                 }
+                let generation = {
+                    let mut current = focus_generation.write();
+                    *current = current.wrapping_add(1);
+                    *current
+                };
+                let visible = document::eval("return document.activeElement?.matches(':focus-visible') ?? false;");
+                spawn(async move {
+                    let visible = matches!(visible.await, Ok(serde_json::Value::Bool(true)));
+                    if *focus_generation.peek() == generation {
+                        keyboard_focus.set(visible);
+                        report();
+                    }
+                });
             },
             onblur: move |_| {
                 if *copying.peek() {
                     return;
                 }
-                pressed.set(false);
+                *focus_generation.write() += 1;
                 keyboard_focus.set(false);
                 report();
             },

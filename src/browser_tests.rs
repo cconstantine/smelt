@@ -2942,18 +2942,21 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
     );
     wait_for_outlined(&page, &[], Duration::from_secs(3)).await;
 
-    // A press that doesn't focus the button (Safari, Firefox on macOS),
-    // then focus from the keyboard: still outlined (code review 1, L4).
-    page.evaluate(format!(
-        "(() => {{ document.activeElement?.blur(); const b = document.querySelector({:?}); \
-         b.dispatchEvent(new PointerEvent('pointerdown', {{ bubbles: true }})); \
-         b.dispatchEvent(new PointerEvent('pointerup', {{ bubbles: true }})); b.focus(); }})()",
-        reply_copy_button(reply)
-    ))
-    .await
-    .expect("press without focusing, then focus");
+    // Focus from the keyboard (Tab from the code block's Copy, just before
+    // it) outlines the reply, after a mouse click on the button (code
+    // reviews 1 and 2).
+    let code_copy = format!(".message[data-reply=\"{reply}\"] .md-code-copy");
+    page.evaluate(format!("document.querySelector({code_copy:?}).focus()")).await.expect("focus the code block's Copy");
+    page.find_element(code_copy.as_str()).await.expect("the code block's Copy").press_key("Tab").await.expect("press Tab");
+    let on_button: bool = page
+        .evaluate("document.activeElement?.classList.contains('reply-copy') ?? false")
+        .await
+        .expect("read the focus")
+        .into_value()
+        .expect("a bool");
+    assert!(on_button, "Tab should reach the Copy reply button");
     if let Err(why) = outlined_within(&page, &[part_one, "Todos"], Duration::from_secs(2)).await {
-        problems.push(format!("keyboard focus after a press that didn't focus: {why}"));
+        problems.push(format!("keyboard focus doesn't outline the reply: {why}"));
     }
     page.evaluate("document.activeElement?.blur()").await.expect("blur");
     wait_for_outlined(&page, &[], Duration::from_secs(3)).await;
@@ -2986,6 +2989,13 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
         0,
         "the fallback's textarea is removed even when the copy fails"
     );
+    // The fallback ran after writeText was refused, outside the click:
+    // its focus moves still aren't keyboard focus (code review 2, L2).
+    page.move_mouse(chromiumoxide::layout::Point::new(5.0, 5.0)).await.expect("point away");
+    assert_eq!(wait_for_copy_label(&page, later, "Copy reply", Duration::from_secs(4)).await, "Copy reply");
+    if let Err(why) = outlined_within(&page, &[], Duration::from_secs(2)).await {
+        problems.push(format!("the outline stayed after a refused writeText: {why}"));
+    }
 
     // Over plain HTTP: no secure context and no Clipboard API, so the
     // fallback copies, without moving the transcript or the focus.
@@ -3088,6 +3098,46 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
         .into_value()
         .expect("facts");
     assert_eq!(fits, serde_json::json!({ "inside": true, "sideways": false }), "{fits}");
+    // A tap: "Copied" with the outline, and no outline once it's over
+    // (a tap's focus isn't the keyboard's; code review 2, L1).
+    page.evaluate(
+        "navigator.clipboard.writeText = async text => { window.__smeltCopied = text; }; \
+         if (window.__smeltExec) document.execCommand = window.__smeltExec; document.activeElement?.blur(); \
+         document.querySelector('.reply-copy').closest('.message').scrollIntoView({ block: 'center' });",
+    )
+    .await
+    .expect("let the clipboard work again");
+    page.execute(chromiumoxide::cdp::browser_protocol::emulation::SetTouchEmulationEnabledParams::new(true))
+        .await
+        .expect("emulate touch");
+    let (x, y, w, h) = element_box(&page, &reply_copy_button(reply)).await;
+    // A touch start and end (headless Chrome turns these into a tap, with
+    // its focus and click; `Input.synthesizeTapGesture` gives no click).
+    {
+        use chromiumoxide::cdp::browser_protocol::input::{DispatchTouchEventParams, DispatchTouchEventType, TouchPoint};
+        let point = TouchPoint::new((x + w / 2) as f64, (y + h / 2) as f64);
+        page.execute(DispatchTouchEventParams::new(DispatchTouchEventType::TouchStart, vec![point.clone()]))
+            .await
+            .expect("touch the button");
+        // chromiumoxide leaves out an empty list, which Chrome refuses; the
+        // point on the end still makes a tap.
+        page.execute(DispatchTouchEventParams::new(DispatchTouchEventType::TouchEnd, vec![point]))
+            .await
+            .expect("lift the touch");
+    }
+    let tapped = wait_for_copy_label(&page, reply, "Copied", Duration::from_secs(5)).await;
+    if tapped != "Copied" {
+        problems.push(format!("the tap didn't copy (the button at {x},{y} {w}x{h} reads {tapped:?})"));
+    } else {
+        wait_for_outlined(&page, &[part_one, "Todos"], Duration::from_secs(1)).await;
+        assert_eq!(
+            wait_for_copy_label(&page, reply, "Copy reply (2 parts)", Duration::from_secs(4)).await,
+            "Copy reply (2 parts)"
+        );
+        if let Err(why) = outlined_within(&page, &[], Duration::from_secs(2)).await {
+            problems.push(format!("the outline stayed after a tap: {why}"));
+        }
+    }
 
     // While a reply is written: no button on the streaming bubble, nor on
     // the newest reply's saved part; the earlier reply's still works. The
