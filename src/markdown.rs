@@ -95,8 +95,10 @@ pub fn parse(source: &str) -> Vec<Block> {
 /// `https://` plus the text, email addresses to `mailto:` plus the text.
 /// Other schemes, dotted names without `www.` (`main.rs`, `example.com`),
 /// and a link that wouldn't go where its text says (see `mailto` and
-/// `has_bidi_control`) stay text. Code, raw HTML blocks, image alt text and an
-/// existing link's words are left alone, so a link never nests in a link.
+/// `has_bidi_control`) stay text. Code, raw HTML blocks, a shown image's
+/// alt text and an allowed link's words are left alone, so a link never
+/// nests in a link; a refused link or image is plain text by now, so a URL
+/// in its words is linked like any other.
 fn autolink(blocks: &mut [Block]) {
     let mut www = LinkFinder::new();
     www.kinds(&[LinkKind::Url]).url_must_have_scheme(false);
@@ -1226,6 +1228,20 @@ mod tests {
             links_in("mail first.last+tag@e.com"),
             pairs(&[("mailto:first.last+tag@e.com", "first.last+tag@e.com")]),
             "an ordinary address still links"
+        );
+    }
+
+    /// SME-104 review 1: a refused link or image is plain text before
+    /// `autolink` runs, so a URL in its words links to where they say.
+    #[test]
+    fn test_a_refused_links_or_images_words_are_autolinked_like_text() {
+        assert_eq!(
+            parse("[https://a.com](javascript:x) ![www.b.com](ftp://c/d.png)"),
+            vec![Block::Paragraph(vec![
+                link("https://a.com", "https://a.com"),
+                text(" "),
+                link("https://www.b.com", "www.b.com"),
+            ])]
         );
     }
 
