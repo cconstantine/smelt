@@ -72,6 +72,8 @@ previous pod to go. Test cleanup that needs nothing to stop cleanly uses
 `immediate_delete_params()` (`grace_period_seconds: Some(0)`) instead, so
 tests don't time out waiting.
 
+**To hold a pod at a start-up stage on purpose, block that stage deterministically rather than starving the node.** `sandbox::tests::cluster::test_a_pod_stuck_before_its_containers_says_what_it_waits_on` (SME-132) gives a pod a volume naming a ConfigMap that doesn't exist: the kubelet can't mount it, so the pod stays at `PodReadyToStartContainers: False` with `FailedMount` events every time, which is where SME-132's browser-tier flake timed out, and no container ever starts, so it costs the node nothing. The kubelet mounts only the volumes a container uses, so the volume needs a mount too. The pod has `activeDeadlineSeconds: 60`, so a run killed after the create leaves a pod the kubelet fails with `DeadlineExceeded`. It checks the deadline only once its 2-minute wait for the mount gives up: a killed run's pod failed at 127 s, not 60. Loading the node to reach a stage slows every other gate and the user's dev pods on the one shared node, and reaches the stage only some of the time.
+
 Three about `pods.exec`, the first two proven the hard way on `sandbox-oom` (hit once during that
 project's design spikes, then hit *again*, independently, while writing
 its final integration test — worth internalizing rather than
