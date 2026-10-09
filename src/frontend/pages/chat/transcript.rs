@@ -1,6 +1,7 @@
 //! Rendering the transcript: content blocks, tool calls and results, diffs, notices.
 
 use super::*;
+use crate::frontend::clipboard::CopyButton;
 use crate::markdown::Markdown;
 
 /// Pretty-prints a `ToolUse` block's `input` for display. Falls back to the
@@ -163,6 +164,159 @@ pub(super) fn tool_use_names_by_id(messages: &[Message]) -> HashMap<String, Stri
             _ => None,
         })
         .collect()
+}
+
+/// One message's share of a finished reply the user can copy (SME-105).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ReplyPart {
+    /// The reply it belongs to: the id of the message holding the reply's
+    /// last text, where its button is.
+    pub(super) reply: i64,
+    /// The blocks of this message the copy includes, which the button
+    /// outlines while it's pointed at.
+    pub(super) blocks: Vec<usize>,
+    /// On the message holding the reply's last text: the button.
+    pub(super) copy: Option<ReplyCopy>,
+}
+
+/// A reply's button: where it sits and what it copies.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ReplyCopy {
+    /// The block whose bubble holds the button: the reply's last text.
+    pub(super) block_index: usize,
+    /// The reply's text blocks as the model wrote them, joined by a blank
+    /// line. Shared, so handing each message its part doesn't copy it.
+    pub(super) markdown: std::rc::Rc<str>,
+    /// How many text bubbles that is.
+    pub(super) parts: usize,
+}
+
+/// Each finished reply's parts, by message id (SME-105). A reply is every
+/// assistant text block from one thing the user did to the next: a
+/// user-role message holding text (their message, or a notice such as
+/// "Stopped.") or answering an `ask_user` call (not refusing it) starts a new one; ordinary
+/// tool results and compaction's placeholders don't, nor does a terminal
+/// command's notice saved right after tool results, inside a turn's tool
+/// loop (a command that finished while the turn went on). Thinking, tool calls,
+/// results and compaction summaries aren't part of the copy, nor is a text
+/// block that is only whitespace. While the turn runs, the newest reply
+/// (the one after the last such message) has none: it may still grow.
+pub(super) fn reply_parts(messages: &[Message], turn_running: bool) -> HashMap<i64, ReplyPart> {
+    // Each message parsed once, for the tool names and the walk below.
+    let readable: Vec<(&Message, Vec<ContentBlock>)> =
+        messages.iter().filter_map(|m| m.blocks().ok().map(|blocks| (m, blocks))).collect();
+    let tool_names: HashMap<&str, &str> = readable
+        .iter()
+        .flat_map(|(_, blocks)| blocks)
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, .. } => Some((id.as_str(), name.as_str())),
+            _ => None,
+        })
+        .collect();
+    let mut parts = HashMap::new();
+    // The reply being gathered: (message id, block index, text) per part.
+    let mut reply: Vec<(i64, usize, &str)> = Vec::new();
+    // Whether the turn is inside its tool loop: the last message was tool
+    // results going back to the model. A terminal command's notice saved
+    // there (drained at the top of the loop) is part of the same turn, not
+    // a new one (code review 1). Only those are drained there: a cut-off
+    // notice or "Stopped." after tool results ends the turn (code review
+    // 2). A turn that failed right after its tool results looks the same
+    // as one still in its loop, so a command finishing after it joins the
+    // failed turn's reply.
+    let mut in_tool_loop = false;
+    for (message, blocks) in &readable {
+        if message.role == "user" {
+            let mut starts_reply = false;
+            let mut tool_results = false;
+            for block in blocks {
+                match block {
+                    ContentBlock::Text { text } => {
+                        let mid_turn_notice = in_tool_loop && text.starts_with("Terminal command ");
+                        starts_reply |= !mid_turn_notice;
+                    }
+                    // An answer to `ask_user` (or the user writing
+                    // instead); a refused call's error result is an
+                    // ordinary tool result and the turn goes on.
+                    ContentBlock::ToolResult { tool_use_id, is_error, .. } => {
+                        tool_results = true;
+                        starts_reply |= *is_error != Some(true)
+                            && tool_names.get(tool_use_id.as_str()).is_some_and(|name| *name == ASK_USER);
+                    }
+                    _ => {}
+                }
+            }
+            if starts_reply {
+                finish_reply(&mut parts, std::mem::take(&mut reply));
+                in_tool_loop = false;
+            } else if tool_results {
+                in_tool_loop = true;
+            }
+        } else if message.role == "assistant" {
+            in_tool_loop = false;
+            for (index, block) in blocks.iter().enumerate() {
+                if let ContentBlock::Text { text } = block
+                    && !text.trim().is_empty()
+                {
+                    reply.push((message.id, index, text));
+                }
+            }
+        }
+    }
+    if !turn_running {
+        finish_reply(&mut parts, reply);
+    }
+    parts
+}
+
+/// Adds one finished reply's parts to `parts`, unless it has no text.
+fn finish_reply(parts: &mut HashMap<i64, ReplyPart>, reply: Vec<(i64, usize, &str)>) {
+    let Some(&(last_message, last_block, _)) = reply.last() else {
+        return;
+    };
+    let markdown = reply
+        .iter()
+        .map(|(_, _, text)| text.trim_matches(|c| c == '\n' || c == '\r'))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    for &(message, block, _) in &reply {
+        parts
+            .entry(message)
+            .or_insert_with(|| ReplyPart { reply: last_message, blocks: Vec::new(), copy: None })
+            .blocks
+            .push(block);
+    }
+    if let Some(part) = parts.get_mut(&last_message) {
+        part.copy = Some(ReplyCopy { block_index: last_block, markdown: markdown.into(), parts: reply.len() });
+    }
+}
+
+/// A reply's Copy button label: how many bubbles it copies, when that's
+/// more than the one it sits in.
+pub(super) fn reply_copy_label(parts: usize) -> String {
+    if parts > 1 { format!("Copy reply ({parts} parts)") } else { "Copy reply".to_string() }
+}
+
+pub(super) fn reply_copy_title(parts: usize) -> String {
+    if parts > 1 {
+        format!("Copy this reply's {parts} outlined parts as Markdown")
+    } else {
+        "Copy this reply as Markdown".to_string()
+    }
+}
+
+/// Outlines the bubbles of the reply whose Copy reply button is pointed
+/// at, focused or showing its feedback, so the user sees how much it
+/// copies. A rule of its own rather than a prop, so only this re-renders
+/// when the pointer moves on or off a button.
+#[component]
+fn ReplyOutline(lit_reply: Signal<Option<i64>>) -> Element {
+    match lit_reply() {
+        Some(reply) => rsx! {
+            style { ".message[data-reply=\"{reply}\"] {{ outline: 2px solid var(--accent); outline-offset: 2px; }}" }
+        },
+        None => rsx! {},
+    }
 }
 
 /// Formats a message's `created_at` for the small, subtle timestamp shown
@@ -345,6 +499,8 @@ pub(super) fn render_block_element(
     commands: &HashMap<String, String>,
     thinking_open: bool,
     on_media_load: EventHandler<()>,
+    reply_part: Option<&ReplyPart>,
+    mut lit_reply: Signal<Option<i64>>,
 ) -> Element {
     let key = format!("{message_id}-{index}");
     let timestamp = format_timestamp(created_at, tz_offset_minutes);
@@ -360,14 +516,41 @@ pub(super) fn render_block_element(
         }
         // The model's replies render as markdown (SME-30); everything
         // else stays plain text.
-        ContentBlock::Text { text } if role == "assistant" => rsx! {
-            div { key: "{key}", class: "message message-{role}",
-                div { class: "message-text message-markdown",
-                    Markdown { source: text.clone(), on_media_load }
+        // A finished reply's last text holds its Copy reply button, and
+        // every text the copy includes is marked with the reply, for the
+        // outline the button shows (SME-105).
+        ContentBlock::Text { text } if role == "assistant" => {
+            let reply_attr = reply_part.filter(|part| part.blocks.contains(&index)).map(|part| part.reply.to_string());
+            let copy = reply_part
+                .and_then(|part| part.copy.clone().filter(|copy| copy.block_index == index).map(|copy| (part.reply, copy)));
+            rsx! {
+                div { key: "{key}", class: "message message-{role}", "data-reply": reply_attr,
+                    div { class: "message-text message-markdown",
+                        Markdown { source: text.clone(), on_media_load }
+                    }
+                    if let Some((reply, copy)) = copy {
+                        div { class: "message-footer",
+                            CopyButton {
+                                label: reply_copy_label(copy.parts),
+                                title: reply_copy_title(copy.parts),
+                                text: copy.markdown,
+                                class: "reply-copy",
+                                on_highlight: move |on: bool| {
+                                    if on {
+                                        lit_reply.set(Some(reply));
+                                    } else if *lit_reply.peek() == Some(reply) {
+                                        lit_reply.set(None);
+                                    }
+                                },
+                            }
+                            span { class: "timestamp", "{timestamp}" }
+                        }
+                    } else {
+                        span { class: "timestamp", "{timestamp}" }
+                    }
                 }
-                span { class: "timestamp", "{timestamp}" }
             }
-        },
+        }
         ContentBlock::Text { text } => rsx! {
             div { key: "{key}", class: "message message-{role}",
                 div { class: "message-text", "{display_text(text)}" }
@@ -552,6 +735,8 @@ pub(super) fn MessageView(
     tool_results: Memo<HashMap<String, (String, bool)>>,
     commands: Memo<HashMap<String, String>>,
     on_media_load: EventHandler<()>,
+    reply_part: Option<ReplyPart>,
+    lit_reply: Signal<Option<i64>>,
 ) -> Element {
     match message.blocks() {
         Ok(blocks) => {
@@ -561,7 +746,7 @@ pub(super) fn MessageView(
             let commands = commands.read();
             rsx! {
                 for (i , block) in blocks.iter().enumerate() {
-                    {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes, block, &tool_names, &tool_results, &commands, thinking_open, on_media_load)}
+                    {render_block_element(message.id, i, &message.role, message.created_at, tz_offset_minutes, block, &tool_names, &tool_results, &commands, thinking_open, on_media_load, reply_part.as_ref(), lit_reply)}
                 }
             }
         }
@@ -600,6 +785,27 @@ pub(super) fn Transcript(
     let tool_names = use_memo(move || tool_use_names_by_id(&messages.read()));
     let tool_results = use_memo(move || tool_results_by_id(&messages.read()));
     let commands = use_memo(move || terminal_commands_by_id(&messages.read()));
+    // Recomputed when a message arrives or the turn starts or ends, not per
+    // streamed delta. Each message gets only its own part, so a moved
+    // button re-renders just the messages it moved between (SME-105).
+    let copies = use_memo(move || reply_parts(&messages.read(), turn_running()));
+    // The reply whose Copy reply button is pointed at, focused or showing
+    // its feedback: its bubbles are outlined.
+    let mut lit_reply = use_signal(|| None::<i64>);
+    // A lit reply whose button is gone (another conversation opened, or the
+    // turn started again) isn't lit any more: the button can't say so
+    // itself once it's unmounted (code review 1).
+    use_effect(move || {
+        let lit = *lit_reply.peek();
+        let has_button = |reply: i64| copies.read().get(&reply).is_some_and(|part| part.copy.is_some());
+        // Subscribe to the parts even when nothing is lit.
+        let _ = copies.read();
+        if let Some(reply) = lit
+            && !has_button(reply)
+        {
+            lit_reply.set(None);
+        }
+    });
     rsx! {
         div {
             class: "messages",
@@ -658,14 +864,17 @@ pub(super) fn Transcript(
             for message in messages() {
                 MessageView {
                     key: "{message.id}",
+                    reply_part: copies.read().get(&message.id).cloned(),
                     message,
                     tz_offset_minutes: tz_offset_minutes(),
                     tool_names,
                     tool_results,
                     commands,
                     on_media_load,
+                    lit_reply,
                 }
             }
+            ReplyOutline { lit_reply }
             // A new conversation says what smelt does and offers a
             // few asks to start from, instead of a blank screen
             // (SME-41 D12). Picking one fills the message box.

@@ -1,3 +1,4 @@
+pub(crate) mod clipboard;
 mod pages;
 
 use dioxus::prelude::*;
