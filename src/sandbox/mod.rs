@@ -83,7 +83,9 @@ const RELAY_CONNECT_WAIT: Duration = Duration::from_secs(7);
 pub enum SandboxError {
     Kube(kube::Error),
     /// The pod didn't reach `Running` within `running_wait_timeout()`; the
-    /// detail is the pod's own explanation, when it gave one.
+    /// detail says what it was stuck on (`pod_start_report`, SME-132), or
+    /// the last poll's first `False` condition when the pod couldn't be
+    /// read again, or why an earlier wait gave up.
     Timeout(Option<String>),
     /// A pod already existed for this session but wasn't `Running` (e.g.
     /// `Terminating`, `Failed`). What to do here is an open question in

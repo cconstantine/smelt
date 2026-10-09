@@ -27,9 +27,13 @@ keyboard-types = "0.7"
 # markdown (SME-30). pulldown-cmark is an event parser (no HTML output
 # used: smelt builds its own node tree and renders Dioxus elements, so raw
 # HTML in a reply stays text); syntect + two-face highlight code blocks
-# into class-named spans with the pure-Rust regex engine. All three build
-# for wasm32-unknown-unknown, so not feature-gated.
+# into class-named spans with the pure-Rust regex engine. linkify finds
+# bare URLs and email addresses in a reply's text, which pulldown-cmark
+# doesn't autolink (SME-104); its only dependency is memchr, already here
+# through pulldown-cmark. All four build for wasm32-unknown-unknown, so
+# not feature-gated.
 pulldown-cmark = { version = "0.13.4", default-features = false }
+linkify = { version = "0.11", default-features = false }
 syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 

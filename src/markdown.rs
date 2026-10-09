@@ -4,13 +4,15 @@
 //!
 //! The reply is untrusted text (the model may echo a web page it read),
 //! so nothing here builds an HTML string or sets `dangerous_inner_html`:
-//! raw HTML in a reply comes out as literal text, a link only becomes an
+//! raw HTML in a reply comes out as literal text, a link (written as one,
+//! or a bare URL or email address `autolink` finds) only becomes an
 //! `<a>` for `http`, `https` and `mailto`, and an image only loads for
 //! `http`/`https`. See docs/frontend.md, "Markdown in replies", for what
 //! this boundary covers and what it doesn't.
 
 use dioxus::prelude::*;
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use linkify::{LinkFinder, LinkKind};
+use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
 
 use crate::highlight::{self, Span};
 
@@ -78,7 +80,133 @@ pub fn parse(source: &str) -> Vec<Block> {
         let at_end = range.end >= end;
         builder.event(event, source.get(range).unwrap_or(""), at_end);
     }
-    builder.finish()
+    let mut blocks = builder.finish();
+    autolink(&mut blocks);
+    blocks
+}
+
+/// Turns bare URLs, `www.` addresses and email addresses in a reply's text
+/// into links (SME-104), which pulldown-cmark doesn't do. It runs on the
+/// finished tree rather than per text event, since pulldown-cmark splits
+/// one URL into several events at escapes and entities.
+///
+/// A link's words are always the text it was found in, so it goes where it
+/// says: `http`/`https` URLs link to themselves, `www.` addresses to
+/// `https://` plus the text, email addresses to `mailto:` plus the text.
+/// Other schemes, dotted names without `www.` (`main.rs`, `example.com`),
+/// and a link that wouldn't go where its text says (see `mailto` and
+/// `has_bidi_control`) stay text. Code, raw HTML blocks, a shown image's
+/// alt text and an allowed link's words are left alone, so a link never
+/// nests in a link; a refused link or image is plain text by now, so a URL
+/// in its words is linked like any other.
+fn autolink(blocks: &mut [Block]) {
+    let mut www = LinkFinder::new();
+    www.kinds(&[LinkKind::Url]).url_must_have_scheme(false);
+    autolink_blocks(blocks, &Finders { links: LinkFinder::new(), www });
+}
+
+/// `links` finds URLs with a scheme and email addresses. `www` finds URLs
+/// without a scheme, and runs only on the text between what `links`
+/// found: in one pass, the `.` in `first.last@e.com` starts a schemeless
+/// match (`first.last`), and the address found after it is the wrong one
+/// (`last@e.com`'s tail).
+struct Finders {
+    links: LinkFinder,
+    www: LinkFinder,
+}
+
+fn autolink_blocks(blocks: &mut [Block], finder: &Finders) {
+    for block in blocks {
+        match block {
+            Block::Paragraph(content) | Block::Plain(content) | Block::Heading { content, .. } => {
+                autolink_inlines(content, finder, 0)
+            }
+            Block::Quote(inner) => autolink_blocks(inner, finder),
+            Block::List { items, .. } => {
+                for item in items {
+                    autolink_blocks(&mut item.blocks, finder);
+                }
+            }
+            Block::Table { head, rows } => {
+                for cell in head.iter_mut().chain(rows.iter_mut().flatten()) {
+                    autolink_inlines(cell, finder, 0);
+                }
+            }
+            Block::Code { .. } | Block::Rule | Block::Html(_) => {}
+        }
+    }
+}
+
+/// `depth` is how many emphasis, strong and strikethrough spans enclose
+/// `inlines`: text already `MAX_DEPTH` deep stays text, so a link doesn't
+/// take the tree past the limit.
+fn autolink_inlines(inlines: &mut Vec<Inline>, finder: &Finders, depth: usize) {
+    let mut out = Vec::with_capacity(inlines.len());
+    for mut inline in std::mem::take(inlines) {
+        match &mut inline {
+            Inline::Text(text) if depth < MAX_DEPTH => {
+                split_links(text, finder, &mut out);
+                continue;
+            }
+            Inline::Emphasis(content) | Inline::Strong(content) | Inline::Strike(content) => {
+                autolink_inlines(content, finder, depth + 1)
+            }
+            _ => {}
+        }
+        out.push(inline);
+    }
+    *inlines = out;
+}
+
+/// Splits `text` into text and the links found in it.
+fn split_links(text: &str, finder: &Finders, out: &mut Vec<Inline>) {
+    for span in finder.links.spans(text) {
+        let found = span.as_str();
+        match span.kind() {
+            Some(LinkKind::Url) if allowed_url(found, &["http", "https"]) && !has_bidi_control(found) => {
+                push_link(out, found.to_string(), found)
+            }
+            Some(LinkKind::Email) if let Some(url) = mailto(found) => push_link(out, url, found),
+            // A URL with another scheme, or one that wouldn't go where it
+            // says, stays text, all of it.
+            Some(_) => push_inline(out, Inline::Text(found.to_string())),
+            None => {
+                for gap in finder.www.spans(found) {
+                    let words = gap.as_str();
+                    if gap.kind().is_some()
+                        && words.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("www."))
+                        && !has_bidi_control(words)
+                    {
+                        push_link(out, format!("https://{words}"), words);
+                    } else {
+                        push_inline(out, Inline::Text(words.to_string()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The `mailto:` link for an email address, or `None` when a mail client
+/// would send it somewhere its text doesn't say: URL syntax in it
+/// (`billing?cc=x@evil.com` is a mail to "billing" copied to x@evil.com,
+/// `x%40evil.com?@bank.com` one to x@evil.com), or bidi controls that
+/// reorder how it shows. RFC 5322 allows `?`, `#`, `%`, `&` and `/` in an
+/// address's name, and linkify finds them; real addresses rarely use them.
+fn mailto(address: &str) -> Option<String> {
+    let url_syntax = address.contains(['?', '#', '%', '&', '/']);
+    (!url_syntax && !has_bidi_control(address)).then(|| format!("mailto:{address}"))
+}
+
+/// Whether `text` holds a bidi control, which reorders how the text
+/// around it shows: a link holding one can show one address and go to
+/// another.
+fn has_bidi_control(text: &str) -> bool {
+    text.chars().any(|c| matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+}
+
+fn push_link(out: &mut Vec<Inline>, url: String, words: &str) {
+    out.push(Inline::Link { url, content: vec![Inline::Text(words.to_string())] });
 }
 
 /// Whether a link or image destination is one smelt will follow.
@@ -257,10 +385,26 @@ impl Builder {
                         Tag::Emphasis => Container::Emphasis(Vec::new()),
                         Tag::Strong => Container::Strong(Vec::new()),
                         Tag::Strikethrough => Container::Strike(Vec::new()),
-                        Tag::Link { dest_url, .. } => Container::Link {
-                            url: allowed_url(&dest_url, &["http", "https", "mailto"]).then(|| dest_url.to_string()),
-                            content: Vec::new(),
-                        },
+                        Tag::Link { link_type, dest_url, .. } => {
+                            // pulldown-cmark gives `<me@e.com>` no `mailto:`.
+                            // An angle-bracket link shows its own address, so
+                            // it is refused where that address would mislead,
+                            // as a bare one is (`split_links`).
+                            let dest = match link_type {
+                                LinkType::Email => mailto(&dest_url),
+                                LinkType::Autolink if has_bidi_control(&dest_url) => None,
+                                LinkType::Autolink
+                                    if dest_url.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("mailto:")) =>
+                                {
+                                    dest_url.get(7..).and_then(mailto)
+                                }
+                                _ => Some(dest_url.to_string()),
+                            };
+                            Container::Link {
+                                url: dest.filter(|dest| allowed_url(dest, &["http", "https", "mailto"])),
+                                content: Vec::new(),
+                            }
+                        }
                         _ => Container::Transparent { block: false },
                     }
                 }
@@ -910,6 +1054,289 @@ mod tests {
             panic!("a paragraph");
         };
         assert!(inline_depth(&content) <= MAX_DEPTH);
+    }
+
+    fn link(url: &str, visible: &str) -> Inline {
+        Inline::Link { url: url.into(), content: vec![text(visible)] }
+    }
+
+    /// Every link in a parsed reply, in order: its `href` and its words.
+    fn links_in(source: &str) -> Vec<(String, String)> {
+        fn inlines(content: &[Inline], out: &mut Vec<(String, String)>) {
+            for inline in content {
+                match inline {
+                    Inline::Link { url, content } => {
+                        let mut words = String::new();
+                        content.iter().for_each(|i| plain_text(i, &mut words));
+                        out.push((url.clone(), words));
+                    }
+                    Inline::Emphasis(c) | Inline::Strong(c) | Inline::Strike(c) => inlines(c, out),
+                    _ => {}
+                }
+            }
+        }
+        fn blocks(content: &[Block], out: &mut Vec<(String, String)>) {
+            for block in content {
+                match block {
+                    Block::Paragraph(c) | Block::Plain(c) | Block::Heading { content: c, .. } => inlines(c, out),
+                    Block::Quote(inner) => blocks(inner, out),
+                    Block::List { items, .. } => items.iter().for_each(|i| blocks(&i.blocks, out)),
+                    Block::Table { head, rows } => {
+                        head.iter().chain(rows.iter().flatten()).for_each(|cell| inlines(cell, out))
+                    }
+                    Block::Code { .. } | Block::Rule | Block::Html(_) => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        blocks(&parse(source), &mut out);
+        out
+    }
+
+    fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected.iter().map(|(u, t)| (u.to_string(), t.to_string())).collect()
+    }
+
+    /// SME-104: a bare URL in a reply is a link whose words are the URL,
+    /// with the text around it kept.
+    #[test]
+    fn test_a_bare_url_becomes_a_link_and_keeps_the_text_around_it() {
+        assert_eq!(
+            parse("See https://e.com/x?y=1#z now"),
+            vec![Block::Paragraph(vec![text("See "), link("https://e.com/x?y=1#z", "https://e.com/x?y=1#z"), text(" now")])]
+        );
+        assert_eq!(
+            links_in("a http://e.com b HTTPS://E.COM/X"),
+            pairs(&[("http://e.com", "http://e.com"), ("HTTPS://E.COM/X", "HTTPS://E.COM/X")])
+        );
+    }
+
+    /// SME-104: trailing punctuation isn't part of a URL, a balanced `)`
+    /// is, and a quote ends one.
+    #[test]
+    fn test_a_bare_urls_trailing_punctuation_and_parentheses() {
+        assert_eq!(links_in("see https://e.com."), pairs(&[("https://e.com", "https://e.com")]));
+        assert_eq!(
+            links_in("a https://a.com, b https://b.com! c https://c.com: d https://d.com; e https://e.com?"),
+            pairs(&[
+                ("https://a.com", "https://a.com"),
+                ("https://b.com", "https://b.com"),
+                ("https://c.com", "https://c.com"),
+                ("https://d.com", "https://d.com"),
+                ("https://e.com", "https://e.com"),
+            ])
+        );
+        assert_eq!(links_in("(https://e.com)"), pairs(&[("https://e.com", "https://e.com")]));
+        let wiki = "https://en.wikipedia.org/wiki/Rust_(programming_language)";
+        assert_eq!(links_in(&format!("{wiki}.")), pairs(&[(wiki, wiki)]));
+        let inner = "https://en.wikipedia.org/wiki/Rust_(language)";
+        assert_eq!(links_in(&format!("(see {inner})")), pairs(&[(inner, inner)]));
+        assert_eq!(links_in("\"https://e.com/\" said"), pairs(&[("https://e.com/", "https://e.com/")]));
+    }
+
+    /// SME-104: a `www.` address links to `https://`, its text unchanged;
+    /// other names with a dot (file names, bare domains) stay text.
+    #[test]
+    fn test_www_addresses_link_and_file_names_stay_text() {
+        assert_eq!(
+            parse("go to www.example.com/a."),
+            vec![Block::Paragraph(vec![
+                text("go to "),
+                link("https://www.example.com/a", "www.example.com/a"),
+                text("."),
+            ])]
+        );
+        assert_eq!(links_in("WWW.E.COM"), pairs(&[("https://WWW.E.COM", "WWW.E.COM")]));
+        assert_eq!(
+            parse("See readme.md, main.rs, foo.bar() and example.com or e.g. this."),
+            vec![Block::Paragraph(vec![text("See readme.md, main.rs, foo.bar() and example.com or e.g. this.")])]
+        );
+    }
+
+    /// SME-104: an email address links to `mailto:`.
+    #[test]
+    fn test_a_bare_email_address_links_to_mailto() {
+        assert_eq!(
+            parse("Mail me@example.com."),
+            vec![Block::Paragraph(vec![text("Mail "), link("mailto:me@example.com", "me@example.com"), text(".")])]
+        );
+        assert_eq!(
+            links_in("or first.last+tag@mail.example.org"),
+            pairs(&[("mailto:first.last+tag@mail.example.org", "first.last+tag@mail.example.org")])
+        );
+        assert_eq!(
+            links_in("user.name@e.com"),
+            pairs(&[("mailto:user.name@e.com", "user.name@e.com")]),
+            "an address with a dot in its name is found whole"
+        );
+        assert_eq!(links_in("root@localhost"), pairs(&[]), "a domain without a dot stays text");
+    }
+
+    /// SME-104: `<me@e.com>` came through with no `mailto:`, so it was
+    /// refused as a link; an angle-bracket URL stays one link.
+    #[test]
+    fn test_angle_bracket_autolinks() {
+        assert_eq!(
+            parse("<me@e.com>"),
+            vec![Block::Paragraph(vec![link("mailto:me@e.com", "me@e.com")])]
+        );
+        assert_eq!(parse("<https://e.com>"), vec![Block::Paragraph(vec![link("https://e.com", "https://e.com")])]);
+    }
+
+    /// SME-104: code, raw HTML blocks, image alt text and an existing
+    /// link's words are left alone, so a link never nests in a link.
+    #[test]
+    fn test_code_html_blocks_alt_text_and_links_are_not_autolinked() {
+        assert_eq!(parse("`https://e.com`"), vec![Block::Paragraph(vec![Inline::Code("https://e.com".into())])]);
+        assert_eq!(links_in("```\nhttps://e.com\n```\n\n    https://f.com\n"), pairs(&[]));
+        assert_eq!(parse("<div>\nhttps://e.com\n</div>"), vec![Block::Html("<div>\nhttps://e.com\n</div>".into())]);
+        assert_eq!(
+            parse("![https://e.com/a](https://e.com/b.png)"),
+            vec![Block::Paragraph(vec![Inline::Image { url: "https://e.com/b.png".into(), alt: "https://e.com/a".into() }])]
+        );
+        assert_eq!(
+            parse("[https://a.com](https://b.com)"),
+            vec![Block::Paragraph(vec![link("https://b.com", "https://a.com")])]
+        );
+        assert_eq!(
+            parse("[see *www.a.com*](https://b.com)"),
+            vec![Block::Paragraph(vec![Inline::Link {
+                url: "https://b.com".into(),
+                content: vec![text("see "), Inline::Emphasis(vec![text("www.a.com")])],
+            }])]
+        );
+    }
+
+    /// SME-104 review 1: an email address whose name holds URL syntax
+    /// (`?`, `#`, `%`, `&`, `/`) would send a `mailto:` somewhere its text
+    /// doesn't say (`billing?cc=x@evil.com` is a mail to "billing" copied to
+    /// x@evil.com), and bidi controls reorder what a link shows; both stay
+    /// text, bare or in angle brackets.
+    #[test]
+    fn test_links_that_would_not_go_where_they_say_stay_text() {
+        for source in [
+            "billing?cc=attacker@evil.com",
+            "attacker%40evil.com?@bank.com",
+            "a#b@e.com",
+            "a&b@e.com",
+            "a/b@e.com",
+            "<billing?cc=attacker@evil.com>",
+            "<https://e.com/\u{202E}moc.knab>",
+            "<mailto:billing?cc=attacker@evil.com>",
+            "<MAILTO:a%40evil.com@bank.com>",
+            "a\u{202E}b@e.com",
+            "https://e.com/\u{202E}moc.knab",
+            "www.e\u{2066}x.com",
+            "see \u{200F}me@e.com",
+        ] {
+            assert_eq!(links_in(source), pairs(&[]), "{source:?}");
+        }
+        assert_eq!(
+            links_in("mail first.last+tag@e.com"),
+            pairs(&[("mailto:first.last+tag@e.com", "first.last+tag@e.com")]),
+            "an ordinary address still links"
+        );
+        assert_eq!(
+            links_in("<mailto:me@e.com>"),
+            pairs(&[("mailto:me@e.com", "mailto:me@e.com")]),
+            "an ordinary mailto: autolink still links"
+        );
+    }
+
+    /// SME-104 review 1: a refused link or image is plain text before
+    /// `autolink` runs, so a URL in its words links to where they say.
+    #[test]
+    fn test_a_refused_links_or_images_words_are_autolinked_like_text() {
+        assert_eq!(
+            parse("[https://a.com](javascript:x) ![www.b.com](ftp://c/d.png)"),
+            vec![Block::Paragraph(vec![
+                link("https://a.com", "https://a.com"),
+                text(" "),
+                link("https://www.b.com", "www.b.com"),
+            ])]
+        );
+    }
+
+    /// SME-104: only `http` and `https` URLs link; other schemes stay text.
+    #[test]
+    fn test_other_schemes_stay_text() {
+        assert_eq!(
+            parse("ftp://e.com file:///etc/passwd javascript://alert(1) data://x.com/y"),
+            vec![Block::Paragraph(vec![text("ftp://e.com file:///etc/passwd javascript://alert(1) data://x.com/y")])]
+        );
+    }
+
+    /// SME-104: pulldown-cmark splits a URL at an escape or an entity; the
+    /// link covers the whole URL, unescaped.
+    #[test]
+    fn test_a_url_split_by_escapes_and_entities_is_one_link() {
+        assert_eq!(
+            links_in("see https://e.com/a\\_b?x=1&amp;y=2 now"),
+            pairs(&[("https://e.com/a_b?x=1&y=2", "https://e.com/a_b?x=1&y=2")])
+        );
+    }
+
+    /// SME-104: bare URLs link inside formatting and every block that
+    /// holds text.
+    #[test]
+    fn test_bare_urls_link_inside_formatting_and_blocks() {
+        let source = "*https://a.com* **https://b.com** ~~https://c.com~~\n\n\
+            # https://d.com\n\n| h |\n|---|\n| https://e.com |\n\n- https://f.com\n\n> https://g.com\n";
+        let found: Vec<String> = links_in(source).into_iter().map(|(u, _)| u).collect();
+        assert_eq!(
+            found,
+            ["https://a.com", "https://b.com", "https://c.com", "https://d.com", "https://e.com", "https://f.com", "https://g.com"]
+        );
+    }
+
+    /// SME-104: several URLs in one run of text, with non-ASCII around
+    /// them.
+    #[test]
+    fn test_several_urls_and_non_ascii_text() {
+        assert_eq!(
+            parse("héllo https://a.com 你好 www.b.com/ü 🎉 c@d.io"),
+            vec![Block::Paragraph(vec![
+                text("héllo "),
+                link("https://a.com", "https://a.com"),
+                text(" 你好 "),
+                link("https://www.b.com/ü", "www.b.com/ü"),
+                text(" 🎉 "),
+                link("mailto:c@d.io", "c@d.io"),
+            ])]
+        );
+    }
+
+    /// SME-104: what a URL looks like while the reply streaming it is
+    /// still arriving.
+    #[test]
+    fn test_half_written_urls_while_streaming() {
+        assert_eq!(links_in("see https://"), pairs(&[]));
+        assert_eq!(links_in("see www."), pairs(&[]));
+        assert_eq!(links_in("mail me@"), pairs(&[]));
+        assert_eq!(links_in("mail me@ex"), pairs(&[]));
+        assert_eq!(links_in("see https://exa"), pairs(&[("https://exa", "https://exa")]));
+        assert_eq!(links_in("[docs](https://ex"), pairs(&[("https://ex", "https://ex")]));
+        assert_eq!(links_in("[docs](https://ex.com)"), pairs(&[("https://ex.com", "docs")]));
+    }
+
+    /// SME-104: a URL nested as deep as formatting goes stays text rather
+    /// than making the tree deeper than `MAX_DEPTH`.
+    #[test]
+    fn test_autolinking_keeps_inline_nesting_within_the_limit() {
+        let stars = "*".repeat(2_000);
+        let blocks = parse(&format!("{stars}https://e.com{stars}"));
+        let Some(Block::Paragraph(content)) = blocks.first() else {
+            panic!("a paragraph: {blocks:?}");
+        };
+        assert!(inline_depth(content) <= MAX_DEPTH, "inline nesting {} deep", inline_depth(content));
+        assert!(format!("{content:?}").contains("https://e.com"), "the URL's text survives");
+        // One level shallower, there's room for the link.
+        let fifteen = (0..MAX_DEPTH - 1).fold("https://e.com".to_string(), |inner, _| format!("*x {inner} y*"));
+        let Some(Block::Paragraph(content)) = parse(&fifteen).first().cloned() else {
+            panic!("a paragraph");
+        };
+        assert_eq!(inline_depth(&content), MAX_DEPTH, "fifteen emphases and the link: {content:?}");
+        assert_eq!(links_in(&fifteen), pairs(&[("https://e.com", "https://e.com")]));
     }
 
     #[test]
