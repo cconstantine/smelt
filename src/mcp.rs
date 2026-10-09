@@ -769,6 +769,10 @@ pub async fn call_tool(
                 crate::telemetry::mark_error(&span, &message);
                 message
             }
+            CallFailure::Transport { message, description } => {
+                crate::telemetry::mark_error(&span, &description);
+                message
+            }
         })
     })
     .await
@@ -781,6 +785,25 @@ pub async fn call_tool(
 enum CallFailure {
     Reported(String),
     Failed(String),
+    /// Below MCP: the span gets `description`, the model `message`.
+    Transport { message: String, description: String },
+}
+
+/// What a `tools/call` that failed below MCP says on its span: the tool,
+/// the server and the kind of failure, never the error's text, which can
+/// quote the server's reply (SME-137 review 2).
+fn transport_failure_description(tool_name: &str, server: &str, error: &rmcp::service::ServiceError) -> String {
+    use rmcp::service::ServiceError;
+    let kind = match error {
+        ServiceError::McpError(_) => "the server returned an error",
+        ServiceError::TransportSend(_) => "a transport error (the server's reply is in the conversation)",
+        ServiceError::TransportClosed => "the transport closed",
+        ServiceError::UnexpectedResponse => "an unexpected response",
+        ServiceError::Timeout { .. } => "rmcp's request timeout",
+        ServiceError::Cancelled { .. } => "the request was cancelled",
+        _ => "an rmcp error",
+    };
+    format!("MCP tool call to {tool_name:?} on {server:?} failed: {kind}")
 }
 
 impl CallFailure {
@@ -840,8 +863,13 @@ async fn call_tool_unspanned(
                 drop_connection(config.id, &service).await;
             }
             let message = format!("MCP tool call to {:?} on {:?} failed: {e}", tool_name, config.name);
-            // The server's own error text can quote the call's input.
-            return Err(if from_the_tool { CallFailure::Reported(message) } else { CallFailure::Failed(message) });
+            // The server's own error text, or its reply quoted in a
+            // transport error, can quote the call's input (review 2).
+            return Err(if from_the_tool {
+                CallFailure::Reported(message)
+            } else {
+                CallFailure::Transport { description: transport_failure_description(tool_name, &config.name, &e), message }
+            });
         }
     };
 
@@ -1287,6 +1315,24 @@ mod tests {
         assert!(calls.iter().all(|span| matches!(span.status, opentelemetry::trace::Status::Error { .. })));
         let exported = format!("{spans:?}");
         assert!(!exported.contains("SECRET"), "{exported}");
+    }
+
+    /// Review 2: a server's non-JSON-RPC error reply to `tools/call` comes
+    /// back as a transport error quoting its body, which can echo the
+    /// call's input; the span names only the kind of failure.
+    #[test]
+    fn test_a_transport_failures_span_description_quotes_no_reply_body() {
+        let error = rmcp::service::ServiceError::TransportSend(rmcp::transport::DynamicTransportError::from_parts(
+            "streamable-http",
+            std::any::TypeId::of::<()>(),
+            Box::new(std::io::Error::other(
+                "unexpected server response: HTTP 500 Internal Server Error: crashed on SECRET-ECHOED-INPUT",
+            )),
+        ));
+        let description = transport_failure_description("search", "probe", &error);
+        assert!(!description.contains("SECRET"), "{description}");
+        assert!(description.contains("search") && description.contains("probe"), "{description}");
+        assert!(description.contains("transport"), "{description}");
     }
 
     #[tokio::test]
