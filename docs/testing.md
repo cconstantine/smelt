@@ -220,6 +220,8 @@ A name filter matches every test whose path contains it, and several filters are
 
 **A real-cluster test runs only this way, under the cluster lock** (see [development-process.md](development-process.md#rules)): on SME-115 a substring filter run outside the lock picked up a new test whose unfixed form was the bug being fixed, and it marked another run's claims in `smelt-park-test` for deletion.
 
+**A module with both pure and real-cluster tests keeps the real-cluster ones in a `cluster` submodule** (as `sweep::tests::cluster::…` does), so a filter on the pure tests' path can't reach them. On SME-134 the filter `sweep::tests::test_the_sweep_`, meant for the pure tests, also ran four real-cluster sweep tests outside the lock.
+
 **Gate from a detached gate worktree** when the lock queue is long, so writing the next commit goes on while a gate waits, and nothing edits the tree being gated (see [development-process.md](development-process.md#rules)). A worktree has its own `target/`, so the gate's build never shares artefacts with the branch's:
 
 ```bash
