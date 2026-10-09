@@ -760,13 +760,31 @@ pub async fn call_tool(
         otel.status_description = Empty,
     );
     crate::telemetry::in_span(span.clone(), async move {
-        let result = call_tool_unspanned(pool, config, tool_name, arguments).await;
-        if let Err(e) = &result {
-            crate::telemetry::mark_error(&span, e);
-        }
-        result
+        call_tool_unspanned(pool, config, tool_name, arguments).await.map_err(|e| match e {
+            CallFailure::Reported(message) => {
+                crate::telemetry::mark_error(&span, CallFailure::REPORTED);
+                message
+            }
+            CallFailure::Failed(message) => {
+                crate::telemetry::mark_error(&span, &message);
+                message
+            }
+        })
     })
     .await
+}
+
+/// How a `tools/call` failed: the tool said so, in output of its own (or
+/// smelt refused the call's input, quoting it), or the call itself did.
+/// Only the second's message goes on the span: a span never holds tool
+/// output or input (SME-137 review 1).
+enum CallFailure {
+    Reported(String),
+    Failed(String),
+}
+
+impl CallFailure {
+    const REPORTED: &'static str = "the MCP tool reported an error (its output is in the conversation)";
 }
 
 async fn call_tool_unspanned(
@@ -774,26 +792,26 @@ async fn call_tool_unspanned(
     config: &McpServerConfig,
     tool_name: &str,
     arguments: serde_json::Value,
-) -> Result<String, String> {
+) -> Result<String, CallFailure> {
     let arguments = match arguments {
         serde_json::Value::Object(map) => Some(map),
         serde_json::Value::Null => None,
         other => {
-            return Err(format!(
+            return Err(CallFailure::Reported(format!(
                 "tool arguments must be a JSON object, got: {other}"
-            ));
+            )));
         }
     };
 
     ensure_connected(pool, config, Attempt::SkipRecentFailures)
         .await
-        .map_err(|e| e.message)?;
+        .map_err(|e| CallFailure::Failed(e.message))?;
     let service = REGISTRY
         .lock()
         .await
         .get(&config.id)
         .map(|conn| conn.service.clone())
-        .ok_or_else(|| format!("not connected to MCP server {:?}", config.name))?;
+        .ok_or_else(|| CallFailure::Failed(format!("not connected to MCP server {:?}", config.name)))?;
 
     let mut request = CallToolRequestParams::new(tool_name.to_string());
     if let Some(arguments) = arguments {
@@ -803,11 +821,11 @@ async fn call_tool_unspanned(
     let result = tokio::time::timeout(CALL_TIMEOUT, service.call_tool(request))
         .await
         .map_err(|_| {
-            format!(
+            CallFailure::Failed(format!(
                 "MCP server {:?} didn't answer {tool_name:?} within {}s",
                 config.name,
                 CALL_TIMEOUT.as_secs()
-            )
+            ))
         })?;
     let result = match result {
         Ok(result) => result,
@@ -817,13 +835,13 @@ async fn call_tool_unspanned(
             // the connection is taken as dead, so the next caller connects
             // again rather than every call failing on it (SME-113). A
             // JSON-RPC error from the tool itself isn't the connection's.
-            if !matches!(e, rmcp::service::ServiceError::McpError(_)) {
+            let from_the_tool = matches!(e, rmcp::service::ServiceError::McpError(_));
+            if !from_the_tool {
                 drop_connection(config.id, &service).await;
             }
-            return Err(format!(
-                "MCP tool call to {:?} on {:?} failed: {e}",
-                tool_name, config.name
-            ));
+            let message = format!("MCP tool call to {:?} on {:?} failed: {e}", tool_name, config.name);
+            // The server's own error text can quote the call's input.
+            return Err(if from_the_tool { CallFailure::Reported(message) } else { CallFailure::Failed(message) });
         }
     };
 
@@ -839,7 +857,7 @@ async fn call_tool_unspanned(
         .join("\n");
 
     if result.is_error.unwrap_or(false) {
-        Err(content)
+        Err(CallFailure::Reported(content))
     } else {
         Ok(content)
     }
@@ -942,6 +960,13 @@ mod tests {
             // An unlisted tool that never answers, for the call timeout.
             if request.name == "hang" {
                 std::future::pending::<()>().await;
+            }
+            // An unlisted tool that reports an error with output of its own.
+            if request.name == "fail" {
+                return Ok(CallToolResult::error(vec![McpContentBlock::Text(rmcp::model::TextContent::new(
+                    "SECRET-OUTPUT of the failed tool".to_string(),
+                ))])
+                .into());
             }
             let router = self.router.read().await;
             router
@@ -1239,6 +1264,29 @@ mod tests {
         assert!(spans.iter().any(|span| span.name == "mcp connect"), "{spans:?}");
         let exported = format!("{spans:?}");
         assert!(!exported.contains("SECRET-KEY"), "{exported}");
+    }
+
+    /// Review 1: a tool's own error output, and input it was refused for,
+    /// stay out of the span; smelt's own failures keep their message.
+    #[tokio::test]
+    async fn test_a_tools_reported_error_exports_none_of_its_output() {
+        let server_id = -137_005;
+        register_test_connection(server_id, false).await;
+        let config = test_config(server_id, "test-server");
+        let ((failed, refused), spans) = crate::telemetry::capture_spans(async {
+            let failed = call_tool(&test_pool(), &config, "fail", serde_json::json!({})).await;
+            let refused = call_tool(&test_pool(), &config, "echo", serde_json::json!(["SECRET-INPUT"])).await;
+            (failed, refused)
+        })
+        .await;
+        REGISTRY.lock().await.remove(&server_id);
+        assert!(failed.is_err_and(|e| e.contains("SECRET-OUTPUT")), "the model still gets the output");
+        assert!(refused.is_err());
+        let calls: Vec<_> = spans.iter().filter(|span| span.name == "mcp call").collect();
+        assert_eq!(calls.len(), 2, "{spans:?}");
+        assert!(calls.iter().all(|span| matches!(span.status, opentelemetry::trace::Status::Error { .. })));
+        let exported = format!("{spans:?}");
+        assert!(!exported.contains("SECRET"), "{exported}");
     }
 
     #[tokio::test]

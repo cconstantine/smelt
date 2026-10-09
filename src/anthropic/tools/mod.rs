@@ -167,7 +167,10 @@ mod server {
                 }
                 Err(message) => {
                     let (message, truncated) = cap_tool_result(message);
-                    crate::telemetry::mark_error(&span, &message);
+                    // An MCP tool's error can be its own output: its
+                    // `mcp call` span has what smelt can say (SME-137).
+                    let is_mcp = crate::mcp::parse_tool_name(name).is_some();
+                    crate::telemetry::mark_error(&span, if is_mcp { MCP_TOOL_FAILED } else { &message });
                     (Err(message), truncated)
                 }
             };
@@ -176,6 +179,9 @@ mod server {
         })
         .await
     }
+
+    /// An MCP tool call's failure on its `tool` span (SME-137 review 1).
+    pub(super) const MCP_TOOL_FAILED: &str = "the MCP tool call failed (see its mcp call span)";
 
     /// The most of one tool result that reaches the model (SME-76).
     /// Conversation 23 took in single results of 40–106 KB, which on a
@@ -367,6 +373,13 @@ mod server {
             assert!(result.is_err(), "no such server: {result:?}");
             let span = spans.iter().find(|span| span.name.starts_with("tool ")).expect("a tool span");
             assert_eq!(span_attribute(span, "smelt.tool.mcp_server"), Some(&"github".into()));
+            // Review 1: an MCP tool's error can be its own output; the
+            // `mcp call` span under it says what smelt saw.
+            assert_eq!(
+                span.status,
+                opentelemetry::trace::Status::error(MCP_TOOL_FAILED),
+                "no MCP output on the tool's span"
+            );
         }
 
         #[sqlx::test]

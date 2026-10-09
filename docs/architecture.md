@@ -101,14 +101,15 @@ POST /api/conversations/{id}/messages        (server; ends at its response)
    │  └─ mcp call (→ mcp connect)
    ├─ chat {model}
    └─ compaction → chat {model}
-startup ; claim_sweep ; pricing_refresh ; pod_event ; pod_reconcile ; mcp connection_check   (roots)
+GET /api/mcp-servers/{id}/status → mcp connection_check → mcp connect
+startup ; claim_sweep ; pricing_refresh ; pod_event ; pod_reconcile   (roots)
 ```
 
 A wake (a finished command, an answered question) starts its `turn` as a root. A failure marks its span's status ERROR with the first 500 characters of the message (`telemetry::mark_error`); a stopped turn records `turn.stopped` and isn't an error. `warn!` and `error!` lines inside a span are exported as its events, and smelt's own `info!` lines too. Dependencies' INFO spans are not exported: dioxus-signals instruments every signal it makes.
 
 **Every exported span runs through `telemetry::in_span`, not `Instrument::instrument`.** A span closes only when the last handle to it drops, and libraries hold handles past the work: hyper-util spawns each new pooled connection `in_current_span`, and rmcp's service loop keeps `Span::current()` for the connection's life. A span that opened a connection (and every parent) would stay open, unexported, until the connection closed. `in_span` ends the span's export when its future ends or is dropped; an HTTP request's span ends at its response. MCP connections are made `outside_spans`, so the cached service loop holds none of the turn's spans.
 
-**Never recorded:** message text, tool input or output, MCP arguments or results, request headers, query strings (the OAuth callback's carries `code` and `state`), API keys, tokens, and `DATABASE_URL`'s credentials. Error descriptions and the existing log lines' fields can contain URLs or error text.
+**Never recorded:** message text, tool input or output as such, MCP arguments or results, request headers, query strings (the OAuth callback's carries `code` and `state`), API keys, tokens, and `DATABASE_URL`'s credentials. An error's description is the message smelt has for it (the one the model gets, for a built-in tool), which can name part of the input, such as a path or a terminal id; every URL in it is cut to scheme, host and path (`telemetry::scrub_urls`). An MCP tool's own error output never goes on a span: its `mcp call` and `tool` spans say only that the tool reported an error. Log lines inside a span are exported with their fields as written, so a line that logs a URL scrubs it first (the request guard logs the path only).
 
 ## Feature flags
 
