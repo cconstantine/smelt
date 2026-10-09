@@ -358,9 +358,11 @@ fn stage_gloss(condition: &str) -> Option<&'static str> {
 }
 
 /// `from` to `to` in whole seconds, as "88 s". The API's timestamps are
-/// to the second.
+/// to the second. Never negative: `to` may be smelt's clock and `from` the
+/// node's, and a skew between them would otherwise show as "-3 s"
+/// (SME-132 review 1).
 fn whole_seconds(from: Timestamp, to: Timestamp) -> String {
-    format!("{} s", to.duration_since(from).as_secs())
+    format!("{} s", to.duration_since(from).as_secs().max(0))
 }
 
 /// Each condition that went `True`, as an offset from the pod's creation,

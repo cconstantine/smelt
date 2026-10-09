@@ -991,6 +991,22 @@ fn test_pod_start_report_caps_its_events() {
     assert!(!report.contains(&"é".repeat(201)), "got {report}");
 }
 
+/// SME-132 review 1: "now" is smelt's clock and the pod's times are the
+/// node's, so a skewed clock can put "now" before them. The report says
+/// 0 s rather than a negative time.
+#[test]
+fn test_pod_start_report_never_shows_a_negative_time() {
+    let pod = report_pod(
+        &[("PodReadyToStartContainers", "False", 3, "", ""), ("PodScheduled", "True", 2, "", "")],
+        serde_json::json!([]),
+        serde_json::json!([]),
+    );
+    let before_creation = report_at(-5).parse().expect("a timestamp");
+    let report = pod_start_report(&pod, Ok(&[]), before_creation);
+    assert!(!report.contains('-'), "got {report}");
+    assert!(report.contains("for 0 s; pod 0 s old"), "got {report}");
+}
+
 /// A start that succeeds after more than half its timeout is slow, and
 /// logged; one at or under half isn't (SME-132).
 #[test]
