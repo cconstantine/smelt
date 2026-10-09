@@ -81,10 +81,58 @@ pub(crate) fn mark_error(span: &Span, message: &str) {
 /// new pooled connection `in_current_span`, and rmcp its service loop, so a
 /// span that opened a connection would otherwise stay open (and unexported)
 /// for as long as the connection lives, its parents with it.
-pub(crate) async fn in_span<F: std::future::Future>(span: Span, future: F) -> F::Output {
+///
+/// A future of its own rather than an `async fn`, which would hold `future`
+/// twice (its argument and the instrumented copy it awaits): sandbox
+/// futures run on a 2 MB stack in debug builds (SME-115).
+pub(crate) fn in_span<F: std::future::Future>(span: Span, future: F) -> InSpan<F> {
     use tracing::Instrument;
-    let _end = EndOnDrop(span.clone());
-    future.instrument(span).await
+    InSpan { _end: EndOnDrop(span.clone()), inner: future.instrument(span) }
+}
+
+/// [`in_span`]'s future.
+pub(crate) struct InSpan<F> {
+    // Dropped first, so the span's work is gone before its export ends.
+    inner: tracing::instrument::Instrumented<F>,
+    _end: EndOnDrop,
+}
+
+impl<F: std::future::Future> std::future::Future for InSpan<F> {
+    type Output = F::Output;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<F::Output> {
+        // SAFETY: `inner` is pinned structurally: it's never moved out of
+        // `self`, and `InSpan` has no `Drop` of its own and isn't `Unpin`
+        // unless `inner` is.
+        unsafe { self.map_unchecked_mut(|this| &mut this.inner) }.poll(cx)
+    }
+}
+
+/// Runs `future` on a task of its own, outside every span, and waits for
+/// it; dropping the wait stops the task. For a library that keeps
+/// `Span::current()` for work outliving the call (rmcp's service loop), so
+/// it holds none of the caller's spans. A panic in `future` is the
+/// caller's.
+pub(crate) async fn outside_spans<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    struct AbortOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    // tokio doesn't carry the current span into a spawned task.
+    let task = tokio::spawn(future);
+    let _abort = AbortOnDrop(task.abort_handle());
+    match task.await {
+        Ok(output) => output,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        // Only `_abort` cancels it, and that runs after this returns.
+        Err(_) => std::future::pending().await,
+    }
 }
 
 struct EndOnDrop(Span);
@@ -441,6 +489,25 @@ mod tests {
         .await;
         let names: Vec<_> = spans.iter().map(|span| span.name.to_string()).collect();
         assert_eq!(names, ["first_hit_elsewhere"]);
+    }
+
+    /// What a library spawns from work run `outside_spans` (rmcp's service
+    /// loop, which captures `Span::current()`) holds none of the caller's
+    /// spans, and a span it makes is a root.
+    #[tokio::test]
+    async fn test_work_outside_spans_sees_no_current_span() {
+        let ((current_is_none, ()), spans) = capture_spans(async {
+            in_span(tracing::info_span!("caller"), async {
+                let current_is_none = outside_spans(async { Span::current().is_none() }).await;
+                outside_spans(async { tracing::info_span!("library").in_scope(|| {}) }).await;
+                (current_is_none, ())
+            })
+            .await
+        })
+        .await;
+        assert!(current_is_none, "the work saw the caller's span");
+        let library = spans.iter().find(|span| span.name == "library").expect("the library's span");
+        assert_eq!(library.parent_span_id, opentelemetry::trace::SpanId::INVALID, "a root");
     }
 
     #[tokio::test]

@@ -382,7 +382,27 @@ fn is_auth_rejection(error: &rmcp::transport::DynamicTransportError) -> bool {
         })
 }
 
+/// Connects to `config`'s server in an `mcp connect` span (SME-137), marked
+/// failed when it can't.
 async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connection, ConnectError> {
+    use tracing::field::Empty;
+    let span = tracing::info_span!(
+        "mcp connect",
+        smelt.mcp.server = %config.name,
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+    );
+    crate::telemetry::in_span(span.clone(), async move {
+        let result = connect_unspanned(pool, config).await;
+        if let Err(e) = &result {
+            crate::telemetry::mark_error(&span, &e.message);
+        }
+        result
+    })
+    .await
+}
+
+async fn connect_unspanned(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connection, ConnectError> {
     install_crypto_provider();
     let headers = build_header_map(&config.extra_headers.0)?;
     let transport_config =
@@ -393,7 +413,9 @@ async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connec
     let handler = SmeltClientHandler {
         stale: stale.clone(),
     };
-    let connecting = async {
+    let name = config.name.clone();
+    let (pool, config) = (pool.clone(), config.clone());
+    let connecting = async move {
         // An OAuth server's requests go through rmcp's `AuthClient`, which
         // gets a token before each one (refreshing it when it's expiring)
         // and, when the server rejects one anyway, refreshes once and
@@ -402,7 +424,7 @@ async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connec
         // runs the provider's metadata discovery, so it's inside the
         // timeout too.
         let serving: Serving = if config.auth_mode == "oauth" {
-            let client = oauth_client(pool, config).await?;
+            let client = oauth_client(&pool, &config).await?;
             Box::pin(handler.serve(StreamableHttpClientTransport::with_client(client, transport_config)))
         } else {
             Box::pin(handler.serve(StreamableHttpClientTransport::with_client(http_client, transport_config)))
@@ -422,12 +444,15 @@ async fn connect(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<Connec
         })?;
         Ok::<_, ConnectError>((service, tools))
     };
-    let (service, tools) = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+    // Outside every span: rmcp's service loop keeps `Span::current()` for
+    // as long as the connection is cached, which would hold the turn that
+    // first connected, and its request, open (SME-137).
+    let (service, tools) = crate::telemetry::outside_spans(tokio::time::timeout(CONNECT_TIMEOUT, connecting))
         .await
         .map_err(|_| {
             ConnectError::from(format!(
                 "MCP server {:?} didn't answer within {}s",
-                config.name,
+                name,
                 CONNECT_TIMEOUT.as_secs()
             ))
         })??;
@@ -657,6 +682,31 @@ pub async fn connection_check(
     pool: &sqlx::PgPool,
     config: &McpServerConfig,
 ) -> Result<Vec<String>, CheckError> {
+    use tracing::field::Empty;
+    let span = tracing::info_span!(
+        "mcp connection_check",
+        smelt.mcp.server = %config.name,
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+    );
+    crate::telemetry::in_span(span.clone(), async move {
+        let result = check_connection(pool, config).await;
+        match &result {
+            Err(CheckError::Unreachable(message) | CheckError::SignInExpired(message)) => {
+                crate::telemetry::mark_error(&span, message)
+            }
+            Ok(_) => {}
+        }
+        result
+    })
+    .await
+}
+
+/// `connection_check`'s work, in its span.
+async fn check_connection(
+    pool: &sqlx::PgPool,
+    config: &McpServerConfig,
+) -> Result<Vec<String>, CheckError> {
     if config.auth_mode == "oauth" {
         check_sign_in(pool, config).await?;
     }
@@ -691,6 +741,31 @@ pub async fn connection_check(
 /// `ContentBlock::ToolResult { is_error: Some(true), .. }` like any other
 /// failed tool call.
 pub async fn call_tool(
+    pool: &sqlx::PgPool,
+    config: &McpServerConfig,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> Result<String, String> {
+    use tracing::field::Empty;
+    // The server and tool, never the arguments or result (SME-137).
+    let span = tracing::info_span!(
+        "mcp call",
+        smelt.mcp.server = %config.name,
+        smelt.mcp.tool = %tool_name,
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+    );
+    crate::telemetry::in_span(span.clone(), async move {
+        let result = call_tool_unspanned(pool, config, tool_name, arguments).await;
+        if let Err(e) = &result {
+            crate::telemetry::mark_error(&span, e);
+        }
+        result
+    })
+    .await
+}
+
+async fn call_tool_unspanned(
     pool: &sqlx::PgPool,
     config: &McpServerConfig,
     tool_name: &str,
@@ -1090,6 +1165,52 @@ mod tests {
         assert!(result.contains("world"));
 
         REGISTRY.lock().await.remove(&server_id);
+    }
+
+    /// SME-137: an MCP tool call is an `mcp call` span under its caller's,
+    /// failed when the server refuses the call.
+    #[tokio::test]
+    async fn test_an_mcp_call_is_a_span_under_its_caller() {
+        let server_id = -137_001;
+        register_test_connection(server_id, false).await;
+        let config = test_config(server_id, "test-server");
+        let ((ok, refused), spans) = crate::telemetry::capture_spans(async {
+            crate::telemetry::in_span(tracing::info_span!("caller"), async {
+                let ok = call_tool(&test_pool(), &config, "echo", serde_json::json!({"x": "SECRET-ARG"})).await;
+                let refused = call_tool(&test_pool(), &config, "no_such_tool", serde_json::json!({})).await;
+                (ok, refused)
+            })
+            .await
+        })
+        .await;
+        REGISTRY.lock().await.remove(&server_id);
+        assert!(ok.is_ok(), "{ok:?}");
+        assert!(refused.is_err(), "{refused:?}");
+        let caller = spans.iter().find(|span| span.name == "caller").expect("the caller's span");
+        let calls: Vec<_> = spans.iter().filter(|span| span.name == "mcp call").collect();
+        let [ok_span, refused_span] = calls.as_slice() else { panic!("two mcp calls: {spans:?}") };
+        for span in [ok_span, refused_span] {
+            assert_eq!(span.parent_span_id, caller.span_context.span_id());
+            assert!(span.attributes.iter().any(|kv| kv.key.as_str() == "smelt.mcp.server" && kv.value == "test-server".into()));
+        }
+        assert_eq!(ok_span.status, opentelemetry::trace::Status::Unset);
+        assert!(matches!(refused_span.status, opentelemetry::trace::Status::Error { .. }), "{:?}", refused_span.status);
+        assert!(!format!("{spans:?}").contains("SECRET-ARG"), "no arguments in a span");
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_mcp_connect_is_a_failed_span() {
+        let config = test_config(-137_002, "nowhere");
+        let (result, spans) = crate::telemetry::capture_spans(connection_check(&test_pool(), &config)).await;
+        assert!(result.is_err());
+        let connects: Vec<_> = spans.iter().filter(|span| span.name == "mcp connect").collect();
+        assert!(!connects.is_empty(), "{spans:?}");
+        assert!(
+            connects.iter().all(|span| matches!(span.status, opentelemetry::trace::Status::Error { .. })),
+            "{connects:?}"
+        );
+        let check = spans.iter().find(|span| span.name == "mcp connection_check").expect("the check's span");
+        assert!(matches!(check.status, opentelemetry::trace::Status::Error { .. }), "{:?}", check.status);
     }
 
     #[tokio::test]
