@@ -191,6 +191,45 @@ fn log(line: std::fmt::Arguments<'_>) {
     let _ = writeln!(std::io::stderr(), "{line}");
 }
 
+/// How old a pod or claim must be for the harness's sweep to delete it:
+/// far longer than any test keeps one (a scenario is cut off at 300 s, a
+/// whole gate takes minutes).
+const MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// How long the harness's sweep may take before the test goes on without
+/// it.
+const SWEEP_BOUND: Duration = Duration::from_secs(60);
+
+static SWEPT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+static SWEEPS_STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times this process has started the harness's sweep.
+pub(super) fn sweeps_started() -> usize {
+    SWEEPS_STARTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Sweeps `smelt-park-test` of everything older than `MAX_AGE`, once per
+/// process: the first caller runs it, any caller while it runs waits for
+/// it, and later callers return at once. It has a client of its own, on
+/// the first caller's runtime, and gives up after `SWEEP_BOUND`. It never
+/// fails the test: whatever happens is one line on stderr.
+pub(super) async fn sweep_once() {
+    SWEPT
+        .get_or_init(|| async {
+            SWEEPS_STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let client = crate::sandbox::tests::test_client().await;
+            match tokio::time::timeout(SWEEP_BOUND, sweep(&client, MAX_AGE, None)).await {
+                Ok(Ok(swept)) => log(format_args!(
+                    "swept {} pods, {} claims older than 1h from {SWEEP_NAMESPACE} ({} kept: mounted by a newer pod; {} skipped, {} failed)",
+                    swept.pods, swept.claims, swept.kept_claims, swept.skipped, swept.failed
+                )),
+                Ok(Err(e)) => log(format_args!("sweep of {SWEEP_NAMESPACE} failed: {e}")),
+                Err(_) => log(format_args!("sweep of {SWEEP_NAMESPACE} didn't finish within {SWEEP_BOUND:?}; the next run sweeps again")),
+            }
+        })
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
