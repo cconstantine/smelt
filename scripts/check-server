@@ -44,8 +44,10 @@
 # runs: a second start on the same port waits for the first to stop. It
 # takes no cluster lock, since nothing it touches is a test run's, and the
 # server never inherits one from its caller (SME-100). Two at once also
-# need a preview address each (`-- SMELT_PREVIEW_ADDR=0.0.0.0:<port>`):
-# both default to 8181, and the second then runs without previews.
+# need previews of their own (`-- SMELT_PREVIEW_ADDR=0.0.0.0:<p>
+# SMELT_PREVIEW_URL=http://{port}-{conversation}.preview.localhost:<p>`):
+# both default to 8181, so the second runs without previews and its links
+# point at the first's listener.
 set -euo pipefail
 
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
@@ -376,7 +378,7 @@ case "${1:-}" in
         fi
         ;;
     *)
-        sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
         exit 2
         ;;
 esac
