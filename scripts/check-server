@@ -13,6 +13,12 @@
 # variable that's already set. (To make compaction happen quickly, set a
 # small context window on the model's row at /providers.)
 #
+# The server logs at RUST_LOG=info, without colour (NO_COLOR=1), unless a
+# non-empty value is given as an override, in the environment or in the
+# check worktree's .env, so its log records what startup and teardown
+# deleted (SME-117). The log is $CHECK_WORKTREE/.check-server.log; start
+# keeps the previous run's as .check-server.log.prev.
+#
 # Settings (environment):
 #   CHECK_WORKTREE  the worktree (default: ../smelt-check next to this repo,
 #                   or $TMPDIR/smelt-check when that isn't writable)
@@ -78,16 +84,67 @@ drop_scratch_db() {
     echo "dropped the scratch database"
 }
 
-# NAME's value in the worktree's .env, as dotenvy reads it: the last line
-# setting it, with or without `export`, unquoted.
+# NAME's value in the worktree's .env, as dotenvy reads it: the first line
+# setting it (dotenvy never overrides a value it has set), with or without
+# `export`, spaces around `=` allowed. A quoted value is what's inside its
+# quotes; an unquoted one ends at a ` #` comment (SME-117 review 1: a
+# `RUST_LOG=debug # note` passed on whole silenced smelt's log entirely).
 env_file_value() {
     local value
-    value=$(sed -En "s/^(export[[:space:]]+)?$1=//p" "$worktree/.env" 2>/dev/null | tail -n 1)
+    value=$(sed -En "s/^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=[[:space:]]*//p" "$worktree/.env" 2>/dev/null | head -n 1)
     case "$value" in
-        \"*\") value=${value#\"}; value=${value%\"} ;;
-        \'*\') value=${value#\'}; value=${value%\'} ;;
+        \"*) value=${value#\"}; value=${value%%\"*} ;;
+        \'*) value=${value#\'}; value=${value%%\'*} ;;
+        # Nothing before a comment: empty, as dotenvy reads it (SME-117
+        # review 2: `RUST_LOG= # note` silenced smelt's log).
+        \#*) value="" ;;
+        *)
+            value=${value%%[[:space:]]#*}
+            value=${value%"${value##*[![:space:]]}"}
+            ;;
     esac
     echo "$value"
+}
+
+# The value of the last `-- NAME=` override given to start (in start's
+# `overrides`), which may be empty; fails when there is none.
+override_value() {
+    local override value found=""
+    for override in "${overrides[@]}"; do
+        if [[ "$override" == "$1="* ]]; then
+            value=${override#"$1="}
+            found=1
+        fi
+    done
+    [ -n "$found" ] || return 1
+    echo "$value"
+}
+
+# Where NAME's value comes from: the first of a `-- NAME=` override, the
+# environment and the check worktree's .env that gives it a non-empty
+# value ("override", "environment" or ".env"). Fails when none does: an
+# empty value counts as unset.
+effective_source() {
+    local value
+    if value=$(override_value "$1") && [ -n "$value" ]; then
+        echo override
+    elif [ -n "${!1:-}" ]; then
+        echo environment
+    elif [ -n "$(env_file_value "$1")" ]; then
+        echo .env
+    else
+        return 1
+    fi
+}
+
+# NAME's value: the first non-empty of a `-- NAME=` override, the
+# environment and the check worktree's .env; empty when none is.
+effective_value() {
+    case "$(effective_source "$1")" in
+        override) override_value "$1" ;;
+        environment) echo "${!1}" ;;
+        .env) env_file_value "$1" ;;
+    esac
 }
 
 # Headless Chrome's cache directory: this checkout's, or else the main
@@ -118,7 +175,7 @@ running_pgid() {
 stop() {
     local pgid
     if ! pgid=$(running_pgid); then
-        echo "no check server running"
+        echo "no check server running (log: $(log_file))"
         [ -e "$(pid_file)" ] && : >"$(pid_file)"
         drop_scratch_db
         return 0
@@ -132,7 +189,7 @@ stop() {
         kill -KILL -- "-$pgid" 2>/dev/null || true
     fi
     : >"$(pid_file)"
-    echo "stopped the check server (process group $pgid)"
+    echo "stopped the check server (process group $pgid; log: $(log_file))"
     # Only once the server is gone: Postgres won't drop a database in use.
     drop_scratch_db
 }
@@ -189,11 +246,8 @@ start() {
     # override). A ref from before SME-102 has no scripts/sandbox-image-ref
     # and keeps `:latest`. The caller's cluster-doctor checks the node has
     # it before anything is built.
-    local image="" override derived=""
-    for override in "${overrides[@]}"; do
-        [[ "$override" == SANDBOX_IMAGE=* ]] && image=${override#SANDBOX_IMAGE=}
-    done
-    [ -n "$image" ] || image=${SANDBOX_IMAGE:-$(env_file_value SANDBOX_IMAGE)}
+    local image derived=""
+    image=$(effective_value SANDBOX_IMAGE)
     if [ -z "$image" ] && [ -x "$worktree/scripts/sandbox-image-ref" ]; then
         image=$("$worktree/scripts/sandbox-image-ref")
         derived=1
@@ -220,6 +274,26 @@ start() {
         echo "serving from scratch database ${db_url##*/}"
     fi
 
+    # smelt logs errors only unless RUST_LOG says otherwise, which left
+    # no record of what a check server's startup and teardown deleted
+    # (SME-115, SME-117). A level given anywhere is kept. The chosen one
+    # goes last, so smelt gets exactly what's printed: an empty override
+    # can't undo it, and an empty RUST_LOG in the environment, which
+    # dotenvy treats as set, can't hide .env's.
+    local log_level log_note no_color
+    log_level=$(effective_value RUST_LOG)
+    case "$(effective_source RUST_LOG)" in
+        "") log_level=info log_note="check-server's default" ;;
+        .env) log_note="from .env" ;;
+        *) log_note=yours ;;
+    esac
+    # Colour codes in the log break grep on field names (`claim=`).
+    no_color=$(effective_value NO_COLOR)
+    overrides+=("RUST_LOG=$log_level" "NO_COLOR=${no_color:-1}")
+
+    # The run before is kept, so one more start can't lose the run being
+    # looked into.
+    [ -s "$(log_file)" ] && cp "$(log_file)" "$(log_file).prev"
     : >"$(log_file)"
     (
         cd "$worktree"
@@ -230,6 +304,7 @@ start() {
     local pgid=$!
     echo "$pgid" >"$(pid_file)"
     echo "building $(git -C "$worktree" log --oneline -1) (log: $(log_file))"
+    echo "logging at RUST_LOG=$log_level ($log_note)"
 
     for _ in $(seq 1 360); do
         if ! pgrep -g "$pgid" >/dev/null 2>&1; then
@@ -253,13 +328,13 @@ case "${1:-}" in
     stop) stop ;;
     status)
         if pgid=$(running_pgid); then
-            echo "running (process group $pgid) at http://localhost:$port/, $(git -C "$worktree" log --oneline -1)"
+            echo "running (process group $pgid) at http://localhost:$port/, $(git -C "$worktree" log --oneline -1) (log: $(log_file))"
         else
-            echo "not running"
+            echo "not running (log: $(log_file))"
         fi
         ;;
     *)
-        sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
         exit 2
         ;;
 esac

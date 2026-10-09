@@ -109,9 +109,18 @@ async fn main() {
     // skip, leaving a server that serves with no pod watch at all. A
     // database that can't give it stops the server, like a failed
     // migration.
-    if let Err(e) = db::smelt_instance(pool).await {
-        tracing::error!(error = %e, "couldn't read this database's smelt_instance (SME-115)");
-        std::process::exit(1);
+    // Logged once, so every later line about pods and claims can be
+    // matched to the database it acted for (SME-117).
+    match db::smelt_instance(pool).await {
+        Ok(instance) => tracing::info!(
+            instance = %instance.id,
+            owns_unlabelled = instance.owns_unlabelled,
+            "this database's smelt instance"
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "couldn't read this database's smelt_instance (SME-115)");
+            std::process::exit(1);
+        }
     }
 
     // A fresh database (a scratch check server's) names its pods and claims
