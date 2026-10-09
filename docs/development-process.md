@@ -79,14 +79,21 @@ Runs the board; does no ticket's work itself. On each pass over the smelt projec
 **Choosing what's next.** Whenever Up Next is empty, even while other tickets wait in Planned or Todo, the Project Manager reads the Backlog and moves one ticket to Up Next. It weighs:
 - what's hurting the user's real use of smelt now, with bugs they've hit first;
 - whether a bug bash or design review is due (see [Bug bash](#bug-bash-every-few-projects) and [Design review](#design-review-every-few-projects-alternating-with-bug-bashes));
-- whether the ticket is unblocked, and whether it would change the same files as a ticket still in progress;
+- whether it would change the same files as a ticket still in progress.
+
+It never picks a ticket that depends on one that isn't Done (see "Plan only what's unblocked" below).
 - what's small enough to finish soon.
+
+**Plan only what's unblocked.** A ticket that depends on another ticket being finished first isn't planned until that ticket is **Done**. Depending means its plan would rest on the other ticket's code, schema, tools or decisions, which may still change in review. Merely editing the same files is not a dependency; the Todo rule already makes such Developers take turns. Such a ticket gets a "blocked by" relation in Linear to each ticket it waits for.
+- The Project Manager doesn't move it to Up Next while a blocker is open.
+- A Planner that finds a dependency nobody recorded stops before writing a plan. It adds the relation, moves the ticket back to **Backlog**, and says so in its report. The Project Manager then picks another ticket.
+- When the last blocker is Done, the ticket can be chosen again like any other.
 
 It comments on the ticket, `Project Manager: moved to Up Next because …`, naming the runners-up. It tells the user in its next report, so they can swap the pick before the plan is approved. The user's own moves always take precedence: a ticket they put in Up Next means the Backlog isn't read.
 
 ### Planner
 
-Plans one **Up Next** ticket: [Phase 1](#phase-1-plan), steps 1–6. It reads the ticket, its comments and the Current state document, checks outside services and comparable tools in their source, creates the branch and worktree, and writes the plan (including the state model) into the ticket under `## Plan`. It can't ask the user directly: anything it would ask goes in [Questions for the user](#rules-every-persona-follows), with its recommendation for each, and trade-offs in Trade-offs to flag. Then it moves the ticket to **Planned**, or to **Todo** when it has no questions, and stops; it writes no code. To revise a plan (the user moved the ticket back to Up Next with notes), it answers each note in the plan and moves the ticket to Planned again, or to Todo when no questions are left.
+Plans one **Up Next** ticket: [Phase 1](#phase-1-plan), steps 1–6. It reads the ticket, its comments and the Current state document, checks outside services and comparable tools in their source, checks that nothing it depends on is still unfinished (see "Plan only what's unblocked" above; if something is, it stops there), creates the branch and worktree, and writes the plan (including the state model) into the ticket under `## Plan`. It can't ask the user directly: anything it would ask goes in [Questions for the user](#rules-every-persona-follows), with its recommendation for each, and trade-offs in Trade-offs to flag. Then it moves the ticket to **Planned**, or to **Todo** when it has no questions, and stops; it writes no code. To revise a plan (the user moved the ticket back to Up Next with notes), it answers each note in the plan and moves the ticket to Planned again, or to Todo when no questions are left.
 
 ### Developer
 
