@@ -4671,8 +4671,9 @@ async fn scenario_address_bar_after_session_closes(t: &Scenario<'_>) {
         wait_for_live_client(&page, conversation.id).await;
         let input = wait_for_element(&page, ".browsing-address-input", Duration::from_secs(10)).await;
         input.focus().await.expect("focus the address bar");
-        // Focusing the bar fills it with the session's URL (`about:blank`),
-        // as a browser's does. Selected, so typing replaces it: before
+        // The bar shows the session's URL (`about:blank`, there since the
+        // client went live), and focusing it makes that the text being
+        // edited, as a browser's does. Selected, so typing replaces it: before
         // SME-118 the scenario typed after it, its address was refused at
         // once ("unsupported scheme: about"), and the bar was disabled only
         // for that round trip, which a poll sometimes missed.
