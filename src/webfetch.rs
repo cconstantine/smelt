@@ -57,7 +57,8 @@ const BROWSER_EGRESS_GUARD: fn(IpAddr) -> bool =
 pub(crate) async fn shared_browser() -> Result<&'static Browser, String> {
     BROWSER
         .get_or_try_init(|| async {
-            BROWSER_RUNTIME
+            browser_runtime()
+                .await?
                 .spawn(launch_browser())
                 .await
                 .map_err(|e| format!("the browser launch task failed: {e}"))?
@@ -72,15 +73,75 @@ pub(crate) async fn shared_browser() -> Result<&'static Browser, String> {
 /// is only one runtime, but each `#[tokio::test]` has its own, so a second
 /// test using the browser broke (SME-40, found when the app's browser tier
 /// started opening browsing sessions).
-#[expect(clippy::expect_used, reason = "not startup: built on the first fetch or browse, and a failure poisons it for every later one (SME-119)")]
-static BROWSER_RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+static BROWSER_RUNTIME: OnceCell<tokio::runtime::Runtime> = OnceCell::const_new();
+
+/// `BROWSER_RUNTIME`, built on the first fetch or browse. A build that
+/// fails fails only that call, with an error the model reads as the tool's
+/// result; nothing is stored, so the next call tries again. It was a
+/// `LazyLock` built with `expect()`, whose panic killed the turn and
+/// poisoned it for every later fetch or browse until a restart (SME-119).
+/// A thread refusal is a panic inside tokio, caught by `runtime_in`, which
+/// only works where panics unwind: the release profile
+/// (`.cargo/config.toml`) has `panic = "abort"`, so there it still ends the
+/// process (SME-139).
+async fn browser_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    runtime_in(&BROWSER_RUNTIME, build_browser_runtime).await
+}
+
+fn build_browser_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("shared-browser")
         .enable_all()
         .build()
-        .expect("build the shared browser's runtime")
-});
+}
+
+/// `browser_runtime`'s body, with the cell and the builder passed in so a
+/// test can make the build fail. `get_or_try_init` stores nothing when the
+/// build returns an error (or is cancelled, or panics), and a waiting
+/// caller then makes its own attempt (tokio's documented behaviour,
+/// checked in 1.53.1's source). A built runtime is stored in the static
+/// and never dropped: dropping one inside an async context panics.
+///
+/// When the OS refuses a worker thread, tokio 1.53.1's `build()` doesn't
+/// return an `Err`: it panics ("OS can't spawn worker thread: …",
+/// `runtime/blocking/pool.rs`); only driver setup comes back as one. So the
+/// build runs under `catch_unwind`, and its panic becomes the same error.
+/// That needs an unwinding build (`dx serve`, the tests): under the release
+/// profile's `panic = "abort"` the panic ends the process before
+/// `catch_unwind` sees it (SME-139).
+/// Unwinding out of a half-built runtime is safe here: its blocking pool's
+/// drop sees `thread::panicking()` in an async context and returns without
+/// waiting (`runtime/blocking/shutdown.rs`). A worker thread that did start
+/// before the refusal is left behind, idle.
+async fn runtime_in(
+    cell: &'static OnceCell<tokio::runtime::Runtime>,
+    build: fn() -> std::io::Result<tokio::runtime::Runtime>,
+) -> Result<&'static tokio::runtime::Runtime, String> {
+    cell.get_or_try_init(|| async move {
+        let reason = match std::panic::catch_unwind(build) {
+            Ok(Ok(runtime)) => return Ok(runtime),
+            Ok(Err(e)) => e.to_string(),
+            Err(panic) => format!("the OS refused its threads: {}", panic_message(panic.as_ref())),
+        };
+        Err(format!(
+            "couldn't start the shared browser ({reason}); \
+             nothing was loaded, and the next call tries again"
+        ))
+    })
+    .await
+}
+
+/// A caught panic's message, when it's a string (as tokio's are).
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        message.to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "the runtime's build panicked".to_string()
+    }
+}
 
 /// A browser context from `new_isolated_page`, plus the sandbox-route
 /// proxy its traffic goes through when it has one. The proxy lives exactly
@@ -109,7 +170,8 @@ pub(crate) async fn new_isolated_page(
         // On the browser's own runtime, like the browser-wide proxy, so
         // it outlives whichever runtime opened the context.
         Some(dial) => Some(
-            BROWSER_RUNTIME
+            browser_runtime()
+                .await?
                 .spawn(crate::egress_proxy::start_with_sandbox(BROWSER_EGRESS_GUARD, dial))
                 .await
                 .map_err(|e| format!("the sandbox route's start task failed: {e}"))?
@@ -581,5 +643,71 @@ mod browser_tests {
         // comment for why they run here, as a plain async fn, rather than
         // as their own `#[tokio::test]`.
         crate::browsing::browser_tests::run_session_scenarios().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A shared-browser runtime that fails to build fails that one call
+    /// with an error the model can read, stores nothing, and the next call
+    /// builds it (SME-119). Before, the `LazyLock`'s `expect()` panicked
+    /// the turn and poisoned it for every later fetch or browse.
+    #[tokio::test]
+    async fn test_a_browser_runtime_that_fails_to_build_fails_only_that_call() {
+        static CELL: OnceCell<tokio::runtime::Runtime> = OnceCell::const_new();
+        // What tokio 1.53.1 returns as an `Err`: its driver's setup, e.g.
+        // no file descriptor left for the epoll instance (EMFILE).
+        let failed = runtime_in(&CELL, || Err(std::io::Error::from_raw_os_error(24))).await;
+        let error = failed.err().expect("a failed build should be an error");
+        assert!(
+            error.contains("Too many open files"),
+            "the OS's reason should reach the model: {error}"
+        );
+        // Not a thread refusal, so the error doesn't call it one (round 2's
+        // finding 2).
+        assert!(!error.contains("threads"), "the error shouldn't blame threads: {error}");
+        // The same error reaches the browsing tools and the live panel's
+        // open, so it doesn't say "fetched" (round 1's finding 2).
+        assert!(
+            error.contains("nothing was loaded") && !error.contains("fetched"),
+            "the error should fit a browse as well as a fetch: {error}"
+        );
+        assert!(CELL.get().is_none(), "a failed build should store nothing");
+
+        let runtime = runtime_in(&CELL, build_browser_runtime)
+            .await
+            .expect("the next call should build the runtime");
+        let answer = runtime.spawn(async { 42 }).await.expect("a task on the built runtime");
+        assert_eq!(answer, 42);
+    }
+
+    /// When the OS refuses a worker thread, tokio 1.53.1's `Builder::build`
+    /// doesn't return an `Err`: it panics with this message
+    /// (`runtime/blocking/pool.rs`). That call must still fail as an error
+    /// the model can read, and the next one build the runtime (SME-119,
+    /// review round 1).
+    #[tokio::test]
+    async fn test_a_browser_runtime_build_that_panics_fails_only_that_call() {
+        static CELL: OnceCell<tokio::runtime::Runtime> = OnceCell::const_new();
+        let failed = runtime_in(&CELL, || {
+            // Formatted, as tokio's is, so the payload is a `String`.
+            let refused = std::io::Error::from_raw_os_error(11);
+            panic!("OS can't spawn worker thread: {refused}")
+        })
+        .await;
+        let error = failed.err().expect("a panicking build should be an error");
+        assert!(
+            error.contains("Resource temporarily unavailable"),
+            "the OS's reason should reach the model: {error}"
+        );
+        assert!(CELL.get().is_none(), "a failed build should store nothing");
+
+        let runtime = runtime_in(&CELL, build_browser_runtime)
+            .await
+            .expect("the next call should build the runtime");
+        let answer = runtime.spawn(async { 42 }).await.expect("a task on the built runtime");
+        assert_eq!(answer, 42);
     }
 }
