@@ -2,9 +2,13 @@
 # Checks that the scripts a session runs for the gate and for hands-on
 # checks delete no files (SME-107), and scripts/check-server's state files:
 # emptied rather than removed, an empty one meaning "not running" or "no
-# scratch database". Needs no cluster or database: dx, sqlx, curl and the
-# image check are stubs. Claude Code's safety check refuses a command whose
-# scripts remove files, so this keeps everything it writes, under
+# scratch database"; and the locks (SME-100): scripts/with-cluster-lock,
+# what check.sh, browser-tier, cluster-test and clean-test-namespace.sh run
+# under the cluster lock, and check-server's port lock. Needs no cluster or
+# database: cargo, dx, sqlx, curl, python3 and the image check are stubs,
+# and every lock lives under target/test-check-scripts/locks
+# (SMELT_LOCK_DIR), never the real one. Claude Code's safety check refuses
+# a command whose scripts remove files, so this keeps everything it writes, under
 # target/test-check-scripts, overwritten on the next run.
 #
 #   scripts/test-check-scripts
@@ -19,7 +23,7 @@ fail() {
 
 # None of the scripts the gate or a hands-on check runs removes a file.
 for script in scripts/check-server scripts/browser-tier scripts/check.sh scripts/lint-expects scripts/build-sandbox-image.sh \
-    scripts/with-cluster-lock scripts/cluster-test; do
+    scripts/with-cluster-lock scripts/cluster-test scripts/clean-test-namespace.sh; do
     if found=$(grep -nE '(^|[^[:alnum:]_-])(rm|rmdir|unlink|shred)([[:space:]]|$)|-delete([[:space:]]|$)' "$script" | grep -vE '^[0-9]+:[[:space:]]*#'); then
         fail "$script removes files: $found"
     fi
@@ -483,6 +487,100 @@ timeout 60 "${gate_env[@]}" CARGO_FAIL="--no-run" scripts/cluster-test --feature
 rc=$?
 [ "$rc" = 101 ] || fail "cluster-test with a failing build exited $rc, not the build's 101"
 grep -q " locked$" "$CALLS" && fail "cluster-test took the lock after a failing build: $(cat "$CALLS")"
+unset CALLS
+
+cs_env=(env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import"
+    DATABASE_URL=postgres://u@localhost/smelt_dev)
+
+# 10. check-server takes no cluster lock, and the server it starts never
+# holds it, even when start runs under an old outer flock (SME-100).
+check_server start HEAD >/dev/null || fail "start for the cluster-lock case"
+lock_is_free || fail "check-server: the cluster lock is held while a check server runs"
+check_server stop >/dev/null
+if ! out=$(timeout 60 flock "$lock" "${cs_env[@]}" CHECK_WORKTREE="$worktree" scripts/check-server start HEAD 2>&1); then
+    fail "check-server start under an outer flock: $out"
+fi
+pgid=$(cat "$pid_file" 2>/dev/null)
+if [ -n "$pgid" ] && [ -d "/proc/$pgid" ]; then
+    fds=$(find "/proc/$pgid/fd" -maxdepth 1 -lname "$lock" 2>/dev/null)
+    [ -z "$fds" ] || fail "check-server: the server started under an outer flock holds the cluster lock: $fds"
+    lock_is_free || fail "check-server: after the outer flock ended, the cluster lock is still held"
+else
+    fail "check-server: no server running after a start under an outer flock: '$pgid'"
+fi
+check_server stop >/dev/null
+
+# 11. The port lock: held by the running server's process group, freed by
+# stop or by the group dying; a second start on the same port waits for it,
+# naming the first's worktree; refusals never wait.
+port_lock=$SMELT_LOCK_DIR/smelt-check-server-8081.lock
+port_is_free() { flock -n "$port_lock" true; }
+worktree2=$dir/worktree2
+[ -d "$worktree2/.git" ] || git clone -q --shared --no-checkout "$PWD" "$worktree2" || exit 1
+"${cs_env[@]}" CHECK_WORKTREE="$worktree2" scripts/check-server stop >/dev/null 2>&1
+check_server start HEAD >/dev/null || fail "start for the port lock"
+pgid=$(cat "$pid_file" 2>/dev/null)
+port_is_free && fail "check-server: the port lock is free while the server runs"
+check_server stop >/dev/null
+port_is_free || fail "check-server: the port lock is still held after stop"
+check_server start HEAD >/dev/null || fail "start for the port lock, to kill"
+pgid=$(cat "$pid_file" 2>/dev/null)
+[ -n "$pgid" ] && kill -KILL -- "-$pgid"
+sleep 0.5
+port_is_free || fail "check-server: the port lock is still held after its server was killed"
+check_server stop >/dev/null
+check_server start HEAD >/dev/null || fail "start before a second one on the same port"
+out=$(timeout 3 "${cs_env[@]}" CHECK_WORKTREE="$worktree2" scripts/check-server start HEAD 2>&1)
+rc=$?
+[ "$rc" = 124 ] || fail "check-server: a second start on the same port didn't wait (exit $rc): $out"
+grep -qF "waiting for port 8081: a check server from $worktree holds it" <<<"$out" ||
+    fail "check-server: the second start's waiting line: $out"
+[ -s "$worktree2/.check-server.pid" ] && fail "check-server: a waiting start wrote its pid file"
+if ! out=$(timeout 20 "${cs_env[@]}" CHECK_WORKTREE="$worktree2" CHECK_PORT=8091 scripts/check-server start HEAD 2>&1); then
+    fail "check-server: a start on another port while one runs: $out"
+fi
+"${cs_env[@]}" CHECK_WORKTREE="$worktree2" CHECK_PORT=8091 scripts/check-server stop >/dev/null 2>&1
+# Refused starts exit at once, even while the port is held.
+out=$(timeout 5 "${cs_env[@]}" CHECK_WORKTREE="$worktree" scripts/check-server start HEAD 2>&1)
+rc=$?
+[ "$rc" = 1 ] || fail "check-server: an 'already running' start exited $rc: $out"
+out=$(timeout 5 "${cs_env[@]}" CHECK_WORKTREE="$worktree2" CHECK_SCRATCH_DB=1 scripts/check-server start "$old_ref" 2>&1)
+rc=$?
+[ "$rc" = 1 ] || fail "check-server: SME-115's refusal exited $rc while the port was held: $out"
+check_server stop >/dev/null
+# The usage text is the whole header.
+header_end=$(awk '/^set -euo pipefail/ { print prev; exit } { prev = $0 }' scripts/check-server | sed 's/^# \{0,1\}//')
+[ "$(scripts/check-server 2>&1 | tail -n 1)" = "$header_end" ] || fail "check-server's usage stops before the header's last line: $header_end"
+
+# 12. clean-test-namespace.sh deletes everything in smelt-park-test, a test
+# run's pods too, so it takes the cluster lock: with a python3 stub, which
+# records the lock's state and its script's first line.
+cat >"$dir/bin/python3" <<'EOF'
+#!/usr/bin/env bash
+read -r first
+echo "python3 $(lock-state) $first" >>"$CALLS"
+EOF
+chmod +x "$dir/bin/python3"
+export CALLS=$dir/calls
+: >"$CALLS"
+clean_env=(env PATH="$dir/bin:$PATH" KUBECONFIG=/nonexistent)
+[ "$("${clean_env[@]}" bash -c 'command -v python3')" = "$dir/bin/python3" ] || {
+    echo "the python3 stub isn't first on PATH; stopping before running clean-test-namespace.sh" >&2
+    exit 1
+}
+timeout 20 "${clean_env[@]}" scripts/clean-test-namespace.sh >/dev/null 2>&1 || fail "clean-test-namespace.sh with a stub failed"
+[ "$(cat "$CALLS")" = "python3 locked import base64, json, re, ssl, sys, tempfile, urllib.request" ] ||
+    fail "clean-test-namespace.sh's python3: $(cat "$CALLS")"
+: >"$CALLS"
+flock "$lock" sleep 3 &
+outer=$!
+wait_until_held || fail "clean-test-namespace.sh: the outer holder never took the lock"
+out=$(timeout 2 "${clean_env[@]}" scripts/clean-test-namespace.sh 2>&1)
+rc=$?
+wait "$outer"
+[ "$rc" = 124 ] || fail "clean-test-namespace.sh didn't wait for the lock (exit $rc): $out"
+grep -q "waiting for the cluster lock" <<<"$out" || fail "clean-test-namespace.sh didn't say it waits: $out"
+[ -s "$CALLS" ] && fail "clean-test-namespace.sh ran while another process held the lock: $(cat "$CALLS")"
 unset CALLS
 
 if [ "$failures" -gt 0 ]; then

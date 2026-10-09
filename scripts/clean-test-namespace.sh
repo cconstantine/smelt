@@ -7,12 +7,15 @@
 # new pods stop starting. The namespace is fixed here on purpose: this never
 # touches `smelt-park`, where a dev instance's sandboxes live.
 #
+# It also deletes a running test's pods, so it takes the cluster lock
+# (scripts/with-cluster-lock), waiting for a test run to finish (SME-100).
+#
 # Uses the service-account kubeconfig at $KUBECONFIG (kubectl isn't
 # installed in the dev container). Run from inside the `smelt` container:
 #   scripts/clean-test-namespace.sh
 set -eu
 
-exec python3 - "${KUBECONFIG:?KUBECONFIG must point at the cluster's kubeconfig}" <<'EOF'
+exec "$(dirname "$0")/with-cluster-lock" python3 - "${KUBECONFIG:?KUBECONFIG must point at the cluster's kubeconfig}" <<'EOF'
 import base64, json, re, ssl, sys, tempfile, urllib.request
 
 NAMESPACE = "smelt-park-test"
