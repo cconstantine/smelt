@@ -194,7 +194,7 @@ pub(super) struct ReplyCopy {
 /// Each finished reply's parts, by message id (SME-105). A reply is every
 /// assistant text block from one thing the user did to the next: a
 /// user-role message holding text (their message, or a notice such as
-/// "Stopped.") or answering an `ask_user` call starts a new one; ordinary
+/// "Stopped.") or answering an `ask_user` call (not refusing it) starts a new one; ordinary
 /// tool results and compaction's placeholders don't, nor does a notice
 /// saved right after tool results, inside a turn's tool loop (a command
 /// that finished while the turn went on). Thinking, tool calls,
@@ -224,9 +224,13 @@ pub(super) fn reply_parts(messages: &[Message], turn_running: bool) -> HashMap<i
                         let mid_turn_notice = in_tool_loop && system_notice(text, &no_commands).is_some();
                         starts_reply |= !mid_turn_notice;
                     }
-                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                    // An answer to `ask_user` (or the user writing
+                    // instead); a refused call's error result is an
+                    // ordinary tool result and the turn goes on.
+                    ContentBlock::ToolResult { tool_use_id, is_error, .. } => {
                         tool_results = true;
-                        starts_reply |= tool_names.get(tool_use_id).is_some_and(|name| name == ASK_USER);
+                        starts_reply |= *is_error != Some(true)
+                            && tool_names.get(tool_use_id).is_some_and(|name| name == ASK_USER);
                     }
                     _ => {}
                 }

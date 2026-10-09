@@ -1841,3 +1841,17 @@ fn test_reply_parts_the_users_own_message_inside_a_tool_loop_still_starts_a_repl
         vec![(2, 0, "Working.".to_string(), 1), (5, 0, "Checked them.".to_string(), 1)]
     );
 }
+
+#[test]
+fn test_reply_parts_a_refused_ask_user_call_does_not_split_a_reply() {
+    // A malformed or second `ask_user` gets an error result in the
+    // ordinary tool results, and the turn goes on. Code review 1, L1.
+    let refused = ContentBlock::ToolResult { tool_use_id: "q1".into(), content: "bad input".into(), is_error: Some(true) };
+    let messages = vec![
+        user_text(1, "go"),
+        message_with_blocks(2, "assistant", vec![text("Let me ask."), call("q1", ASK_USER)]),
+        message_with_blocks(3, "user", vec![refused]),
+        message_with_blocks(4, "assistant", vec![text("Retrying.")]),
+    ];
+    assert_eq!(buttons(&reply_parts(&messages, false)), vec![(4, 0, "Let me ask.\n\nRetrying.".to_string(), 2)]);
+}
