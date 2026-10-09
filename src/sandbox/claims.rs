@@ -25,6 +25,9 @@ pub(super) fn orphaned_docker_claims(
     let mut orphans: Vec<OrphanedClaim> = claims
         .iter()
         .filter(|c| ownership(&c.metadata, instance) == Ownership::Ours)
+        // One already being deleted isn't deleted, logged and counted
+        // again (SME-117 review 1).
+        .filter(|c| c.metadata.deletion_timestamp.is_none())
         .filter_map(|c| {
             Some(OrphanedClaim {
                 conversation_id: c.metadata.labels.as_ref()?.get(CONVERSATION_LABEL)?.parse().ok()?,
@@ -364,6 +367,9 @@ pub(super) async fn delete_conversation_pvcs(client: &kube::Client, conversation
         // Only its ownership and uid are kept across the delete (see
         // `delete_terminated_pod`).
         let (owner, uid) = match pvc_api(client).get_opt(&name).await {
+            // Already being deleted: nothing to do, or to log again
+            // (SME-117 review 1).
+            Ok(Some(claim)) if claim.metadata.deletion_timestamp.is_some() => continue,
             Ok(Some(claim)) => (ownership(&claim.metadata, instance), claim.metadata.uid),
             Ok(None) => continue,
             Err(e) => {
@@ -543,6 +549,48 @@ pub(super) mod log_tests {
             "another database's claim: {their_log}"
         );
         assert!(!their_log.contains("deleted claim"), "another database's claim logged as deleted: {their_log}");
+    }
+
+    /// A pod a teardown deletes by its label and again by its record's id
+    /// is logged as deleted once: the second finds it terminating and
+    /// leaves it (SME-117 review 1).
+    #[tokio::test]
+    async fn test_a_teardown_logs_a_pod_its_record_also_names_once() {
+        let client = test_client().await;
+        let conversation_id = unused_conversation_id();
+        let pod = pod_name(conversation_id);
+        let pod_uid = make_pending_pod(
+            &client,
+            &pod,
+            serde_json::json!({CONVERSATION_LABEL: conversation_id.to_string(), INSTANCE_LABEL: TEST_INSTANCE}),
+        )
+        .await;
+
+        let ((), log) =
+            logged(teardown_conversation_with(&client, conversation_id, &[conversation_id], &test_instance())).await;
+
+        pods_api(&client).delete(&pod, &immediate_delete_params()).await.ok();
+        let deleted = log.lines().filter(|line| line.contains("deleted pod") && line.contains(&format!("uid={pod_uid}"))).count();
+        assert_eq!(deleted, 1, "the pod's delete was logged {deleted} times: {log}");
+    }
+
+    /// A claim already being deleted isn't an orphan to delete again: the
+    /// sweep would log and count it a second time (SME-117 review 1).
+    #[test]
+    fn test_a_terminating_claim_is_not_swept_again() {
+        let mut claim = PersistentVolumeClaim::default();
+        claim.metadata.name = Some("sandbox-workspace-5".to_string());
+        claim.metadata.uid = Some("uid-5".to_string());
+        claim.metadata.labels = Some(
+            [(CONVERSATION_LABEL.to_string(), "5".to_string()), (INSTANCE_LABEL.to_string(), TEST_INSTANCE.to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let live = std::collections::HashSet::new();
+        assert_eq!(orphaned_docker_claims(std::slice::from_ref(&claim), &live, TEST_INSTANCE).len(), 1);
+        claim.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(k8s_openapi::jiff::Timestamp::now()));
+        assert!(orphaned_docker_claims(&[claim], &live, TEST_INSTANCE).is_empty());
     }
 
     /// Stopping a pod logs its delete with its uid.
