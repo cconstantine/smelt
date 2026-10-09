@@ -670,6 +670,24 @@ async fn test_try_reconnect_does_not_wait_for_a_connect_in_progress(pool: PgPool
     connecting.await.expect("join").expect("the first connect still succeeds");
 }
 
+/// Review 2: the Sandboxes page's refresh (`try_reconnect`) reads an
+/// unknown image again too, so the page doesn't say "restart" where only
+/// a rebuild helps; it still never dials the refused agent again.
+#[sqlx::test]
+async fn test_a_page_refresh_reads_an_unknown_image_again(pool: PgPool) {
+    let (_, pod_id) = pod_row(&pool).await;
+    let v0_line = r#"{"id":"cmd-1","terminal_id":"3","stream":"stdout","seq":1,"data":"hi"}"#;
+    let agent = fake_agent(pod_id, Greeting::Raw(v0_line.into()), Duration::ZERO).await;
+    let _ = reconnect_if_needed(&pool, pod_id).await;
+    assert_eq!(agent_status(pod_id), Some(AgentStatus::RestartRequired { version: None, rebuild_image: false }));
+
+    fake_images().lock().unwrap_or_else(|e| e.into_inner()).insert(pod_id, default_sandbox_image());
+    try_reconnect(&pool, pod_id).await;
+    assert_eq!(agent_status(pod_id), Some(AgentStatus::RestartRequired { version: None, rebuild_image: true }));
+    try_reconnect(&pool, pod_id).await;
+    assert_eq!(agent.dials.load(Ordering::SeqCst), 1, "the refused agent was dialled again");
+}
+
 /// Review 2: a pod torn down while its refused agent's image is read
 /// isn't remembered as outdated afterwards (nothing would ever clear it).
 #[sqlx::test]

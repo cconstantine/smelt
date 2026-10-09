@@ -602,7 +602,9 @@ pub(super) async fn clean_up_and_terminate_pod(pool: &PgPool, pod_id: i64, reaso
 /// Doesn't wait behind a connect already under way: a page load shows the
 /// terminals disconnected for now instead.
 pub async fn try_reconnect(pool: &PgPool, pod_id: i64) {
-    if registry_contains(pod_id) || outdated(pod_id).is_some() {
+    // A refused pod whose image couldn't be read goes through, to read it
+    // again (`connect_with_retry` doesn't dial its agent again).
+    if registry_contains(pod_id) || outdated(pod_id).is_some_and(|o| o.image.is_some()) {
         return;
     }
     if pod_connect_lock(pod_id).try_lock().is_err() {
