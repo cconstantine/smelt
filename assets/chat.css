@@ -1260,6 +1260,8 @@ body {
 .task-terminal {
     display: flex;
     flex-direction: column;
+    /* The titlebar's container queries (below) measure the card. */
+    container-type: inline-size;
     border-radius: 8px;
     overflow: hidden;
     background: #1e1e1e;
@@ -1311,9 +1313,6 @@ body {
 }
 
 .task-terminal-status {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
     white-space: nowrap;
     padding: 1px 8px;
     border-radius: 999px;
@@ -1322,16 +1321,33 @@ body {
     text-transform: capitalize;
     background: #444;
     color: #ddd;
-    flex-shrink: 1;
+    flex-shrink: 0;
+}
+
+@container (max-width: 240px) {
+    .task-terminal-status {
+        display: none;
+    }
+}
+
+@container (max-width: 160px) {
+    .task-terminal-id {
+        display: none;
+    }
+
+    .task-terminal-dots {
+        margin-right: auto;
+    }
 }
 
 /* The titlebar's pills, pushed right by the terminal's name
    (`margin-right: auto`): the last command's status (SME-144), then the
    terminal's connection. The titlebar sits outside .task-terminal-body,
    the one part that scrolls, so the command's status stays in view however
-   much it prints. In a narrow titlebar (720-1024px with a todo list beside
-   the sandbox, where the card can be ~156px wide) the name and then the
-   connection pill give way, with an ellipsis; the command's pill doesn't.
+   much it prints. In a narrow card (720-1024px with a todo list beside the
+   sandbox, ~137-156px wide) the name shrinks first; below 240px the
+   connection pill is hidden (the titlebar's tooltip still says it), and
+   below 160px the name too. The dots and the command's pill always fit.
    The terminal's palette is always dark, so these colours serve both
    themes; each text/background pair is at least 6.5:1. */
 .task-terminal-command,

@@ -5271,7 +5271,7 @@ async fn scenario_markdown_link_bidi_isolated(t: &Scenario<'_>) {
 /// can't be read): its text, classes, and whether
 /// it lies inside the viewport, its terminal card and (when there is one)
 /// `.side-panels-row`'s visible box, and whether the connection pill beside
-/// it still shows inside the card.
+/// it is either hidden or readable (at least 30px) inside the card.
 async fn command_pill(page: &chromiumoxide::Page) -> serde_json::Value {
     page.evaluate(
         "JSON.stringify((() => { const p = document.querySelector('.task-terminal-titlebar .task-terminal-command'); \
@@ -5285,7 +5285,9 @@ async fn command_pill(page: &chromiumoxide::Page) -> serde_json::Value {
            viewport: inside({ top: 0, left: 0, bottom: innerHeight, right: innerWidth }), \
            card: inside(card), row: row ? inside(row.getBoundingClientRect()) : null, \
            title: p.getAttribute('title'), \
-           status_in_card: status.left >= card.left - 0.5 && status.right <= card.right + 0.5, \
+           card_width: card.width, \
+           status_shown: status.width > 0, \
+           status_in_card: status.width === 0 || (status.left >= card.left - 0.5 && status.right <= card.right + 0.5 && status.width >= 30), \
            layout: [card.left, card.right].concat(Array.from(p.closest('.task-terminal-titlebar').querySelectorAll('*')) \
              .map(e => e.className + ':' + Math.round(e.getBoundingClientRect().left) + '-' + Math.round(e.getBoundingClientRect().right))) }; })())",
     )
@@ -5357,8 +5359,9 @@ async fn scenario_terminal_command_indicator(t: &Scenario<'_>) {
     let open = || async {
         page.goto(t.url(&format!("conversation/{}", conversation.id))).await.expect("open the conversation");
         wait_for_live_client(&page, conversation.id).await;
+        // By its titlebar, not its name: a narrow card hides the name.
         assert!(
-            wait_for_text(&page, &format!("terminal {terminal}"), Duration::from_secs(15)).await,
+            wait_for_count(&page, ".task-terminal-titlebar", 1, Duration::from_secs(15)).await,
             "the terminal card should render"
         );
     };
@@ -5444,12 +5447,21 @@ async fn scenario_terminal_command_indicator(t: &Scenario<'_>) {
     .await
     .expect("set a middle width");
     open().await;
+    let narrow = |pill: serde_json::Value, width: u32| {
+        assert!(
+            pill["card_width"].as_f64().is_some_and(|w| w < 200.0),
+            "at {width}px the card isn't narrow, so this checks nothing: {pill}"
+        );
+        assert_eq!(
+            (pill["card"].as_bool(), pill["status_in_card"].as_bool()),
+            (Some(true), Some(true)),
+            "at {width}px beside a todo list, a pill falls outside the terminal's card or is a blank stub: {pill}"
+        );
+    };
+    assert!(wait_for_count(&page, ".todo-panel", 1, Duration::from_secs(15)).await, "the todo panel should show");
     let pill = wait_for_pill(&page, "lost", "task-terminal-command-lost", Duration::from_secs(15)).await;
-    assert_eq!(
-        (pill["card"].as_bool(), pill["status_in_card"].as_bool()),
-        (Some(true), Some(true)),
-        "at 740px beside a todo list, a pill falls outside the terminal's card: {pill}"
-    );
+    narrow(pill, 740);
+    assert_eq!(titlebar_height(&page).await, heights[0].1, "the titlebar's height changes at 740px");
 
     // At a phone's width the pill is on screen, inside the side panels'
     // strip.
@@ -5465,6 +5477,20 @@ async fn scenario_terminal_command_indicator(t: &Scenario<'_>) {
         (Some(true), Some(true), Some(true)),
         "at a phone's width: {pill}"
     );
+
+    // The narrowest middle width, with the widest common pill (SME-144
+    // review 2): running, at 721px beside the todo list.
+    run("sleep 30", "cmd-narrow").await;
+    page.execute(
+        chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(721, 900, 1.0, false),
+    )
+    .await
+    .expect("set the narrowest middle width");
+    open().await;
+    assert!(wait_for_count(&page, ".todo-panel", 1, Duration::from_secs(15)).await, "the todo panel should show");
+    let pill = wait_for_pill(&page, "running", "task-terminal-command-running", Duration::from_secs(15)).await;
+    narrow(pill, 721);
+    assert_eq!(titlebar_height(&page).await, heights[0].1, "the titlebar's height changes at 721px");
 
     let _ = sandbox::terminate_terminal(pool, terminal).await;
     let _ = sandbox::terminate_pod(pool, conversation.id).await;

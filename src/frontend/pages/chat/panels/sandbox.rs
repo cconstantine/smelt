@@ -220,7 +220,11 @@ pub(in super::super) fn SandboxPanel(
                             div {
                                 key: "{terminal.terminal_id}",
                                 class: "task-terminal",
-                                div { class: "task-terminal-titlebar",
+                                div {
+                                    class: "task-terminal-titlebar",
+                                    // A narrow card hides the connection pill
+                                    // (and the name); this still says both.
+                                    title: "terminal {terminal.terminal_id} \u{b7} {terminal.status}",
                                     span { class: "task-terminal-dots",
                                         span { class: "dot dot-red" }
                                         span { class: "dot dot-yellow" }
@@ -246,7 +250,7 @@ pub(in super::super) fn SandboxPanel(
                                     }
                                     span { class: "task-terminal-status", "{terminal.status}" }
                                 }
-                                TerminalBody { terminal }
+                                TerminalBody { terminal: terminal.clone() }
                             }
                         }
                     }
