@@ -571,7 +571,8 @@ pub(super) fn build_pod_spec(
             containers: vec![Container {
                 name: "sandbox".to_string(),
                 image: Some(default_sandbox_image()),
-                // `Never`, not the `:latest`-tag default of `Always`: this
+                // `Never`, not Kubernetes' default (`IfNotPresent` for a
+                // tag like `src-<hash>`, `Always` for `:latest`): this
                 // image is delivered straight into the node's local image
                 // store (`ctr images import`, see
                 // scripts/build-sandbox-image.sh) with no registry
