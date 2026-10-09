@@ -141,10 +141,40 @@ mod server {
         name: &str,
         input: &Value,
     ) -> Result<String, String> {
-        execute_uncapped(pool, conversation_id, tool_use_id, name, input)
-            .await
-            .map(cap_tool_result)
-            .map_err(cap_tool_result)
+        use tracing::field::Empty;
+        // The call's ids and outcome, never its input or output (SME-137).
+        let span = tracing::info_span!(
+            "tool",
+            otel.name = %format_args!("tool {name}"),
+            conversation_id,
+            gen_ai.operation.name = "execute_tool",
+            gen_ai.tool.name = %name,
+            gen_ai.tool.call.id = %tool_use_id,
+            smelt.tool.mcp_server = Empty,
+            smelt.tool.truncated = Empty,
+            otel.status_code = Empty,
+            otel.status_description = Empty,
+        );
+        if let Some((server_name, _)) = crate::mcp::parse_tool_name(name) {
+            span.record("smelt.tool.mcp_server", server_name);
+        }
+        crate::telemetry::in_span(span.clone(), async move {
+            let result = execute_uncapped(pool, conversation_id, tool_use_id, name, input).await;
+            let (result, truncated) = match result {
+                Ok(output) => {
+                    let (output, truncated) = cap_tool_result(output);
+                    (Ok(output), truncated)
+                }
+                Err(message) => {
+                    let (message, truncated) = cap_tool_result(message);
+                    crate::telemetry::mark_error(&span, &message);
+                    (Err(message), truncated)
+                }
+            };
+            span.record("smelt.tool.truncated", truncated);
+            result
+        })
+        .await
     }
 
     /// The most of one tool result that reaches the model (SME-76).
@@ -153,15 +183,18 @@ mod server {
     const MAX_TOOL_RESULT_CHARS: usize = 30_000;
 
     /// Cuts `result` to `MAX_TOOL_RESULT_CHARS`, saying so and how to see
-    /// the rest. The rest is dropped.
-    fn cap_tool_result(result: String) -> String {
+    /// the rest. The rest is dropped. Also says whether it cut.
+    fn cap_tool_result(result: String) -> (String, bool) {
         let total = result.chars().count();
         match crate::fetch_guard::truncate(result, MAX_TOOL_RESULT_CHARS) {
-            (kept, true) => format!(
-                "{kept}\n[cut to the first {MAX_TOOL_RESULT_CHARS} of {total} characters; narrow \
-                 the request (a smaller query, offset/limit, tail_lines) to see the rest]"
+            (kept, true) => (
+                format!(
+                    "{kept}\n[cut to the first {MAX_TOOL_RESULT_CHARS} of {total} characters; narrow \
+                     the request (a smaller query, offset/limit, tail_lines) to see the rest]"
+                ),
+                true,
             ),
-            (whole, false) => whole,
+            (whole, false) => (whole, false),
         }
     }
 
@@ -283,6 +316,73 @@ mod server {
                 content: content.to_string(),
                 is_error: if is_error { Some(true) } else { None },
             }
+        }
+
+        fn span_attribute<'a>(
+            span: &'a opentelemetry_sdk::trace::SpanData,
+            key: &str,
+        ) -> Option<&'a opentelemetry::Value> {
+            let values: Vec<_> =
+                span.attributes.iter().filter(|kv| kv.key.as_str() == key).map(|kv| &kv.value).collect();
+            assert!(values.len() <= 1, "{key} recorded more than once: {values:?}");
+            values.first().copied()
+        }
+
+        /// SME-137: a tool call is a `tool {name}` span with the call's ids,
+        /// marked failed when the tool fails, and none of its input.
+        #[tokio::test]
+        async fn test_a_failed_tool_call_is_a_failed_span_without_its_input() {
+            let (result, spans) = crate::telemetry::capture_spans(execute(
+                &test_pool(),
+                9_137_000_001,
+                "toolu_9",
+                "no_such_tool",
+                &serde_json::json!({"text": "SECRET-INPUT"}),
+            ))
+            .await;
+            assert!(result.is_err());
+            let [span] = spans.as_slice() else { panic!("one span: {spans:?}") };
+            assert_eq!(span.name, "tool no_such_tool");
+            assert_eq!(span_attribute(span, "conversation_id"), Some(&9_137_000_001_i64.into()));
+            assert_eq!(span_attribute(span, "gen_ai.tool.name"), Some(&"no_such_tool".into()));
+            assert_eq!(span_attribute(span, "gen_ai.tool.call.id"), Some(&"toolu_9".into()));
+            assert_eq!(span_attribute(span, "smelt.tool.truncated"), Some(&false.into()));
+            let opentelemetry::trace::Status::Error { description } = &span.status else {
+                panic!("{:?}", span.status)
+            };
+            assert!(description.contains("unknown tool"), "{description}");
+            assert!(!format!("{span:?}").contains("SECRET-INPUT"), "{span:?}");
+        }
+
+        #[sqlx::test]
+        async fn test_an_mcp_tool_calls_span_names_its_server(pool: PgPool) {
+            let (result, spans) = crate::telemetry::capture_spans(execute(
+                &pool,
+                9_137_000_002,
+                "toolu_9",
+                "mcp__github__search",
+                &serde_json::json!({}),
+            ))
+            .await;
+            assert!(result.is_err(), "no such server: {result:?}");
+            let span = spans.iter().find(|span| span.name.starts_with("tool ")).expect("a tool span");
+            assert_eq!(span_attribute(span, "smelt.tool.mcp_server"), Some(&"github".into()));
+        }
+
+        #[sqlx::test]
+        async fn test_a_tool_call_that_succeeds_leaves_its_span_unmarked(pool: PgPool) {
+            let conversation = db::create_conversation(&pool).await.expect("conversation");
+            let (result, spans) = crate::telemetry::capture_spans(execute(
+                &pool,
+                conversation.id,
+                "toolu_9",
+                "todoread",
+                &serde_json::json!({}),
+            ))
+            .await;
+            assert_eq!(result.as_deref(), Ok("[]"));
+            let span = spans.iter().find(|span| span.name == "tool todoread").expect("a tool span");
+            assert_eq!(span.status, opentelemetry::trace::Status::Unset);
         }
 
         #[test]
@@ -498,7 +598,8 @@ mod server {
 
         #[test]
         fn test_cap_tool_result_cuts_a_long_result_and_says_so() {
-            let capped = cap_tool_result("x".repeat(40_000));
+            let (capped, cut) = cap_tool_result("x".repeat(40_000));
+            assert!(cut, "it says it cut");
             assert!(capped.starts_with(&"x".repeat(MAX_TOOL_RESULT_CHARS)), "the start is kept");
             assert!(!capped.contains(&"x".repeat(MAX_TOOL_RESULT_CHARS + 1)), "the rest is dropped");
             assert!(
@@ -511,7 +612,7 @@ mod server {
         #[test]
         fn test_cap_tool_result_leaves_a_result_at_the_cap_alone() {
             let whole = "é".repeat(MAX_TOOL_RESULT_CHARS);
-            assert_eq!(cap_tool_result(whole.clone()), whole);
+            assert_eq!(cap_tool_result(whole.clone()), (whole, false));
         }
 
         /// The cap is in `execute`, so it covers every tool and errors too.
@@ -520,10 +621,12 @@ mod server {
         #[tokio::test]
         async fn test_execute_caps_an_error_too() {
             let name = "n".repeat(40_000);
-            let message = execute(&test_pool(), 1, "t1", &name, &serde_json::json!({}))
-                .await
-                .expect_err("an unknown tool is an error");
+            let (result, spans) =
+                crate::telemetry::capture_spans(execute(&test_pool(), 1, "t1", &name, &serde_json::json!({}))).await;
+            let message = result.expect_err("an unknown tool is an error");
             assert!(message.chars().count() < MAX_TOOL_RESULT_CHARS + 200, "{} chars", message.chars().count());
+            let [span] = spans.as_slice() else { panic!("one span: {spans:?}") };
+            assert_eq!(span_attribute(span, "smelt.tool.truncated"), Some(&true.into()), "its span says it was cut");
         }
 
         #[test]
@@ -555,7 +658,7 @@ mod server {
                 .map(|i| format!("error[E0308] at {i}:1  {}", "x".repeat(1_000)))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let result = cap_tool_result(edit_result_json("new-hash".to_string(), Some(diagnostics)));
+            let (result, _) = cap_tool_result(edit_result_json("new-hash".to_string(), Some(diagnostics)));
             let parsed: Value = serde_json::from_str(&result).expect("the result is still JSON");
             assert_eq!(parsed["hash"], "new-hash");
             let shown = parsed["diagnostics"].as_str().expect("diagnostics");
