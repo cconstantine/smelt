@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Runs one command under the cluster lock and exits with its status (SME-100):
+#
+#   scripts/with-cluster-lock [--output FILE] COMMAND [ARGS...]
+#
+# The lock keeps test runs apart: the real-cluster tests share the
+# `smelt-park-test` namespace, and two runs of the suite on one Postgres
+# server drop each other's `#[sqlx::test]` databases (sqlx names them from
+# the test's path alone). scripts/check.sh, scripts/browser-tier,
+# scripts/cluster-test and scripts/clean-test-namespace.sh take it through
+# this, around their test run only, after building.
+#
+# The lock is `flock` on $SMELT_LOCK_DIR/smelt-cluster.lock. SMELT_LOCK_DIR
+# defaults to the git common dir of the checkout this script is in (not the
+# caller's directory): one file for every worktree, the same one the old
+# outer `flock` convention used. scripts/test-check-scripts sets it, so its
+# cases never touch the real lock.
+#
+# - Waiting: when another process holds the lock, says once who (pid,
+#   command, directory), then waits.
+# - The command inherits the lock, as under the old outer `flock`, and runs
+#   in its caller's process group (so it can read a terminal, and Ctrl-C
+#   reaches it and ends the caller). The lock is held until the command and
+#   everything it started that still has the descriptor have ended: no kill
+#   of this script frees it while a test binary may still be running
+#   (SME-100 review 2). A server meant to outlive a run closes the
+#   descriptor itself, as scripts/check-server does for its `dx serve`.
+# - Re-entry: when this process inherited a descriptor that holds the lock
+#   (a run inside another, or an outer `flock LOCK command` or
+#   `exec 9>>LOCK; flock 9`), or an ancestor holds it (`flock -o`), the
+#   command runs inside that lock instead of deadlocking: silently inside
+#   this script, with a notice inside an old outer `flock`. Linux only
+#   (/proc/<pid>/fdinfo, /proc/locks).
+# - --output FILE: the command's stdout and stderr go to FILE (emptied
+#   first), while this script's own lines stay on its stderr.
+# - The log: each finished run appends one line to
+#   $SMELT_LOCK_DIR/smelt-cluster-lock.log (start, waited, held, exit
+#   status, worktree, the command's first words), written while the lock is
+#   still held, so lines never interleave. A run ended by a signal logs
+#   nothing. Nothing is ever removed (SME-107).
+set -uo pipefail
+
+self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+here=$(dirname "$self")
+
+worktree() { git -C "$here" rev-parse --show-toplevel 2>/dev/null || echo "$here"; }
+utc() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+
+# Runs the command in the foreground, into --output's file when given;
+# returns its status.
+run() {
+    if [ -n "$output" ]; then
+        "$@" >"$output" 2>&1
+    else
+        "$@"
+    fi
+}
+
+# The second half, which `flock -F` below execs in this same process once
+# the lock is taken: runs the command, which inherits the lock's
+# descriptor, then logs the run while the lock is still held.
+if [ -n "${_SMELT_LOCK_INNER:-}" ]; then
+    asked=$_SMELT_LOCK_ASKED output=$_SMELT_LOCK_OUTPUT log=$_SMELT_LOCK_LOG
+    unset _SMELT_LOCK_INNER _SMELT_LOCK_ASKED _SMELT_LOCK_OUTPUT _SMELT_LOCK_LOG
+    took=$EPOCHSECONDS
+    run "$@"
+    rc=$?
+    printf '%s waited=%d held=%d exit=%d worktree=%s cmd=%s\n' "$(utc "$asked")" \
+        $((took - asked)) $((EPOCHSECONDS - took)) "$rc" "$(worktree)" "${*:1:3}" >>"$log"
+    exit "$rc"
+fi
+
+output=""
+if [ "${1:-}" = "--output" ]; then
+    [ $# -ge 2 ] || { echo "with-cluster-lock: --output needs a file" >&2; exit 2; }
+    output=$2
+    shift 2
+fi
+if [ $# -eq 0 ]; then
+    sed -n '2,40p' "$self" | sed 's/^# \{0,1\}//' >&2
+    exit 2
+fi
+
+lock_dir=${SMELT_LOCK_DIR:-$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)} || exit 1
+lock=$lock_dir/smelt-cluster.lock
+log=$lock_dir/smelt-cluster-lock.log
+: >>"$lock" || exit 1
+lock_path=$(readlink -f "$lock")
+lock_id=$(stat -L -c '%d:%i' "$lock")
+
+# Whether descriptor $2 of process $1 is on the lock file and its open file
+# holds the lock. /proc/<pid>/fdinfo lists a flock on the open file that
+# holds it, even once the process that took it has exited (which hides it
+# from /proc/locks). Reading it takes no lock (SME-100 review 2: a flock on
+# an inherited descriptor to test it could take the lock for its owner).
+holds() {
+    [ "$(stat -L -c '%d:%i' "/proc/$1/fd/$2" 2>/dev/null)" = "$lock_id" ] &&
+        grep -q '^lock:.*FLOCK' "/proc/$1/fdinfo/$2" 2>/dev/null
+}
+
+# Whether a descriptor this process inherited holds the lock.
+inside() {
+    local fd
+    for fd in /proc/$$/fd/*; do
+        fd=${fd##*/}
+        holds $$ "$fd" && return 0
+    done
+    return 1
+}
+
+# The pids of the processes with a descriptor that holds the lock: its
+# holder and whatever inherited it, a run's leftovers included.
+openers() {
+    local fd pid
+    for fd in $(find /proc/[0-9]*/fd -maxdepth 1 -lname "$lock_path" 2>/dev/null); do
+        pid=${fd#/proc/}
+        pid=${pid%%/*}
+        holds "$pid" "${fd##*/}" && echo "$pid"
+    done
+}
+
+# The pids /proc/locks names as holding a flock on the lock file (not the
+# ones waiting for it, whose lines have "->" before FLOCK): for a holder
+# whose command doesn't inherit the lock (`flock -o LOCK command`).
+holders() {
+    local dev ino
+    read -r dev ino < <(stat -L -c '%Hd:%Ld %i' "$lock") || return 1
+    dev=$(printf '%02x:%02x' "${dev%%:*}" "${dev##*:}")
+    awk -v id="$dev:$ino" '$2 == "FLOCK" && $6 == id { print $5 }' /proc/locks 2>/dev/null
+}
+
+# This process's ancestors, parent first.
+ancestors() {
+    local pid=$$ ppid
+    while [ "$pid" -gt 1 ]; do
+        # The fields after the command name, which may hold spaces or ")".
+        ppid=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f2)
+        [ -n "$ppid" ] || break
+        echo "$ppid"
+        pid=$ppid
+    done
+}
+
+describe() { # pid: its command line and directory
+    local cmd cwd
+    cmd=$(tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null)
+    cwd=$(readlink "/proc/$1/cwd" 2>/dev/null)
+    echo "pid $1, ${cmd% }, in ${cwd:-?}"
+}
+
+# Runs the command inside a lock an enclosing process holds, and logs it.
+reenter() { # holder description ("" when it's this script), command...
+    local holder=$1
+    shift
+    if [ -n "$holder" ]; then
+        echo "the cluster lock is already held by an enclosing $holder; running inside it. The scripts take the lock themselves since SME-100: drop the outer flock." >&2
+    fi
+    run "$@"
+    rc=$?
+    printf '%s reentered held=%d exit=%d worktree=%s cmd=%s\n' "$(utc "$asked")" \
+        $((EPOCHSECONDS - asked)) "$rc" "$(worktree)" "${*:1:3}" >>"$log"
+    exit "$rc"
+}
+
+asked=$EPOCHSECONDS
+mine=$(ancestors)
+ours=""
+[ -n "${SMELT_CLUSTER_LOCK_HOLDER:-}" ] && grep -qx "$SMELT_CLUSTER_LOCK_HOLDER" <<<"$mine" && ours=1
+if inside; then
+    if [ -n "$ours" ]; then
+        reenter "" "$@"
+    fi
+    reenter "flock (this process inherited its lock descriptor)" "$@"
+fi
+for pid in $(holders); do
+    grep -qx "$pid" <<<"$mine" && reenter "$(describe "$pid")" "$@"
+done
+
+if ! flock -n "$lock" true; then
+    holder=$(openers | head -n 1)
+    [ -n "$holder" ] || holder=$(holders | head -n 1)
+    if [ -n "$holder" ]; then
+        echo "waiting for the cluster lock (held by $(describe "$holder"))" >&2
+    else
+        echo "waiting for the cluster lock (its holder isn't visible to this user)" >&2
+    fi
+fi
+
+# flock keeps this pid (exec) and, with -F, execs the second half in it
+# too: the holder /proc/locks names is this process for the whole run, and
+# a run of this script inside the command finds SMELT_CLUSTER_LOCK_HOLDER
+# among its ancestors and re-enters silently.
+export SMELT_CLUSTER_LOCK_HOLDER=$$
+_SMELT_LOCK_INNER=1 _SMELT_LOCK_ASKED=$asked _SMELT_LOCK_OUTPUT=$output _SMELT_LOCK_LOG=$log \
+    exec flock -F "$lock" "$self" "$@"

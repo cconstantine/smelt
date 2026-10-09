@@ -227,15 +227,24 @@ Some state is process-wide and keyed by conversation id: the turn lock, a stop, 
 
 ```bash
 scripts/check.sh                              # the per-commit gate (see below)
-cargo test --features server                 # the real (server-gated) tests
-cargo test --features server -- --nocapture   # show println! output
-cargo test --features server test_name        # a single test by name
-cargo test --features server -- --exact sandbox::tests::test_name   # exactly one test
+scripts/cluster-test --features server                 # the real (server-gated) tests
+scripts/cluster-test --features server -- --nocapture   # show println! output
+scripts/cluster-test --features server -- --exact sandbox::tests::test_name   # exactly one test
 ```
+
+**Any run that includes a `#[sqlx::test]` or a real-cluster test goes through `scripts/cluster-test`** (SME-100), which takes its arguments as `cargo test` does: it builds them with `--no-run` first, unlocked, then runs the same command under the cluster lock. A `cargo test … --no-run` needs no lock. See [development-process.md](development-process.md#rules-every-persona-follows) ("One cluster user at a time").
+
+**The cluster lock** is `flock` on `<git common dir>/smelt-cluster.lock`, taken by `scripts/with-cluster-lock COMMAND…`, which `check.sh`, `browser-tier`, `cluster-test` and `clean-test-namespace.sh` call around their test run only:
+- while another process holds it, it prints `waiting for the cluster lock (held by pid N, <command>, in <directory>)` once, then waits;
+- the command inherits the lock, as under the old outer `flock`, and runs in its caller's process group, so it can read a terminal and Ctrl-C ends it and its caller. The lock is held until the command and everything it started that still has the descriptor have ended: no kill of `with-cluster-lock` frees it while a test binary may still be running (SME-100 review 2). A server meant to outlive a run closes the descriptor itself, as `check-server` does for its `dx serve`;
+- run inside a holder (a script that locks calling another, or an old outer `flock` in any form), it runs inside that lock rather than deadlocking, and for an outer `flock` says to drop it. It finds holders through `/proc/<pid>/fdinfo` and `/proc/locks`, Linux only, and the waiting line names a process holding the lock even after the one that took it has exited;
+- `--output FILE` sends the command's output to FILE while the waiting line stays on the terminal (`check.sh` keeps `target/check/server-tests.log` this way);
+- each run appends a line to `smelt-cluster-lock.log` next to the lock: start time, `waited=` and `held=` seconds, `exit=`, the worktree, the command;
+- `SMELT_LOCK_DIR` moves the lock (and `check-server`'s port locks) elsewhere; `scripts/test-check-scripts` sets it so its cases never touch the real one.
 
 A name filter matches every test whose path contains it, and several filters are OR'd, so a filter meant for one unit test can also pick up real-cluster tests (on SME-85, `test_a_` matched a claims test that creates pods). To run one test, name it with `--exact` and its full path.
 
-**A real-cluster test runs only this way, under the cluster lock** (see [development-process.md](development-process.md#rules)): on SME-115 a substring filter run outside the lock picked up a new test whose unfixed form was the bug being fixed, and it marked another run's claims in `smelt-park-test` for deletion.
+**A real-cluster test runs only this way, by exact name through `scripts/cluster-test`** (see [development-process.md](development-process.md#rules)): on SME-115 a substring filter run outside the lock picked up a new test whose unfixed form was the bug being fixed, and it marked another run's claims in `smelt-park-test` for deletion.
 
 **A module with both pure and real-cluster tests keeps the real-cluster ones in a `cluster` submodule** (as `sweep::tests::cluster::…` does), so a filter on the pure tests' path can't reach them. On SME-134 the filter `sweep::tests::test_the_sweep_`, meant for the pure tests, also ran four real-cluster sweep tests outside the lock.
 
@@ -244,8 +253,9 @@ A name filter matches every test whose path contains it, and several filters are
 ```bash
 git worktree add --detach ~/smelt-worktrees/gate-<ticket> <commit>
 cd ~/smelt-worktrees/gate-<ticket>
-cargo build --features server && cargo test --features server --no-run   # build outside the lock
-flock "$(git rev-parse --git-common-dir)/smelt-cluster.lock" scripts/check.sh > <scratchpad>/sme-N/gate-<commit>.log 2>&1; rc=$?   # act on rc, not on the log
+scripts/check.sh > <scratchpad>/sme-N/gate-<commit>.log 2>&1; rc=$?   # act on rc, not on the log; it locks only its test run
+# a commit without scripts/with-cluster-lock (before SME-100) takes no lock: build first, then
+# flock "$(git rev-parse --git-common-dir)/smelt-cluster.lock" scripts/check.sh > … ; rc=$?
 git checkout --detach <next commit>   # the next gate, once this one is back
 ```
 
@@ -255,9 +265,9 @@ Commit on top of a commit only once its gate passed. Run the browser tier from t
 
 Most logic lives behind the `server` feature; plain `cargo test` compiles but skips it.
 
-`scripts/check.sh` is what every commit is gated on (`scripts/check.sh && git commit ...`, see [development-process.md](development-process.md#rules)): the web build (`cargo check` for `wasm32-unknown-unknown`), the server binary build, and the server tests. It fails on any failure, including a warning in either build. It doesn't run the browser tier. The server tests' full log is kept at `target/check/server-tests.log` until the next run.
+`scripts/check.sh` is what every commit is gated on (`scripts/check.sh && git commit ...`, see [development-process.md](development-process.md#rules)): the web build (`cargo check` for `wasm32-unknown-unknown`), the server binary build, the lint, the test build, and then, under the cluster lock, the server tests. It fails on any failure, including a warning in either build. It doesn't run the browser tier. The server tests' full log is kept at `target/check/server-tests.log` until the next run.
 
-**The scripts a session runs for the gate and for hands-on checks delete no files** (`check.sh`, `browser-tier`, `check-server`, `build-sandbox-image.sh`): Claude Code's safety check refuses a command whose scripts remove files at paths it can't resolve, and only a person can approve it (SME-107). Logs go to fixed paths under `target/`, overwritten by the next run (`browser-tier`'s `dx build` log is `target/browser-tier/web-bundle.log`), and `check-server` empties its state files (`.check-server.pid`, `.check-server.scratch-db` in the check worktree) rather than removing them: an empty or missing one means nothing is running or there's no scratch database to drop. Dropping scratch databases and stopping processes stay. `scripts/test-check-scripts` checks both, with stubs for `dx`, `sqlx`, `curl` and the image check; run it after changing any of these scripts.
+**The scripts a session runs for the gate and for hands-on checks delete no files** (`check.sh`, `browser-tier`, `check-server`, `build-sandbox-image.sh`, `with-cluster-lock`, `cluster-test`, `clean-test-namespace.sh`): Claude Code's safety check refuses a command whose scripts remove files at paths it can't resolve, and only a person can approve it (SME-107). Logs go to fixed paths under `target/`, overwritten by the next run (`browser-tier`'s `dx build` log is `target/browser-tier/web-bundle.log`), and `check-server` empties its state files (`.check-server.pid`, `.check-server.scratch-db` in the check worktree) rather than removing them: an empty or missing one means nothing is running or there's no scratch database to drop. Dropping scratch databases and stopping processes stay. `scripts/test-check-scripts` checks both, and the locks (what each gate script runs locked and unlocked, re-entry, `check-server`'s port lock), with stubs for `cargo`, `dx`, `sqlx`, `curl`, `python3` and the image check; run it after changing any of these scripts.
 
 `mcp::tests::test_live_exa_search_through_smelt_mcp_client` checks the built-in Exa MCP server against the real service: smelt's own MCP client connects keylessly, sees only `web_search_exa`, and gets results back. It needs the internet and depends on Exa's unpublished free limits, so it's `#[ignore]`d **and** skips unless `SMELT_LIVE_EXA=1` is set. CI's browser job runs every ignored test, and this one shouldn't depend on Exa there. Run it with `SMELT_LIVE_EXA=1 cargo test --features server live_exa -- --ignored`. See [Definition of done](development-process.md#definition-of-done) for the full two-target check.
 
