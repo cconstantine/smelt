@@ -33,12 +33,14 @@ const LIVE_NAMESPACE: &str = "smelt-park";
 
 /// What the sweep would delete: each object's name and the uid it was
 /// listed with. `kept_claims` counts the old claims it keeps because a pod
-/// it keeps still mounts them.
+/// it keeps still mounts them. `mounts` names each chosen pod's claims, as
+/// (pod, claim), so a claim whose pod isn't deleted after all is kept too.
 #[derive(Debug, Default, PartialEq)]
 struct Choice {
     pods: Vec<(String, String)>,
     claims: Vec<(String, String)>,
     kept_claims: usize,
+    mounts: Vec<(String, String)>,
 }
 
 /// Refuses unless the sweep's namespace is the one the tests use and isn't
@@ -70,13 +72,13 @@ fn choose(pods: &[Pod], claims: &[PersistentVolumeClaim], now: Timestamp, max_ag
     let mut choice = Choice::default();
     let mut mounted_by_kept_pods = std::collections::HashSet::new();
     for pod in pods {
+        let volumes = pod.spec.as_ref().and_then(|s| s.volumes.as_ref());
+        let mounted = volumes.into_iter().flatten().filter_map(|v| v.persistent_volume_claim.as_ref()).map(|c| c.claim_name.as_str());
         if let Some(listed) = sweepable(&pod.metadata) {
+            choice.mounts.extend(mounted.map(|claim| (listed.0.clone(), claim.to_string())));
             choice.pods.push(listed);
         } else if pod.metadata.deletion_timestamp.is_none() {
-            let volumes = pod.spec.as_ref().and_then(|s| s.volumes.as_ref());
-            mounted_by_kept_pods.extend(
-                volumes.into_iter().flatten().filter_map(|v| v.persistent_volume_claim.as_ref()).map(|c| c.claim_name.as_str()),
-            );
+            mounted_by_kept_pods.extend(mounted);
         }
     }
     for claim in claims {
@@ -94,7 +96,7 @@ fn choose(pods: &[Pod], claims: &[PersistentVolumeClaim], now: Timestamp, max_ag
 const DELETES_AT_ONCE: usize = 16;
 
 /// What a sweep did: objects it deleted, old claims it kept because a
-/// kept pod mounts them, and deletes it skipped because the object was
+/// pod it kept or couldn't delete mounts them, and deletes it skipped because the object was
 /// already gone (404) or had been created again under its name (409).
 #[derive(Debug, Default, PartialEq)]
 struct Swept {
@@ -141,15 +143,25 @@ async fn sweep_with(
     delete_chosen(client, choice).await
 }
 
-/// Deletes each chosen object, held to the uid it was listed with.
+/// Deletes each chosen object, held to the uid it was listed with. A
+/// chosen claim is kept after all when a pod that mounts it is left (made
+/// again under its name, or its delete failed): that pod may still use it
+/// (review 2).
 async fn delete_chosen(client: &kube::Client, choice: Choice) -> Result<Swept, String> {
     let (pods, claims) = apis(client)?;
     let pods = delete_each(&pods, "pod", choice.pods).await;
-    let claims = delete_each(&claims, "claim", choice.claims).await;
+    let held: std::collections::HashSet<&str> = choice
+        .mounts
+        .iter()
+        .filter(|(pod, _)| pods.left.contains(pod))
+        .map(|(_, claim)| claim.as_str())
+        .collect();
+    let (kept, to_delete): (Vec<_>, Vec<_>) = choice.claims.into_iter().partition(|(name, _)| held.contains(name.as_str()));
+    let claims = delete_each(&claims, "claim", to_delete).await;
     Ok(Swept {
         pods: pods.deleted,
         claims: claims.deleted,
-        kept_claims: choice.kept_claims,
+        kept_claims: choice.kept_claims + kept.len(),
         skipped: pods.skipped + claims.skipped,
         failed: pods.failed + claims.failed,
     })
@@ -160,6 +172,9 @@ struct Outcome {
     deleted: usize,
     skipped: usize,
     failed: usize,
+    /// The objects still there afterwards, as far as the sweep knows: made
+    /// again under their name, or their delete failed.
+    left: Vec<String>,
 }
 
 async fn delete_each<K>(api: &Api<K>, kind: &str, listed: Vec<(String, String)>) -> Outcome
@@ -188,10 +203,12 @@ where
             Err(kube::Error::Api(e)) if e.code == 409 => {
                 log(format_args!("sweep: {kind} {name} was made again since it was listed; left alone"));
                 outcome.skipped += 1;
+                outcome.left.push(name);
             }
             Err(e) => {
                 log(format_args!("sweep: couldn't delete {kind} {name}: {e}"));
                 outcome.failed += 1;
+                outcome.left.push(name);
             }
         }
     }
@@ -357,6 +374,7 @@ mod tests {
         assert_eq!(choice.pods, vec![listed("old-pod")]);
         assert_eq!(choice.claims, vec![listed("mounted-by-old"), listed("mounted-by-stopping")]);
         assert_eq!(choice.kept_claims, 1);
+        assert_eq!(choice.mounts, vec![("old-pod".to_string(), "mounted-by-old".to_string())]);
     }
 
     /// The tests' fixed instance, a database's UUID or no label at all:
@@ -421,8 +439,13 @@ mod tests {
     // even `max_age` zero reaches nothing of another test's or run's.
 
     /// A label of this test's own, and the selector that picks it.
+    /// The clock alone isn't enough: two tests in parallel once got the
+    /// same nanoseconds and made the same claim name. A counter keeps
+    /// this process's apart, and the process id other processes'.
     fn scope() -> (String, String) {
-        let run = crate::sandbox::tests::unique_session_id("sweep");
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let run = format!("{}-{}-{n}", crate::sandbox::tests::unique_session_id("sweep"), std::process::id());
         let selector = format!("{SWEEP_TEST_LABEL}={run}");
         (run, selector)
     }
@@ -532,6 +555,43 @@ mod tests {
         assert_ne!(left, vec![pod_name.clone()], "the claim was deleted from under a pod the sweep didn't see");
         assert_eq!(swept, Ok(Swept { pods: 1, claims: 1, ..Swept::default() }));
         assert_eq!(left, Vec::<String>::new());
+    }
+
+    /// SME-134 review 2: a claim the sweep chose with its old pod is kept
+    /// when that pod's delete is refused, because the pod was made again
+    /// under its name since the listing and still mounts the claim.
+    #[tokio::test]
+    async fn test_the_sweep_keeps_a_claim_whose_pod_was_made_again() {
+        let client = crate::sandbox::tests::test_client().await;
+        let (run, selector) = scope();
+        let claim_name = format!("{run}-claim");
+        let pod_name = format!("{run}-pod");
+        let claim = create_claim(&client, &claim_name, &run).await;
+        create_pod(&client, &pod_name, &run, &claim_name).await;
+        let pods = Api::<Pod>::namespaced(client.clone(), SWEEP_NAMESPACE);
+        let listed_pod_uid = pods.get(&pod_name).await.expect("get pod").metadata.uid.expect("uid");
+        pods.delete(&pod_name, &DeleteParams { grace_period_seconds: Some(0), ..DeleteParams::default() })
+            .await
+            .expect("delete pod");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while pods.get_opt(&pod_name).await.expect("get").is_some() {
+            assert!(tokio::time::Instant::now() < deadline, "the first pod wasn't gone within 30 s");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        create_pod(&client, &pod_name, &run, &claim_name).await;
+
+        let choice = Choice {
+            pods: vec![(pod_name.clone(), listed_pod_uid)],
+            claims: vec![(claim_name.clone(), claim.metadata.uid.clone().expect("uid"))],
+            mounts: vec![(pod_name.clone(), claim_name.clone())],
+            ..Choice::default()
+        };
+        let swept = delete_chosen(&client, choice).await;
+        let left = live(&client, &selector).await;
+
+        clean_up(&client, &selector).await;
+        assert_eq!(left, vec![claim_name, pod_name], "the pod made again, and the claim it mounts, should both be left");
+        assert_eq!(swept, Ok(Swept { kept_claims: 1, skipped: 1, ..Swept::default() }));
     }
 
     /// A claim deleted and made again under its name between the listing
