@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""Block until the smelt Linear board needs the Project Manager, then exit.
+
+The Project Manager runs this as a background command. It exits, which wakes
+the Project Manager, as soon as a status change on the board needs acting on:
+
+  - a ticket enters Up Next, Todo or Approved;
+  - a ticket reaches Done while it blocks a ticket that isn't Done
+    (a waiting Up Next ticket may be plannable now).
+
+Everything else (sub-agents finishing, CI) already wakes the Project Manager
+through the sub-agents' own reports, so this only watches statuses.
+
+It polls Linear's GraphQL API every --interval seconds (default 60) and
+compares the board with a snapshot kept in
+~/.local/state/smelt/pm-board-snapshot.json (or $SMELT_PM_STATE_DIR). The
+snapshot is saved when the script exits, and loaded when it starts, so a
+change made between two runs (by the user, or by the Project Manager's own
+pass) is reported at once. The Project Manager's own moves therefore cause at
+most one extra wake, and nothing the user does in between is missed.
+
+The API key is a Linear personal API key (read-only is enough), read from
+~/.config/smelt/linear-api-key, or the file $SMELT_LINEAR_KEY_FILE names. The
+file must not be readable by group or others (chmod 600). The key is never
+printed.
+
+Exit status: 0 with one line per change on stdout; 1 for --once with nothing
+changed; 2 when the key is missing, refused (401/403, no retry) or the API keeps
+failing (the message says why). With --once a failed poll isn't retried.
+
+    scripts/pm-wait-for-board                 # wait for the next change
+    scripts/pm-wait-for-board --once          # check once: report and exit 0, or exit 1 if nothing changed
+    scripts/pm-wait-for-board --self-test     # run the comparison's tests (no network)
+"""
+
+import argparse
+import json
+import os
+import stat
+import sys
+import time
+import urllib.error
+import urllib.request
+
+API_URL = os.environ.get("SMELT_LINEAR_API_URL", "https://api.linear.app/graphql")
+PROJECT = "smelt"
+WAKE_STATES = ("Up Next", "Todo", "Approved")
+DONE = "Done"
+MAX_FAILURES = 10
+
+QUERY = """
+query Board($project: String!, $after: String) {
+  issues(first: 100, after: $after, filter: { project: { name: { eq: $project } } }) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      identifier
+      state { name }
+      relations(first: 50) { nodes { type relatedIssue { identifier } } }
+    }
+  }
+}
+"""
+
+
+def key_path():
+    return os.environ.get(
+        "SMELT_LINEAR_KEY_FILE", os.path.expanduser("~/.config/smelt/linear-api-key")
+    )
+
+
+def state_path():
+    base = os.environ.get(
+        "SMELT_PM_STATE_DIR", os.path.expanduser("~/.local/state/smelt")
+    )
+    return os.path.join(base, "pm-board-snapshot.json")
+
+
+def fail(msg):
+    print(f"pm-wait-for-board: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def read_key():
+    path = key_path()
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        fail(
+            f"no Linear API key at {path}. Create a personal API key "
+            "(Linear > Settings > Security & access > API keys; read-only is enough), "
+            f"put it in that file, and chmod 600 it."
+        )
+    if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        fail(f"{path} is readable by others; run chmod 600 {path}")
+    with open(path) as f:
+        key = f.read().strip()
+    if not key:
+        fail(f"{path} is empty")
+    return key
+
+
+def fetch_board(key):
+    """{identifier: {"state": name, "blocks": [identifier, ...]}} for the project."""
+    board, after = {}, None
+    while True:
+        body = json.dumps(
+            {"query": QUERY, "variables": {"project": PROJECT, "after": after}}
+        ).encode()
+        req = urllib.request.Request(
+            API_URL,
+            data=body,
+            headers={"Content-Type": "application/json", "Authorization": key},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+        if data.get("errors"):
+            raise RuntimeError(
+                "Linear API error: " + "; ".join(e.get("message", "?") for e in data["errors"])
+            )
+        issues = data["data"]["issues"]
+        for node in issues["nodes"]:
+            board[node["identifier"]] = {
+                "state": node["state"]["name"],
+                "blocks": sorted(
+                    r["relatedIssue"]["identifier"]
+                    for r in node["relations"]["nodes"]
+                    if r["type"] == "blocks" and r.get("relatedIssue")
+                ),
+            }
+        if not issues["pageInfo"]["hasNextPage"]:
+            return board
+        after = issues["pageInfo"]["endCursor"]
+
+
+def changes(old, new):
+    """Lines describing the changes in `new` that need the Project Manager."""
+    out = []
+    for ident in sorted(new, key=lambda i: (i.split("-")[0], int(i.split("-")[-1]))):
+        now = new[ident]["state"]
+        before = old.get(ident, {}).get("state")
+        if now == before:
+            continue
+        if now in WAKE_STATES:
+            out.append(f"{ident}: {before or 'new'} -> {now}")
+        elif now == DONE:
+            waiting = [
+                b for b in new[ident]["blocks"] if b in new and new[b]["state"] != DONE
+            ]
+            if waiting:
+                out.append(
+                    f"{ident}: {before or 'new'} -> Done, unblocking {', '.join(waiting)}"
+                )
+    return out
+
+
+def load_snapshot():
+    try:
+        with open(state_path()) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_snapshot(board):
+    path = state_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(board, f, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def self_test():
+    def b(**states):
+        return {k.replace("_", "-"): {"state": v, "blocks": []} for k, v in states.items()}
+
+    cases = []
+    # No change: nothing.
+    cases.append((b(SME_1="Backlog"), b(SME_1="Backlog"), []))
+    # Into each wake state.
+    for s in WAKE_STATES:
+        cases.append((b(SME_1="Backlog"), b(SME_1=s), [f"SME-1: Backlog -> {s}"]))
+    # A new ticket created straight into Todo.
+    cases.append(({}, b(SME_2="Todo"), ["SME-2: new -> Todo"]))
+    # Out of a wake state, or into a non-wake state: nothing.
+    cases.append((b(SME_1="Todo"), b(SME_1="In Progress"), []))
+    cases.append((b(SME_1="Up Next"), b(SME_1="Planned"), []))
+    # Done with nothing waiting: nothing.
+    cases.append((b(SME_1="Approved"), b(SME_1="Done"), []))
+    # Done while blocking an open ticket: wake, naming it.
+    old = b(SME_1="Approved", SME_2="Up Next", SME_3="Done")
+    new = b(SME_1="Done", SME_2="Up Next", SME_3="Done")
+    new["SME-1"]["blocks"] = ["SME-2", "SME-3"]
+    cases.append((old, new, ["SME-1: Approved -> Done, unblocking SME-2"]))
+    # Several changes, in ticket order.
+    cases.append(
+        (b(SME_10="Backlog", SME_9="Planned"), b(SME_10="Up Next", SME_9="Todo"),
+         ["SME-9: Planned -> Todo", "SME-10: Backlog -> Up Next"])
+    )
+    failed = 0
+    for i, (old, new, want) in enumerate(cases):
+        got = changes(old, new)
+        if got != want:
+            failed += 1
+            print(f"case {i}: want {want}, got {got}")
+    print(f"{len(cases) - failed} passed, {failed} failed")
+    return 1 if failed else 0
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Wait until the smelt Linear board needs the Project Manager."
+    )
+    p.add_argument("--interval", type=int, default=60, help="seconds between polls (default 60)")
+    p.add_argument("--once", action="store_true", help="check once and exit (1 if nothing changed)")
+    p.add_argument("--self-test", action="store_true", help="run the comparison's tests and exit")
+    args = p.parse_args()
+    if args.self_test:
+        return self_test()
+    if args.interval < 10:
+        p.error("--interval must be at least 10 seconds")
+
+    key = read_key()
+    old = load_snapshot()
+    failures = 0
+    while True:
+        try:
+            board = fetch_board(key)
+            failures = 0
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                fail(
+                    f"Linear refused the key in {key_path()} (HTTP {e.code}). It should be a "
+                    "personal API key, which starts with lin_api_ (Linear > Settings > "
+                    "Security & access > API keys)."
+                )
+            failures += 1
+            if args.once or failures >= MAX_FAILURES:
+                print(f"pm-wait-for-board: giving up after {failures} failed polls: {e}", file=sys.stderr)
+                return 2
+            print(f"pm-wait-for-board: poll failed ({e}); retrying", file=sys.stderr)
+            time.sleep(min(args.interval * failures, 600))
+            continue
+        except (urllib.error.URLError, OSError, RuntimeError, KeyError, ValueError) as e:
+            failures += 1
+            if args.once or failures >= MAX_FAILURES:
+                print(f"pm-wait-for-board: giving up after {failures} failed polls: {e}", file=sys.stderr)
+                return 2
+            print(f"pm-wait-for-board: poll failed ({e}); retrying", file=sys.stderr)
+            time.sleep(min(args.interval * failures, 600))
+            continue
+        if old is None:
+            # First run: nothing to compare with yet. Keep this as the baseline.
+            save_snapshot(board)
+            old = board
+            print("pm-wait-for-board: no snapshot yet; took one, watching from now", file=sys.stderr)
+        else:
+            found = changes(old, board)
+            if found:
+                save_snapshot(board)
+                print("\n".join(found))
+                return 0
+        if args.once:
+            return 1
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
