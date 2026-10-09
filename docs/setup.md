@@ -45,8 +45,9 @@ dx bundle --platform web
 # sources, `smelt-sandbox:src-<hash>` (scripts/sandbox-image-ref, SME-102):
 # a server with no SANDBOX_IMAGE runs the one named after the sources it was
 # built from, and so do scripts/check.sh and the browser tier (SME-121).
-# Run it again after pulling a change to the agent's sources, Cargo.toml or
-# Cargo.lock if no gate has built that image yet: until then `create_pod`
+# Run it again after pulling a change to the agent's sources,
+# docker/sandbox/Dockerfile, Cargo.toml or Cargo.lock if no gate has built
+# that image yet: until then `create_pod`
 # fails within seconds with `ErrImageNeverPull`, naming the image and this
 # command. (`--latest` also tags it `smelt-sandbox:latest`, for a server
 # whose SANDBOX_IMAGE names that tag; nothing uses it by default.)
