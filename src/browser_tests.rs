@@ -3002,6 +3002,12 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
         .into_value()
         .expect("a string");
     assert_eq!(pasted, whole, "the clipboard should hold the reply's markdown");
+    // The tier's browser is shared: later scenarios get no clipboard access.
+    t.harness
+        .browser
+        .execute(chromiumoxide::cdp::browser_protocol::browser::ResetPermissionsParams::default())
+        .await
+        .expect("reset the permissions");
 
     // Phone width: the button stays inside its bubble and nothing scrolls
     // sideways.
@@ -3087,6 +3093,9 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
     let heard = errors.clone();
     let listener = tokio::spawn(async move {
         while let Some(event) = futures_util::StreamExt::next(&mut console).await {
+            if !matches!(event.r#type, chromiumoxide::cdp::js_protocol::runtime::ConsoleApiCalledType::Error) {
+                continue;
+            }
             let line = event
                 .args
                 .iter()
@@ -3101,6 +3110,13 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
     wait_for_live_client(&tab, reloading.id).await;
     send_from(&tab, "go").await;
     assert!(wait_for_text(&tab, "zebra1", Duration::from_secs(10)).await, "the reply should start streaming");
+    // A part of the running reply already saved (as before a tool call):
+    // the server renders the page without knowing the turn runs, so this
+    // is where the server's and the client's renders could differ.
+    let saved_part = db::create_message(t.pool, reloading.id, "assistant", &[text("Saved mid-turn.")]).await.expect("save a part");
+    let saved_id = saved_part.id;
+    publish(reloading.id, ConversationEvent::MessagesAppended { messages: vec![saved_part] });
+    assert!(wait_for_text(&tab, "Saved mid-turn.", Duration::from_secs(5)).await);
     tab.reload().await.expect("reload mid-turn");
     wait_for_live_client(&tab, reloading.id).await;
     assert!(wait_for_count(&tab, ".stop-turn", 1, Duration::from_secs(5)).await, "still running after the reload");
@@ -3110,13 +3126,18 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
         Some(vec![serde_json::json!(before_turn.to_string())]),
         "only the finished reply has a button mid-turn: {mid}"
     );
+    let marks: Vec<serde_json::Value> = mid["bubbles"].as_array().cloned().unwrap_or_default().iter().map(|b| b["reply"].clone()).collect();
+    assert!(
+        !marks.contains(&serde_json::json!(saved_id.to_string())) && mid["bubbles"].to_string().contains("Saved mid-turn."),
+        "the running reply's saved part has no button or mark after a reload: {mid}"
+    );
     assert!(wait_for_count(&tab, ".stop-turn", 0, Duration::from_secs(20)).await, "the turn should finish");
     assert!(wait_for_count(&tab, ".reply-copy", 2, Duration::from_secs(10)).await, "the finished reply gets its button");
     listener.abort();
     let lines = errors.lock().expect("the console lock").clone();
     assert!(lines.iter().any(|l| l.contains("smelt console probe")), "the console listener heard nothing: {lines:?}");
-    let hydration: Vec<&String> = lines.iter().filter(|l| l.to_lowercase().contains("hydrat")).collect();
-    assert!(hydration.is_empty(), "hydration problems after a reload mid-turn: {hydration:?}");
+    let console_errors: Vec<&String> = lines.iter().filter(|l| !l.contains("smelt console probe")).collect();
+    assert!(console_errors.is_empty(), "console errors around a reload mid-turn: {console_errors:?}");
 }
 
 /// SME-30: a long reply (about 30 KB, ten code blocks) keeps up while it
