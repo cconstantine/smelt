@@ -393,6 +393,11 @@ impl Builder {
                             let dest = match link_type {
                                 LinkType::Email => mailto(&dest_url),
                                 LinkType::Autolink if has_bidi_control(&dest_url) => None,
+                                LinkType::Autolink
+                                    if dest_url.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("mailto:")) =>
+                                {
+                                    dest_url.get(7..).and_then(mailto)
+                                }
                                 _ => Some(dest_url.to_string()),
                             };
                             Container::Link {
@@ -1217,6 +1222,8 @@ mod tests {
             "a/b@e.com",
             "<billing?cc=attacker@evil.com>",
             "<https://e.com/\u{202E}moc.knab>",
+            "<mailto:billing?cc=attacker@evil.com>",
+            "<MAILTO:a%40evil.com@bank.com>",
             "a\u{202E}b@e.com",
             "https://e.com/\u{202E}moc.knab",
             "www.e\u{2066}x.com",
@@ -1228,6 +1235,11 @@ mod tests {
             links_in("mail first.last+tag@e.com"),
             pairs(&[("mailto:first.last+tag@e.com", "first.last+tag@e.com")]),
             "an ordinary address still links"
+        );
+        assert_eq!(
+            links_in("<mailto:me@e.com>"),
+            pairs(&[("mailto:me@e.com", "mailto:me@e.com")]),
+            "an ordinary mailto: autolink still links"
         );
     }
 
