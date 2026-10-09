@@ -572,8 +572,8 @@ async fn test_exhausted_reconnects_force_terminate_an_unreachable_pod(pool: PgPo
 }
 
 /// SME-121: a pod whose image isn't on the node fails within seconds with
-/// the kubelet's `ErrImageNeverPull`, naming the image and the command that
-/// builds it, instead of waiting out the running timeout. A hand-built pod
+/// the kubelet's `ErrImageNeverPull`, naming the image and what to do,
+/// instead of waiting out the running timeout. A hand-built pod
 /// with the sandbox's pull policy and an image no one built; its deadline
 /// bounds its life if the test is killed before teardown.
 #[sqlx::test]
@@ -617,7 +617,14 @@ async fn test_a_pod_whose_image_is_missing_fails_fast_saying_how_to_build_it(poo
         };
         assert!(started.elapsed() < Duration::from_secs(45), "took {:?}", started.elapsed());
         assert!(reason.contains("ErrImageNeverPull") && reason.contains(missing), "{reason}");
-        assert!(reason.contains("scripts/build-sandbox-image.sh"), "{reason}");
+        // The advice is picked by the image the container's status names.
+        let status_image = pods_api(&client).get(&pod_name(pod)).await.expect("get the pod").status
+            .and_then(|s| s.container_statuses)
+            .and_then(|c| c.into_iter().next())
+            .map(|c| c.image);
+        assert_eq!(status_image.as_deref(), Some(missing));
+        // Not an image the build script makes, so the advice says whose it is.
+        assert!(reason.contains("SANDBOX_IMAGE or SANDBOX_DOCKER_IMAGE"), "{reason}");
     })
     .await;
 }

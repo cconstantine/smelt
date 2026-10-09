@@ -804,29 +804,52 @@ fn test_pod_startup_failure_reports_a_container_that_cannot_start() {
 
 /// The kubelet's own words for an image that isn't on the node, with
 /// `imagePullPolicy: Never`: the pod would wait out the whole running
-/// timeout, so it's a startup failure at once, naming the image and the
-/// command that builds it, which the model can't run itself (SME-121).
-const NEVER_PULL_MESSAGE: &str =
-    "Container image \"docker.io/library/smelt-sandbox:src-0123456789abcdef\" is not present with pull policy of Never";
+/// timeout, so it's a startup failure at once, naming the image and what
+/// to do, which the model can't do itself (SME-121). The container's
+/// status names the image too.
+fn pod_never_pulling(image: &str) -> Pod {
+    let message = format!("Container image \"{image}\" is not present with pull policy of Never");
+    let mut pod = pod_waiting("ErrImageNeverPull", &message);
+    for status in pod.status.as_mut().expect("status").container_statuses.iter_mut().flatten() {
+        status.image = image.to_string();
+    }
+    pod
+}
 
 #[test]
 fn test_a_missing_image_is_a_startup_failure_that_says_how_to_build_it() {
-    let failure = pod_startup_failure(&pod_waiting("ErrImageNeverPull", NEVER_PULL_MESSAGE))
+    let failure = pod_startup_failure(&pod_never_pulling(OWN_SANDBOX_IMAGE))
         .expect("an image that isn't on the node is a startup failure");
-    assert!(failure.contains("smelt-sandbox:src-0123456789abcdef"), "names the image: {failure}");
-    assert!(failure.contains("scripts/build-sandbox-image.sh"), "says how to build it: {failure}");
+    assert!(failure.contains(OWN_SANDBOX_IMAGE), "names the image: {failure}");
+    assert!(failure.contains("with scripts/build-sandbox-image.sh"), "says how to build it: {failure}");
+    assert!(!failure.contains("--latest"), "{failure}");
     assert!(failure.contains("tell the user"), "the model can't build it itself: {failure}");
+}
+
+/// Review 1: the script builds only this tree's own image (and moves
+/// `:latest` only with `--latest`), so advice for any other image says so.
+#[test]
+fn test_a_missing_image_the_script_doesnt_build_gets_its_own_advice() {
+    let latest = pod_startup_failure(&pod_never_pulling("smelt-sandbox:latest")).expect("a startup failure");
+    assert!(latest.contains("scripts/build-sandbox-image.sh --latest"), "{latest}");
+
+    let other = "registry.example/team/sandbox:1";
+    let failure = pod_startup_failure(&pod_never_pulling(other)).expect("a startup failure");
+    assert!(failure.contains(other), "{failure}");
+    assert!(failure.contains("SANDBOX_IMAGE or SANDBOX_DOCKER_IMAGE"), "{failure}");
+    assert!(failure.contains("import"), "{failure}");
+    assert!(!failure.contains("with scripts/build-sandbox-image.sh"), "{failure}");
 }
 
 /// The Docker sidecar is an init container, delivered by the same script:
 /// a missing `docker:29-dind` fails the same way.
 #[test]
 fn test_a_sidecar_whose_image_is_missing_is_a_startup_failure() {
-    let mut pod = pod_waiting("ErrImageNeverPull", NEVER_PULL_MESSAGE);
+    let mut pod = pod_never_pulling("docker.io/library/docker:29-dind");
     let status = pod.status.as_mut().expect("status");
     status.init_container_statuses = status.container_statuses.take();
     let failure = pod_startup_failure(&pod).expect("a sidecar that can't start is a startup failure");
-    assert!(failure.contains("scripts/build-sandbox-image.sh"), "{failure}");
+    assert!(failure.contains("with scripts/build-sandbox-image.sh"), "{failure}");
 
     // A sidecar crashing while it starts is left to its own restarts.
     let mut crashing = pod_waiting("CrashLoopBackOff", "back-off restarting failed container");

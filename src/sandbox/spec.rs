@@ -68,12 +68,34 @@ pub(super) const FATAL_WAITING_REASONS: [&str; 8] = [
     "ErrImageNeverPull",
 ];
 
-/// What to do about `ErrImageNeverPull`. Sandbox pods' images are delivered
-/// into the node by `scripts/build-sandbox-image.sh` on smelt's host, which
-/// the model can't run, so it says so rather than retrying.
-const IMAGE_NEVER_PULL_ADVICE: &str = "The cluster's node doesn't have this image, and sandbox pods never pull \
-     one: it's built on smelt's host with scripts/build-sandbox-image.sh (from the checkout smelt runs \
-     from), which can't be run from a sandbox. Don't retry create_pod: tell the user to run that script.";
+/// What to do about `ErrImageNeverPull` for `image`. Sandbox pods' images
+/// are delivered into the node from smelt's host, which the model can't
+/// do, so it says to tell the user rather than retry. The build script
+/// makes only this tree's own image and `docker:29-dind`, and moves
+/// `smelt-sandbox:latest` only with `--latest`; any other image is one a
+/// setting names, which the script can't help with (review 1).
+fn image_never_pull_advice(image: &str) -> String {
+    const NOT_THERE: &str = "The cluster's node doesn't have this image, and sandbox pods never pull one.";
+    const DONT_RETRY: &str = "It can't be built or imported from a sandbox, so don't retry create_pod:";
+    let full = full_image_name(image);
+    let built_by_script = [OWN_SANDBOX_IMAGE, "docker.io/library/docker:29-dind"].map(full_image_name);
+    if built_by_script.contains(&full) {
+        format!(
+            "{NOT_THERE} {DONT_RETRY} tell the user to build it with scripts/build-sandbox-image.sh, from \
+             the checkout smelt runs from."
+        )
+    } else if full == "docker.io/library/smelt-sandbox:latest" {
+        format!(
+            "{NOT_THERE} {DONT_RETRY} tell the user to build it with scripts/build-sandbox-image.sh --latest, \
+             from the checkout smelt runs from, or to unset SANDBOX_IMAGE."
+        )
+    } else {
+        format!(
+            "{NOT_THERE} SANDBOX_IMAGE or SANDBOX_DOCKER_IMAGE names it, and scripts/build-sandbox-image.sh \
+             doesn't make it. {DONT_RETRY} tell the user to import it into the node, or to unset the setting."
+        )
+    }
+}
 
 /// The fatal reasons that are about the image, which no restart fixes.
 /// Only these count for an init container (the Docker sidecar): a sidecar
@@ -96,7 +118,7 @@ pub(super) fn pod_startup_failure(pod: &Pod) -> Option<String> {
                 None => reason.to_string(),
             };
             if reason == "ErrImageNeverPull" {
-                format!("{failure}. {IMAGE_NEVER_PULL_ADVICE}")
+                format!("{failure}. {}", image_never_pull_advice(&status.image))
             } else {
                 failure
             }
