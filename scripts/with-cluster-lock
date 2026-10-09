@@ -18,9 +18,13 @@
 #
 # - Waiting: when another process holds the lock, says once who (pid,
 #   command, directory), then waits.
-# - The command doesn't inherit the lock (`flock -o`): something it leaves
-#   running in the background can't keep it once the command ends. Killing
-#   this script (its pid is the holder's) frees it.
+# - The command doesn't inherit the lock: something it leaves running in
+#   the background can't keep it once the command ends. This script's pid,
+#   the one /proc/locks and the waiting line name, holds the lock and waits
+#   for the command, run in a process group of its own: INT, TERM and HUP
+#   are passed on to that group and the lock is freed once it's gone, and a
+#   SIGKILL takes the command with it (setpriv --pdeathsig), so no kill of
+#   the holder lets a second run in beside a command still running.
 # - Re-entry: when an ancestor process already holds the lock, the command
 #   runs inside that lock instead of deadlocking on it: silently when the
 #   ancestor is this script, with a notice when it's an old outer `flock`.
@@ -48,15 +52,39 @@ run() {
     fi
 }
 
-# The second half, run by `flock` below once the lock is taken: runs the
-# command (which never had the lock's descriptor) and logs the run while
-# the lock is still held.
+# The second half, which `flock -F` below execs in this same process once
+# the lock is taken, holding it on a descriptor: runs the command without
+# that descriptor and waits for it, then logs the run while the lock is
+# still held.
 if [ -n "${_SMELT_LOCK_INNER:-}" ]; then
-    asked=$_SMELT_LOCK_ASKED output=$_SMELT_LOCK_OUTPUT log=$_SMELT_LOCK_LOG
-    unset _SMELT_LOCK_INNER _SMELT_LOCK_ASKED _SMELT_LOCK_OUTPUT _SMELT_LOCK_LOG
+    asked=$_SMELT_LOCK_ASKED output=$_SMELT_LOCK_OUTPUT log=$_SMELT_LOCK_LOG lock=$_SMELT_LOCK_FILE
+    unset _SMELT_LOCK_INNER _SMELT_LOCK_ASKED _SMELT_LOCK_OUTPUT _SMELT_LOCK_LOG _SMELT_LOCK_FILE
     took=$EPOCHSECONDS
-    run "$@"
-    rc=$?
+    lock_id=$(stat -L -c '%d:%i' "$lock")
+    lock_fd=""
+    for fd in /proc/$$/fd/*; do
+        [ "$(stat -L -c '%d:%i' "$fd" 2>/dev/null)" = "$lock_id" ] && lock_fd=${fd##*/}
+    done
+    # Its own process group (job control), so a signal for the command
+    # reaches everything it started; stdin passed on explicitly, since a
+    # background job's is otherwise /dev/null.
+    set -m
+    if [ -n "$output" ]; then
+        setpriv --pdeathsig KILL "$@" {lock_fd}>&- <&0 >"$output" 2>&1 &
+    else
+        setpriv --pdeathsig KILL "$@" {lock_fd}>&- <&0 &
+    fi
+    child=$!
+    trap 'kill -INT -- "-$child" 2>/dev/null' INT
+    trap 'kill -TERM -- "-$child" 2>/dev/null' TERM
+    trap 'kill -HUP -- "-$child" 2>/dev/null' HUP
+    rc=0
+    # A trapped signal ends `wait` early; wait again until the command has
+    # really gone, and take its status.
+    while kill -0 "$child" 2>/dev/null; do
+        wait "$child"
+        rc=$?
+    done
     printf '%s waited=%d held=%d exit=%d worktree=%s cmd=%s\n' "$(utc "$asked")" \
         $((took - asked)) $((EPOCHSECONDS - took)) "$rc" "$(worktree)" "${*:1:3}" >>"$log"
     exit "$rc"
@@ -69,7 +97,7 @@ if [ "${1:-}" = "--output" ]; then
     shift 2
 fi
 if [ $# -eq 0 ]; then
-    sed -n '2,33p' "$self" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,37p' "$self" | sed 's/^# \{0,1\}//' >&2
     exit 2
 fi
 
@@ -131,9 +159,11 @@ else
     echo "with-cluster-lock: can't read /proc/locks, so re-entry detection is off: an enclosing flock on $lock would deadlock this" >&2
 fi
 
-# flock keeps this pid (exec), so the holder /proc/locks names is this
-# process, and a run of this script inside the command finds it among its
-# ancestors and in SMELT_CLUSTER_LOCK_HOLDER.
+# flock keeps this pid (exec) and, with -F, execs the second half in it
+# too, so the holder /proc/locks names is this process for the whole run
+# (a lock whose taker has exited isn't listed at all), and a run of this
+# script inside the command finds it among its ancestors and in
+# SMELT_CLUSTER_LOCK_HOLDER.
 export SMELT_CLUSTER_LOCK_HOLDER=$$
-_SMELT_LOCK_INNER=1 _SMELT_LOCK_ASKED=$asked _SMELT_LOCK_OUTPUT=$output _SMELT_LOCK_LOG=$log \
-    exec flock -o "$lock" "$self" "$@"
+_SMELT_LOCK_INNER=1 _SMELT_LOCK_ASKED=$asked _SMELT_LOCK_OUTPUT=$output _SMELT_LOCK_LOG=$log _SMELT_LOCK_FILE=$lock \
+    exec flock -F "$lock" "$self" "$@"
