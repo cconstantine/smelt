@@ -218,6 +218,14 @@ name = "sandbox_image_import"
 path = "src/bin/sandbox_image_import.rs"
 required-features = ["server"]
 
+# Standalone CLI, run by scripts/check-server's cleanup (SME-129): deletes
+# the sandbox pods and claims a check server's scratch database made — see
+# src/bin/sandbox_instance_cleanup.rs's own doc comment.
+[[bin]]
+name = "sandbox_instance_cleanup"
+path = "src/bin/sandbox_instance_cleanup.rs"
+required-features = ["server"]
+
 [dev-dependencies]
 # rmcp's server side, for the #[cfg(test)] mock MCP server in src/mcp.rs
 # (its ServerHandler trait): tests only, so it stays out of the binary.
