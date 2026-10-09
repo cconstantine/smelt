@@ -185,8 +185,8 @@ pub(super) struct ReplyCopy {
     /// The block whose bubble holds the button: the reply's last text.
     pub(super) block_index: usize,
     /// The reply's text blocks as the model wrote them, joined by a blank
-    /// line.
-    pub(super) markdown: String,
+    /// line. Shared, so handing each message its part doesn't copy it.
+    pub(super) markdown: std::rc::Rc<str>,
     /// How many text bubbles that is.
     pub(super) parts: usize,
 }
@@ -202,12 +202,20 @@ pub(super) struct ReplyCopy {
 /// block that is only whitespace. While the turn runs, the newest reply
 /// (the one after the last such message) has none: it may still grow.
 pub(super) fn reply_parts(messages: &[Message], turn_running: bool) -> HashMap<i64, ReplyPart> {
-    let tool_names = tool_use_names_by_id(messages);
+    // Each message parsed once, for the tool names and the walk below.
+    let readable: Vec<(&Message, Vec<ContentBlock>)> =
+        messages.iter().filter_map(|m| m.blocks().ok().map(|blocks| (m, blocks))).collect();
+    let tool_names: HashMap<&str, &str> = readable
+        .iter()
+        .flat_map(|(_, blocks)| blocks)
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, .. } => Some((id.as_str(), name.as_str())),
+            _ => None,
+        })
+        .collect();
     let mut parts = HashMap::new();
     // The reply being gathered: (message id, block index, text) per part.
     let mut reply: Vec<(i64, usize, &str)> = Vec::new();
-    let readable: Vec<(&Message, Vec<ContentBlock>)> =
-        messages.iter().filter_map(|m| m.blocks().ok().map(|blocks| (m, blocks))).collect();
     // Whether the turn is inside its tool loop: the last message was tool
     // results going back to the model. A notice saved there (a command
     // finishing, drained at the top of the loop) is part of the same turn,
@@ -230,7 +238,7 @@ pub(super) fn reply_parts(messages: &[Message], turn_running: bool) -> HashMap<i
                     ContentBlock::ToolResult { tool_use_id, is_error, .. } => {
                         tool_results = true;
                         starts_reply |= *is_error != Some(true)
-                            && tool_names.get(tool_use_id).is_some_and(|name| name == ASK_USER);
+                            && tool_names.get(tool_use_id.as_str()).is_some_and(|name| *name == ASK_USER);
                     }
                     _ => {}
                 }
@@ -276,7 +284,7 @@ fn finish_reply(parts: &mut HashMap<i64, ReplyPart>, reply: Vec<(i64, usize, &st
             .push(block);
     }
     if let Some(part) = parts.get_mut(&last_message) {
-        part.copy = Some(ReplyCopy { block_index: last_block, markdown, parts: reply.len() });
+        part.copy = Some(ReplyCopy { block_index: last_block, markdown: markdown.into(), parts: reply.len() });
     }
 }
 

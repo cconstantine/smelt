@@ -1651,7 +1651,7 @@ fn result(id: &str, content: &str) -> ContentBlock {
 fn buttons(parts: &HashMap<i64, ReplyPart>) -> Vec<(i64, usize, String, usize)> {
     let mut buttons: Vec<_> = parts
         .iter()
-        .filter_map(|(id, part)| part.copy.as_ref().map(|c| (*id, c.block_index, c.markdown.clone(), c.parts)))
+        .filter_map(|(id, part)| part.copy.as_ref().map(|c| (*id, c.block_index, c.markdown.to_string(), c.parts)))
         .collect();
     buttons.sort();
     buttons

@@ -114,7 +114,7 @@ impl CopyFeedback {
 /// copies (SME-105).
 #[component]
 pub(crate) fn CopyButton(
-    text: String,
+    text: std::rc::Rc<str>,
     label: String,
     class: &'static str,
     title: String,
