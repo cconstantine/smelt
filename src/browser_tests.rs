@@ -4731,7 +4731,11 @@ async fn scenario_address_bar_after_session_closes(t: &Scenario<'_>) {
         Ok(())
     }
     .await;
-    // Closed before the checks, so a failing one doesn't leave the session open.
+    // Closed before the checks, so one that fails as an `Err` doesn't leave
+    // the session open. A panic inside the block (an `expect`, a helper's
+    // own assert) or the scenario's time limit still skips this, leaving
+    // the session open until the test process ends; no later scenario
+    // uses this conversation.
     crate::browsing::close_session(conversation.id).await.expect("close the browsing session");
     if let Err(why) = outcome {
         panic!("{why}");
