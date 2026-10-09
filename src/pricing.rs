@@ -222,7 +222,24 @@ impl CatalogStore {
     /// Postgres. A fetch that fails or isn't the catalog changes nothing.
     /// A save that fails still leaves the new copy in memory; the next
     /// refresh saves again.
+    /// In a `pricing_refresh` span (SME-137), failed when the refresh is.
     pub async fn refresh(&self, pool: &sqlx::PgPool, url: &str) -> Result<(), String> {
+        let span = tracing::info_span!(
+            "pricing_refresh",
+            otel.status_code = tracing::field::Empty,
+            otel.status_description = tracing::field::Empty,
+        );
+        crate::telemetry::in_span(span.clone(), async move {
+            let result = self.refresh_unspanned(pool, url).await;
+            if let Err(e) = &result {
+                crate::telemetry::mark_error(&span, e);
+            }
+            result
+        })
+        .await
+    }
+
+    async fn refresh_unspanned(&self, pool: &sqlx::PgPool, url: &str) -> Result<(), String> {
         let providers = parse(&fetch(url).await?)?;
         if providers.values().all(|p| p.models.is_empty()) {
             return Err(format!("{url} lists no prices"));
@@ -528,6 +545,18 @@ mod tests {
         let restarted = CatalogStore::new();
         restarted.load_saved(&pool).await.expect("load");
         assert_eq!(restarted.current().map(|c| c.fetched_at), Some(good.fetched_at), "saved copy unchanged");
+    }
+
+    /// SME-137: each refresh is a `pricing_refresh` span, failed when the
+    /// refresh fails, so its warning reaches the trace.
+    #[sqlx::test]
+    async fn test_a_failed_refresh_is_a_failed_span(pool: sqlx::PgPool) {
+        let url = catalog_server(vec![(500, "oops".to_string())]).await;
+        let store = CatalogStore::new();
+        let (result, spans) = crate::telemetry::capture_spans(store.refresh(&pool, &url)).await;
+        assert!(result.is_err());
+        let span = spans.iter().find(|span| span.name == "pricing_refresh").expect("the refresh's span");
+        assert!(matches!(span.status, opentelemetry::trace::Status::Error { .. }), "{:?}", span.status);
     }
 
     #[sqlx::test]
