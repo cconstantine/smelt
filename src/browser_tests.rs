@@ -5292,6 +5292,20 @@ async fn command_pill(page: &chromiumoxide::Page) -> serde_json::Value {
     .unwrap_or(serde_json::Value::Null)
 }
 
+/// SME-144: the terminal titlebar's height, in CSS pixels to a hundredth.
+/// The body below it scrolls, and a titlebar that changes height with the
+/// pill resizes the body, which the terminal's follow takes for the window
+/// resizing (it broke `terminal_follow_after_switch`'s return to the bottom).
+async fn titlebar_height(page: &chromiumoxide::Page) -> f64 {
+    let height: f64 = page
+        .evaluate("document.querySelector('.task-terminal-titlebar').getBoundingClientRect().height")
+        .await
+        .expect("measure the titlebar")
+        .into_value()
+        .expect("a number");
+    (height * 100.0).round() / 100.0
+}
+
 /// Waits for the pill to contain `text` and carry `class`; returns it.
 async fn wait_for_pill(page: &chromiumoxide::Page, text: &str, class: &str, timeout: Duration) -> serde_json::Value {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -5345,6 +5359,7 @@ async fn scenario_terminal_command_indicator(t: &Scenario<'_>) {
     };
     open().await;
     assert!(command_pill(&page).await.is_null(), "a terminal with no command shows no pill");
+    let mut heights = vec![("no pill", titlebar_height(&page).await)];
 
     // Long output, then a pause, then a failure. A subshell: a bare `exit`
     // would end the terminal's own shell.
@@ -5359,17 +5374,20 @@ async fn scenario_terminal_command_indicator(t: &Scenario<'_>) {
         .expect("a bool");
     assert!(overflows, "the output doesn't overflow the terminal body, so the in-view checks measure nothing");
     assert_eq!((pill["viewport"].as_bool(), pill["card"].as_bool()), (Some(true), Some(true)), "{pill}");
+    heights.push(("running", titlebar_height(&page).await));
     page.evaluate("document.querySelector('.task-terminal-body').scrollTop = 0").await.expect("scroll to the top");
     let pill = command_pill(&page).await;
     assert_eq!(pill["viewport"].as_bool(), Some(true), "scrolled to the top, the pill left the viewport: {pill}");
     let pill = wait_for_pill(&page, "exit 3", "task-terminal-command-failed", Duration::from_secs(20)).await;
     assert!(pill["title"].as_str().is_some_and(|t| t.contains("exited with status 3")), "{pill}");
+    heights.push(("exit 3", titlebar_height(&page).await));
     wait_command_finished(pool, terminal).await;
 
     // A command that finishes at once: its start reaches the tab before
     // its finish, so the pill doesn't stick at running.
     run("true", "cmd-true").await;
     wait_for_pill(&page, "exit 0", "task-terminal-command-ok", Duration::from_secs(15)).await;
+    heights.push(("exit 0", titlebar_height(&page).await));
     wait_command_finished(pool, terminal).await;
 
     // Running across a reload, then interrupted.
@@ -5397,6 +5415,11 @@ async fn scenario_terminal_command_indicator(t: &Scenario<'_>) {
     open().await;
     let pill = wait_for_pill(&page, "lost", "task-terminal-command-lost", Duration::from_secs(15)).await;
     assert!(pill["title"].as_str().is_some_and(|t| t.contains("no exit status")), "{pill}");
+    heights.push(("lost", titlebar_height(&page).await));
+    assert!(
+        heights.iter().all(|(_, h)| *h == heights[0].1),
+        "the titlebar changes height with the pill, which resizes the terminal body: {heights:?}"
+    );
 
     // At a phone's width the pill is on screen, inside the side panels'
     // strip.

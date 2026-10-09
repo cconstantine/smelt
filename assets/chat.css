@@ -1334,6 +1334,17 @@ body {
     flex-shrink: 0;
 }
 
+/* Both pills have one fixed height: the glyphs come from fallback fonts
+   with taller line boxes, and a titlebar that grew a pixel with the pill
+   resized the body below it, which the terminal's follow took for the
+   window resizing (SME-144). */
+.task-terminal-command,
+.task-terminal-status {
+    box-sizing: border-box;
+    height: 18px;
+    line-height: 16px;
+}
+
 .task-terminal-command {
     display: inline-flex;
     align-items: center;
@@ -1346,6 +1357,10 @@ body {
     flex-shrink: 0;
     background: #444;
     color: #ddd;
+}
+
+.task-terminal-command-glyph {
+    line-height: 1;
 }
 
 .task-terminal-command-running {
