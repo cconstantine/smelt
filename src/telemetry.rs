@@ -244,12 +244,17 @@ where
         .with_filter(export_filter())
 }
 
-/// What the export layer takes. Targets match by prefix, so `opentelemetry`
-/// covers `opentelemetry_sdk`, `opentelemetry-otlp` and `opentelemetry-http`
-/// (their internal logs), and `hyper` covers `hyper_util`: the exporter's
-/// HTTP client would otherwise trace its own exports.
+/// What the export layer takes: smelt's own spans and events from INFO, and
+/// everyone else's warnings and errors (as events on smelt's spans).
+/// Dependencies' INFO spans stay out: dioxus-signals instruments every
+/// signal it makes, which would be a root trace per signal. Targets match
+/// by prefix, so `opentelemetry` covers `opentelemetry_sdk`,
+/// `opentelemetry-otlp` and `opentelemetry-http` (their internal logs), and
+/// `hyper` covers `hyper_util`: the exporter's own HTTP client would
+/// otherwise trace its exports.
 fn export_filter() -> Targets {
-    Targets::new().with_default(LevelFilter::INFO).with_targets([
+    Targets::new().with_default(LevelFilter::WARN).with_targets([
+        ("smelt", LevelFilter::INFO),
         ("opentelemetry", LevelFilter::OFF),
         ("reqwest", LevelFilter::OFF),
         ("hyper", LevelFilter::OFF),
@@ -508,6 +513,26 @@ mod tests {
         assert!(current_is_none, "the work saw the caller's span");
         let library = spans.iter().find(|span| span.name == "library").expect("the library's span");
         assert_eq!(library.parent_span_id, opentelemetry::trace::SpanId::INVALID, "a root");
+    }
+
+    /// A dependency's own INFO spans (dioxus-signals instruments every
+    /// signal it makes) aren't exported, but its warnings inside smelt's
+    /// spans are.
+    #[tokio::test]
+    async fn test_only_smelts_info_spans_and_everyones_warnings_are_exported() {
+        let ((), spans) = capture_spans(async {
+            tracing::info_span!(target: "dioxus_signals::signal", "new_maybe_sync").in_scope(|| {});
+            in_span(tracing::info_span!("work"), async {
+                tracing::info!(target: "kube_client", "a dependency's chatter");
+                tracing::warn!(target: "kube_client", "a dependency's warning");
+            })
+            .await;
+        })
+        .await;
+        let names: Vec<_> = spans.iter().map(|span| span.name.to_string()).collect();
+        assert_eq!(names, ["work"]);
+        let events: Vec<_> = spans[0].events.iter().map(|event| event.name.to_string()).collect();
+        assert_eq!(events, ["a dependency's warning"]);
     }
 
     #[tokio::test]
