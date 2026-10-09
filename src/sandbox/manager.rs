@@ -2,6 +2,8 @@
 //! start, terminate, stop, teardown, list, and volumes.
 
 use super::*;
+use k8s_openapi::api::core::v1::Event;
+use k8s_openapi::jiff::Timestamp;
 
 /// Creates any volume claim that's missing from this namespace. Every pod
 /// mounts every configured volume, and a pod whose claim doesn't exist
@@ -242,6 +244,162 @@ pub(super) async fn wait_for_running_with_timeout(
     })
     .await;
     waited.map_err(|_| SandboxError::Timeout(last_detail))?
+}
+
+/// The most events `pod_start_report` lists.
+const REPORT_MAX_EVENTS: usize = 5;
+
+/// The most characters of an event's message `pod_start_report` keeps.
+const REPORT_MAX_MESSAGE_CHARS: usize = 200;
+
+/// What a pod that hasn't started is stuck on, for a timed-out wait's
+/// error (SME-132): the stage (its first `False` condition, as
+/// `pod_pending_detail` gives it) and for how long, the pod's age, the
+/// stages it passed, each container's state, and up to 5 of its events,
+/// `Warning`s first, then the newest. `events` is `Err` with why when
+/// they couldn't be listed; the rest is reported anyway.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn pod_start_report(pod: &Pod, events: Result<&[Event], &str>, now: Timestamp) -> String {
+    let created = pod.metadata.creation_timestamp.as_ref().map(|t| t.0);
+    let conditions = pod.status.as_ref().and_then(|s| s.conditions.as_deref()).unwrap_or_default();
+    let stage = match conditions.iter().find(|c| c.status == "False") {
+        Some(stuck) => {
+            let detail = pod_pending_detail(pod).unwrap_or_else(|| stuck.type_.clone());
+            let gloss = stage_gloss(&stuck.type_).map(|g| format!(" ({g})")).unwrap_or_default();
+            let since = stuck.last_transition_time.as_ref().map(|t| format!(" for {}", whole_seconds(t.0, now)));
+            format!("{detail}{gloss}{}", since.unwrap_or_default())
+        }
+        None if conditions.is_empty() => "not scheduled yet".to_string(),
+        None => "no stage false".to_string(),
+    };
+    let mut parts = vec![stage];
+    if let Some(created) = created {
+        parts.push(format!("pod {} old", whole_seconds(created, now)));
+    }
+    let timeline = pod_start_timeline(pod);
+    if !timeline.is_empty() {
+        parts.push(format!("timeline: {timeline}"));
+    }
+    parts.push(format!("containers: {}", container_states(pod)));
+    parts.push(match events {
+        Ok([]) => "events: none".to_string(),
+        Ok(events) => format!("events: {}", describe_events(events)),
+        Err(e) => format!("events unavailable: {e}"),
+    });
+    parts.join("; ")
+}
+
+/// What the kubelet does while one of its pod conditions is `False`.
+fn stage_gloss(condition: &str) -> Option<&'static str> {
+    match condition {
+        "PodReadyToStartContainers" => Some("volumes and sandbox"),
+        "Initialized" => Some("Docker sidecar starting"),
+        "ContainersReady" | "Ready" => Some("sandbox container starting"),
+        _ => None,
+    }
+}
+
+/// `from` to `to` in whole seconds, as "88 s". The API's timestamps are
+/// to the second.
+fn whole_seconds(from: Timestamp, to: Timestamp) -> String {
+    format!("{} s", to.duration_since(from).as_secs())
+}
+
+/// Each condition that went `True`, as an offset from the pod's creation,
+/// in the order they happened: "scheduled +0 s, sandbox ready +1 s".
+pub(super) fn pod_start_timeline(pod: &Pod) -> String {
+    let Some(created) = pod.metadata.creation_timestamp.as_ref().map(|t| t.0) else {
+        return String::new();
+    };
+    let conditions = pod.status.as_ref().and_then(|s| s.conditions.as_deref()).unwrap_or_default();
+    let mut passed: Vec<_> = conditions
+        .iter()
+        .filter(|c| c.status == "True")
+        .filter_map(|c| Some((c.last_transition_time.as_ref()?.0, c.type_.as_str())))
+        .collect();
+    passed.sort_by_key(|(at, _)| *at);
+    passed
+        .iter()
+        .map(|(at, condition)| {
+            let name = match *condition {
+                "PodScheduled" => "scheduled",
+                "PodReadyToStartContainers" => "sandbox ready",
+                "Initialized" => "sidecar started",
+                "ContainersReady" => "containers ready",
+                "Ready" => "ready",
+                other => other,
+            };
+            format!("{name} +{}", whole_seconds(created, *at))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Each of the pod spec's containers, init containers first, with its
+/// state: "docker running, not started, sandbox not created".
+fn container_states(pod: &Pod) -> String {
+    let spec = pod.spec.as_ref();
+    let status = pod.status.as_ref();
+    let init = spec.and_then(|s| s.init_containers.as_deref()).unwrap_or_default();
+    let main = spec.map(|s| s.containers.as_slice()).unwrap_or_default();
+    let statuses = [
+        status.and_then(|s| s.init_container_statuses.as_deref()).unwrap_or_default(),
+        status.and_then(|s| s.container_statuses.as_deref()).unwrap_or_default(),
+    ];
+    init.iter()
+        .chain(main)
+        .map(|container| {
+            let found = statuses.iter().flat_map(|s| s.iter()).find(|s| s.name == container.name);
+            format!("{} {}", container.name, found.map_or_else(|| "not created".to_string(), container_state))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One container's state, as `container_states` writes it.
+fn container_state(status: &k8s_openapi::api::core::v1::ContainerStatus) -> String {
+    let state = status.state.as_ref();
+    if let Some(waiting) = state.and_then(|s| s.waiting.as_ref()) {
+        return format!("waiting ({})", waiting.reason.as_deref().unwrap_or("no reason"));
+    }
+    if state.and_then(|s| s.running.as_ref()).is_some() {
+        return match status.started {
+            Some(false) => "running, not started".to_string(),
+            _ => "running".to_string(),
+        };
+    }
+    if let Some(done) = state.and_then(|s| s.terminated.as_ref()) {
+        return format!("terminated ({}, exit {})", done.reason.as_deref().unwrap_or("no reason"), done.exit_code);
+    }
+    "not created".to_string()
+}
+
+/// Up to `REPORT_MAX_EVENTS` events, `Warning`s first and then the newest,
+/// as "FailedMount (×4): …", each message cut to
+/// `REPORT_MAX_MESSAGE_CHARS`.
+fn describe_events(events: &[Event]) -> String {
+    let last_seen = |e: &Event| {
+        e.last_timestamp
+            .as_ref()
+            .map(|t| t.0)
+            .or_else(|| e.event_time.as_ref().map(|t| t.0))
+            .or_else(|| e.first_timestamp.as_ref().map(|t| t.0))
+    };
+    let mut sorted: Vec<&Event> = events.iter().collect();
+    sorted.sort_by_key(|e| (e.type_.as_deref() != Some("Warning"), std::cmp::Reverse(last_seen(e))));
+    sorted
+        .iter()
+        .take(REPORT_MAX_EVENTS)
+        .map(|e| {
+            let message = e.message.as_deref().unwrap_or("");
+            let mut cut: String = message.chars().take(REPORT_MAX_MESSAGE_CHARS).collect();
+            if cut.len() < message.len() {
+                cut.push('…');
+            }
+            format!("{} (×{}): {cut}", e.reason.as_deref().unwrap_or("no reason"), e.count.unwrap_or(1))
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 pub(super) async fn drain_cleanup_queue(client: kube::Client, mut rx: mpsc::UnboundedReceiver<String>) {
