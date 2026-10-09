@@ -1089,6 +1089,18 @@ fn test_pod_start_report_names_a_pending_pod_with_no_false_stage() {
     assert!(report.starts_with("every stage passed, phase Pending;"), "got {report}");
 }
 
+/// SME-132 review 2: `char::is_control` misses the line and paragraph
+/// separators and the bidi controls, which also break the report's one
+/// line or reorder what's shown; each becomes a space too.
+#[test]
+fn test_pod_start_report_replaces_separators_and_bidi_controls() {
+    let pod = report_pod(&[("Initialized", "False", 0, "", "")], serde_json::json!([]), serde_json::json!([]));
+    let message = "a\u{2028}b\u{2029}c\u{202e}d\u{2066}e\u{200f}f";
+    let events = [report_event("Warning", "Unhealthy", 1, 10, message)];
+    let report = pod_start_report(&pod, Ok(&events), report_now());
+    assert!(report.contains("Unhealthy (×1): a b c d e f"), "got {report:?}");
+}
+
 /// At most 5 events, each message cut to 200 characters, on a char
 /// boundary.
 #[test]

@@ -484,6 +484,14 @@ fn container_state(status: &k8s_openapi::api::core::v1::ContainerStatus) -> Stri
     "not created".to_string()
 }
 
+/// Whether `c` would break the report's one line or reorder what's shown:
+/// a control character, the line and paragraph separators (U+2028,
+/// U+2029), or a bidi control (U+200E/F, U+202A-E, U+2066-9), which
+/// `char::is_control` misses (SME-132 review 2).
+fn breaks_a_line(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
 /// Up to `REPORT_MAX_EVENTS` events, `Warning`s first and then the newest,
 /// as "FailedMount (×4): …", each message cut to
 /// `REPORT_MAX_MESSAGE_CHARS`.
@@ -511,7 +519,7 @@ fn describe_events(events: &[Event]) -> String {
             // review 1).
             let mut cut: String = message
                 .chars()
-                .map(|c| if c.is_control() { ' ' } else { c })
+                .map(|c| if breaks_a_line(c) { ' ' } else { c })
                 .take(REPORT_MAX_MESSAGE_CHARS)
                 .collect();
             if message.chars().nth(REPORT_MAX_MESSAGE_CHARS).is_some() {
