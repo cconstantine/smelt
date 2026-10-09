@@ -3652,6 +3652,12 @@ async fn test_sandbox_futures_stay_small() {
         ("close_if_gone_with", std::mem::size_of_val(&watch::close_if_gone_with(&pool, &client, 1)), 4000),
         ("create_pod", std::mem::size_of_val(&create_pod(&pool, 1, PodLimitOverrides::default())), 15000),
         ("ensure_conversation_pvcs", std::mem::size_of_val(&claims::ensure_conversation_pvcs(&client, 1, &instance)), 6700),
+        // `create_pod` spawns its work, so its own size can't show what
+        // the wait for `Running` holds; these two do (SME-132 review 1).
+        // The wait's bound is tighter than twice its 2760 bytes: its
+        // timed-out report, unboxed, takes it to 4520.
+        ("create_pod_attempt", std::mem::size_of_val(&create_pod_attempt(&pool, 1, PodLimitOverrides::default())), 19000),
+        ("wait_for_running_with_timeout", std::mem::size_of_val(&wait_for_running_with_timeout(&pods_api(&client), "sandbox-1", Duration::from_secs(1))), 3600),
     ];
     for (name, size, bound) in sizes {
         println!("{name}: {size} bytes (bound {bound})");

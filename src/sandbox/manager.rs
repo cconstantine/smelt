@@ -250,7 +250,8 @@ pub(super) async fn wait_for_running_with_timeout(
                 }
                 return Ok(());
             }
-            // Not held across the sleep (see `test_sandbox_futures_stay_small`).
+            // Not needed across the sleep. (Holding it adds nothing today:
+            // its space is shared with the `get` it came from.)
             drop(pod);
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
