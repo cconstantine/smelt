@@ -116,10 +116,10 @@ async fn runtime_in(
         let reason = match std::panic::catch_unwind(build) {
             Ok(Ok(runtime)) => return Ok(runtime),
             Ok(Err(e)) => e.to_string(),
-            Err(panic) => panic_message(panic.as_ref()),
+            Err(panic) => format!("the OS refused its threads: {}", panic_message(panic.as_ref())),
         };
         Err(format!(
-            "couldn't start the shared browser (the OS refused its threads: {reason}); \
+            "couldn't start the shared browser ({reason}); \
              nothing was loaded, and the next call tries again"
         ))
     })
@@ -651,9 +651,17 @@ mod tests {
     #[tokio::test]
     async fn test_a_browser_runtime_that_fails_to_build_fails_only_that_call() {
         static CELL: OnceCell<tokio::runtime::Runtime> = OnceCell::const_new();
-        let failed = runtime_in(&CELL, || Err(std::io::Error::other("no threads"))).await;
+        // What tokio 1.53.1 returns as an `Err`: its driver's setup, e.g.
+        // no file descriptor left for the epoll instance (EMFILE).
+        let failed = runtime_in(&CELL, || Err(std::io::Error::from_raw_os_error(24))).await;
         let error = failed.err().expect("a failed build should be an error");
-        assert!(error.contains("no threads"), "the OS's reason should reach the model: {error}");
+        assert!(
+            error.contains("Too many open files"),
+            "the OS's reason should reach the model: {error}"
+        );
+        // Not a thread refusal, so the error doesn't call it one (round 2's
+        // finding 2).
+        assert!(!error.contains("threads"), "the error shouldn't blame threads: {error}");
         // The same error reaches the browsing tools and the live panel's
         // open, so it doesn't say "fetched" (round 1's finding 2).
         assert!(
