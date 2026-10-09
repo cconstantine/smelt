@@ -794,6 +794,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "markdown_bare_urls", 60, Box::pin(scenario_markdown_bare_urls(&t))).await;
     run_scenario(&t, only, r, k, "markdown_bare_urls_streaming", 60, Box::pin(scenario_markdown_bare_urls_streaming(&t))).await;
     run_scenario(&t, only, r, k, "markdown_link_bidi_isolated", 60, Box::pin(scenario_markdown_link_bidi_isolated(&t))).await;
+    run_scenario(&t, only, r, k, "terminal_command_indicator", 180, Box::pin(scenario_terminal_command_indicator(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -5264,4 +5265,154 @@ async fn scenario_markdown_link_bidi_isolated(t: &Scenario<'_>) {
     for (words, first, last) in &order {
         assert!(first < last, "{words:?} shows reversed: its first character is at x={first}, its last at x={last}");
     }
+}
+
+/// The terminal titlebar's pill, as JSON (null when there's none, or it
+/// can't be read): its text, classes, and whether
+/// it lies inside the viewport, its terminal card and (when there is one)
+/// `.side-panels-row`'s visible box.
+async fn command_pill(page: &chromiumoxide::Page) -> serde_json::Value {
+    page.evaluate(
+        "JSON.stringify((() => { const p = document.querySelector('.task-terminal-titlebar .task-terminal-command'); \
+         if (!p) return null; \
+         const r = p.getBoundingClientRect(); \
+         const inside = (o) => r.top >= o.top - 0.5 && r.bottom <= o.bottom + 0.5 && r.left >= o.left - 0.5 && r.right <= o.right + 0.5; \
+         const card = p.closest('.task-terminal').getBoundingClientRect(); \
+         const row = document.querySelector('.side-panels-row'); \
+         return { text: p.textContent, cls: p.className, \
+           viewport: inside({ top: 0, left: 0, bottom: innerHeight, right: innerWidth }), \
+           card: inside(card), row: row ? inside(row.getBoundingClientRect()) : null, \
+           title: p.getAttribute('title') }; })())",
+    )
+    .await
+    .expect("read the command pill")
+    .into_value::<String>()
+    .ok()
+    .and_then(|json| serde_json::from_str(&json).ok())
+    .unwrap_or(serde_json::Value::Null)
+}
+
+/// Waits for the pill to contain `text` and carry `class`; returns it.
+async fn wait_for_pill(page: &chromiumoxide::Page, text: &str, class: &str, timeout: Duration) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let pill = command_pill(page).await;
+        if pill["text"].as_str().is_some_and(|t| t.contains(text)) && pill["cls"].as_str().is_some_and(|c| c.contains(class)) {
+            return pill;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the pill never read {text:?} ({class}); last: {pill}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// SME-144: each terminal's titlebar shows its last command's status in a
+/// pill that stays in view while the output scrolls, live and after a
+/// reload, at laptop and phone widths.
+async fn scenario_terminal_command_indicator(t: &Scenario<'_>) {
+    let pool = t.pool;
+    let conversation = t.conversation().await;
+    sandbox::create_pod(pool, conversation.id, Default::default()).await.expect("create_pod");
+    let terminal = sandbox::create_terminal(pool, conversation.id).await.expect("create_terminal");
+    let run = |command: &'static str, label: &'static str| {
+        let command_id = unique_id(label);
+        async move {
+            anthropic::tools::execute(
+                pool,
+                conversation.id,
+                &command_id,
+                "run_terminal_command",
+                &serde_json::json!({"terminal_id": terminal, "command": command}),
+            )
+            .await
+            .expect("run_terminal_command");
+            command_id
+        }
+    };
+
+    let page = t.tab("about:blank").await;
+    page.execute(
+        chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(1400, 900, 1.0, false),
+    )
+    .await
+    .expect("set the window size");
+    let open = || async {
+        page.goto(t.url(&format!("conversation/{}", conversation.id))).await.expect("open the conversation");
+        wait_for_live_client(&page, conversation.id).await;
+        assert!(
+            wait_for_text(&page, &format!("terminal {terminal}"), Duration::from_secs(15)).await,
+            "the terminal card should render"
+        );
+    };
+    open().await;
+    assert!(command_pill(&page).await.is_null(), "a terminal with no command shows no pill");
+
+    // Long output, then a pause, then a failure. A subshell: a bare `exit`
+    // would end the terminal's own shell.
+    run("for i in $(seq -w 1 200); do echo indicator-$i; done; sleep 6; (exit 3)", "cmd-long").await;
+    assert!(wait_for_text(&page, "indicator-200", Duration::from_secs(30)).await, "the output should stream in");
+    let pill = wait_for_pill(&page, "running", "task-terminal-command-running", Duration::from_secs(5)).await;
+    let overflows: bool = page
+        .evaluate("(() => { const b = document.querySelector('.task-terminal-body'); return b.scrollHeight > b.clientHeight + 40; })()")
+        .await
+        .expect("measure the body")
+        .into_value()
+        .expect("a bool");
+    assert!(overflows, "the output doesn't overflow the terminal body, so the in-view checks measure nothing");
+    assert_eq!((pill["viewport"].as_bool(), pill["card"].as_bool()), (Some(true), Some(true)), "{pill}");
+    page.evaluate("document.querySelector('.task-terminal-body').scrollTop = 0").await.expect("scroll to the top");
+    let pill = command_pill(&page).await;
+    assert_eq!(pill["viewport"].as_bool(), Some(true), "scrolled to the top, the pill left the viewport: {pill}");
+    let pill = wait_for_pill(&page, "exit 3", "task-terminal-command-failed", Duration::from_secs(20)).await;
+    assert!(pill["title"].as_str().is_some_and(|t| t.contains("exited with status 3")), "{pill}");
+    wait_command_finished(pool, terminal).await;
+
+    // A command that finishes at once: its start reaches the tab before
+    // its finish, so the pill doesn't stick at running.
+    run("true", "cmd-true").await;
+    wait_for_pill(&page, "exit 0", "task-terminal-command-ok", Duration::from_secs(15)).await;
+    wait_command_finished(pool, terminal).await;
+
+    // Running across a reload, then interrupted.
+    let sleeping = run("sleep 30", "cmd-sleep").await;
+    wait_for_pill(&page, "running", "task-terminal-command-running", Duration::from_secs(15)).await;
+    open().await;
+    wait_for_pill(&page, "running", "task-terminal-command-running", Duration::from_secs(15)).await;
+    anthropic::tools::execute(
+        pool,
+        conversation.id,
+        &unique_id("signal"),
+        "send_signal",
+        &serde_json::json!({"command_id": sleeping, "signal": "INT"}),
+    )
+    .await
+    .expect("send_signal");
+    let pill = wait_for_pill(&page, "exit", "task-terminal-command-failed", Duration::from_secs(15)).await;
+    assert!(!pill["text"].as_str().unwrap_or_default().contains("exit 0"), "an interrupted command exited 0: {pill}");
+    wait_command_finished(pool, terminal).await;
+
+    // A lost command, seen after a reload.
+    let lost = unique_id("cmd-lost");
+    db::create_terminal_command(pool, conversation.id, terminal, &lost, "make").await.expect("a command row");
+    db::mark_terminal_command_lost(pool, &lost).await.expect("mark it lost");
+    open().await;
+    let pill = wait_for_pill(&page, "lost", "task-terminal-command-lost", Duration::from_secs(15)).await;
+    assert!(pill["title"].as_str().is_some_and(|t| t.contains("no exit status")), "{pill}");
+
+    // At a phone's width the pill is on screen, inside the side panels'
+    // strip.
+    page.execute(
+        chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(390, 844, 2.0, true),
+    )
+    .await
+    .expect("emulate a phone");
+    open().await;
+    let pill = wait_for_pill(&page, "lost", "task-terminal-command-lost", Duration::from_secs(15)).await;
+    assert_eq!(
+        (pill["viewport"].as_bool(), pill["card"].as_bool(), pill["row"].as_bool()),
+        (Some(true), Some(true), Some(true)),
+        "at a phone's width: {pill}"
+    );
+
+    let _ = sandbox::terminate_terminal(pool, terminal).await;
+    let _ = sandbox::terminate_pod(pool, conversation.id).await;
 }

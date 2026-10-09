@@ -38,6 +38,86 @@ pub(in super::super) fn repo_detail(repo: &RepoSummary) -> String {
     }
 }
 
+/// What a terminal's titlebar says about its most recent command
+/// (SME-144): the titlebar sits outside the scrolling body, so this stays
+/// in view however much the command prints.
+#[derive(Clone, Debug, PartialEq)]
+pub(in super::super) enum CommandIndicator {
+    /// No command yet: no pill.
+    None,
+    Running,
+    Exited(i32),
+    /// The sandbox lost track of it: no exit status.
+    Lost,
+    /// A status the panel doesn't know, or a finish with no code.
+    Other(String),
+}
+
+/// The indicator for `terminal`'s last command.
+pub(in super::super) fn latest_command_indicator(terminal: &SandboxTerminalPanelEntry) -> CommandIndicator {
+    let Some(last) = terminal.commands.last() else {
+        return CommandIndicator::None;
+    };
+    match (last.status.as_str(), last.exit_code) {
+        ("running", _) => CommandIndicator::Running,
+        ("finished", Some(code)) => CommandIndicator::Exited(code),
+        ("lost", _) => CommandIndicator::Lost,
+        (other, _) => CommandIndicator::Other(other.to_string()),
+    }
+}
+
+impl CommandIndicator {
+    /// The pill's text: the word carries the meaning, never the colour
+    /// alone.
+    pub(in super::super) fn label(&self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::Running => "running".to_string(),
+            Self::Exited(code) => format!("exit {code}"),
+            Self::Lost => "lost".to_string(),
+            Self::Other(status) => status.clone(),
+        }
+    }
+
+    /// A glyph shown before the label, hidden from screen readers.
+    pub(in super::super) fn glyph(&self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Running => "\u{25cf}",
+            Self::Exited(0) => "\u{2713}",
+            Self::Exited(_) => "\u{2717}",
+            Self::Lost => "\u{26a0}",
+            Self::Other(_) => "\u{2022}",
+        }
+    }
+
+    /// The pill's classes.
+    pub(in super::super) fn class(&self) -> &'static str {
+        match self {
+            Self::None => "task-terminal-command",
+            Self::Running => "task-terminal-command task-terminal-command-running",
+            Self::Exited(0) => "task-terminal-command task-terminal-command-ok",
+            Self::Exited(_) => "task-terminal-command task-terminal-command-failed",
+            Self::Lost => "task-terminal-command task-terminal-command-lost",
+            Self::Other(_) => "task-terminal-command task-terminal-command-other",
+        }
+    }
+
+    /// The pill's tooltip and accessible name.
+    pub(in super::super) fn title(&self, command: &str) -> String {
+        let state = match self {
+            Self::None => return String::new(),
+            Self::Running => "running".to_string(),
+            Self::Exited(code) => format!("exited with status {code}"),
+            Self::Lost => {
+                "lost: the sandbox lost track of it (the send failed or the pod restarted); no exit status".to_string()
+            }
+            Self::Other(status) => status.clone(),
+        };
+        format!("Last command: {command} \u{b7} {state}")
+    }
+}
+
 /// The sandbox panel: the conversation's repos, its pod with a Stop
 /// button and preview links, and each terminal's commands and output.
 /// Stopping a pod is the panel's (`on_stop_pod`).
@@ -127,7 +207,26 @@ pub(in super::super) fn SandboxPanel(
                                         span { class: "dot dot-green" }
                                     }
                                     span { class: "task-terminal-id", "terminal {terminal.terminal_id}" }
-                                    span { class: "task-terminal-status", "{terminal.status}" }
+                                    span { class: "task-terminal-pills",
+                                        {
+                                            let indicator = latest_command_indicator(&terminal);
+                                            let command = terminal.commands.last().map(|c| c.command.clone()).unwrap_or_default();
+                                            let title = indicator.title(&command);
+                                            rsx! {
+                                                if indicator != CommandIndicator::None {
+                                                    span {
+                                                        class: "{indicator.class()}",
+                                                        title: "{title}",
+                                                        aria_label: "{title}",
+                                                        role: "status",
+                                                        span { class: "task-terminal-command-glyph", aria_hidden: "true", "{indicator.glyph()}" }
+                                                        "{indicator.label()}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        span { class: "task-terminal-status", "{terminal.status}" }
+                                    }
                                 }
                                 TerminalBody { terminal }
                             }
