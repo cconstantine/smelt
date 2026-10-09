@@ -250,6 +250,13 @@ async fn capture<F: std::future::Future>(
             Ok(())
         }
     }
+    // tracing-core asks the current thread's dispatcher, not the list, while
+    // only one dispatcher is registered: with this capture's the only one,
+    // a callsite another test's thread hit first was cached as "never" (see
+    // `test_a_callsite_first_hit_on_another_thread_is_still_captured`). A
+    // second dispatcher kept for the process keeps the list in use.
+    static KEEP_THE_DISPATCHER_LIST: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    KEEP_THE_DISPATCHER_LIST.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
     let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder().with_simple_exporter(exporter.clone()).build();
     let console = console.map(|buffer| {
@@ -414,6 +421,26 @@ mod tests {
         .await;
         let names: Vec<_> = spans.iter().map(|span| span.name.to_string()).collect();
         assert_eq!(names, ["work"]);
+    }
+
+    /// tracing-core keeps one dispatcher list for the whole process, and
+    /// with only one registered it asks the *current thread's* dispatcher
+    /// instead. With a capture's subscriber the only one registered, a
+    /// callsite another test's thread hit first was cached as "never", and
+    /// a capture missed its span (the chat-span test, in a full run). A
+    /// span first made on another thread is still captured here.
+    #[tokio::test]
+    async fn test_a_callsite_first_hit_on_another_thread_is_still_captured() {
+        fn fresh() -> Span {
+            tracing::info_span!("first_hit_elsewhere")
+        }
+        let ((), spans) = capture_spans(async {
+            std::thread::spawn(|| drop(fresh())).join().expect("the other thread");
+            in_span(fresh(), async {}).await;
+        })
+        .await;
+        let names: Vec<_> = spans.iter().map(|span| span.name.to_string()).collect();
+        assert_eq!(names, ["first_hit_elsewhere"]);
     }
 
     #[tokio::test]
