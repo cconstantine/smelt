@@ -86,10 +86,12 @@ printf 'RUST_LOG=%s\nNO_COLOR=%s\n' "${RUST_LOG-<unset>}" "${NO_COLOR-<unset>}" 
 mv "$DX_ENV.tmp" "$DX_ENV"
 exec sleep 600
 EOF
-# sqlx: records each call, one per line.
+# sqlx: records each call, one per line, and to $ORDER when set (with the
+# cleanup stub's lines, so a case can check their order).
 cat >"$dir/bin/sqlx" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >>"$SQLX_CALLS"
+[ -n "${ORDER:-}" ] && echo "sqlx $*" >>"$ORDER"
 [ -n "${CALLS:-}" ] && echo "sqlx $* $(lock-state)" >>"$CALLS"
 exit 0
 EOF
@@ -104,7 +106,19 @@ cat >"$dir/bin/import" <<'EOF'
 [ -n "${CALLS:-}" ] && echo "import $(lock-state)" >>"$CALLS"
 exit 0
 EOF
-chmod +x "$dir/bin/lock-state" "$dir/bin/cargo" "$dir/bin/dx" "$dir/bin/sqlx" "$dir/bin/curl" "$dir/bin/import"
+# The instance cleanup (SME-129): records each call with the KUBECONFIG it
+# got, and to $ORDER when set. CLEANUP_FAIL makes it fail (a guard, a
+# timeout, an unreachable cluster); CLEANUP_SLEEP makes it slow, so a case
+# can hold the scratch lock while it runs.
+cat >"$dir/bin/cleanup" <<'EOF'
+#!/usr/bin/env bash
+printf 'KUBECONFIG=%s %s\n' "${KUBECONFIG-<unset>}" "$*" >>"$CLEANUP_CALLS"
+[ -n "${ORDER:-}" ] && echo "cleanup $*" >>"$ORDER"
+[ -n "${CLEANUP_SLEEP:-}" ] && sleep "$CLEANUP_SLEEP"
+[ -n "${CLEANUP_FAIL:-}" ] && exit 3
+exit 0
+EOF
+chmod +x "$dir/bin/lock-state" "$dir/bin/cargo" "$dir/bin/dx" "$dir/bin/sqlx" "$dir/bin/curl" "$dir/bin/import" "$dir/bin/cleanup"
 
 # The check worktree: a clone sharing this repo's objects, so it can check
 # out any commit here without registering a worktree. Reused across runs.
@@ -113,8 +127,15 @@ worktree=$dir/worktree
 
 export SQLX_CALLS=$dir/sqlx-calls
 export DX_ENV=$dir/dx-env
+# The cleanup stub's calls, and the order of the cleanup and sqlx stubs'
+# lines (SME-129).
+export CLEANUP_CALLS=$dir/cleanup-calls
+export ORDER=$dir/order
+: >"$CLEANUP_CALLS"
+: >"$ORDER"
 pid_file=$worktree/.check-server.pid
 scratch_file=$worktree/.check-server.scratch-db
+kubeconfig_file=$worktree/.check-server.kubeconfig
 log_file=$worktree/.check-server.log
 # Extra VAR=VALUE settings for check_server's environment, set per case.
 extra_env=()
@@ -122,7 +143,8 @@ extra_env=()
 # the results.
 check_server() {
     env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR PATH="$dir/bin:$PATH" CHECK_WORKTREE="$worktree" \
-        SANDBOX_IMAGE_IMPORT="$dir/bin/import" DATABASE_URL=postgres://u@localhost/smelt_dev \
+        SANDBOX_IMAGE_IMPORT="$dir/bin/import" SANDBOX_INSTANCE_CLEANUP="$dir/bin/cleanup" \
+        DATABASE_URL=postgres://u@localhost/smelt_dev \
         "${extra_env[@]}" scripts/check-server "$@" 2>&1
 }
 scratch_url=postgres://u@localhost/smelt_scratch_worktree
@@ -546,7 +568,7 @@ grep -q " locked$" "$CALLS" && fail "cluster-test took the lock after a failing 
 unset CALLS
 
 cs_env=(env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import"
-    DATABASE_URL=postgres://u@localhost/smelt_dev)
+    SANDBOX_INSTANCE_CLEANUP="$dir/bin/cleanup" DATABASE_URL=postgres://u@localhost/smelt_dev)
 
 # 10. check-server takes no cluster lock, and the server it starts never
 # holds it, even when start runs under an old outer flock (SME-100).
@@ -607,6 +629,95 @@ check_server stop >/dev/null
 # The usage text is the whole header.
 header_end=$(awk '/^set -euo pipefail/ { print prev; exit } { prev = $0 }' scripts/check-server | sed 's/^# \{0,1\}//')
 [ "$(scripts/check-server 2>&1 | tail -n 1)" = "$header_end" ] || fail "check-server's usage stops before the header's last line: $header_end"
+
+# The scratch cleanup (SME-129). stop runs the tool on the scratch database's
+# URL before it drops it — the database's own `smelt_instance` row is the last
+# record of the instance its server labelled its pods and claims with — and
+# drops it only once the tool succeeded; a failure keeps the database for a
+# later stop; a start over a leftover cleans it up before recreating it; and
+# the tool gets the KUBECONFIG the server was started with.
+: >"$ORDER"
+: >"$CLEANUP_CALLS"
+extra_env=(KUBECONFIG=/the/servers/cluster)
+if ! out=$(CHECK_SCRATCH_DB=1 check_server start HEAD); then
+    fail "start for the cleanup cases: $out"
+fi
+extra_env=()
+cleanup_line="cleanup --database-url $scratch_url --dev-database-url postgres://u@localhost/smelt_dev"
+stop_order="$cleanup_line
+sqlx database drop -y --database-url $scratch_url"
+[ "$(head -n 1 "$ORDER")" = "$cleanup_line" ] ||
+    fail "start dropped the leftover before cleaning it: $(cat "$ORDER")"
+grep -qF "KUBECONFIG=/the/servers/cluster" "$CLEANUP_CALLS" ||
+    fail "the cleanup didn't get the server's KUBECONFIG: $(cat "$CLEANUP_CALLS")"
+
+# stop a running server: the cleanup first, then the drop.
+: >"$ORDER"
+out=$(check_server stop)
+[ "$(cat "$ORDER")" = "$stop_order" ] || fail "stop's cleanup then drop: $(cat "$ORDER")"
+
+# A cleanup that fails keeps the database and its file, and stop exits 1.
+dead=$(bash -c 'echo $$')
+echo "$dead" >"$pid_file"
+echo "$scratch_url" >"$scratch_file"
+: >"$ORDER"
+extra_env=(CLEANUP_FAIL=1)
+out=$(check_server stop)
+rc=$?
+extra_env=()
+[ "$rc" = 1 ] || fail "stop with a failed cleanup exited $rc: $out"
+grep -q "weren't all deleted" <<<"$out" || fail "a failed cleanup's message: $out"
+[ "$(cat "$scratch_file" 2>/dev/null)" = "$scratch_url" ] || fail "a failed cleanup emptied the scratch file"
+grep -q "^sqlx " "$ORDER" && fail "a failed cleanup dropped the database: $(cat "$ORDER")"
+
+# The retry cleans up, drops, and empties the files.
+: >"$ORDER"
+check_server stop >/dev/null || fail "stop after a failed cleanup"
+[ "$(cat "$ORDER")" = "$stop_order" ] || fail "the retry's cleanup then drop: $(cat "$ORDER")"
+[ -e "$scratch_file" ] && [ ! -s "$scratch_file" ] || fail "the retry left the scratch file: $(cat "$scratch_file")"
+
+# A stop with no server running (crashed, killed) cleans up before dropping
+# too.
+echo "$dead" >"$pid_file"
+echo "$scratch_url" >"$scratch_file"
+: >"$ORDER"
+check_server stop >/dev/null
+[ "$(cat "$ORDER")" = "$stop_order" ] || fail "the no-server cleanup then drop: $(cat "$ORDER")"
+
+# The recorded KUBECONFIG wins over the environment at stop time: the tool
+# must talk to the cluster the server used, not whatever is set now.
+extra_env=(KUBECONFIG=/the/servers/cluster)
+CHECK_SCRATCH_DB=1 check_server start HEAD >/dev/null || fail "start for the KUBECONFIG case"
+extra_env=(KUBECONFIG=/another/cluster)
+: >"$CLEANUP_CALLS"
+check_server stop >/dev/null
+extra_env=()
+grep -q "^KUBECONFIG=/the/servers/cluster " "$CLEANUP_CALLS" ||
+    fail "stop's cleanup didn't use the recorded KUBECONFIG: $(cat "$CLEANUP_CALLS")"
+grep -q "KUBECONFIG=/another/cluster" "$CLEANUP_CALLS" &&
+    fail "stop's cleanup used the environment's KUBECONFIG: $(cat "$CLEANUP_CALLS")"
+
+# The scratch lock: a stop holds it through its cleanup, so a start of the
+# same database waits for it and says so.
+scratch_lock=$SMELT_LOCK_DIR/smelt-check-scratch-smelt_scratch_worktree.lock
+scratch_is_free() { flock -n "$scratch_lock" true; }
+CHECK_SCRATCH_DB=1 check_server start HEAD >/dev/null || fail "start for the scratch lock"
+extra_env=(CLEANUP_SLEEP=3)
+check_server stop >/dev/null 2>&1 &
+stopper=$!
+extra_env=()
+held=""
+for _ in $(seq 1 100); do
+    scratch_is_free || { held=1; break; }
+    sleep 0.1
+done
+[ -n "$held" ] || fail "the stop's cleanup never took the scratch lock"
+out=$(timeout 2 "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_SCRATCH_DB=1 scripts/check-server start HEAD 2>&1)
+rc=$?
+[ "$rc" = 124 ] || fail "a start didn't wait for the scratch lock (exit $rc): $out"
+grep -qF "waiting for the scratch lock" <<<"$out" || fail "the waiting start's line: $out"
+wait "$stopper" || fail "the stop holding the scratch lock failed"
+scratch_is_free || fail "the scratch lock is still held after the stop ended"
 
 # 12. clean-test-namespace.sh deletes everything in smelt-park-test, a test
 # run's pods too, so it takes the cluster lock: with a python3 stub, which
