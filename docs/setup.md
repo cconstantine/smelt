@@ -197,7 +197,7 @@ smelt's spans (each request, turn, model call, tool call, MCP call and sandbox s
 docker compose up -d tempo grafana   # neither starts with the rest of the stack
 ```
 
-- **Grafana** is at http://localhost:8182 (localhost only; anonymous Admin, no login), with Tempo as its data source. Explore → Tempo → TraceQL, e.g. `{ name = "turn" }` for turns, `{ span.conversation_id = 12 }` for one conversation's, `{ status = error }` for failures.
+- **Grafana** is at http://localhost:8182, with Tempo as its data source. There's no login: you're an anonymous Editor, which can explore but not add data sources. It listens on localhost only and answers only to the name `localhost` (any other Host is redirected there), so another site's page can't reach it by DNS rebinding. Explore → Tempo → TraceQL, e.g. `{ name = "turn" }` for turns, `{ span.conversation_id = 12 }` for one conversation's, `{ status = error }` for failures.
 - **Tempo** has no host port; smelt reaches it as `tempo:4318`, which the `smelt` service's `OTEL_EXPORTER_OTLP_ENDPOINT` names. Traces are kept a week, in the `tempo-data` volume (`docker/tempo/tempo.yaml`).
 - **Check servers** in the container export too (they inherit the variable). Tell them from the dev server by the resource's `smelt.database`: the dev server's is `smelt`, a scratch check server's `smelt_scratch_…`, e.g. `{ resource.smelt.database = "smelt" }`. (`smelt.port` is the server's own port; under `dx serve` that's one `dx` picks, not 8080.)
 - **Spans export in batches**, about every 5 s, so a trace shows up a few seconds after its turn ends. A span still open when smelt stops (a running turn) is lost.
