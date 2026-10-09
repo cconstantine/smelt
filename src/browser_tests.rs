@@ -5270,7 +5270,8 @@ async fn scenario_markdown_link_bidi_isolated(t: &Scenario<'_>) {
 /// The terminal titlebar's pill, as JSON (null when there's none, or it
 /// can't be read): its text, classes, and whether
 /// it lies inside the viewport, its terminal card and (when there is one)
-/// `.side-panels-row`'s visible box.
+/// `.side-panels-row`'s visible box, and whether the connection pill beside
+/// it still shows inside the card.
 async fn command_pill(page: &chromiumoxide::Page) -> serde_json::Value {
     page.evaluate(
         "JSON.stringify((() => { const p = document.querySelector('.task-terminal-titlebar .task-terminal-command'); \
@@ -5279,10 +5280,14 @@ async fn command_pill(page: &chromiumoxide::Page) -> serde_json::Value {
          const inside = (o) => r.top >= o.top - 0.5 && r.bottom <= o.bottom + 0.5 && r.left >= o.left - 0.5 && r.right <= o.right + 0.5; \
          const card = p.closest('.task-terminal').getBoundingClientRect(); \
          const row = document.querySelector('.side-panels-row'); \
+         const status = p.closest('.task-terminal-titlebar').querySelector('.task-terminal-status').getBoundingClientRect(); \
          return { text: p.textContent, cls: p.className, \
            viewport: inside({ top: 0, left: 0, bottom: innerHeight, right: innerWidth }), \
            card: inside(card), row: row ? inside(row.getBoundingClientRect()) : null, \
-           title: p.getAttribute('title') }; })())",
+           title: p.getAttribute('title'), \
+           status_in_card: status.left >= card.left - 0.5 && status.right <= card.right + 0.5, \
+           layout: [card.left, card.right].concat(Array.from(p.closest('.task-terminal-titlebar').querySelectorAll('*')) \
+             .map(e => e.className + ':' + Math.round(e.getBoundingClientRect().left) + '-' + Math.round(e.getBoundingClientRect().right))) }; })())",
     )
     .await
     .expect("read the command pill")
@@ -5419,6 +5424,31 @@ async fn scenario_terminal_command_indicator(t: &Scenario<'_>) {
     assert!(
         heights.iter().all(|(_, h)| *h == heights[0].1),
         "the titlebar changes height with the pill, which resizes the terminal body: {heights:?}"
+    );
+
+    // Between 720 and 1024px the side panels sit in a row, and a todo list
+    // takes a fixed width beside the sandbox: a narrow titlebar keeps both
+    // pills inside the card (SME-144 review 1).
+    anthropic::tools::execute(
+        pool,
+        conversation.id,
+        &unique_id("todos"),
+        "todowrite",
+        &serde_json::json!({"todos": [{"content": "narrow the window", "status": "pending"}]}),
+    )
+    .await
+    .expect("todowrite");
+    page.execute(
+        chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(740, 900, 1.0, false),
+    )
+    .await
+    .expect("set a middle width");
+    open().await;
+    let pill = wait_for_pill(&page, "lost", "task-terminal-command-lost", Duration::from_secs(15)).await;
+    assert_eq!(
+        (pill["card"].as_bool(), pill["status_in_card"].as_bool()),
+        (Some(true), Some(true)),
+        "at 740px beside a todo list, a pill falls outside the terminal's card: {pill}"
     );
 
     // At a phone's width the pill is on screen, inside the side panels'

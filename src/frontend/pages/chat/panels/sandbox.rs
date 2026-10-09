@@ -220,26 +220,24 @@ pub(in super::super) fn SandboxPanel(
                                         span { class: "dot dot-green" }
                                     }
                                     span { class: "task-terminal-id", "terminal {terminal.terminal_id}" }
-                                    span { class: "task-terminal-pills",
-                                        {
-                                            let indicator = latest_command_indicator(&terminal);
-                                            let command = terminal.commands.last().map(|c| c.command.clone()).unwrap_or_default();
-                                            let title = indicator.title(&command);
-                                            rsx! {
-                                                if indicator != CommandIndicator::None {
-                                                    span {
-                                                        class: "{indicator.class()}",
-                                                        title: "{title}",
-                                                        aria_label: "{title}",
-                                                        role: "status",
-                                                        span { class: "task-terminal-command-glyph", aria_hidden: "true", "{indicator.glyph()}" }
-                                                        "{indicator.label()}"
-                                                    }
+                                    {
+                                        let indicator = latest_command_indicator(&terminal);
+                                        let command = terminal.commands.last().map(|c| c.command.clone()).unwrap_or_default();
+                                        let title = indicator.title(&command);
+                                        rsx! {
+                                            if indicator != CommandIndicator::None {
+                                                span {
+                                                    class: "{indicator.class()}",
+                                                    title: "{title}",
+                                                    aria_label: "{title}",
+                                                    role: "status",
+                                                    span { class: "task-terminal-command-glyph", aria_hidden: "true", "{indicator.glyph()}" }
+                                                    "{indicator.label()}"
                                                 }
                                             }
                                         }
-                                        span { class: "task-terminal-status", "{terminal.status}" }
                                     }
+                                    span { class: "task-terminal-status", "{terminal.status}" }
                                 }
                                 TerminalBody { terminal }
                             }
