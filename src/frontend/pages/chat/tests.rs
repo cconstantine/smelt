@@ -1230,6 +1230,129 @@ fn test_apply_sandbox_command_update_finish_sets_status_and_exit_code_on_the_mos
     assert_eq!(terminals[0].commands[0].exit_code, Some(0));
 }
 
+/// Two commands in terminal 10, `cmd-old` (with the given status and
+/// code) then `cmd-new` (running).
+fn two_commands(old_status: &str, old_code: Option<i32>) -> Vec<SandboxTerminalPanelEntry> {
+    let mut terminals = vec![test_sandbox_terminal_entry(10, 1)];
+    let mut old = test_sandbox_command_entry("cmd-old", "make");
+    old.status = old_status.to_string();
+    old.exit_code = old_code;
+    terminals[0].commands.push(old);
+    terminals[0].commands.push(test_sandbox_command_entry("cmd-new", "sleep 30"));
+    terminals
+}
+
+fn finish(terminals: &mut Vec<SandboxTerminalPanelEntry>, command_id: &str, status: &str, code: Option<i32>) {
+    apply_sandbox_command_update(terminals, 10, command_id.into(), None, status.into(), code, None, None, None);
+}
+
+fn statuses(terminals: &[SandboxTerminalPanelEntry]) -> Vec<(String, String, Option<i32>)> {
+    terminals[0].commands.iter().map(|c| (c.command_id.clone(), c.status.clone(), c.exit_code)).collect()
+}
+
+/// SME-144: a finish for an older command (published after the model
+/// already started the next one) lands on that command, not on the
+/// newest, which keeps running.
+#[test]
+fn test_a_finish_for_an_older_command_updates_only_that_command() {
+    let mut terminals = two_commands("running", None);
+    finish(&mut terminals, "cmd-old", "finished", Some(2));
+    assert_eq!(
+        statuses(&terminals),
+        vec![
+            ("cmd-old".to_string(), "finished".to_string(), Some(2)),
+            ("cmd-new".to_string(), "running".to_string(), None),
+        ]
+    );
+}
+
+#[test]
+fn test_a_finish_for_a_command_the_tab_never_saw_changes_nothing() {
+    let mut terminals = two_commands("finished", Some(0));
+    let before = statuses(&terminals);
+    finish(&mut terminals, "cmd-unknown", "finished", Some(1));
+    assert_eq!(statuses(&terminals), before);
+}
+
+#[test]
+fn test_a_lost_update_marks_its_command_lost_with_no_code() {
+    let mut terminals = two_commands("finished", Some(0));
+    finish(&mut terminals, "cmd-new", "lost", None);
+    assert_eq!(statuses(&terminals)[1], ("cmd-new".to_string(), "lost".to_string(), None));
+}
+
+#[test]
+fn test_a_repeated_finish_is_idempotent() {
+    let mut terminals = two_commands("finished", Some(0));
+    finish(&mut terminals, "cmd-new", "finished", Some(4));
+    finish(&mut terminals, "cmd-new", "finished", Some(4));
+    assert_eq!(statuses(&terminals)[1], ("cmd-new".to_string(), "finished".to_string(), Some(4)));
+}
+
+/// A reconnect replays a line from before the snapshot after the snapshot
+/// already says the command finished: the line mustn't flip it back to
+/// running.
+#[test]
+fn test_a_buffered_line_for_a_finished_command_keeps_it_finished() {
+    let mut terminals = two_commands("finished", Some(0));
+    terminals[0].commands[1].status = "finished".into();
+    terminals[0].commands[1].exit_code = Some(3);
+    terminals[0].commands[1].output =
+        vec![SandboxOutputLinePanelEntry { stream: "stdout".into(), data: "one".into(), seq: Some(1) }];
+    apply_sandbox_command_update(&mut terminals, 10, "cmd-new".into(), None, "running".into(), None, Some("stdout".into()), Some("one".into()), Some(1));
+    assert_eq!(statuses(&terminals)[1], ("cmd-new".to_string(), "finished".to_string(), Some(3)));
+    assert_eq!(terminals[0].commands[1].output.len(), 1, "the replayed line was added twice");
+}
+
+/// A line for an older command goes to that command.
+#[test]
+fn test_a_line_for_an_older_command_goes_to_that_command() {
+    let mut terminals = two_commands("running", None);
+    apply_sandbox_command_update(&mut terminals, 10, "cmd-old".into(), None, "running".into(), None, Some("stdout".into()), Some("late".into()), Some(9));
+    assert_eq!(terminals[0].commands[0].output.len(), 1);
+    assert!(terminals[0].commands[1].output.is_empty(), "the old command's line went to the new one");
+}
+
+/// A replayed start for a command the snapshot already has finished
+/// leaves it finished.
+#[test]
+fn test_a_replayed_start_keeps_the_snapshots_finished_status() {
+    let mut terminals = two_commands("finished", Some(0));
+    terminals[0].commands[1].status = "finished".into();
+    terminals[0].commands[1].exit_code = Some(1);
+    apply_sandbox_command_update(&mut terminals, 10, "cmd-new".into(), Some("sleep 30".into()), "running".into(), None, None, None, None);
+    assert_eq!(statuses(&terminals)[1], ("cmd-new".to_string(), "finished".to_string(), Some(1)));
+}
+
+/// A tab that shows a command running takes the reconnect's word that it
+/// finished.
+#[test]
+fn test_a_snapshot_finishes_a_command_the_tab_shows_running() {
+    let mut pods = Vec::new();
+    let mut terminals = two_commands("finished", Some(0));
+    let snapshot = SandboxSnapshot {
+        pods: vec![SandboxPodSummary {
+            pod_id: 1,
+            status: "Running".to_string(),
+            terminals: vec![SandboxTerminalSummary {
+                terminal_id: 10,
+                pod_id: 1,
+                status: "connected".to_string(),
+                commands: vec![SandboxCommandSummary {
+                    command_id: "cmd-new".to_string(),
+                    command: "sleep 30".to_string(),
+                    status: "finished".to_string(),
+                    exit_code: Some(1),
+                    output: Vec::new(),
+                }],
+            }],
+            previews: Vec::new(),
+        }],
+    };
+    merge_sandbox_snapshot(&mut pods, &mut terminals, snapshot);
+    assert_eq!(statuses(&terminals), vec![("cmd-new".to_string(), "finished".to_string(), Some(1))]);
+}
+
 #[test]
 fn test_apply_sandbox_command_update_without_command_and_no_history_yet_is_a_no_op() {
     let mut terminals = vec![test_sandbox_terminal_entry(10, 1)];
@@ -1886,4 +2009,91 @@ fn test_reply_parts_a_cut_off_or_stop_after_tool_results_ends_the_reply() {
         buttons(&reply_parts(&stopped, false)),
         vec![(2, 0, "Working.".to_string(), 1), (6, 0, "After the stop.".to_string(), 1)]
     );
+}
+
+fn terminal_with(commands: &[(&str, &str, Option<i32>)]) -> SandboxTerminalPanelEntry {
+    let mut terminal = test_sandbox_terminal_entry(10, 1);
+    for (i, (command, status, code)) in commands.iter().enumerate() {
+        let mut entry = test_sandbox_command_entry(&format!("cmd-{i}"), command);
+        entry.status = status.to_string();
+        entry.exit_code = *code;
+        terminal.commands.push(entry);
+    }
+    terminal
+}
+
+/// SME-144: the titlebar's pill reads the terminal's last command.
+#[test]
+fn test_latest_command_indicator_reads_the_last_command() {
+    let cases: [(&[(&str, &str, Option<i32>)], CommandIndicator); 7] = [
+        (&[], CommandIndicator::None),
+        (&[("sleep 9", "running", None)], CommandIndicator::Running),
+        (&[("true", "finished", Some(0))], CommandIndicator::Exited(0)),
+        (&[("false", "finished", Some(3))], CommandIndicator::Exited(3)),
+        (&[("make", "lost", None)], CommandIndicator::Lost),
+        (&[("make", "finished", None)], CommandIndicator::Other("finished".into())),
+        (&[("false", "finished", Some(1)), ("sleep 9", "running", None)], CommandIndicator::Running),
+    ];
+    for (commands, expected) in cases {
+        assert_eq!(latest_command_indicator(&terminal_with(commands)), expected, "{commands:?}");
+    }
+}
+
+#[test]
+fn test_each_command_indicator_has_a_label_class_and_title() {
+    let cases = [
+        (CommandIndicator::Running, "running", "task-terminal-command task-terminal-command-running", "running"),
+        (CommandIndicator::Exited(0), "exit 0", "task-terminal-command task-terminal-command-ok", "exited with status 0"),
+        (CommandIndicator::Exited(130), "exit 130", "task-terminal-command task-terminal-command-failed", "exited with status 130"),
+        (CommandIndicator::Lost, "lost", "task-terminal-command task-terminal-command-lost", "lost"),
+        (CommandIndicator::Other("weird".into()), "weird", "task-terminal-command task-terminal-command-other", "weird"),
+    ];
+    for (indicator, label, class, says) in cases {
+        assert_eq!(indicator.label(), label);
+        assert_eq!(indicator.class(), class);
+        assert!(!indicator.glyph().is_empty(), "{indicator:?} has no glyph");
+        let title = indicator.title("cargo build --release");
+        assert!(title.starts_with("Last command: \u{2068}cargo build --release\u{2069}"), "{title}");
+        assert!(title.contains(says), "{title}");
+    }
+    assert!(CommandIndicator::Lost.title("x").contains("no exit status"));
+}
+
+/// SME-144 review 1: a long or multi-line command (a heredoc the model
+/// wrote) isn't the whole tooltip and accessible name: its first line with
+/// anything in it, cut at 120 characters, isolated so bidi controls in it
+/// can't reorder the status after it (review 2).
+#[test]
+fn test_a_command_indicators_title_shortens_a_long_command() {
+    let shown = |command: &str| format!("\u{2068}{command}\u{2069}");
+    let long = format!("cat > big.txt <<'EOF'\n{}\nEOF", "x".repeat(5000));
+    assert_eq!(
+        CommandIndicator::Running.title(&long),
+        format!("Last command: {} \u{b7} running", shown("cat > big.txt <<'EOF'\u{2026}"))
+    );
+    let wide = "y".repeat(300);
+    assert_eq!(
+        CommandIndicator::Exited(1).title(&wide),
+        format!("Last command: {} \u{b7} exited with status 1", shown(&format!("{}\u{2026}", "y".repeat(120))))
+    );
+    assert_eq!(CommandIndicator::Exited(0).title("true"), format!("Last command: {} \u{b7} exited with status 0", shown("true")));
+    assert_eq!(CommandIndicator::Exited(0).title("true\n"), format!("Last command: {} \u{b7} exited with status 0", shown("true")));
+    // Review 2: leading blank lines are skipped, and say something was.
+    assert_eq!(CommandIndicator::Running.title("\n\necho hi"), format!("Last command: {} \u{b7} running", shown("echo hi")));
+    assert_eq!(CommandIndicator::Running.title("\n  \necho hi\nmore"), format!("Last command: {} \u{b7} running", shown("echo hi\u{2026}")));
+    // An empty or blank command says so, with no stray whitespace.
+    assert_eq!(CommandIndicator::Running.title(""), "Last command: (empty) \u{b7} running");
+    assert_eq!(CommandIndicator::Running.title("\t\n  \n"), "Last command: (empty) \u{b7} running");
+    // A right-to-left override inside stays inside its isolate.
+    assert_eq!(CommandIndicator::Running.title("echo \u{202e}abc"), format!("Last command: {} \u{b7} running", shown("echo \u{202e}abc")));
+}
+
+/// SME-144 review 2: a live `lost` pill only ever comes from a failed send
+/// (a pod restart's crash cleanup removes the terminal's card), so its
+/// tooltip doesn't offer a pod restart as the reason.
+#[test]
+fn test_the_lost_title_names_only_what_can_cause_it() {
+    let title = CommandIndicator::Lost.title("make");
+    assert!(title.contains("couldn't be sent") && title.contains("no exit status"), "{title}");
+    assert!(!title.contains("restart"), "{title}");
 }

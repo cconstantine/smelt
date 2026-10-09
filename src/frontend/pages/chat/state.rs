@@ -501,13 +501,11 @@ pub(super) fn apply_sandbox_terminal_update(
 /// (command)` means a *new* command just started in this terminal — pushed
 /// onto the terminal's history as a new entry, rather than overwriting
 /// anything (a real terminal's scrollback keeps growing, it doesn't erase
-/// itself for the next command). `None` means this is continuing the
-/// terminal's *most recent* command (an output line, or its completion) —
-/// the single-command-in-flight-per-terminal guarantee is what makes "the
-/// last entry in this terminal's history" an unambiguous target, no
-/// `command_id` matching needed. A `terminal_id` with no matching entry is
-/// a no-op (shouldn't happen: a command can't start before its terminal is
-/// known to the panel).
+/// itself for the next command). `None` is an output line, a finish or a
+/// lost command for the command with this `command_id`, which needn't be
+/// the newest: a finish can be published after the next command started
+/// (SME-144). A `terminal_id` or `command_id` the tab doesn't know is a
+/// no-op.
 #[cfg(any(feature = "web", test))]
 pub(super) fn apply_sandbox_command_update(
     terminals: &mut Vec<SandboxTerminalPanelEntry>,
@@ -539,13 +537,18 @@ pub(super) fn apply_sandbox_command_update(
         return;
     }
 
-    let Some(current) = entry.commands.last_mut() else {
+    // The command this update is about, by its id (SME-144): a finish can
+    // be published after the next command started, and must not land on
+    // that one. An id the tab never saw is skipped; a reconnect's snapshot
+    // brings whatever it missed.
+    let Some(current) = entry.commands.iter_mut().rev().find(|c| c.command_id == command_id) else {
         return;
     };
-    current.status = status;
-    current.exit_code = exit_code;
     if let (Some(stream), Some(data)) = (stream, latest_output) {
-        // A line the snapshot already has (SME-51 B3).
+        // An output line says nothing new about the status: a replayed one
+        // from before the snapshot mustn't turn a finished command back to
+        // running (SME-144). Skips a line the snapshot already has (SME-51
+        // B3).
         let last_seq = current.output.iter().filter_map(|l| l.seq).max();
         if let (Some(seq), Some(last)) = (position, last_seq)
             && seq <= last
@@ -555,5 +558,9 @@ pub(super) fn apply_sandbox_command_update(
         current
             .output
             .push(SandboxOutputLinePanelEntry { stream, data, seq: position });
+    } else {
+        // A finish, or a lost command.
+        current.status = status;
+        current.exit_code = exit_code;
     }
 }

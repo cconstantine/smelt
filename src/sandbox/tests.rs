@@ -3790,6 +3790,8 @@ async fn test_sandbox_futures_stay_small() {
         ("start_or_get_pod", std::mem::size_of_val(&start_or_get_pod(&pool, 1)), 15400),
         ("terminate_pod", std::mem::size_of_val(&terminate_pod(&pool, 1)), 1700),
         ("teardown_conversation", std::mem::size_of_val(&teardown_conversation(&pool, 1, &[])), 14400),
+        // SME-144 moved its publishes around the send: 664 bytes then.
+        ("run_command", std::mem::size_of_val(&run_command(&pool, 1, 1, "cmd", "true")), 1300),
     ];
     for (name, size, bound) in sizes {
         println!("{name}: {size} bytes (bound {bound})");
