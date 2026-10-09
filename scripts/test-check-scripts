@@ -211,6 +211,13 @@ extra_env=(RUST_LOG=)
 expect_log_settings "an empty level in the environment" info 1 "check-server's default"
 echo "RUST_LOG=warn" >"$env_file"
 expect_log_settings "a level in .env" warn 1 "from .env"
+# Written the ways dotenvy also reads: spaces around =, a comment after.
+echo "RUST_LOG = warn" >"$env_file"
+expect_log_settings "a level in .env with spaces around =" warn 1 "from .env"
+echo "RUST_LOG=warn # quieter" >"$env_file"
+expect_log_settings "a level in .env with a comment after it" warn 1 "from .env"
+echo 'RUST_LOG="warn # not a comment"' >"$env_file"
+expect_log_settings "a quoted level in .env keeps its #" "warn # not a comment" 1 "from .env"
 # dotenvy never overrides a variable that's set, even to "", so an empty
 # one in the environment would hide .env's from smelt.
 echo "RUST_LOG=warn" >"$env_file"

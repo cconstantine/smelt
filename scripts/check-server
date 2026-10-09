@@ -85,13 +85,20 @@ drop_scratch_db() {
 }
 
 # NAME's value in the worktree's .env, as dotenvy reads it: the last line
-# setting it, with or without `export`, unquoted.
+# setting it, with or without `export`, spaces around `=` allowed. A quoted
+# value is what's inside its quotes; an unquoted one ends at a ` #` comment
+# (SME-117 review 1: a `RUST_LOG=debug # note` passed on whole silenced
+# smelt's log entirely).
 env_file_value() {
     local value
-    value=$(sed -En "s/^(export[[:space:]]+)?$1=//p" "$worktree/.env" 2>/dev/null | tail -n 1)
+    value=$(sed -En "s/^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=[[:space:]]*//p" "$worktree/.env" 2>/dev/null | tail -n 1)
     case "$value" in
-        \"*\") value=${value#\"}; value=${value%\"} ;;
-        \'*\') value=${value#\'}; value=${value%\'} ;;
+        \"*) value=${value#\"}; value=${value%%\"*} ;;
+        \'*) value=${value#\'}; value=${value%%\'*} ;;
+        *)
+            value=${value%%[[:space:]]#*}
+            value=${value%"${value##*[![:space:]]}"}
+            ;;
     esac
     echo "$value"
 }
@@ -324,7 +331,7 @@ case "${1:-}" in
         fi
         ;;
     *)
-        sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
         exit 2
         ;;
 esac
