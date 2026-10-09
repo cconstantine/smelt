@@ -31,7 +31,8 @@ pub(super) struct StickyBottom {
     el: Signal<Option<MountedEvent>>,
     stuck: Signal<bool>,
     /// The last scroll event's position and client height: whether the view
-    /// can have moved on its own since then. See `scrolled`.
+    /// can have moved on its own since then, and whether the viewport did. See
+    /// `scrolled`.
     last_scroll: Signal<Option<(f64, f64)>>,
 }
 
@@ -53,30 +54,43 @@ impl StickyBottom {
     /// For the element's `onscroll`: whether the user is still at the
     /// bottom.
     ///
-    /// A position out of the slack only counts as a scroll-up — and demotes
-    /// the follow — when the view moved *up* since the last event with the
-    /// element's client height unchanged. A resize, a zoom or any layout
-    /// change fires the event with a different client height, and the view
-    /// sitting far from the bottom afterwards is not the user going back to
-    /// read (SME-108: the browser's own clamp of `scrollTop` on a window
-    /// resize looked exactly like a scroll-up, so the terminal — and the
-    /// transcript, same hook — stopped following their bottom for good after
-    /// a single resize, with nothing the user had done to ask for that).
-    /// The scroll height is not part of the test: it grows with streaming
-    /// output on every event, whether or not the user is scrolling.
+    /// A resize, a zoom or any other layout change fires the event with a
+    /// viewport height the previous event never had, and the browser puts the
+    /// view where its own clamp says it must go (SME-108: the clamp looked
+    /// exactly like a scroll-up, so the terminal — and the transcript, same
+    /// hook — stopped following its bottom for good after a single resize,
+    /// with nothing the user had done to ask for that; and growing the window
+    /// clamps a reader down *onto* the bottom, which read as a request to
+    /// start following again a moment after they'd asked not to be). Such an
+    /// event says nothing about intent, so the follow stays exactly as it
+    /// was. With the viewport height steady, the position is the user's own
+    /// and does say: at the bottom means following again, up from where they
+    /// were means they stopped. Nothing else scrolls the view while the
+    /// follow is off — the browser's own habit of pinning a scroller that sits
+    /// at its end onto each new bottom is turned off for these elements by
+    /// `overflow-anchor: none` (assets/chat.css), which is what makes that
+    /// reading safe. The scroll height is not part of the test: it grows with
+    /// streaming output on every event, whether or not the user is scrolling.
     pub(super) fn scrolled(mut self, data: &ScrollData) {
-        let (top, height, client) = (data.scroll_top(), data.scroll_height() as f64, data.client_height() as f64);
-        let at_bottom = is_scrolled_to_bottom(top, height, client);
-        let moved_up = match self.last_scroll.peek().as_ref() {
-            Some(&(last_top, last_client)) => {
-                top < last_top - 1.0 && (client - last_client).abs() < 0.5
-            }
-            None => false,
-        };
+        let (top, height, client) =
+            (data.scroll_top(), data.scroll_height() as f64, data.client_height() as f64);
+        let last = *self.last_scroll.peek();
         self.last_scroll.set(Some((top, client)));
-        if at_bottom {
+        let Some((last_top, last_client)) = last else {
+            // The first event since the element mounted, so nothing can have
+            // resized yet: the position is the view's own, and at the bottom
+            // means following.
+            if is_scrolled_to_bottom(top, height, client) {
+                self.stuck.set(true);
+            }
+            return;
+        };
+        if (client - last_client).abs() >= 0.5 {
+            return;
+        }
+        if is_scrolled_to_bottom(top, height, client) {
             self.stuck.set(true);
-        } else if moved_up {
+        } else if top < last_top - 1.0 {
             self.stuck.set(false);
         }
     }

@@ -322,6 +322,15 @@ body {
 .messages {
     flex: 1;
     overflow-y: auto;
+    /* The transcript follows its bottom through the app's own scroll, and
+       keeps what is under the pointer still through its own anchor snap
+       (SME-75, SME-83) — the browser guessing on top of that is how a resize
+       came to look like a user scrolling up (SME-108), and pinning a reader
+       who sits at the end onto each new message is the same confusion from
+       the other side: a reader scrolled up to read who a resize then clamped
+       onto the bottom would ride every new message along while the app's own
+       follow said it was off. Same reasoning as `.task-terminal-body`. */
+    overflow-anchor: none;
     padding: 24px;
     display: flex;
     flex-direction: column;
@@ -1260,6 +1269,16 @@ body {
        so each card's body scrolls internally well before hitting this. */
     max-height: 60vh;
     overflow-y: auto;
+    /* Chrome's scroll anchoring pins a scroller that sits at its end onto
+       every new bottom as content arrives. A reader who scrolled up to read
+       and then grew the window gets clamped onto the bottom by that resize
+       once (no way to avoid that), and the anchoring then keeps dragging them
+       onto each new line after it — which is indistinguishable from the
+       follow they just switched off, and no amount of scroll logic can undo
+       it (SME-108 review 1: a window grow revived the follow through it).
+       The terminal follows its bottom through the app's own scroll (see
+       `StickyBottom`), so the browser has no need to guess here. */
+    overflow-anchor: none;
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
     font-size: 12px;
     line-height: 1.6;
