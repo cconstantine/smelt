@@ -3293,19 +3293,27 @@ async fn test_stopping_a_woken_turn_is_not_reported_as_a_failure(pool: PgPool) {
         let pool = pool.clone();
         async move { wake_conversation(&pool, conversation.id).await }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Stop once the turn has started, not after a fixed wait: a stop
+    // landing before the wake checks for a pause leaves nothing to stop,
+    // and a wake that never started a turn (its conversation left paused
+    // by another test's stop, say) would pass the check below untested.
+    let started = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let events::ConversationEvent::TurnState { running: true } =
+                rx.recv().await.expect("event channel should not close")
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(started.is_ok(), "the wake should have started a turn");
     stop_turn_now(conversation.id);
     let _ = wake.await;
 
-    let seen = drain_events(&mut rx).await;
-    // A wake that never started a turn (its conversation left paused by
-    // another test's stop, say) would pass the check below untested.
-    assert!(
-        seen.iter().any(|e| matches!(e, events::ConversationEvent::TurnState { running: true })),
-        "the wake should have started a turn: {seen:?}"
-    );
-    let reported = seen
-        .iter()
+    let reported = drain_events(&mut rx)
+        .await
+        .into_iter()
         .any(|e| matches!(e, events::ConversationEvent::NotificationDeliveryFailed { .. }));
     assert!(!reported, "a stop isn't a failed notification");
 }
