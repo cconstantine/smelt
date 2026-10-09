@@ -38,6 +38,8 @@ mod request_guard;
 #[cfg(feature = "server")]
 mod sandbox;
 #[cfg(feature = "server")]
+mod telemetry;
+#[cfg(feature = "server")]
 mod turn;
 #[cfg(feature = "server")]
 mod webfetch;
@@ -64,7 +66,12 @@ fn build_router() -> axum::Router {
         // No login, so another site's page mustn't be able to act as the
         // user (SME-51 B1).
         .layer(axum::middleware::from_fn(request_guard::guard))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        // Path only, never the query string or headers (SME-137).
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http()
+                .make_span_with(telemetry::make_http_span)
+                .on_response(telemetry::on_http_response),
+        )
 }
 
 #[cfg(feature = "server")]
@@ -80,11 +87,21 @@ async fn main() {
     // auto-install for. Must happen before any kube::Client is built.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter_directives(
-            &std::env::var("RUST_LOG").unwrap_or_default(),
-        )))
-        .init();
+    // The console log, filtered by RUST_LOG, and the OTLP export when
+    // OTEL_EXPORTER_OTLP_ENDPOINT is set (SME-137). Held for the process's
+    // life: dropping it flushes the export.
+    let _telemetry = telemetry::init();
+    let listener = tracing::Instrument::instrument(start_up(dotenv_problem), tracing::info_span!("startup")).await;
+    let router = build_router();
+    #[expect(clippy::expect_used, reason = "serving is the process's whole job: when it ends, the process does")]
+    axum::serve(listener, router).await.expect("server error");
+}
+
+/// Everything from loading `.env` to listening, in the `startup` span
+/// (SME-137).
+#[cfg(feature = "server")]
+async fn start_up(dotenv_problem: Option<String>) -> tokio::net::TcpListener {
+    use tracing::Instrument;
     if let Some(problem) = dotenv_problem {
         tracing::error!("{problem}");
     }
@@ -159,6 +176,7 @@ async fn main() {
     tokio::spawn({
         let pool = pool.clone();
         async move { sandbox::sweep_orphaned_conversation_claims(&pool).await }
+            .instrument(tracing::info_span!("claim_sweep"))
     });
 
     // Each sandbox's dev servers, for the user's browser, on a listener of
@@ -168,8 +186,6 @@ async fn main() {
     // Model prices for each call's cost: the saved copy, then models.dev
     // now and hourly (SME-106).
     pricing::start(pool.clone());
-
-    let router = build_router();
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -184,8 +200,7 @@ async fn main() {
         Ok(addr) => tracing::info!("listening on {addr}"),
         Err(e) => tracing::info!("listening on port {port} (couldn't read the bound address: {e})"),
     }
-    #[expect(clippy::expect_used, reason = "serving is the process's whole job: when it ends, the process does")]
-    axum::serve(listener, router).await.expect("server error");
+    listener
 }
 
 /// The `EnvFilter` directives to log with, given `RUST_LOG`'s value.
