@@ -84,14 +84,14 @@ drop_scratch_db() {
     echo "dropped the scratch database"
 }
 
-# NAME's value in the worktree's .env, as dotenvy reads it: the last line
-# setting it, with or without `export`, spaces around `=` allowed. A quoted
-# value is what's inside its quotes; an unquoted one ends at a ` #` comment
-# (SME-117 review 1: a `RUST_LOG=debug # note` passed on whole silenced
-# smelt's log entirely).
+# NAME's value in the worktree's .env, as dotenvy reads it: the first line
+# setting it (dotenvy never overrides a value it has set), with or without
+# `export`, spaces around `=` allowed. A quoted value is what's inside its
+# quotes; an unquoted one ends at a ` #` comment (SME-117 review 1: a
+# `RUST_LOG=debug # note` passed on whole silenced smelt's log entirely).
 env_file_value() {
     local value
-    value=$(sed -En "s/^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=[[:space:]]*//p" "$worktree/.env" 2>/dev/null | tail -n 1)
+    value=$(sed -En "s/^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=[[:space:]]*//p" "$worktree/.env" 2>/dev/null | head -n 1)
     case "$value" in
         \"*) value=${value#\"}; value=${value%%\"*} ;;
         \'*) value=${value#\'}; value=${value%%\'*} ;;

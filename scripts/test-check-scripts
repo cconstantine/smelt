@@ -222,6 +222,9 @@ expect_log_settings "a quoted level in .env keeps its #" "warn # not a comment" 
 # default applies (SME-117 review 2).
 echo "RUST_LOG= # debug when needed" >"$env_file"
 expect_log_settings "an empty level in .env with a comment" info 1 "check-server's default"
+# dotenvy keeps the first line that sets a name (SME-117 review 2).
+printf 'RUST_LOG=debug\nRUST_LOG=warn\n' >"$env_file"
+expect_log_settings "a level set twice in .env" debug 1 "from .env"
 # dotenvy never overrides a variable that's set, even to "", so an empty
 # one in the environment would hide .env's from smelt.
 echo "RUST_LOG=warn" >"$env_file"
