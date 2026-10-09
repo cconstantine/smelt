@@ -4441,6 +4441,81 @@ async fn scenario_llama_cpp_provider(t: &Scenario<'_>) {
     db::delete_inference_provider(t.pool, provider.id).await.expect("delete the llama.cpp provider");
 }
 
+/// A test server that holds every answer until the test calls `release`
+/// (SME-118): a state that lasts only while a page or image is loading
+/// then lasts until the test has seen it, however slow the runner. A
+/// fixed delay instead gives the test a window it has to land in, which a
+/// slow runner can miss.
+///
+/// Every request gets the same `200` with `body`. Dropping it stops the
+/// server, and a request still held closes unanswered.
+struct HeldPage {
+    address: String,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    release: tokio::sync::watch::Sender<bool>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl HeldPage {
+    async fn start(content_type: &str, body: &str) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a held page");
+        let address = format!("http://{}/", listener.local_addr().expect("the held page's address"));
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // A watch, not a oneshot: Chrome may send more than one request (a
+        // retry, a favicon), and each one is released.
+        let (release, released) = tokio::sync::watch::channel(false);
+        let response: std::sync::Arc<[u8]> = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+        .into();
+        let counter = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut released = released.clone();
+                let counter = counter.clone();
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 1024];
+                    // Nothing read: a connection opened ahead of a request
+                    // (Chrome preconnects) and closed unused.
+                    if !matches!(tokio::io::AsyncReadExt::read(&mut socket, &mut request).await, Ok(n) if n > 0) {
+                        return;
+                    }
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // An error: the HeldPage went without releasing it.
+                    if released.wait_for(|released| *released).await.is_err() {
+                        return;
+                    }
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, &response).await;
+                });
+            }
+        });
+        Self { address, requests, release, server }
+    }
+
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// How many requests have arrived, answered or held.
+    fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Answers every held request, and every later one at once.
+    fn release(&self) {
+        self.release.send_replace(true);
+    }
+}
+
+impl Drop for HeldPage {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
 /// A server that answers every request after `delay` with an SVG image of
 /// `height` pixels, so an image in a reply grows its bubble after the
 /// reply has rendered. Returns its address.
@@ -4597,52 +4672,76 @@ async fn scenario_address_bar_after_session_closes(t: &Scenario<'_>) {
     crate::browsing::open_session_with_guard(conversation.id, |_| true)
         .await
         .expect("open a browsing session");
-    // A page that answers after 3 s: the navigation is still loading when
-    // the session closes.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a slow page");
-    let address = format!("http://{}/", listener.local_addr().expect("the slow page's address"));
-    let server = tokio::spawn(async move {
-        while let Ok((mut socket, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let mut request = [0u8; 1024];
-                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                let _ = tokio::io::AsyncWriteExt::write_all(
-                    &mut socket,
-                    b"HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: 11\r\n\r\n<p>slow</p>",
-                )
-                .await;
-            });
-        }
-    });
+    // A page that answers only once released, so the navigation is still
+    // loading when the test looks for it and when the session closes,
+    // however slow the runner (SME-118; it used to answer on a fixed 3 s
+    // timer).
+    let slow = HeldPage::start("text/html", "<p>slow</p>").await;
     let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
-    wait_for_live_client(&page, conversation.id).await;
-    let input = wait_for_element(&page, ".browsing-address-input", Duration::from_secs(10)).await;
-    input.focus().await.expect("focus the address bar");
-    input.type_str(&address).await.expect("type the slow page's address");
-    input.press_key("Enter").await.expect("go");
-    let loading = wait_for_count(&page, ".browsing-address-input[disabled]", 1, Duration::from_secs(5)).await;
-    crate::browsing::close_session(conversation.id).await.expect("close the browsing session");
-    let closed = wait_for_count(&page, ".browsing-panel", 0, Duration::from_secs(5)).await;
-    // Past the slow page's answer: the navigation has ended either way.
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    crate::browsing::open_session_with_guard(conversation.id, |_| true)
-        .await
-        .expect("open the browsing session again");
-    let reopened = wait_for_count(&page, ".browsing-address-input", 1, Duration::from_secs(10)).await;
-    let disabled: bool = page
-        .evaluate("document.querySelector('.browsing-address-input')?.disabled ?? true")
-        .await
-        .expect("read the address bar")
-        .into_value()
-        .expect("a bool");
+    let outcome: Result<(), String> = async {
+        wait_for_live_client(&page, conversation.id).await;
+        let input = wait_for_element(&page, ".browsing-address-input", Duration::from_secs(10)).await;
+        input.focus().await.expect("focus the address bar");
+        // Focusing the bar fills it with the session's URL (`about:blank`),
+        // as a browser's does. Selected, so typing replaces it: before
+        // SME-118 the scenario typed after it, its address was refused at
+        // once ("unsupported scheme: about"), and the bar was disabled only
+        // for that round trip, which a poll sometimes missed.
+        page.evaluate("document.querySelector('.browsing-address-input').select()")
+            .await
+            .expect("select the address bar's text");
+        input.type_str(slow.address()).await.expect("type the slow page's address");
+        let typed: String = page
+            .evaluate("document.querySelector('.browsing-address-input').value")
+            .await
+            .expect("read the address bar")
+            .into_value()
+            .expect("a string");
+        if typed != slow.address() {
+            return Err(format!("the address bar holds {typed:?}, not the address typed, {:?}", slow.address()));
+        }
+        input.press_key("Enter").await.expect("go");
+        if !wait_until(|| async { slow.requests() >= 1 }, Duration::from_secs(10)).await {
+            let error: String = page
+                .evaluate("document.querySelector('.browsing-address-error')?.textContent ?? ''")
+                .await
+                .expect("read the address error")
+                .into_value()
+                .expect("a string");
+            return Err(format!("the navigation never reached the slow page (address error: {error:?})"));
+        }
+        if !wait_for_count(&page, ".browsing-address-input[disabled]", 1, Duration::from_secs(5)).await {
+            return Err("the address bar should show the navigation loading".to_string());
+        }
+        crate::browsing::close_session(conversation.id).await.expect("close the browsing session");
+        if !wait_for_count(&page, ".browsing-panel", 0, Duration::from_secs(5)).await {
+            return Err("the browsing panel should go when the session closes".to_string());
+        }
+        // Only now: the navigation was still loading when the session
+        // closed, which is the case this scenario is for.
+        slow.release();
+        crate::browsing::open_session_with_guard(conversation.id, |_| true)
+            .await
+            .expect("open the browsing session again");
+        if !wait_for_count(&page, ".browsing-address-input", 1, Duration::from_secs(10)).await {
+            return Err("the browsing panel should come back when the session reopens".to_string());
+        }
+        // The navigation ends when the page answers or the closed page
+        // fails it, at the latest on `browsing`'s own 20 s NAV_TIMEOUT.
+        // With its spawn dropped along with the panel, it never ends.
+        if !wait_for_count(&page, ".browsing-address-input:not([disabled])", 1, Duration::from_secs(25)).await {
+            return Err(
+                "the address bar is still disabled after the session closed mid-navigation and reopened".to_string(),
+            );
+        }
+        Ok(())
+    }
+    .await;
     // Closed before the checks, so a failing one doesn't leave the session open.
     crate::browsing::close_session(conversation.id).await.expect("close the browsing session");
-    server.abort();
-    assert!(loading, "the address bar should show the navigation loading");
-    assert!(closed, "the browsing panel should go when the session closes");
-    assert!(reopened, "the browsing panel should come back when the session reopens");
-    assert!(!disabled, "the address bar is still disabled after the session closed mid-navigation and reopened");
+    if let Err(why) = outcome {
+        panic!("{why}");
+    }
 }
 
 /// SME-82: the context bar and its detail view work from the
