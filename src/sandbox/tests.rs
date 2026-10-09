@@ -1007,6 +1007,29 @@ fn test_pod_start_report_never_shows_a_negative_time() {
     assert!(report.contains("for 0 s; pod 0 s old"), "got {report}");
 }
 
+/// SME-132 review 1: the API's times are whole seconds, so stages often
+/// tie, and the API lists conditions in another order than they happen.
+/// Tied stages come out in the order the kubelet passes them.
+#[test]
+fn test_pod_start_timeline_orders_tied_stages_as_they_happen() {
+    let pod = report_pod(
+        &[
+            ("PodReadyToStartContainers", "True", 1, "", ""),
+            ("Initialized", "True", 65, "", ""),
+            ("Ready", "True", 65, "", ""),
+            ("ContainersReady", "True", 65, "", ""),
+            ("PodScheduled", "True", 1, "", ""),
+        ],
+        serde_json::json!([]),
+        serde_json::json!([]),
+    );
+    let report = pod_start_report(&pod, Ok(&[]), report_now());
+    assert!(
+        report.contains("timeline: scheduled +1 s, sandbox ready +1 s, sidecar started +65 s, containers ready +65 s, ready +65 s;"),
+        "got {report}"
+    );
+}
+
 /// A start that succeeds after more than half its timeout is slow, and
 /// logged; one at or under half isn't (SME-132).
 #[test]

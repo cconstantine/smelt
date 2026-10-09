@@ -377,7 +377,10 @@ fn pod_start_timeline(pod: &Pod) -> String {
         .filter(|c| c.status == "True")
         .filter_map(|c| Some((c.last_transition_time.as_ref()?.0, c.type_.as_str())))
         .collect();
-    passed.sort_by_key(|(at, _)| *at);
+    // Times are whole seconds, so stages tie often; a tie goes in the
+    // order the kubelet passes them, not the API's list order (SME-132
+    // review 1). Conditions it doesn't know go after, by name.
+    passed.sort_by_key(|(at, condition)| (*at, stage_rank(condition), *condition));
     passed
         .iter()
         .map(|(at, condition)| {
@@ -393,6 +396,19 @@ fn pod_start_timeline(pod: &Pod) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Where a pod condition comes in a start, for ordering stages that
+/// happened in the same second.
+fn stage_rank(condition: &str) -> u8 {
+    match condition {
+        "PodScheduled" => 0,
+        "PodReadyToStartContainers" => 1,
+        "Initialized" => 2,
+        "ContainersReady" => 3,
+        "Ready" => 4,
+        _ => 5,
+    }
 }
 
 /// Each of the pod spec's containers, init containers first, with its
