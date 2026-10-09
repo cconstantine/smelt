@@ -2087,3 +2087,13 @@ fn test_a_command_indicators_title_shortens_a_long_command() {
     // A right-to-left override inside stays inside its isolate.
     assert_eq!(CommandIndicator::Running.title("echo \u{202e}abc"), format!("Last command: {} \u{b7} running", shown("echo \u{202e}abc")));
 }
+
+/// SME-144 review 2: a live `lost` pill only ever comes from a failed send
+/// (a pod restart's crash cleanup removes the terminal's card), so its
+/// tooltip doesn't offer a pod restart as the reason.
+#[test]
+fn test_the_lost_title_names_only_what_can_cause_it() {
+    let title = CommandIndicator::Lost.title("make");
+    assert!(title.contains("couldn't be sent") && title.contains("no exit status"), "{title}");
+    assert!(!title.contains("restart"), "{title}");
+}

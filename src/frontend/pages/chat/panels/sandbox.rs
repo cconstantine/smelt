@@ -110,7 +110,7 @@ impl CommandIndicator {
             Self::Running => "running".to_string(),
             Self::Exited(code) => format!("exited with status {code}"),
             Self::Lost => {
-                "lost: the sandbox lost track of it (the send failed or the pod restarted); no exit status".to_string()
+                "lost: it couldn't be sent to the sandbox, so it never ran; no exit status".to_string()
             }
             Self::Other(status) => status.clone(),
         };
