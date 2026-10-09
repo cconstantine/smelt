@@ -4552,6 +4552,12 @@ async fn scenario_markdown_late_image(t: &Scenario<'_>) {
         let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
         wait_for_live_client(&page, conversation.id).await;
         wait_for_element(&page, ".markdown img.md-image", Duration::from_secs(10)).await;
+        // Asked for and held, so "still loading" below is the held answer,
+        // not an image that was never requested.
+        assert!(
+            wait_until(|| async { image.requests() >= 1 }, Duration::from_secs(10)).await,
+            "the image was never requested"
+        );
         let loaded: bool = page
             .evaluate("document.querySelector('.markdown img.md-image').complete")
             .await
