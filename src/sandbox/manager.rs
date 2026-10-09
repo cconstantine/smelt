@@ -237,7 +237,7 @@ pub(super) async fn wait_for_running_with_timeout(
                 return Err(SandboxError::StartFailed(reason));
             }
             last_detail = pod_pending_detail(&pod);
-            if pod.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running") {
+            if pod_phase_is_running(&pod) {
                 let took = started.elapsed();
                 if is_slow_start(took, timeout) {
                     tracing::warn!(
@@ -261,7 +261,7 @@ pub(super) async fn wait_for_running_with_timeout(
         Ok(result) => result,
         // Boxed: a `Pod` and its events are large, and this path is rare
         // (see `test_sandbox_futures_stay_small`).
-        Err(_) => Err(SandboxError::Timeout(Box::pin(timed_out_detail(pods, name, last_detail)).await)),
+        Err(_) => Box::pin(timed_out(pods, name, timeout, last_detail)).await,
     }
 }
 
@@ -275,16 +275,42 @@ pub(super) fn is_slow_start(took: Duration, timeout: Duration) -> bool {
 /// How long `timed_out_detail` waits for each of its two reads.
 const REPORT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A timed-out start's detail: `pod_start_report` on a fresh read of the
-/// pod and its events (SME-132). It runs before `create_with_running_timeout`
-/// deletes the pod. When the pod can't be read, the last poll's
-/// `pod_pending_detail` stands.
-async fn timed_out_detail(pods: &Api<Pod>, name: &str, last_detail: Option<String>) -> Option<String> {
+/// A timed-out wait's result, from a fresh read of the pod and its events
+/// (SME-132): `pod_start_report` as the timeout's detail, before
+/// `create_with_running_timeout` deletes the pod. When the pod can't be
+/// read, the last poll's `pod_pending_detail` stands. A pod that reached
+/// `Running` since the last poll has started (review 2), and is logged as
+/// a slow start.
+async fn timed_out(pods: &Api<Pod>, name: &str, timeout: Duration, last_detail: Option<String>) -> Result<(), SandboxError> {
     let Ok(Ok(pod)) = tokio::time::timeout(REPORT_READ_TIMEOUT, pods.get(name)).await else {
-        return last_detail;
+        return Err(SandboxError::Timeout(last_detail));
     };
+    if pod_phase_is_running(&pod) {
+        tracing::warn!(
+            pod = %name,
+            timeout_secs = timeout.as_secs(),
+            timeline = %pod_start_timeline(&pod),
+            "a sandbox pod reached Running only as its start timed out"
+        );
+        return Ok(());
+    }
     let events = pod_events(pods, &pod).await;
-    Some(pod_start_report(&pod, events.as_deref().map_err(String::as_str), Timestamp::now()))
+    timed_out_outcome(&pod, events.as_deref().map_err(String::as_str), Timestamp::now())
+}
+
+/// Whether `pod`'s phase is `Running`.
+fn pod_phase_is_running(pod: &Pod) -> bool {
+    pod.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")
+}
+
+/// What a timed-out wait returns, given the fresh read of its pod: a
+/// start if it's `Running` by now, otherwise a timeout whose detail is
+/// `pod_start_report`.
+pub(super) fn timed_out_outcome(pod: &Pod, events: Result<&[Event], &str>, now: Timestamp) -> Result<(), SandboxError> {
+    if pod_phase_is_running(pod) {
+        return Ok(());
+    }
+    Err(SandboxError::Timeout(Some(pod_start_report(pod, events, now))))
 }
 
 /// `pod`'s events, or why they couldn't be listed. The `park` Role may
@@ -329,7 +355,14 @@ pub(super) fn pod_start_report(pod: &Pod, events: Result<&[Event], &str>, now: T
             format!("{detail}{gloss}{}", since.unwrap_or_default())
         }
         None if conditions.is_empty() => "not scheduled yet".to_string(),
-        None => "no stage false".to_string(),
+        // Review 2: where a pending pod with no `False` condition is.
+        None if conditions.iter().all(|c| c.type_ == "PodScheduled") => {
+            "scheduled, nothing from the kubelet yet".to_string()
+        }
+        None => format!(
+            "every stage passed, phase {}",
+            pod.status.as_ref().and_then(|s| s.phase.as_deref()).unwrap_or("unknown")
+        ),
     };
     let mut parts = vec![stage];
     if let Some(created) = created {

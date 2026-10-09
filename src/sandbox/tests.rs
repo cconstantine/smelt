@@ -1055,6 +1055,40 @@ fn test_pod_start_report_for_a_pod_not_scheduled_yet() {
     assert!(report.contains("events: none"), "got {report}");
 }
 
+/// SME-132 review 2: a pod that reached `Running` between the last poll
+/// and the timeout's fresh read has started; the wait succeeds rather
+/// than report a timeout and have the caller delete a running pod.
+#[test]
+fn test_a_pod_running_by_the_timeouts_read_is_a_start() {
+    let mut running = report_pod(&[("Ready", "True", 30, "", "")], serde_json::json!([]), serde_json::json!([]));
+    running.status.as_mut().expect("a status").phase = Some("Running".to_string());
+    assert!(matches!(timed_out_outcome(&running, Ok(&[]), report_now()), Ok(())));
+
+    let pending = report_pod(&[("PodReadyToStartContainers", "False", 2, "", "")], serde_json::json!([]), serde_json::json!([]));
+    match timed_out_outcome(&pending, Ok(&[]), report_now()) {
+        Err(SandboxError::Timeout(Some(detail))) => assert!(detail.contains("PodReadyToStartContainers"), "got {detail}"),
+        other => panic!("expected a timeout with the report, got {other:?}"),
+    }
+}
+
+/// SME-132 review 2: a pending pod with no `False` condition says where it
+/// is rather than "no stage false": scheduled with nothing from the
+/// kubelet yet, or past every stage and not yet `Running`.
+#[test]
+fn test_pod_start_report_names_a_pending_pod_with_no_false_stage() {
+    let scheduled = report_pod(&[("PodScheduled", "True", 0, "", "")], serde_json::json!([]), serde_json::json!([]));
+    let report = pod_start_report(&scheduled, Ok(&[]), report_now());
+    assert!(report.starts_with("scheduled, nothing from the kubelet yet;"), "got {report}");
+
+    let passed = report_pod(
+        &[("PodScheduled", "True", 0, "", ""), ("PodReadyToStartContainers", "True", 1, "", ""), ("Ready", "True", 9, "", "")],
+        serde_json::json!([]),
+        serde_json::json!([]),
+    );
+    let report = pod_start_report(&passed, Ok(&[]), report_now());
+    assert!(report.starts_with("every stage passed, phase Pending;"), "got {report}");
+}
+
 /// At most 5 events, each message cut to 200 characters, on a char
 /// boundary.
 #[test]
