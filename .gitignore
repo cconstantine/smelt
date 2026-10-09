@@ -28,4 +28,7 @@ __pycache__/
 .check-server.pid
 .check-server.log
 .check-server.scratch-db
+# The KUBECONFIG a check server was started with, for `stop`'s cleanup
+# (SME-129).
+.check-server.kubeconfig
 ui-check-out/

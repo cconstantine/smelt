@@ -34,6 +34,16 @@
 #                   conversation's /workspace) of every conversation on the
 #                   dev server.
 #
+#                   stop deletes that database's own sandbox objects first
+#                   (SME-129): every pod and claim its server made carries
+#                   smelt/instance=<the database's id>, and once the
+#                   database is dropped no server ever owns them again. A
+#                   failed cleanup keeps the database, so stop can be run
+#                   again; start over a leftover cleans that one up before
+#                   recreating it. Nothing without that exact label is
+#                   touched, and the tool refuses a target that isn't a
+#                   smelt_scratch_* database.
+#
 # `dx serve` runs its server as a child process, so stopping only the `dx`
 # process leaves the server running (SME-51). This starts `dx` in a process
 # group of its own and stops the whole group.
@@ -48,6 +58,13 @@
 # SMELT_PREVIEW_URL=http://{port}-{conversation}.preview.localhost:<p>`):
 # both default to 8181, so the second runs without previews and its links
 # point at the first's listener.
+#
+# A start and a stop of the same scratch database take a lock on the
+# database's own name ($SMELT_LOCK_DIR/smelt-check-scratch-<name>.lock)
+# around every step that reads or writes that database or its state file,
+# so a start in the same worktree can't create it under a stop that is
+# cleaning it up, or the other way round (SME-129). stop's cleanup tool
+# inherits it until it ends, and the server never holds it.
 set -euo pipefail
 
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
@@ -69,23 +86,80 @@ pid_file() { echo "$worktree/.check-server.pid"; }
 log_file() { echo "$worktree/.check-server.log"; }
 # Holds the scratch database's URL while one exists, so `stop` can drop it.
 scratch_db_file() { echo "$worktree/.check-server.scratch-db"; }
+# Holds the KUBECONFIG the server was started with, so `stop`'s cleanup talks
+# to the same cluster (SME-129). Empty means the inherited environment.
+kubeconfig_file() { echo "$worktree/.check-server.kubeconfig"; }
 
-# The dev DATABASE_URL (the environment's, else the worktree's .env) with the
-# database renamed after the worktree: a fixed name, so a leftover from a
-# failed run is easy to find and the next run reuses it.
-scratch_db_url() {
+# The dev DATABASE_URL: the environment's, else the check worktree's .env.
+dev_database_url() {
     local url=${DATABASE_URL:-}
     if [ -z "$url" ] && [ -f "$worktree/.env" ]; then
         url=$(sed -n 's/^DATABASE_URL=//p' "$worktree/.env" | tail -n 1)
         url=${url%\"}
         url=${url#\"}
     fi
+    echo "$url"
+}
+
+# A database URL's database name: what the scratch lock is keyed by.
+db_name() {
+    local url=$1
+    url=${url%%\?*}
+    echo "${url##*/}"
+}
+
+# The dev DATABASE_URL (the environment's, else the worktree's .env) with the
+# database renamed after the worktree: a fixed name, so a leftover from a
+# failed run is easy to find and the next run reuses it.
+scratch_db_url() {
+    local url
+    url=$(dev_database_url)
     [ -n "$url" ] || { echo "CHECK_SCRATCH_DB needs DATABASE_URL (environment or .env)" >&2; return 1; }
     local query=""
     case "$url" in *\?*) query="?${url#*\?}"; url=${url%%\?*} ;; esac
     local name
     name=smelt_scratch_$(basename "$worktree" | tr -c 'a-zA-Z0-9\n' '_')
     echo "${url%/*}/$name$query"
+}
+
+# The lock ordering a start and a stop of the same scratch database
+# (SME-129): keyed by the database's name, so it works before the check
+# worktree exists and whatever CHECK_PORT each side uses. Descriptor 9: the
+# cleanup tool a stop runs inherits it, and start waits for the tool to end,
+# while the dx subshell below closes it, so the server never holds it.
+take_scratch_lock() { # scratch database name
+    exec 9>>"$lock_dir/smelt-check-scratch-$1.lock"
+    if ! flock -n 9; then
+        echo "waiting for the scratch lock: a check-server start or stop in $worktree holds it" >&2
+        flock 9
+    fi
+}
+
+# Deletes the sandbox objects (pods, then claims) of the instance the scratch
+# database `$1` names (SME-129), before the database is dropped: its
+# smelt_instance row is the last record of the instance its server labelled
+# them with, and once it is dropped no server ever owns them again. Succeeds
+# when there is nothing to know (no database, or one never migrated) and when
+# `$1` is empty. The tool refuses anything that isn't a smelt_scratch_*
+# database, and deletes nothing without the exact instance label.
+cleanup_scratch() { # scratch database url (may be empty)
+    local url=$1
+    [ -n "$url" ] || return 0
+    local cleanup
+    if [ -n "${SANDBOX_INSTANCE_CLEANUP:-}" ]; then
+        cleanup=("$SANDBOX_INSTANCE_CLEANUP")
+    else
+        cleanup=(cargo run -q --bin sandbox_instance_cleanup --features server --)
+    fi
+    local kubeconfig
+    kubeconfig=$(cat "$(kubeconfig_file)" 2>/dev/null || true)
+    local -a kube=()
+    [ -n "$kubeconfig" ] && kube=(KUBECONFIG="$kubeconfig")
+    (
+        cd "$repo"
+        env "${kube[@]}" "${cleanup[@]}" \
+            --database-url "$url" --dev-database-url "$(dev_database_url)" </dev/null
+    )
 }
 
 drop_scratch_db() {
@@ -199,12 +273,38 @@ running_pgid() {
     echo "$pgid"
 }
 
+# Cleans up the scratch database's objects and drops it, then empties the
+# KUBECONFIG file. Everything is kept when the cleanup can't finish, so a
+# later stop retries.
+finish_stop() { # scratch database url (may be empty)
+    if ! cleanup_scratch "$1"; then
+        echo "the scratch database's sandbox objects weren't all deleted; scripts/check-server stop again (it retries) — the database is kept so they can still be found" >&2
+        return 1
+    fi
+    drop_scratch_db
+    # Only a start writes it, so a stop with none leaves it alone.
+    [ -e "$(kubeconfig_file)" ] && : >"$(kubeconfig_file)"
+}
+
 stop() {
+    # The scratch lock first, before the pid file is read, and held through
+    # the kill, the cleanup and the drop: a start in the same worktree holds
+    # it until its pid file is written, so it can't create the database under
+    # this cleanup, or have this stop drop the one it just made (SME-129).
+    # Taken only when the scratch file names a database; the unlocked read
+    # says whether one is, and it is read again under the lock.
+    local scratch_url
+    scratch_url=$(cat "$(scratch_db_file)" 2>/dev/null || true)
+    if [ -n "$scratch_url" ]; then
+        take_scratch_lock "$(db_name "$scratch_url")"
+        scratch_url=$(cat "$(scratch_db_file)" 2>/dev/null || true)
+    fi
+
     local pgid
     if ! pgid=$(running_pgid); then
         echo "no check server running (log: $(log_file))"
         [ -e "$(pid_file)" ] && : >"$(pid_file)"
-        drop_scratch_db
+        finish_stop "$scratch_url"
         return 0
     fi
     kill -TERM -- "-$pgid" 2>/dev/null || true
@@ -217,8 +317,9 @@ stop() {
     fi
     : >"$(pid_file)"
     echo "stopped the check server (process group $pgid; log: $(log_file))"
-    # Only once the server is gone: Postgres won't drop a database in use.
-    drop_scratch_db
+    # Only once the server is gone: Postgres won't drop a database in use,
+    # and nothing may make new objects under the cleanup.
+    finish_stop "$scratch_url"
 }
 
 start() {
@@ -229,11 +330,6 @@ start() {
     fi
     [ "${1:-}" = "--" ] && shift
     local overrides=("$@")
-
-    if running_pgid >/dev/null; then
-        echo "a check server is already running; scripts/check-server stop first" >&2
-        exit 1
-    fi
 
     local commit
     commit=$(git -C "$repo" rev-parse --verify "$ref^{commit}")
@@ -248,6 +344,21 @@ start() {
     if [ "${CHECK_SCRATCH_DB:-}" = 1 ] &&
         ! git -C "$repo" merge-base --is-ancestor 6c9f03c "$commit" 2>/dev/null; then
         echo "CHECK_SCRATCH_DB=1 is refused for $ref ($commit): it predates SME-115's fix, so a server serving it on a scratch database deletes the dev server's sandbox claims" >&2
+        exit 1
+    fi
+    # The scratch lock, after the refusals (a refused start never waits) and
+    # before the "already running" check, held until this start writes its
+    # pid file: a stop of the same database waits for it, so it can't take
+    # its no-server branch and drop a database a starting server is about to
+    # use (SME-129). A start that has to wait says so.
+    local db_url
+    if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
+        db_url=$(scratch_db_url)
+        take_scratch_lock "$(db_name "$db_url")"
+    fi
+
+    if running_pgid >/dev/null; then
+        echo "a check server is already running; scripts/check-server stop first" >&2
         exit 1
     fi
     # The port, after the refusals (a refused start never waits) and before
@@ -300,12 +411,21 @@ start() {
         exit 1
     fi
     if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
-        local db_url
-        db_url=$(scratch_db_url)
+        # A leftover scratch database's objects are cleaned up before it is
+        # dropped and made again (SME-129): dropping it strands every pod and
+        # claim its server labelled, since nothing else names its instance.
+        # The URL and the cluster are recorded first, so the cleanup talks to
+        # the server's own cluster and a failed start's `stop` knows which
+        # database to finish.
+        echo "$db_url" >"$(scratch_db_file)"
+        effective_value KUBECONFIG >"$(kubeconfig_file)"
+        if ! cleanup_scratch "$db_url"; then
+            echo "start: the leftover scratch database's sandbox objects weren't all deleted; scripts/check-server stop (it retries), then start again" >&2
+            exit 1
+        fi
         # Start from an empty database, even after a run that failed to drop it.
         sqlx database drop -y --database-url "$db_url" >/dev/null
         sqlx database create --database-url "$db_url"
-        echo "$db_url" >"$(scratch_db_file)"
         # Before the caller's overrides, so an explicit DATABASE_URL still wins.
         overrides=("DATABASE_URL=$db_url" "${overrides[@]}")
         echo "serving from scratch database ${db_url##*/}"
@@ -347,6 +467,12 @@ start() {
     # setsid made the child a group leader: its pid is the group's id.
     local pgid=$!
     echo "$pgid" >"$(pid_file)"
+    # The pid file is written, so a stop may take over from here: this start
+    # lets go of the scratch lock before it waits for the server to answer,
+    # which can take minutes (SME-129).
+    if [ "${CHECK_SCRATCH_DB:-}" = 1 ]; then
+        exec 9>&-
+    fi
     echo "building $(git -C "$worktree" log --oneline -1) (log: $(log_file))"
     echo "logging at RUST_LOG=$log_level ($log_note)"
 
@@ -378,7 +504,7 @@ case "${1:-}" in
         fi
         ;;
     *)
-        sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,67p' "$0" | sed 's/^# \{0,1\}//'
         exit 2
         ;;
 esac
