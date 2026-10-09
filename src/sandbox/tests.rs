@@ -1030,6 +1030,31 @@ fn test_pod_start_timeline_orders_tied_stages_as_they_happen() {
     );
 }
 
+/// SME-132 review 1: an event recorded through `events.k8s.io` (the
+/// scheduler's) reads back through core/v1 with no `count` or
+/// `lastTimestamp`, its repeats in `series`. The report counts and orders
+/// it by the series.
+#[test]
+fn test_pod_start_report_reads_an_event_series() {
+    let pod = report_pod(&[("PodScheduled", "False", 0, "Unschedulable", "")], serde_json::json!([]), serde_json::json!([]));
+    let series: k8s_openapi::api::core::v1::Event = serde_json::from_value(serde_json::json!({
+        "metadata": {"name": "sandbox-report.series"},
+        "involvedObject": {"kind": "Pod", "name": "sandbox-report"},
+        "type": "Warning",
+        "reason": "FailedScheduling",
+        "eventTime": report_at(0).replace('Z', ".000000Z"),
+        "series": {"count": 12, "lastObservedTime": report_at(80).replace('Z', ".000000Z")},
+        "message": "0/1 nodes are available",
+    }))
+    .expect("an event fixture");
+    let newer_once = report_event("Warning", "FailedMount", 1, 40, "once");
+    let report = pod_start_report(&pod, Ok(&[newer_once, series]), report_now());
+    assert!(report.contains("FailedScheduling (×12)"), "got {report}");
+    let scheduling = report.find("FailedScheduling").expect("listed");
+    let mount = report.find("FailedMount").expect("listed");
+    assert!(scheduling < mount, "the series was last seen later, so it comes first: {report}");
+}
+
 /// A start that succeeds after more than half its timeout is slow, and
 /// logged; one at or under half isn't (SME-132).
 #[test]

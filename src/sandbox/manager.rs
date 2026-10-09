@@ -454,10 +454,15 @@ fn container_state(status: &k8s_openapi::api::core::v1::ContainerStatus) -> Stri
 /// as "FailedMount (×4): …", each message cut to
 /// `REPORT_MAX_MESSAGE_CHARS`.
 fn describe_events(events: &[Event]) -> String {
+    // An event recorded through `events.k8s.io` (the scheduler's) has no
+    // `count` or `lastTimestamp` here: its repeats are in `series`
+    // (SME-132 review 1).
     let last_seen = |e: &Event| {
-        e.last_timestamp
+        e.series
             .as_ref()
+            .and_then(|s| s.last_observed_time.as_ref())
             .map(|t| t.0)
+            .or_else(|| e.last_timestamp.as_ref().map(|t| t.0))
             .or_else(|| e.event_time.as_ref().map(|t| t.0))
             .or_else(|| e.first_timestamp.as_ref().map(|t| t.0))
     };
@@ -472,7 +477,7 @@ fn describe_events(events: &[Event]) -> String {
             if cut.len() < message.len() {
                 cut.push('…');
             }
-            format!("{} (×{}): {cut}", e.reason.as_deref().unwrap_or("no reason"), e.count.unwrap_or(1))
+            format!("{} (×{}): {cut}", e.reason.as_deref().unwrap_or("no reason"), e.series.as_ref().and_then(|s| s.count).or(e.count).unwrap_or(1))
         })
         .collect::<Vec<_>>()
         .join(" | ")
