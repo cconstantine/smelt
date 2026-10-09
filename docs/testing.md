@@ -367,6 +367,7 @@ It runs these scenarios, in order, each its own `scenario_*` function, in one `#
 25. An OAuth MCP server taking extra headers (SME-76).
 26. A tab older than the server (SME-43): an event type the bundle doesn't know (`ConversationEvent::BrowserTestAddedLater`, which only exists with `browser-test`, so the `dx build` bundle really lacks it) neither ends the stream nor loses the next event, and asks for a reload; a reconnect to a server with another build id (`api::version::test_override`) does too, on the chat and Sandboxes pages; Reload clears it.
 27. A small scroll up in the transcript staying where it was put (SME-83).
+28. Switching away from a conversation and back leaving its sandbox terminal following its last line, never painted at its top — unhurried, racing the rebuild, mid-burst, rapid repeated switches, a reload with completed output, and the same switch-back at phone width through the drawer; plus a window resize landing on the follow mid-stream, a user scroll-up mid-stream, and a window grow clamping a reader back onto the bottom, which the sticky logic must tell apart (SME-108).
 
 Then, unnumbered: a repo's AGENTS.md waiting for the user's trust, and trusting it loading exactly that file (SME-32); and switching conversations closing the context detail view (SME-51 B11).
 

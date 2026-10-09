@@ -30,11 +30,19 @@ pub(super) fn is_scrolled_to_bottom(scroll_top: f64, scroll_height: f64, client_
 pub(super) struct StickyBottom {
     el: Signal<Option<MountedEvent>>,
     stuck: Signal<bool>,
+    /// The last scroll event's position and client height: whether the view
+    /// can have moved on its own since then, and whether the viewport did. See
+    /// `scrolled`.
+    last_scroll: Signal<Option<(f64, f64)>>,
 }
 
 /// A `StickyBottom` that starts stuck, so new content shows.
 pub(super) fn use_sticky_bottom() -> StickyBottom {
-    StickyBottom { el: use_signal(|| None), stuck: use_signal(|| true) }
+    StickyBottom {
+        el: use_signal(|| None),
+        stuck: use_signal(|| true),
+        last_scroll: use_signal(|| None),
+    }
 }
 
 impl StickyBottom {
@@ -45,9 +53,46 @@ impl StickyBottom {
 
     /// For the element's `onscroll`: whether the user is still at the
     /// bottom.
+    ///
+    /// A resize, a zoom or any other layout change fires the event with a
+    /// viewport height the previous event never had, and the browser puts the
+    /// view where its own clamp says it must go (SME-108: the clamp looked
+    /// exactly like a scroll-up, so the terminal — and the transcript, same
+    /// hook — stopped following its bottom for good after a single resize,
+    /// with nothing the user had done to ask for that; and growing the window
+    /// clamps a reader down *onto* the bottom, which read as a request to
+    /// start following again a moment after they'd asked not to be). Such an
+    /// event says nothing about intent, so the follow stays exactly as it
+    /// was. With the viewport height steady, the position is the user's own
+    /// and does say: at the bottom means following again, up from where they
+    /// were means they stopped. Nothing else scrolls the view while the
+    /// follow is off — the browser's own habit of pinning a scroller that sits
+    /// at its end onto each new bottom is turned off for these elements by
+    /// `overflow-anchor: none` (assets/chat.css), which is what makes that
+    /// reading safe. The scroll height is not part of the test: it grows with
+    /// streaming output on every event, whether or not the user is scrolling.
     pub(super) fn scrolled(mut self, data: &ScrollData) {
-        self.stuck
-            .set(is_scrolled_to_bottom(data.scroll_top(), data.scroll_height() as f64, data.client_height() as f64));
+        let (top, height, client) =
+            (data.scroll_top(), data.scroll_height() as f64, data.client_height() as f64);
+        let last = *self.last_scroll.peek();
+        self.last_scroll.set(Some((top, client)));
+        let Some((last_top, last_client)) = last else {
+            // The first event since the element mounted, so nothing can have
+            // resized yet: the position is the view's own, and at the bottom
+            // means following.
+            if is_scrolled_to_bottom(top, height, client) {
+                self.stuck.set(true);
+            }
+            return;
+        };
+        if (client - last_client).abs() >= 0.5 {
+            return;
+        }
+        if is_scrolled_to_bottom(top, height, client) {
+            self.stuck.set(true);
+        } else if top < last_top - 1.0 {
+            self.stuck.set(false);
+        }
     }
 
     /// Back to following the bottom, as when a conversation opens.
