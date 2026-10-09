@@ -4447,8 +4447,10 @@ async fn scenario_llama_cpp_provider(t: &Scenario<'_>) {
 /// fixed delay instead gives the test a window it has to land in, which a
 /// slow runner can miss.
 ///
-/// Every request gets the same `200` with `body`. Dropping it stops the
-/// server, and a request still held closes unanswered.
+/// Every request gets the same `200` with `body`. Dropping it stops
+/// accepting connections, and a request still held closes unanswered. A
+/// connection that hasn't sent its request yet (a preconnect) is left to
+/// its client; one sent after a `release` is still answered.
 struct HeldPage {
     address: String,
     requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
