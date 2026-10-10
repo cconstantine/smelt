@@ -167,7 +167,7 @@ A public GHCR package needs neither the secret nor the setting; the Docker sidec
 
 `scripts/build-sandbox-image.sh`, `scripts/cluster-doctor` and the import loader are then dev and CI machinery: a deployment pulling images never runs them, and `cluster-doctor`'s `ctr images ls` check would report the node has no image it isn't looking for.
 
-The builds themselves have been run: this Dockerfile produced the server image, which starts against a real Postgres, applies its migrations, and serves the app and its assets from the bundle beside it. What hasn't been tried is the rest of the route — pulling from GHCR instead of out of a local build, and a sandbox pod started from the published sandbox image.
+The builds themselves have been run: this Dockerfile produced the server image, which starts against a real Postgres, applies its migrations, and serves the app and its assets from the bundle beside it. And both images have been pulled back out of GHCR by tag and tried again as pulled — the server image against a database nothing had touched, where it applied all its migrations and served its own bundle's assets, and the sandbox image's agent, whose libraries all resolve. What hasn't been tried is the last step: a sandbox pod started from the published sandbox image against a real cluster.
 
 ### Before you expose it
 
