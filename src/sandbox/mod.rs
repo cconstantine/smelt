@@ -16,9 +16,9 @@ use futures_util::{SinkExt, StreamExt};
 #[cfg(test)]
 use futures_util::FutureExt;
 use k8s_openapi::api::core::v1::{
-    Container, EmptyDirVolumeSource, EnvVar, ExecAction, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    PersistentVolumeClaimVolumeSource, Pod, PodSpec, Probe, ResourceRequirements, SecurityContext,
-    Volume, VolumeMount, VolumeResourceRequirements,
+    Container, EmptyDirVolumeSource, EnvVar, ExecAction, LocalObjectReference, PersistentVolumeClaim,
+    PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, Pod, PodSpec, Probe, ResourceRequirements,
+    SecurityContext, Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;

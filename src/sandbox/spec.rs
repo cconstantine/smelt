@@ -92,7 +92,8 @@ pub(super) fn how_to_build(image: &str) -> &'static str {
 fn image_never_pull_advice(image: &str) -> String {
     format!(
         "The cluster's node doesn't have this image, and sandbox pods never pull one. It can't be built \
-         or imported from a sandbox, so don't retry create_pod: {}",
+         or imported from a sandbox, so don't retry create_pod: {}. If the image is meant to come from a \
+         registry instead, that's SANDBOX_IMAGE_PULL_POLICY being unset.",
         how_to_build(image)
     )
 }
@@ -472,6 +473,72 @@ pub(super) fn default_docker_image() -> String {
         .unwrap_or_else(|| "docker.io/library/docker:29-dind".to_string())
 }
 
+/// The pull policies Kubernetes accepts on a container's image.
+const IMAGE_PULL_POLICIES: [&str; 3] = ["Never", "IfNotPresent", "Always"];
+
+/// `SANDBOX_IMAGE_PULL_POLICY`, default `Never` — the policy both of a pod's
+/// containers fetch their image with, so one setting covers the pair.
+/// `Never` is right for the images `scripts/build-sandbox-image.sh` delivers
+/// straight into the node's containerd: they're in no registry a pod could
+/// reach, and a real pull would only fail. A deployment that publishes its
+/// images to a registry sets `IfNotPresent` (or `Always`) instead — see
+/// `image_pull_policy_from` for how the setting is read, and docs/setup.md
+/// for the pull credentials a private registry needs.
+pub(super) fn default_image_pull_policy() -> &'static str {
+    let setting = std::env::var("SANDBOX_IMAGE_PULL_POLICY").ok().map(|s| s.trim().to_string());
+    let policy = image_pull_policy_from(setting.as_deref());
+    // A typo here otherwise shows up as a pod that simply won't start, so
+    // say what was ignored — the same "fall back and log" posture as
+    // SMELT_PREVIEW_URL's invalid value.
+    if let Some(ignored) = setting.filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(policy)) {
+        tracing::warn!(
+            "SANDBOX_IMAGE_PULL_POLICY={ignored} isn't a pull policy, so it's ignored: use Never, \
+             IfNotPresent or Always"
+        );
+    }
+    policy
+}
+
+/// The pull policy a `SANDBOX_IMAGE_PULL_POLICY` of `setting` asks for, in
+/// Kubernetes' own spelling whatever case it was written in — or `Never`,
+/// when it's unset, empty, or not one of `IMAGE_PULL_POLICIES`.
+pub(super) fn image_pull_policy_from(setting: Option<&str>) -> &'static str {
+    setting
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| IMAGE_PULL_POLICIES.iter().find(|p| p.eq_ignore_ascii_case(s)).copied())
+        .unwrap_or("Never")
+}
+
+/// `SANDBOX_IMAGE_PULL_SECRET` — the names, comma-separated, of the pull
+/// credentials a sandbox pod fetches its images with. A registry that asks to
+/// be authenticated first (GHCR's private packages among them) otherwise gives
+/// the pod nothing to present, and both pulls fail with `pull access denied`.
+/// The secrets themselves are `kubernetes.io/dockerconfigjson` objects in
+/// `smelt-park`, where the pods run — see docs/setup.md. Unset, as it is for
+/// images built straight into the node, and the pod pulls however the
+/// namespace's own service account does, which is how it has always worked.
+pub(super) fn default_image_pull_secrets() -> Option<Vec<LocalObjectReference>> {
+    let secrets = image_pull_secrets_from(std::env::var("SANDBOX_IMAGE_PULL_SECRET").ok().as_deref());
+    (!secrets.is_empty()).then_some(secrets)
+}
+
+/// The pull credentials a `SANDBOX_IMAGE_PULL_SECRET` of `setting` names: one
+/// per comma-separated entry, spaces trimmed, blanks dropped. Empty when the
+/// setting names nothing at all.
+pub(super) fn image_pull_secrets_from(setting: Option<&str>) -> Vec<LocalObjectReference> {
+    setting
+        .into_iter()
+        .flat_map(|setting| setting.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| LocalObjectReference {
+            name: name.to_string(),
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// Starts dockerd inside the sidecar's own cgroup instead of through the
 /// docker:dind image's entrypoint; see the script's own comment.
 pub(super) const START_DOCKERD_SCRIPT: &str = include_str!("../../docker/sandbox/start-dockerd.sh");
@@ -532,9 +599,10 @@ pub(super) fn build_pod_spec(
             init_containers: Some(vec![Container {
                 name: "docker".to_string(),
                 image: Some(default_docker_image()),
-                // Delivered into the node like the sandbox image, see
-                // scripts/build-sandbox-image.sh.
-                image_pull_policy: Some("Never".to_string()),
+                // Fetched the same way as the sandbox image — see
+                // `default_image_pull_policy`, which explains why the
+                // default is `Never`.
+                image_pull_policy: Some(default_image_pull_policy().to_string()),
                 restart_policy: Some("Always".to_string()),
                 security_context: Some(SecurityContext {
                     privileged: Some(true),
@@ -571,15 +639,16 @@ pub(super) fn build_pod_spec(
             containers: vec![Container {
                 name: "sandbox".to_string(),
                 image: Some(default_sandbox_image()),
-                // `Never`, not Kubernetes' default (`IfNotPresent` for a
-                // tag like `src-<hash>`, `Always` for `:latest`): this
-                // image is delivered straight into the node's local image
-                // store (`ctr images import`, see
-                // scripts/build-sandbox-image.sh) with no registry
-                // involved at all — a real pull would just fail (there's
-                // no such image on any real registry to pull), which is
-                // exactly what happened the first time this was left unset.
-                image_pull_policy: Some("Never".to_string()),
+                // The default `Never`, not Kubernetes' own (`IfNotPresent`
+                // for a tag like `src-<hash>`, `Always` for `:latest`): the
+                // image scripts/build-sandbox-image.sh delivers went straight
+                // into the node's local image store (`ctr images import`)
+                // with no registry involved at all — a real pull would just
+                // fail (there's no such image on any real registry to pull),
+                // which is exactly what happened the first time this was left
+                // unset. A deployment whose images are in a registry says so
+                // with SANDBOX_IMAGE_PULL_POLICY.
+                image_pull_policy: Some(default_image_pull_policy().to_string()),
                 // No `command` override — the image's own `ENTRYPOINT` is
                 // the sandbox agent, so it's already running (and keeping
                 // the pod alive) the moment the container starts. See
@@ -589,6 +658,12 @@ pub(super) fn build_pod_spec(
                 ..Default::default()
             }],
             volumes: Some(pod_volumes),
+            // Only set when SANDBOX_IMAGE_PULL_SECRET names secrets: an
+            // image that never came from a registry needs no credentials, and
+            // gets none. Both containers fetch theirs the same way, so one
+            // pod-level setting covers the pair, as SANDBOX_IMAGE_PULL_POLICY
+            // does.
+            image_pull_secrets: default_image_pull_secrets(),
             restart_policy: Some("Never".to_string()),
             ..Default::default()
         }),
