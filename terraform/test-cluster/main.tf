@@ -10,9 +10,13 @@
 # The k3s image matters: sandbox pods use native sidecar containers, which a
 # k3d default image (1.28-era) refuses. Pin the one docs/setup.md pins.
 #
-# Sandbox/server images can't be pulled from GHCR inside the node (the registry
-# is unreachable from the k3d network on some sandboxes), so import them into
-# the node's containerd before the first pod start:
+# Whether a GHCR pull reaches the node depends on where the cluster runs: on
+# the machine hosting this sandbox, containers behind its Docker daemon cannot
+# finish a TLS handshake to ghcr.io at all (plain docker bridge or k3d network
+# alike; verified 2026-10-11) while the host itself reaches it fine. A normal
+# cluster — including the homelab this module ships to — pulls both images from
+# GHCR directly, as it would pull anything else. Where the registry doesn't
+# reach, import the images into the node's containerd before the first start:
 #
 #   docker cp <image>.tar k3d-smelt-test-server-0:/tmp/
 #   docker exec k3d-smelt-test-server-0 \
