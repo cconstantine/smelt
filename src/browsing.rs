@@ -59,7 +59,6 @@ pub enum BrowserInputEvent {
 #[cfg(feature = "server")]
 mod server {
     use std::collections::HashMap;
-    use std::net::IpAddr;
 
     use crate::egress_proxy::SandboxDial;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -192,16 +191,9 @@ mod server {
 
     struct Session {
         id: u64,
-        /// The address check this session's loads go through; `navigate`
-        /// checks a new address against it before loading anything.
-        is_addr_allowed: fn(IpAddr) -> bool,
-        /// This session's own browser context — see `open_session_with_guard`.
+        /// This session's own browser context — see `open_session`.
         context: crate::webfetch::IsolatedContext,
-        /// Whether `localhost` in this session means the conversation's
-        /// sandbox (SME-42) — `navigate` checks a new address with it.
-        sandbox_routed: bool,
         page: Page,
-        intercept_task: tokio::task::JoinHandle<()>,
         /// The latest frame, as a template for new viewers' receivers — a
         /// `watch` channel rather than a broadcast one, because Chrome only
         /// sends a frame when something on screen changes: a viewer joining
@@ -223,37 +215,13 @@ mod server {
 
     /// Opens a browsing session for `conversation_id` — refuses if one is
     /// already open (mirrors `create_pod`'s own "refuses if a pod already
-    /// exists" precedent; `close_session` first). Always uses the real,
-    /// strict `fetch_guard::is_safe_fetch_addr` — see
-    /// `open_session_with_guard` for why a test-only seam exists at all.
-    pub async fn open_session(conversation_id: i64, sandbox: SandboxDial) -> Result<(), String> {
-        open_session_routed(conversation_id, fetch_guard::is_safe_fetch_addr, Some(sandbox)).await
-    }
-
-    /// The real implementation behind `open_session`, parameterized on the
-    /// address-safety predicate — same reason `webfetch::fetch_with_guard`
-    /// has this seam: every locally-reachable address in this dev
-    /// container is either loopback or RFC1918-private, so exercising
-    /// "does a real navigation actually get through" needs a relaxed
-    /// variant in tests, while the real `open_session` above always uses
-    /// the strict guard.
-    #[cfg(all(test, feature = "browser-test"))]
-    pub(crate) async fn open_session_with_guard(
+    /// exists" precedent; `close_session` first). With `sandbox`, the
+    /// session's browser context sends `localhost`-style hosts and pod
+    /// container addresses to the conversation's sandbox (SME-42, SME-33).
+    pub async fn open_session(
         conversation_id: i64,
-        is_addr_allowed: fn(IpAddr) -> bool,
-    ) -> Result<(), String> {
-        open_session_routed(conversation_id, is_addr_allowed, None).await
-    }
-
-    /// `open_session_with_guard` plus an optional sandbox route: with one,
-    /// the session's browser context sends `localhost`-style hosts to the
-    /// conversation's sandbox (SME-42).
-    async fn open_session_routed(
-        conversation_id: i64,
-        is_addr_allowed: fn(IpAddr) -> bool,
         sandbox: Option<SandboxDial>,
     ) -> Result<(), String> {
-        let sandbox_routed = sandbox.is_some();
         let _lifecycle = SESSION_LIFECYCLE.lock().await;
         if sessions().contains_key(&conversation_id) {
             return Err(
@@ -266,18 +234,14 @@ mod server {
         // conversations ever share cookies, storage or service workers, and
         // closing the session deletes everything it stored.
         let (page, context) = crate::webfetch::new_isolated_page(sandbox).await?;
-        let intercept_task = match configure_session_page(&page, is_addr_allowed, sandbox_routed).await {
-            Ok(task) => task,
-            Err(e) => {
-                crate::webfetch::dispose_isolated(context).await;
-                return Err(e);
-            }
-        };
+        if let Err(e) = configure_session_page(&page).await {
+            crate::webfetch::dispose_isolated(context).await;
+            return Err(e);
+        }
         let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let url_task = match watch_url(conversation_id, session_id, &page).await {
             Ok(task) => task,
             Err(e) => {
-                intercept_task.abort();
                 crate::webfetch::dispose_isolated(context).await;
                 return Err(e);
             }
@@ -289,13 +253,10 @@ mod server {
             conversation_id,
             Session {
                 id: session_id,
-                is_addr_allowed,
                 context,
-                sandbox_routed,
                 current_url: "about:blank".to_string(),
                 url_task,
                 page,
-                intercept_task,
                 latest_frame,
                 frame_subscriber_count: 0,
                 want_screencast,
@@ -309,15 +270,10 @@ mod server {
         Ok(())
     }
 
-    /// Everything a fresh session page needs before it's handed out —
-    /// pinned viewport plus SSRF interception. Split out so
-    /// `open_session_with_guard` can close the page if any step fails,
-    /// rather than leaking it in the shared browser.
-    async fn configure_session_page(
-        page: &Page,
-        is_addr_allowed: fn(IpAddr) -> bool,
-        sandbox_routed: bool,
-    ) -> Result<tokio::task::JoinHandle<()>, String> {
+    /// Everything a fresh session page needs before it's handed out: pin
+    /// the viewport. Split out so `open_session` can close the page if the
+    /// step fails, rather than leaking it in the shared browser.
+    async fn configure_session_page(page: &Page) -> Result<(), String> {
         // Pins this page's viewport to exactly the screencast's own
         // max dimensions (device_scale_factor 1, no mobile emulation) —
         // otherwise every screencast frame's actual pixel size depends on
@@ -333,8 +289,8 @@ mod server {
             false,
         ))
         .await
-        .map_err(|e| format!("failed to set the session's viewport: {e}"))?;
-        fetch_guard::spawn_request_interceptor(page, is_addr_allowed, sandbox_routed).await
+        .map(|_| ())
+        .map_err(|e| format!("failed to set the session's viewport: {e}"))
     }
 
     /// Closes `conversation_id`'s browsing session — a no-op (not an
@@ -346,7 +302,6 @@ mod server {
         let _lifecycle = SESSION_LIFECYCLE.lock().await;
         let session = sessions().remove(&conversation_id);
         if let Some(session) = session {
-            session.intercept_task.abort();
             session.screencast_task.abort();
             session.url_task.abort();
             // Closes the page and deletes everything the session stored.
@@ -852,20 +807,13 @@ mod server {
     /// the resulting page's state.
     pub async fn navigate(conversation_id: i64, url: &str) -> Result<PageState, String> {
         let page = live_page(conversation_id)?;
-        // Checked before loading, so a refused address leaves the session
-        // on its current page instead of Chrome's blank error page, and
-        // the error says why (SME-40 F11). `check_load` also refuses a
-        // `data:` (or similar) URL, which the request interceptor can't see
-        // because it never touches the network. The interceptor still
-        // guards everything the page loads after this, redirects included.
-        let (is_addr_allowed, sandbox_routed) = sessions()
-            .get(&conversation_id)
-            .map_or((fetch_guard::is_safe_fetch_addr as fn(IpAddr) -> bool, false), |s| {
-                (s.is_addr_allowed, s.sandbox_routed)
-            });
-        fetch_guard::check_load(url, is_addr_allowed, sandbox_routed)
-            .await
-            .map_err(|e| format!("refused {url}: {e}; smelt doesn't load private or local addresses"))?;
+        // Checked before loading, so a bad URL leaves the session on its
+        // current page instead of Chrome's blank error page, and the error
+        // says why (SME-40 F11). Only the scheme is checked — addresses
+        // aren't filtered any more (SME-155) — and a `data:` (or similar)
+        // URL never reaches the network, so this pre-load check is what
+        // refuses it.
+        fetch_guard::parse_fetch_target(url).map_err(|e| format!("refused {url}: {e}"))?;
         tokio::time::timeout(NAV_TIMEOUT, page.goto(url))
             .await
             .map_err(|_| format!("timed out loading {url}"))?
@@ -1051,14 +999,6 @@ mod server {
     pub(crate) mod browser_tests {
         use super::*;
 
-        /// Same seam `webfetch::browser_tests::allow_loopback_too`
-        /// already establishes, same reason: every locally-reachable
-        /// address in this dev container is either loopback or
-        /// RFC1918-private.
-        fn allow_loopback_too(addr: IpAddr) -> bool {
-            fetch_guard::is_safe_fetch_addr(addr) || addr.is_loopback()
-        }
-
         async fn start_test_server(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
             let router = axum::Router::new().route(
                 "/",
@@ -1188,7 +1128,7 @@ mod server {
                  <a href=\"#\">a link</a></body></html>",
             )
             .await;
-            open_session_with_guard(conversation_id, allow_loopback_too)
+            open_session(conversation_id, None)
                 .await
                 .expect("open_session should succeed");
             let state = navigate(conversation_id, &url)
@@ -1208,22 +1148,20 @@ mod server {
             // --- Scenario 2: opening a second session for the same
             // conversation is refused (mirrors create_pod). ---
             let second_open =
-                open_session_with_guard(conversation_id, allow_loopback_too).await;
+                open_session(conversation_id, None).await;
             assert!(
                 second_open.is_err(),
                 "expected a second open_session for the same conversation to be refused"
             );
 
-            // --- Scenario 3 (riskiest assumption #1): interception
-            // enabled once when the session opened still applies on a
-            // *later*, separate navigate call on the same page — not
-            // just within the one `goto` a single `webfetch` call
-            // makes. ---
-            let blocked = navigate(conversation_id, "http://169.254.169.254/").await;
+            // --- Scenario 3: the URL checks run on every call, not just
+            // the first one after a session opens — a non-http scheme is
+            // refused on a later `navigate` too. ---
+            let blocked = navigate(conversation_id, "file:///etc/passwd").await;
             assert!(
                 blocked.is_err(),
-                "expected a later navigate on an already-open session to still be \
-                 SSRF-guarded, got: {blocked:?}"
+                "expected a later navigate on an already-open session to still \
+                 reject a non-http scheme, got: {blocked:?}"
             );
 
             close_session(conversation_id)
@@ -1242,7 +1180,7 @@ mod server {
             // fill, go_back — a fresh session against a small multi-page
             // fixture. ---
             let (base, _server) = start_interactive_test_server().await;
-            open_session_with_guard(conversation_id, allow_loopback_too)
+            open_session(conversation_id, None)
                 .await
                 .expect("re-open_session should succeed");
             let state = navigate(conversation_id, &base)
@@ -1534,7 +1472,7 @@ mod server {
             // conversation when it finally drops. ---
             let stale_sub = subscribe_frames(conversation_id).expect("subscribe should succeed");
             close_session(conversation_id).await.expect("close should succeed");
-            open_session_with_guard(conversation_id, allow_loopback_too)
+            open_session(conversation_id, None)
                 .await
                 .expect("re-open should succeed");
             navigate_to_animated_page(conversation_id).await;
@@ -1570,8 +1508,8 @@ mod server {
             // — exactly one wins; the other is refused rather than
             // silently replacing (and leaking) the first. ---
             let (first, second) = tokio::join!(
-                open_session_with_guard(conversation_id, allow_loopback_too),
-                open_session_with_guard(conversation_id, allow_loopback_too),
+                open_session(conversation_id, None),
+                open_session(conversation_id, None),
             );
             assert_eq!(
                 [first.is_ok(), second.is_ok()].iter().filter(|ok| **ok).count(),
@@ -1583,7 +1521,7 @@ mod server {
                 .await
                 .expect("close_session should succeed");
 
-            open_session_with_guard(conversation_id, allow_loopback_too)
+            open_session(conversation_id, None)
                 .await
                 .expect("open for the remaining scenarios should succeed");
 
@@ -1708,7 +1646,7 @@ mod server {
             // in progress (deleting the conversation mid-open) wins —
             // the session doesn't reappear once the open finishes. ---
             let (opened, _) = tokio::join!(
-                open_session_with_guard(conversation_id, allow_loopback_too),
+                open_session(conversation_id, None),
                 async {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     close_session(conversation_id).await
@@ -1723,7 +1661,7 @@ mod server {
                 .await
                 .expect("close_session should succeed");
 
-            open_session_with_guard(conversation_id, allow_loopback_too)
+            open_session(conversation_id, None)
                 .await
                 .expect("open for the remaining scenarios should succeed");
 
@@ -1784,16 +1722,13 @@ mod server {
                 .expect("filling multi-line text should succeed");
             assert_eq!(field_value(&page, "#notes").await, "line one\nline two");
 
-            // --- Scenario 24: nothing a page does can reach an address the
-            // guard refuses — not a popup (window.open or a target=_blank
-            // link), not a WebSocket, not a service worker. The forbidden
-            // server listens on this machine's own private address, which
-            // even the test's loopback-allowing guard refuses. ---
-            let forbidden = start_forbidden_server().await;
-            let (escape_url, _escape_server) = start_escape_test_server(&forbidden).await;
+            // --- Scenario 24: a session opens no popup tab, and the pages
+            // behind its `window.open` button and target=_blank link are
+            // never requested at all. ---
+            let (escape_url, hits, _escape_server) = start_popup_test_server().await;
             let state = navigate(conversation_id, &escape_url)
                 .await
-                .expect("navigate to the escape page should succeed");
+                .expect("navigate to the popup page should succeed");
             let open_pages = || async {
                 crate::webfetch::shared_browser()
                     .await
@@ -1812,11 +1747,10 @@ mod server {
                 .await
                 .expect("clicking the target=_blank link should succeed");
             tokio::time::sleep(Duration::from_secs(3)).await;
-            let hits = forbidden.hits.lock().unwrap().clone();
+            let hits = hits.lock().unwrap().clone();
             assert!(
                 hits.is_empty(),
-                "a page reached the forbidden address {}: {hits:?}",
-                forbidden.addr
+                "a blocked popup still requested its page: {hits:?}"
             );
             assert_eq!(
                 open_pages().await,
@@ -1850,14 +1784,16 @@ mod server {
                 current_url(conversation_id),
                 Some(format!("{base}/pushed"))
             );
-            // A refused address isn't loaded at all: the error says why,
-            // and the session stays on the page it was on. It used to load
-            // and be blocked mid-way, leaving Chrome's blank error page
+            // A refused URL isn't loaded at all: the error says why, and the
+            // session stays on the page it was on. It used to load and be
+            // blocked mid-way, leaving Chrome's blank error page
             // (`chrome-error://chromewebdata/`) as the current page, which
             // the model then read (SME-40 F11).
-            let refused = "http://169.254.169.254/";
-            let error = navigate(conversation_id, refused).await.expect_err("a refused address");
-            assert!(error.contains("private or local"), "the refusal should say why: {error}");
+            let refused = "file:///etc/passwd";
+            let error = navigate(conversation_id, refused)
+                .await
+                .expect_err("a non-http scheme is refused before anything loads");
+            assert!(error.contains("unsupported scheme"), "the refusal should say why: {error}");
             assert_eq!(current_url(conversation_id), Some(format!("{base}/pushed")));
             let still_here = read(conversation_id).await.expect("read after a refusal");
             assert_eq!(still_here.url, format!("{base}/pushed"), "the session left its page");
@@ -1872,10 +1808,10 @@ mod server {
             // conversation's, and gone once the session is closed. ---
             let first = conversation_id;
             let second = conversation_id + 1;
-            open_session_with_guard(first, allow_loopback_too)
+            open_session(first, None)
                 .await
                 .expect("open the first conversation's session");
-            open_session_with_guard(second, allow_loopback_too)
+            open_session(second, None)
                 .await
                 .expect("open the second conversation's session");
             navigate(first, &format!("{base}/set-data"))
@@ -1898,7 +1834,7 @@ mod server {
                 other.text
             );
             close_session(first).await.expect("close the first session");
-            open_session_with_guard(first, allow_loopback_too)
+            open_session(first, None)
                 .await
                 .expect("reopen the first conversation's session");
             let reopened = navigate(first, &format!("{base}/show-data"))
@@ -1913,9 +1849,8 @@ mod server {
             close_session(second).await.expect("close the second session");
 
             // --- SME-42: a session with a sandbox route loads `localhost`
-            // from the sandbox under the strict guard — the navigation and
-            // the page's own requests alike — while a session without one
-            // still refuses it. ---
+            // from the sandbox — the navigation and the page's own requests
+            // alike. ---
             let (sandbox_url, _sandbox_server) = start_test_server(
                 "<html><body><div id=\"out\">pending</div><script>\
                  fetch('http://localhost:4400/').then(\
@@ -1931,9 +1866,8 @@ mod server {
                 .expect("a test server address");
             let dialed = std::sync::Arc::new(Mutex::new(Vec::new()));
             let routed: i64 = 900_101;
-            open_session_routed(
+            open_session(
                 routed,
-                fetch_guard::is_safe_fetch_addr,
                 Some(crate::egress_proxy::dial_to(sandbox_addr, dialed.clone())),
             )
             .await
@@ -1949,15 +1883,6 @@ mod server {
             loaded.expect("a routed session should load localhost from the sandbox");
             assert!(text.contains("in-page fetch 200"), "the page's own request to localhost failed: {text:?}");
             assert!(dialed.lock().unwrap().iter().all(|&(_, p)| p == 4400), "unexpected ports: {dialed:?}");
-
-            let unrouted: i64 = 900_102;
-            open_session_with_guard(unrouted, fetch_guard::is_safe_fetch_addr)
-                .await
-                .expect("open an unrouted session");
-            let refused = navigate(unrouted, "http://localhost:4400/").await;
-            close_session(unrouted).await.expect("close the unrouted session");
-            let error = refused.expect_err("a session without a sandbox route must refuse localhost");
-            assert!(error.contains("private or local"), "the refusal should say why: {error}");
 
             // --- SME-42 review: a page from another site, open in a routed
             // session, can't reach the sandbox — not by fetch, an image or a
@@ -1978,9 +1903,8 @@ mod server {
             });
             let reached = std::sync::Arc::new(Mutex::new(Vec::new()));
             let guarded: i64 = 900_103;
-            open_session_routed(
+            open_session(
                 guarded,
-                allow_loopback_too,
                 Some(crate::egress_proxy::dial_to(sandbox_addr, reached.clone())),
             )
             .await
@@ -2020,7 +1944,7 @@ mod server {
             let conversation_id: i64 = 900_119;
             let (url, _server) =
                 start_test_server("<html><body><h1>Opened after a poisoning</h1></body></html>").await;
-            open_session_with_guard(conversation_id, allow_loopback_too)
+            open_session(conversation_id, None)
                 .await
                 .expect("a session should open on a recovered lock");
             let state = navigate(conversation_id, &url)
@@ -2052,95 +1976,26 @@ mod server {
         pub(crate) const SEES_FIRST_DATA: &str = "cookie=[smelt_probe=from-first] storage=[from-first]";
         pub(crate) const SEES_NO_DATA: &str = "cookie=[] storage=[]";
 
-        /// A server on this machine's own private (non-loopback) address,
-        /// logging every request that reaches it — anything logged got past
-        /// the address guard.
-        pub(crate) struct ForbiddenServer {
-            pub(crate) addr: std::net::SocketAddr,
-            pub(crate) hits: std::sync::Arc<Mutex<Vec<String>>>,
-            _task: tokio::task::JoinHandle<()>,
-        }
-
-        pub(crate) async fn start_forbidden_server() -> ForbiddenServer {
-            use axum::extract::ws::WebSocketUpgrade;
-            let ip = {
-                // Picks the outward-facing interface; UDP connect sends nothing.
-                let probe = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind a probe socket");
-                probe.connect("10.255.255.255:1").expect("route a probe socket");
-                probe.local_addr().expect("probe address").ip()
-            };
-            assert!(
-                !ip.is_loopback() && !allow_loopback_too(ip),
-                "this test needs a private, non-loopback address the guard refuses; got {ip}"
-            );
+        /// A loopback page with a `window.open` button and a
+        /// target=`_blank` link, both aimed at a route on the same server
+        /// that counts every request it gets: a popup that really opened
+        /// would show up in that count.
+        async fn start_popup_test_server(
+        ) -> (
+            String,
+            std::sync::Arc<Mutex<Vec<String>>>,
+            tokio::task::JoinHandle<()>,
+        ) {
             let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
-            let record = |hits: std::sync::Arc<Mutex<Vec<String>>>, what: &'static str| {
-                move || async move {
-                    hits.lock().unwrap().push(what.to_string());
-                    "reached"
-                }
-            };
-            let ws_hits = hits.clone();
-            let router = axum::Router::new()
-                .route("/popup", axum::routing::get(record(hits.clone(), "window.open popup")))
-                .route("/blank", axum::routing::get(record(hits.clone(), "target=_blank link")))
-                .route("/sw-hit", axum::routing::get(record(hits.clone(), "service worker fetch")))
-                .route(
-                    "/ws",
-                    axum::routing::get(move |ws: WebSocketUpgrade| async move {
-                        ws_hits.lock().unwrap().push("websocket".to_string());
-                        ws.on_upgrade(|_socket| async {})
-                    }),
-                );
-            let listener = tokio::net::TcpListener::bind((ip, 0))
-                .await
-                .expect("bind on the private address");
-            let addr = listener.local_addr().expect("local addr");
-            let task = tokio::spawn(async move {
-                axum::serve(listener, router).await.expect("forbidden server error");
-            });
-            ForbiddenServer {
-                addr,
-                hits,
-                _task: task,
-            }
-        }
-
-        /// A page (on an allowed loopback address) that tries every way out
-        /// to `forbidden` it can: a WebSocket and a service worker as soon
-        /// as it loads, plus a window.open button and a target=_blank link.
-        pub(crate) async fn start_escape_test_server(
-            forbidden: &ForbiddenServer,
-        ) -> (String, tokio::task::JoinHandle<()>) {
-            let target = forbidden.addr;
-            let page: &'static str = Box::leak(
-                format!(
-                    "<html><body>\
-                     <button onclick=\"window.open('http://{target}/popup')\">Popup</button>\
-                     <a href=\"http://{target}/blank\" target=\"_blank\">Blank link</a>\
-                     <script>\
-                     try {{ new WebSocket('ws://{target}/ws'); }} catch (e) {{}}\
-                     if (navigator.serviceWorker) {{ navigator.serviceWorker.register('/sw.js'); }}\
-                     </script>\
-                     </body></html>"
-                )
-                .into_boxed_str(),
-            );
-            let worker: &'static str = Box::leak(
-                format!(
-                    "self.addEventListener('install', e => e.waitUntil(\
-                     fetch('http://{target}/sw-hit').catch(() => {{}})));"
-                )
-                .into_boxed_str(),
-            );
+            let page: &'static str = "<html><body>\
+                 <button onclick=\"window.open('/popup')\">Popup</button>\
+                 <a href=\"/blank\" target=\"_blank\">Blank link</a>\
+                 </body></html>";
+            let (hits_a, hits_b) = (hits.clone(), hits.clone());
             let router = axum::Router::new()
                 .route("/", axum::routing::get(move || async move { axum::response::Html(page) }))
-                .route(
-                    "/sw.js",
-                    axum::routing::get(move || async move {
-                        ([(axum::http::header::CONTENT_TYPE, "application/javascript")], worker)
-                    }),
-                );
+                .route("/popup", axum::routing::get(move || count_popup_hit(hits_a.clone())))
+                .route("/blank", axum::routing::get(move || count_popup_hit(hits_b.clone())));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind a test-local port");
@@ -2148,7 +2003,12 @@ mod server {
             let task = tokio::spawn(async move {
                 axum::serve(listener, router).await.expect("test server error");
             });
-            (format!("http://127.0.0.1:{port}/"), task)
+            (format!("http://127.0.0.1:{port}/"), hits, task)
+        }
+
+        async fn count_popup_hit(hits: std::sync::Arc<Mutex<Vec<String>>>) -> &'static str {
+            hits.lock().unwrap().push("popup page".to_string());
+            "opened"
         }
 
         /// Waits for a `BrowsingUrlUpdate` carrying exactly `url`, skipping
@@ -2479,8 +2339,3 @@ pub use server::{
 
 #[cfg(all(test, feature = "browser-test"))]
 pub(crate) use server::browser_tests;
-
-/// The relaxed-guard opener, for the app's browser tier (a page it serves
-/// itself on loopback).
-#[cfg(all(test, feature = "browser-test"))]
-pub(crate) use server::open_session_with_guard;

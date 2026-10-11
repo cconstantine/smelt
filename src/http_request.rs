@@ -1,16 +1,12 @@
 //! `http_request`: a plain HTTP client tool for hitting APIs directly — no
 //! browser, no JS execution, much cheaper than `webfetch` for a JSON
-//! endpoint or any page that doesn't need real rendering. Shares its SSRF
-//! guard and response truncation with `webfetch` via `src/fetch_guard.rs`
-//! — same reasoning as that module's own doc comment: SSRF logic should
-//! have one source of truth. Unlike `webfetch`, `reqwest`'s own automatic
+//! endpoint or any page that doesn't need real rendering. Shares its URL
+//! parsing and response truncation with `webfetch` via
+//! `src/fetch_guard.rs`. Unlike `webfetch`, `reqwest`'s own automatic
 //! redirect-following is disabled and redirects are followed manually, one
-//! hop at a time, re-checking each target against the SSRF guard — a
-//! plain HTTP client never executes page JS, so there's no CDP
-//! interception layer to lean on here; the guard has to sit at the
-//! redirect-loop level instead.
+//! hop at a time, so each hop is resolved once and connected to that
+//! address (SME-51 B4).
 
-use std::net::IpAddr;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -42,64 +38,28 @@ pub struct HttpResponseResult {
 /// Issues a plain HTTP request and returns its response — no browser, no
 /// JS execution. A non-2xx status is still a successful `Ok` (that's real
 /// data the model should see, e.g. a 404 or a 500 with a JSON error body),
-/// never a tool error; only a genuine transport/SSRF/timeout failure is.
+/// never a tool error; only a genuine transport/timeout failure is.
 pub async fn request(
     method: &str,
     url: &str,
     headers: &[(String, String)],
     body: Option<&str>,
 ) -> Result<HttpResponseResult, String> {
-    request_with_guard(method, url, headers, body, fetch_guard::is_safe_fetch_addr).await
-}
-
-/// The real implementation behind `request`, parameterized on the
-/// address-safety predicate — same reason `webfetch::fetch_with_guard` has
-/// this seam: every locally-reachable address in this dev container is
-/// either loopback or RFC1918-private, so testing "does a legitimate
-/// request actually get through" needs a relaxed variant, while the real
-/// `request` above always uses the strict, real `is_safe_fetch_addr`.
-async fn request_with_guard(
-    method: &str,
-    url: &str,
-    headers: &[(String, String)],
-    body: Option<&str>,
-    is_addr_allowed: fn(IpAddr) -> bool,
-) -> Result<HttpResponseResult, String> {
     let method = parse_method(method)?;
-    // `reqwest`'s own automatic redirect-following is disabled — unlike
-    // `webfetch`'s CDP Fetch-domain interception, a plain HTTP client has
-    // no per-request hook to check a redirect target *before* connecting
-    // to it, so redirects are followed manually here, one hop at a time,
-    // re-running the SSRF guard against each target.
+    // `reqwest`'s own automatic redirect-following is disabled —
+    // `webfetch`'s CDP interception has a per-request hook to check a
+    // redirect target before connecting to it; a plain HTTP client doesn't,
+    // so redirects are followed manually here, one hop at a time.
     let mut current_url = url.to_string();
     let mut current_method = method;
     for _ in 0..=MAX_REDIRECTS {
         // Resolved once, and the client then connects only to those
         // addresses: letting reqwest resolve the name again would let a
-        // DNS-rebinding name pass the check with one address and connect
-        // to another (SME-51 B4).
-        let checked = match fetch_guard::parse_fetch_target(&current_url) {
-            Ok((host, port)) => fetch_guard::resolve_allowed(&host, port, is_addr_allowed)
-                .await
-                .ok()
-                .map(|addrs| (host, addrs)),
-            Err(_) => None,
-        };
-        let Some((host, addrs)) = checked else {
-            // localhost means the sandbox only in the browser tools (SME-42):
-            // say so, rather than leave the model guessing.
-            let sandbox_hint = fetch_guard::parse_fetch_target(&current_url)
-                .is_ok_and(|(host, _)| fetch_guard::is_sandbox_host(&host));
-            return Err(if sandbox_hint {
-                format!(
-                    "refusing to request {current_url}: http_request can't reach localhost. For a \
-                     server in your sandbox, use webfetch or a browsing session (there localhost \
-                     is your sandbox), or curl in a terminal."
-                )
-            } else {
-                format!("refusing to request {current_url}: not a safe address")
-            });
-        };
+        // DNS-rebinding name answer the check with one address and the
+        // connection with another (SME-51 B4).
+        let (host, port) = fetch_guard::parse_fetch_target(&current_url)
+            .map_err(|e| format!("refused {current_url}: {e}"))?;
+        let addrs = fetch_guard::resolve_target(&host, port).await?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(REQUEST_TIMEOUT)
@@ -205,15 +165,6 @@ fn parse_method(method: &str) -> Result<reqwest::Method, String> {
 mod tests {
     use super::*;
 
-    /// Every locally-reachable address in this dev container is either
-    /// loopback or RFC1918-private, so there's no way to stand up a
-    /// "legitimate" fixture server for these tests without loosening the
-    /// guard *somewhere* — same reasoning, same seam,
-    /// `webfetch::browser_tests::allow_loopback_too` already established.
-    fn allow_loopback_too(addr: IpAddr) -> bool {
-        fetch_guard::is_safe_fetch_addr(addr) || addr.is_loopback()
-    }
-
     async fn start_test_server() -> (String, tokio::task::JoinHandle<()>) {
         let router = axum::Router::new()
             .route(
@@ -242,12 +193,6 @@ mod tests {
             .route(
                 "/not-found",
                 axum::routing::get(|| async { (axum::http::StatusCode::NOT_FOUND, "nope") }),
-            )
-            .route(
-                "/redirect-to-private",
-                axum::routing::get(|| async {
-                    axum::response::Redirect::temporary("http://169.254.169.254/secret")
-                }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -259,21 +204,20 @@ mod tests {
         (format!("http://127.0.0.1:{port}"), task)
     }
 
-    /// SME-51 B4: the request goes to the address the guard checked. A
-    /// name the guard resolves (here, only through the test DNS) but the
-    /// system can't stands in for a DNS-rebinding name, which answers the
-    /// guard with a public address and the connection with a private one.
+    /// SME-51 B4: the request connects to the address the one resolution
+    /// produced. A name only the test DNS answers stands in for a
+    /// DNS-rebinding name, which could otherwise answer the check with one
+    /// address and the connection with another.
     #[tokio::test]
     async fn test_the_request_connects_to_the_address_that_was_checked() {
         let (base, _server) = start_test_server().await;
         let port = base.rsplit(':').next().unwrap();
         fetch_guard::test_dns::set("rebind.smelt-test.invalid", vec!["127.0.0.1".parse().unwrap()]);
-        let result = request_with_guard(
+        let result = request(
             "GET",
             &format!("http://rebind.smelt-test.invalid:{port}/echo"),
             &[],
             None,
-            allow_loopback_too,
         )
         .await
         .expect("the request should go to the checked address");
@@ -287,7 +231,7 @@ mod tests {
         let (base, _server) = start_test_server().await;
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            request_with_guard("GET", &format!("{base}/endless"), &[], None, allow_loopback_too),
+            request("GET", &format!("{base}/endless"), &[], None),
         )
         .await
         .expect("the request should stop reading once it has enough")
@@ -299,7 +243,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_returns_a_successful_response() {
         let (base, _server) = start_test_server().await;
-        let result = request_with_guard("GET", &format!("{base}/echo"), &[], None, allow_loopback_too)
+        let result = request("GET", &format!("{base}/echo"), &[], None)
             .await
             .expect("request should succeed");
         assert_eq!(result.status, 200);
@@ -311,12 +255,11 @@ mod tests {
     #[tokio::test]
     async fn test_request_follows_a_redirect_and_reports_the_final_url() {
         let (base, _server) = start_test_server().await;
-        let result = request_with_guard(
+        let result = request(
             "GET",
             &format!("{base}/redirect-once"),
             &[],
             None,
-            allow_loopback_too,
         )
         .await
         .expect("request should succeed");
@@ -328,12 +271,11 @@ mod tests {
     #[tokio::test]
     async fn test_request_returns_a_non_2xx_status_as_data_not_an_error() {
         let (base, _server) = start_test_server().await;
-        let result = request_with_guard(
+        let result = request(
             "GET",
             &format!("{base}/not-found"),
             &[],
             None,
-            allow_loopback_too,
         )
         .await
         .expect("a 404 should still be a successful call");
@@ -341,47 +283,19 @@ mod tests {
         assert_eq!(result.body, "nope");
     }
 
-    #[tokio::test]
-    async fn test_request_refuses_to_follow_a_redirect_to_a_private_address() {
-        // The redirect *target* is checked too, not just the URL the model
-        // originally asked for — a plain HTTP client has no page-JS layer
-        // to worry about (unlike webfetch), but a redirect chain is
-        // exactly the same "attacker-influenced destination" shape.
-        let (base, _server) = start_test_server().await;
-        let result = request_with_guard(
-            "GET",
-            &format!("{base}/redirect-to-private"),
-            &[],
-            None,
-            allow_loopback_too,
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "expected a redirect to a private address to be refused, got: {result:?}"
-        );
-    }
 
-    #[tokio::test]
-    async fn test_request_refuses_a_direct_loopback_target_without_the_test_seam() {
-        let (base, _server) = start_test_server().await;
-        let result = request("GET", &format!("{base}/echo"), &[], None).await;
-        assert!(
-            result.is_err(),
-            "the real (non-relaxed) guard should refuse a loopback address"
-        );
-    }
 
-    /// A model reaching for its sandbox's dev server with http_request
-    /// (seen on SME-42's hands-on check) should hear where that works.
+
+    /// SME-155: with no address filter, the real `request` reaches a
+    /// loopback server — there's no test seam loosening anything any more.
     #[tokio::test]
-    async fn test_a_refused_localhost_request_says_where_localhost_reaches_the_sandbox() {
-        for url in ["http://127.0.0.1:5173/", "http://localhost:3000/api"] {
-            let error = request("GET", url, &[], None).await.expect_err("loopback is refused here");
-            assert!(error.contains("webfetch") && error.contains("curl"), "{url}: {error}");
-        }
-        let error = request("GET", "http://10.0.0.5/", &[], None).await.expect_err("private is refused");
-        assert!(!error.contains("webfetch"), "only localhost-style hosts get the pointer: {error}");
+    async fn test_request_reaches_a_loopback_server() {
+        let (base, _server) = start_test_server().await;
+        let result = request("GET", &format!("{base}/echo"), &[], None)
+            .await
+            .expect("a loopback address is requested like any other");
+        assert_eq!(result.status, 200);
+        assert_eq!(result.body, "hello from the test server");
     }
 
     #[test]

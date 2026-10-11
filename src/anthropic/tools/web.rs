@@ -15,10 +15,8 @@ pub(super) fn tools() -> Vec<Tool> {
                 description: "Fetch a URL in a real browser (JS included — unlike a plain HTTP \
                                request, this handles JS-rendered pages) and return its \
                                rendered, readable text. Works with no pod created. http/https \
-                               only; the resolved address (and every address any redirect or \
-                               the page's own JS tries to reach) must be a real public address, \
-                               not an internal/private one — except localhost (or 127.0.0.1), \
-                               which means this conversation's sandbox pod: \
+                               only; every address is reachable, and localhost (or 127.0.0.1) \
+                               means this conversation's sandbox pod: \
                                http://localhost:5173/ reaches a server listening on port 5173 \
                                there. Slower and heavier than http_request — prefer \
                                http_request for a JSON API or anything that doesn't need real \
@@ -67,9 +65,11 @@ pub(super) fn tools() -> Vec<Tool> {
                                a REST endpoint, or anything else that doesn't need a real \
                                rendered page; use webfetch instead for a page that needs JS to \
                                show its real content. A non-2xx status (404, 500, ...) is \
-                               returned as normal data, not an error. http/https only; the \
-                               resolved address (and any redirect target) must be a real public \
-                               address, not an internal/private one."
+                               returned as normal data, not an error. http/https only; every \
+                               address is reachable. Here localhost is the machine smelt runs \
+                               on, not your sandbox — for a server in your sandbox use \
+                               webfetch or a browsing session, where localhost is the \
+                               sandbox's, or curl in a terminal."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",

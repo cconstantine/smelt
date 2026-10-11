@@ -1,19 +1,20 @@
-//! A small HTTP proxy that all of the shared headless browser's traffic is
-//! forced through, so the SSRF guard applies to *everything* a page does —
-//! not just requests on the one page CDP interception is enabled on. Popups,
-//! WebSockets, service workers and other workers each run outside that page
-//! and slipped past per-page interception entirely; at the network level
-//! there's no way around the proxy.
+//! A small HTTP proxy that a conversation's browser contexts route through,
+//! the only way a browser running in smelt's server process can name a
+//! pod's `localhost` or a container's address there (SME-42, SME-33):
+//! requests for those hosts go to that conversation's sandbox through a
+//! port-forward instead of to the open internet.
 //!
 //! Handles the two forms a browser sends to an HTTP proxy: `CONNECT
 //! host:port` (HTTPS, WebSockets) becomes a raw tunnel, and absolute-form
 //! `GET http://host/path` is forwarded as origin-form with `Connection:
 //! close`, so the browser never reuses one upstream connection for a
-//! different host. Every target is resolved here, every resolved address is
-//! checked, and the connection goes to exactly the address that was checked.
+//! different host. Every other host is resolved and connected to directly —
+//! addresses are no longer filtered (SME-155), but resolving here rather
+//! than letting the connection resolve itself keeps the checked address and
+//! the connected one identical.
 
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,25 +31,6 @@ const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// Bounds reading the request head and connecting upstream; the tunnel
 /// itself is unbounded, since a WebSocket can legitimately stay open.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
-#[cfg(test)]
-static REQUESTS_HANDLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// How many requests any proxy in this process has accepted — for tests
-/// that need to prove traffic actually went through one.
-#[cfg(all(test, feature = "browser-test"))]
-pub fn requests_handled() -> u64 {
-    REQUESTS_HANDLED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Starts the proxy on a loopback port and returns its address. Runs for
-/// the rest of the process's life.
-pub async fn start(is_addr_allowed: fn(IpAddr) -> bool) -> std::io::Result<SocketAddr> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    tokio::spawn(accept_loop(listener, is_addr_allowed, None));
-    Ok(addr)
-}
 
 /// Opens a connection to a port in one conversation's sandbox pod, on its
 /// own `localhost` or at a Docker container's address there (SME-33) —
@@ -143,33 +125,26 @@ impl Drop for RoutedProxy {
     }
 }
 
-/// Like `start`, but for one conversation's browser context: requests for
+/// Starts the proxy for one conversation's browser context: requests for
 /// `localhost`, `127.0.0.1` or `::1`, or a Docker container's address in
 /// the pod (`fetch_guard::sandbox_host`), go to that port in the
-/// conversation's sandbox through `dial`, instead of being refused as
-/// loopback or private. Every other host goes through `is_addr_allowed`
-/// exactly as with `start`. See SME-42 and SME-33.
-pub async fn start_with_sandbox(
-    is_addr_allowed: fn(IpAddr) -> bool,
-    dial: SandboxDial,
-) -> std::io::Result<RoutedProxy> {
+/// conversation's sandbox through `dial` — the only way a browser in
+/// smelt's server process can reach them. Every other host is resolved and
+/// forwarded as-is. See SME-42 and SME-33.
+pub async fn start_with_sandbox(dial: SandboxDial) -> std::io::Result<RoutedProxy> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let accept_task = tokio::spawn(accept_loop(listener, is_addr_allowed, Some(dial)));
+    let accept_task = tokio::spawn(accept_loop(listener, Some(dial)));
     Ok(RoutedProxy { addr, accept_task })
 }
 
-async fn accept_loop(
-    listener: TcpListener,
-    is_addr_allowed: fn(IpAddr) -> bool,
-    sandbox: Option<SandboxDial>,
-) {
+async fn accept_loop(listener: TcpListener, sandbox: Option<SandboxDial>) {
     loop {
         match listener.accept().await {
             Ok((client, _)) => {
                 let sandbox = sandbox.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle(client, is_addr_allowed, sandbox).await {
+                    if let Err(e) = handle(client, sandbox).await {
                         tracing::debug!("egress proxy: {e}");
                     }
                 });
@@ -182,16 +157,10 @@ async fn accept_loop(
     }
 }
 
-async fn handle(
-    mut client: TcpStream,
-    is_addr_allowed: fn(IpAddr) -> bool,
-    sandbox: Option<SandboxDial>,
-) -> Result<(), String> {
+async fn handle(mut client: TcpStream, sandbox: Option<SandboxDial>) -> Result<(), String> {
     let (head, rest) = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_head(&mut client))
         .await
         .map_err(|_| "timed out reading the request".to_string())??;
-    #[cfg(test)]
-    REQUESTS_HANDLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let request = match parse_request_head(&head) {
         Ok(request) => request,
         Err(e) => {
@@ -204,11 +173,10 @@ async fn handle(
     {
         return handle_sandbox(client, request, host, rest, dial).await;
     }
-    let addrs = match fetch_guard::resolve_allowed(&request.host, request.port, is_addr_allowed).await
-    {
+    let addrs = match fetch_guard::resolve_target(&request.host, request.port).await {
         Ok(addrs) => addrs,
         Err(e) => {
-            respond(&mut client, "403 Forbidden").await;
+            respond_with_body(&mut client, "502 Bad Gateway", &e).await;
             return Err(e);
         }
     };
@@ -575,16 +543,22 @@ mod tests {
         assert!(parse_request_head(b"garbage\r\n\r\n").is_err());
     }
 
-    fn allow_loopback(addr: IpAddr) -> bool {
-        addr.is_loopback()
-    }
-
     async fn start_upstream() -> SocketAddr {
         let router = axum::Router::new().route("/", axum::routing::get(|| async { "upstream says hi" }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         addr
+    }
+
+    /// A name that means the upstream test server but is none of the hosts
+    /// that mean the sandbox, so requests for it go down the plain forward
+    /// path of a sandbox-routed proxy.
+    async fn upstream_named() -> (String, SocketAddr) {
+        let upstream = start_upstream().await;
+        let name = "upstream.smelt-test.invalid";
+        fetch_guard::test_dns::set(name, vec![upstream.ip()]);
+        (name.to_string(), upstream)
     }
 
     fn client_via(proxy: SocketAddr) -> reqwest::Client {
@@ -595,35 +569,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_forwards_a_plain_http_request_to_an_allowed_address() {
-        let upstream = start_upstream().await;
-        let proxy = start(allow_loopback).await.unwrap();
-        let response = client_via(proxy).get(format!("http://{upstream}/")).send().await.unwrap();
-        assert_eq!(response.status(), 200);
-        assert_eq!(response.text().await.unwrap(), "upstream says hi");
-    }
-
-    #[tokio::test]
-    async fn test_refuses_a_plain_http_request_to_a_refused_address() {
-        let upstream = start_upstream().await;
-        let proxy = start(fetch_guard::is_safe_fetch_addr).await.unwrap();
-        let response = client_via(proxy).get(format!("http://{upstream}/")).send().await.unwrap();
-        assert_eq!(response.status(), 403);
-    }
-
-    #[tokio::test]
-    async fn test_refuses_a_hostname_that_resolves_to_a_refused_address() {
-        let upstream = start_upstream().await;
-        let proxy = start(fetch_guard::is_safe_fetch_addr).await.unwrap();
-        let response = client_via(proxy)
-            .get(format!("http://localhost:{}/", upstream.port()))
+    async fn test_a_sandbox_route_forwards_every_other_host() {
+        let (name, upstream) = upstream_named().await;
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = start_with_sandbox(dial_to("127.0.0.1:1".parse().unwrap(), dialed.clone()))
+            .await
+            .unwrap();
+        let response = client_via(proxy.addr)
+            .get(format!("http://{name}:{}/", upstream.port()))
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 403);
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "upstream says hi");
+        assert!(dialed.lock().unwrap().is_empty(), "a plain host must not be dialed into the sandbox");
     }
 
-    async fn connect_through(proxy: SocketAddr, target: SocketAddr) -> (TcpStream, String) {
+    #[tokio::test]
+    async fn test_a_sandbox_route_reports_a_host_it_cannot_resolve() {
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = start_with_sandbox(dial_to("127.0.0.1:1".parse().unwrap(), dialed.clone()))
+            .await
+            .unwrap();
+        let response = client_via(proxy.addr).get("http://this-host-does-not-exist.invalid/").send().await.unwrap();
+        assert_eq!(response.status(), 502);
+        assert!(response.text().await.unwrap().contains("this-host-does-not-exist"), "the reply should say why");
+    }
+
+    async fn connect_through(proxy: SocketAddr, target: &str) -> (TcpStream, String) {
         let mut stream = TcpStream::connect(proxy).await.unwrap();
         stream
             .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
@@ -635,33 +608,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tunnels_connect_to_an_allowed_address() {
-        let upstream = start_upstream().await;
-        let proxy = start(allow_loopback).await.unwrap();
-        let (mut tunnel, reply) = connect_through(proxy, upstream).await;
+    async fn test_a_sandbox_route_tunnels_connect_to_every_other_host() {
+        let (name, upstream) = upstream_named().await;
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = start_with_sandbox(dial_to("127.0.0.1:1".parse().unwrap(), dialed.clone()))
+            .await
+            .unwrap();
+        let target = format!("{name}:{}", upstream.port());
+        let (mut tunnel, reply) = connect_through(proxy.addr, &target).await;
         assert!(reply.starts_with("HTTP/1.1 200"), "got {reply:?}");
         tunnel
-            .write_all(format!("GET / HTTP/1.1\r\nHost: {upstream}\r\nConnection: close\r\n\r\n").as_bytes())
+            .write_all(format!("GET / HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n").as_bytes())
             .await
             .unwrap();
         let mut response = String::new();
         tunnel.read_to_string(&mut response).await.unwrap();
         assert!(response.ends_with("upstream says hi"), "got {response:?}");
+        assert!(dialed.lock().unwrap().is_empty(), "a plain host must not be dialed into the sandbox");
     }
 
     #[tokio::test]
-    async fn test_refuses_connect_to_a_refused_address() {
-        let upstream = start_upstream().await;
-        let proxy = start(fetch_guard::is_safe_fetch_addr).await.unwrap();
-        let (_, reply) = connect_through(proxy, upstream).await;
-        assert!(reply.starts_with("HTTP/1.1 403"), "got {reply:?}");
-    }
-
-    #[tokio::test]
-    async fn test_a_sandbox_route_sends_localhost_to_the_sandbox_despite_the_strict_guard() {
+    async fn test_a_sandbox_route_sends_localhost_to_the_sandbox() {
         let upstream = start_upstream().await;
         let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
+        let proxy = start_with_sandbox(dial_to(upstream, dialed.clone()))
             .await
             .unwrap();
         for host in ["localhost", "127.0.0.1", "[::1]"] {
@@ -676,7 +646,7 @@ mod tests {
     async fn test_a_sandbox_route_sends_a_container_address_to_that_container() {
         let upstream = start_upstream().await;
         let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
+        let proxy = start_with_sandbox(dial_to(upstream, dialed.clone()))
             .await
             .unwrap();
         // As the model's browser opens it: a page load (SME-90).
@@ -710,7 +680,7 @@ mod tests {
     async fn test_a_sandbox_route_refuses_requests_other_sites_send() {
         let upstream = start_upstream().await;
         let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
+        let proxy = start_with_sandbox(dial_to(upstream, dialed.clone()))
             .await
             .unwrap();
         for head in [
@@ -746,7 +716,7 @@ mod tests {
     async fn test_a_sandbox_route_refuses_other_sites_requests_to_a_container() {
         let upstream = start_upstream().await;
         let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
+        let proxy = start_with_sandbox(dial_to(upstream, dialed.clone()))
             .await
             .unwrap();
         for head in [
@@ -782,12 +752,12 @@ mod tests {
     async fn test_a_sandbox_route_checks_who_opened_a_tunnel() {
         let upstream = start_upstream().await;
         let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
+        let proxy = start_with_sandbox(dial_to(upstream, dialed.clone()))
             .await
             .unwrap();
         let target: SocketAddr = "127.0.0.1:5173".parse().unwrap();
 
-        let (mut tunnel, reply) = connect_through(proxy.addr, target).await;
+        let (mut tunnel, reply) = connect_through(proxy.addr, &target.to_string()).await;
         assert!(reply.starts_with("HTTP/1.1 200"), "got {reply:?}");
         tunnel
             .write_all(b"GET /ws HTTP/1.1\r\nHost: localhost:5173\r\nOrigin: https://evil.example\r\n\
@@ -803,7 +773,7 @@ mod tests {
         assert!(dialed.lock().unwrap().is_empty(), "another site's tunnel must not reach the sandbox");
 
         // TLS can't be checked, so it isn't let through either.
-        let (mut tls, _) = connect_through(proxy.addr, target).await;
+        let (mut tls, _) = connect_through(proxy.addr, &target.to_string()).await;
         tls.write_all(&[0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5]).await.unwrap();
         let mut rest = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut rest))
@@ -812,7 +782,7 @@ mod tests {
         assert!(dialed.lock().unwrap().is_empty(), "a TLS tunnel must not reach the sandbox");
 
         // The sandbox's own page opening one still gets through.
-        let (mut own, _) = connect_through(proxy.addr, target).await;
+        let (mut own, _) = connect_through(proxy.addr, &target.to_string()).await;
         own.write_all(b"GET / HTTP/1.1\r\nHost: localhost:5173\r\nOrigin: http://localhost:5173\r\n\
                         Connection: close\r\n\r\n")
             .await
@@ -832,7 +802,7 @@ mod tests {
         let upstream = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed))
+        let proxy = start_with_sandbox(dial_to(upstream, dialed))
             .await
             .unwrap();
         let mut stream = TcpStream::connect(proxy.addr).await.unwrap();
@@ -857,11 +827,11 @@ mod tests {
     async fn test_a_sandbox_route_tunnels_connect_to_localhost_through_the_sandbox() {
         let upstream = start_upstream().await;
         let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
+        let proxy = start_with_sandbox(dial_to(upstream, dialed.clone()))
             .await
             .unwrap();
         let target: SocketAddr = "127.0.0.1:5173".parse().unwrap();
-        let (mut tunnel, reply) = connect_through(proxy.addr, target).await;
+        let (mut tunnel, reply) = connect_through(proxy.addr, &target.to_string()).await;
         assert!(reply.starts_with("HTTP/1.1 200"), "got {reply:?}");
         tunnel
             .write_all(b"GET / HTTP/1.1\r\nHost: localhost:5173\r\nConnection: close\r\n\r\n")
@@ -874,28 +844,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_sandbox_route_still_guards_every_other_host() {
-        let upstream = start_upstream().await;
-        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed.clone()))
-            .await
-            .unwrap();
-        // Loopback, but not one of the names that mean the sandbox.
-        let response = client_via(proxy.addr)
-            .get(format!("http://127.0.0.2:{}/", upstream.port()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 403);
-        assert!(dialed.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn test_a_sandbox_route_that_cannot_connect_says_why() {
         let dial: SandboxDial = Arc::new(|_, _| {
             Box::pin(async { Err(DialError::from("This conversation has no running sandbox.".to_string())) })
         });
-        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial).await.unwrap();
+        let proxy = start_with_sandbox(dial).await.unwrap();
         let response = client_via(proxy.addr).get("http://localhost:3000/").send().await.unwrap();
         assert_eq!(response.status(), 502);
         assert_eq!(response.text().await.unwrap(), "This conversation has no running sandbox.");
@@ -913,7 +866,7 @@ mod tests {
             }
         });
         let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(silent, dialed))
+        let proxy = start_with_sandbox(dial_to(silent, dialed))
             .await
             .unwrap();
         let response = client_via(proxy.addr).get("http://localhost:3000/").send().await.unwrap();
@@ -964,7 +917,7 @@ mod tests {
     async fn test_dropping_a_routed_proxy_stops_it_accepting() {
         let upstream = start_upstream().await;
         let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let proxy = start_with_sandbox(fetch_guard::is_safe_fetch_addr, dial_to(upstream, dialed))
+        let proxy = start_with_sandbox(dial_to(upstream, dialed))
             .await
             .unwrap();
         let addr = proxy.addr;
