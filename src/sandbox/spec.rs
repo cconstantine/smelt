@@ -664,6 +664,23 @@ pub(super) fn build_pod_spec(
             // pod-level setting covers the pair, as SANDBOX_IMAGE_PULL_POLICY
             // does.
             image_pull_secrets: default_image_pull_secrets(),
+            // Every image the system runs — server, sandbox agent, dind
+            // sidecar, and the language-server pod images — is built for
+            // linux/amd64 only (`publish-images.yml` builds natively on
+            // ubuntu-latest; nothing in the project cross-compiles), and the
+            // nodes it runs on are all x86_64. So a pod must never reach a
+            // node of another architecture: an amd64-only image has no
+            // arm64 manifest, and the pod would sit `Pending` on a platform
+            // mismatch instead of starting. `kubernetes.io/arch` is a label
+            // every kubelet sets itself, so this is a hard pin, not a
+            // preference. Language-server pods need no matching pin: they're
+            // bound to their sandbox pod's node by `nodeName`
+            // (`lsp::pods::server_pod_spec`), and so land wherever the
+            // sandbox pod did.
+            node_selector: Some(std::collections::BTreeMap::from([(
+                "kubernetes.io/arch".to_string(),
+                "amd64".to_string(),
+            )])),
             restart_policy: Some("Never".to_string()),
             ..Default::default()
         }),

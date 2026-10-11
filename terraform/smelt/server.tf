@@ -72,6 +72,17 @@ resource "kubernetes_deployment_v1" "smelt" {
       spec {
         service_account_name = kubernetes_service_account_v1.park.metadata[0].name
 
+        # Every image smelt publishes is linux/amd64 alone
+        # (`publish-images.yml` builds natively on ubuntu-latest), and the
+        # nodes this runs on are all x86_64. A pod on a node of another
+        # architecture would fail its pull on a platform mismatch, so no
+        # pod of this system is ever scheduled on one. Sandbox pods carry
+        # the same pin in smelt's own pod spec (src/sandbox/spec.rs);
+        # language-server pods follow their sandbox pod's node.
+        node_selector = {
+          "kubernetes.io/arch" = "amd64"
+        }
+
         dynamic "image_pull_secrets" {
           for_each = var.image_pull_secret != null ? toset([var.image_pull_secret]) : toset([])
 
