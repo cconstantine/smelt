@@ -119,13 +119,15 @@ smelt is one server binary plus a web bundle. Alongside it, it needs:
 - **The sandbox image**, delivered straight to the node's containerd with no registry involved.
 - **Headless Chrome**, for `webfetch` and browsing sessions.
 
+The steps below build all of that yourself, which is the only route that has ever been tested end to end. [Deploying from published images](#deploying-from-published-images) covers the alternative: pull the server and sandbox images from GHCR instead, and skip the building.
+
 ### Steps
 
 1. **Get a build environment.** Build inside the repo's [Dockerfile](../Dockerfile) image (its `base` stage, on `rust:1.96-trixie`), or on Debian trixie on x86_64 with the same tools: Rust, the `wasm32-unknown-unknown` target and the Dioxus CLI at the version the Dockerfile pins (`dioxus-cli@0.7.9`; a different `dx` refuses to build the project). Other hosts don't work. The sandbox agent is linked against the build host's glibc and runs in a `debian:trixie-slim` image, so a newer glibc stops every sandbox from starting. `scripts/browser-check/setup.sh` also fetches Chrome's libraries with `apt-get`. Run the server binary in a matching environment too.
 2. **Set up the cluster.** Run `kubectl apply -f k8s/smelt-park-rbac.yaml`, then make a kubeconfig for the `park` service account. [scripts/k3s-bootstrap.sh](../scripts/k3s-bootstrap.sh) shows how: it mints a long-lived token secret and writes the kubeconfig. It's written for the compose stack, so use your cluster's API address, an admin kubeconfig and your own paths instead of its `k3s:6443`, `/k3s-admin/k3s.yaml`, `/k8s/` and `/out/`. Point `KUBECONFIG` at that file.
 3. **Deliver the sandbox image.** With `DOCKER_HOST` and `KUBECONFIG` set, run `scripts/build-sandbox-image.sh` from the same tree as the server you build in step 5. Run it again after every upgrade of smelt. The image is named after the agent's sources (`smelt-sandbox:src-<hash>`), and a server with no `SANDBOX_IMAGE` runs the one named after the sources it was built from (SME-121), so it can't start pods from an older agent. If the image isn't on the node, `create_pod` fails within seconds with `ErrImageNeverPull`, naming the image and this command.
 4. **Install headless Chrome:** `scripts/browser-check/setup.sh`. Then set `BROWSER_CHECK_CACHE` to the absolute path of the `.browser-check-cache` directory it creates.
-5. **Build:** `dx bundle --platform web`. It produces a release server binary next to its web bundle, and dx's output says where. Run the binary from that layout: it serves the bundle from the `public/` directory beside it.
+5. **Build:** `dx bundle --platform web --release`. Keep the `--release`: without it dx builds a debug binary — its own output says `.../debug/web/` — which isn't what you want running for real. It puts a release server binary next to its web bundle, and dx's output says where. Run the binary from that layout: it serves the bundle from the `public/` directory beside it.
 6. **Configure and start it.** Set the environment variables in [docs/setup.md](#environment-variables). The ones a deployment needs are:
    - `DATABASE_URL` and `KUBECONFIG`.
    - `PORT`: default `8080`.
@@ -135,6 +137,37 @@ smelt is one server binary plus a web bundle. Alongside it, it needs:
    - `BROWSER_CHECK_CACHE`: from step 4.
 7. **Put it behind TLS.** Use a reverse proxy that speaks HTTP/2: each tab holds an open event stream, and HTTP/1.1 allows only six connections per host. Route the preview host names (for example `{port}-{conversation}-smelt.example.com`) to `SMELT_PREVIEW_ADDR`'s port. They need wildcard DNS and a wildcard TLS certificate. The proxy must pass the browser's `Host` header through unchanged (in nginx, `proxy_set_header Host $host;`), since the preview listener reads the conversation and port from it, and must pass WebSocket upgrades through for a dev server's live reload. See [Sandbox previews](#sandbox-previews).
 8. **Add a model provider.** Open smelt, go to **Model providers** in the sidebar, and add one with its key. Nothing about the model is read from the environment.
+
+### Deploying from published images
+
+`.github/workflows/publish-images.yml` builds both images from one commit and pushes them to GHCR — every branch push publishes its own `<sha>` tags, and only main moves `latest`:
+
+- `ghcr.io/<you>/smelt:<sha>` — the server: the release binary (26 MB, stripped by this repo's release profile), its web bundle, and the headless Chrome `webfetch` and browsing sessions use, already laid out the way `BROWSER_CHECK_CACHE` wants (set in the image, so a deployment doesn't set it). It listens on `8080` (and `8181` for previews), runs as uid 1000, and needs no volumes. About 885 MB, of which Chrome and the libraries it fetched are 492 MB.
+- `ghcr.io/<you>/smelt-sandbox:<sha>` — the sandbox agent image, built from `docker/sandbox/Dockerfile` like any other image. It carries a `src-<hash>` tag as well: the same 16 hex digits `scripts/sandbox-image-ref` prints for the sources it was built from, under a registry a pod can actually reach.
+
+One commit builds both, so a server and the agent it expects are the same build. These settings replace steps 1, 3, 4 and 5 above:
+
+```bash
+SANDBOX_IMAGE=ghcr.io/<you>/smelt-sandbox:<sha>          # not the src-<hash> default: that one
+SANDBOX_IMAGE_PULL_POLICY=IfNotPresent                   # names nothing a pod can reach
+SANDBOX_IMAGE_PULL_SECRET=ghcr                           # only when the package is private
+# SANDBOX_DOCKER_IMAGE unset: docker:29-dind pulls from Docker Hub
+```
+
+`SANDBOX_IMAGE_PULL_POLICY` is the one that bites: pods ask `Never` unless told, so a sandbox from a registry image fails within seconds with `ErrImageNeverPull` — now an error that names the setting, not just the build script.
+
+**Pull credentials.** A GHCR package is private until you make it public, and a private one needs the pod to present something, or both pulls fail with `pull access denied`. Make the secret in the namespace the pods are created in, and name it for them:
+
+```bash
+kubectl create secret docker-registry ghcr -n smelt-park \
+  --docker-server=ghcr.io --docker-username=<you> --docker-password=<read-only-package-token>
+```
+
+A public GHCR package needs neither the secret nor the setting; the Docker sidecar's pull from Docker Hub is anonymous, so it needs nothing either. The secret is only ever read by sandbox pods, which is why it lives in `smelt-park` and not in whatever namespace smelt's own pod runs in.
+
+`scripts/build-sandbox-image.sh`, `scripts/cluster-doctor` and the import loader are then dev and CI machinery: a deployment pulling images never runs them, and `cluster-doctor`'s `ctr images ls` check would report the node has no image it isn't looking for.
+
+The builds themselves have been run: this Dockerfile produced the server image, which starts against a real Postgres, applies its migrations, and serves the app and its assets from the bundle beside it. And both images have been pulled back out of GHCR by tag and tried again as pulled — the server image against a database nothing had touched, where it applied all its migrations and served its own bundle's assets, and the sandbox image's agent, whose libraries all resolve. What hasn't been tried is the last step: a sandbox pod started from the published sandbox image against a real cluster.
 
 ### Before you expose it
 
@@ -180,6 +213,8 @@ panics at startup just like an unset one.
 | `SANDBOX_WORKSPACE_STORAGE_SIZE` | no | `20Gi` | Size each conversation's `/workspace` claim (`sandbox-workspace-<conversation id>`, its files and checkouts) requests. |
 | `SANDBOX_VOLUME_STORAGE_SIZE` | no | `10Gi` | Size each generic volume's claim (`sandbox-volume-<id>`, the volumes configured on the `/sandbox-volumes` page) requests (`src/sandbox/spec.rs`). Not configurable per volume. |
 | `SANDBOX_DOCKER_IMAGE` | no | `docker.io/library/docker:29-dind` | The Docker sidecar's image, delivered into the node by `scripts/build-sandbox-image.sh`. Only its `dockerd` is used, never its entrypoint. |
+| `SANDBOX_IMAGE_PULL_POLICY` | no | `Never` | How both of a pod's containers fetch their image — `Never`, `IfNotPresent` or `Always`, in any case. `Never` is what a node that got its images through `scripts/build-sandbox-image.sh` needs: those images are in no registry a pod could reach. A deployment that pulls its images instead (see [Deploying from published images](#deploying-from-published-images)) sets `IfNotPresent`; without it a pod from a registry image fails at once with `ErrImageNeverPull`. An unrecognised value falls back to `Never` with a warning at startup. |
+| `SANDBOX_IMAGE_PULL_SECRET` | no | none | The names, comma-separated, of the credentials both of a pod's containers fetch their image with, for a registry that asks to be authenticated first — a private GHCR package among them. Each name is a `kubernetes.io/dockerconfigjson` secret in `smelt-park`, where the pods are created (see [Deploying from published images](#deploying-from-published-images)). Unset, as it always was for images built straight into the node: nothing to authenticate to, so nothing presented. |
 | `BROWSER_CHECK_CACHE` | no | `<build checkout>/.browser-check-cache` | Where headless Chrome and its libraries are: `scripts/browser-check/setup.sh` downloads into it and smelt launches Chrome from it, for `webfetch` and browsing sessions (see [Commands](#commands) above). Set it, as an absolute path, wherever smelt runs from somewhere other than the checkout it was built in: smelt reads a relative one against its own working directory. |
 | `SMELT_MASON_REGISTRY_URL` | no | `https://raw.githubusercontent.com/mason-org/mason-registry/main` | Where the Language servers page's lookup reads mason's `packages/<name>/package.yaml` (see [Language servers](#language-servers)). |
 | `SMELT_HELIX_LANGUAGES_URL` | no | `https://raw.githubusercontent.com/helix-editor/helix/master/languages.toml` | Helix's `languages.toml`, for the lookup's arguments, file types, root markers and settings. |

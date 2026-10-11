@@ -603,6 +603,78 @@ fn test_pod_container_limits_include_the_docker_sidecar() {
     );
 }
 
+/// The setting is a deployment's, not a test's, so nothing here sets it: what
+/// the spec asks for has to be whatever `default_image_pull_policy` resolves
+/// to, for both containers, which is the whole point of one setting covering
+/// the pair.
+#[test]
+fn test_both_containers_fetch_their_image_with_the_same_policy() {
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let spec = pod.spec.expect("a pod spec");
+    for container in spec.containers.iter().chain(spec.init_containers.iter().flatten()) {
+        assert_eq!(
+            container.image_pull_policy.as_deref(),
+            Some(default_image_pull_policy()),
+            "{}: the pod's two images are fetched the same way",
+            container.name
+        );
+    }
+}
+
+#[test]
+fn test_an_unset_or_unrecognised_pull_policy_never_pulls() {
+    assert_eq!(image_pull_policy_from(None), "Never");
+    assert_eq!(image_pull_policy_from(Some("")), "Never", "an empty setting is no setting");
+    // A typo is the default, not a pod Kubernetes refuses to create;
+    // default_image_pull_policy logs what it ignored.
+    assert_eq!(image_pull_policy_from(Some("registry")), "Never");
+}
+
+#[test]
+fn test_a_pull_policy_is_read_in_any_case_with_the_spaces_trimmed() {
+    assert_eq!(image_pull_policy_from(Some("ifnotpresent")), "IfNotPresent", "Kubernetes spells it");
+    assert_eq!(image_pull_policy_from(Some(" ALWAYS ")), "Always");
+}
+
+/// A sandbox pod carries pull credentials only if the deployment names some,
+/// and names them for the pod as a whole rather than per container — the same
+/// one-setting-covers-both-images shape as the pull policy.
+#[test]
+fn test_a_pod_carries_the_pull_credentials_the_deployment_names() {
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let named = |secrets: Option<Vec<LocalObjectReference>>| {
+        secrets.unwrap_or_default().into_iter().map(|secret| secret.name).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        named(pod.spec.expect("a pod spec").image_pull_secrets),
+        named(default_image_pull_secrets()),
+        "the pod asks for exactly the credentials the setting names"
+    );
+}
+
+#[test]
+fn test_a_pull_secret_setting_names_no_credentials_when_it_names_nothing() {
+    assert!(image_pull_secrets_from(None).is_empty());
+    assert!(image_pull_secrets_from(Some("")).is_empty(), "an empty setting is no setting");
+    assert!(image_pull_secrets_from(Some(" , ")).is_empty(), "a blank entry is no entry");
+}
+
+#[test]
+fn test_pull_secrets_are_named_one_per_comma_with_the_spaces_trimmed() {
+    let named = |setting: &str| {
+        image_pull_secrets_from(Some(setting))
+            .into_iter()
+            .map(|secret| secret.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(named("ghcr"), ["ghcr".to_string()]);
+    assert_eq!(
+        named("ghcr, smelt-park-harbor ,"),
+        ["ghcr".to_string(), "smelt-park-harbor".to_string()],
+        "several registries, and the trailing comma is no secret"
+    );
+}
+
 #[test]
 fn test_a_missing_stream_is_a_no_stream_error_naming_it() {
     let err = require_stream::<u8>(None, "the exec's stdout").expect_err("no stream should be an error");
