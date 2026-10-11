@@ -149,13 +149,15 @@ RUN dx bundle --platform web --release \
 
 # Headless Chrome for webfetch and browsing sessions, laid out the way smelt
 # reads it from BROWSER_CHECK_CACHE. Deliberately fetched on
-# debian:trixie-slim and not on `base`: setup.sh decides which shared
-# libraries it needs from what `ldd` reports missing where it runs, so running
-# it on a fat build image would record a set of libraries missing from
-# nothing. Checked on trixie-slim: with the fetched libdir on
-# LD_LIBRARY_PATH every library resolves and chrome-headless-shell renders a
-# page. Same glibc as the server image, which is what the sandbox agent's
-# glibc has to match anyway (docs/setup.md).
+# debian:trixie-slim and not on `base`: setup.sh keeps its library list
+# fixed, so building it where nothing extra is installed keeps the list
+# honest. It was not always honest: python3, which setup.sh itself needs,
+# installs libexpat1 and libffi8, and a check run in this stage passes on
+# them while the runtime stage below — which has no python3 — does not have
+# them at all. That's why the real check is a RUN of Chrome in the runtime
+# stage, and why PKGS in setup.sh names both. Same glibc as the server
+# image, which is what the sandbox agent's glibc has to match anyway
+# (docs/setup.md).
 FROM debian:trixie-slim AS chrome
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl python3 unzip \
@@ -196,5 +198,15 @@ WORKDIR /opt/smelt
 # 8080 is the app; 8181 is the sandbox preview listener, a separate one of its
 # own (docs/setup.md, "Sandbox previews").
 EXPOSE 8080 8181
-RUN test -x /opt/smelt/smelt && test -d /opt/smelt/public && test -x /opt/browser-check-cache/chrome/chrome-headless-shell-linux64/chrome-headless-shell
+# Not just that Chrome is present and executable: actually run it, the way
+# src/headless_chrome.rs launches it. `test -x` here let through images whose
+# Chrome died at the first webfetch/browsing call — a cache laid down by an
+# incomplete library list satisfies the build stage it was made in (see the
+# chrome stage's comment) and nothing like it exists to check against at
+# runtime. `--version` costs nothing and forces the dynamic linker to
+# resolve every library Chrome needs; if the image is missing one, the
+# image build fails here instead of the user's first browse.
+RUN test -x /opt/smelt/smelt && test -d /opt/smelt/public \
+    && LD_LIBRARY_PATH=/opt/browser-check-cache/libs/usr/lib/x86_64-linux-gnu:/opt/browser-check-cache/libs/usr/lib/x86_64-linux-gnu/dri \
+    /opt/browser-check-cache/chrome/chrome-headless-shell-linux64/chrome-headless-shell --version
 ENTRYPOINT ["/opt/smelt/smelt"]
