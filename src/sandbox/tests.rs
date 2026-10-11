@@ -100,6 +100,26 @@ fn test_pod_spec_leaves_the_sandbox_container_unprivileged() {
     );
 }
 
+/// Every image the system runs is built linux/amd64 only
+/// (`publish-images.yml` has no `platforms:`), so a sandbox pod must never
+/// be scheduled onto a node of another architecture, where its pull would
+/// fail on a platform mismatch. `kubernetes.io/arch: amd64` is that pin;
+/// x86_64 is what Kubernetes calls amd64.
+#[test]
+fn test_pod_spec_pins_pods_to_amd64_nodes() {
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let selector = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_selector.as_ref())
+        .expect("a pod should say the arch it may land on");
+    assert_eq!(
+        selector.get("kubernetes.io/arch").map(String::as_str),
+        Some("amd64"),
+        "every image is linux/amd64; a pod must never reach another arch"
+    );
+}
+
 #[test]
 fn test_pod_spec_shares_workspace_and_socket_but_keeps_docker_data_in_the_sidecar() {
     let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);

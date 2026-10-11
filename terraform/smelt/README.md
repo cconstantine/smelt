@@ -39,6 +39,13 @@ where smelt's own real-cluster test suite runs.
   binds loopback inside the pod, which is the safe default).
 - OAuth and anything else secret go in through `extra_env`; the module has no
   opinion about them.
+- **amd64 only.** Every image CI publishes is built linux/amd64
+  (`publish-images.yml` has no `platforms:`), the Docker sidecar wants the
+  node's own architecture, and the homelab's nodes are all x86_64 — so every
+  pod template here pins `kubernetes.io/arch: amd64`. Sandbox pods carry the
+  same pin in smelt's own pod spec (`src/sandbox/spec.rs`), and language-server
+  pods are bound to their sandbox pod's node, so no pod of this system ever
+  schedules off amd64.
 - The pod gets its cluster access from its own ServiceAccount token — no
   kubeconfig is mounted, and none should be.
 
