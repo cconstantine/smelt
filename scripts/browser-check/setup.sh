@@ -60,16 +60,33 @@ if LD_LIBRARY_PATH="$LIBDIR:$LIBDIR/dri:${LD_LIBRARY_PATH:-}" ldd "$BIN" 2>/dev/
     # (trixie). --no-install-recommends keeps this to just the ~35 actual
     # library packages, not systemd/dbus-daemon/etc. pulled in as
     # Recommends.
+    # libexpat1 and libffi8 are missing from the original derivation: any
+    # machine you derive it on already has both (python3 depends on them),
+    # so they never show up as "not found" — but chrome-headless-shell
+    # links both directly, and a slim image that runs Chrome without
+    # python3 (the deployment runtime stage) has neither, so Chrome dies at
+    # launch with "error while loading shared libraries: libexpat.so.1".
     PKGS="libnspr4 libnss3 libatk1.0-0 libatk-bridge2.0-0 libdbus-1-3 \
 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
-libxkbcommon0 libasound2 libatspi2.0-0"
+libxkbcommon0 libasound2 libatspi2.0-0 libexpat1 libffi8"
 
+    # --reinstall is the load-bearing flag: plain `install --print-uris`
+    # silently omits any package dpkg already considers installed, so a
+    # fetcher that happens to have some of PKGS system-wide — the Docker
+    # chrome stage does, python3 pulls in libexpat1 and libffi8, exactly
+    # the two the original PKGS derivation missed — "fetches" them into
+    # nothing, the cache is incomplete, and every check on that machine
+    # still passes because the system has what the cache lacks. --reinstall
+    # forces a URL for every named package regardless of dpkg state, while
+    # keeping apt's name resolution (libatk1.0-0 → its t64 package on
+    # trixie) and its fetching of not-yet-installed dependencies, both of
+    # which `apt-get download` does not do.
     URLS=$(apt-get -o Dir::State::lists="$APT_DIR/lists" \
                     -o Dir::Cache="$APT_DIR" \
                     -o Dir::Cache::archives="$CACHE_DIR/debs" \
                     -o APT::Install-Recommends=false \
                     -o APT::Install-Suggests=false \
-                    --print-uris -qq install $PKGS | awk -F"'" '{print $2}')
+                    --print-uris -qq --reinstall install $PKGS | awk -F"'" '{print $2}')
 
     if [ -z "$URLS" ]; then
         echo "error: apt-get --print-uris returned no package URLs. The update above fetched a real index (see the listing before this), so re-running the same install non-quietly to see apt's actual reasoning (already satisfied? unavailable? something else):" >&2
@@ -78,7 +95,7 @@ libxkbcommon0 libasound2 libatspi2.0-0"
                 -o Dir::Cache::archives="$CACHE_DIR/debs" \
                 -o APT::Install-Recommends=false \
                 -o APT::Install-Suggests=false \
-                --print-uris install $PKGS >&2 2>&1 || true
+                --print-uris --reinstall install $PKGS >&2 2>&1 || true
         echo "--- dpkg status for these packages (system-wide, not our custom cache) ---" >&2
         dpkg -l $PKGS >&2 2>&1 || true
         exit 1
@@ -89,6 +106,21 @@ libxkbcommon0 libasound2 libatspi2.0-0"
     for deb in "$CACHE_DIR"/debs/*.deb; do
         dpkg-deb -x "$deb" "$CACHE_DIR/libs"
     done
+
+    # The fetch was the whole point — confirm it produced a libdir that
+    # actually resolves everything Chrome links. Before this, a fetch that
+    # missed a library (a new Chrome dependency, or one the derivation
+    # machine had installed system-wide) was only noticed at launch, in
+    # whatever environment happened to have the gap.
+    STILL_MISSING=$(LD_LIBRARY_PATH="$LIBDIR:$LIBDIR/dri:${LD_LIBRARY_PATH:-}" \
+        ldd "$BIN" 2>/dev/null | grep "not found" || true)
+    if [ -n "$STILL_MISSING" ]; then
+        echo "error: shared libraries still missing after the fetch:" >&2
+        printf '%s\n' "$STILL_MISSING" >&2
+        echo "Map each to its Debian package (https://packages.debian.org/trixie/)" >&2
+        echo "and add it to PKGS in this script." >&2
+        exit 1
+    fi
 else
     echo "Shared libraries already present, skipping." >&2
 fi
