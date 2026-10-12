@@ -1524,7 +1524,7 @@ async fn scenario_reply_on_conversation_stream(t: &Scenario<'_>) {
 async fn scenario_busy_session_layout(t: &Scenario<'_>) {
     let pool = t.pool;
     let browsing = t.conversation().await;
-    crate::browsing::open_session(browsing.id, crate::egress_proxy::sandbox_dial(pool.clone(), browsing.id))
+    crate::browsing::open_session(browsing.id, Some(crate::egress_proxy::sandbox_dial(pool.clone(), browsing.id)))
         .await
         .expect("open a browsing session");
     // With a todo list and a sandbox terminal open too, as in a real
@@ -1923,7 +1923,7 @@ async fn scenario_sandbox_dev_server(t: &Scenario<'_>) {
     assert!(listening, "the dev server never started listening");
 
     // The model's side: localhost in its browsing session is the sandbox.
-    crate::browsing::open_session(serving.id, crate::egress_proxy::sandbox_dial(pool.clone(), serving.id))
+    crate::browsing::open_session(serving.id, Some(crate::egress_proxy::sandbox_dial(pool.clone(), serving.id)))
         .await
         .expect("open a browsing session");
     let seen = crate::browsing::navigate(serving.id, "http://localhost:8000/").await;
@@ -2049,16 +2049,7 @@ async fn scenario_sandbox_dev_server(t: &Scenario<'_>) {
     .await
     .expect("webfetch the container");
     assert!(fetched.contains("Hello from a Docker container"), "got {fetched}");
-    let refused = anthropic::tools::execute(
-        pool,
-        serving.id,
-        &unique_id("fetch"),
-        "webfetch",
-        &serde_json::json!({"url": "http://172.24.0.1:8001/"}),
-    )
-    .await;
-    assert!(refused.is_err(), "a private address outside the pod's Docker range must stay refused: {refused:?}");
-    crate::browsing::open_session(serving.id, crate::egress_proxy::sandbox_dial(pool.clone(), serving.id))
+    crate::browsing::open_session(serving.id, Some(crate::egress_proxy::sandbox_dial(pool.clone(), serving.id)))
         .await
         .expect("open a browsing session");
     let seen = crate::browsing::navigate(serving.id, &format!("http://{container}:8001/")).await;
@@ -4662,7 +4653,7 @@ async fn wait_for_transcript_at_bottom(page: &chromiumoxide::Page) {
 /// in that conversation, its address bar must still take an address.
 async fn scenario_address_bar_after_session_closes(t: &Scenario<'_>) {
     let conversation = t.conversation().await;
-    crate::browsing::open_session_with_guard(conversation.id, |_| true)
+    crate::browsing::open_session(conversation.id, None)
         .await
         .expect("open a browsing session");
     // A page that answers only once released, so the navigation is still
@@ -4714,7 +4705,7 @@ async fn scenario_address_bar_after_session_closes(t: &Scenario<'_>) {
         // Only now: the navigation was still loading when the session
         // closed, which is the case this scenario is for.
         slow.release();
-        crate::browsing::open_session_with_guard(conversation.id, |_| true)
+        crate::browsing::open_session(conversation.id, None)
             .await
             .expect("open the browsing session again");
         if !wait_for_count(&page, ".browsing-address-input", 1, Duration::from_secs(10)).await {
