@@ -13,6 +13,14 @@
 # unlocked, so a run waiting for the lock has nothing left to compile
 # (SME-100). Don't wrap it in `flock`.
 #
+# The shell tests of the scripts themselves (scripts/test-*) run here too.
+# None needs a cluster or a database, and together they take about a minute
+# (SME-157's retrospective: nothing ran any of them, so a regression in the
+# code they cover went uncaught). scripts/test-check-scripts runs this script
+# under stubs to check how it uses the cluster lock, so it sets
+# SMELT_SKIP_SCRIPT_TESTS to ask for this step to be skipped instead of
+# running itself again.
+#
 # The browser tier (`cargo test --features "server browser-test" --
 # --ignored --test-threads=1`) isn't run here: it needs a built web
 # bundle and a real browser, and belongs before calling a change done.
@@ -51,6 +59,19 @@ lint_output=$(scripts/lint-expects 2>&1) || {
     echo "an expect() or unwrap() in production code: handle the error, or say why it can't fail (scripts/lint-expects)"
     exit 1
 }
+
+# The scripts' own tests (SME-157's retrospective: nothing ran them). About
+# a minute together, and none of them needs a cluster or a database.
+echo "== script tests"
+if [ -z "${SMELT_SKIP_SCRIPT_TESTS:-}" ]; then
+    for t in test-start-dockerd test-cluster-doctor test-ci-web-bundle test-check-scripts; do
+        echo "-- scripts/$t"
+        "scripts/$t" || {
+            echo "scripts/$t failed"
+            exit 1
+        }
+    done
+fi
 
 # Kept, and overwritten by the next run: this script deletes no files, so a
 # session can run it unattended (SME-107).

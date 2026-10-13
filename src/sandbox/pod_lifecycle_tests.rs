@@ -1541,3 +1541,157 @@ async fn test_terminals_in_one_pod_run_independently_and_are_guarded(pool: PgPoo
     })
     .await;
 }
+
+/// SME-157: containers made by a pod's Docker sidecar get the pod's own
+/// uplink MTU, not Docker's default of 1500 — on the default bridge and on
+/// a user-defined bridge created after dockerd came up (compose's project
+/// networks' equivalent). The pod's uplink is smaller than 1500 on these
+/// clusters (Flannel's VXLAN, k3s's default), and a container advertising
+/// MSS 1460 then loses every full-MSS segment its peer sends: from inside
+/// it, github.com and other hosts whose TLS handshake spans several
+/// packets are unreachable in silence, while reaching them from the pod
+/// itself takes a fraction of a second.
+///
+/// The MTU is asserted relative to what the pod itself reports for the
+/// interface its default route uses — whatever the cluster's overlay
+/// happens to have made it, which is exactly what `start-dockerd.sh` is
+/// meant to have taken, and is checked against dockerd's own arguments.
+#[sqlx::test]
+async fn test_docker_containers_get_the_pods_uplink_mtu(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    // Longer than `SCENARIO_LIMIT`: importing a base image from the
+    // sandbox's own filesystem through exec streams its whole root
+    // filesystem, as SME-33's docker test found.
+    let scenario_limit = Duration::from_secs(420);
+    run_then_tear_down(&pool, &client, scenario_limit, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        let instance = db::smelt_instance(&pool).await.expect("instance");
+        let docker = DockerSidecar {
+            memory: "1Gi".to_string(),
+            storage: PodStorage::Conversation(conversation.id),
+        };
+        ensure_conversation_pvcs(&client, conversation.id, &instance)
+            .await
+            .expect("ensure conversation claims");
+        let pod = get()
+            .expect("this test's manager")
+            .create_with_docker(
+                &super::tests::unique_session_id("docker-mtu"),
+                "256Mi",
+                &docker,
+                &[],
+                &instance,
+            )
+            .await
+            .expect("create a pod with a Docker sidecar");
+
+        // The pod's own uplink MTU, read the way start-dockerd.sh reads it:
+        // the sysfs MTU of the interface carrying the default route.
+        let uplink = pod
+            .exec(&[
+                "sh",
+                "-c",
+                "while read -r iface dest _; do [ \"$dest\" = \"00000000\" ] && break; done < /proc/net/route; cat /sys/class/net/$iface/mtu",
+            ])
+            .await
+            .expect("read the pod's uplink MTU");
+        assert_eq!(uplink.exit_code, 0, "read uplink mtu: {}", uplink.stderr);
+        let uplink_mtu: u32 = uplink
+            .stdout
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("uplink mtu {:?} isn't a number", uplink.stdout));
+
+        // What dockerd was actually told — the value of its --mtu flag and
+        // of its bridge default-network-opt — read from its own cmdline in
+        // the sidecar, so the check below can't pass on a coincidence.
+        let flags = pod
+            .exec_in(
+                "docker",
+                &[
+                    "sh",
+                    "-c",
+                    "tr '\\0' '\\n' < /proc/$(cat /var/run/docker.pid)/cmdline | grep -e '^--mtu=' -e 'com.docker.network.driver.mtu='",
+                ],
+            )
+            .await
+            .expect("read dockerd's flags");
+        let flag_mtus: Vec<u32> = flags
+            .stdout
+            .lines()
+            .map(|line| {
+                line.rsplit('=')
+                    .next()
+                    .unwrap_or_default()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("dockerd flag line {line:?} has no MTU number"))
+            })
+            .collect();
+        assert_eq!(
+            flag_mtus.len(),
+            2,
+            "dockerd should carry both --mtu and --default-network-opt, got {:?}",
+            flags.stdout
+        );
+        assert!(
+            flag_mtus.iter().all(|m| *m == uplink_mtu),
+            "dockerd's MTU flags {flag_mtus:?} should all be the pod's uplink MTU {uplink_mtu}"
+        );
+
+        // A base image from the sandbox's own files: no Docker Hub (SME-33).
+        let import = pod
+            .exec(&[
+                "bash",
+                "-c",
+                "sudo tar -C / -c bin sbin lib lib64 usr etc 2>/dev/null | docker import - local/base",
+            ])
+            .await
+            .expect("import base image");
+        assert_eq!(import.exit_code, 0, "import base image: {}", import.stdout);
+
+        // A container on the default bridge: what --mtu governs.
+        let on_default = pod
+            .exec(&["docker", "run", "--rm", "local/base", "cat", "/sys/class/net/eth0/mtu"])
+            .await
+            .expect("run container on default bridge");
+        assert_eq!(on_default.exit_code, 0, "container run: {}", on_default.stderr);
+        let bridge_mtu: u32 = on_default
+            .stdout
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("default bridge container mtu {:?}", on_default.stdout));
+
+        // A container on a user-defined bridge created now, after dockerd
+        // came up: what only --default-network-opt reaches. The same choice
+        // docker compose makes for a project's network, and a model's own
+        // `docker network create`.
+        let create_net = pod
+            .exec(&["docker", "network", "create", "sme157-probe"])
+            .await
+            .expect("create a user-defined bridge");
+        assert_eq!(create_net.exit_code, 0, "network create: {}", create_net.stderr);
+        let on_user_net = pod
+            .exec(&["docker", "run", "--rm", "--network", "sme157-probe", "local/base", "cat", "/sys/class/net/eth0/mtu"])
+            .await
+            .expect("run container on the user-defined bridge");
+        assert_eq!(on_user_net.exit_code, 0, "container run: {}", on_user_net.stderr);
+        let user_net_mtu: u32 = on_user_net
+            .stdout
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("user bridge container mtu {:?}", on_user_net.stdout));
+
+        assert_eq!(
+            bridge_mtu, uplink_mtu,
+            "a container on the default bridge got MTU {bridge_mtu}, not the pod's uplink MTU {uplink_mtu}"
+        );
+        assert_eq!(
+            user_net_mtu, uplink_mtu,
+            "a container on a user-defined bridge got MTU {user_net_mtu}, not the pod's uplink MTU {uplink_mtu} — \
+             --default-network-opt is what reaches these"
+        );
+
+        std::mem::forget(pod);
+    })
+    .await;
+}
