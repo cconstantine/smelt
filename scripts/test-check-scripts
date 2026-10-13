@@ -50,6 +50,26 @@ wait_until_held() {
     done
     return 1
 }
+# Whether a process id names a live process. kill -0 succeeds on a zombie,
+# and nothing in a container reaps the orphans a killed run leaves behind,
+# so a check that asks whether something still runs has to read the state:
+# /proc/<pid>/stat names it after the command name, which can hold spaces
+# and ')'.
+pid_is_live() {
+    local state
+    [ -r "/proc/$1/stat" ] || return 1
+    state=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f1)
+    [ -n "$state" ] && [ "$state" != Z ]
+}
+# Whether a live process is in process group $1, for the same reason: pgrep
+# counts a zombie too.
+group_is_live() {
+    local pid
+    for pid in $(pgrep -g "$1" 2>/dev/null); do
+        pid_is_live "$pid" && return 0
+    done
+    return 1
+}
 
 # Each stub below that the gate scripts call appends a line to $CALLS (when
 # set): its arguments, then "locked" or "unlocked", whether another process
@@ -164,7 +184,7 @@ if ! out=$(CHECK_SCRATCH_DB=1 check_server start HEAD); then
     fail "start: $out"
 fi
 pgid=$(cat "$pid_file" 2>/dev/null)
-[ -n "$pgid" ] && pgrep -g "$pgid" >/dev/null || fail "after start, the pid file names no live group: '$pgid'"
+[ -n "$pgid" ] && group_is_live "$pgid" || fail "after start, the pid file names no live group: '$pgid'"
 [ "$(cat "$scratch_file" 2>/dev/null)" = "$scratch_url" ] || fail "after start, the scratch file holds '$(cat "$scratch_file" 2>/dev/null)'"
 grep -qx "database create --database-url $scratch_url" "$SQLX_CALLS" || fail "start didn't create the scratch database: $(cat "$SQLX_CALLS")"
 case "$(check_server status)" in running*) ;; *) fail "status after start: $(check_server status)" ;; esac
@@ -172,7 +192,7 @@ case "$(check_server status)" in running*) ;; *) fail "status after start: $(che
 # stop: the group gone, the database dropped, both files kept and empty.
 : >"$SQLX_CALLS"
 out=$(check_server stop)
-[ -n "$pgid" ] && pgrep -g "$pgid" >/dev/null && fail "after stop, group $pgid is still running"
+[ -n "$pgid" ] && group_is_live "$pgid" && fail "after stop, group $pgid is still running"
 grep -qx "database drop -y --database-url $scratch_url" "$SQLX_CALLS" || fail "stop didn't drop the scratch database: $(cat "$SQLX_CALLS")"
 for file in "$pid_file" "$scratch_file"; do
     if [ ! -e "$file" ]; then
@@ -187,14 +207,14 @@ if ! out=$(check_server start HEAD); then
     fail "start: $out"
 fi
 pgid=$(cat "$pid_file" 2>/dev/null)
-[ -n "$pgid" ] && pgrep -g "$pgid" >/dev/null || fail "after start, the pid file names no live group: '$pgid'"
+[ -n "$pgid" ] && group_is_live "$pgid" || fail "after start, the pid file names no live group: '$pgid'"
 [ -s "$scratch_file" ] && fail "a start without CHECK_SCRATCH_DB left '$(cat "$scratch_file")' to drop"
 case "$(check_server status)" in running*) ;; *) fail "status after start: $(check_server status)" ;; esac
 
 # stop: the group gone, nothing to drop, both files kept and empty.
 : >"$SQLX_CALLS"
 out=$(check_server stop)
-[ -n "$pgid" ] && pgrep -g "$pgid" >/dev/null && fail "after stop, group $pgid is still running"
+[ -n "$pgid" ] && group_is_live "$pgid" && fail "after stop, group $pgid is still running"
 [ -s "$SQLX_CALLS" ] && fail "stop with no scratch database called sqlx: $(cat "$SQLX_CALLS")"
 for file in "$pid_file" "$scratch_file"; do
     if [ ! -e "$file" ]; then
@@ -383,12 +403,12 @@ grep -q "waiting for the cluster lock" <<<"$out" || fail "with-cluster-lock wait
 # side (SME-100 review 2). A run waiting meanwhile names it, though
 # /proc/locks can't once the holder has exited.
 bg=$(timeout 20 scripts/with-cluster-lock bash -c 'sleep 4 >/dev/null 2>&1 & echo $!')
-if [ -n "$bg" ] && kill -0 "$bg" 2>/dev/null; then
+if [ -n "$bg" ] && pid_is_live "$bg"; then
     lock_is_free && fail "with-cluster-lock: the lock came free while something the command started still ran"
     out=$(timeout 1 scripts/with-cluster-lock true 2>&1)
     grep -q "waiting for the cluster lock (held by pid $bg" <<<"$out" ||
         fail "with-cluster-lock: the waiting line doesn't name the leftover holding the lock: $out"
-    for _ in $(seq 1 60); do kill -0 "$bg" 2>/dev/null || break; sleep 0.1; done
+    for _ in $(seq 1 60); do pid_is_live "$bg" || break; sleep 0.1; done
     lock_is_free || fail "with-cluster-lock: the lock is still held after the command's leftover ended"
 else
     fail "with-cluster-lock: the background sleep isn't running: '$bg'"
@@ -399,7 +419,7 @@ fi
 # second run beside an orphaned test binary is the collision the lock is
 # for (SME-100 reviews 1 and 2).
 child_pid=$dir/lock-child-pid grandchild_pid=$dir/lock-grandchild-pid
-alive() { [ -s "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+alive() { [ -s "$1" ] && pid_is_live "$(cat "$1")"; }
 for sig in KILL TERM; do
     : >"$child_pid"
     : >"$grandchild_pid"
@@ -468,9 +488,12 @@ out=$(cd / && env -u SMELT_LOCK_DIR timeout 20 "$fake/scripts/with-cluster-lock"
 # The gate scripts with stubs for cargo, dx, sqlx and the image check: what
 # runs before the lock, and what under it. They write their logs to this
 # checkout's target/check and target/browser-tier, as a real run does.
+# SMELT_SKIP_SCRIPT_TESTS asks check.sh not to run its own scripts/test-*
+# step: this suite does run check.sh, and the nested run would run this
+# suite again, under stubs, recursing and polluting the calls recorded below.
 export CALLS=$dir/calls
 gate_env=(env -u SANDBOX_IMAGE -u CARGO_FAIL PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import"
-    DATABASE_URL=postgres://u@localhost/smelt_dev BROWSER_CHECK_CACHE="$dir")
+    DATABASE_URL=postgres://u@localhost/smelt_dev BROWSER_CHECK_CACHE="$dir" SMELT_SKIP_SCRIPT_TESTS=1)
 # Never the real cargo or dx: that would build, and run the real tests.
 for tool in cargo dx sqlx; do
     [ "$("${gate_env[@]}" bash -c "command -v $tool")" = "$dir/bin/$tool" ] || {

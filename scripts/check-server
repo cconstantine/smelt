@@ -188,14 +188,30 @@ port_holder() {
     echo "another worktree"
 }
 
+# Whether a live process is in process group $1. pgrep counts a zombie, and
+# a process killed here stays a zombie until its parent notices it died: the
+# parent is often gone (the server runs in its own group and session), and
+# a container's PID 1 never reaps at all, so pgrep alone reports a stopped
+# server as running forever. /proc/<pid>/stat names the state after the
+# command name, which can hold spaces and ')'.
+group_is_live() {
+    local pid state
+    for pid in $(pgrep -g "$1" 2>/dev/null); do
+        state=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f1)
+        [ -n "$state" ] || continue
+        [ "$state" = Z ] || return 0
+    done
+    return 1
+}
+
 running_pgid() {
     local file
     file=$(pid_file)
     [ -s "$file" ] || return 1
     local pgid
     pgid=$(cat "$file")
-    # Still ours if a process in that group is still alive.
-    pgrep -g "$pgid" >/dev/null 2>&1 || return 1
+    # Still ours if a live process in that group is.
+    group_is_live "$pgid" || return 1
     echo "$pgid"
 }
 
@@ -209,10 +225,10 @@ stop() {
     fi
     kill -TERM -- "-$pgid" 2>/dev/null || true
     for _ in $(seq 1 20); do
-        pgrep -g "$pgid" >/dev/null 2>&1 || break
+        group_is_live "$pgid" || break
         sleep 0.5
     done
-    if pgrep -g "$pgid" >/dev/null 2>&1; then
+    if group_is_live "$pgid"; then
         kill -KILL -- "-$pgid" 2>/dev/null || true
     fi
     : >"$(pid_file)"
@@ -351,7 +367,7 @@ start() {
     echo "logging at RUST_LOG=$log_level ($log_note)"
 
     for _ in $(seq 1 360); do
-        if ! pgrep -g "$pgid" >/dev/null 2>&1; then
+        if ! group_is_live "$pgid"; then
             echo "dx serve exited; see $(log_file)" >&2
             exit 1
         fi
