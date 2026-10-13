@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Tests the uplink-MTU discovery in docker/sandbox/start-dockerd.sh (SME-157)
+# without a cluster: the function between the two marker comments is extracted
+# and sourced, then run against fixture routing tables and sysfs trees. The
+# markers are part of the script's contract — if they move, this test says so
+# rather than quietly testing nothing. The function is run under both sh (what
+# the sidecar uses) and bash, since both must take it.
+#
+#   scripts/test-start-dockerd
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+failures=0
+fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
+
+script=docker/sandbox/start-dockerd.sh
+begin='# SME-157 uplink mtu: begin'
+end='# SME-157 uplink mtu: end'
+body=$(sed -n "/^$begin\$/,/^$end\$/p" "$script")
+if [ -z "$body" ]; then
+    echo "FAIL: $script holds nothing between '$begin' and '$end'"
+    echo '1 failure'
+    exit 1
+fi
+printf '%s\n' "$body" > "$tmp/discover.sh"
+printf '%s\n' '. "$(dirname "$0")/discover.sh"' 'discover_uplink_mtu "$@"' > "$tmp/run.sh"
+
+# discover [route-file] [sysfs-net-dir] — the function's own defaults are the
+# real /proc and /sys paths; every case below passes fixtures. The pod calls
+# discover_uplink_mtu with no arguments at all.
+discover() { sh "$tmp/run.sh" "$@"; }
+discover_bash() { bash "$tmp/run.sh" "$@"; }
+
+# mk_fixture <name> <route-lines...> — a fixture route file plus a sysfs tree
+# holding eth0=1450, eth1=1500, bad=not-a-number, zero=0 and empty=<no content
+# at all>. The two good interfaces deliberately hold different numbers: a
+# function that ignored which interface the route names can't print both.
+mk_fixture() {
+    name=$1
+    dir="$tmp/$name"
+    mkdir -p "$dir/sys/net/eth0" "$dir/sys/net/eth1" "$dir/sys/net/bad" "$dir/sys/net/zero" "$dir/sys/net/empty"
+    printf '1450\n' >"$dir/sys/net/eth0/mtu"
+    printf '1500\n' >"$dir/sys/net/eth1/mtu"
+    printf 'not-a-number\n' >"$dir/sys/net/bad/mtu"
+    printf '0\n' >"$dir/sys/net/zero/mtu"
+    : >"$dir/sys/net/empty/mtu"
+    printf '%s\n' "${@:2}" >"$dir/route"
+    echo "$dir"
+}
+
+header=$'Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT'
+default_eth0=$'eth0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0'
+direct_eth1=$'eth1\t000011AC\t00000000\t0001\t0\t0\t0\t00FFFF00\t0\t0\t0'
+
+# The pod case: a default route on eth0, whose sysfs MTU is what dockerd gets.
+dir=$(mk_fixture pod "$header" "$default_eth0" "$direct_eth1")
+out=$(discover "$dir/route" "$dir/sys/net"); rc=$?
+[ "$rc" = 0 ] || fail "pod case exited $rc: $out"
+[ "$out" = 1450 ] || fail "pod case printed '$out', wanted the eth0 MTU 1450"
+
+# The same fixtures under bash: sourcing must not depend on which sh runs it.
+out=$(discover_bash "$dir/route" "$dir/sys/net"); rc=$?
+[ "$rc" = 0 ] && [ "$out" = 1450 ] || fail "pod case under bash exited $rc printing '$out'"
+
+# It's the route's interface, not a hard-coded one: the same discovery with
+# the default route on eth1 prints eth1's MTU, not eth0's.
+default_eth1=$'eth1\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0'
+dir=$(mk_fixture on-eth1 "$header" "$direct_eth1" "$default_eth1")
+out=$(discover "$dir/route" "$dir/sys/net"); rc=$?
+[ "$rc" = 0 ] || fail "eth1 case exited $rc: $out"
+[ "$out" = 1500 ] || fail "eth1 case printed '$out', wanted the eth1 MTU 1500"
+
+# The default route, not just any route: eth1 is listed first here and is not
+# the uplink, and a second default-route line must not win over the first.
+dir=$(mk_fixture order "$header" "$direct_eth1" "$default_eth0" $'eth1\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0')
+out=$(discover "$dir/route" "$dir/sys/net"); rc=$?
+[ "$rc" = 0 ] || fail "route-order case exited $rc: $out"
+[ "$out" = 1450 ] || fail "route-order case printed '$out': it followed eth1, or a later default route"
+
+# Only the header: no default route at all, and the header's own
+# "Destination" field must not read as one.
+dir=$(mk_fixture header-only "$header")
+out=$(discover "$dir/route" "$dir/sys/net" 2>&1); rc=$?
+[ "$rc" != 0 ] || fail "a table with no default route was accepted, printing: $out"
+grep -qi 'default route' <<<"$out" || fail "the no-default-route failure doesn't say why: $out"
+
+# An empty routing table is the same case with a different failure mode.
+dir="$tmp/empty-table"
+mkdir -p "$dir"
+: >"$dir/route"
+out=$(discover "$dir/route" "$dir/sys/net" 2>&1); rc=$?
+[ "$rc" != 0 ] || fail "an empty routing table was accepted, printing: $out"
+
+# A missing routing table says which file it couldn't read.
+out=$(discover "$tmp/no-such-route" "$tmp/pod/sys/net" 2>&1); rc=$?
+[ "$rc" != 0 ] || fail "a missing routing table was accepted, printing: $out"
+grep -q "$tmp/no-such-route" <<<"$out" || fail "the unreadable-file failure doesn't name the file: $out"
+
+# The default route names an interface this container has no sysfs entry for.
+dir=$(mk_fixture no-iface "$header" $'eth9\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0')
+out=$(discover "$dir/route" "$dir/sys/net" 2>&1); rc=$?
+[ "$rc" != 0 ] || fail "a default route onto a missing interface was accepted, printing: $out"
+grep -q 'eth9' <<<"$out" || fail "the missing-interface failure doesn't name the interface: $out"
+
+# An MTU that isn't a number, one that's empty, and one that's the number 0
+# are all refused rather than passed to dockerd, which would fail its own
+# argument parse later — and the pod must not come up with a 0-MTU bridge.
+for iface in bad empty zero; do
+    line=$(printf '%s\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0' "$iface")
+    dir=$(mk_fixture "mtu-$iface" "$header" "$line")
+    out=$(discover "$dir/route" "$dir/sys/net" 2>&1); rc=$?
+    [ "$rc" != 0 ] || fail "an MTU file with nothing usable in it ($iface) was accepted, printing: $out"
+    grep -q "$iface" <<<"$out" || fail "the bad-MTU failure doesn't name $iface: $out"
+done
+
+# And the two arguments really are optional: called the way the pod calls it,
+# against this machine's own uplink, it prints a number.
+out=$(discover); rc=$?
+[ "$rc" = 0 ] || fail "discovery on this machine's own uplink exited $rc: $out"
+[[ "$out" =~ ^[0-9]+$ ]] || fail "discovery on this machine's own uplink printed '$out'"
+
+if [ "$failures" -gt 0 ]; then
+    echo "$failures failure(s)"
+    exit 1
+fi
+echo "all start-dockerd tests passed"
