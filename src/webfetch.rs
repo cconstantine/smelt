@@ -1,18 +1,14 @@
 //! `webfetch`: navigates a real headless browser (`chromiumoxide`, driving
 //! `chrome-headless-shell` over CDP — the same binary/setup
 //! `src/browser_tests.rs` already uses) to a URL and returns its rendered,
-//! readable text. See SME-21 for the full design,
-//! including why a real browser (JS execution included) rather than a
-//! plain HTTP GET, and why every request the page makes — not just the
-//! top-level navigation — gets checked against an SSRF guard via the CDP
-//! Fetch domain — and, since that only covers the one page, why the browser
-//! itself runs behind `crate::egress_proxy`. The guard itself (and
-//! response-text truncation) lives in
-//! `src/fetch_guard.rs`, shared with `src/http_request.rs`'s plain-HTTP
-//! tool — one source of truth for SSRF logic, not two copies that could
-//! drift apart.
+//! readable text. See SME-21 for the full design, including why a real
+//! browser (JS execution included) rather than a plain HTTP GET.
+//! `src/fetch_guard.rs` holds the URL-scheme check and response-text
+//! truncation, shared with `src/http_request.rs`'s plain-HTTP tool — one
+//! source of truth, not two copies that could drift apart. There used to be
+//! an SSRF guard here, and a browser-wide egress proxy to enforce it on
+//! every request a page makes; SME-155 removed both.
 
-use std::net::IpAddr;
 use std::time::Duration;
 
 use chromiumoxide::cdp::browser_protocol::browser::BrowserContextId;
@@ -22,7 +18,7 @@ use serde::Serialize;
 use tokio::sync::OnceCell;
 
 use crate::egress_proxy::SandboxDial;
-use crate::fetch_guard::{self, is_safe_fetch_addr};
+use crate::fetch_guard;
 
 /// Bounds page navigation+load — "bound the boundaries" (development-process.md):
 /// a slow/hanging page shouldn't tie up a tool call indefinitely.
@@ -41,16 +37,6 @@ pub struct FetchResult {
 }
 
 static BROWSER: OnceCell<Browser> = OnceCell::const_new();
-
-/// What the browser-wide egress proxy (`crate::egress_proxy`) lets through.
-/// Test builds also allow loopback, where every test fixture server lives;
-/// the strict per-call guard (`fetch_guard::spawn_request_interceptor`)
-/// still applies on top in every build.
-#[cfg(not(test))]
-const BROWSER_EGRESS_GUARD: fn(IpAddr) -> bool = is_safe_fetch_addr;
-#[cfg(test)]
-const BROWSER_EGRESS_GUARD: fn(IpAddr) -> bool =
-    |addr| is_safe_fetch_addr(addr) || addr.is_loopback();
 
 /// `pub(crate)` — `src/browsing.rs`'s persistent sessions run on this same
 /// shared browser instance rather than launching a second one.
@@ -159,20 +145,20 @@ pub(crate) struct IsolatedContext {
 /// does in the browser is visible to another.
 ///
 /// With `sandbox`, the context gets a proxy of its own
-/// (`egress_proxy::start_with_sandbox`) instead of the browser-wide one, so
-/// `localhost` in this context means the conversation's sandbox (SME-42).
-/// Every other host is guarded exactly as before.
+/// (`egress_proxy::start_with_sandbox`) so `localhost` in this context means
+/// the conversation's sandbox (SME-42), and a container's address reaches
+/// that container (SME-33). A context without one has no proxy at all.
 pub(crate) async fn new_isolated_page(
     sandbox: Option<SandboxDial>,
 ) -> Result<(Page, IsolatedContext), String> {
     let browser = shared_browser().await?;
     let sandbox_proxy = match sandbox {
-        // On the browser's own runtime, like the browser-wide proxy, so
-        // it outlives whichever runtime opened the context.
+        // On the browser's own runtime, so it outlives whichever runtime
+        // opened the context.
         Some(dial) => Some(
             browser_runtime()
                 .await?
-                .spawn(crate::egress_proxy::start_with_sandbox(BROWSER_EGRESS_GUARD, dial))
+                .spawn(crate::egress_proxy::start_with_sandbox(dial))
                 .await
                 .map_err(|e| format!("the sandbox route's start task failed: {e}"))?
                 .map_err(|e| format!("failed to start the sandbox route: {e}"))?,
@@ -182,8 +168,8 @@ pub(crate) async fn new_isolated_page(
     let mut params = CreateBrowserContextParams::default();
     if let Some(proxy) = &sandbox_proxy {
         params.proxy_server = Some(format!("http://{}", proxy.addr));
-        // As with the browser-wide proxy: don't let Chrome skip it for
-        // loopback, which is exactly what this proxy is for.
+        // Don't let Chrome skip the proxy for loopback, which is exactly
+        // what this proxy is for.
         params.proxy_bypass_list = Some("<-loopback>".to_string());
     }
     let id = browser
@@ -220,77 +206,20 @@ pub(crate) async fn dispose_isolated(context: IsolatedContext) {
 /// a running Chrome. Launched via `crate::headless_chrome`, so it dies with
 /// this process.
 async fn launch_browser() -> Result<Browser, String> {
-    // All of the browser's traffic goes through the egress proxy, which
-    // applies the SSRF guard to everything — including popups, WebSockets
-    // and service workers, which per-page CDP interception never sees.
-    // `<-loopback>` stops Chrome's default of skipping the proxy for
-    // localhost. Popups are refused outright rather than left to pile up,
-    // and WebRTC may not send UDP around the proxy.
-    let proxy = crate::egress_proxy::start(BROWSER_EGRESS_GUARD)
-        .await
-        .map_err(|e| format!("failed to start the browser's egress proxy: {e}"))?;
-    crate::headless_chrome::launch(&[
-        format!("--proxy-server=http://{proxy}"),
-        "--proxy-bypass-list=<-loopback>".to_string(),
-        "--block-new-web-contents".to_string(),
-        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string(),
-    ])
-    .await
+    // Popups are refused outright rather than left to pile up.
+    crate::headless_chrome::launch(&["--block-new-web-contents".to_string()]).await
 }
 
 /// Fetches `url` in a real browser and returns its rendered readable text.
-/// Every request the page makes (this navigation, any redirect,
-/// subresources, JS-initiated fetches) is checked via
-/// `fetch_guard::is_request_allowed_with` through the CDP Fetch domain
-/// before being let through — see SME-21's "SSRF guard via CDP request
-/// interception" for why this has to cover more than just the top-level
-/// URL once the fetch is a real, JS-executing browser rather than a plain
-/// HTTP GET.
+/// With `sandbox`, the page's browser context sends `localhost`-style hosts
+/// and pod container addresses to the conversation's sandbox (SME-42,
+/// SME-33). Addresses aren't filtered (SME-155); only the scheme is
+/// checked, here rather than by any interceptor, because a `data:` (or
+/// similar) URL never touches the network for an interceptor to see
+/// (SME-40 F15).
 pub async fn fetch(url: &str, sandbox: Option<SandboxDial>) -> Result<FetchResult, String> {
-    fetch_routed(url, is_safe_fetch_addr, sandbox).await
-}
-
-/// The real implementation behind `fetch`, parameterized on the
-/// address-safety predicate purely so tests can exercise a relaxed variant
-/// (allowing loopback, where this test suite's own local fixture server
-/// necessarily lives — every locally-reachable address in this dev
-/// container is either loopback or RFC1918-private, so there is no way to
-/// stand up a "legitimate" test page without *some* seam here) while the
-/// real `fetch` above always uses the strict, real `is_safe_fetch_addr`.
-#[cfg(all(test, feature = "browser-test"))]
-async fn fetch_with_guard(
-    url: &str,
-    is_addr_allowed: fn(IpAddr) -> bool,
-) -> Result<FetchResult, String> {
-    fetch_routed(url, is_addr_allowed, None).await
-}
-
-/// `fetch_with_guard` plus an optional sandbox route: with one, the page's
-/// browser context sends `localhost`-style hosts to the conversation's
-/// sandbox (SME-42).
-async fn fetch_routed(
-    url: &str,
-    is_addr_allowed: fn(IpAddr) -> bool,
-    sandbox: Option<SandboxDial>,
-) -> Result<FetchResult, String> {
-    let sandbox_routed = sandbox.is_some();
-    // The request interceptor only sees loads that touch the network, so it
-    // can't stop a `data:` (or similar) URL — `check_load` checks the
-    // scheme too. Refuse a private or local address before loading, with a
-    // reason the model can act on rather than Chrome's
-    // "net::ERR_BLOCKED_BY_CLIENT" (SME-40 F15). The interceptor still
-    // guards everything the page loads.
-    fetch_guard::check_load(url, is_addr_allowed, sandbox_routed)
-        .await
-        .map_err(|e| format!("refused {url}: {e}; smelt doesn't load private or local addresses"))?;
+    fetch_guard::parse_fetch_target(url).map_err(|e| format!("refused {url}: {e}"))?;
     let (page, context) = new_isolated_page(sandbox).await?;
-    let intercept_task = match fetch_guard::spawn_request_interceptor(&page, is_addr_allowed, sandbox_routed).await {
-        Ok(task) => task,
-        Err(e) => {
-            dispose_isolated(context).await;
-            return Err(e);
-        }
-    };
 
     // `goto` itself already resolves only once the navigated URL is fully
     // loaded (confirmed against the vendored source's own doc comment) —
@@ -304,7 +233,6 @@ async fn fetch_routed(
     })
     .await;
 
-    intercept_task.abort();
     dispose_isolated(context).await;
 
     let value = match nav_result {
@@ -332,15 +260,6 @@ async fn fetch_routed(
 #[cfg(all(test, feature = "browser-test"))]
 mod browser_tests {
     use super::*;
-
-    /// Every locally-reachable address in this dev container is either
-    /// loopback or RFC1918-private, so there is no way to serve a
-    /// "legitimate" fixture page for these tests without loosening the
-    /// guard *somewhere* — this loosens it only for loopback, only in
-    /// these tests, never in `fetch`'s own real default (`is_safe_fetch_addr`).
-    fn allow_loopback_too(addr: IpAddr) -> bool {
-        is_safe_fetch_addr(addr) || addr.is_loopback()
-    }
 
     const OWNER_HELPER_ENV: &str = "SMELT_CHROME_OWNER_HELPER";
 
@@ -471,17 +390,13 @@ mod browser_tests {
     #[tokio::test]
     #[ignore]
     async fn test_fetch_scenarios() {
-        // --- Scenario 1: a real page's rendered, readable text comes back. ---
+        // --- Scenario 1: a real page's rendered, readable text comes
+        // back. Its address is loopback, where this test suite's fixture
+        // server necessarily lives — addresses aren't filtered any more
+        // (SME-155), and there's no test seam to prove it through. ---
         let (url, _server) =
             start_test_server("<html><body><h1>Hello from a real page</h1></body></html>").await;
-        let proxied_before = crate::egress_proxy::requests_handled();
-        let result = fetch_with_guard(&url, allow_loopback_too)
-            .await
-            .expect("fetch should succeed");
-        assert!(
-            crate::egress_proxy::requests_handled() > proxied_before,
-            "the browser reached a loopback page without going through the egress proxy"
-        );
+        let result = fetch(&url, None).await.expect("fetch should succeed");
         assert_eq!(result.url, url);
         assert!(
             result.text.contains("Hello from a real page"),
@@ -490,68 +405,12 @@ mod browser_tests {
         );
         assert!(!result.truncated);
 
-        // --- Scenario 2: navigating straight to a loopback address is refused. ---
-        let result = fetch("http://127.0.0.1:1/", None).await;
-        let error = result.expect_err("expected navigating straight to a loopback address to be refused");
-        // And says why, not Chrome's "net::ERR_BLOCKED_BY_CLIENT" (SME-40 F15).
-        assert!(error.contains("private or local"), "the refusal should say why: {error}");
-
-        // --- Scenario 2b: a data: URL is refused too — it never touches
-        // the network, so the request interceptor can't be what stops it. ---
+        // --- Scenario 2: a data: URL is refused — it never touches the
+        // network, so only the pre-load scheme check stops it (SME-40 F15). ---
         let result = fetch("data:text/html,<h1>DATA-SCHEME-LOADED</h1>", None).await;
         assert!(result.is_err(), "expected a data: URL to be refused, got: {result:?}");
 
-        // --- Scenario 3: a page-initiated (JS `fetch()`) request to a
-        // private address is blocked too — the case a plain top-level-URL
-        // check (SME-21's original, reqwest-based plan) couldn't cover. Proves
-        // the CDP Fetch-domain interception covers subresource/JS-initiated
-        // requests, not just the top-level navigation. ---
-        let (url, _server) = start_test_server(
-            "<html><body><div id=\"out\">pending</div><script>
-                fetch('http://169.254.169.254/').then(
-                    () => { document.getElementById('out').innerText = 'reached'; },
-                    () => { document.getElementById('out').innerText = 'blocked'; }
-                );
-            </script></body></html>",
-        )
-        .await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let result = fetch_with_guard(&url, allow_loopback_too)
-                .await
-                .expect("fetch should succeed");
-            if result.text.contains("blocked") {
-                break;
-            }
-            assert!(
-                !result.text.contains("reached"),
-                "the page-initiated request to a private address should have been blocked, \
-                 got: {:?}",
-                result.text
-            );
-            if tokio::time::Instant::now() >= deadline {
-                panic!("script never finished; last text: {:?}", result.text);
-            }
-        }
-
-        // --- Scenario 4: a fetched page can't reach a refused address by
-        // any route the per-page interception doesn't see — a WebSocket or
-        // a service worker, both started as soon as the page loads. ---
-        let forbidden = crate::browsing::browser_tests::start_forbidden_server().await;
-        let (escape_url, _escape_server) =
-            crate::browsing::browser_tests::start_escape_test_server(&forbidden).await;
-        fetch_with_guard(&escape_url, allow_loopback_too)
-            .await
-            .expect("fetching the escape page should succeed");
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let hits = forbidden.hits.lock().unwrap().clone();
-        assert!(
-            hits.is_empty(),
-            "a fetched page reached the forbidden address {}: {hits:?}",
-            forbidden.addr
-        );
-
-        // --- Scenario 5: one webfetch call leaves nothing behind for the
+        // --- Scenario 3: one webfetch call leaves nothing behind for the
         // next — not cookies, not site storage — so nothing leaks between
         // conversations through webfetch either. ---
         {
@@ -581,10 +440,10 @@ mod browser_tests {
             let _server = tokio::spawn(async move {
                 axum::serve(listener, router).await.expect("test server error");
             });
-            fetch_with_guard(&format!("{base}/set-data"), allow_loopback_too)
+            fetch(&format!("{base}/set-data"), None)
                 .await
                 .expect("the first fetch should succeed");
-            let second = fetch_with_guard(&format!("{base}/show-data"), allow_loopback_too)
+            let second = fetch(&format!("{base}/show-data"), None)
                 .await
                 .expect("the second fetch should succeed");
             assert!(
@@ -594,16 +453,15 @@ mod browser_tests {
             );
         }
 
-        // --- Scenario 6 (SME-42): with a sandbox route, `localhost` is the
-        // conversation's sandbox — the page comes through the route, even
-        // under the strict guard, not from this machine. ---
+        // --- Scenario 4 (SME-42): with a sandbox route, `localhost` is the
+        // conversation's sandbox — the page comes through the route, not
+        // from this machine. ---
         let (sandbox_url, _sandbox_server) =
             start_test_server("<html><body><p>Served from the sandbox</p></body></html>").await;
         let sandbox_addr = test_server_addr(&sandbox_url);
         let dialed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let result = fetch_routed(
+        let result = fetch(
             "http://localhost:4321/",
-            is_safe_fetch_addr,
             Some(crate::egress_proxy::dial_to(sandbox_addr, dialed.clone())),
         )
         .await
@@ -614,29 +472,6 @@ mod browser_tests {
             result.text
         );
         assert!(dialed.lock().unwrap().contains(&(crate::sandbox::PodHost::Localhost, 4321)), "the route was never used: {dialed:?}");
-
-        // --- Scenario 7 (SME-42): a routed context is still guarded —
-        // a page loaded from the sandbox can't reach a private address by a
-        // WebSocket or a service worker either. ---
-        let forbidden = crate::browsing::browser_tests::start_forbidden_server().await;
-        let (escape_url, _escape_server) =
-            crate::browsing::browser_tests::start_escape_test_server(&forbidden).await;
-        let dialed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let result = fetch_routed(
-            "http://localhost:4322/",
-            is_safe_fetch_addr,
-            Some(crate::egress_proxy::dial_to(test_server_addr(&escape_url), dialed)),
-        )
-        .await
-        .expect("fetching the escape page from the sandbox should succeed");
-        assert!(result.text.contains("Blank link"), "the escape page didn't load: {:?}", result.text);
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let hits = forbidden.hits.lock().unwrap().clone();
-        assert!(
-            hits.is_empty(),
-            "a page in a routed context reached the forbidden address {}: {hits:?}",
-            forbidden.addr
-        );
 
         // `src/browsing.rs`'s own real-browser scenarios run on this same
         // shared browser static — see that module's `browser_tests` doc

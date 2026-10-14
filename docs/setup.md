@@ -115,9 +115,11 @@ Running smelt for real, outside the dev stack. The [README](../README.md#deployi
 smelt is one server binary plus a web bundle. Alongside it, it needs:
 
 - **Postgres.** smelt applies its own migrations at startup.
-- **A single-node k3s cluster** for the sandboxes, with a default StorageClass (k3s ships `local-path`). It has to be k3s on one node: the sandbox image is imported straight into that node's containerd at k3s's socket path, with no registry, and pods never pull it. smelt runs the sandboxes in the `smelt-park` namespace under a `park` service account, and [k8s/smelt-park-rbac.yaml](../k8s/smelt-park-rbac.yaml) creates both. The cluster must allow privileged pods, because each sandbox's Docker sidecar is privileged. Live memory and CPU on the Sandboxes page also need metrics-server. The cluster needs to pull from Docker Hub: the image import's loader pod (`rancher/k3s`, pinned to k3s v1.34, whose `ctr` should match your cluster's containerd) and language-server pods both come from there.
+- **A single-node k3s cluster** for the sandboxes, with a default StorageClass (k3s ships `local-path`). It has to be k3s on one node: the sandbox image is imported straight into that node's containerd at k3s's socket path, with no registry, and pods never pull it. The node is x86_64 (`amd64`), and smelt pins every pod it makes to `kubernetes.io/arch: amd64`: every image the project publishes is built linux/amd64 only, so a node of another architecture could only fail the pull. smelt runs the sandboxes in the `smelt-park` namespace under a `park` service account, and [k8s/smelt-park-rbac.yaml](../k8s/smelt-park-rbac.yaml) creates both. The cluster must allow privileged pods, because each sandbox's Docker sidecar is privileged. Live memory and CPU on the Sandboxes page also need metrics-server. The cluster needs to pull from Docker Hub: the image import's loader pod (`rancher/k3s`, pinned to k3s v1.34, whose `ctr` should match your cluster's containerd) and language-server pods both come from there.
 - **The sandbox image**, delivered straight to the node's containerd with no registry involved.
 - **Headless Chrome**, for `webfetch` and browsing sessions.
+
+The steps below build all of that yourself, which is the only route that has ever been tested end to end. [Deploying from published images](#deploying-from-published-images) covers the alternative: pull the server and sandbox images from GHCR instead, and skip the building.
 
 ### Steps
 
@@ -125,7 +127,7 @@ smelt is one server binary plus a web bundle. Alongside it, it needs:
 2. **Set up the cluster.** Run `kubectl apply -f k8s/smelt-park-rbac.yaml`, then make a kubeconfig for the `park` service account. [scripts/k3s-bootstrap.sh](../scripts/k3s-bootstrap.sh) shows how: it mints a long-lived token secret and writes the kubeconfig. It's written for the compose stack, so use your cluster's API address, an admin kubeconfig and your own paths instead of its `k3s:6443`, `/k3s-admin/k3s.yaml`, `/k8s/` and `/out/`. Point `KUBECONFIG` at that file.
 3. **Deliver the sandbox image.** With `DOCKER_HOST` and `KUBECONFIG` set, run `scripts/build-sandbox-image.sh` from the same tree as the server you build in step 5. Run it again after every upgrade of smelt. The image is named after the agent's sources (`smelt-sandbox:src-<hash>`), and a server with no `SANDBOX_IMAGE` runs the one named after the sources it was built from (SME-121), so it can't start pods from an older agent. If the image isn't on the node, `create_pod` fails within seconds with `ErrImageNeverPull`, naming the image and this command.
 4. **Install headless Chrome:** `scripts/browser-check/setup.sh`. Then set `BROWSER_CHECK_CACHE` to the absolute path of the `.browser-check-cache` directory it creates.
-5. **Build:** `dx bundle --platform web`. It produces a release server binary next to its web bundle, and dx's output says where. Run the binary from that layout: it serves the bundle from the `public/` directory beside it.
+5. **Build:** `dx bundle --platform web --release`. Keep the `--release`: without it dx builds a debug binary — its own output says `.../debug/web/` — which isn't what you want running for real. It puts a release server binary next to its web bundle, and dx's output says where. Run the binary from that layout: it serves the bundle from the `public/` directory beside it.
 6. **Configure and start it.** Set the environment variables in [docs/setup.md](#environment-variables). The ones a deployment needs are:
    - `DATABASE_URL` and `KUBECONFIG`.
    - `PORT`: default `8080`.
@@ -135,6 +137,37 @@ smelt is one server binary plus a web bundle. Alongside it, it needs:
    - `BROWSER_CHECK_CACHE`: from step 4.
 7. **Put it behind TLS.** Use a reverse proxy that speaks HTTP/2: each tab holds an open event stream, and HTTP/1.1 allows only six connections per host. Route the preview host names (for example `{port}-{conversation}-smelt.example.com`) to `SMELT_PREVIEW_ADDR`'s port. They need wildcard DNS and a wildcard TLS certificate. The proxy must pass the browser's `Host` header through unchanged (in nginx, `proxy_set_header Host $host;`), since the preview listener reads the conversation and port from it, and must pass WebSocket upgrades through for a dev server's live reload. See [Sandbox previews](#sandbox-previews).
 8. **Add a model provider.** Open smelt, go to **Model providers** in the sidebar, and add one with its key. Nothing about the model is read from the environment.
+
+### Deploying from published images
+
+`.github/workflows/publish-images.yml` builds both images from one commit and pushes them to GHCR — every branch push publishes its own `<sha>` tags, and only main moves `latest`:
+
+- `ghcr.io/<you>/smelt:<sha>` — the server: the release binary (26 MB, stripped by this repo's release profile), its web bundle, and the headless Chrome `webfetch` and browsing sessions use, already laid out the way `BROWSER_CHECK_CACHE` wants (set in the image, so a deployment doesn't set it). It listens on `8080` (and `8181` for previews), runs as uid 1000, and needs no volumes. About 885 MB, of which Chrome and the libraries it fetched are 492 MB.
+- `ghcr.io/<you>/smelt-sandbox:<sha>` — the sandbox agent image, built from `docker/sandbox/Dockerfile` like any other image. It carries a `src-<hash>` tag as well: the same 16 hex digits `scripts/sandbox-image-ref` prints for the sources it was built from, under a registry a pod can actually reach.
+
+One commit builds both, so a server and the agent it expects are the same build. These settings replace steps 1, 3, 4 and 5 above:
+
+```bash
+SANDBOX_IMAGE=ghcr.io/<you>/smelt-sandbox:<sha>          # not the src-<hash> default: that one
+SANDBOX_IMAGE_PULL_POLICY=IfNotPresent                   # names nothing a pod can reach
+SANDBOX_IMAGE_PULL_SECRET=ghcr                           # only when the package is private
+# SANDBOX_DOCKER_IMAGE unset: docker:29-dind pulls from Docker Hub
+```
+
+`SANDBOX_IMAGE_PULL_POLICY` is the one that bites: pods ask `Never` unless told, so a sandbox from a registry image fails within seconds with `ErrImageNeverPull` — now an error that names the setting, not just the build script.
+
+**Pull credentials.** A GHCR package is private until you make it public, and a private one needs the pod to present something, or both pulls fail with `pull access denied`. Make the secret in the namespace the pods are created in, and name it for them:
+
+```bash
+kubectl create secret docker-registry ghcr -n smelt-park \
+  --docker-server=ghcr.io --docker-username=<you> --docker-password=<read-only-package-token>
+```
+
+A public GHCR package needs neither the secret nor the setting; the Docker sidecar's pull from Docker Hub is anonymous, so it needs nothing either. The secret is only ever read by sandbox pods, which is why it lives in `smelt-park` and not in whatever namespace smelt's own pod runs in.
+
+`scripts/build-sandbox-image.sh`, `scripts/cluster-doctor` and the import loader are then dev and CI machinery: a deployment pulling images never runs them, and `cluster-doctor`'s `ctr images ls` check would report the node has no image it isn't looking for.
+
+The builds themselves have been run: this Dockerfile produced the server image, which starts against a real Postgres, applies its migrations, and serves the app and its assets from the bundle beside it. And both images have been pulled back out of GHCR by tag and tried again as pulled — the server image against a database nothing had touched, where it applied all its migrations and served its own bundle's assets, and the sandbox image's agent, whose libraries all resolve. What hasn't been tried is the last step: a sandbox pod started from the published sandbox image against a real cluster.
 
 ### Before you expose it
 
@@ -182,6 +215,8 @@ panics at startup just like an unset one.
 | `SANDBOX_WORKSPACE_STORAGE_SIZE` | no | `20Gi` | Size each conversation's `/workspace` claim (`sandbox-workspace-<conversation id>`, its files and checkouts) requests. |
 | `SANDBOX_VOLUME_STORAGE_SIZE` | no | `10Gi` | Size each generic volume's claim (`sandbox-volume-<id>`, the volumes configured on the `/sandbox-volumes` page) requests (`src/sandbox/spec.rs`). Not configurable per volume. |
 | `SANDBOX_DOCKER_IMAGE` | no | `docker.io/library/docker:29-dind` | The Docker sidecar's image, delivered into the node by `scripts/build-sandbox-image.sh`. Only its `dockerd` is used, never its entrypoint. |
+| `SANDBOX_IMAGE_PULL_POLICY` | no | `Never` | How both of a pod's containers fetch their image — `Never`, `IfNotPresent` or `Always`, in any case. `Never` is what a node that got its images through `scripts/build-sandbox-image.sh` needs: those images are in no registry a pod could reach. A deployment that pulls its images instead (see [Deploying from published images](#deploying-from-published-images)) sets `IfNotPresent`; without it a pod from a registry image fails at once with `ErrImageNeverPull`. An unrecognised value falls back to `Never` with a warning at startup. |
+| `SANDBOX_IMAGE_PULL_SECRET` | no | none | The names, comma-separated, of the credentials both of a pod's containers fetch their image with, for a registry that asks to be authenticated first — a private GHCR package among them. Each name is a `kubernetes.io/dockerconfigjson` secret in `smelt-park`, where the pods are created (see [Deploying from published images](#deploying-from-published-images)). Unset, as it always was for images built straight into the node: nothing to authenticate to, so nothing presented. |
 | `BROWSER_CHECK_CACHE` | no | `<build checkout>/.browser-check-cache` | Where headless Chrome and its libraries are: `scripts/browser-check/setup.sh` downloads into it and smelt launches Chrome from it, for `webfetch` and browsing sessions (see [Commands](#commands) above). Set it, as an absolute path, wherever smelt runs from somewhere other than the checkout it was built in: smelt reads a relative one against its own working directory. |
 | `SMELT_MASON_REGISTRY_URL` | no | `https://raw.githubusercontent.com/mason-org/mason-registry/main` | Where the Language servers page's lookup reads mason's `packages/<name>/package.yaml` (see [Language servers](#language-servers)). |
 | `SMELT_HELIX_LANGUAGES_URL` | no | `https://raw.githubusercontent.com/helix-editor/helix/master/languages.toml` | Helix's `languages.toml`, for the lookup's arguments, file types, root markers and settings. |
@@ -237,6 +272,7 @@ Every sandbox pod runs its own Docker daemon (SME-33), so the model can `docker 
 - **Its own limits.** Containers count against the sidecar's limits (`SANDBOX_DOCKER_MEMORY_LIMIT`/`SANDBOX_DOCKER_CPU_LIMIT`). The sidecar starts dockerd with `docker/sandbox/start-dockerd.sh`, not the `docker:dind` entrypoint: a privileged container shares the node's cgroup tree, and that entrypoint rearranges the node's root cgroup and lets containers escape every limit. An OOM kill restarts only the sidecar; the model gets a notice, and its terminals and `/workspace` carry on.
 - **Persistence.** `/var/lib/docker` is the conversation's own claim, `sandbox-docker-<conversation id>`: images, build cache and named volumes survive a new pod and are deleted with the conversation. `/workspace` is another, `sandbox-workspace-<conversation id>` (SME-32): the conversation's files, checkouts and uncommitted work are there again in its next pod. At startup smelt deletes claims whose conversation no longer exists. `create_pod` waits for the conversation's previous pod to be gone first, so two pods never share a claim.
 - **Networking like a Linux host.** A published port is at `localhost:<port>`, and any container port at the container's address. Docker's networks come from `172.20.0.0/14`, clear of k3s's ranges and the homelab LAN. The model's browser (`webfetch`, browsing sessions) reaches container addresses in that range, and `sandbox_preview_url`'s `host` gives the user a preview of one (`http://172-21-0-2-3000-42.preview.localhost:8181`). The sandbox agent relays those connections from `127.0.0.1:8089` and refuses any address outside the range; every other private address stays refused.
+- **Containers get the pod's uplink MTU** (SME-157). Docker's own default MTU is 1500; on Flannel's VXLAN (k3s's default) the pod's uplink is 1450, and a container advertising MSS 1460 loses every full-MSS segment its peer sends — `git clone` over HTTPS dies on a recv failure, `docker build` fails in whichever `RUN` step reaches out, and it looks like a problem with the site. `start-dockerd.sh` reads the MTU of the interface carrying the pod's default route from `/proc/net/route` and sysfs and starts dockerd with both `--mtu` (the default bridge) and `--default-network-opt bridge=com.docker.network.driver.mtu=` (user-defined bridges — what compose project networks are); neither flag alone covers both. If no uplink MTU can be read the sidecar refuses to start dockerd, with the reason in its container log, rather than come up broken for some hosts. Networks already stored in `/var/lib/docker` keep the MTU they were created with, and nothing migrates them: a user-created network gets the new one when it's deleted and recreated (a compose project's, with `docker compose down` then `up`), and the default bridge on a conversation's Docker volume created before this fix keeps its stored MTU until that volume's Docker data is reset.
 
 **What this gives up.** The sidecar is privileged and the sandbox holds its socket, so anything the model runs can become root on the node (`docker run --privileged -v /:/host …`). The sandbox still keeps a runaway command out of smelt's own process, but not off the node or away from other pods on it. With previews and no login yet, anyone who can reach smelt can reach root on that node. Not covered: a container started with `--network host` shares the pod's network and can reach the sandbox agent on `127.0.0.1:8088`, as it could on a Linux host. Running Docker unprivileged, in a user-namespaced pod, needs a newer node kernel ([SME-47](https://linear.app/smelt-agent/issue/SME-47)).
 
