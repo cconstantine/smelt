@@ -1335,6 +1335,55 @@ mod tests {
         assert!(description.contains("transport"), "{description}");
     }
 
+    /// Review 2, in the real caller's shape: an MCP server over real HTTP
+    /// that answers `tools/call` with an HTTP 500 whose plain-text body
+    /// echoes the call's input. rmcp quotes that body in a transport
+    /// error; the model gets it, the exported spans don't.
+    #[tokio::test]
+    async fn test_a_tools_call_answered_with_a_non_json_rpc_500_exports_none_of_the_body() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        async fn handler(axum::Json(request): axum::Json<serde_json::Value>) -> axum::response::Response {
+            let Some(id) = request.get("id").cloned() else {
+                return StatusCode::ACCEPTED.into_response();
+            };
+            let result = match request["method"].as_str() {
+                Some("initialize") => serde_json::json!({
+                    "protocolVersion": request["params"]["protocolVersion"],
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "mock", "version": "0"},
+                }),
+                Some("tools/list") => serde_json::json!({"tools": [
+                    {"name": "search", "description": "Searches", "inputSchema": {"type": "object"}}
+                ]}),
+                Some("tools/call") => {
+                    let echoed = request["params"]["arguments"]["q"].as_str().unwrap_or_default().to_string();
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("crashed on {echoed}")).into_response();
+                }
+                _ => serde_json::json!({}),
+            };
+            axum::Json(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let app = axum::Router::new().route("/mcp", axum::routing::post(handler));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let config = config_at(-137_006, format!("http://{addr}/mcp"));
+        let (result, spans) = crate::telemetry::capture_spans(async {
+            call_tool(&test_pool(), &config, "search", serde_json::json!({"q": "SECRET-ECHOED-INPUT"})).await
+        })
+        .await;
+        evict(config.id).await;
+        lock_failures().remove(&config.id);
+        let error = result.expect_err("a 500 fails the call");
+        assert!(error.contains("SECRET-ECHOED-INPUT"), "the model gets the reply: {error}");
+        let call = spans.iter().find(|span| span.name == "mcp call").expect("an mcp call span");
+        assert!(matches!(call.status, opentelemetry::trace::Status::Error { .. }), "{:?}", call.status);
+        let exported = format!("{spans:?}");
+        assert!(!exported.contains("SECRET"), "{exported}");
+    }
+
     #[tokio::test]
     async fn test_a_failed_mcp_connect_is_a_failed_span() {
         let config = test_config(-137_002, "nowhere");
