@@ -172,10 +172,14 @@ pub enum ConversationEvent {
     ProvidersChanged {},
     /// Whether a model turn is running (or queued) in this conversation,
     /// published when that changes, so every tab watching it can offer a
-    /// Stop button, including for turns it didn't start. Regenerable from
+    /// Stop button, including for turns it didn't start. `elapsed` is how
+    /// long the busy spell had been running on the server's clock when
+    /// this was published, in whole seconds: 0 at both transitions
+    /// (SME-160). Regenerable, with the turn's real age, from
     /// `api::chat::get_turn_state`.
     TurnState {
         running: bool,
+        elapsed: u64,
     },
     /// A model call is starting: whatever reply text a tab is showing as
     /// "streaming" is done with (it's saved, or it was a false start the
@@ -463,7 +467,7 @@ mod server {
         #[test]
         fn test_a_publish_with_no_subscriber_makes_no_channel() {
             let conversation_id = 9_100_000_098;
-            publish(conversation_id, ConversationEvent::TurnState { running: false });
+            publish(conversation_id, ConversationEvent::TurnState { running: false, elapsed: 0 });
             assert!(!has_channel(conversation_id));
         }
 
@@ -747,7 +751,7 @@ mod wire_tests {
             ConversationEvent::TurnError { message: "boom".to_string() },
             ConversationEvent::ReplyReset {},
             ConversationEvent::ReplyDelta { text: "Hi".to_string(), offset: 0 },
-            ConversationEvent::TurnState { running: true },
+            ConversationEvent::TurnState { running: true, elapsed: 0 },
             ConversationEvent::PodsChanged {},
             ConversationEvent::TurnsChanged {},
             ConversationEvent::QuestionsChanged {},

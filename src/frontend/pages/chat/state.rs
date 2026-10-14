@@ -34,8 +34,10 @@ pub(super) struct ConversationState {
     /// Whether the server has a turn running (or queued) here, whoever
     /// started it (`ConversationEvent::TurnState`).
     pub(super) turn_running: bool,
-    /// Seconds this tab has seen the current turn running, for the
-    /// "Working…" line (SME-41 D1).
+    /// Seconds the current turn has been running, for the "Working…"
+    /// line: the server's clock, from the busy spell's start — set from
+    /// `ConversationEvent::TurnState` and the reconnect pull, and ticked
+    /// once a second in between (SME-41 D1; SME-160).
     pub(super) turn_elapsed: u64,
     /// A background wake-up that failed to reach the model
     /// (`ConversationEvent::NotificationDeliveryFailed`). Kept apart from
@@ -191,8 +193,11 @@ pub(super) fn apply_event(state: Store<ConversationState>, event: ConversationEv
         ConversationEvent::BrowsingUrlUpdate { url } => state.browsing_url().set(Some(url)),
         ConversationEvent::ReposUpdate { repos } => state.repos().set(repos),
         ConversationEvent::QuestionUpdate { question } => state.pending_question().set(question),
-        ConversationEvent::TurnState { running } => {
+        ConversationEvent::TurnState { running, elapsed } => {
             state.turn_running().set(running);
+            // SME-160: the timer shows the turn's age on the server's
+            // clock, not this tab's own.
+            state.turn_elapsed().set(elapsed);
             if !running {
                 state.streaming_reply().set(None);
             }

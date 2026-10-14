@@ -704,6 +704,57 @@ async fn test_a_running_turn_marks_its_conversation_busy() {
     assert!(!busy_conversations().contains(&conversation_id));
 }
 
+/// SME-160: the working timer's age comes from when the busy spell
+/// started, on the server's monotonic clock: a fresh turn is seconds
+/// old, a turn queuing behind a running one doesn't move the start,
+/// the age keeps climbing while any turn runs (not from whenever a tab
+/// connected), and it's gone once the last turn ends. `TurnState`
+/// carries it on the wire.
+#[tokio::test]
+async fn test_turn_started_elapsed_counts_from_the_busy_spell_start() {
+    let conversation_id = 9_160_000_016;
+    let mut rx = events::subscribe(conversation_id);
+    assert_eq!(turn_started_elapsed(conversation_id), None, "idle has no age");
+
+    let running = TurnInFlight::start(conversation_id);
+    let event = rx.recv().await.expect("a starting turn announces itself");
+    assert!(
+        matches!(event, events::ConversationEvent::TurnState { running: true, elapsed: 0 }),
+        "got {event:?}"
+    );
+    let age = turn_started_elapsed(conversation_id).expect("a running turn has an age");
+    assert!(age < std::time::Duration::from_secs(1), "a fresh turn is seconds old: {age:?}");
+
+    // A turn queuing behind the running one doesn't restart the spell,
+    // and ending the running one while the queued one remains doesn't
+    // either — the busy spell is still one spell.
+    let queued = TurnInFlight::start(conversation_id);
+    drop(running);
+    let age = turn_started_elapsed(conversation_id).expect("the queued turn keeps the spell running");
+    assert!(age < std::time::Duration::from_secs(1), "the start was moved: {age:?}");
+    assert!(rx.try_recv().is_err(), "a queued turn or a partial end publishes nothing");
+
+    // The clock moves with the wall clock: after a real second it has
+    // counted it, from the spell's start rather than from now.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let age = turn_started_elapsed(conversation_id).expect("the turn is still running");
+    assert!(age >= std::time::Duration::from_secs(1), "the clock didn't move: {age:?}");
+
+    // The spell ends with the last turn, and the next one starts fresh.
+    drop(queued);
+    assert_eq!(turn_started_elapsed(conversation_id), None, "idle again has no age");
+    let event = rx.recv().await.expect("the last turn ending announces itself");
+    assert!(
+        matches!(event, events::ConversationEvent::TurnState { running: false, elapsed: 0 }),
+        "got {event:?}"
+    );
+    let fresh = TurnInFlight::start(conversation_id);
+    let age = turn_started_elapsed(conversation_id).expect("the next turn has its own age");
+    assert!(age < std::time::Duration::from_secs(1), "the spell didn't restart: {age:?}");
+    drop(fresh);
+    events::forget(conversation_id);
+}
+
 #[tokio::test]
 async fn test_a_conversation_stream_relays_turns_changed() {
     let stream = conversation_event_stream(9_000_000_042);
@@ -2484,7 +2535,7 @@ async fn next_turn_state(
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             match rx.recv().await {
-                Ok(events::ConversationEvent::TurnState { running }) => return Some(running),
+                Ok(events::ConversationEvent::TurnState { running, .. }) => return Some(running),
                 Ok(_) => continue,
                 Err(_) => return None,
             }
@@ -3302,7 +3353,7 @@ async fn test_stopping_a_woken_turn_is_not_reported_as_a_failure(pool: PgPool) {
     // by another test's stop, say) would pass the check below untested.
     let started = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if let events::ConversationEvent::TurnState { running: true } =
+            if let events::ConversationEvent::TurnState { running: true, .. } =
                 rx.recv().await.expect("event channel should not close")
             {
                 return;

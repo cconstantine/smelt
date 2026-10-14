@@ -795,6 +795,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "markdown_bare_urls_streaming", 60, Box::pin(scenario_markdown_bare_urls_streaming(&t))).await;
     run_scenario(&t, only, r, k, "markdown_link_bidi_isolated", 60, Box::pin(scenario_markdown_link_bidi_isolated(&t))).await;
     run_scenario(&t, only, r, k, "terminal_command_indicator", 180, Box::pin(scenario_terminal_command_indicator(&t))).await;
+    run_scenario(&t, only, r, k, "working_line_timer_survives_a_reload", 60, Box::pin(scenario_working_line_timer_survives_a_reload(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -3844,7 +3845,7 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
     let live = t.tab(t.url(&format!("conversation/{}", streaming.id))).await;
     wait_for_live_client(&live, streaming.id).await;
     assert!(wait_for_count(&live, ".reply-copy", 1, Duration::from_secs(10)).await);
-    publish(streaming.id, ConversationEvent::TurnState { running: true });
+    publish(streaming.id, ConversationEvent::TurnState { running: true, elapsed: 0 });
     let asked = db::create_message(t.pool, streaming.id, "user", &[text("second")]).await.expect("save the ask");
     let partway = db::create_message(t.pool, streaming.id, "assistant", &[
         text("Saved before a call."),
@@ -3876,7 +3877,7 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
     let finished = db::create_message(t.pool, streaming.id, "assistant", &[text("Finished now.")]).await.expect("save part two");
     let finished_id = finished.id;
     publish(streaming.id, ConversationEvent::MessagesAppended { messages: vec![answered, finished] });
-    publish(streaming.id, ConversationEvent::TurnState { running: false });
+    publish(streaming.id, ConversationEvent::TurnState { running: false, elapsed: 0 });
     assert!(wait_for_count(&live, ".reply-copy", 2, Duration::from_secs(10)).await, "the button shows once the turn ends");
     assert_eq!(
         wait_for_copy_label(&live, finished_id, "Copy reply (2 parts)", Duration::from_secs(5)).await,
@@ -3993,6 +3994,66 @@ async fn scenario_markdown_long_reply(t: &Scenario<'_>) {
     assert!(lag < Duration::from_secs(3), "the page fell {lag:?} behind a long streamed reply");
 }
 
+/// The seconds a "Working…" line's timer shows, or -1 while it's absent:
+/// `Working… 12s` reads as 12, `Working… 2m 05s` as 125.
+async fn working_line_seconds(page: &chromiumoxide::Page) -> i64 {
+    page.evaluate(
+        r#"(() => { const line = document.querySelector('.turn-working');
+             if (!line) return -1;
+             const m = line.innerText.match(/(?:(\d+)m )?(\d+)s/);
+             return m ? (m[1] ? +m[1] * 60 : 0) + +m[2] : -1; })()"#,
+    )
+    .await
+    .expect("read the working line's timer")
+    .into_value()
+    .expect("a number")
+}
+
+/// SME-160: the "Working…" timer counts from when the turn started, not
+/// from when the tab opened. Reload mid-turn: the timer comes back
+/// showing the turn's real age on the server's clock — at least what it
+/// showed before the reload — instead of starting over at 0s. The mock's
+/// reply streams for about five seconds (25 words, 200ms apart), long
+/// enough to reload into.
+async fn scenario_working_line_timer_survives_a_reload(t: &Scenario<'_>) {
+    let conversation = t.conversation().await;
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    send_from(&page, "how long will this take?").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let before = loop {
+        let shown = working_line_seconds(&page).await;
+        if shown >= 2 || tokio::time::Instant::now() >= deadline {
+            break shown;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        before >= 2,
+        "the working line should appear and count to at least 2s while the turn runs: {before}s"
+    );
+    page.reload().await.expect("reload mid-turn");
+    wait_for_live_client(&page, conversation.id).await;
+    // The reconnect pull runs before the page marks itself live, so the
+    // timer is already the turn's age on the server's clock; the short
+    // wait is only for the re-render.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = working_line_seconds(&page).await;
+    assert!(
+        after >= before,
+        "the timer started over with the reload: {before}s before it, {after}s after"
+    );
+    // The turn finishes as usual, and the line goes with it.
+    assert!(
+        t.mock.wait_until_idle(Duration::from_secs(30)).await,
+        "the reply never finished upstream"
+    );
+    assert!(
+        wait_for_count(&page, ".turn-working", 0, Duration::from_secs(15)).await,
+        "the working line should go away once the turn has ended"
+    );
+}
+
 /// Streams a 100-delta reply into `conversation` (open in `page`, live)
 /// with a turn running, then lets the working line tick twice. Returns how
 /// long after the last delta its end showed, and the page's main-thread
@@ -4004,7 +4065,7 @@ async fn stream_and_measure(page: &chromiumoxide::Page, conversation: i64, marke
     let script_seconds =
         |metrics: Vec<Metric>| metrics.iter().find(|m| m.name == "ScriptDuration").map(|m| m.value).unwrap_or(0.0);
     let before = script_seconds(page.metrics().await.expect("read metrics"));
-    publish(conversation, ConversationEvent::TurnState { running: true });
+    publish(conversation, ConversationEvent::TurnState { running: true, elapsed: 0 });
     publish(conversation, ConversationEvent::ReplyReset {});
     let reply: String = (0..100).map(|i| format!("word{i} ")).collect::<String>() + marker;
     let chunk = reply.len().div_ceil(100);
@@ -4022,7 +4083,7 @@ async fn stream_and_measure(page: &chromiumoxide::Page, conversation: i64, marke
     // The working line ticks once a second.
     tokio::time::sleep(Duration::from_millis(2500)).await;
     let script = script_seconds(page.metrics().await.expect("read metrics")) - before;
-    publish(conversation, ConversationEvent::TurnState { running: false });
+    publish(conversation, ConversationEvent::TurnState { running: false, elapsed: 0 });
     (lag, script)
 }
 

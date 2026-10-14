@@ -482,8 +482,12 @@ fn ChatPanel(
                         if let Ok(snapshot) = list_conversation_repos(id).await {
                             repos.set(snapshot);
                         }
-                        if let Ok(running) = get_turn_state(id).await {
+                        if let Ok((running, elapsed)) = get_turn_state(id).await {
                             turn_running.set(running);
+                            // SME-160: the turn's real age from the
+                            // server's clock, so a reload mid-turn shows
+                            // it counting on rather than from 0s.
+                            turn_elapsed.set(elapsed);
                         }
                         if let Ok(reply) = get_reply_in_progress(id).await {
                             streaming_reply.set(reply);
