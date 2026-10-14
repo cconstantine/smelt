@@ -476,10 +476,29 @@ async fn click_conversation(page: &chromiumoxide::Page, id: i64) {
 /// replies are still open, so a scenario can wait for a reply to have
 /// finished (or been cut off) upstream instead of sleeping for as long as a
 /// reply takes.
+const DEFAULT_REPLY_WORDS: usize = 25;
+
+/// How long the mock's reply runs for: this many `content_block_delta`
+/// events, one every 200ms, so the default is about 5s. A scenario that
+/// needs the turn outlive a page reload, or two tabs, raises it (see
+/// `MockUpstream::longer_reply`).
 struct MockUpstream {
     addr: std::net::SocketAddr,
     chunks_sent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     open: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    reply_words: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Raises the mock's reply length for one scenario and puts the default
+/// back when it drops — including when the scenario fails, since every
+/// scenario in the run shares this one mock.
+struct LongerReply(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for LongerReply {
+    fn drop(&mut self) {
+        self.0
+            .store(DEFAULT_REPLY_WORDS, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Counts one open reply for as long as its body stream lives: the body is
@@ -499,14 +518,18 @@ impl MockUpstream {
         }
         let chunks_sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (sent, opened) = (chunks_sent.clone(), open.clone());
+        let reply_words =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(DEFAULT_REPLY_WORDS));
+        let (sent, opened, words) = (chunks_sent.clone(), open.clone(), reply_words.clone());
         let router = axum::Router::new().route(
             "/v1/messages",
             axum::routing::post(move || {
-                let (sent, opened) = (sent.clone(), opened.clone());
+                let (sent, opened, words) =
+                    (sent.clone(), opened.clone(), words.clone());
                 async move {
                     let mut chunks = vec![event("message_start", r#"{"type":"message_start"}"#)];
-                    for i in 0..25 {
+                    let words = words.load(std::sync::atomic::Ordering::SeqCst);
+                    for i in 0..words {
                         chunks.push(event(
                             "content_block_delta",
                             &format!(
@@ -548,11 +571,27 @@ impl MockUpstream {
         tokio::spawn(async move {
             axum::serve(listener, router).await.ok();
         });
-        Self { addr, chunks_sent, open }
+        Self {
+            addr,
+            chunks_sent,
+            open,
+            reply_words,
+        }
     }
 
     fn chunks_sent(&self) -> usize {
         self.chunks_sent.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Make the mock's reply `words` words long (200ms each) for as long
+    /// as the returned guard lives: 5s by default, which is not long
+    /// enough
+    /// for a scenario that reloads a page mid-turn or opens a second
+    /// tab into a running turn.
+    fn longer_reply(&self, words: usize) -> LongerReply {
+        self.reply_words
+            .store(words, std::sync::atomic::Ordering::SeqCst);
+        LongerReply(self.reply_words.clone())
     }
 
     fn open(&self) -> usize {
@@ -4010,13 +4049,15 @@ async fn working_line_seconds(page: &chromiumoxide::Page) -> i64 {
 }
 
 /// SME-160: the "Working…" timer counts from when the turn started, not
-/// from when the tab opened. Reload mid-turn: the timer comes back
-/// showing the turn's real age on the server's clock — at least what it
-/// showed before the reload — instead of starting over at 0s. The mock's
-/// reply streams for about five seconds (25 words, 200ms apart), long
-/// enough to reload into.
+/// from when a tab came to be. Both ways the report had: reload mid-turn
+/// and the timer comes back at the turn's real age on the server's clock
+/// instead of starting over at 0s; open a second tab mid-turn and it
+/// shows that same age straight away, rather than counting from its own
+/// load. The mock's reply is held at 75 words (15s) so the spell outlives
+/// the reload and the second tab both.
 async fn scenario_working_line_timer_survives_a_reload(t: &Scenario<'_>) {
     let conversation = t.conversation().await;
+    let _long_reply = t.mock.longer_reply(75);
     let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
     wait_for_live_client(&page, conversation.id).await;
     send_from(&page, "how long will this take?").await;
@@ -4032,6 +4073,16 @@ async fn scenario_working_line_timer_survives_a_reload(t: &Scenario<'_>) {
         before >= 2,
         "the working line should appear and count to at least 2s while the turn runs: {before}s"
     );
+    // A second tab opened mid-spell: it has watched nothing, so its
+    // number can only come from the server. On the unfixed code it shows
+    // about 1s — the age of its own page.
+    let other = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&other, conversation.id).await;
+    let second_tab = working_line_seconds(&other).await;
+    assert!(
+        second_tab >= before,
+        "a tab opened mid-turn counted from its own load: {second_tab}s against the {before}s the first tab had shown"
+    );
     page.reload().await.expect("reload mid-turn");
     wait_for_live_client(&page, conversation.id).await;
     // The reconnect pull runs before the page marks itself live, so the
@@ -4040,8 +4091,8 @@ async fn scenario_working_line_timer_survives_a_reload(t: &Scenario<'_>) {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let after = working_line_seconds(&page).await;
     assert!(
-        after >= before,
-        "the timer started over with the reload: {before}s before it, {after}s after"
+        after >= second_tab,
+        "the timer started over with the reload: {before}s before it, {second_tab}s in a second tab opened mid-turn, {after}s after the reload"
     );
     // The turn finishes as usual, and the line goes with it.
     assert!(
