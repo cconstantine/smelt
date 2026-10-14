@@ -670,15 +670,86 @@ const RETRY_DELAYS: [std::time::Duration; 2] = [
 /// block — text and/or tool_use — plus the turn's `stop_reason` once the
 /// stream ends. Tool-use blocks accumulate silently; `on_delta` only ever
 /// fires for text. `request.stream` should be `true`.
+///
+/// Runs in a CLIENT span, `chat {model}`, with the GenAI conventions' model,
+/// usage and finish reason, the transient retries and the thinking binding
+/// it ended on (SME-137). A failure or a cut-off reply marks it failed. Its
+/// text and the request's are never recorded.
 pub async fn stream_anthropic_message(
     endpoint: &Endpoint,
     request: &CreateMessageRequest,
+    on_delta: impl FnMut(&str),
+) -> Result<StreamedTurn, String> {
+    use tracing::field::Empty;
+    let span = tracing::info_span!(
+        "chat",
+        otel.name = %format_args!("chat {}", request.model),
+        otel.kind = "client",
+        gen_ai.operation.name = "chat",
+        gen_ai.request.model = %request.model,
+        server.address = Empty,
+        gen_ai.usage.input_tokens = Empty,
+        gen_ai.usage.output_tokens = Empty,
+        gen_ai.usage.cache_creation.input_tokens = Empty,
+        gen_ai.usage.cache_read.input_tokens = Empty,
+        gen_ai.response.finish_reasons = Empty,
+        smelt.retries = Empty,
+        smelt.binding = Empty,
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+    );
+    // The host only: a base URL's path or userinfo stays out.
+    if let Some(host) = url::Url::parse(&endpoint.base_url).ok().as_ref().and_then(url::Url::host_str) {
+        span.record("server.address", host);
+    }
+    crate::telemetry::in_span(span.clone(), async move {
+        let mut tries = Tries { retries: 0, binding: binding_for(endpoint, request) };
+        let result = stream_message(endpoint, request, on_delta, &mut tries).await;
+        // Each once: a span keeps every value an attribute is given.
+        span.record("smelt.retries", tries.retries as i64);
+        span.record("smelt.binding", tracing::field::debug(tries.binding));
+        record_outcome(&span, &result);
+        result
+    })
+    .await
+}
+
+/// How a model call got its answer: the transient retries it took and the
+/// thinking binding it ended on.
+struct Tries {
+    retries: usize,
+    binding: Binding,
+}
+
+/// A model call's usage and finish reason on its span; a failure or a
+/// cut-off reply marks it failed.
+fn record_outcome(span: &tracing::Span, result: &Result<StreamedTurn, String>) {
+    match result {
+        Ok(turn) => {
+            span.record("gen_ai.usage.input_tokens", turn.usage.input_tokens);
+            span.record("gen_ai.usage.output_tokens", turn.usage.output_tokens);
+            span.record("gen_ai.usage.cache_creation.input_tokens", turn.usage.cache_creation_input_tokens);
+            span.record("gen_ai.usage.cache_read.input_tokens", turn.usage.cache_read_input_tokens);
+            span.record("gen_ai.response.finish_reasons", turn.stop_reason.as_str());
+            if is_cut_off(&turn.stop_reason) {
+                crate::telemetry::mark_error(span, &format!("the reply was cut off ({})", turn.stop_reason));
+            }
+        }
+        Err(e) => crate::telemetry::mark_error(span, e),
+    }
+}
+
+/// `stream_anthropic_message`'s work, in its span.
+async fn stream_message(
+    endpoint: &Endpoint,
+    request: &CreateMessageRequest,
     mut on_delta: impl FnMut(&str),
+    tries: &mut Tries,
 ) -> Result<StreamedTurn, String> {
     // Retried only here, before anything has streamed: nothing has been
     // shown to the viewer yet, so a retry is invisible to them.
     let mut attempt = 0;
-    let mut binding = binding_for(endpoint, request);
+    let mut binding = tries.binding;
     let mut tried = vec![binding];
     let response = loop {
         let response = send_and_await_response(endpoint, request, binding, RESPONSE_TIMEOUT).await?;
@@ -698,6 +769,7 @@ pub async fn stream_anthropic_message(
             tracing::warn!(%status, attempt, "model provider unavailable; retrying");
             tokio::time::sleep(RETRY_DELAYS[attempt]).await;
             attempt += 1;
+            tries.retries = attempt;
             continue;
         }
         let body = response.text().await.unwrap_or_default();
@@ -715,6 +787,7 @@ pub async fn stream_anthropic_message(
                 "model provider refused the replayed thinking; retrying"
             );
             binding = next;
+            tries.binding = binding;
             continue;
         }
         let message = provider_error_message(&body);
@@ -1189,6 +1262,89 @@ mod tests {
             run_against_responses(vec![(400, r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#)]).await;
         assert!(result.is_err());
         assert_eq!(requests, 1, "a 400 won't get better by retrying");
+    }
+
+    const USAGE_BODY: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":120,\"cache_creation_input_tokens\":7,\"cache_read_input_tokens\":30,\"output_tokens\":1}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"the secret reply\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    fn chat_spans(spans: &[opentelemetry_sdk::trace::SpanData]) -> Vec<&opentelemetry_sdk::trace::SpanData> {
+        spans.iter().filter(|span| span.name.starts_with("chat ")).collect()
+    }
+
+    /// `key`'s value on `span`, which must have it at most once.
+    fn span_attribute<'a>(span: &'a opentelemetry_sdk::trace::SpanData, key: &str) -> Option<&'a opentelemetry::Value> {
+        let values: Vec<_> = span.attributes.iter().filter(|kv| kv.key.as_str() == key).map(|kv| &kv.value).collect();
+        assert!(values.len() <= 1, "{key} recorded more than once: {values:?}");
+        values.first().copied()
+    }
+
+    /// SME-137: a model call is one CLIENT span named after its model, with
+    /// its usage, finish reason and retries, and none of its text.
+    #[tokio::test]
+    async fn test_a_model_call_is_a_client_span_with_its_usage_and_retries() {
+        let ((result, _), spans) = crate::telemetry::capture_spans(run_against_responses(vec![
+            (529, PAUSED_PROVIDER_BODY),
+            (200, USAGE_BODY),
+        ]))
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        let chats = chat_spans(&spans);
+        let [span] = chats.as_slice() else { panic!("one chat span: {spans:?}") };
+        assert_eq!(span.name, "chat claude-opus-4-8");
+        assert_eq!(span.span_kind, opentelemetry::trace::SpanKind::Client);
+        assert_eq!(span_attribute(span, "gen_ai.operation.name"), Some(&"chat".into()));
+        assert_eq!(span_attribute(span, "gen_ai.request.model"), Some(&"claude-opus-4-8".into()));
+        assert_eq!(span_attribute(span, "server.address"), Some(&"127.0.0.1".into()));
+        assert_eq!(span_attribute(span, "gen_ai.usage.input_tokens"), Some(&120_i64.into()));
+        assert_eq!(span_attribute(span, "gen_ai.usage.output_tokens"), Some(&42_i64.into()));
+        assert_eq!(span_attribute(span, "gen_ai.usage.cache_creation.input_tokens"), Some(&7_i64.into()));
+        assert_eq!(span_attribute(span, "gen_ai.usage.cache_read.input_tokens"), Some(&30_i64.into()));
+        assert_eq!(span_attribute(span, "gen_ai.response.finish_reasons"), Some(&"end_turn".into()));
+        assert_eq!(span_attribute(span, "smelt.retries"), Some(&1_i64.into()));
+        assert_eq!(span_attribute(span, "smelt.binding"), Some(&"AsIs".into()));
+        assert_eq!(span.status, opentelemetry::trace::Status::Unset);
+        assert!(!format!("{span:?}").contains("secret reply"), "no reply text: {span:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_refused_model_call_marks_its_span_failed() {
+        let ((result, _), spans) = crate::telemetry::capture_spans(run_against_responses(vec![(
+            400,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#,
+        )]))
+        .await;
+        assert!(result.is_err());
+        let chats = chat_spans(&spans);
+        let [span] = chats.as_slice() else { panic!("one chat span: {:?}", spans.iter().map(|s| s.name.clone()).collect::<Vec<_>>()) };
+        let opentelemetry::trace::Status::Error { description } = &span.status else {
+            panic!("{:?}", span.status)
+        };
+        assert!(description.contains("bad"), "{description}");
+    }
+
+    #[tokio::test]
+    async fn test_a_cut_off_model_call_marks_its_span_failed() {
+        const CUT_OFF_BODY: &str = concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n",
+        );
+        let ((result, _), spans) =
+            crate::telemetry::capture_spans(run_against_responses(vec![(200, CUT_OFF_BODY)])).await;
+        assert!(result.is_ok(), "{result:?}");
+        let chats = chat_spans(&spans);
+        let [span] = chats.as_slice() else { panic!("one chat span: {spans:?}") };
+        assert!(matches!(span.status, opentelemetry::trace::Status::Error { .. }), "{:?}", span.status);
+        assert_eq!(span_attribute(span, "gen_ai.response.finish_reasons"), Some(&"max_tokens".into()));
     }
 
     /// The 400 an account enforcing preserved thinking returns when a
