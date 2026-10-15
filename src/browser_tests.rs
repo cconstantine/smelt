@@ -4050,6 +4050,22 @@ async fn working_line_seconds(page: &chromiumoxide::Page) -> i64 {
     .expect("a number")
 }
 
+/// `working_line_seconds` polled until the line has been drawn. A tab's
+/// first paint of it can lag the point where the client reports itself
+/// live, and a -1 read would otherwise be reported as the timer starting
+/// over. A line that never appears still reads -1, so the caller's
+/// assertion fails with its own message.
+async fn drawn_working_line_seconds(page: &chromiumoxide::Page) -> i64 {
+    let settled = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let shown = working_line_seconds(page).await;
+        if shown >= 0 || tokio::time::Instant::now() >= settled {
+            return shown;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// SME-160: the "Working…" timer counts from when the turn started, not
 /// from when a tab came to be. Both ways the report had: reload mid-turn
 /// and the timer comes back at the turn's real age on the server's clock
@@ -4077,20 +4093,10 @@ async fn scenario_working_line_timer_survives_a_reload(t: &Scenario<'_>) {
     );
     // A second tab opened mid-spell: it has watched nothing, so its
     // number can only come from the server. On the unfixed code it shows
-    // about 1s — the age of its own page. The line's first paint lags
-    // the live marker the way it does after a reload, so wait for it to
-    // exist before reading it: a -1 read here would look like the bug
-    // rather than like a tab that has not drawn the line yet.
+    // about 1s — the age of its own page.
     let other = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
     wait_for_live_client(&other, conversation.id).await;
-    let settled = tokio::time::Instant::now() + Duration::from_secs(5);
-    let second_tab = loop {
-        let shown = working_line_seconds(&other).await;
-        if shown >= 0 || tokio::time::Instant::now() >= settled {
-            break shown;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    let second_tab = drawn_working_line_seconds(&other).await;
     assert!(
         second_tab >= before,
         "a tab opened mid-turn counted from its own load: {second_tab}s against the {before}s the first tab had shown"
@@ -4098,10 +4104,11 @@ async fn scenario_working_line_timer_survives_a_reload(t: &Scenario<'_>) {
     page.reload().await.expect("reload mid-turn");
     wait_for_live_client(&page, conversation.id).await;
     // The reconnect pull runs before the page marks itself live, so the
-    // timer is already the turn's age on the server's clock; the short
-    // wait is only for the re-render.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let after = working_line_seconds(&page).await;
+    // timer is already the turn's age on the server's clock; the poll is
+    // only for the re-render. The 300ms it used to sleep was a bet on a
+    // render whose lag nothing had measured, and a lost bet read as the
+    // timer having started over.
+    let after = drawn_working_line_seconds(&page).await;
     assert!(
         after >= second_tab,
         "the timer started over with the reload: {before}s before it, {second_tab}s in a second tab opened mid-turn, {after}s after the reload"
