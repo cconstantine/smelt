@@ -434,8 +434,24 @@ start() {
         # A leftover scratch database's objects are cleaned up before it is
         # dropped and made again (SME-129): dropping it strands every pod and
         # claim its server labelled, since nothing else names its instance.
-        # The URL and the cluster are recorded first, so the cleanup talks to
-        # the server's own cluster and a failed start's `stop` knows which
+        # One the state files still record goes first, with the URL and the
+        # KUBECONFIG it was recorded with (SME-129 review): this start's could
+        # name another cluster, where the tool finds nothing and succeeds, or
+        # another host, where it reports the database missing, and either way
+        # its objects would be stranded. A failure leaves both files as they
+        # were, for `stop` to retry.
+        local leftover
+        leftover=$(cat "$(scratch_db_file)" 2>/dev/null || true)
+        if [ -n "$leftover" ]; then
+            if ! cleanup_scratch "$leftover"; then
+                echo "start: the leftover scratch database's sandbox objects weren't all deleted; scripts/check-server stop (it retries), then start again" >&2
+                exit 1
+            fi
+            drop_scratch_db
+        fi
+        # Then the URL and the cluster are recorded, so the cleanup of a
+        # database at the fixed name that no file recorded talks to the
+        # server's own cluster, and a failed start's `stop` knows which
         # database to finish.
         echo "$db_url" >"$(scratch_db_file)"
         effective_value KUBECONFIG >"$(kubeconfig_file)"

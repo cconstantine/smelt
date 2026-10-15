@@ -728,6 +728,36 @@ out=$("${cs_env[@]}" CHECK_WORKTREE="$dir/never-started" scripts/check-server st
 rc=$?
 [ "$rc" = 0 ] || fail "stop with no KUBECONFIG file exited $rc: $out"
 
+# A start over a recorded leftover cleans it up, and drops it, with the URL
+# and KUBECONFIG it was recorded with, not this start's (SME-129 review): on
+# another cluster the tool finds nothing and succeeds, and a database under
+# another URL is reported missing, so either way the leftover's objects were
+# stranded silently. A failed cleanup changes neither file and drops nothing.
+leftover_url=postgres://u@oldhost/smelt_scratch_worktree
+echo "$leftover_url" >"$scratch_file"
+echo /the/leftovers/cluster >"$kubeconfig_file"
+: >"$CLEANUP_CALLS"
+: >"$ORDER"
+extra_env=(KUBECONFIG=/a/new/cluster CLEANUP_FAIL=1)
+out=$(CHECK_SCRATCH_DB=1 check_server start HEAD) && fail "start over a leftover whose cleanup failed started: $out"
+extra_env=()
+[ "$(head -n 1 "$CLEANUP_CALLS")" = "KUBECONFIG=/the/leftovers/cluster --database-url $leftover_url --dev-database-url postgres://u@localhost/smelt_dev" ] ||
+    fail "start cleaned the leftover with what it wasn't recorded with: $(cat "$CLEANUP_CALLS")"
+[ "$(cat "$scratch_file")" = "$leftover_url" ] || fail "a failed leftover cleanup changed the scratch file: $(cat "$scratch_file")"
+[ "$(cat "$kubeconfig_file")" = /the/leftovers/cluster ] || fail "a failed leftover cleanup changed the KUBECONFIG file: $(cat "$kubeconfig_file")"
+grep -q "^sqlx " "$ORDER" && fail "a failed leftover cleanup dropped a database: $(cat "$ORDER")"
+: >"$CLEANUP_CALLS"
+: >"$ORDER"
+extra_env=(KUBECONFIG=/a/new/cluster)
+CHECK_SCRATCH_DB=1 check_server start HEAD >/dev/null || fail "start over a leftover"
+extra_env=()
+[ "$(head -n 1 "$CLEANUP_CALLS")" = "KUBECONFIG=/the/leftovers/cluster --database-url $leftover_url --dev-database-url postgres://u@localhost/smelt_dev" ] ||
+    fail "start cleaned the leftover with what it wasn't recorded with: $(cat "$CLEANUP_CALLS")"
+grep -qx "sqlx database drop -y --database-url $leftover_url" "$ORDER" || fail "start didn't drop the recorded leftover: $(cat "$ORDER")"
+[ "$(cat "$scratch_file")" = "$scratch_url" ] || fail "start over a leftover recorded '$(cat "$scratch_file")'"
+[ "$(cat "$kubeconfig_file")" = /a/new/cluster ] || fail "start over a leftover recorded KUBECONFIG '$(cat "$kubeconfig_file")'"
+check_server stop >/dev/null || fail "stop after the leftover case"
+
 # The scratch lock: a stop holds it through its cleanup, so a start of the
 # same database waits for it and says so.
 scratch_lock=$SMELT_LOCK_DIR/smelt-check-scratch-smelt_scratch_worktree.lock
