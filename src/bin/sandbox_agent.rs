@@ -331,7 +331,7 @@ enum ShellEvent {
 /// The marker is matched at the end of a line, not only as a whole line:
 /// a command whose last output has no newline (`printf abc`, `head -c`)
 /// has the marker glued onto that output (SME-76). Lines come from
-/// `read_until` into a buffer kept across calls, which is cancel safe;
+/// `fill_piece` into a buffer kept across calls, which is cancel safe;
 /// `read_line` in this `select!` dropped half a stdout line whenever stderr
 /// won the race. Bytes that aren't UTF-8 are shown as U+FFFD (B2,
 /// SME-122): `Lines` ended the reader on them, wedging the terminal.
@@ -357,11 +357,11 @@ async fn run_reader(
     let (mut stdout_open, mut stderr_open) = (true, true);
     while stdout_open || stderr_open {
         tokio::select! {
-            result = stdout.read_until(b'\n', &mut stdout_buf), if stdout_open => {
+            result = fill_piece(&mut stdout, &mut stdout_buf), if stdout_open => {
                 match result {
-                    Ok(0) | Err(_) => stdout_open = false, // bash exited or pipe error
-                    Ok(_) => {
-                        let line = take_line(&mut stdout_buf);
+                    Ok(false) | Err(_) => stdout_open = false, // bash exited or pipe error
+                    Ok(true) => {
+                        let line = take_piece(&mut stdout_buf);
                         let found = ending.find(&marker, &line, Stream::Stdout);
                         let (data, exit_code) = match found {
                             Some((before, exit_code)) => (before, Some(exit_code)),
@@ -388,11 +388,11 @@ async fn run_reader(
                     }
                 }
             }
-            result = stderr.read_until(b'\n', &mut stderr_buf), if stderr_open => {
+            result = fill_piece(&mut stderr, &mut stderr_buf), if stderr_open => {
                 match result {
-                    Ok(0) | Err(_) => stderr_open = false,
-                    Ok(_) => {
-                        let line = take_line(&mut stderr_buf);
+                    Ok(false) | Err(_) => stderr_open = false,
+                    Ok(true) => {
+                        let line = take_piece(&mut stderr_buf);
                         let (data, found) = match ending.find(&marker, &line, Stream::Stderr) {
                             Some((before, _)) => (before, true),
                             None => (line, false),
@@ -439,6 +439,14 @@ async fn run_reader(
     }
     finish_ended_shell(&terminal_id, &shell, seq, &tx).await;
 }
+
+/// The longest piece of a line sent as one `Output` (B13, SME-122).
+const MAX_OUTPUT_CHUNK: usize = 64 * 1024;
+
+/// How much of a long line's end `take_piece` holds back for the next
+/// piece: more than a marker and its exit code (`new_marker`: 40 bytes,
+/// plus up to 11), so one is never split across two pieces.
+const MARKER_TAIL: usize = 64;
 
 /// How long after a command's stdout marker its stderr marker may take
 /// before the command is finished without it (B12, SME-122).
@@ -541,14 +549,46 @@ async fn shell_exit_code(shell: &Shell) -> i32 {
     }
 }
 
-/// One line read by `read_until`, without its `\n` or `\r\n` (as `Lines`
-/// gave it), decoded lossily, leaving `buf` empty for the next.
-fn take_line(buf: &mut Vec<u8>) -> String {
+/// Reads into `buf` until it holds a whole line or `MAX_OUTPUT_CHUNK`
+/// bytes (B13, SME-122), or the stream ends. True when there's a piece to
+/// take (`take_piece`); false at the end of the stream with nothing left.
+/// Cancel safe: `fill_buf` is, and what's read is moved into `buf`, kept
+/// across calls, before the next await.
+async fn fill_piece<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<bool> {
+    loop {
+        if buf.last() == Some(&b'\n') || buf.len() >= MAX_OUTPUT_CHUNK {
+            return Ok(true);
+        }
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(!buf.is_empty());
+        }
+        let room = (MAX_OUTPUT_CHUNK - buf.len()).min(available.len());
+        let take = available[..room].iter().position(|&b| b == b'\n').map_or(room, |at| at + 1);
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+    }
+}
+
+/// The piece `fill_piece` read, decoded lossily (B2): a whole line without
+/// its `\n` or `\r\n` (as `Lines` gave it), or the start of a long one.
+/// Of a long line it keeps the last `MARKER_TAIL` bytes in `buf` for the
+/// next piece, so a marker at its end is found whole, and splits it before
+/// a character's first byte, never inside one.
+fn take_piece(buf: &mut Vec<u8>) -> String {
     if buf.last() == Some(&b'\n') {
         buf.pop();
         if buf.last() == Some(&b'\r') {
             buf.pop();
         }
+    } else if buf.len() >= MAX_OUTPUT_CHUNK {
+        let mut at = buf.len() - MARKER_TAIL;
+        while at > 0 && (buf[at] & 0b1100_0000) == 0b1000_0000 {
+            at -= 1;
+        }
+        let piece = String::from_utf8_lossy(&buf[..at]).into_owned();
+        buf.drain(..at);
+        return piece;
     }
     let line = String::from_utf8_lossy(buf).into_owned();
     buf.clear();
@@ -2243,6 +2283,34 @@ mod socket_tests {
         assert_eq!((stdout, code), (vec!["still".to_string()], 0));
         let (stdout, _, code) = run_collect(&mut client, "t1", "c2", "echo next").await;
         assert_eq!((stdout, code), (vec!["next".to_string()], 0));
+    }
+
+    /// B13 (SME-122): a very long line goes out in pieces no longer than
+    /// `MAX_OUTPUT_CHUNK`; one 20 MB line was over smelt's WebSocket frame
+    /// limit and dropped the connection. The pieces join up to the line,
+    /// a multi-byte character isn't split, and a marker glued onto the end
+    /// of a long line without a newline still ends the command.
+    #[tokio::test]
+    async fn test_a_long_line_is_sent_in_pieces_that_join_up() {
+        let addr = serve_agent().await;
+        let mut client = connect_ready(addr).await;
+        create_terminal(&mut client, "t1").await;
+        let cases = [
+            ("head -c 200000 /dev/zero | tr '\\0' x; echo", "x".repeat(200_000)),
+            ("head -c 200000 /dev/zero | tr '\\0' x", "x".repeat(200_000)),
+            ("for i in $(seq 1 40001); do printf '\u{e9}'; done; echo", "\u{e9}".repeat(40_001)),
+        ];
+        for (n, (command, line)) in cases.into_iter().enumerate() {
+            let (stdout, _, code) = run_collect(&mut client, "t1", &format!("c{n}"), command).await;
+            assert_eq!(code, 0, "{command}");
+            assert!(
+                stdout.iter().all(|piece| piece.len() <= MAX_OUTPUT_CHUNK),
+                "{command}: pieces of {:?} bytes",
+                stdout.iter().map(String::len).collect::<Vec<_>>()
+            );
+            assert!(stdout.len() > 1, "{command}: sent in one piece");
+            assert!(stdout.concat() == line, "{command}: the pieces don't join up to the line");
+        }
     }
 
     #[tokio::test]
