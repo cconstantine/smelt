@@ -229,5 +229,23 @@ async fn navigate_to_animated_page(conversation_id: i64) {
         .expect("navigate to the animated page should succeed");
 }
 
+mod interaction;
+mod isolation;
+mod live_panel;
 mod sessions;
-pub(crate) use sessions::run_session_scenarios;
+
+/// The session scenarios, in order. Each group of them starts where only
+/// the conversation, and from Scenario 10 on the interactive test
+/// server's address, carry over from the ones before (SME-163).
+pub(crate) async fn run_session_scenarios() {
+    let conversation_id: i64 = 900_001;
+    sessions::open_navigate_close(conversation_id).await;
+    sessions::click_fill_go_back(conversation_id).await;
+    sessions::screencast_frames(conversation_id).await;
+    let base = live_panel::live_panel_input_and_viewers(conversation_id).await;
+    interaction::schemes_passwords_and_fields(&base, conversation_id).await;
+    live_panel::second_viewer_and_close_race(&base, conversation_id).await;
+    interaction::clicks_fills_popups_and_urls(&base, conversation_id).await;
+    isolation::conversations_share_no_data(&base, conversation_id).await;
+    isolation::sandbox_routes().await;
+}
