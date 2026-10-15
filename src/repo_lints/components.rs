@@ -9,8 +9,9 @@
 pub(crate) const MAX_COMPONENT_LINES: usize = 200;
 
 /// Each `#[component]` function in `source`: its name and the code lines in
-/// its body.
-pub(crate) fn component_lengths(source: &str) -> Vec<(String, usize)> {
+/// its body. A component whose function or body can't be found is an error
+/// naming its line, so the check fails rather than leaving it out.
+pub(crate) fn component_lengths(source: &str) -> Result<Vec<(String, usize)>, String> {
     let chars: Vec<char> = source.chars().collect();
     let kinds = classify(&chars);
     // Each line's code: its characters outside comments, strings kept.
@@ -41,7 +42,7 @@ pub(crate) fn component_lengths(source: &str) -> Vec<(String, usize)> {
         // The function's name (on the attribute's line, or a later one), then
         // its body from the first `{`.
         let Some((fn_line, name)) = (i..code_only.len()).find_map(|k| fn_name(&code_only[k]).map(|n| (k, n))) else {
-            break;
+            return Err(format!("no function after the component attribute at line {}", i + 1));
         };
         let mut depth = 0i64;
         let mut open = None;
@@ -64,12 +65,14 @@ pub(crate) fn component_lengths(source: &str) -> Vec<(String, usize)> {
                 }
             }
         }
-        let (Some(open), Some(close)) = (open, close) else { break };
+        let (Some(open), Some(close)) = (open, close) else {
+            return Err(format!("couldn't find the body of component {name} at line {}", fn_line + 1));
+        };
         let count = lines[open + 1..close].iter().filter(|l| !l.trim().is_empty()).count();
         found.push((name, count));
         i = close + 1;
     }
-    found
+    Ok(found)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,7 +136,9 @@ fn classify(chars: &[char]) -> Vec<Kind> {
             i += 1;
             kind = Kind::Str;
         } else if chars[i] == '\'' && chars.get(i + 1) == Some(&'\\') {
-            i += 2;
+            // Past the quote, the backslash and the escaped character (which
+            // may be a quote itself), then to the closing quote.
+            i += 3;
             while i < chars.len() && chars[i] != '\'' {
                 i += 1;
             }
@@ -190,7 +195,7 @@ mod tests {
     #[test]
     fn test_a_components_code_lines_are_counted() {
         let src = "#[component]\nfn Small() -> Element {\n    let a = 1;\n\n    // a comment\n    rsx! { div {} }\n}\n";
-        assert_eq!(component_lengths(src), vec![("Small".to_string(), 2)]);
+        assert_eq!(component_lengths(src), Ok(vec![("Small".to_string(), 2)]));
     }
 
     #[test]
@@ -207,7 +212,7 @@ mod tests {
             "}\n",
             "fn after() {}\n",
         );
-        assert_eq!(component_lengths(src), vec![("Tricky".to_string(), 6)]);
+        assert_eq!(component_lengths(src), Ok(vec![("Tricky".to_string(), 6)]));
     }
 
     /// Code review 1 (SME-163): an attribute with arguments, a full path, or
@@ -221,14 +226,31 @@ mod tests {
             "#[component] fn A() -> Element {\n",
             "  #[component]\n  pub fn A() -> Element {\n",
         ] {
-            assert_eq!(component_lengths(&format!("{head}{body}")), vec![("A".to_string(), 2)], "{head:?}");
+            assert_eq!(component_lengths(&format!("{head}{body}")), Ok(vec![("A".to_string(), 2)]), "{head:?}");
         }
-        assert_eq!(component_lengths("#[components]\nfn B() {\n    let a = 1;\n}\n"), vec![]);
+        assert_eq!(component_lengths("#[components]\nfn B() {\n    let a = 1;\n}\n"), Ok(vec![]));
+    }
+
+    /// Code review 2 (SME-163): an escaped quote in a char literal (`'\''`)
+    /// ends the literal; read as code, its closing quote paired with a later
+    /// one and the component's braces were lost.
+    #[test]
+    fn test_an_escaped_quote_char_doesnt_hide_a_component() {
+        let src = "#[component]\nfn Q() -> Element {\n    let q = ['\\'','\"'];\n    let a = 1;\n}\n";
+        assert_eq!(component_lengths(src), Ok(vec![("Q".to_string(), 2)]));
+    }
+
+    /// A component whose body can't be read fails the check rather than
+    /// being left out of it.
+    #[test]
+    fn test_a_component_whose_body_isnt_found_is_an_error() {
+        assert!(component_lengths("#[component]\nfn Open() -> Element {\n    let a = 1;\n").is_err());
+        assert!(component_lengths("#[component]\n").is_err());
     }
 
     #[test]
     fn test_only_components_are_counted() {
         let src = "fn plain() {\n    let a = 1;\n}\n#[component]\npub(crate) fn Two(props: P) -> Element {\n    rsx! {}\n}\n";
-        assert_eq!(component_lengths(src), vec![("Two".to_string(), 1)]);
+        assert_eq!(component_lengths(src), Ok(vec![("Two".to_string(), 1)]));
     }
 }

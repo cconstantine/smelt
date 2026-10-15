@@ -166,7 +166,8 @@ mod tests {
         let mut seen = 0;
         for path in tracked_files().into_iter().filter(|p| p.starts_with("src/") && p.ends_with(".rs")) {
             let Ok(source) = std::fs::read_to_string(root.join(&path)) else { continue };
-            for (name, lines) in components::component_lengths(&source) {
+            let lengths = components::component_lengths(&source).unwrap_or_else(|e| panic!("{path}: {e}"));
+            for (name, lines) in lengths {
                 seen += 1;
                 if lines > components::MAX_COMPONENT_LINES {
                     over.push(format!("{path}: {name} is {lines} code lines"));
