@@ -13,8 +13,8 @@
 # The lock is `flock` on $SMELT_LOCK_DIR/smelt-cluster.lock. SMELT_LOCK_DIR
 # defaults to the git common dir of the checkout this script is in (not the
 # caller's directory): one file for every worktree, the same one the old
-# outer `flock` convention used. scripts/test-check-scripts sets it, so its
-# cases never touch the real lock.
+# outer `flock` convention used. The script tests (test-cluster-lock and the
+# others) set it, so their cases never touch the real lock.
 #
 # - Waiting: when another process holds the lock, says once who (pid,
 #   command, directory), then waits.

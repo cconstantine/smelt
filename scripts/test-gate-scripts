@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# The scripts a session runs for the gate and for hands-on checks delete
+# no files (SME-107), and check.sh, browser-tier and cluster-test run
+# their tests under the cluster lock and build unlocked (SME-100). The
+# stubs and helpers are in scripts/lib/test-check-scripts.sh.
+#
+#   scripts/test-gate-scripts
+. "$(dirname "$0")/lib/test-check-scripts.sh"
+
+# None of the scripts the gate or a hands-on check runs removes a file.
+for script in scripts/check-server scripts/browser-tier scripts/check.sh scripts/lint-expects scripts/build-sandbox-image.sh \
+    scripts/with-cluster-lock scripts/cluster-test scripts/clean-test-namespace.sh; do
+    if found=$(grep -nE '(^|[^[:alnum:]_-])(rm|rmdir|unlink|shred)([[:space:]]|$)|-delete([[:space:]]|$)' "$script" | grep -vE '^[0-9]+:[[:space:]]*#'); then
+        fail "$script removes files: $found"
+    fi
+done
+
+
+# SMELT_SKIP_SCRIPT_TESTS asks check.sh not to run its own scripts/test-*
+# step: this suite does run check.sh, and the nested run would run this
+# suite again, under stubs, recursing and polluting the calls recorded below.
+export CALLS=$dir/calls
+gate_env=(env -u SANDBOX_IMAGE -u CARGO_FAIL PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import"
+    DATABASE_URL=postgres://u@localhost/smelt_dev BROWSER_CHECK_CACHE="$dir" SMELT_SKIP_SCRIPT_TESTS=1)
+# Never the real cargo or dx: that would build, and run the real tests.
+for tool in cargo dx sqlx; do
+    [ "$("${gate_env[@]}" bash -c "command -v $tool")" = "$dir/bin/$tool" ] || {
+        echo "the $tool stub isn't first on PATH; stopping before running any gate script" >&2
+        exit 1
+    }
+done
+wasm_check="cargo check --no-default-features --features web --target wasm32-unknown-unknown"
+lints="-- -D warnings -A clippy::all -D clippy::expect_used -D clippy::unwrap_used -D clippy::too_many_lines"
+
+# 7. check.sh builds, lints, compiles the tests and checks the cluster
+# unlocked, and takes the lock for the test run only.
+: >"$CALLS"
+if ! out=$(timeout 60 "${gate_env[@]}" scripts/check.sh 2>&1); then
+    fail "check.sh with stubs failed: $out"
+fi
+expected="$wasm_check unlocked
+cargo build --features server unlocked
+cargo clippy --version unlocked
+cargo clippy --features server $lints unlocked
+cargo clippy --no-default-features --features web --target wasm32-unknown-unknown $lints unlocked
+cargo test --features server --no-run unlocked
+import unlocked
+cargo test --features server locked"
+[ "$(cat "$CALLS")" = "$expected" ] || fail "check.sh's calls: $(cat "$CALLS")"
+# A test build that fails stops check.sh before the lock.
+: >"$CALLS"
+if out=$(timeout 60 "${gate_env[@]}" CARGO_FAIL="--no-run" scripts/check.sh 2>&1); then
+    fail "check.sh passed with a failing test build: $out"
+fi
+grep -q " locked$" "$CALLS" && fail "check.sh took the lock after a failing test build: $(cat "$CALLS")"
+grep -q "stub cargo told to fail" <<<"$out" || fail "check.sh didn't show the test build's error: $out"
+
+# 8. browser-tier likewise: the bundle, the test build and the scratch
+# database unlocked, the tier's run locked.
+: >"$CALLS"
+if ! out=$(timeout 60 "${gate_env[@]}" scripts/browser-tier 2>&1); then
+    fail "browser-tier with stubs failed: $out"
+fi
+tier_db=postgres://u@localhost/smelt_browser_tier_$(basename "$PWD" | tr -c 'a-zA-Z0-9\n' '_')
+expected="import unlocked
+dx build --platform web unlocked
+cargo test --features server browser-test --no-run unlocked
+sqlx database drop -y --database-url $tier_db unlocked
+sqlx database create --database-url $tier_db unlocked
+cargo test --features server browser-test -- --ignored --test-threads=1 locked
+sqlx database drop -y --database-url $tier_db unlocked"
+[ "$(cat "$CALLS")" = "$expected" ] || fail "browser-tier's calls: $(cat "$CALLS")"
+: >"$CALLS"
+if out=$(timeout 60 "${gate_env[@]}" CARGO_FAIL="--no-run" scripts/browser-tier 2>&1); then
+    fail "browser-tier passed with a failing test build: $out"
+fi
+grep -q " locked$" "$CALLS" && fail "browser-tier took the lock after a failing test build: $(cat "$CALLS")"
+
+# 9. cluster-test: the same cargo test, built with --no-run unlocked (before
+# the first --, or last when there's none), then run locked.
+: >"$CALLS"
+timeout 60 "${gate_env[@]}" scripts/cluster-test --features server -- --exact a::b >/dev/null 2>&1 ||
+    fail "cluster-test failed"
+expected="cargo test --features server --no-run -- --exact a::b unlocked
+cargo test --features server -- --exact a::b locked"
+[ "$(cat "$CALLS")" = "$expected" ] || fail "cluster-test's calls: $(cat "$CALLS")"
+: >"$CALLS"
+timeout 60 "${gate_env[@]}" scripts/cluster-test --features server sweep >/dev/null 2>&1 || fail "cluster-test without -- failed"
+expected="cargo test --features server sweep --no-run unlocked
+cargo test --features server sweep locked"
+[ "$(cat "$CALLS")" = "$expected" ] || fail "cluster-test's calls without --: $(cat "$CALLS")"
+: >"$CALLS"
+timeout 60 "${gate_env[@]}" CARGO_FAIL="--no-run" scripts/cluster-test --features server >/dev/null 2>&1
+rc=$?
+[ "$rc" = 101 ] || fail "cluster-test with a failing build exited $rc, not the build's 101"
+grep -q " locked$" "$CALLS" && fail "cluster-test took the lock after a failing build: $(cat "$CALLS")"
+unset CALLS
+
+finish

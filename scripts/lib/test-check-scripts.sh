@@ -1,0 +1,170 @@
+# Shared by scripts/test-check-server, test-cluster-lock and
+# test-gate-scripts (SME-163; they were one script, test-check-scripts):
+# the stubs and helpers their cases use. Sourced, never run. Each script
+# keeps its files, the stubs and the locks under its own
+# target/<script name>/, so no two share a lock. Needs no cluster or
+# database: cargo, dx, sqlx, curl, python3 and the image check are stubs,
+# and every lock lives under target/<script name>/locks (SMELT_LOCK_DIR),
+# never the real one. Claude Code's safety check refuses a command whose
+# scripts remove files, so everything they write is kept, overwritten on
+# the next run.
+
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+failures=0
+fail() {
+    echo "FAIL: $*" >&2
+    failures=$((failures + 1))
+}
+
+
+dir=$PWD/target/$(basename "$0")
+mkdir -p "$dir/bin"
+
+# Every lock these scripts take goes here, never the real cluster lock
+# (SME-100): another session's gate may hold that one.
+export SMELT_LOCK_DIR=$dir/locks
+mkdir -p "$SMELT_LOCK_DIR"
+lock=$SMELT_LOCK_DIR/smelt-cluster.lock
+lock_log=$SMELT_LOCK_DIR/smelt-cluster-lock.log
+: >"$lock_log"
+# Whether the cluster lock is free: a fresh open and a non-blocking flock,
+# which fails while any other open of the file holds it.
+lock_is_free() { flock -n "$lock" true; }
+# Waits up to 10 s for the cluster lock to be taken.
+wait_until_held() {
+    for _ in $(seq 1 100); do
+        lock_is_free || return 0
+        sleep 0.1
+    done
+    return 1
+}
+# Whether a process id names a live process. kill -0 succeeds on a zombie,
+# and nothing in a container reaps the orphans a killed run leaves behind,
+# so a check that asks whether something still runs has to read the state:
+# /proc/<pid>/stat names it after the command name, which can hold spaces
+# and ')'.
+pid_is_live() {
+    local state
+    [ -r "/proc/$1/stat" ] || return 1
+    state=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f1)
+    [ -n "$state" ] && [ "$state" != Z ]
+}
+# Whether a live process is in process group $1, for the same reason: pgrep
+# counts a zombie too.
+group_is_live() {
+    local pid
+    for pid in $(pgrep -g "$1" 2>/dev/null); do
+        pid_is_live "$pid" && return 0
+    done
+    return 1
+}
+
+# Each stub below that the gate scripts call appends a line to $CALLS (when
+# set): its arguments, then "locked" or "unlocked", whether another process
+# held the cluster lock at the time (SME-100).
+cat >"$dir/bin/lock-state" <<'EOF'
+#!/usr/bin/env bash
+flock -n "$SMELT_LOCK_DIR/smelt-cluster.lock" true && echo unlocked || echo locked
+EOF
+# cargo: records each call. A test run (not --no-run) prints a result line.
+# CARGO_FAIL: a pattern; a call whose arguments match it fails.
+cat >"$dir/bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+echo "cargo $* $(lock-state)" >>"$CALLS"
+if [ -n "${CARGO_FAIL:-}" ] && [[ "$*" =~ $CARGO_FAIL ]]; then
+    echo "error: stub cargo told to fail"
+    exit 101
+fi
+if [ "$1" = test ] && [[ " $* " != *" --no-run "* ]]; then
+    echo "test result: ok. 1 passed; 0 failed"
+fi
+exit 0
+EOF
+# dx serve: runs until stopped, like the real one. It first records the
+# log settings it was started with (the server it runs inherits them) and
+# writes a line of its own to the log. dx build records the call and ends.
+cat >"$dir/bin/dx" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = build ]; then
+    echo "dx $* $(lock-state)" >>"$CALLS"
+    exit 0
+fi
+echo "stub dx started as $$"
+printf 'RUST_LOG=%s\nNO_COLOR=%s\n' "${RUST_LOG-<unset>}" "${NO_COLOR-<unset>}" >"$DX_ENV.tmp"
+mv "$DX_ENV.tmp" "$DX_ENV"
+exec sleep 600
+EOF
+# sqlx: records each call, one per line, and to $ORDER when set (with the
+# cleanup stub's lines, so a case can check their order).
+cat >"$dir/bin/sqlx" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >>"$SQLX_CALLS"
+[ -n "${ORDER:-}" ] && echo "sqlx $*" >>"$ORDER"
+[ -n "${CALLS:-}" ] && echo "sqlx $* $(lock-state)" >>"$CALLS"
+exit 0
+EOF
+# curl: the server is up at once.
+cat >"$dir/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+# The image check: the cluster has it.
+cat >"$dir/bin/import" <<'EOF'
+#!/usr/bin/env bash
+[ -n "${CALLS:-}" ] && echo "import $(lock-state)" >>"$CALLS"
+exit 0
+EOF
+# The instance cleanup (SME-129): records each call with the KUBECONFIG it
+# got, and to $ORDER when set. CLEANUP_FAIL makes it fail (a guard, a
+# timeout, an unreachable cluster); CLEANUP_SLEEP makes it slow, so a case
+# can hold the scratch lock while it runs.
+cat >"$dir/bin/cleanup" <<'EOF'
+#!/usr/bin/env bash
+printf 'KUBECONFIG=%s %s\n' "${KUBECONFIG-<unset>}" "$*" >>"$CLEANUP_CALLS"
+[ -n "${ORDER:-}" ] && echo "cleanup $*" >>"$ORDER"
+[ -n "${CLEANUP_SLEEP:-}" ] && sleep "$CLEANUP_SLEEP"
+[ -n "${CLEANUP_FAIL:-}" ] && exit 3
+exit 0
+EOF
+chmod +x "$dir/bin/lock-state" "$dir/bin/cargo" "$dir/bin/dx" "$dir/bin/sqlx" "$dir/bin/curl" "$dir/bin/import" "$dir/bin/cleanup"
+
+# The check worktree: a clone sharing this repo's objects, so it can check
+# out any commit here without registering a worktree. Reused across runs.
+worktree=$dir/worktree
+[ -d "$worktree/.git" ] || git clone -q --shared --no-checkout "$PWD" "$worktree" || exit 1
+
+export SQLX_CALLS=$dir/sqlx-calls
+export DX_ENV=$dir/dx-env
+# The cleanup stub's calls, and the order of the cleanup and sqlx stubs'
+# lines (SME-129).
+export CLEANUP_CALLS=$dir/cleanup-calls
+export ORDER=$dir/order
+: >"$CLEANUP_CALLS"
+: >"$ORDER"
+pid_file=$worktree/.check-server.pid
+scratch_file=$worktree/.check-server.scratch-db
+kubeconfig_file=$worktree/.check-server.kubeconfig
+log_file=$worktree/.check-server.log
+# Extra VAR=VALUE settings for check_server's environment, set per case.
+extra_env=()
+# The caller's own RUST_LOG and NO_COLOR are dropped, so they can't change
+# the results.
+check_server() {
+    env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR PATH="$dir/bin:$PATH" CHECK_WORKTREE="$worktree" \
+        SANDBOX_IMAGE_IMPORT="$dir/bin/import" SANDBOX_INSTANCE_CLEANUP="$dir/bin/cleanup" \
+        DATABASE_URL=postgres://u@localhost/smelt_dev \
+        "${extra_env[@]}" scripts/check-server "$@" 2>&1
+}
+scratch_url=postgres://u@localhost/smelt_scratch_worktree
+
+
+# Ends a script: its failures, or that every case passed.
+finish() {
+    if [ "$failures" -gt 0 ]; then
+        echo "$failures failure(s)"
+        exit 1
+    fi
+    echo "all $(basename "$0" | sed 's/^test-//') tests passed"
+}
