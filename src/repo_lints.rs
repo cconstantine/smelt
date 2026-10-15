@@ -24,7 +24,6 @@ const NOT_COUNTED: &[&str] = &["Cargo.lock", "assets/highlight.css"];
 const EXCEPTIONS: &[(&str, Limit)] = &[
     ("assets/chat.css", Limit { bytes: 76_167, lines: 3_518 }),
     ("scripts/test-check-scripts", Limit { bytes: 42_116, lines: 818 }),
-    ("src/anthropic/stream.rs", Limit { bytes: 110_355, lines: 2_506 }),
     ("src/bin/sandbox_agent.rs", Limit { bytes: 114_191, lines: 2_749 }),
     ("src/browser_tests.rs", Limit { bytes: 281_142, lines: 5_781 }),
     ("src/browsing.rs", Limit { bytes: 106_451, lines: 2_341 }),
