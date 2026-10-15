@@ -15,7 +15,7 @@ A single-user, 100%-Rust AI chat agent talking to Claude. Dioxus fullstack (SSR 
 | Dioxus components, routing, calling server functions from the UI | [docs/frontend.md](docs/frontend.md) |
 | Inline tests, mock-upstream SSE testing | [docs/testing.md](docs/testing.md) |
 | New feature flow, plan phase, TDD workflow | [docs/development-process.md](docs/development-process.md) |
-| Personas (Project Manager, Planner, Developer, Code Reviewer, Integrator) and the ticket workflow they run | [docs/development-process.md](docs/development-process.md#personas) |
+| Personas (Project Manager, Planner, Developer, Code Reviewer, Integrator) and the ticket workflow they run | [docs/personas/README.md](docs/personas/README.md) |
 
 ## Project tracking
 

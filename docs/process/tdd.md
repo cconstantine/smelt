@@ -1,0 +1,71 @@
+# Phase 2: Implementation (TDD)
+Part of the [development process](../development-process.md).
+
+
+Work through the plan one behavior at a time. For each behavior:
+
+## Step 1 — Write a failing test
+
+Write the test before writing any implementation code.
+
+The test must fail **because the behavior does not exist yet** — not just because the code does not compile. If the code does not compile, that is not yet a failing test; it is an incomplete test. Get it to compile first (with stub implementations returning dummy values), then confirm it fails at runtime. Pick a stub value the test's assertion rejects: an empty string, zero or `None` can pass a `contains`, `>=` or `is_none` check by accident. On SME-111 a notice test asserted `contains(&notice)` against a stub returning `""`, which every string contains, and was caught only by rereading it.
+
+A good failing test:
+- Calls the real function or module being built (not a placeholder)
+- Asserts the specific outcome the behavior should produce
+- Fails with a clear message that points to the missing behavior
+- Would pass once the behavior is correctly implemented and fail if it regresses
+
+A bad failing test:
+- Fails only because it calls a function that does not exist yet
+- Asserts `true` or uses `assert!(result.is_ok())` without checking what is inside
+- Would pass with any non-panicking implementation
+- Tests the wrong thing (e.g., tests the test setup rather than the code)
+
+Show the failing test output to the user before moving on.
+
+## Step 2 — Write the minimum code to make it pass
+
+Implement only what is needed to make the test pass. Do not add features, abstractions, or handling for cases the test does not cover yet.
+
+Run the test and confirm it passes.
+
+## Step 3 — Refactor if needed
+
+Clean up the implementation while keeping the test green. Run the test again after refactoring to confirm it still passes.
+
+## Step 4 — Repeat
+
+Move to the next behavior in the plan. Write the next failing test. Do not skip ahead.
+
+## Testing rules
+
+- **Write the failing test first for logic-bearing code** — anything with branching, computation, parsing, or edge cases. Never write that implementation before its test exists.
+- **Mechanical mirror code is the one exception.** Code that is a near-verbatim copy of something already covered by an equivalent test — e.g. CRUD for a new table that mirrors an existing table's CRUD — may be written alongside a characterization test instead of strictly test-first. The test must still assert real behavior (e.g. a create/read/update/delete round-trip), not just that it compiles. When you take this path, say so.
+- **Never move to the next behavior before the current test passes**
+- **Never show the user a passing test without having first shown the failing version**
+- **See every check fail before trusting it when it passes — not just new tests.** This covers a regression test for a reported bug, a manual check, and a log grep used as evidence alike: first confirm it fails when the thing it detects is present. For a bug, that means running the new test on the unfixed code. When a check for a suspected bug passes unexpectedly, find out why before believing it. On `web-browsing`, three checks passed for the wrong reason:
+  - a log fix "verified" by an empty log that was empty because *all* logging was off;
+  - click tests whose pages reacted instantly, so a click that never waited looked fine;
+  - a still-page frame test kept busy by a blinking cursor.
+
+  **Once a timing flake is diagnosed, make it fail every time before fixing it:** add to the test the delay that crosses the boundary the diagnosis names, see it fail on the unfixed code, and keep the delay in the test, so the fix is shown to hold where the flake struck. On SME-143 a 1.1 s wait after making a pod pushed the runner past the whole-second boundary the diagnosis named, and a flake that failed 3 of 7 CI runs failed 3 of 3 locally; the fixed test then passed 10 of 10 with the wait still in.
+- **Make at least one test take the shape of the real caller, not just the obvious one.** The easy case passes beside a wrong fix. SME-157's cluster test creates its user-defined bridge *after* dockerd starts, because `docker compose` creates its project network after the daemon is up; that single choice is what showed `--mtu` reaching only the default bridge. A test that had used only the default bridge would have shipped a fix leaving every compose project broken.
+- **Check that a fixture set bites before believing it.** Hand-built fixtures encode the assumptions that built them, so pass the function under test through a mutation first: the first fixtures for `discover_uplink_mtu` passed against two mutants — one that ignored which interface the route names, one that skipped the MTU validation — and said the code was tested. Give the good fixtures deliberately *different* values (two interfaces at 1450 and 1500, not both 1450) so a function that ignores its input cannot print a right answer. On SME-157 the mutation check found both; the fixtures were rebuilt and every mutant is now caught.
+- **Run a test against the unfixed code in a detached worktree with a `CARGO_TARGET_DIR` of its own** (`git worktree add --detach <path> <unfixed commit>`), never the branch's `target/`. An unfixed commit from before SME-100 has scripts that take no lock: run them under `flock` (see "Which copy locks itself" in [the persona rules](../personas/rules.md)). Cargo's dep-info then records the other tree's files, so the branch's next build can be judged fresh and run the old binary. On SME-112 a `scripts/check.sh` ran the unfixed code this way, and the loud failures cost a full lock wait and run (about 35 minutes) before the cause was found. **Or copy the unfixed test binary:** after `cargo test --features server --no-run`, and before editing, copy the test binary it names out of `target/` into the ticket's scratch directory, then run the copy by exact name under the cluster lock, `scripts/with-cluster-lock <copy> --exact <name>` (it finds the lock from its own checkout, so it can run from the scratch directory). It costs no second build and leaves the branch's `target/` alone. On SME-117 the six log tests and the double-delete test were seen failing this way while the fix was written.
+- **A fix that adds state lists that state's transitions first,** the same way a plan's state model does (see [Phase 1](plan.md)). This covers a kept error, a new notice or a new lock as much as a new table. Write the transitions in the commit or the ticket before the code, including what happens when the step that makes one fails partway, and test each one. On SME-51 both code-review rounds found edges of state the bug fixes had added: a kept turn error cleared at the wrong moment, and a stop notice saved twice. **List the ways the state's inputs can arrive, too, before the code:** each stream or channel a signal can come on, and each way it can be moved, merged, swapped or closed (for a shell, `exec 2>&1`, `exec 1>&2`, `exec >/dev/null`, a swap, a closed pipe). On SME-122 B12's end markers were told apart by the pipe they came on, and the protocol was redesigned three times (the fix, review round 1, review round 2), each round finding another redirection; that list, written first, gives the final design (markers that name themselves and carry the exit code) at once.
+- **A test of a race forces one named interleaving,** one test per interleaving, rather than letting timing pick one: hold a lock, pause at a hook, or order the steps by hand, and name the interleaving in the test. A test that can land on either side of a race passes on whichever it hits. On SME-122 B1's first test passed locally on one interleaving and failed in the gate on the other (a Stop deleting the pod the start waited for, which gave Kubernetes' raw 404); two deterministic tests replaced it. Review round 1's finding 5 had the same shape: its socket-level test passed on the unfixed code for want of timing, and a direct test that forced the order reproduced it.
+- **When a change makes a previously-inert code path start firing calls into a different subsystem, check whether tests exercising that path now need the same test isolation that subsystem's own tests already rely on** — especially when the call is indirect (a detached background task, not something the test itself invokes), since it's easy to miss precisely because the affected test's own code never mentions the subsystem at all. `terminal-exit-notify`'s real-cluster integration test hung the first time it ran: giving every terminal-command completion an active push into `turn::wake_conversation` meant that test's already-existing commands now made genuine (and, in this sandboxed environment, un-routable) calls to the live Anthropic API — it needed the same `ANTHROPIC_BASE_URL` redirect `turn`'s own mock-upstream tests already use, even though `sandbox.rs`'s test had never had to think about Anthropic before.
+- **A real-cluster test deletes what it creates itself, and never sets process-global state another test relies on.** Delete pods (and anything else it makes in the cluster) directly before asserting, not through smelt's background cleanup (`terminate_pod`, `Sandbox`'s drop queue), which the test process can exit before draining. Don't set `sandbox::MANAGER`, `db`'s pool or any other `OnceLock` from a second test; give the test its own client instead (`open_pod_port_with` takes one for this reason), or, for the free functions that reach the manager through `get()`, a manager of its own with `use_test_manager` (SME-94). On SME-42 a new test left two pods behind through the cleanup queue, and setting `MANAGER` broke `test_terminal_lifecycle_end_to_end` with `Kube(Service(Closed))` whenever it ran after the new test finished (see [testing.md](../testing.md)).
+- **A change that removes a long-held test lock, or makes serial real-cluster tests run in parallel, runs the full `scripts/check.sh` twice before the PR,** and the Integrator runs it twice again on the merged head. Tests the old serialization kept apart now meet only some of the time, so one green run proves little. On SME-94, splitting one serial test into 20 parallel ones exposed a subscriber-count flake the old test's lock had hidden and a pod-start load that outran the 90 s wait; each failed only some gates.
+- **Run a real-cluster test only by exact name, under the cluster lock** (`scripts/cluster-test --features server -- --exact sandbox::tests::<name>`), never by a substring filter, which also picks up every test whose path contains it. A test whose unfixed form is destructive (a sweep, a teardown) is seen failing only on a copy with the behaviour reverted (see the detached-worktree rule above) or with its destructive call stubbed, never by running the unfixed code in place. On SME-115 `cargo test -- orphan`, outside the lock, matched the new sweep test while the sweep was still unfixed: it ran the old sweep in `smelt-park-test` and marked another run's claims there for deletion.
+- **A change whose first run deletes shared cluster objects runs that first time alone, under the cluster lock, between read-only snapshots of every namespace it could reach** (`smelt-park` included; the run and both snapshots in one script under one `scripts/with-cluster-lock bash <script>`), and the two snapshots are compared: what was deleted, what was kept, and that nothing outside its target changed. On SME-134 the first sweep ran this way: the snapshots showed the 22 pods and 270 claims over an hour old gone from `smelt-park-test`, its 20 younger objects untouched, and `smelt-park`'s 2 pods and 4 claims unchanged, for two API reads.
+- **A cluster object a test creates that could block other tests must be harmless if the test is killed at any point,** not only cleaned up on every exit path: a killed process (a CI timeout, a cancel) runs no cleanup at all. Give such an object (a pod labelled like a real conversation's, a claim with a real name) a bounded life, such as a grace period or a deadline, or keep it matching nothing until the moment it has to. On SME-99 the reproduction's own pod, labelled as conversation 1's, was first held by a finalizer, which a killed run would leave Terminating for good, blocking every real-cluster test that uses conversation 1; then a run killed before the delete would leave it running with that label. Both review rounds found one of these. **A real-cluster test uses unique names, never a fixed id:** on SME-115 a run killed mid-test left a pod holding `test_create_recreates_a_missing_volume_claim`'s fixed `sandbox-volume-990003`, and the next three gates failed that test for a reason unrelated to their code (SME-133 fixes the test).
+- **Spikes that create cluster resources use fixed names**, not a PID or timestamp, so a stopped or failed run's leftovers are easy to find and a rerun reuses them. On SME-42 a stopped spike left a pod named after its process id, found only by listing the namespace afterwards.
+- Tests live inline with the code they cover: `#[cfg(test)]` blocks in the same `.rs` file
+- Use `#[tokio::test]` for async tests
+- Use descriptive test names that state the scenario and expected outcome: `test_second_message_does_not_overwrite_title`, not `test_title`
+- Use `expect("message")` instead of `unwrap()` so failures are readable
+- Test return types can be `-> Result<(), E>` to allow using `?` inside tests
+
+See [testing.md](../testing.md) for Rust-specific patterns.

@@ -25,7 +25,6 @@ const EXCEPTIONS: &[(&str, Limit)] = &[
     ("assets/chat.css", Limit { bytes: 76_167, lines: 3_518 }),
     ("docs/api.md", Limit { bytes: 53_821, lines: 304 }),
     ("docs/architecture.md", Limit { bytes: 46_112, lines: 119 }),
-    ("docs/development-process.md", Limit { bytes: 107_535, lines: 478 }),
     ("docs/setup.md", Limit { bytes: 48_889, lines: 325 }),
     ("docs/testing.md", Limit { bytes: 78_171, lines: 426 }),
     ("scripts/test-check-scripts", Limit { bytes: 42_116, lines: 818 }),

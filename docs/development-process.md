@@ -2,17 +2,33 @@
 
 These rules are mandatory. Follow them in order. Do not skip steps.
 
+The process is split into a file per part, so an agent reads only the part its job needs.
+
+| Part | File |
+| -- | -- |
+| Personas: who does what, and the statuses each moves | [personas/README.md](personas/README.md) |
+| Rules every persona follows (ownership, worktrees, the cluster lock, hands-on checks, questions for the user) | [personas/rules.md](personas/rules.md) |
+| Project Manager, Planner, Developer, Code Reviewer, Integrator | [personas/](personas/README.md) |
+| Phase 1: the plan | [process/plan.md](process/plan.md) |
+| Phase 2: test-first implementation, and the testing rules | [process/tdd.md](process/tdd.md) |
+| Rules for the code: outside APIs, spikes, Kubernetes, async boundaries, errors | [process/rules-code.md](process/rules-code.md) |
+| Rules for commits, gates and scope | [process/rules-commits.md](process/rules-commits.md) |
+| Rules for running processes, servers and scripts | [process/rules-running.md](process/rules-running.md) |
+| Definition of done, and adding a feature | [process/done.md](process/done.md) |
+| Close-out: Linear, the code review, the retrospective | [process/close-out.md](process/close-out.md) |
+| Bug bashes and design reviews | [process/sweeps.md](process/sweeps.md) |
+
 ---
 
 ## Where work is tracked
 
-Ideas, plans and finished projects live in Linear, not in the repo: team **Smelt Agent** (ticket ids `SME-N`), project **smelt**. Use the Linear MCP tools to read and update them. The one exception is a plan too long for the Linear MCP to return, which goes in `docs/plans/` on the ticket's branch (see [Planner](#planner)).
+Ideas, plans and finished projects live in Linear, not in the repo: team **Smelt Agent** (ticket ids `SME-N`), project **smelt**. Use the Linear MCP tools to read and update them. The one exception is a plan too long for the Linear MCP to return, which goes in `docs/plans/` on the ticket's branch (see [Planner](personas/planner.md)).
 
 | Status | Meaning |
 |---|---|
 | **Backlog** | An idea: what the user wants, not yet planned. |
-| **Up Next** | The user wants it planned next. A Planner plans it (see [Personas](#personas)), unless it's waiting on another ticket (a "blocked by" relation that isn't Done; see [Planning waits for overlapping work](#planning-waits-for-overlapping-work)). |
-| **Planned** | Has a plan with questions for the user (see [Questions for the user](#rules-every-persona-follows)); the user may leave notes on the ticket. A plan with no questions goes straight to Todo. |
+| **Up Next** | The user wants it planned next. A Planner plans it (see [Personas](personas/README.md)), unless it's waiting on another ticket (a "blocked by" relation that isn't Done; see [Planning waits for overlapping work](personas/project-manager.md#planning-waits-for-overlapping-work)). |
+| **Planned** | Has a plan with questions for the user (see [Questions for the user](personas/rules.md)); the user may leave notes on the ticket. A plan with no questions goes straight to Todo. |
 | **Todo** | The user approved the plan; ready to be worked on. |
 | **In Progress** | Being implemented on a branch. |
 | **In Review** | PR open, reviewed and fixed, retrospective written; waiting for the user to answer its questions. A ticket with no questions goes straight to Approved. |
@@ -28,327 +44,6 @@ Linear's markdown differs from GitHub's in ways that bite: don't hard-wrap lines
 
 ---
 
-## Personas
-
-A persona is a role a Claude instance takes on: what it's responsible for, which ticket statuses it moves, and where it stops. The user starts one by asking an instance to "take on the persona of Project Manager" (or another). **Every sub-agent is started as a persona**: its prompt names the persona, points at this section, and gives only what that job needs (the ticket id, its worktree and branch, the PR). A sub-agent never gets a fork of its starter's conversation. When work comes up that no persona covers, add one here, in the same shape, before handing it out.
-
-Everything below still follows the rest of this document: the plan phase, TDD, the gate, close-out and the retrospective. A persona says who does each part, and where a persona's rule differs from a section below, the persona's rule wins for the tickets the Project Manager runs.
-
-### Rules every persona follows
-
-- **Ownership is recorded in Linear, not only in a conversation.** Before starting a sub-agent, the Project Manager comments on its ticket: `<Persona> started: worktree <path>, branch <branch>`. The sub-agent's final report is a comment too, beginning `<Persona> finished:` or, when it can't go on without the user, `<Persona> blocked, needs the user:`. A "started" comment with no report after it means that sub-agent is still running. Only one Project Manager runs at a time, and it rebuilds its picture from these comments and `git worktree list` on every pass, so a restart doesn't lose track.
-- **Branches start from GitHub's `main`, fetched first.** Nobody pulls the main checkout, so its `main` goes stale. Fetch with `git fetch origin main`, or over HTTPS (see Pushing) with `… fetch https://github.com/cconstantine/smelt.git main:refs/remotes/origin/main`, then use `origin/main`. This updates only the remote-tracking ref, not the user's checkout.
-- **Its own worktree, at a fixed place.** Each ticket's branch gets one worktree, `~/smelt-worktrees/smelt-<ticket>`, made by the Planner (`git branch <slug> origin/main`, then `git worktree add ~/smelt-worktrees/smelt-<ticket> <slug>`) and named on the plan's **Branch:** line. `DATABASE_URL` comes from the environment, so a worktree needs no `.env`. One persona works in a worktree at a time; a Code Reviewer only reads the Developer's. Never `git checkout` in the main checkout: the user's dev server serves it.
-- **Hands off the user's running setup:** the main checkout, the dev database, the dev server's port (8080) and the `:latest` sandbox image (no `--latest`). Since SME-121 the dev server runs `smelt-sandbox:src-<hash of the main checkout's agent sources>` (which can lag `origin/main`); a gate building the image for its own tree's sources is fine: a tag it shares with the dev server's image is rebuilt from the same agent sources.
-- **Edit files from a script saved in the ticket's scratch directory, never from a heredoc inside another heredoc.** An inner `<<'EOF'` closes the outer one, and the rest runs as shell commands. On SME-100 a patch script's remainder started the real `check.sh` and `browser-tier` with real `cargo`; they failed before their test steps and wrote nothing, but only by luck. Write the edit as a file in `<scratchpad>/sme-N/` and run that file.
-- **Scratch files go in a directory named after the ticket,** `<scratchpad>/sme-N/`, never at the scratchpad's top level: personas share the scratchpad. On SME-127 one persona's `gate-commits.sh` could have overwritten another's.
-- **One cluster user at a time, and the scripts take turns themselves (SME-100).** Test runs share the k3s cluster's `smelt-park-test` namespace and the shared Postgres's `#[sqlx::test]` databases: sqlx names each from the test's path alone and drops any old one of that name first, so on SME-111 a filtered run outside the lock failed three tests (`dropdb … being accessed by other users`) while another persona's gate ran. So every test run takes the cluster lock, `flock` on `<git common dir>/smelt-cluster.lock` (one file for every worktree), through `scripts/with-cluster-lock`, and only around the run itself:
-  - `scripts/check.sh` and `scripts/browser-tier` build, lint, compile the tests (`--no-run`) and check the cluster first, unlocked, then lock their test run only. `scripts/clean-test-namespace.sh` locks too.
-  - Any other `cargo test` that includes a `#[sqlx::test]` or a real-cluster test, a filtered one too, goes through `scripts/cluster-test <cargo test arguments>`: it builds with `--no-run` unlocked, then runs the same command locked. A test binary run directly (a copied one) goes through `scripts/with-cluster-lock <binary> --exact <name>`.
-  - `scripts/check-server`, `scripts/build-sandbox-image.sh` and `scripts/cluster-doctor` take no cluster lock: none of them touches a test run's namespace or databases.
-  - **Don't wrap the scripts in `flock`.** A run under an old outer `flock` doesn't deadlock (it finds the lock held by an ancestor, or by a descriptor it inherited, runs inside it, and says to drop the `flock`), but the outer lock is then held through every build again.
-  - **Which copy locks itself:** a worktree runs the scripts of the commit it has checked out, and only a commit that has `scripts/with-cluster-lock` (SME-100's merge or later) locks. Check it per commit, `[ -x scripts/with-cluster-lock ]` in the checked-out tree, not per branch: a branch that merged `origin/main` still has older commits, and a per-commit gate script or a red run of an unfixed commit checks them out. For a commit without it, wrap its `check.sh`, `browser-tier` and test runs in `flock "$(git rev-parse --git-common-dir)/smelt-cluster.lock" …` as before, building first (SME-100 review 1). A branch cut before SME-100 merges `origin/main` before relying on the scripts' own lock.
-  - Each locked run appends a line (start, waited, held, exit status, worktree, command) to `smelt-cluster-lock.log` next to the lock; `scripts/with-cluster-lock` says who holds the lock while it waits.
-- **A hands-on check runs on a scratch database, from a ref with SME-115's fix.** A check server on the dev database runs the branch's migrations there, which the main checkout then can't start against; and a smelt from before SME-115 on a scratch database deleted every sandbox claim in the shared namespace whose conversation wasn't in its own database, the user's conversations' `/workspace` among them (`check-server` refuses `CHECK_SCRATCH_DB=1` for such a ref). Since the fix each database touches only cluster objects labelled with its own instance. **The worktree that runs `check-server` must contain the fix too** (`git merge-base --is-ancestor 6c9f03c HEAD`; otherwise merge `origin/main` first): the refusal lives in the script, and a branch cut before the fix runs its own old copy, which has none and serves its own pre-fix HEAD. A hands-on check takes no cluster lock (SME-100): `check-server start` takes a lock on its `CHECK_PORT` instead, which the server holds for as long as it runs, so a second start on the same port waits for the first to stop (to run two at once, give the second another `CHECK_PORT`, a check worktree of its own and previews of its own, `-- SMELT_PREVIEW_ADDR=0.0.0.0:<p> SMELT_PREVIEW_URL=http://{port}-{conversation}.preview.localhost:<p>`: both would otherwise bind previews on 8181, so the second would run without previews, and its preview links would point at the first server's listener, which could open another check's sandbox (both scratch databases start at conversation 1); SME-96 is to derive these from `CHECK_PORT`). It runs with a check worktree of its own, keeps the check's exit status, and ends the check by deleting, in the check server's own UI, every conversation it started a sandbox in (`stop` itself now deletes that scratch database's pods and claims before it drops it, SME-129, so this is good practice rather than the only thing that cleans up — and still required from a checkout whose `check-server` predates SME-129), and never stops a check server it didn't start. Write the steps to a script file in the ticket's scratch directory and run that, `bash <scratchpad>/sme-N/hands-on.sh`, rather than an inline `bash -c '…'`: on SME-126 Claude Code refused the inline form as a removal it couldn't read, though it removed nothing, and the same steps in a file ran. The file holds:
-
-  ```bash
-  export CHECK_WORKTREE=~/smelt-worktrees/check-<ticket> CHECK_SCRATCH_DB=1
-  scripts/check-server start && <the check>; rc=$?
-  # A failed stop keeps the scratch database so it can be retried: run it
-  # again until it succeeds, with a pause and a time limit (SME-129). One
-  # still failing after that goes in the report, never left unsaid.
-  timeout 15m bash -c 'until scripts/check-server stop; do echo "check-server stop failed; retrying" >&2; sleep 10; done' ||
-      echo 'check-server stop still failing: the scratch database is kept; report it' >&2
-  exit $rc
-  ```
-
-  A Playwright check built on `scripts/ui-check/smelt_ui.py`'s `run` deletes the conversations it started even when it fails (see [testing.md](testing.md#playwright-preferred)). Never modify anything in the `smelt-park` namespace by hand: the user's dev server's pods and claims live there.
-- **Pushing:** when `origin`'s SSH key isn't available, push over HTTPS through `gh` with only that helper: `git -c credential.helper= -c credential.helper='!gh auth git-credential' push https://github.com/cconstantine/smelt.git <branch>` (the empty value drops the configured helpers first; it changes no settings). Never force-push a branch with an open PR, and never push to `main`.
-- **The Current state docs** (docs/current-state/, one file per section) are ordinary file edits: read the file, change the lines, keep the diff small. **The Feature checklist document** is edited with patch operations on the lines that change, never by replacing a whole section, and read back afterwards: two Developers may close out at once.
-- **Questions for the user end the ticket.** A persona that moves a ticket to a status that waits for the user (Planned, In Review) first puts a `## Questions for the user` section at the bottom of the description. It holds only numbered questions the user must answer, each with the persona's recommended answer in a sentence. Trade-offs, risks and limits it wants the user to see go in a `## Trade-offs to flag` section above it, never among the questions. Hands-on steps the user runs after the merge stay in What shipped. **If there are no questions, the persona moves the ticket on as if the user had approved it** (Planned to Todo, In Review to Approved) and says so in its report. The user can still pull it back.
-- **Stop your own background work before reporting.** Every wait loop (`until …; do sleep …; done`), watcher, `gh pr checks --watch` and server a persona starts in the background, it stops by PID before its final report, its Code Reviewers' included (see "Stop only processes you started" under Rules). A finished sub-agent's shells keep running: on 2026-10-09 the Project Manager found 12 such loops, the oldest 35 hours old, still polling for CI on merged PRs and for output files that would never fill. Give a wait loop a time limit too (`timeout 2h bash -c 'until …'`), so one that outlives its persona still ends.
-- **Reports back** in a few lines: what it did, the ticket's new status, and anything that needs the user or the Project Manager.
-
-### Project Manager
-
-Runs the board; does no ticket's work itself. On each pass over the smelt project's tickets in Linear, it first rebuilds who owns what (the "started" comments, `git worktree list`), then:
-
-| Status | What the Project Manager does |
-| -- | -- |
-| **Up Next** | Starts a **Planner** for each one without a running one (an open "started" comment) and without an open blocker (a "blocked by" ticket that isn't Done). A ticket the user moved back from Planned (it has a plan already) gets a Planner that revises the plan from the user's notes. |
-| **Todo** | Starts a **Developer** for each one without a running one, **while fewer than 2 Developers are running**, unless the plan says it waits for another ticket (until that one merges) or another running Developer's ticket changes the same files (until that one is done, so they don't conflict). |
-| **Approved** | Starts an **Integrator** for each one without a running one. |
-| **Planned**, **In Review** | Waits for the user. |
-| **In Progress** | Leaves it alone unless a "started" comment shows one of its sub-agents owns it; if that sub-agent stopped without a report, it starts a fresh one. |
-| **Any** status with a "blocked, needs the user" report as its latest persona comment | Starts nothing until the user has commented after it, then starts the same persona again. |
-| **Backlog**, when nothing is in Up Next, or no sub-agent is running | Picks the ticket that should be next and moves it to **Up Next**, so the pass then starts its Planner. See "Choosing what's next" below. |
-
-- When a sub-agent stops partway (a usage limit, a crash), it starts a fresh one of the same persona on the same worktree, telling it what's already done; it never repeats finished work.
-- Brings to the user only what needs them: a question a sub-agent couldn't settle, a failure it couldn't fix, a high-severity finding left unfixed, a merge conflict between two branches.
-- Wakes for three things, not on a timer: a sub-agent's report; a status change on the board, through `scripts/pm-wait-for-board`; and the user. After each pass it starts `scripts/pm-wait-for-board` again as a background command. That command exits, waking the Project Manager, when a ticket enters Up Next, Todo or Approved, or when a ticket reaches Done while blocking an open one. It polls Linear every 60 s with the user's read-only API key, kept in `~/.config/smelt/linear-api-key` (mode 600). It doesn't wake on comments.
-- Before a PR that adds or changes a guard in a repo script merges (a refusal in `check-server`, say), tells the Developers on branches cut before it to merge `origin/main` before they rely on the guard: each branch runs its own copy of the script. On SME-115, the branches of SME-111, SME-113 and SME-94 had `check-server`s with no refusal.
-
-**Choosing what's next.** When Up Next is empty, or when no sub-agent is running at all, the Project Manager reads the Backlog and moves one ticket to Up Next. Waiting tickets in Up Next are a deliberate throttle: they hold planning back until the work they wait on lands, and the second condition only keeps the board from sitting idle while everything waits on the user. It weighs:
-- what's hurting the user's real use of smelt now, with bugs they've hit first;
-- whether a bug bash or design review is due (see [Bug bash](#bug-bash-every-few-projects) and [Design review](#design-review-every-few-projects-alternating-with-bug-bashes));
-- whether it's likely to change the same files as a ticket in Planned, Todo or In Progress (if so, its Planner will stop early; see below);
-- what's small enough to finish soon.
-
-It comments on the ticket, `Project Manager: moved to Up Next because …`, naming the runners-up. It tells the user in its next report, so they can swap the pick before the plan is approved. The user's own moves always take precedence: a ticket they put in Up Next means the Backlog isn't read.
-
-#### Planning waits for overlapping work
-
-Too much planned at once goes stale: once one plan merges, every other plan that changes the same files is out of date. So a ticket isn't planned while its plan would overlap work that hasn't shipped.
-- **When to stop.** A Planner first works out which files its plan would change. It stops if any of them is also changed by a ticket in **Planned, Todo or In Progress**, or if its plan would rest on such a ticket's code, schema, tools or decisions.
-- **What doesn't count:** `docs/*`, `Cargo.toml` and `Cargo.lock`, and new scenarios appended to `src/browser_tests.rs`. Rewriting an existing scenario counts.
-- **What it leaves behind.** It stops the plan where it is. It writes into the ticket what it found so far: the files, anything critical, and the tickets it waits for, each recorded as a "blocked by" relation in Linear. Then it moves the ticket back to **Up Next** and says so in its report.
-- **When it resumes.** The Project Manager starts no Planner for an Up Next ticket with an open blocker. Once every blocker is Done, the next pass starts a Planner, which begins from those notes.
-
-This rule is new (2026-10-09). The user asked to watch how it works and revise it if it doesn't.
-
-### Planner
-
-Plans one **Up Next** ticket: [Phase 1](#phase-1-plan), steps 1–6. It reads the ticket, its comments and the Current state docs. It works out which files the plan would change, and stops if they overlap another ticket (see [Planning waits for overlapping work](#planning-waits-for-overlapping-work)). For a flaky test, it lists each way the failing check can fail, and for each one names an assertion that tells it apart from the others, which the Developer runs before the fix: on SME-118 the ticket blamed a 3 s window, and the plan's "read the typed address back" assertion failed on its first run with `about:blankhttp://…`, the real cause. It checks outside services and comparable tools in their source, and when the plan relies on an environment variable being unset (or set), it checks the dev `.env` too, since check servers read it: SME-105's plan assumed `SMELT_ALLOWED_HOSTS` was unset, and the dev `.env` sets it. It creates the branch and worktree, and writes the plan (including the state model) into the ticket under `## Plan`. **A plan longer than about 25,000 characters goes in a file instead,** `docs/plans/sme-N.md` on the ticket's branch, committed and pushed (SME-129): the Linear MCP returns at most about 30,000 characters of a description, with no way to read on, and SME-129's Developer never saw the end of its 39,000-character plan. Then the ticket's `## Plan` holds a short summary and the file's GitHub link (`https://github.com/cconstantine/smelt/blob/<branch>/docs/plans/sme-N.md`), while Trade-offs to flag and Questions for the user stay in the ticket. A revision edits the file, and the file merges with the PR as the plan's record. It can't ask the user directly: anything it would ask goes in [Questions for the user](#rules-every-persona-follows), with its recommendation for each, and trade-offs in Trade-offs to flag. Then it moves the ticket to **Planned**, or to **Todo** when it has no questions, and stops; it writes no code. To revise a plan (the user moved the ticket back to Up Next with notes), it answers each note in the plan and moves the ticket to Planned again, or to Todo when no questions are left.
-
-### Developer
-
-Works one **Todo** ticket through to **In Review**:
-
-1. Moves it to **In Progress**. Reads the plan (the ticket's `## Plan`, or the `docs/plans/sme-N.md` it links to) and every comment on the ticket since it was written: the user's notes there amend the plan. Rebases the branch onto a freshly fetched `origin/main` before its first push, naming `origin/main` itself (`git rebase origin/main`, or `git rebase -i origin/main`), never the plan's original base commit: on SME-115, `git rebase -i 98a8e67` on a branch already rebased onto a newer `main` linearized `main`'s own commits into the branch.
-2. Builds it test-first ([Phase 2](#phase-2-implementation-tdd)), one commit per behaviour or plan step, each gated by `scripts/check.sh` (which takes the cluster lock itself); then the browser tier. Where the change has UI, it runs the hands-on check under the check-server rule above, and writes its steps into What shipped.
-3. Does the close-out that comes before the PR (What shipped, the Current state docs and the Feature checklist; see [Keeping Linear current](#keeping-linear-current)), then opens the PR with the ticket id in its title.
-4. **Two review rounds at most, each a review and then its fixes.** It starts a **Code Reviewer** on the PR and fixes every finding the reviewer confirms, test-first, one commit per finding, then pushes. It tries to confirm each suspected finding (a test or a reproduction) and fixes those it confirms; the ones it can't confirm either way are listed in What shipped for the user. If round one found anything, a second Code Reviewer reviews the fixed PR, and its findings are fixed the same way, with no third round. A finding outside the ticket's scope is filed as a Backlog ticket, linked as related. A high-severity finding it can't fix goes to the Project Manager for the user, and the ticket doesn't move to In Review. Each round goes in What shipped's code-review part, recorded as "fixed, gating" until its fix commits pass their gates and only then as "fixed": on SME-137 a Developer stopped at a usage limit while What shipped called round 2 fixed, with one fix commit ungated, another's gate red, and none pushed.
-5. Writes the retrospective (see [Retrospective](#retrospective-end-of-each-project)) with its recommendations numbered. A recommendation the Integrator can act on without the user's decision is just listed. One that needs a choice from the user also goes in [Questions for the user](#rules-every-persona-follows). Then it moves the ticket to **In Review**, or to **Approved** when there are no questions.
-
-For tickets the Project Manager runs, step 4 replaces [Code review](#code-review-after-opening-the-pr)'s "report the findings and stop" and its third-round exception: the user reviews the whole ticket at In Review instead of each round.
-
-### Code Reviewer
-
-Reviews one PR's diff for bugs, including security gaps, and changes nothing. It reads the PR's branch in the Developer's worktree (or a detached worktree of its own), never the main checkout; any test it runs to reproduce a finding goes through `scripts/cluster-test` (which takes the cluster lock), named by its full path with `--exact`, and built with a `CARGO_TARGET_DIR` of the reviewer's own, never the Developer's `target/`. On SME-105 a substring filter (`review_`) matched about 17 `preview` tests, `#[sqlx::test]` ones among them, and ran them outside the lock, in the Developer's `target/`. It may use `/code-review <PR number>` to do the review (see [Code review](#code-review-after-opening-the-pr)). It checks each finding against the code before reporting it, and reports each with a severity, the file and line, what goes wrong in a concrete case, and a suggested fix. It says which findings it confirmed and which it only suspects. For a docs change, it checks every claim against the code (and the scripts, manifests and Dockerfiles), not against other docs: on SME-127 that is what found every deployment blocker in the README, such as the k3s-only image import and the glibc tie between the build host and the sandbox image.
-
-### Integrator
-
-Finishes one **Approved** ticket:
-
-1. Reads the user's answers to the questions and their replies to the retrospective. Acts on every recommendation the user didn't mark as disagreed (a process or doc change on the branch, or a new ticket), and records the ones they disagreed with as declined, in the ticket.
-2. Fetches `origin/main`; if it has moved on, merges it into the branch (not a rebase: the PR is open, and force-pushing it is ruled out), pushes, and runs the gate again (`scripts/check.sh`, which takes the cluster lock itself). When the PR adds a lint or a gate check, that run covers it on the merged tree: code from `main` wasn't written against the new rule.
-3. Merges the PR once CI passes on that head, moves the ticket to **Done**, and removes the branch's worktrees.
-
----
-
-## Phase 1: Plan
-
-**Do this before writing any code, any tests, or any files other than the plan itself.**
-
-1. Read the user's request carefully
-2. Read the ticket, and the **Current state** docs, to understand the request and the current codebase
-3. Ask clarifying questions if the request is ambiguous — do not assume (a Planner writes them as the plan's open questions instead; see [Personas](#personas))
-4. **If the work depends on an outside service or tool, check it before presenting options.** For each claim a choice rests on (whether it's still available, pricing and free tiers, what signup or access it needs, the API's request and response shape), check the provider's current docs and cite them. Don't answer from memory with a general "worth checking" caveat. Also look at how a comparable tool solves the same problem, in its source rather than its marketing. On `websearch`, provider answers from memory had three wrong or stale claims, and a three-provider plan was written on top of them. Reading opencode's source then showed Exa's keyless MCP endpoint, which cut the project to about 60 lines. **When the plan changes a value smelt sends to a provider** (a larger `max_tokens`, a new thinking setting), check each provider kind's limit on that field and every `stop_reason` the change can make reachable, and cite them in the plan. On SME-111 the plan let Other ask for up to half the window, though Claude, behind a gateway, refuses a `max_tokens` above its cap; and its cut-off notice covered only `max_tokens`, while bigger replies made Claude's `model_context_window_exceeded` reachable (round 1's medium finding). **A claim about what a tool does counts as one of these claims, even when the tool is local and free to probe.** A plan said dockerd's `--mtu` is the default for any bridge that doesn't set its own; it is the default for the *default bridge* only, and user-defined bridges — what a compose project makes — need `--default-network-opt` (SME-157). The plan was hours of work and the wrong claim sat in it unnoticed until a test measured it.
-5. Create a branch in a worktree of its own: `git branch <short-slug> main`, then `git worktree add ../smelt-<ticket> <short-slug>`, and work there (a Planner branches from a freshly fetched `origin/main` into `~/smelt-worktrees/smelt-<ticket>`; see [Personas](#personas)). Never `git checkout` in the main checkout: the user's dev server may be serving it. On SME-43 this step said `git checkout -b`, and following it switched the user's checkout. A new worktree needs no image build when the cluster already has the one named after its agent sources (`scripts/sandbox-image-ref`, SME-102); `scripts/cluster-doctor` says when it doesn't.
-6. Write the plan into the ticket's description, under a `## Plan` heading after the idea's own text (create a ticket first if the work has none). The plan contains:
-   - **Branch:** the branch name created in step 5
-   - **What** is being built and why
-   - **Which files** will be created or modified (be specific)
-   - **How** it will be implemented: data model, API shape, UI flow. For a split of a component, list each request (`spawn`) that moves and the condition its new component is shown under: a request in a component its own result hides is dropped (SME-57, see [frontend.md](frontend.md#calling-server-functions))
-   - **State model**, for a feature that keeps state (database rows with a status, files in the sandbox, decisions the user makes): each record's states, what moves it between them (the user, the model, a Stop, a restart, a retry, a timeout, another conversation), and who else sees each change (other conversations, other tabs, the pod). For state in the sandbox, say what survives a pod restart and what's lost. For each transition, also say what happens if the operation that makes it fails partway: a delete that errors after the mark is set, a send that fails after the event was taken. For a record that several callers write, also list every writer: each path that creates, retries or finishes it (a retry and a fresh request for the same thing, a failure path as well as success). Each listing or refresh path that writes the record is a writer of its own, even when two of them call the same function: on SME-111 the plan named the provider page's `/props` refresh as the writer of a model's reported window, and the picker's quick listing, which skips `/props`, wrote it too (round 2's medium finding). The races sit between writers. List every caller that reads shared state too (a remembered setting, a cached decision), and what each does with a value another caller just changed: on SME-93 all three review rounds found their bug at a reader of the remembered per-provider thinking choice, not at a writer. For each check a caller makes before acting on a record (is it waiting? is it answered?), also say what can change between the check and the act, and who can change it: on SME-34 a turn checked a pending question when it started and again only when calling the model, and an answer recorded in between was neither waiting nor taken (round 1's high finding). A tool's own scratch resources count as records here too (a helper pod, a lock file, a temporary name): on SME-102 both review rounds found the image import's loader pod, whose fixed name let one run delete another's mid-import, because the state model listed the images but not the tool's own pod. The tests then cover each transition, not just the happy path. On SME-32 none of this was written down: a re-clone step was built and then thrown away when the user asked why `/workspace` didn't outlive the pod, and ten code-review rounds found about 45 bugs, most of them transitions nobody had listed (retry, interrupt, trust given from another conversation), several made by the previous round's local fixes. On SME-53 the plan listed a torn-down mark's transitions but not a teardown that fails after setting it, and a failed pod delete left a live pod refusing every connect. On SME-86 the plan had a repo row's states but not its writers, and both review rounds found another writer racing the retry it fixed: a fresh clone into the same directory, and a failed attempt's error path. For a record keyed by an id that events arrive for (a stream's content blocks, a tool call, a pod), write the states and events as a small state × event table: every event in every state, including a repeat of the event that created the record (a second start for one still open). On SME-112 the plan listed a delta for a block already finished but not a start for a block still open, and round 2's finding sat in exactly that cell: llama.cpp's final chunk can resend a tool call's start, which split one call in two. When the plan adds a shared resource to prevent a race (one cache, one manager, one lock), it names the second user that makes the race possible: a test can only fail once that user exists, so the resource and that user land in one commit. On SME-113 one OAuth manager per server could only be tested together with the status check, its second user. For each skip or failure outcome in the table, also say what happens to the other records chosen together with that one: on SME-134 the plan had "a pod's delete is refused (409) → skipped", but not what then happens to the claims chosen because of that pod, and round 2 found them deleted from under the pod made again. When the change wraps another command (a lock, a timeout, a supervisor), the state model has a row per way the wrapper and its command can end: a signal to the wrapper alone, a signal to the process group, SIGKILL, a stopped command, a command reading the terminal, and what each does to the command's own children. On SME-100 the plan decided that the locked command wouldn't inherit the lock without listing these, and round 2 found three bugs in exactly those cells: a terminal read stopped the command while the holder spun holding the lock, `kill -9` of the holder left an orphaned test binary running with the lock free, and Ctrl-C no longer ended the calling script.
-   - **Where new UI goes,** for anything new on screen (a banner, a panel, a button): where it sits at a laptop width and at a phone width, and what it may cover. On SME-43 the plan placed a reload banner "at the top"; on a phone it covered the Conversations button, found only by a screenshot. A UI fix's plan also names each layout the fix depends on (laptop and phone widths, which side panels are open, where they sit) and what the fix does in each. On SME-75 the fix for text moving under the pointer had to hold with the side panels open and at phone width, which the plan hadn't listed. For each layout, also compute the narrowest width the new element gets, with every panel that can sit beside it, and test there with the widest content it can show. On SME-144 the checks used 900px with no todo list, where the terminal card is about 316px wide; at 721px beside a todo list it's 137px, and a `running` pill pushed the connection pill out of the card. Round 1's fix was then checked at 740px with the narrowest label (`lost`), and round 2 found 721–739px with the widest one still broken.
-   - **Every source of error text, when the change sends it somewhere new** (a span, a shipped log, the UI): each source that reaches the new sink, and what each can quote (a URL with its query, a server's reply body, the tool's input). The tests put a marker into each source and assert it never reaches the sink, at least one per source in the real caller's shape, not only through a helper. On SME-137 the plan listed what a span never holds but not what reaches `mark_error`: round 1 found four sources (reqwest's URL with its query, the request guard's URI, an MCP tool's error output, JSON-RPC errors) and round 2 a fifth, an rmcp transport error quoting the server's reply body.
-   - **A threat list for a new service with a web UI** (a compose service such as Grafana): what an unauthenticated visitor, or another site through DNS rebinding, can make it do (add a data source, send a webhook or an alert, install a plugin, answer to another Host name), and the setting that turns each off. It is the plan-time half of the security-boundary rule under [Phase 2](#phase-2-implementation-tdd) ("write down what it does *not* cover"). On SME-137 Grafana took two review rounds: an anonymous Admin reachable by DNS rebinding, then an Editor's alerting webhooks to any host on the compose network.
-   - **What each caller does in each state,** as a small table: for every state (none, starting, ready, broken...), what each caller of it does (waits, fails fast, starts it, retries, gives up). The states and transitions alone don't say this. On SME-35 the plan listed a language server connection's states, and "an edit never starts a server", but not that an edit must never *wait* for one to connect. Most of its 15 review findings were at those cells: a failed start left running, an edit waiting two minutes, a spent retry budget that a restart didn't reset, a "connecting" message repeated forever.
-   - **A row for work already in flight.** For any setting a running operation reads (a turn's model, a pod's limits), say what the operation in flight does when the setting changes under it (keeps what it read, or picks up the change, and when), and which record says what it actually used. On SME-72 the plan had the model's states but not this, and the first review's top finding sat exactly there: the switch point for a model's signed reasoning was recorded when the user picked a new model, while a turn still running kept writing for the old one past it.
-   - **How it will be checked by hand,** when the Definition of done calls for a hands-on check: the steps, and which settings make the case happen. Before calling a check impractical, look up the real floor or ceiling of each setting that would trigger it, in the code and the UI, not from memory. On SME-126 the plan called a cut-off-mid-tool-call check impractical because the reply budget is "never below 16,384 tokens", but the provider's "Max reply tokens" goes down to 1,024; the Developer found that and the check took two minutes.
-   - **Questions for the user**, in their own section at the bottom of the ticket (see [Questions for the user](#rules-every-persona-follows)), and **trade-offs** you want the user to see, in a section of their own. When a tradeoff says "only X sees the difference", name a real X and check it before writing it down. On SME-90 the plan stopped at "only header-less clients see the difference" without asking who they are; review found webhooks to production's https previews refused. When a yes to a question would widen the ticket, say by how much next to it: the files and sites it adds, and any toolchain, image or CI change. On SME-95 the plan asked whether to lint `expect()` with clippy without saying a yes meant 36 more sites in 15 files, clippy added to the image and a CI step, so the user chose without seeing the size.
-7. Show the plan to the user (link the ticket) and **stop**. A Planner moves the ticket to **Planned** instead, and the user approves by moving it to Todo (see [Personas](#personas))
-8. **Wait for explicit approval** — a response like "looks good", "yes", or "go ahead". The user may also leave feedback as comments on the ticket.
-9. Once approved, move the ticket to **Todo**; move it to **In Progress** when implementation starts
-10. Do not write any implementation code or tests until you receive that approval
-
-If the user requests changes to the plan, update the ticket's plan and show it again. Repeat until approved.
-
----
-
-## Phase 2: Implementation (TDD)
-
-Work through the plan one behavior at a time. For each behavior:
-
-### Step 1 — Write a failing test
-
-Write the test before writing any implementation code.
-
-The test must fail **because the behavior does not exist yet** — not just because the code does not compile. If the code does not compile, that is not yet a failing test; it is an incomplete test. Get it to compile first (with stub implementations returning dummy values), then confirm it fails at runtime. Pick a stub value the test's assertion rejects: an empty string, zero or `None` can pass a `contains`, `>=` or `is_none` check by accident. On SME-111 a notice test asserted `contains(&notice)` against a stub returning `""`, which every string contains, and was caught only by rereading it.
-
-A good failing test:
-- Calls the real function or module being built (not a placeholder)
-- Asserts the specific outcome the behavior should produce
-- Fails with a clear message that points to the missing behavior
-- Would pass once the behavior is correctly implemented and fail if it regresses
-
-A bad failing test:
-- Fails only because it calls a function that does not exist yet
-- Asserts `true` or uses `assert!(result.is_ok())` without checking what is inside
-- Would pass with any non-panicking implementation
-- Tests the wrong thing (e.g., tests the test setup rather than the code)
-
-Show the failing test output to the user before moving on.
-
-### Step 2 — Write the minimum code to make it pass
-
-Implement only what is needed to make the test pass. Do not add features, abstractions, or handling for cases the test does not cover yet.
-
-Run the test and confirm it passes.
-
-### Step 3 — Refactor if needed
-
-Clean up the implementation while keeping the test green. Run the test again after refactoring to confirm it still passes.
-
-### Step 4 — Repeat
-
-Move to the next behavior in the plan. Write the next failing test. Do not skip ahead.
-
----
-
-## Rules
-
-- **Write the failing test first for logic-bearing code** — anything with branching, computation, parsing, or edge cases. Never write that implementation before its test exists.
-- **Mechanical mirror code is the one exception.** Code that is a near-verbatim copy of something already covered by an equivalent test — e.g. CRUD for a new table that mirrors an existing table's CRUD — may be written alongside a characterization test instead of strictly test-first. The test must still assert real behavior (e.g. a create/read/update/delete round-trip), not just that it compiles. When you take this path, say so.
-- **Never move to the next behavior before the current test passes**
-- **Never show the user a passing test without having first shown the failing version**
-- **See every check fail before trusting it when it passes — not just new tests.** This covers a regression test for a reported bug, a manual check, and a log grep used as evidence alike: first confirm it fails when the thing it detects is present. For a bug, that means running the new test on the unfixed code. When a check for a suspected bug passes unexpectedly, find out why before believing it. On `web-browsing`, three checks passed for the wrong reason:
-  - a log fix "verified" by an empty log that was empty because *all* logging was off;
-  - click tests whose pages reacted instantly, so a click that never waited looked fine;
-  - a still-page frame test kept busy by a blinking cursor.
-
-  **Once a timing flake is diagnosed, make it fail every time before fixing it:** add to the test the delay that crosses the boundary the diagnosis names, see it fail on the unfixed code, and keep the delay in the test, so the fix is shown to hold where the flake struck. On SME-143 a 1.1 s wait after making a pod pushed the runner past the whole-second boundary the diagnosis named, and a flake that failed 3 of 7 CI runs failed 3 of 3 locally; the fixed test then passed 10 of 10 with the wait still in.
-- **Make at least one test take the shape of the real caller, not just the obvious one.** The easy case passes beside a wrong fix. SME-157's cluster test creates its user-defined bridge *after* dockerd starts, because `docker compose` creates its project network after the daemon is up; that single choice is what showed `--mtu` reaching only the default bridge. A test that had used only the default bridge would have shipped a fix leaving every compose project broken.
-- **Check that a fixture set bites before believing it.** Hand-built fixtures encode the assumptions that built them, so pass the function under test through a mutation first: the first fixtures for `discover_uplink_mtu` passed against two mutants — one that ignored which interface the route names, one that skipped the MTU validation — and said the code was tested. Give the good fixtures deliberately *different* values (two interfaces at 1450 and 1500, not both 1450) so a function that ignores its input cannot print a right answer. On SME-157 the mutation check found both; the fixtures were rebuilt and every mutant is now caught.
-- **Run a test against the unfixed code in a detached worktree with a `CARGO_TARGET_DIR` of its own** (`git worktree add --detach <path> <unfixed commit>`), never the branch's `target/`. An unfixed commit from before SME-100 has scripts that take no lock: run them under `flock` (see "Which copy locks itself"). Cargo's dep-info then records the other tree's files, so the branch's next build can be judged fresh and run the old binary. On SME-112 a `scripts/check.sh` ran the unfixed code this way, and the loud failures cost a full lock wait and run (about 35 minutes) before the cause was found. **Or copy the unfixed test binary:** after `cargo test --features server --no-run`, and before editing, copy the test binary it names out of `target/` into the ticket's scratch directory, then run the copy by exact name under the cluster lock, `scripts/with-cluster-lock <copy> --exact <name>` (it finds the lock from its own checkout, so it can run from the scratch directory). It costs no second build and leaves the branch's `target/` alone. On SME-117 the six log tests and the double-delete test were seen failing this way while the fix was written.
-- **Verify external crate APIs against the source, not memory.** Read the crate in `~/.cargo/registry/src` (or `cargo doc`) before calling unfamiliar methods, especially for fast-moving or less-documented APIs. Macro-generated or re-exported items don't show up in a `grep` for `fn` and are easy to hallucinate. **When the code depends on a call's timing, lifecycle or defaults, read its implementation, not just its signature and doc comment** — what makes it return, what it does on drop or disconnect, what it turns on or off by default. `web-browsing` hit several of these, all visible in the vendored source:
-  - `wait_for_navigation` returns at once if the page is already loaded;
-  - `type_str` only knows a US keyboard and needs focus first;
-  - `EnvFilter` drops its default level once any directive is given;
-  - `ServerEvents::new` runs a detached task that never notices a disconnect;
-  - chromiumoxide only kills Chrome on drop, and turns popup blocking off by default.
-
-  **When a fix depends on how a call fails, read that failure path in the source too: does it panic or return `Err`?** On SME-119 the plan read `OnceCell::get_or_try_init` but not tokio 1.53.1's `Builder::build`, which panics ("OS can't spawn worker thread") when the OS refuses a thread; only driver setup returns `Err`. The test stub returned an `Err`, so it encoded the same wrong assumption as the code, and only a code review found it.
-
-  **When code re-implements how a library reads input it used to leave to that library** (dotenvy's `.env`, an `EnvFilter` string), list the library's rules from its source first: which duplicate wins, comments, quoting, whitespace, empty values. Then test each one. On SME-117 `check-server` began passing `.env`'s `RUST_LOG` itself instead of leaving it to dotenvy, and both review rounds found its differences one at a time (a trailing comment, spaces around `=`, an empty value before a comment, the last duplicate instead of the first); the tests had been written from the script's own assumptions.
-
-  `webfetch`'s retrospective had already named the same lesson.
-
-  **A Kubernetes status field can differ from the spec it reports on.** `ContainerStatus.image` is filled in by the runtime once a container has run (another tag, or a bare `sha256:` id), not copied from the pod spec. When smelt wrote the value, read it from the spec. On SME-121 the missing-image advice first read the status, and the second review caught it.
-- **A request that carries a credential in a custom header doesn't follow redirects.** HTTP clients strip only the standard auth headers on a redirect to another host: reqwest drops `Authorization` and cookies, but keeps `x-api-key` and any other custom header (checked in reqwest 0.12's `remove_sensitive_headers`). A redirecting endpoint could then hand the credential to a host it wasn't entered for. Build the client with `redirect::Policy::none()` (as `anthropic::stream::Endpoint::client` does, SME-72), or send the credential only as `Authorization`. The same goes for a credential stored for one address: a new address needs it entered again.
-- **A change that turns untrusted text into a link (or any `href`) checks how the link is *read*, not only what bytes it holds.** Untrusted text here means the model's replies, a tool's output, or anything a page or outside service sent. There are two readers:
-  - the program its scheme opens: a mail client reads `?cc=` and `%40` in a `mailto:` as more recipients;
-  - the browser's display: a bidi control inside the link, or earlier in the text around it, can make the link show as a different address.
-
-  Test that the shown text and where the link goes still agree with both readers. On SME-104 the plan's rule ("the href is the visible text") held for the bytes, yet both review rounds found links that went somewhere else. Round 1 found an email address with `?cc=` in it, and a bidi control inside a link. Round 2 found a bidi control before a link, which round 1's fix missed; every reply link is now `unicode-bidi: isolate`.
-- **Verify a wire protocol's own structural constraints the same way — against its real spec, not an assumed shape.** Before writing code that builds or extends a request/message sequence for an external API, check what shape constraints it actually enforces (role-alternation rules, a required first role, ordering requirements, and similar structural rules), not just what data belongs in each field. Discovered on `auto-compaction`: the first design for inserting a compaction summary assumed one synthetic message would do, but Anthropic's Messages API requires `messages` to start with `user` and strictly alternate roles — a single message can't satisfy both "starts with user" and "ends with something to respond to" at once. Caught by reasoning through the real constraint on paper before writing any code, not by a failing test; the fix was a three-message sequence (`user` placeholder → `assistant` summary → `user` continuation) instead of one.
-- **Spike the riskiest assumption first.** When a planned phase depends on an unproven external or architectural assumption (a runtime, tool, or framework behavior), validate it with a minimal spike before building dependent infrastructure. **When the assumption is specific to a container or namespace runtime — signal handling, PID 1 behavior, process groups, filesystem/network isolation — the spike must run inside the actual target container, not just on the host.** A host-level spike proving the same mechanism isn't sufficient evidence: container-specific kernel/runtime behavior (e.g. PID 1's kernel-forced `SIG_IGN` on any signal it never installs a handler for, inherited by every descendant process) can silently invalidate a result that held on the host. Discovered the hard way on `sandbox-terminal`: a `send_signal` mechanism verified working in a local, non-containerized spike silently did nothing the first time it ran for real, because of exactly this.
-- **For a failure-mode or resource-limit assumption specifically, spike with a workload shaped like real usage first — not an artificially controlled trigger.** A controlled trigger (a synthetic memory bomb, a single isolated failure) is for *confirming* a mechanism once you already know roughly what to expect; it's not a substitute for finding out what the failure actually looks like under real conditions, and can give a misleadingly narrow picture if it's the only spike run. Discovered on `sandbox-oom`: a first spike (a single-process memory bomb under a real memory limit) found a narrow, misleading picture of an OOM kill's blast radius (just the one process dying); a second spike using a real `cargo build` found the actual dominant behavior (the whole pod dying together, via `memory.oom.group=1`) that invalidated three detection designs already built on the first spike's incomplete picture.
-- **When a real-environment-only failure resists two consecutive fixes built on the same theory, stop iterating on that theory.** Add direct observability into the real environment (logs, `kubectl describe`/events, whatever the environment actually exposes) before attempting a third variation — "same failure, same timing, different magnitude of the thing I changed" is itself a signal the theory targeted the wrong mechanism, not that the fix just needs tuning further. `ci-tests-in-pr` spent two full iterations (raising a timeout, then lowering a CPU request) on a sandbox-test `Timeout` in CI that a local repro made *look* like CPU contention — both fixes failed identically, at the same elapsed time regardless of the CPU size changed, which in hindsight was the tell. A diagnostics-on-failure CI step (dumping real pod/event state) found the actual cause — insufficient memory, never CPU — on the very next run.
-- **Verify Kubernetes subresource RBAC verbs against reality, not the resource name or older examples.** Before granting a Role a verb for a subresource (`pods/exec`, `pods/portforward`, `pods/attach`, ...), confirm the actual HTTP verb the client library sends — via a raw HTTP probe or a `SelfSubjectAccessReview` — rather than inferring it. A WebSocket-based subresource call is often an HTTP `GET` (authorized as `get`), not a `POST`/`create`, even when the operation conceptually "creates" a connection — `sandbox-terminal`'s `pods/portforward` grant used `create` (a reasonable but wrong guess) and 403'd every time until a raw probe against the API server showed the real verb.
-- **Hold a patch on a live Kubernetes object to its `metadata.uid`, not its `resourceVersion`,** when what matters is that it's still the same object (a label patch, an adoption). A running pod's status changes the version several times a second, so a version precondition can fail every retry; a patch carrying another uid is refused (422, checked against k3s on SME-115), which is the identity check wanted. On SME-115 adoption first used the version and left just-created pods unadopted, intermittently.
-- **Bound the boundaries, not every await.** An await only stalls if something it transitively waits on can stall, and that happens where control leaves the process. Put a timeout there — once, at the shared client or wrapper — and let interior awaits inherit it. Don't add timeouts to in-process waits; a hang there is a bug a timeout would hide. At each boundary, also handle every non-success terminal state explicitly (cancelled, superseded, truncated — not just `Err`), and add `tracing` at the seam so a stall identifies itself from a console read. A remote call that changes state the caller can't redo (a refresh that rotates a token, a charge, a one-time code) runs in a spawned task the timeout only stops waiting for, never inside a future a timeout or a dropped request can cancel. On SME-113 a status check's 15 s timeout dropped a token refresh GitHub had already acted on: GitHub had retired the old refresh token, the new one was never saved, and the sign-in was lost (round 2's finding).
-- **Two `async fn`s that call each other (directly or through a longer cycle) defeat rustc's `Send`-auto-trait inference**, surfacing as a cryptic `cannot satisfy \`impl Future: Send\`` error pointing at an unrelated line, not at the cycle itself. Break it by making at least one side return a boxed, type-erased future (`Pin<Box<dyn Future<Output = T> + Send>>`) instead of relying on `async fn` sugar's opaque return type. `turn::run_turn` and `anthropic::tools::execute` are a concrete instance of this shape (a turn loop that dispatches tools, one of which can itself trigger another turn) — expect the same pattern anywhere a conversation loop hands control to a tool/proxy that can call back into it, which a real (non-throwaway) tool-use feature will.
-- **Keep large values out of an `.await`'s scope in sandbox code, and `Box::pin` a large or rarely taken sub-future.** A debug build (the dev server's too) runs these futures on a 2 MB thread stack, and a future's size includes every value held across any of its awaits, and every callee's. Keep only what the next step needs (an ownership, a uid) rather than a whole `Pod`. `sandbox::tests::test_sandbox_futures_stay_small` bounds the futures of `force_terminate_pod`, `close_if_gone`, `create_pod`, `create_pod_attempt`, `wait_for_running_with_timeout` and `ensure_conversation_pvcs`, most at about twice their size when it was added; when it fails, shrink the future rather than raising the bound. On SME-115 holding a `Pod` across a delete took `force_terminate_pod`'s future from 5.5 KB to 12.8 KB, and the first sign was `test_terminal_lifecycle_end_to_end` overflowing its stack and aborting the whole test binary. **A change to an async fn on the sandbox path adds that fn's own future to the test,** because a caller that spawns its work (as `create_pod` does) can't show it. Size the bound so the test fails with the change's large part unboxed, and see it fail. On SME-132 the test bounded only `create_pod`, whose size the change couldn't move; the usual 2× bound on the wait would also have let an unboxed report through (2760 to 4520 bytes), so its bound is 3600.
-- **Surface fallback outcomes on user-visible flows.** When a feature degrades gracefully — a parser returns `None`, a lookup misses, an optional enrichment fails — the UI must say what happened. A silent fallback is indistinguishable from the code not running at all, both to the user and to whoever debugs their report. Best-effort is fine; invisible is not.
-- **Fixture real artifacts — don't re-synthesize them.** When a bug is reproduced from a real artifact (an API response, a wire capture, a malformed input), check the artifact's actual bytes in as the regression fixture. A hand-built synthetic fixture encodes the same assumptions that produced the bug. **The same goes for code that formats an outside API's objects for people** (events, statuses, conditions): alongside the hand-built fixtures, it gets at least one fixture captured live from the real service. On SME-132 five of eight review findings were about real data's shape (clock skew, ties within a second, `events.k8s.io` series fields, multi-line messages, a pod Running at the boundary), and hand-built fixtures had the code's own assumptions; a captured event list would have shown the series fields at once.
-- **A mock of an outside service also covers what the real service sends today,** not just the minimum that exercises the code path being built. When a feature that talks to the service is touched, fetch the service's live responses (metadata, headers, optional fields) and check the mock still has a variant for each shape. SME-16's mock OAuth server deliberately served no discovery metadata, which exercised rmcp's fallback path but meant no test could reach its issuer checks. When GitHub started publishing metadata that required `iss`, Connect broke for GitHub and Linear, and no test noticed (SME-65). This includes its errors: when a plan relies on how a provider refuses something (an expired token, a bad grant), check the refusal's status code and body in the provider's docs or a live capture, and give the mock that exact variant. On SME-113 the mock refused a dead refresh token the RFC's way (a 400 `invalid_grant`), while GitHub answers HTTP 200 with `error=bad_refresh_token`; rmcp took GitHub's reply for a failed request, so an expired GitHub sign-in read as Unreachable, and only round 1's review found it.
-- **Commit at natural milestones, not just at the end of a long session.** A session that ships several individually-shippable pieces back-to-back (a bug fix, a UI change, a new feature) risks leaving all of it as uncommitted working-tree state indefinitely — `sandbox-visibility`'s entire branch sat uncommitted, days of work, until a final review caught it by diffing against `main`. Commit once a coherent, working piece is done rather than treating a whole session as one unit.
-- **Stage files by name. Never `git add -A`, `git add .` or `git commit -a`.** The user may be editing the repo at the same time, and a catch-all add sweeps their in-progress work into your commit. On `system-prompt`, a new idea file and an edit the user made mid-session landed in a code commit, and were only split out because the commit happened to be read afterward. Check `git status` before committing, and leave alone anything you didn't change.
-- **Every commit builds for both targets.** Before each commit, not only before calling a feature done, run the web check and the server build alongside the server tests. `scripts/check.sh` does all three and fails on any failure (a warning in either build included), so gate the commit on it rather than reading output by eye. Before the tests it runs `scripts/cluster-doctor`, which fails at once, with what to do, if the cluster's node lacks the sandbox image named after the working tree's agent sources (`scripts/sandbox-image-ref`; the tests run their pods from it) or the Docker sidecar's:
-  ```bash
-  scripts/check.sh && git commit ...
-  ```
-  On SME-41 a commit went in over a failing test because the command ran the tests and then committed regardless; the script is the fix. The same goes for any command whose result you act on: never end it with something that replaces its exit status (`| tail`, `| grep`, `; echo exit=$?`). Save the output to a file and check the command's own status (`scripts/check.sh > log 2>&1; rc=$?`). On SME-32 a failed image build reported success through a trailing `echo`, and `scripts/check.sh | tail` let a commit through with a build warning. On SME-33 a commit passed every test and still didn't build: `ListParams` was imported only under `#[cfg(test)]`, so the test build compiled and the server binary didn't. The script now builds the server binary on its own too.
-  A change to a type the page matches on (a new `ConversationEvent` variant, say) can pass every server test and still break the web build. A commit that doesn't build breaks bisecting, and breaks checking a new test against older code in a separate worktree. On `connection-limits`, one commit added events without the page handling them; only server tests ran between commits, so it went unnoticed until a worktree run of the old code failed to compile.
-- **Gate a commit before committing on top of it, and never edit a worktree that a gate, test run or browser tier is building from.** A commit stacked on an ungated one hides its breakage under later work, and an edit mid-build makes the run test a mix of two sources. When the lock queue makes waiting slow, gate from a detached gate worktree while writing the next change in the branch's own (see [testing.md](testing.md#running-tests)). On SME-115 two broken commits sat under later ones until their gates came back, so unpushed history was rewritten twice; and an edit while the browser tier built failed three scenarios because the web bundle and the server came from different sources. **Stacked commits that aren't pushed yet may be gated together in one script,** oldest first, from the gate worktree, stopping at the first failure; a failure then means rewriting the unpushed history from that commit. Nothing is pushed until every gate passes, so breakage under later work never reaches anyone. On SME-117 this saved a lock wait per commit across 11 gates.
-- **A commit that only moves code can be gated on building every target,** with the full `scripts/check.sh` run on the branch's tip, when a script proves the move (each item appears verbatim, once, in its new place) and the script is kept in the PR description or ticket. Every other commit still runs the full check. On SME-56 a full locked check per move commit cost most of a day of shared lock time for commits whose content a script had already shown unchanged.
-- **A commit that changes only Markdown or images can be gated on building every target,** with the full `scripts/check.sh` run on the branch's tip, when a script proves its file list (`git diff --name-only <commit>^ <commit>`): every changed path ends in `.md`, `.png`, `.jpg`, `.gif` or `.svg`, and none is under `src/`, `assets/`, `migrations/`, `scripts/`, `docker/`, `k8s/` or `.github/`. Keep the script in the PR description or ticket, as for a move. No build or test reads those files (`build.rs` hashes only `src/`, `assets/`, the Cargo files and `docker/sandbox/Dockerfile`), so a full locked check can't change its result. On SME-127, 17 README-only commits cost about 85 minutes of shared lock.
-- **Start a refactor of a file once the open PRs changing it have merged,** or plan to regenerate its move commits by script instead of rebasing them. On SME-56 the split of `sandbox.rs` was stacked on two branches still in review; both merged mid-work and `main` moved twice more, so its first commit was regenerated three times and two queued gates were thrown away.
-- **Say in the PR when it adds, removes, renames or rewords one of smelt's own tools.** The tool list is part of what the model's earlier reasoning is bound to: on an Anthropic account that checks preserved thinking, any change to it fails ongoing conversations' next turn until SME-93's fix is in. SME-54 removed twelve tools.
-- **A rule written into the docs comes with a sweep of the code it covers.** When a change adds "every X does Y" to a doc, search the code for every X in the same change, fix or list what doesn't, and say what the sweep found in the PR. On SME-81 the docs gained "every user-facing error goes through `server_error_message`"; the sweep found sites the ticket hadn't named.
-- **A rule that tells someone to run a repo script says which copy runs.** A guard in a script protects only the branches that have it: a worktree runs its own checkout's copy. Say which commit the script must come from, and how to check (`git merge-base --is-ancestor <commit> HEAD`). On SME-115 the first post-fix rule sent personas to scratch-database checks, but a branch cut before the fix would have run its own `check-server`, which has no refusal.
-- **A change to the chat page's web-only code runs `scripts/browser-tier` before its commit,** not only at the end: the event loop, the reconnect pull, anything under `#[cfg(feature = "web")]`. `scripts/check.sh` compiles that code for wasm but never runs it, so a behaviour change there passes the gate untested. On SME-57's PR (b) the store's event loop was only exercised by the tier.
-- **Flag when a request substantially exceeds the current plan's scope**, rather than silently folding it into the branch already in progress. `sandbox-visibility`'s plan covered a live pod/terminal panel; the branch it shipped on ended up also covering conversation URL routing and extended thinking, neither mentioned in that plan — convenient in the moment, but it left one close-out doc and retrospective covering several unrelated pieces of work instead of one each. Consider whether a substantially-different ask deserves its own idea/plan doc before starting it.
-- **Fix bugs found in already-merged code in their own PR**, even when a review of the current branch is what found them. On `web-browsing`, the SSRF proxy and the Chrome launcher fixed gaps in already-merged `webfetch` but shipped inside the browsing PR, which grew it to 28 files and one close-out doc covering several unrelated changes. A separate PR keeps each fix reviewable on its own and lets it merge without waiting on the feature.
-- **Give a new server-only module shared wire types from the start.** Put the types that cross the client/server boundary at the top level, unconditionally compiled, and the server logic in an inner `#[cfg(feature = "server")] mod server { ... }` with `pub use` re-exports. Decide this when the module is created, not when a server function first needs one of its types on the `web` side. `anthropic::tools`, `events.rs` and `browsing.rs` all ended up in this shape, and `browsing.rs` needed a mid-implementation rewrite to get there.
-- **Test every type that crosses the client/server boundary at that boundary.** A server-function payload or `ConversationEvent`-style enum gets a test that serializes one of each variant to JSON and back. A test that inspects the value inside the server proves nothing about whether it can be sent. On the bug bash, `ConversationEvent::MessagesAppended(Vec<Message>)` was a tuple variant in an internally tagged enum, which serde can't serialize. Every send failed silently, so no tab but the sender's ever got a message live, and every existing test passed because none of them serialized the event. `events::wire_tests::test_every_event_round_trips_through_json` is the pattern; add the new variant to it when adding one.
-- **When a fresh, unrelated request arrives mid-branch, decide how to package it (its own commit? its own branch?) at the point it arrives, not just at the end of the session.** The packaging question is easy to answer in the moment and gets harder to reconstruct later, once several such requests have piled up in the same working tree. `file-tools`' branch picked up a live bug fix, `ANTHROPIC_AUTH_TOKEN` support, and a sandbox resource-limit fix as separate mid-session asks, all landing in the same uncommitted working tree — sorting them into three clean commits (and, for the bug fix, its own already-merged PR) only happened as a deliberate untangling step at the very end, using `git stash` and a reconstruct-then-recommit dance to split files that had picked up more than one concern's edits.
-- **Never write a real secret into a source file, even temporarily for a throwaway diagnostic.** Load it from the environment (`std::env::var`, `dotenvy::dotenv()`) at runtime instead. A live-verification test on `sandbox-visibility` once had a real API key typed directly into it — caught by tooling that time, but the discipline shouldn't depend on that safety net existing.
-- **Default to asking before killing or restarting a process the user started themselves** (e.g. a long-running `dx serve`). Killing one to pick up a server-side change once left orphaned child processes that blocked the user from starting their own afterward — asking first costs one round trip; leaving the user's own session broken costs much more. **The same hazard has an implicit form, with no `kill` command involved at all:** investigating a live-app symptom by editing source files in a repo `dx serve` is actively watching triggers a real rebuild-and-restart on every save — even a `#[cfg(test)]`-only edit — which can interrupt a concurrent real user request exactly like an explicit restart would. `mcp-servers`'s flakiness investigation chased a symptom that stopped reproducing right around when the debugging session stopped actively editing files; that's a specific signal worth naming and checking for, not evidence the bug quietly self-healed.
-- **Stop only processes you started, by the PID you recorded when you started them.** Never kill by name or pattern (`pkill -f`, `grep … | kill`). A pattern also matches the shell running the kill command whenever the pattern appears on its own command line. That happened twice, once on `websearch` and once on `system-prompt`, even after a retro named the risk. It can also match the user's own processes, since their dev server runs the same binaries. So start a background server in a way that prints its PID, note it, and stop exactly that PID and its children later. **Then check the PID is the server itself** (`readlink /proc/<pid>/exe`). Backgrounding `cd dir && ./server &` records the subshell's PID, and `setsid` forks, so the server gets another; start it with `exec` (`(cd dir && exec ./server) &`). On SME-43 both happened: the kill missed, the old server stayed up, and the new one couldn't bind the port. **Before editing source files for a live check, look for a dev server of the user's watching the repo** (`ps` for `dx serve`), and say so if one is running: every save rebuilds and restarts it, as described above.
-- **A fix that adds state lists that state's transitions first,** the same way a plan's state model does (see Phase 1). This covers a kept error, a new notice or a new lock as much as a new table. Write the transitions in the commit or the ticket before the code, including what happens when the step that makes one fails partway, and test each one. On SME-51 both code-review rounds found edges of state the bug fixes had added: a kept turn error cleared at the wrong moment, and a stop notice saved twice. **List the ways the state's inputs can arrive, too, before the code:** each stream or channel a signal can come on, and each way it can be moved, merged, swapped or closed (for a shell, `exec 2>&1`, `exec 1>&2`, `exec >/dev/null`, a swap, a closed pipe). On SME-122 B12's end markers were told apart by the pipe they came on, and the protocol was redesigned three times (the fix, review round 1, review round 2), each round finding another redirection; that list, written first, gives the final design (markers that name themselves and carry the exit code) at once.
-- **A test of a race forces one named interleaving,** one test per interleaving, rather than letting timing pick one: hold a lock, pause at a hook, or order the steps by hand, and name the interleaving in the test. A test that can land on either side of a race passes on whichever it hits. On SME-122 B1's first test passed locally on one interleaving and failed in the gate on the other (a Stop deleting the pod the start waited for, which gave Kubernetes' raw 404); two deterministic tests replaced it. Review round 1's finding 5 had the same shape: its socket-level test passed on the unfixed code for want of timing, and a direct test that forced the order reproduced it.
-- **Run hands-on checks against a server that doesn't watch the files you're editing.** `scripts/check-server start [REF] [-- KEY=VALUE ...]` builds and serves the branch from a separate git worktree (`../smelt-check`, or `$TMPDIR/smelt-check` when that isn't writable; port 8081), waiting for a real answer rather than `dx`'s 500 while it builds, and `scripts/check-server stop` stops it and everything it started. To move it to a newer commit, `stop` it and `start` again. If the dev database has migrations from another branch, smelt won't start against it (every page is a 500); `CHECK_SCRATCH_DB=1` serves from an empty database of the check server's own, dropped on `stop`; `check-server` refuses it for a ref from before SME-115's fix (run it only from a branch that contains the fix: an older branch's copy of the script has no refusal), whose server deletes the sandbox claims in the shared namespace whose conversation isn't in its own database, the dev server's conversations' `/workspace` among them. The same goes for a built `./server` run by hand against a scratch `DATABASE_URL`: only one with the fix. On SME-65 a branch off `main` hit this after another session's branch had migrated the dev database. The script also points the server at headless Chrome (`BROWSER_CHECK_CACHE`), which `webfetch` and browsing sessions need; on SME-51 a hand-made worktree lacked it. It also stops `dx serve`'s server child along with `dx` itself: stopping `dx` alone once left the server running. A server started in the working tree rebuilds and restarts on every save: on SME-41 that killed a nine-minute model turn, dropped an in-memory browsing session, and left pages on a stale stylesheet until a manual restart. The same hazard was already noted on SME-17 and SME-25. For a before/after comparison, serve each ref from its own check worktree and reproduce any difference once before investigating it (see [testing.md](testing.md#playwright-preferred), SME-57).
-- **A script a session hands to someone else to run (the user, or the coordinator) keeps removals out of the script itself,** writing each run to a new folder instead. Claude Code's built-in safety check refuses a `bash -c` command whose removals it can't inspect: on SME-57's PR (c) it refused the hands-on check even after the script's own `rm` was gone, because the scripts it called still removed files, and the user ran it by hand. Those scripts (`check.sh`, `browser-tier`, `check-server`, `build-sandbox-image.sh`) now delete no files either (SME-107; `scripts/test-check-scripts` checks it): keep it that way, overwriting or emptying a file rather than removing it. See [testing.md](testing.md#running-tests).
-- **A gate or watcher script you run yourself also writes each run's logs and summary to a new file or folder** (named with the run's time, say), never appending to or overwriting one kept across runs, and reads only the current run's. On SME-132 a watcher read a summary file left from the previous run as this run's result; it was caught before anything acted on it.
-- **A multi-commit PR whose gates someone else runs hands over one per-commit gate script,** not one request per commit. The script checks out each commit in the worktree, oldest first, runs the image import (no `--latest`), `scripts/check.sh` and `scripts/browser-tier` (skipping the tier for a commit that touches no code), writes each commit's logs and a summary line to a new folder, removes nothing, and checks the branch back out at the end. It isn't wrapped in `flock` as a whole: a commit with `scripts/with-cluster-lock` locks each test run itself, so other sessions' runs go in between its commits (SME-100), and a commit without it has its `check.sh` and `browser-tier` wrapped in `flock` after building (see "Which copy locks itself"). On SME-57's PR (d) one such script gated all ten commits in a single run.
-- **When a change makes a previously-inert code path start firing calls into a different subsystem, check whether tests exercising that path now need the same test isolation that subsystem's own tests already rely on** — especially when the call is indirect (a detached background task, not something the test itself invokes), since it's easy to miss precisely because the affected test's own code never mentions the subsystem at all. `terminal-exit-notify`'s real-cluster integration test hung the first time it ran: giving every terminal-command completion an active push into `turn::wake_conversation` meant that test's already-existing commands now made genuine (and, in this sandboxed environment, un-routable) calls to the live Anthropic API — it needed the same `ANTHROPIC_BASE_URL` redirect `turn`'s own mock-upstream tests already use, even though `sandbox.rs`'s test had never had to think about Anthropic before.
-- **A real-cluster test deletes what it creates itself, and never sets process-global state another test relies on.** Delete pods (and anything else it makes in the cluster) directly before asserting, not through smelt's background cleanup (`terminate_pod`, `Sandbox`'s drop queue), which the test process can exit before draining. Don't set `sandbox::MANAGER`, `db`'s pool or any other `OnceLock` from a second test; give the test its own client instead (`open_pod_port_with` takes one for this reason), or, for the free functions that reach the manager through `get()`, a manager of its own with `use_test_manager` (SME-94). On SME-42 a new test left two pods behind through the cleanup queue, and setting `MANAGER` broke `test_terminal_lifecycle_end_to_end` with `Kube(Service(Closed))` whenever it ran after the new test finished (see [testing.md](testing.md)).
-- **A change that removes a long-held test lock, or makes serial real-cluster tests run in parallel, runs the full `scripts/check.sh` twice before the PR,** and the Integrator runs it twice again on the merged head. Tests the old serialization kept apart now meet only some of the time, so one green run proves little. On SME-94, splitting one serial test into 20 parallel ones exposed a subscriber-count flake the old test's lock had hidden and a pod-start load that outran the 90 s wait; each failed only some gates.
-- **Run a real-cluster test only by exact name, under the cluster lock** (`scripts/cluster-test --features server -- --exact sandbox::tests::<name>`), never by a substring filter, which also picks up every test whose path contains it. A test whose unfixed form is destructive (a sweep, a teardown) is seen failing only on a copy with the behaviour reverted (see the detached-worktree rule above) or with its destructive call stubbed, never by running the unfixed code in place. On SME-115 `cargo test -- orphan`, outside the lock, matched the new sweep test while the sweep was still unfixed: it ran the old sweep in `smelt-park-test` and marked another run's claims there for deletion.
-- **A change whose first run deletes shared cluster objects runs that first time alone, under the cluster lock, between read-only snapshots of every namespace it could reach** (`smelt-park` included; the run and both snapshots in one script under one `scripts/with-cluster-lock bash <script>`), and the two snapshots are compared: what was deleted, what was kept, and that nothing outside its target changed. On SME-134 the first sweep ran this way: the snapshots showed the 22 pods and 270 claims over an hour old gone from `smelt-park-test`, its 20 younger objects untouched, and `smelt-park`'s 2 pods and 4 claims unchanged, for two API reads.
-- **A cluster object a test creates that could block other tests must be harmless if the test is killed at any point,** not only cleaned up on every exit path: a killed process (a CI timeout, a cancel) runs no cleanup at all. Give such an object (a pod labelled like a real conversation's, a claim with a real name) a bounded life, such as a grace period or a deadline, or keep it matching nothing until the moment it has to. On SME-99 the reproduction's own pod, labelled as conversation 1's, was first held by a finalizer, which a killed run would leave Terminating for good, blocking every real-cluster test that uses conversation 1; then a run killed before the delete would leave it running with that label. Both review rounds found one of these. **A real-cluster test uses unique names, never a fixed id:** on SME-115 a run killed mid-test left a pod holding `test_create_recreates_a_missing_volume_claim`'s fixed `sandbox-volume-990003`, and the next three gates failed that test for a reason unrelated to their code (SME-133 fixes the test).
-- **Spikes that create cluster resources use fixed names**, not a PID or timestamp, so a stopped or failed run's leftovers are easy to find and a rerun reuses them. On SME-42 a stopped spike left a pod named after its process id, found only by listing the namespace afterwards.
-- **No `expect()` or `unwrap()` in production code without a reason.** `scripts/lint-expects` (run by `scripts/check.sh` and CI) denies clippy's `expect_used` and `unwrap_used` outside test code, in the server, its binaries (the sandbox agent included) and the web build. Return the `None` or `Err` on the error path the caller already has; where an `expect()` can't fail, or a panic is the right answer (startup), mark it `#[expect(clippy::expect_used, reason = "...")]` saying why, on the statement rather than the function (a mark on `main` would also pass every `expect()` added to it later); prefer that to a marked `unwrap()`. A lock is recovered from poisoning (`unwrap_or_else(|e| e.into_inner())`, as `events`, `mcp`, the sandbox and `browsing::sessions()` do) rather than unwrapped, when no critical section can leave its data half-changed: otherwise one panic under a shared lock breaks every later caller until a restart. `#[expect]`, not `#[allow]`: once the call under it goes, the mark itself fails the lint. SME-95 turned the sandbox's six `expect()`s into errors and marked the other 36, each checked; SME-119 removed the 11 production `unwrap()`s (9 on browsing's session lock) with no marks.
-- **A fix that catches or recovers from a panic says which builds it covers.** The release profile (`.cargo/config.toml`) has `panic = "abort"`, and the user chose to keep it (SME-119, SME-139): there a panic ends the process before `catch_unwind` sees it, and no lock is ever poisoned. So `catch_unwind` and poison recovery only help unwinding builds, `dx serve` and the tests. Say so in the code's comment and the PR, and prefer a fix that doesn't panic at all where a release build needs one. SME-119's second code review found its `catch_unwind` inert in release, reproduced with a release-inheriting profile (exit 134).
-- **A PR that adds a lint or a gate check runs it on the branch merged with the latest `main` before it goes to In Review** (in a scratch worktree, so the branch's history is untouched), and the Integrator runs it again after merging `main` in. Code already on `main` wasn't written against the new rule; on SME-95 `main` gained about 2,000 lines during review, and only a lint of the merged tree showed they passed.
-- Tests live inline with the code they cover: `#[cfg(test)]` blocks in the same `.rs` file
-- Use `#[tokio::test]` for async tests
-- Use descriptive test names that state the scenario and expected outcome: `test_second_message_does_not_overwrite_title`, not `test_title`
-- Use `expect("message")` instead of `unwrap()` so failures are readable
-- Test return types can be `-> Result<(), E>` to allow using `?` inside tests
-
-See [testing.md](testing.md) for Rust-specific patterns.
-
----
-
-## Definition of done
-
-A feature is not finished until **both build targets compile**. Server and web code are gated by different feature flags, so a change that builds for one can silently break the other — a missing `#[cfg(...)]`, a server-only dependency pulled into WASM, or dead code that only one target sees. Run both before considering the work complete or asking for review:
-
-```bash
-cargo test  --features server                                                     # server logic + tests
-cargo check --no-default-features --features web --target wasm32-unknown-unknown   # WASM frontend
-```
-
-(Plain `cargo test` compiles but skips every `server`-gated test, so it proves almost nothing — always pass `--features server`.)
-
-(Real-cluster sandbox tests that create a pod need `scripts/build-sandbox-image.sh` to have run against that cluster for the working tree's agent sources — `scripts/check.sh` runs them against `smelt-sandbox:src-<hash>`, and `scripts/cluster-doctor` says when it's missing (SME-102) — the sandbox pod's image is delivered straight into the cluster's node with no registry involved, so a pod referencing it fails outright (`ImagePullBackOff`) otherwise. Not a compile-time dependency of `cargo test` itself. See [setup.md](setup.md).)
-
-The automated browser tier (`src/browser_tests.rs`, plus `src/webfetch.rs`'s own separate real-browser test — both run by the same command below) covers the sandbox panel (including preview links), the context-usage indicator/detail view/compaction divider, the todo panel, and `webfetch`'s real navigation/SSRF-guard behavior (including the sandbox route) — anything else touching rendering, interaction, or `webfetch` itself still needs a manual pass or its own test. See [testing.md](testing.md#whats-not-covered-yet). **Run it — `scripts/browser-tier` — as part of done for any change touching a covered panel's DOM structure or `src/webfetch.rs`, not just during a later review.** It sat broken for a while after the panel's tabs shipped on `sandbox-visibility`, because nothing re-ran it in between; a deliberate final review caught it, not the change that broke it. The script builds the web bundle first (`dx build --platform web`: the tier serves a separately-built WASM bundle that plain `cargo test` never rebuilds, so a stale one can make a real UI change look broken or still missing; discovered the hard way on `todo-list-tool`), runs the tier against a scratch database it creates and drops, and points a worktree that lacks headless Chrome at the main checkout's (`BROWSER_CHECK_CACHE`). **Don't run the tier against the dev database:** it applies the branch's migrations there, and a branch with a new migration then stops `main` from starting against it until the branch merges (SME-65; on SME-72 the tier was run through a hand-made scratch database for this reason). See [testing.md](testing.md#srcbrowser_testsrs-automated) for the full reasoning.
-
-**A new browser scenario is a `scenario_*` function plus one `run_scenario` line,** not a numbered block inside a shared test: each scenario makes its own conversations and tabs, so it fails on its own and several branches can add scenarios without agreeing on numbers. On SME-83 and SME-90 two branches each added a "Scenario 26" the same day; SME-59 gave scenarios this shape.
-
-Gate per-target dead code with `#[cfg(feature = "...")]` rather than leaving a warning in the other target.
-
-**Run every setup path the feature suggests for real, once, before the PR.** When the feature hands the user or the model a recipe (an install command, an image, a path, a generated config), each distinct kind of recipe gets one real run: a real-cluster test or a hands-on check. A unit test that asserts the recipe's text only records the same assumption the code made. On SME-35 the catalog's gopls suggestion had a fixture test asserting its command path, and it still never started: the `golang` image put the binary somewhere else. Only a real gopls run in the third review found it.
-
-**Test the edges, not just each piece working on its own.** Before calling a feature done, write a test for how it behaves at each of these, wherever it applies:
-- the far side disconnecting or closing mid-operation;
-- two calls racing (two opens, an open and a close, a start and a stop);
-- a second instance, or reopening after a close — anything left over from the first must not affect the second;
-- a slow or failing dependency (a slow page, a refused request, a timeout);
-- unusual input — non-ASCII, empty, very long, secrets such as passwords.
-
-For a security boundary, also write down what it does *not* cover, and test the paths around it. On `web-browsing`, most of the 21 bugs three reviews found sat at exactly these edges. One of them was an SSRF guard that only watched one page, while popups, WebSockets and service workers went around it — a gap nobody had written down.
-
-**CI runs all of this automatically on every PR** (`.github/workflows/ci.yml`) — `cargo test --features server`, the WASM `cargo check`, and the browser tier, against the same `docker-compose.yml` stack (Postgres, real k3s cluster) local dev uses. A red CI check means the same thing a red local run does; it doesn't replace running these yourself before pushing, since CI turnaround is much slower than local iteration.
-
----
-
-## Adding a New Feature (Typical Flow)
-
-1. Add struct to `src/models.rs` (see [models.md](models.md))
-2. Add migration: `migrations/YYYYMMDDHHMMSS_description.sql`
-3. Add async CRUD functions to `src/db.rs` returning `Result<T, sqlx::Error>`
-4. Add server functions to `src/api/` (see [api.md](api.md)) — there's no separate client fetch layer to add, the server function is directly callable from a component
-5. Create or extend a page in `src/frontend/pages/`
-6. Register a new page in `src/frontend/pages/mod.rs` and, if it needs its own route, `src/frontend/mod.rs`'s `Route` enum
-
----
-
 ## Evolving this process
 
 This document should change as we learn what works. Either party can propose a change at any time — proposals are especially natural after a project wraps up, but don't wait.
@@ -358,105 +53,11 @@ This document should change as we learn what works. Either party can propose a c
 - A pattern that worked especially well and is not captured here
 - A rule that did not fit the situation
 
-To propose a change: describe it in plain text and explain why. No plan doc needed. Once confirmed, update this file.
+To propose a change: describe it in plain text and explain why. No plan doc needed. Once confirmed, update the file it belongs in.
 
 Process changes follow the same confirm-before-change rule — propose first, update after the user agrees.
 
 ---
-
-## Keeping Linear current
-
-After each project completes:
-- Replace the ticket's `## Plan` section with `## What shipped` (including anything changed from the plan, and what's not done)
-- Update the **Current state** docs if features or architecture changed
-- Add or update the project's rows in the **Feature checklist**: what a user can do, and how to check it in the browser
-- File anything left undone that's worth doing as its own Backlog ticket, linked as related
-- When the project deleted a feature, search for its name in prose too (docs, comments, CSS, prompts, test names), not only its identifiers: the compiler finds the code, nothing finds the sentences. On SME-54, removing `run_async`'s task suite left wording about it in docs and comments that only the code review found.
-- Put the ticket id in the PR's title or body
-- Review the PR once it's open (see [Code review](#code-review-after-opening-the-pr))
-- Once the reviews are done, add `## Retrospective` to the ticket (see below), before the PR merges
-- Move the ticket to **Done** once the PR merges
-
-When the user mentions a new idea, create a **Backlog** ticket for it before it is forgotten.
-
-**After a range edit to a Linear ticket or document** (`replace_range`, or replacing a whole section), read it back and compare it against the version from before the edit; sections outside the range should be unchanged. A save's reply can show stale content, so read it again rather than trusting the reply. On SME-32 a `replace_range` on the Current state document silently deleted 11 architecture bullets, restored only because an earlier copy was still in the session. `replace_range`'s `to` anchor is exclusive and stays in place: end the range at the next section's heading and **don't** repeat that heading in `new_string`, or it appears twice (or `replace` the whole old section). Ending it at a section's own last line left that line duplicated on SME-70, SME-49, SME-86 and SME-90; this doc's old advice to include the `to` heading in `new_string` doubled a heading on SME-117.
-
-**Prefer `replace` with a unique anchor over `replace_range`.** Quote just the text that changes, with enough around it to match once; a range's two anchors are where the doubled lines and lost sections above came from. **When appending a table row** (`append`, or `insert_after` a table's last row), check whether the content already ends with a newline, and if it does, don't start the row with another: a blank line ends a Markdown table, so the new row shows as a paragraph under it. On SME-106 range edits left a doubled heading, and an append left a blank line splitting a table.
-
-**A full-content field on these tools is a whole-body replace, not a section update.** Passing `description` to `save_issue` writes the entire ticket description, so every section left out of the call is deleted — on SME-157 an update meant to add a `## What shipped` section dropped the Evidence section and the user's own answers to three questions, restored only because the pre-edit text happened to be in the session. Patch operations are the only safe form of update here. And when a patch's `old_string` is text the document holds more than once (a list item copied by an earlier failed attempt), include the surrounding lines that make it match once, or the op edits a copy of it: the same attempt to place one question landed three copies and a placeholder across the document before the ops were anchored.
-
-**A section a document holds in one place can become three in a bad edit.** Read back the *whole* changed section after patching, not just the anchor, and compare against the version from before: SME-157's questions list was left with the same question as a stray item above its own heading, inside the list, and after the last section of the document.
-
----
-
-## Retrospective (end of each project)
-
-**Close-out (this section plus "Keeping Linear current" above) is a
-gate on merging the project's PR, not a follow-up to do after it merges.**
-What shipped, the Current state docs and the Feature checklist come
-before the PR opens. The retrospective comes after the code review
-finishes, since the reviews are often where the most is learned (SME-32's
-ten review rounds were, and a retrospective written before them missed
-it all).
-Do it on the same branch as the implementation, so the close-out commit
-rides along in the same PR — not as a separate direct-to-main commit
-afterward, which is easy to forget entirely once the PR is merged and
-attention has moved to whatever's next. Discovered on `todo-list-tool`:
-its close-out was skipped after merge and only caught because the user
-noticed the stale plan file still sitting in the repo — checking
-"did the last thing get closed out" at the *start* of the next project
-relies on remembering to look backward, which is exactly what failed;
-gating it at the point the current project's own PR is created doesn't
-have that failure mode. The same holds for merging: the retrospective is
-the last step before it.
-
-Before considering a project closed, do a short retrospective covering:
-
-- **What worked** that we should keep doing.
-- **What caused friction, surprise, or rework** — especially anything discovered
-  late that an earlier check would have surfaced.
-- **What to change**: concrete proposals to this process, the docs, or the code.
-
-Record it as a short **Retrospective** section in the project's ticket, and say whether a [bug bash](#bug-bash-every-few-projects) is due.
-Any resulting process changes follow the [confirm-before-change rule](#evolving-this-process):
-propose first, update after the user agrees. On a ticket the Project Manager runs, a recommendation counts as agreed when the user doesn't mark it as disagreed, including when the ticket moves on because it had no questions; one the persona thinks the user should decide goes in Questions for the user.
-
-## Code review (after opening the PR)
-
-Every PR gets a code review once it's open, while CI runs, by a [Code Reviewer](#code-reviewer) sub-agent started on the PR. It reads the whole diff for bugs, including security gaps, which a project's own tests are poorly placed to find because they were written with the same assumptions as the code.
-
-Don't run `/code-review` from the conversation that wrote the change: the skill forks that conversation, and its reviewer then inherits the author's assumptions and context, against the rule that sub-agents start fresh (see [Personas](#personas)). The Code Reviewer may run `/code-review <PR number>` itself, since its fork carries only the Code Reviewer's own brief; it still checks and reports each finding as its persona says. (SME-114)
-
-1. **Check each finding before reporting it.** Confirm it against the code (and, where it's cheap, reproduce it) so the report says which findings are real.
-2. **Report the findings and stop.** Give each one a severity, what goes wrong and a suggested fix, and let the user choose what gets fixed. Fixing changes the PR under review, so it waits for their go-ahead.
-3. **Fix on the PR's branch, test-first, one commit per finding.** A failing test first, as in Phase 2; for a finding about a browser's behaviour, a browser-tier scenario shown failing with the fix switched off. A finding in already-merged code gets its own PR (see Rules). **When fixing a finding, search for every other place that makes the same decision** (the same advice, comparison or check) and fix them in the same commit. On SME-121 round 1 fixed the missing-image advice, and round 2 found the same gap in the outdated-agent advice. **When a round has more than two fixes, gate each from a detached gate worktree while writing the next** (see the gating rule in Rules), rather than one after another: SME-121's eleven review fixes, mostly advice text, took eleven full gates of about 20 minutes of lock each, back to back.
-4. **Review again after fixing, twice in all by default.** Fixes change the code, and a second pass looks with fresh eyes. The second round follows fixes: when the first round finds nothing to fix, it's the only one (SME-70). After the second round, only high-severity findings block the merge; report the rest and file each one the user wants as a Backlog ticket, linked as related. **Exception: a third round when the second finds medium-severity issues in a new integration** (a new external system, protocol or process smelt drives). Fix the second round's findings first, then review once more; that's the last. On SME-35 (language servers) the second round found two medium issues, and the third found a catalog suggestion that could never start. SME-32 ran ten rounds, each mostly fixing edges made by the last; a round that keeps finding new edges points to a missing state model (see Phase 1), which another round won't supply.
-5. **Record it in the ticket**: a short code-review part in What shipped listing each finding and its fix.
-6. **Then write the retrospective** (see [Retrospective](#retrospective-end-of-each-project)), covering the reviews too, and only then merge.
-
-On SME-42, the first review found that both new routes could reach the sandbox agent's command WebSocket (any website could have run commands in the sandbox). The project's own real-cluster tests had used that very port as their test server. The second review, after the fixes, found a stalled POST and cross-site requests to the sandbox. None of the four were caught by the tests, the browser tier or the hands-on check.
-
-## Bug bash (every few projects)
-
-Every three completed projects or so, run a bug bash as its own branch and PR: code sweeps of the areas most recently changed, plus hands-on sweeps of the running app with a real model. Include at least one sweep with two tabs open on the same conversation and a reload mid-reply. Most of what the 2026-09-24 bug bash found sat in flows no single project owned (a second tab, a reload, a background reply, a deleted conversation), so no project's own tests covered them. Every bug bash also runs the whole **Feature checklist** through the web UI (including its busy-session row, with every side panel open at once), marking each row works, broken, model (the model didn't cooperate) or not web-checkable, so "does everything still work" is a list to re-run rather than something to reconstruct. Hands-on checks go through the browser only: no seeding the database or calling APIs directly. Run them against `scripts/check-server`, and drive the browser with `scripts/ui-check/smelt_ui.py` (see [testing.md](testing.md#playwright-preferred)). Write the findings up in the bug bash's ticket, each with a severity and marked confirmed in the UI, confirmed by code, or suspected; stop for the user to choose what gets fixed; then fix them in severity order, one commit per finding, test-first. **When the user picks more than about six fixes, the fixing is two sub-agent runs, not one:** first the fixes and their before/after re-shoots, then the close-out, the PR, the reviews and the retrospective. The plan says so when it splits the bash into parts, and the Project Manager starts the second run once the first reports. SME-122's single fix part carried eleven fixes, 27 Backlog tickets, the close-out, a before/after session pair and two review rounds. See [SME-23](https://linear.app/smelt-agent/issue/SME-23) and [SME-40](https://linear.app/smelt-agent/issue/SME-40).
-
-A bug bash ends with its own retrospective, like any project (see Retrospective above): what the sweep caught and why it had been missed, what slowed it down, and what to change in the process or the Feature checklist.
-
-At each project's close-out, check how many projects have completed since the last bug bash, and say so if one is due.
-
-## Design review (every few projects, alternating with bug bashes)
-
-Every six completed projects or so, alternating with bug bashes so one kind of review happens about every three projects, run a design review as its own ticket. The Feature checklist says what should work; a design review asks whether it's good to use. Everything goes through the web UI with a real model, at a laptop width and a phone width, in five passes:
-
-1. **Visual craft**, page by page: type hierarchy, colour and what it means, consistency of repeated elements, spacing, empty states, focus, phone width. Include a **busy session**: every side panel open at once (todos, live browser, sandbox with a terminal), at both widths. Panels are rarely alone in real use; SME-41 reviewed them one at a time and missed that together they squeezed the browser to 100px and the terminal off screen.
-2. **Copy**: things named from the user's side, not the system's; buttons that say what happens; errors that say what went wrong and how to fix it.
-3. **Information design**: summary before detail, state shown in form and not only in text, interactive things that look interactive.
-4. **Workflows**, walked end to end: starting a task, following a long one, stepping in, coming back later, setting up, browsing together, housekeeping.
-5. **Information availability**: at each point in those workflows, can the user tell what the model is doing, what it changed, why something failed, how close the conversation is to its limit, and what's running?
-
-Write the findings up in the ticket, each with a category, a severity, evidence (a screenshot or exact steps) and a recommendation, then stop for the user to triage. Small polish the user picks is fixed in one PR, one commit each; anything bigger becomes its own Backlog ticket. Like a bug bash, it ends with a retrospective. See [SME-41](https://linear.app/smelt-agent/issue/SME-41).
-
-At each project's close-out, say whether a design review is due as well.
 
 ## Writing idea tickets
 
@@ -476,3 +77,97 @@ Implementation details belong in the plan, which is written once the idea is app
 **Example of what to avoid:** "Add a `tool_calls` table with columns `id`, `message_id`, `name`, `input`, `result` and expose it via a new server function `get_tool_calls()`..."
 
 **Example of the right level:** "Smelt can look things up on the web instead of only answering from what it already knows."
+
+---
+
+## Where the old sections went
+
+Links into this file from tickets, briefs and memories point at the headings below, each of which says where its section moved (SME-163).
+
+## Personas
+
+Moved to [personas/README.md](personas/README.md).
+
+### Rules every persona follows
+
+Moved to [personas/rules.md](personas/rules.md).
+
+### Project Manager
+
+Moved to [personas/project-manager.md](personas/project-manager.md).
+
+#### Planning waits for overlapping work
+
+Moved to [personas/project-manager.md](personas/project-manager.md#planning-waits-for-overlapping-work).
+
+### Planner
+
+Moved to [personas/planner.md](personas/planner.md).
+
+### Developer
+
+Moved to [personas/developer.md](personas/developer.md).
+
+### Code Reviewer
+
+Moved to [personas/code-reviewer.md](personas/code-reviewer.md).
+
+### Integrator
+
+Moved to [personas/integrator.md](personas/integrator.md).
+
+## Phase 1: Plan
+
+Moved to [process/plan.md](process/plan.md).
+
+## Phase 2: Implementation (TDD)
+
+Moved to [process/tdd.md](process/tdd.md).
+
+### Step 1 — Write a failing test
+
+Moved to [process/tdd.md](process/tdd.md#step-1--write-a-failing-test).
+
+### Step 2 — Write the minimum code to make it pass
+
+Moved to [process/tdd.md](process/tdd.md#step-2--write-the-minimum-code-to-make-it-pass).
+
+### Step 3 — Refactor if needed
+
+Moved to [process/tdd.md](process/tdd.md#step-3--refactor-if-needed).
+
+### Step 4 — Repeat
+
+Moved to [process/tdd.md](process/tdd.md#step-4--repeat).
+
+## Rules
+
+Split by subject: [process/tdd.md](process/tdd.md#testing-rules) (testing), [process/rules-code.md](process/rules-code.md), [process/rules-commits.md](process/rules-commits.md) and [process/rules-running.md](process/rules-running.md).
+
+## Definition of done
+
+Moved to [process/done.md](process/done.md).
+
+## Adding a New Feature (Typical Flow)
+
+Moved to [process/done.md](process/done.md#adding-a-new-feature-typical-flow).
+
+## Keeping Linear current
+
+Moved to [process/close-out.md](process/close-out.md#keeping-linear-current).
+
+## Retrospective (end of each project)
+
+Moved to [process/close-out.md](process/close-out.md#retrospective-end-of-each-project).
+
+## Code review (after opening the PR)
+
+Moved to [process/close-out.md](process/close-out.md#code-review-after-opening-the-pr).
+
+## Bug bash (every few projects)
+
+Moved to [process/sweeps.md](process/sweeps.md#bug-bash-every-few-projects).
+
+## Design review (every few projects, alternating with bug bashes)
+
+Moved to [process/sweeps.md](process/sweeps.md#design-review-every-few-projects-alternating-with-bug-bashes).

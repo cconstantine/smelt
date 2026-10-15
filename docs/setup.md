@@ -106,7 +106,7 @@ and on manual dispatch: the full `cargo test
 WASM `cargo check`, and the automated browser tier — the same tests and the
 same `docker-compose.yml` stack described above and in
 [testing.md](testing.md), just running on GitHub's runner instead of a local
-machine. See [development-process.md](development-process.md#definition-of-done).
+machine. See [process/done.md](process/done.md).
 
 ## Deploying
 
