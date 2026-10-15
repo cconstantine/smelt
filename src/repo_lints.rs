@@ -36,7 +36,6 @@ const EXCEPTIONS: &[(&str, Limit)] = &[
     ("src/git.rs", Limit { bytes: 123_125, lines: 2_624 }),
     ("src/lsp/manager.rs", Limit { bytes: 48_823, lines: 1_005 }),
     ("src/lsp/pods.rs", Limit { bytes: 57_041, lines: 1_202 }),
-    ("src/markdown.rs", Limit { bytes: 56_218, lines: 1_349 }),
     ("src/mcp.rs", Limit { bytes: 103_619, lines: 2_366 }),
     ("src/mcp_oauth.rs", Limit { bytes: 47_899, lines: 1_149 }),
     ("src/preview.rs", Limit { bytes: 64_259, lines: 1_349 }),
