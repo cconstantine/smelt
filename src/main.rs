@@ -33,7 +33,7 @@ mod preview;
 mod pricing;
 mod providers;
 mod questions;
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod repo_lints;
 #[cfg(feature = "server")]
 mod request_guard;

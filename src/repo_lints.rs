@@ -6,6 +6,8 @@
 //! opencode. See docs/process/rules-commits.md, "Files stay under the
 //! ceiling".
 
+mod links;
+
 /// The most a tracked text file may hold.
 pub(crate) const CEILING: Limit = Limit {
     bytes: 40_000,
@@ -144,6 +146,21 @@ fn measured_text_files() -> Vec<Measured> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_docs_links_resolve() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tracked: std::collections::HashSet<String> = tracked_files().into_iter().collect();
+        let docs: std::collections::BTreeMap<String, String> = tracked
+            .iter()
+            .filter(|p| p.ends_with(".md"))
+            .filter_map(|p| Some((p.clone(), std::fs::read_to_string(root.join(p)).ok()?)))
+            .collect();
+        assert!(docs.contains_key("README.md"), "the walk found the docs");
+        let exists = |p: &str| tracked.contains(p) || tracked.iter().any(|t| t.starts_with(&format!("{p}/")));
+        let broken = links::broken_links(&docs, &exists);
+        assert!(broken.is_empty(), "links that don't resolve:\n{}", broken.join("\n"));
+    }
 
     #[test]
     fn test_no_file_crosses_the_size_ceiling() {
