@@ -34,12 +34,13 @@ pub(crate) fn component_lengths(source: &str) -> Vec<(String, usize)> {
     let mut found = Vec::new();
     let mut i = 0;
     while i < code_only.len() {
-        if code_only[i].trim() != "#[component]" {
+        if !is_component_attribute(&code_only[i]) {
             i += 1;
             continue;
         }
-        // The function's name, then its body from the first `{`.
-        let Some((fn_line, name)) = (i + 1..code_only.len()).find_map(|k| fn_name(&code_only[k]).map(|n| (k, n))) else {
+        // The function's name (on the attribute's line, or a later one), then
+        // its body from the first `{`.
+        let Some((fn_line, name)) = (i..code_only.len()).find_map(|k| fn_name(&code_only[k]).map(|n| (k, n))) else {
             break;
         };
         let mut depth = 0i64;
@@ -166,6 +167,15 @@ fn is_raw_string_start(chars: &[char], i: usize) -> bool {
     chars.get(k) == Some(&'"')
 }
 
+/// Whether a line starts with the `component` attribute, however it's
+/// written: `#[component]`, `#[component(no_case_check)]`,
+/// `#[dioxus::prelude::component]`, with the function after it or not.
+fn is_component_attribute(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("#[") else { return false };
+    let path: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':').collect();
+    path == "component" || path.ends_with("::component")
+}
+
 /// The function a line declares, if it does.
 fn fn_name(line: &str) -> Option<String> {
     let rest = line.split_once("fn ")?.1;
@@ -198,6 +208,22 @@ mod tests {
             "fn after() {}\n",
         );
         assert_eq!(component_lengths(src), vec![("Tricky".to_string(), 6)]);
+    }
+
+    /// Code review 1 (SME-163): an attribute with arguments, a full path, or
+    /// the function on the attribute's own line is a component too.
+    #[test]
+    fn test_every_way_of_writing_the_attribute_is_counted() {
+        let body = "    let a = 1;\n    let b = 2;\n}\n";
+        for head in [
+            "#[component(no_case_check)]\nfn A() -> Element {\n",
+            "#[dioxus::prelude::component]\nfn A() -> Element {\n",
+            "#[component] fn A() -> Element {\n",
+            "  #[component]\n  pub fn A() -> Element {\n",
+        ] {
+            assert_eq!(component_lengths(&format!("{head}{body}")), vec![("A".to_string(), 2)], "{head:?}");
+        }
+        assert_eq!(component_lengths("#[components]\nfn B() {\n    let a = 1;\n}\n"), vec![]);
     }
 
     #[test]
