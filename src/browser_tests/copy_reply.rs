@@ -5,7 +5,6 @@ use super::*;
 /// It copies over plain HTTP too, where `navigator.clipboard` doesn't
 /// exist, and doesn't show on a reply still being written.
 pub(super) async fn scenario_copy_reply(t: &Scenario<'_>) {
-    use crate::events::{ConversationEvent, publish};
     let text = |text: &str| anthropic::ContentBlock::Text { text: text.to_string() };
     let part_one = "Let me check the todo list.";
     let part_two = "## Todos\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```text\nnothing yet\n```";
@@ -38,6 +37,15 @@ pub(super) async fn scenario_copy_reply(t: &Scenario<'_>) {
     wait_for_live_client(&page, conversation.id).await;
     assert!(wait_for_count(&page, ".reply-copy", 2, Duration::from_secs(10)).await, "one button per finished reply");
 
+    scenario_copy_reply_placement_and_indicator(later, &page, part_one, reply).await;
+    scenario_copy_reply_copying(t, &conversation, &elsewhere, later, &page, part_one, part_two, &path, &mut problems, reply).await;
+    scenario_copy_reply_phone_width(t, &page, part_one, &mut problems, reply).await;
+    scenario_copy_reply_while_written(t, &mut problems, text).await;
+}
+
+
+/// Where each reply's Copy button sits, and the outline that shows what it copies.
+async fn scenario_copy_reply_placement_and_indicator(later: i64, page: &chromiumoxide::Page, part_one: &str, reply: i64) {
     // Placement: on each reply's last bubble, in its footer, nowhere
     // interactive; part one is marked as the first reply's too.
     let facts: serde_json::Value = page.evaluate(REPLY_COPY_FACTS).await.expect("read the buttons").into_value().expect("facts");
@@ -64,7 +72,10 @@ pub(super) async fn scenario_copy_reply(t: &Scenario<'_>) {
     wait_for_outlined(&page, &[part_one, "Todos"], Duration::from_secs(3)).await;
     page.move_mouse(chromiumoxide::layout::Point::new(5.0, 5.0)).await.expect("point away");
     wait_for_outlined(&page, &[], Duration::from_secs(3)).await;
+}
 
+/// Copying on the secure origin, from the keyboard, across a switch, refused, and over plain HTTP, and what reached the clipboard.
+async fn scenario_copy_reply_copying(t: &Scenario<'_>, conversation: &crate::models::Conversation, elsewhere: &crate::models::Conversation, later: i64, page: &chromiumoxide::Page, part_one: &str, part_two: &str, path: &str, problems: &mut Vec<String>, reply: i64) {
     // The secure path (the tier's 127.0.0.1 origin): writeText gets the
     // reply's markdown, both parts, byte for byte.
     page.evaluate("navigator.clipboard.writeText = async text => { window.__smeltCopied = text; }")
@@ -216,6 +227,10 @@ pub(super) async fn scenario_copy_reply(t: &Scenario<'_>) {
         .into_value()
         .expect("a string");
     assert_eq!(pasted, whole, "the clipboard should hold the reply's markdown");
+}
+
+/// At phone width: the button stays in its bubble, and a tap or a touch copies.
+async fn scenario_copy_reply_phone_width(t: &Scenario<'_>, page: &chromiumoxide::Page, part_one: &str, problems: &mut Vec<String>, reply: i64) {
     // The tier's browser is shared: later scenarios get no clipboard access.
     t.harness
         .browser
@@ -282,7 +297,11 @@ pub(super) async fn scenario_copy_reply(t: &Scenario<'_>) {
             problems.push(format!("the outline stayed after a tap: {why}"));
         }
     }
+}
 
+/// While a reply is written, and after a reload mid-turn: no button until the reply is done.
+async fn scenario_copy_reply_while_written(t: &Scenario<'_>, problems: &mut Vec<String>, text: impl Fn(&str) -> anthropic::ContentBlock) {
+    use crate::events::{ConversationEvent, publish};
     // While a reply is written: no button on the streaming bubble, nor on
     // the newest reply's saved part; the earlier reply's still works. The
     // button shows on the reply's last part once the turn ends.

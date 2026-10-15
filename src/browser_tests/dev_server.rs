@@ -48,6 +48,13 @@ pub(super) async fn scenario_sandbox_dev_server(t: &Scenario<'_>) {
     }
     assert!(listening, "the dev server never started listening");
 
+    scenario_sandbox_dev_server_models_side(pool, &serving).await;
+    scenario_sandbox_dev_server_users_side(t, pool, &serving).await;
+}
+
+
+/// The model's side: localhost in its browsing session is the sandbox's own.
+async fn scenario_sandbox_dev_server_models_side(pool: &sqlx::PgPool, serving: &crate::models::Conversation) {
     // The model's side: localhost in its browsing session is the sandbox.
     crate::browsing::open_session(serving.id, Some(crate::egress_proxy::sandbox_dial(pool.clone(), serving.id)))
         .await
@@ -56,7 +63,10 @@ pub(super) async fn scenario_sandbox_dev_server(t: &Scenario<'_>) {
     crate::browsing::close_session(serving.id).await.expect("close the browsing session");
     let seen = seen.expect("the model's browser should load the sandbox's dev server");
     assert!(seen.text.contains("Hello from the sandbox dev server"), "got {:?}", seen.text);
+}
 
+/// The user's side: a preview link, live and after a reload; then a Docker container's server, for the model and as a preview.
+async fn scenario_sandbox_dev_server_users_side(t: &Scenario<'_>, pool: &sqlx::PgPool, serving: &crate::models::Conversation) {
     // The user's side.
     let page = t.tab(t.url(&format!("conversation/{}", serving.id))).await;
     wait_for_live_client(&page, serving.id).await;

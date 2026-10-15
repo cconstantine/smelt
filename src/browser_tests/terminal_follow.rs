@@ -47,6 +47,18 @@ pub(super) async fn scenario_terminal_follow_after_switch(t: &Scenario<'_>) {
         "the terminal card should render"
     );
 
+    scenario_terminal_follow_after_switch_unhurried(t, &conversation, &other, &page, row, terminal).await;
+    scenario_terminal_follow_after_switch_racing_the_rebuild(&conversation, &other, &page, row).await;
+    scenario_terminal_follow_after_switch_mid_burst(t, &conversation, &other, &page, row, terminal).await;
+    scenario_terminal_follow_after_switch_rapid_switches(t, &conversation, &other, &page, row, terminal).await;
+    scenario_terminal_follow_after_switch_phone_width(t, &conversation, &other, &page, row, terminal).await;
+    scenario_terminal_follow_after_switch_scrolled_up(t, &conversation, &page, terminal).await;
+    scenario_terminal_follow_after_switch_clamped_by_a_resize(t, &conversation, &page, terminal).await;
+}
+
+
+/// Phase A: the ticket's sequence, unhurried: a burst past the body's height, followed, then a switch away and back.
+async fn scenario_terminal_follow_after_switch_unhurried(t: &Scenario<'_>, conversation: &crate::models::Conversation, other: &crate::models::Conversation, page: &chromiumoxide::Page, row: impl Fn(i64) -> String, terminal: i64) {
     // Phase A — the ticket's sequence, unhurried: a burst well past the body's
     // height, followed live, finished before the switch.
     let command_id = unique_id("cmd-follow");
@@ -97,7 +109,10 @@ pub(super) async fn scenario_terminal_follow_after_switch(t: &Scenario<'_>) {
     );
     settle_terminal_bottom(&page, 8).await;
     assert_never_painted_at_top(&page, "sme108A").await;
+}
 
+/// Phase B: the switch back racing the rebuild itself.
+async fn scenario_terminal_follow_after_switch_racing_the_rebuild(conversation: &crate::models::Conversation, other: &crate::models::Conversation, page: &chromiumoxide::Page, row: impl Fn(i64) -> String) {
     // Phase B — the switch-back racing the rebuild itself: away and back with
     // nothing waited between the clicks, so the back-click lands while the
     // away-switch is still resolving.
@@ -106,7 +121,10 @@ pub(super) async fn scenario_terminal_follow_after_switch(t: &Scenario<'_>) {
     click_when_present(&page, &row(conversation.id), Duration::from_secs(10)).await;
     settle_terminal_bottom(&page, 8).await;
     assert_never_painted_at_top(&page, "sme108B").await;
+}
 
+/// Phase C: the ticket's actual conditions: the switch lands while a burst and a streaming reply arrive.
+async fn scenario_terminal_follow_after_switch_mid_burst(t: &Scenario<'_>, conversation: &crate::models::Conversation, other: &crate::models::Conversation, page: &chromiumoxide::Page, row: impl Fn(i64) -> String, terminal: i64) {
     // Phase C — the ticket's actual conditions: the switch lands while a
     // second command's output is still streaming. Lines that arrive while the
     // page is on the other conversation never reach the old body; the rebuilt
@@ -159,7 +177,10 @@ pub(super) async fn scenario_terminal_follow_after_switch(t: &Scenario<'_>) {
     );
     wait_command_finished(t.pool, terminal).await;
     settle_terminal_bottom(&page, 8).await;
+}
 
+/// Phase E: rapid repeated switches mid-stream.
+async fn scenario_terminal_follow_after_switch_rapid_switches(t: &Scenario<'_>, conversation: &crate::models::Conversation, other: &crate::models::Conversation, page: &chromiumoxide::Page, row: impl Fn(i64) -> String, terminal: i64) {
     // Phase E — rapid repeated switches mid-stream: four clicks, away and back
     // twice, nothing waited for.
     let rapid_id = unique_id("cmd-rapid");
@@ -196,7 +217,10 @@ pub(super) async fn scenario_terminal_follow_after_switch(t: &Scenario<'_>) {
     );
     wait_command_finished(t.pool, terminal).await;
     settle_terminal_bottom(&page, 8).await;
+}
 
+/// Phase F (F1 to F3): a phone-width window, a resize mid-burst, a reload's fresh mount, and the drawer's switch back.
+async fn scenario_terminal_follow_after_switch_phone_width(t: &Scenario<'_>, conversation: &crate::models::Conversation, other: &crate::models::Conversation, page: &chromiumoxide::Page, row: impl Fn(i64) -> String, terminal: i64) {
     // Phase F — a phone-width window, the layout the ticket's capture most
     // resembles: the side panels stack in a column that itself scrolls, the
     // terminal body is short, and the conversation list is a drawer, so the
@@ -310,7 +334,10 @@ pub(super) async fn scenario_terminal_follow_after_switch(t: &Scenario<'_>) {
     );
     wait_command_finished(t.pool, terminal).await;
     settle_terminal_bottom(&page, 8).await;
+}
 
+/// F4: the other half of the sticky rule: a user scrolled up stays put, and scrolling back down follows again.
+async fn scenario_terminal_follow_after_switch_scrolled_up(t: &Scenario<'_>, conversation: &crate::models::Conversation, page: &chromiumoxide::Page, terminal: i64) {
     // F4 — the other half of the sticky rule the fix must keep: scrolling up
     // mid-stream is a user gesture, and the follow must stop and stay put
     // (SME-83's semantics, now distinguished from a resize by *how* the
@@ -390,7 +417,10 @@ pub(super) async fn scenario_terminal_follow_after_switch(t: &Scenario<'_>) {
     );
     wait_command_finished(t.pool, terminal).await;
     settle_terminal_bottom(&page, 8).await;
+}
 
+/// Phase G: a resize that clamps a reader who scrolled up doesn't turn the follow back on.
+async fn scenario_terminal_follow_after_switch_clamped_by_a_resize(t: &Scenario<'_>, conversation: &crate::models::Conversation, page: &chromiumoxide::Page, terminal: i64) {
     // Phase G — the other direction on the same rule, which the first fix left
     // as it found it: growing the window *shrinks* the scroll range, so a reader
     // close enough to the bottom gets clamped down onto it, landing inside the
