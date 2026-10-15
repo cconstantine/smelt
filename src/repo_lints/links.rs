@@ -3,6 +3,15 @@
 //! takes its anchor with it: this finds each link left pointing at the old
 //! place. Links to this repo on GitHub (`https://github.com/cconstantine/smelt/blob/main/…`)
 //! are checked against the working tree the same way.
+//!
+//! What it doesn't read (code review 1): a link whose `](` and target are
+//! split across lines, paths named in code or script comments, setext
+//! (underlined) and indented headings, and headings whose rendered text
+//! differs from their source in ways other than links, tags and code spans
+//! (`_emphasis_`, entities, a `<T>` inside a code span). No heading in the
+//! docs uses those forms today; one that starts to needs this module taught
+//! it first. Paths in comments (`scripts/browser-check/browser_check.py`
+//! names one) are checked by nobody.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::LazyLock;
@@ -85,10 +94,11 @@ pub(crate) fn links(markdown: &str) -> Vec<(usize, String)> {
     static CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(`+)[^`]*?(`+)").expect("a valid regex"));
     static INLINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\]\(\s*(<[^>]*>|[^)\s]*)").expect("a valid regex"));
     static REFERENCE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*\[[^\]]+\]:\s*(<[^>]*>|\S+)").expect("a valid regex"));
+    static HREF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<a\s[^>]*href="([^"]*)""#).expect("a valid regex"));
     let mut found = Vec::new();
     for (n, line) in prose_lines(markdown) {
         let line = CODE.replace_all(line, "");
-        for c in INLINE.captures_iter(&line).chain(REFERENCE.captures_iter(&line)) {
+        for c in INLINE.captures_iter(&line).chain(REFERENCE.captures_iter(&line)).chain(HREF.captures_iter(&line)) {
             let target = c[1].trim_start_matches('<').trim_end_matches('>');
             if !target.is_empty() {
                 found.push((n, target.to_string()));
@@ -179,6 +189,13 @@ mod tests {
         let got: Vec<String> = links(md).into_iter().map(|(_, t)| t).collect();
         assert_eq!(got, vec!["a.md#x", "images/p.png", "docs/b.md#y", "https://example.com", "#local"]);
         assert_eq!(links(md)[0].0, 1);
+    }
+
+    /// Code review 1 (SME-163): an HTML link is a link too.
+    #[test]
+    fn test_an_html_links_href_is_checked() {
+        let got: Vec<String> = links("See <a href=\"docs/a.md#x\">a</a>.\n").into_iter().map(|(_, t)| t).collect();
+        assert_eq!(got, vec!["docs/a.md#x"]);
     }
 
     fn check(files: &[(&str, &str)], extra: &[&str]) -> Vec<String> {
