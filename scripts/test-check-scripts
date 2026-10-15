@@ -720,6 +720,14 @@ grep -q "^KUBECONFIG=/the/servers/cluster " "$CLEANUP_CALLS" ||
 grep -q "KUBECONFIG=/another/cluster" "$CLEANUP_CALLS" &&
     fail "stop's cleanup used the environment's KUBECONFIG: $(cat "$CLEANUP_CALLS")"
 
+# A stop in a check worktree where no scratch start ever wrote the KUBECONFIG
+# file (a plain start, a scratch start that failed before it, or none at all)
+# succeeds (SME-129 review): it once exited 1 on the missing file, so the
+# documented "until stop succeeds" retry never ended.
+out=$("${cs_env[@]}" CHECK_WORKTREE="$dir/never-started" scripts/check-server stop 2>&1)
+rc=$?
+[ "$rc" = 0 ] || fail "stop with no KUBECONFIG file exited $rc: $out"
+
 # The scratch lock: a stop holds it through its cleanup, so a start of the
 # same database waits for it and says so.
 scratch_lock=$SMELT_LOCK_DIR/smelt-check-scratch-smelt_scratch_worktree.lock

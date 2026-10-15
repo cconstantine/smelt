@@ -55,8 +55,10 @@ Everything below still follows the rest of this document: the plan phase, TDD, t
   export CHECK_WORKTREE=~/smelt-worktrees/check-<ticket> CHECK_SCRATCH_DB=1
   scripts/check-server start && <the check>; rc=$?
   # A failed stop keeps the scratch database so it can be retried: run it
-  # again until it succeeds, never leave it (SME-129).
-  until scripts/check-server stop; do echo 'check-server stop failed; retrying' >&2; done
+  # again until it succeeds, with a pause and a time limit (SME-129). One
+  # still failing after that goes in the report, never left unsaid.
+  timeout 15m bash -c 'until scripts/check-server stop; do echo "check-server stop failed; retrying" >&2; sleep 10; done' ||
+      echo 'check-server stop still failing: the scratch database is kept; report it' >&2
   exit $rc
   ```
 

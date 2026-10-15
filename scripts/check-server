@@ -298,8 +298,12 @@ finish_stop() { # scratch database url (may be empty)
         return 1
     fi
     drop_scratch_db
-    # Only a start writes it, so a stop with none leaves it alone.
-    [ -e "$(kubeconfig_file)" ] && : >"$(kubeconfig_file)"
+    # Only a start writes it, so a stop with none leaves it alone. An `if`,
+    # not `&&`: as the function's last command, a missing file would make it
+    # fail, and stop exit 1 after a cleanup and drop that succeeded.
+    if [ -e "$(kubeconfig_file)" ]; then
+        : >"$(kubeconfig_file)"
+    fi
 }
 
 stop() {
