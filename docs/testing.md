@@ -66,7 +66,7 @@ In [testing/techniques.md](testing/techniques.md).
 scripts/check.sh                              # the per-commit gate (see below)
 scripts/cluster-test --features server                 # the real (server-gated) tests
 scripts/cluster-test --features server -- --nocapture   # show println! output
-scripts/cluster-test --features server -- --exact sandbox::tests::test_name   # exactly one test
+scripts/cluster-test --features server -- --exact sandbox::tests::manager::test_name   # exactly one test
 ```
 
 **Any run that includes a `#[sqlx::test]` or a real-cluster test goes through `scripts/cluster-test`** (SME-100), which takes its arguments as `cargo test` does: it builds them with `--no-run` first, unlocked, then runs the same command under the cluster lock. A `cargo test … --no-run` needs no lock. See [personas/rules.md](personas/rules.md) ("One cluster user at a time").
