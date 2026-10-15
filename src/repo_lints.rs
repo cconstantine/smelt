@@ -22,7 +22,6 @@ const NOT_COUNTED: &[&str] = &["Cargo.lock", "assets/highlight.css"];
 /// the check, and so does one that is now under the ceiling (or gone), until
 /// its entry is removed.
 const EXCEPTIONS: &[(&str, Limit)] = &[
-    ("src/frontend/pages/chat/transcript.rs", Limit { bytes: 42_561, lines: 917 }),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
