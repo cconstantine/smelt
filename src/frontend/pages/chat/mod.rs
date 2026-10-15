@@ -489,9 +489,16 @@ fn ChatPanel(
                             streaming_reply.set(reply);
                         }
                         // A turn that failed before this tab connected
-                        // (SME-51 B11).
-                        if let Ok(Some(error)) = get_turn_error(id).await {
-                            stream_errors.write().insert(id, error);
+                        // (SME-51 B11), or none since a later one started
+                        // (B19, SME-122).
+                        match get_turn_error(id).await {
+                            Ok(Some(error)) => {
+                                stream_errors.write().insert(id, error);
+                            }
+                            Ok(None) => {
+                                stream_errors.write().remove(&id);
+                            }
+                            Err(_) => {}
                         }
                         crate::frontend::check_build_id().await;
                         if let Ok(state) = get_browsing_state(id).await {
@@ -526,6 +533,9 @@ fn ChatPanel(
                                 }
                                 EventEffect::TurnError(message) => {
                                     stream_errors.write().insert(id, message);
+                                }
+                                EventEffect::TurnStarted => {
+                                    stream_errors.write().remove(&id);
                                 }
                                 EventEffect::StaleBundle => *crate::frontend::STALE_BUNDLE.write() = true,
                             }

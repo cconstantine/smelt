@@ -795,6 +795,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "markdown_bare_urls_streaming", 60, Box::pin(scenario_markdown_bare_urls_streaming(&t))).await;
     run_scenario(&t, only, r, k, "markdown_link_bidi_isolated", 60, Box::pin(scenario_markdown_link_bidi_isolated(&t))).await;
     run_scenario(&t, only, r, k, "terminal_command_indicator", 180, Box::pin(scenario_terminal_command_indicator(&t))).await;
+    run_scenario(&t, only, r, k, "turn_error_clears_on_a_later_turn", 30, Box::pin(scenario_turn_error_clears_on_a_later_turn(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -5582,4 +5583,25 @@ async fn scenario_terminal_command_indicator(t: &Scenario<'_>) {
 
     let _ = sandbox::terminate_terminal(pool, terminal).await;
     let _ = sandbox::terminate_pod(pool, conversation.id).await;
+}
+
+/// B19 (SME-122): a turn's error goes once a later turn starts, in every
+/// tab, not only the tab that sent it. Before, a success sent from another
+/// tab left the first tab showing the error.
+async fn scenario_turn_error_clears_on_a_later_turn(t: &Scenario<'_>) {
+    use crate::events::{ConversationEvent, publish};
+    let conversation = t.conversation().await;
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    publish(conversation.id, ConversationEvent::TurnError { message: "B19-TURN-ERROR".into() });
+    assert!(wait_for_text(&page, "B19-TURN-ERROR", Duration::from_secs(10)).await, "the error never showed");
+
+    // Another tab sends: its turn starts, and finishes without an error.
+    publish(conversation.id, ConversationEvent::TurnState { running: true });
+    publish(conversation.id, ConversationEvent::TurnState { running: false });
+
+    assert!(
+        wait_for_text_gone(&page, "B19-TURN-ERROR", Duration::from_secs(10)).await,
+        "the earlier turn's error should go once another turn starts"
+    );
 }

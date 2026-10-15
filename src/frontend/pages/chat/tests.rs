@@ -1595,6 +1595,17 @@ fn test_apply_event_sandbox_preview_update_sets_the_pods_previews() {
     });
 }
 
+/// B19 (SME-122): a turn starting says so, so the page drops an earlier
+/// turn's error; one ending doesn't.
+#[test]
+fn test_apply_event_a_turn_starting_clears_an_earlier_error() {
+    with_state(|state| {
+        assert_eq!(apply_event(state, ConversationEvent::TurnState { running: true }), EventEffect::TurnStarted);
+        assert!(*state.turn_running().peek());
+        assert_eq!(apply_event(state, ConversationEvent::TurnState { running: false }), EventEffect::None);
+    });
+}
+
 #[test]
 fn test_apply_event_sandbox_terminal_update_adds_then_removes_the_terminal() {
     with_state(|state| {
@@ -1727,7 +1738,7 @@ fn test_apply_event_question_update_sets_and_clears_the_waiting_question() {
 fn test_apply_event_turn_state_sets_running_and_an_ended_turn_drops_its_reply() {
     with_state(|state| {
         let effect = apply_event(state, ConversationEvent::TurnState { running: true });
-        assert_eq!(effect, EventEffect::None);
+        assert_eq!(effect, EventEffect::TurnStarted, "B19: an earlier error goes");
         assert!(*state.turn_running().peek());
         state.streaming_reply().set(Some("half a reply".to_string()));
         apply_event(state, ConversationEvent::TurnState { running: false });

@@ -123,6 +123,9 @@ pub(super) enum EventEffect {
     /// the model's window.
     ModelChanged,
     TurnError(String),
+    /// A turn started: an earlier turn's error no longer stands, whichever
+    /// tab sent either (B19, SME-122).
+    TurnStarted,
     /// A type added since this page loaded: the server is newer than this
     /// bundle.
     StaleBundle,
@@ -195,6 +198,8 @@ pub(super) fn apply_event(state: Store<ConversationState>, event: ConversationEv
             state.turn_running().set(running);
             if !running {
                 state.streaming_reply().set(None);
+            } else {
+                return EventEffect::TurnStarted;
             }
         }
         ConversationEvent::ReplyReset {} => state.streaming_reply().set(Some(String::new())),
