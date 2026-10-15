@@ -347,6 +347,11 @@ async fn run_reader(
     let marker = shell.marker.clone();
     let (mut stdout_buf, mut stderr_buf) = (Vec::new(), Vec::new());
     let mut seq: u64 = 0;
+    // The in-flight command's end, as the two markers arrive (B12,
+    // SME-122): its exit code from stdout's, and whether stderr's has come.
+    // It's sent once both have, or `STDERR_MARKER_WAIT` after stdout's (a
+    // command that closed or redirected the shell's stderr sends none).
+    let mut ending = Ending::default();
     // Both pipes are read to their end: the shell's last words on one
     // mustn't be lost because the other closed first.
     let (mut stdout_open, mut stderr_open) = (true, true);
@@ -357,17 +362,7 @@ async fn run_reader(
                     Ok(0) | Err(_) => stdout_open = false, // bash exited or pipe error
                     Ok(_) => {
                         let line = take_line(&mut stdout_buf);
-                        let found = {
-                            let mut marker = marker.lock().unwrap_or_else(|e| e.into_inner());
-                            let found = marker
-                                .as_deref()
-                                .and_then(|m| split_marker(&line, m))
-                                .map(|(before, exit_code)| (before.to_string(), exit_code));
-                            if found.is_some() {
-                                *marker = None;
-                            }
-                            found
-                        };
+                        let found = ending.find(&marker, &line, Stream::Stdout);
                         let (data, exit_code) = match found {
                             Some((before, exit_code)) => (before, Some(exit_code)),
                             None => (line, None),
@@ -387,10 +382,8 @@ async fn run_reader(
                             }
                         }
                         if let Some(exit_code) = exit_code {
-                            if tx.send(ShellEvent::Marker { terminal_id: terminal_id.clone(), exit_code }).is_err() {
-                                return;
-                            }
-                            seq = 0;
+                            ending.stdout_code = Some(exit_code);
+                            ending.deadline = Some(tokio::time::Instant::now() + STDERR_MARKER_WAIT);
                         }
                     }
                 }
@@ -400,24 +393,107 @@ async fn run_reader(
                     Ok(0) | Err(_) => stderr_open = false,
                     Ok(_) => {
                         let line = take_line(&mut stderr_buf);
-                        seq += 1;
-                        if tx
-                            .send(ShellEvent::Line {
-                                terminal_id: terminal_id.clone(),
-                                stream: Stream::Stderr,
-                                seq,
-                                data: line,
-                            })
-                            .is_err()
-                        {
-                            return;
+                        let (data, found) = match ending.find(&marker, &line, Stream::Stderr) {
+                            Some((before, _)) => (before, true),
+                            None => (line, false),
+                        };
+                        if !found || !data.is_empty() {
+                            seq += 1;
+                            if tx
+                                .send(ShellEvent::Line {
+                                    terminal_id: terminal_id.clone(),
+                                    stream: Stream::Stderr,
+                                    seq,
+                                    data,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        if found {
+                            ending.stderr_seen = true;
                         }
                     }
                 }
             }
+            _ = sleep_until_or_never(ending.deadline) => {
+                // stdout's marker came and stderr's didn't in time.
+                ending.stderr_seen = true;
+            }
+        }
+        if let Some(exit_code) = ending.complete(&marker) {
+            if tx.send(ShellEvent::Marker { terminal_id: terminal_id.clone(), exit_code }).is_err() {
+                return;
+            }
+            seq = 0;
         }
     }
+    // Ended between the two markers: the command did finish.
+    if let Some(exit_code) = ending.stdout_code.take() {
+        marker.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if tx.send(ShellEvent::Marker { terminal_id: terminal_id.clone(), exit_code }).is_err() {
+            return;
+        }
+        seq = 0;
+    }
     finish_ended_shell(&terminal_id, &shell, seq, &tx).await;
+}
+
+/// How long after a command's stdout marker its stderr marker may take
+/// before the command is finished without it (B12, SME-122).
+const STDERR_MARKER_WAIT: Duration = Duration::from_secs(1);
+
+/// Where the in-flight command's end has got to: see `run_reader`.
+#[derive(Default)]
+struct Ending {
+    /// The exit code from stdout's marker, once it has come.
+    stdout_code: Option<i32>,
+    /// Whether stderr's marker has come (or been given up on).
+    stderr_seen: bool,
+    /// When to stop waiting for stderr's marker.
+    deadline: Option<tokio::time::Instant>,
+    /// The last finished command's marker: one of its markers that comes
+    /// late is dropped, not shown as the next command's output.
+    previous: Option<String>,
+}
+
+impl Ending {
+    /// The output before a marker at the end of `line` on `stream`, and
+    /// its code: the in-flight command's marker, or the last command's
+    /// (late, which `complete` has already given up on).
+    fn find(&self, marker: &std::sync::Mutex<Option<String>>, line: &str, stream: Stream) -> Option<(String, i32)> {
+        let current = marker.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let waiting = match stream {
+            Stream::Stdout => self.stdout_code.is_none(),
+            Stream::Stderr => !self.stderr_seen,
+        };
+        let current = current.filter(|_| waiting);
+        [current.as_deref(), self.previous.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(|m| split_marker(line, m))
+            .map(|(before, code)| (before.to_string(), code))
+    }
+
+    /// The exit code, once both markers have come: clears the in-flight
+    /// marker and starts over for the next command.
+    fn complete(&mut self, marker: &std::sync::Mutex<Option<String>>) -> Option<i32> {
+        let code = self.stdout_code.filter(|_| self.stderr_seen)?;
+        self.previous = marker.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.stdout_code = None;
+        self.stderr_seen = false;
+        self.deadline = None;
+        Some(code)
+    }
+}
+
+/// Sleeps until `deadline`, or forever when there's none.
+async fn sleep_until_or_never(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// After a terminal's shell has ended (B11, SME-122): `exit`, `exec`, a
@@ -1292,9 +1368,13 @@ async fn start_command(state: &Arc<AppState>, terminal_id: &str, id: String, com
     // stdin, so a command that reads stdin (`cat`, `read`, a prompt) would
     // otherwise swallow the marker line and never finish. Nothing writes
     // to a terminal command's stdin.
+    // The marker goes to stdout with the exit code, then to stderr: the
+    // command finished before either, so everything it wrote to stderr is
+    // ahead of the second in its pipe (B12, SME-122).
     let payload = format!(
-        "eval {} </dev/null\nprintf '%s%s\\n' {} \"$?\"\n",
+        "eval {} </dev/null\nprintf '%s%s\\n' {} \"$?\"\nprintf '%s0\\n' {} >&2\n",
         shell_quote(command),
+        shell_quote(&marker),
         shell_quote(&marker)
     );
     let mut stdin = shell.stdin.lock().await;
@@ -2119,6 +2199,50 @@ mod socket_tests {
 
         let (stdout, _, code) = run_collect(&mut client, "t1", "c2", "echo again").await;
         assert_eq!((stdout, code), (vec!["again".to_string()], 0));
+    }
+
+    /// B12 (SME-122): a command's stderr is all sent before its exit. The
+    /// exit marker comes on stdout, so stderr still in its pipe could be
+    /// read after it and lost. 2,000 lines overfill the pipe, so most of
+    /// them are still unread when the marker arrives, every run.
+    #[tokio::test]
+    async fn test_all_of_a_commands_stderr_comes_before_its_exit() {
+        let addr = serve_agent().await;
+        let mut client = connect_ready(addr).await;
+        create_terminal(&mut client, "t1").await;
+
+        let (stdout, stderr, code) = run_collect(
+            &mut client,
+            "t1",
+            "c1",
+            "echo out1; for i in $(seq 1 2000); do echo \"err $i\" >&2; done; echo out2; printf tail >&2",
+        )
+        .await;
+
+        assert_eq!((stdout, code), (vec!["out1".to_string(), "out2".to_string()], 0));
+        let mut expected: Vec<String> = (1..=2000).map(|i| format!("err {i}")).collect();
+        expected.push("tail".to_string());
+        assert_eq!(stderr.len(), expected.len(), "stderr lines before the exit");
+        assert_eq!(stderr, expected);
+
+        // Nothing of c1's turns up in the next command.
+        let (stdout, stderr, code) = run_collect(&mut client, "t1", "c2", "echo next").await;
+        assert_eq!((stdout, stderr, code), (vec!["next".to_string()], vec![], 0));
+    }
+
+    /// B12 (SME-122): a command that sends the shell's stderr elsewhere
+    /// still finishes, once the wait for stderr's marker runs out, and the
+    /// terminal goes on working.
+    #[tokio::test]
+    async fn test_a_command_that_redirects_the_shells_stderr_still_finishes() {
+        let addr = serve_agent().await;
+        let mut client = connect_ready(addr).await;
+        create_terminal(&mut client, "t1").await;
+
+        let (stdout, _, code) = run_collect(&mut client, "t1", "c1", "exec 2>/dev/null; echo still").await;
+        assert_eq!((stdout, code), (vec!["still".to_string()], 0));
+        let (stdout, _, code) = run_collect(&mut client, "t1", "c2", "echo next").await;
+        assert_eq!((stdout, code), (vec!["next".to_string()], 0));
     }
 
     #[tokio::test]
