@@ -37,7 +37,6 @@ const EXCEPTIONS: &[(&str, Limit)] = &[
     ("src/lsp/manager.rs", Limit { bytes: 48_823, lines: 1_005 }),
     ("src/lsp/pods.rs", Limit { bytes: 57_041, lines: 1_202 }),
     ("src/mcp.rs", Limit { bytes: 103_619, lines: 2_366 }),
-    ("src/mcp_oauth.rs", Limit { bytes: 47_899, lines: 1_149 }),
     ("src/preview.rs", Limit { bytes: 64_259, lines: 1_349 }),
     ("src/providers.rs", Limit { bytes: 105_588, lines: 2_252 }),
     ("src/sandbox/agent.rs", Limit { bytes: 40_800, lines: 924 }),
