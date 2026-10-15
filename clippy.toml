@@ -1,0 +1,3 @@
+# Clippy settings for scripts/lint-expects, which turns on only the lints it
+# names. A production function over 200 code lines is split (SME-163).
+too-many-lines-threshold = 200

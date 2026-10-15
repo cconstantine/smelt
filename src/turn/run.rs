@@ -364,6 +364,7 @@ impl Drop for TurnSteps {
 /// with the turn's own message, already saved by `run_turn_bounded`, and
 /// `new_content` is that message's content (`None` for a wake).
 #[cfg(feature = "server")]
+#[expect(clippy::too_many_lines, reason = "SME-163 splits it along its phases")]
 pub(super) fn run_turn_body<'a>(
     pool: &'a PgPool,
     conversation_id: i64,

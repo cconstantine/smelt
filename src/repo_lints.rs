@@ -28,7 +28,7 @@ const EXCEPTIONS: &[(&str, Limit)] = &[
     ("docs/development-process.md", Limit { bytes: 107_535, lines: 478 }),
     ("docs/setup.md", Limit { bytes: 48_889, lines: 325 }),
     ("docs/testing.md", Limit { bytes: 78_171, lines: 426 }),
-    ("scripts/test-check-scripts", Limit { bytes: 42_090, lines: 818 }),
+    ("scripts/test-check-scripts", Limit { bytes: 42_116, lines: 818 }),
     ("src/anthropic/stream.rs", Limit { bytes: 110_355, lines: 2_506 }),
     ("src/anthropic/tools/mod.rs", Limit { bytes: 46_115, lines: 1_055 }),
     ("src/bin/sandbox_agent.rs", Limit { bytes: 114_191, lines: 2_749 }),

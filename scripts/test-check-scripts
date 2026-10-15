@@ -524,7 +524,7 @@ for tool in cargo dx sqlx; do
     }
 done
 wasm_check="cargo check --no-default-features --features web --target wasm32-unknown-unknown"
-lints="-- -D warnings -A clippy::all -D clippy::expect_used -D clippy::unwrap_used"
+lints="-- -D warnings -A clippy::all -D clippy::expect_used -D clippy::unwrap_used -D clippy::too_many_lines"
 
 # 7. check.sh builds, lints, compiles the tests and checks the cluster
 # unlocked, and takes the lock for the test run only.

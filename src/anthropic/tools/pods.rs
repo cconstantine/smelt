@@ -8,6 +8,7 @@ use super::server::{required_i64, required_str};
 use crate::{db, sandbox};
 use crate::anthropic::ToolDefinition;
 
+#[expect(clippy::too_many_lines, reason = "SME-163 splits it, a function per tool")]
 pub(super) fn tools() -> Vec<Tool> {
     vec![
         // --- Terminal: pod, terminal, and command are three separate,
