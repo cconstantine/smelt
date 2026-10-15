@@ -772,7 +772,7 @@ pub(super) fn Transcript(
     tz_offset_minutes: Signal<i32>,
     mut input: Signal<String>,
     on_attach: EventHandler<()>,
-    stream_errors: Signal<HashMap<i64, String>>,
+    stream_errors: Signal<super::state::ChatErrors>,
     scroll: StickyBottom,
     mut pointer_over_transcript: Signal<bool>,
     mut media_loaded: Signal<u64>,

@@ -1595,6 +1595,28 @@ fn test_apply_event_sandbox_preview_update_sets_the_pods_previews() {
     });
 }
 
+/// SME-122 review 1: a turn starting, or a pull that finds no kept error,
+/// ends a turn's error but not one only this tab saw (a failed send): the
+/// user's message would vanish with no error.
+#[test]
+fn test_a_later_turn_clears_a_turns_error_but_not_a_failed_send() {
+    let mut errors = ChatErrors::default();
+    errors.set_turn_error(1, "the turn failed".to_string());
+    errors.set_local_error(2, "couldn't send".to_string());
+    errors.clear_turn_error(1);
+    errors.clear_turn_error(2);
+    assert_eq!(errors.lines.get(&1), None);
+    assert_eq!(errors.lines.get(&2).map(String::as_str), Some("couldn't send"));
+
+    // A turn's error replaced by a local one stays too.
+    errors.set_turn_error(3, "the turn failed".to_string());
+    errors.set_local_error(3, "couldn't stop".to_string());
+    errors.clear_turn_error(3);
+    assert_eq!(errors.lines.get(&3).map(String::as_str), Some("couldn't stop"));
+    errors.clear(3);
+    assert_eq!(errors.lines.get(&3), None);
+}
+
 /// B19 (SME-122): a turn starting says so, so the page drops an earlier
 /// turn's error; one ending doesn't.
 #[test]

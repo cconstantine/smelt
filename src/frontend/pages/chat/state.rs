@@ -131,6 +131,46 @@ pub(super) enum EventEffect {
     StaleBundle,
 }
 
+/// The chat's error lines, by conversation: a turn's error (the server
+/// keeps it, and a later turn ends it) or one only this tab saw (a send or
+/// a Stop that failed), which stays until this tab sends again. `turn`
+/// holds the conversations whose line is a turn's (review 1).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct ChatErrors {
+    pub(super) lines: HashMap<i64, String>,
+    turn: std::collections::HashSet<i64>,
+}
+
+impl ChatErrors {
+    #[cfg(any(feature = "web", test))]
+    /// A turn's error, from `TurnError` or the reconnect pull.
+    pub(super) fn set_turn_error(&mut self, id: i64, message: String) {
+        self.lines.insert(id, message);
+        self.turn.insert(id);
+    }
+
+    /// An error only this tab saw.
+    pub(super) fn set_local_error(&mut self, id: i64, message: String) {
+        self.lines.insert(id, message);
+        self.turn.remove(&id);
+    }
+
+    #[cfg(any(feature = "web", test))]
+    /// A later turn started, or the server keeps no error: a turn's error
+    /// goes, one only this tab saw stays.
+    pub(super) fn clear_turn_error(&mut self, id: i64) {
+        if self.turn.remove(&id) {
+            self.lines.remove(&id);
+        }
+    }
+
+    /// This tab sent again, or the conversation is gone: every error goes.
+    pub(super) fn clear(&mut self, id: i64) {
+        self.turn.remove(&id);
+        self.lines.remove(&id);
+    }
+}
+
 /// Applies one live event from the open conversation's stream onto its
 /// state, and says what else it asks for.
 #[cfg(any(feature = "web", test))]
