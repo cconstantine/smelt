@@ -6,6 +6,7 @@
 //! opencode. See docs/process/rules-commits.md, "Files stay under the
 //! ceiling".
 
+mod components;
 mod links;
 
 /// The most a tracked text file may hold.
@@ -148,6 +149,31 @@ mod tests {
             let linked: Vec<String> = links.captures_iter(&text).map(|c| c[1].to_string()).collect();
             assert_eq!(linked, parts, "{file} should link every part of assets/css/, in order");
         }
+    }
+
+    /// clippy can't see inside a `#[component]`, so components are held to
+    /// its 200-code-line limit here (SME-163).
+    #[test]
+    fn test_no_component_is_over_the_function_length_limit() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut over = Vec::new();
+        let mut seen = 0;
+        for path in tracked_files().into_iter().filter(|p| p.starts_with("src/") && p.ends_with(".rs")) {
+            let Ok(source) = std::fs::read_to_string(root.join(&path)) else { continue };
+            for (name, lines) in components::component_lengths(&source) {
+                seen += 1;
+                if lines > components::MAX_COMPONENT_LINES {
+                    over.push(format!("{path}: {name} is {lines} code lines"));
+                }
+            }
+        }
+        assert!(seen > 20, "found the components ({seen})");
+        assert!(
+            over.is_empty(),
+            "components over {} code lines: split each into child components along its own parts\n{}",
+            components::MAX_COMPONENT_LINES,
+            over.join("\n")
+        );
     }
 
     #[test]
