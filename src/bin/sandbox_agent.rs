@@ -362,12 +362,11 @@ async fn run_reader(
                     Ok(false) | Err(_) => stdout_open = false, // bash exited or pipe error
                     Ok(true) => {
                         let line = take_piece(&mut stdout_buf);
-                        let found = ending.find(&marker, &line, Stream::Stdout);
-                        let (data, exit_code) = match found {
-                            Some((before, exit_code)) => (before, Some(exit_code)),
+                        let (data, meaning) = match ending.find(&marker, &line, Stream::Stdout) {
+                            Some((before, meaning)) => (before, Some(meaning)),
                             None => (line, None),
                         };
-                        if exit_code.is_none() || !data.is_empty() {
+                        if meaning.is_none() || !data.is_empty() {
                             seq += 1;
                             if tx
                                 .send(ShellEvent::Line {
@@ -381,9 +380,13 @@ async fn run_reader(
                                 return;
                             }
                         }
-                        if let Some(exit_code) = exit_code {
-                            ending.stdout_code = Some(exit_code);
-                            ending.deadline = Some(tokio::time::Instant::now() + STDERR_MARKER_WAIT);
+                        match meaning {
+                            Some(EndMarker::Exit(exit_code)) => {
+                                ending.stdout_code = Some(exit_code);
+                                ending.deadline = Some(tokio::time::Instant::now() + STDERR_MARKER_WAIT);
+                            }
+                            Some(EndMarker::StderrEnd) => ending.stderr_seen = true,
+                            Some(EndMarker::Stale) | None => {}
                         }
                     }
                 }
@@ -394,10 +397,10 @@ async fn run_reader(
                     Ok(true) => {
                         let line = take_piece(&mut stderr_buf);
                         let (data, found) = match ending.find(&marker, &line, Stream::Stderr) {
-                            Some((before, _)) => (before, true),
-                            None => (line, false),
+                            Some((before, meaning)) => (before, Some(meaning)),
+                            None => (line, None),
                         };
-                        if !found || !data.is_empty() {
+                        if found.is_none() || !data.is_empty() {
                             seq += 1;
                             if tx
                                 .send(ShellEvent::Line {
@@ -411,7 +414,7 @@ async fn run_reader(
                                 return;
                             }
                         }
-                        if found {
+                        if matches!(found, Some(EndMarker::StderrEnd | EndMarker::Exit(_))) {
                             ending.stderr_seen = true;
                         }
                     }
@@ -470,20 +473,26 @@ struct Ending {
 
 impl Ending {
     /// The output before a marker at the end of `line` on `stream`, and
-    /// its code: the in-flight command's marker, or the last command's
-    /// (late, which `complete` has already given up on).
-    fn find(&self, marker: &std::sync::Mutex<Option<String>>, line: &str, stream: Stream) -> Option<(String, i32)> {
+    /// what the marker stands for. The in-flight command's first marker on
+    /// stdout carries its exit code; its next one, on stderr or, after
+    /// `exec 2>&1`, on stdout too, is stderr's end (review 1). The last
+    /// command's, turning up late after `complete` gave up on it, is stale.
+    fn find(&self, marker: &std::sync::Mutex<Option<String>>, line: &str, stream: Stream) -> Option<(String, EndMarker)> {
         let current = marker.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let waiting = match stream {
-            Stream::Stdout => self.stdout_code.is_none(),
-            Stream::Stderr => !self.stderr_seen,
+        if let Some((before, code)) = current.as_deref().and_then(|m| split_marker(line, m)) {
+            let meaning = match stream {
+                Stream::Stdout if self.stdout_code.is_none() => EndMarker::Exit(code),
+                _ if !self.stderr_seen => EndMarker::StderrEnd,
+                _ => EndMarker::Stale,
+            };
+            return Some((before.to_string(), meaning));
+        }
+        let (before, code) = self.previous.as_deref().and_then(|m| split_marker(line, m))?;
+        let meaning = match stream {
+            Stream::Stdout => EndMarker::Exit(code),
+            Stream::Stderr => EndMarker::StderrEnd,
         };
-        let current = current.filter(|_| waiting);
-        [current.as_deref(), self.previous.as_deref()]
-            .into_iter()
-            .flatten()
-            .find_map(|m| split_marker(line, m))
-            .map(|(before, code)| (before.to_string(), code))
+        Some((before.to_string(), meaning))
     }
 
     /// The exit code, once both markers have come: clears the in-flight
@@ -496,6 +505,17 @@ impl Ending {
         self.deadline = None;
         Some(code)
     }
+}
+
+/// What an end marker found by `Ending::find` stands for.
+#[derive(Debug, PartialEq)]
+enum EndMarker {
+    /// The command's exit code, from stdout's marker.
+    Exit(i32),
+    /// The end of the command's stderr.
+    StderrEnd,
+    /// Nothing: dropped from the output and otherwise ignored.
+    Stale,
 }
 
 /// Sleeps until `deadline`, or forever when there's none.
@@ -2277,6 +2297,23 @@ mod socket_tests {
         // Nothing of c1's turns up in the next command.
         let (stdout, stderr, code) = run_collect(&mut client, "t1", "c2", "echo next").await;
         assert_eq!((stdout, stderr, code), (vec!["next".to_string()], vec![], 0));
+    }
+
+    /// SME-122 review 1: after `exec 2>&1` both end markers come on
+    /// stdout. The second is the stderr marker: it isn't shown as output,
+    /// and the command doesn't wait out the fallback for it.
+    #[tokio::test]
+    async fn test_a_shell_with_stderr_on_stdout_shows_no_marker_and_doesnt_wait() {
+        let addr = serve_agent().await;
+        let mut client = connect_ready(addr).await;
+        create_terminal(&mut client, "t1").await;
+
+        let (stdout, _, code) = run_collect(&mut client, "t1", "c1", "exec 2>&1; echo one").await;
+        assert_eq!((stdout, code), (vec!["one".to_string()], 0));
+        let started = std::time::Instant::now();
+        let (stdout, _, code) = run_collect(&mut client, "t1", "c2", "echo two; echo err-two >&2").await;
+        assert_eq!((stdout, code), (vec!["two".to_string(), "err-two".to_string()], 0));
+        assert!(started.elapsed() < STDERR_MARKER_WAIT, "waited {:?} for a marker that came on stdout", started.elapsed());
     }
 
     /// B12 (SME-122): a command that sends the shell's stderr elsewhere
