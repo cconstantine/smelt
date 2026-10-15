@@ -26,7 +26,6 @@ const EXCEPTIONS: &[(&str, Limit)] = &[
     ("scripts/test-check-scripts", Limit { bytes: 42_116, lines: 818 }),
     ("src/anthropic/stream.rs", Limit { bytes: 110_355, lines: 2_506 }),
     ("src/bin/sandbox_agent.rs", Limit { bytes: 114_191, lines: 2_749 }),
-    ("src/bin/sandbox_instance_cleanup/main.rs", Limit { bytes: 43_573, lines: 1_116 }),
     ("src/browser_tests.rs", Limit { bytes: 281_142, lines: 5_781 }),
     ("src/browsing.rs", Limit { bytes: 106_451, lines: 2_341 }),
     ("src/frontend/pages/chat/tests.rs", Limit { bytes: 88_347, lines: 2_158 }),
