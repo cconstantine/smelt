@@ -211,9 +211,9 @@ fn ChatPanel(
     // says so and offers no message box, instead of a send that can only
     // fail.
     let conversation_missing = move || load_error().as_deref() == Some("conversation not found");
-    // The last turn error, by conversation (`TurnError`, or a send the
-    // server refused).
-    let mut stream_errors: Signal<HashMap<i64, String>> = use_signal(HashMap::new);
+    // The error line, by conversation: a turn's (`TurnError`) or one only
+    // this tab saw (a send or Stop the server refused); see `ChatErrors`.
+    let mut stream_errors: Signal<ChatErrors> = use_signal(ChatErrors::default);
     // Bumped when the conversation's model or the providers change, so the
     // model picker refetches (SME-72).
     #[allow(unused_mut)]
@@ -244,7 +244,7 @@ fn ChatPanel(
             {
                 stream_errors
                     .write()
-                    .insert(id, format!("Couldn't stop the turn: {}", server_error_message(&e)));
+                    .set_local_error(id, format!("Couldn't stop the turn: {}", server_error_message(&e)));
             }
         });
     };
@@ -452,7 +452,13 @@ fn ChatPanel(
                         && let Err(e) = get_messages(id).await
                         && server_error_message(&e) == "conversation not found"
                     {
+                        // Nothing of it stays under the message, and the
+                        // sidebar drops it (B44, SME-122): it kept the
+                        // transcript and the row until a reload.
+                        state.set(ConversationState { conversation: Some(id), ..ConversationState::default() });
+                        stream_errors.write().clear(id);
                         load_error.set(Some(server_error_message(&e)));
+                        *conversations_changed.write() += 1;
                         break;
                     }
                     if let Ok(mut events) = subscribed {
@@ -489,9 +495,16 @@ fn ChatPanel(
                             streaming_reply.set(reply);
                         }
                         // A turn that failed before this tab connected
-                        // (SME-51 B11).
-                        if let Ok(Some(error)) = get_turn_error(id).await {
-                            stream_errors.write().insert(id, error);
+                        // (SME-51 B11), or none since a later one started
+                        // (B19, SME-122).
+                        match get_turn_error(id).await {
+                            Ok(Some(error)) => {
+                                stream_errors.write().set_turn_error(id, error);
+                            }
+                            Ok(None) => {
+                                stream_errors.write().clear_turn_error(id);
+                            }
+                            Err(_) => {}
                         }
                         crate::frontend::check_build_id().await;
                         if let Ok(state) = get_browsing_state(id).await {
@@ -525,7 +538,10 @@ fn ChatPanel(
                                     });
                                 }
                                 EventEffect::TurnError(message) => {
-                                    stream_errors.write().insert(id, message);
+                                    stream_errors.write().set_turn_error(id, message);
+                                }
+                                EventEffect::TurnStarted => {
+                                    stream_errors.write().clear_turn_error(id);
                                 }
                                 EventEffect::StaleBundle => *crate::frontend::STALE_BUNDLE.write() = true,
                             }
@@ -615,9 +631,9 @@ fn ChatPanel(
         // conversation's own event stream; this request only starts the
         // turn. Keyed by `id`: the viewer may switch away meanwhile.
         spawn(async move {
-            stream_errors.write().remove(&id);
+            stream_errors.write().clear(id);
             if let Err(e) = send_message(id, content).await {
-                stream_errors.write().insert(id, server_error_message(&e));
+                stream_errors.write().set_local_error(id, server_error_message(&e));
             }
             // The first message titles a conversation, and any send moves
             // it up the list — refresh the sidebar even if the viewer has

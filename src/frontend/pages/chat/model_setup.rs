@@ -9,10 +9,10 @@ use super::*;
 pub(super) fn ModelNotes(
     selected: Memo<Option<i64>>,
     state: Store<ConversationState>,
-    stream_errors: Signal<HashMap<i64, String>>,
+    stream_errors: Signal<super::state::ChatErrors>,
 ) -> Element {
     let notification_delivery_error = state.notification_delivery_error();
-    let stream_error = move || selected().and_then(|id| stream_errors.read().get(&id).cloned());
+    let stream_error = move || selected().and_then(|id| stream_errors.read().lines.get(&id).cloned());
     rsx! {
         if let Some(err) = stream_error() {
             if err == crate::providers::NO_MODEL_CONFIGURED {

@@ -481,6 +481,16 @@ pub fn McpServerEdit(id: i64) -> Element {
                 // Prefixed with `_` since it's only read under `#[cfg(feature =
                 // "web")]` below — the server build (e.g. `cargo test
                 // --features server`) never touches it.
+                // B4 (SME-122): the server refuses anything else already;
+                // this keeps the page from navigating to a non-http(s) URL
+                // even if that check is ever lost.
+                Ok(url) if !crate::api::mcp::is_navigable_authorization_url(&url) => {
+                    oauth_error.set(Some(
+                        "The sign-in address isn't an http or https URL, so smelt won't open it."
+                            .to_string(),
+                    ));
+                    oauth_connecting.set(false);
+                }
                 Ok(_url) => {
                     // A real full-page navigation, not a client-side route
                     // push — this has to leave smelt entirely for the

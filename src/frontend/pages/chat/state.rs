@@ -123,9 +123,52 @@ pub(super) enum EventEffect {
     /// the model's window.
     ModelChanged,
     TurnError(String),
+    /// A turn started: an earlier turn's error no longer stands, whichever
+    /// tab sent either (B19, SME-122).
+    TurnStarted,
     /// A type added since this page loaded: the server is newer than this
     /// bundle.
     StaleBundle,
+}
+
+/// The chat's error lines, by conversation: a turn's error (the server
+/// keeps it, and a later turn ends it) or one only this tab saw (a send or
+/// a Stop that failed), which stays until this tab sends again. `turn`
+/// holds the conversations whose line is a turn's (review 1).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct ChatErrors {
+    pub(super) lines: HashMap<i64, String>,
+    turn: std::collections::HashSet<i64>,
+}
+
+impl ChatErrors {
+    #[cfg(any(feature = "web", test))]
+    /// A turn's error, from `TurnError` or the reconnect pull.
+    pub(super) fn set_turn_error(&mut self, id: i64, message: String) {
+        self.lines.insert(id, message);
+        self.turn.insert(id);
+    }
+
+    /// An error only this tab saw.
+    pub(super) fn set_local_error(&mut self, id: i64, message: String) {
+        self.lines.insert(id, message);
+        self.turn.remove(&id);
+    }
+
+    #[cfg(any(feature = "web", test))]
+    /// A later turn started, or the server keeps no error: a turn's error
+    /// goes, one only this tab saw stays.
+    pub(super) fn clear_turn_error(&mut self, id: i64) {
+        if self.turn.remove(&id) {
+            self.lines.remove(&id);
+        }
+    }
+
+    /// This tab sent again, or the conversation is gone: every error goes.
+    pub(super) fn clear(&mut self, id: i64) {
+        self.turn.remove(&id);
+        self.lines.remove(&id);
+    }
 }
 
 /// Applies one live event from the open conversation's stream onto its
@@ -195,6 +238,8 @@ pub(super) fn apply_event(state: Store<ConversationState>, event: ConversationEv
             state.turn_running().set(running);
             if !running {
                 state.streaming_reply().set(None);
+            } else {
+                return EventEffect::TurnStarted;
             }
         }
         ConversationEvent::ReplyReset {} => state.streaming_reply().set(Some(String::new())),

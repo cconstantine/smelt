@@ -918,9 +918,17 @@ pub(super) async fn create_pod_attempt_unspanned(
             // push with a confusing ssh error, so a failure here is the
             // pod's failure.
             if let Err(e) = crate::git::install_into_new_pod(pool, row.id).await {
+                let e = start_error(pool, row.id, SandboxError::GitSetup(e)).await;
                 let _ = manager.delete(sandbox).await;
                 let _ = db::terminate_sandbox_pod(pool, row.id).await;
-                return Err(SandboxError::GitSetup(e));
+                return Err(e);
+            }
+            // Its record may have been closed while it started (the
+            // sandbox panel's Stop): a pod left running with no live record
+            // is one nothing deletes (B1, SME-122).
+            if !db::sandbox_pod_is_live(pool, row.id).await.unwrap_or(true) {
+                let _ = manager.delete(sandbox).await;
+                return Err(stopped_while_starting());
             }
             std::mem::forget(sandbox);
             // The conversation may have been deleted while this pod was
@@ -943,9 +951,39 @@ pub(super) async fn create_pod_attempt_unspanned(
             Ok(row.id)
         }
         Err(e) => {
+            let e = start_error(pool, row.id, e).await;
             let _ = db::terminate_sandbox_pod(pool, row.id).await;
             Err(e)
         }
+    }
+}
+
+/// What a start says when its pod's record was closed while it ran (B1,
+/// SME-122).
+fn stopped_while_starting() -> SandboxError {
+    SandboxError::StartFailed("the sandbox was stopped while it was starting".to_string())
+}
+
+/// The error a failed start reports: `stopped_while_starting` when its
+/// record was closed meanwhile (the panel's Stop deletes the pod the start
+/// waits for, which then fails with Kubernetes' 404), else `e` (B1,
+/// SME-122). Read before the start closes the record itself.
+async fn start_error(pool: &PgPool, pod_id: i64, e: SandboxError) -> SandboxError {
+    if db::sandbox_pod_is_live(pool, pod_id).await.unwrap_or(true) {
+        e
+    } else {
+        stopped_while_starting()
+    }
+}
+
+/// Whether a start is under way for `pod_id`'s conversation: its start
+/// lock is held from before the pod's record is made until the start
+/// returns (B1, SME-122). A start that only finds the live pod holds it
+/// briefly too, which just puts off a reconnect's crash check.
+pub(super) async fn start_under_way_for_pod(pool: &PgPool, pod_id: i64) -> bool {
+    match db::sandbox_pod_conversation_id(pool, pod_id).await {
+        Ok(Some(conversation_id)) => pod_start_lock(conversation_id).try_lock().is_err(),
+        _ => false,
     }
 }
 

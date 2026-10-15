@@ -175,6 +175,16 @@ pub async fn start(
             config.name
         )
     })?;
+    // B4 (SME-122): the URL is built from the authorization server's
+    // metadata, which rmcp parses but doesn't limit to http(s); the page
+    // navigates to it, so a `javascript:` endpoint would run in smelt's
+    // origin.
+    if !crate::api::mcp::is_navigable_authorization_url(&url) {
+        return Err(format!(
+            "MCP server {:?}'s authorization server gave a sign-in address that isn't an http or https URL, so smelt won't open it",
+            config.name
+        ));
+    }
 
     PENDING
         .lock()
@@ -650,6 +660,8 @@ mod tests {
         Issuer { iss_supported: bool },
         /// `issuer` names a different server from the one serving it.
         WrongIssuer,
+        /// `authorization_endpoint` is a `javascript:` URL (B4, SME-122).
+        JavascriptEndpoint,
     }
 
     /// The issuer the mock at `base_url` advertises — what a callback's
@@ -670,12 +682,19 @@ mod tests {
         let (issuer, iss_supported) = match metadata {
             MockMetadata::None => (None, false),
             MockMetadata::Issuer { iss_supported } => (Some(mock_issuer(&base_url)), iss_supported),
+            MockMetadata::JavascriptEndpoint => (Some(mock_issuer(&base_url)), true),
             MockMetadata::WrongIssuer => (Some("http://127.0.0.1:1".to_string()), true),
+        };
+        let authorization_endpoint = match metadata {
+            MockMetadata::JavascriptEndpoint => {
+                "javascript:document.body.textContent='B4-RAN'//".to_string()
+            }
+            _ => format!("{base_url}authorize"),
         };
         if let Some(issuer) = issuer {
             let document = serde_json::json!({
                 "issuer": issuer,
-                "authorization_endpoint": format!("{base_url}authorize"),
+                "authorization_endpoint": authorization_endpoint,
                 "token_endpoint": format!("{base_url}token"),
                 "registration_endpoint": format!("{base_url}register"),
                 "response_types_supported": ["code"],
@@ -771,6 +790,32 @@ mod tests {
         assert!(
             stored_credentials(&pool, config.id).await.is_some(),
             "credentials should be stored after a successful callback"
+        );
+    }
+
+    /// B4 (SME-122): an authorization server whose metadata names a
+    /// `javascript:` authorization endpoint gets no URL handed to the
+    /// browser, and leaves no attempt pending.
+    #[sqlx::test]
+    async fn test_a_javascript_authorization_endpoint_is_refused(pool: PgPool) {
+        let base_url = spawn_mock_oauth_server(MockMetadata::JavascriptEndpoint).await;
+        let config = create_oauth_server(&pool, &base_url).await;
+
+        let result = start(
+            &pool,
+            &config,
+            "http://localhost/oauth/mcp-callback/1".to_string(),
+        )
+        .await;
+
+        let error = result.expect_err("a javascript: authorization endpoint must be refused");
+        assert!(
+            error.contains("http or https"),
+            "the error should say what's wrong with the URL: {error}"
+        );
+        assert!(
+            !PENDING.lock().await.contains_key(&config.id),
+            "a refused start must leave no attempt pending"
         );
     }
 

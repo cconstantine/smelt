@@ -521,6 +521,13 @@ pub(super) fn connect_with_retry(
         {
             return Err(outdated.error());
         }
+        // A pod still starting has no agent to answer yet, which the checks
+        // below would take for a dead pod and stop, closing the record of a
+        // pod the start then makes anyway (B1, SME-122). The start reports
+        // its own failure.
+        if mode == ConnectMode::Reconnect && start_under_way_for_pod(&pool, pod_id).await {
+            return Err(TerminalError::NoPod);
+        }
 
         let instance = db::smelt_instance(&pool).await?;
         let dialer = dialer_for(pod_id, instance)?;

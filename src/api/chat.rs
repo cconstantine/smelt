@@ -139,6 +139,37 @@ pub fn cut_off_notice(tokens: u32, limit: ReplyLimit, cut_call: Option<&str>) ->
     format!("{CUT_OFF_NOTICE_START}{tokens} tokens ({}) before it finished.{call}", limit.reason())
 }
 
+/// How a refusal notice starts (`refusal_notice`).
+pub const REFUSAL_NOTICE_START: &str = "Your last reply was stopped by the model provider's safety system (a refusal) before it finished.";
+
+/// Saved after a reply that ended with `stop_reason: refusal` (B3,
+/// SME-122), like a cut-off notice: the model learns its reply was
+/// stopped, and the chat shows it (`parse_refusal_notice`).
+#[cfg(any(feature = "server", test))]
+pub fn refusal_notice(cut_call: Option<&str>) -> String {
+    let call = cut_call.map(|name| format!("{CUT_CALL_START}{name}{CUT_CALL_END}")).unwrap_or_default();
+    format!("{REFUSAL_NOTICE_START}{call}")
+}
+
+/// A refusal notice's dropped call, if it names one; `None` for any other
+/// text.
+pub fn parse_refusal_notice(text: &str) -> Option<Option<String>> {
+    parse_cut_call(text.strip_prefix(REFUSAL_NOTICE_START)?)
+}
+
+/// The end of a cut-off or refusal notice: nothing, or the call it was
+/// stopped in (`CUT_CALL_START`…`CUT_CALL_END`). `None` for anything else.
+fn parse_cut_call(rest: &str) -> Option<Option<String>> {
+    if rest.is_empty() {
+        return Some(None);
+    }
+    let name = rest.strip_prefix(CUT_CALL_START)?.strip_suffix(CUT_CALL_END)?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(Some(name.to_string()))
+}
+
 /// How a cut-off notice names the call it was cut in (`cut_off_notice`).
 const CUT_CALL_START: &str = " It stopped in the middle of a call to `";
 const CUT_CALL_END: &str = "`, which was dropped and not run.";
@@ -150,16 +181,7 @@ pub fn parse_cut_off_notice(text: &str) -> Option<(u32, ReplyLimit, Option<Strin
     let (tokens, rest) = rest.split_once(" tokens (")?;
     let (reason, rest) = rest.split_once(')')?;
     let limit = ReplyLimit::ALL.into_iter().find(|limit| limit.reason() == reason)?;
-    let rest = rest.strip_prefix(" before it finished.")?;
-    let cut_call = if rest.is_empty() {
-        None
-    } else {
-        let name = rest.strip_prefix(CUT_CALL_START)?.strip_suffix(CUT_CALL_END)?;
-        if name.is_empty() {
-            return None;
-        }
-        Some(name.to_string())
-    };
+    let cut_call = parse_cut_call(rest.strip_prefix(" before it finished.")?)?;
     Some((tokens.parse().ok()?, limit, cut_call))
 }
 

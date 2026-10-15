@@ -1937,13 +1937,117 @@ async fn test_a_cut_off_reply_is_followed_by_a_notice(pool: PgPool) {
 /// A reply cut off at `max_tokens` (60 tokens written): `blocks` in
 /// Anthropic's order, each a content block's SSE events.
 fn cut_off_in_a_call_body(blocks: &[[String; 3]]) -> String {
-    let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}"#;
-    let end = r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":60}}"#;
-    std::iter::once(start)
-        .chain(blocks.iter().flatten().map(String::as_str))
-        .chain([end, r#"{"type":"message_stop"}"#])
+    reply_ending_body(blocks, "max_tokens")
+}
+
+/// A reply of `blocks` (each a content block's SSE events) that ends with
+/// `stop_reason`, 60 tokens written.
+fn reply_ending_body(blocks: &[[String; 3]], stop_reason: &str) -> String {
+    let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}"#.to_string();
+    let end = format!(r#"{{"type":"message_delta","delta":{{"stop_reason":"{stop_reason}"}},"usage":{{"output_tokens":60}}}}"#);
+    std::iter::once(&start)
+        .chain(blocks.iter().flatten())
+        .chain([&end, &r#"{"type":"message_stop"}"#.to_string()])
         .map(|data| format!("data: {data}\n\n"))
         .collect()
+}
+
+/// The roles and contents of the messages request `n` sent.
+fn sent_messages(requests: &std::sync::Mutex<Vec<serde_json::Value>>, n: usize) -> Vec<(String, serde_json::Value)> {
+    requests.lock().expect("the request log")[n]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|m| (m["role"].as_str().expect("a role").to_string(), m["content"].clone()))
+        .collect()
+}
+
+/// B3 (SME-122): an empty reply isn't saved: the API refuses an empty
+/// assistant message once it isn't the last, so every later turn failed.
+#[sqlx::test]
+async fn test_an_empty_reply_is_not_saved_and_the_next_turn_works(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let empty = reply_ending_body(&[], "end_turn");
+    let blank = reply_ending_body(&[text_events(0, " ")], "end_turn");
+    let requests = start_recording_mock_upstream(&pool, vec![empty, blank, text_reply_body("Done.")]).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("an empty reply doesn't fail the turn");
+    let roles: Vec<&str> = saved.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user"], "nothing saved for the empty reply: {saved:?}");
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("a blank reply doesn't fail the turn");
+    let roles: Vec<&str> = saved.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user"], "nothing saved for the blank reply: {saved:?}");
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the next turn");
+    let roles: Vec<String> = sent_messages(&requests, 2).into_iter().map(|(role, _)| role).collect();
+    assert_eq!(roles, ["user", "user", "user"]);
+}
+
+/// B3 (SME-122): a conversation that already holds an empty or blank
+/// assistant message (saved before the fix) recovers: the history leaves
+/// it out.
+#[test]
+fn test_history_leaves_out_an_empty_or_blank_reply() {
+    let text = |t: &str| anthropic::ContentBlock::Text { text: t.to_string() };
+    let history = history_for_request_all(vec![
+        message_with_blocks(1, "user", vec![text("hi")]),
+        message_with_blocks(2, "assistant", vec![]),
+        message_with_blocks(3, "user", vec![text("again")]),
+        message_with_blocks(4, "assistant", vec![text(" \n")]),
+        message_with_blocks(5, "user", vec![text("and?")]),
+        message_with_blocks(6, "assistant", vec![text(""), text("sure")]),
+    ])
+    .expect("parses");
+    let contents: Vec<(String, Vec<anthropic::ContentBlock>)> = history.into_iter().map(|m| (m.role, m.content)).collect();
+    assert_eq!(
+        contents,
+        vec![
+            ("user".to_string(), vec![text("hi")]),
+            ("user".to_string(), vec![text("again")]),
+            ("user".to_string(), vec![text("and?")]),
+            ("assistant".to_string(), vec![text("sure")]),
+        ]
+    );
+}
+
+/// B3 (SME-122): a reply the provider refused partway keeps its text and
+/// is followed by a notice saying so, not saved as if it had finished.
+#[sqlx::test]
+async fn test_a_refused_reply_keeps_its_text_and_says_it_was_refused(pool: PgPool) {
+    use crate::api::chat::refusal_notice;
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let body = reply_ending_body(&[text_events(0, "Here is how to")], "refusal");
+    start_recording_mock_upstream(&pool, vec![body]).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("a refusal doesn't fail the turn");
+
+    let roles: Vec<&str> = saved.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "user"], "{saved:?}");
+    assert_eq!(only_text(&saved[1]), "Here is how to");
+    assert_eq!(only_text(&saved[2]), refusal_notice(None));
+}
+
+/// B3 (SME-122): a reply refused in the middle of a tool call drops the
+/// call (its input may be cut short), as a cut-off does, instead of
+/// failing the turn on the half-written input; with nothing else in the
+/// reply, only the notice is saved.
+#[sqlx::test]
+async fn test_a_reply_refused_in_a_call_drops_the_call(pool: PgPool) {
+    use crate::api::chat::refusal_notice;
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool).await.expect("create conversation");
+    let body = reply_ending_body(&[todowrite_events(0, "toolu_cut", CUT_TODOS)], "refusal");
+    let requests = start_recording_mock_upstream(&pool, vec![body, text_reply_body("Done.")]).await;
+
+    let saved = run_turn(&pool, conversation.id, hello()).await.expect("a refusal in a call doesn't fail the turn");
+
+    let roles: Vec<&str> = saved.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user", "user"], "{saved:?}");
+    assert_eq!(only_text(&saved[1]), refusal_notice(Some("todowrite")));
+    run_turn(&pool, conversation.id, hello()).await.expect("the next turn is accepted");
+    assert!(!requests.lock().expect("the request log")[1].to_string().contains("toolu_cut"), "the dropped call appears nowhere");
 }
 
 /// A text block at `index`, started, written and stopped.

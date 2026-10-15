@@ -39,6 +39,10 @@ pub struct ModelDetails {
     pub tools: Option<bool>,
     /// The most a reply may be: Anthropic's `max_tokens` (SME-111).
     pub max_output: Option<u32>,
+    /// Whether the model takes adaptive thinking, as Anthropic's listing
+    /// says (`capabilities.thinking.types.adaptive`). Haiku 4.5 and older
+    /// models don't, and refuse it: they take a budget (B9, SME-122).
+    pub adaptive_thinking: Option<bool>,
 }
 
 /// One model in a provider's listing, with whatever details the listing
@@ -85,6 +89,9 @@ fn parse_v1_model(entry: &Value) -> Option<ListedModel> {
             .and_then(Value::as_str)
             .map(str::to_string),
         details: ModelDetails {
+            adaptive_thinking: entry
+                .pointer("/capabilities/thinking/types/adaptive/supported")
+                .and_then(Value::as_bool),
             context_window,
             thinking: entry
                 .pointer("/capabilities/thinking/supported")
@@ -142,7 +149,7 @@ fn parse_ollama_show(body: &Value) -> ModelDetails {
         })
         .and_then(|n| n.parse::<u32>().ok())
         .filter(|n| *n > 0);
-    ModelDetails {
+    ModelDetails { adaptive_thinking: None,
         context_window,
         thinking,
         tools: capabilities.as_ref().map(|caps| caps.contains(&"tools")),
@@ -412,6 +419,19 @@ mod tests {
     const OLLAMA_TAGS: &str = include_str!("fixtures/ollama_api_tags.json");
     const OLLAMA_SHOW: &str = include_str!("fixtures/ollama_api_show.json");
     const OLLAMA_PS: &str = include_str!("fixtures/ollama_api_ps.json");
+    const HAIKU_4_5: &str = include_str!("fixtures/anthropic_v1_models_claude_haiku_4_5.json");
+    const HAIKU_5_5: &str = include_str!("fixtures/anthropic_v1_models_claude_haiku_5_5.json");
+
+    /// B9 (SME-122): Anthropic's own entries for Haiku 4.5 and 5.5, as
+    /// captured: 4.5 can't take adaptive thinking, 5.5 can.
+    #[test]
+    fn test_anthropics_entries_say_which_models_take_adaptive_thinking() {
+        let haiku_4_5 = parse_v1_model(&json(HAIKU_4_5)).expect("parses");
+        assert_eq!(haiku_4_5.id, "claude-haiku-4-5-20251001");
+        assert_eq!((haiku_4_5.details.thinking, haiku_4_5.details.adaptive_thinking), (Some(true), Some(false)));
+        let haiku_5_5 = parse_v1_model(&json(HAIKU_5_5)).expect("parses");
+        assert_eq!((haiku_5_5.details.thinking, haiku_5_5.details.adaptive_thinking), (Some(true), Some(true)));
+    }
 
     #[test]
     fn test_anthropics_listing_gives_names_thinking_and_the_next_page() {
@@ -422,7 +442,7 @@ mod tests {
                 id: "claude-opus-5".to_string(),
                 display_name: Some("Claude Opus 5".to_string()),
                 // The docs' example says 0 tokens: a placeholder, not a size.
-                details: ModelDetails { context_window: None, thinking: Some(true), tools: None, max_output: None },
+                details: ModelDetails { adaptive_thinking: Some(true), context_window: None, thinking: Some(true), tools: None, max_output: None },
             }]
         );
         assert_eq!(next.as_deref(), Some("last_id"), "has_more, so continue after last_id");
@@ -436,7 +456,7 @@ mod tests {
             vec![ListedModel {
                 id: "flash-next".to_string(),
                 display_name: None,
-                details: ModelDetails { context_window: Some(262_144), thinking: None, tools: None, max_output: None },
+                details: ModelDetails { adaptive_thinking: None, context_window: Some(262_144), thinking: None, tools: None, max_output: None },
             }]
         );
         assert_eq!(next, None, "no has_more");
@@ -476,7 +496,7 @@ mod tests {
         ListedModel {
             id: id.to_string(),
             display_name: None,
-            details: ModelDetails { context_window: window, thinking: None, tools: None, max_output: None },
+            details: ModelDetails { adaptive_thinking: None, context_window: window, thinking: None, tools: None, max_output: None },
         }
     }
 
@@ -485,7 +505,7 @@ mod tests {
         let info = parse_llama_props(&json(LLAMA_CPP_PROPS));
         let mut one = vec![listed("anything", Some(4096))];
         apply_llama_props(&mut one, &info);
-        assert_eq!(one[0].details, ModelDetails { context_window: Some(262_144), thinking: None, tools: Some(true), max_output: None }, "the only one listed");
+        assert_eq!(one[0].details, ModelDetails { adaptive_thinking: None, context_window: Some(262_144), thinking: None, tools: Some(true), max_output: None }, "the only one listed");
 
         let mut several = vec![listed("other", Some(4096)), listed("flash-next", None)];
         apply_llama_props(&mut several, &info);
@@ -521,7 +541,7 @@ mod tests {
         let (models, _) = parse_v1_models(&body).expect("parses");
         assert_eq!(
             models[0].details,
-            ModelDetails { context_window: Some(1_000_000), thinking: Some(false), tools: None, max_output: None }
+            ModelDetails { adaptive_thinking: None, context_window: Some(1_000_000), thinking: Some(false), tools: None, max_output: None }
         );
     }
 
@@ -544,7 +564,7 @@ mod tests {
             parse_ollama_show(&json(OLLAMA_SHOW)),
             // The fixture's capabilities are completion, thinking and
             // vision: no tools. Its trained length (131072) isn't used.
-            ModelDetails { context_window: Some(2048), thinking: Some(true), tools: Some(false), max_output: None }
+            ModelDetails { adaptive_thinking: None, context_window: Some(2048), thinking: Some(true), tools: Some(false), max_output: None }
         );
     }
 
@@ -559,7 +579,7 @@ mod tests {
         let body = json(r#"{"capabilities":["completion","tools","thinking"],"thinking":{"values":[false],"default":false}}"#);
         assert_eq!(
             parse_ollama_show(&body),
-            ModelDetails { context_window: None, thinking: Some(false), tools: Some(true), max_output: None }
+            ModelDetails { adaptive_thinking: None, context_window: None, thinking: Some(false), tools: Some(true), max_output: None }
         );
     }
 
@@ -693,7 +713,7 @@ mod tests {
         let details = model_details(ProviderKind::Ollama, &endpoint, "gemma4").await.expect("details");
         assert_eq!(
             details,
-            ModelDetails { context_window: Some(4096), thinking: Some(false), tools: Some(true), max_output: None }
+            ModelDetails { adaptive_thinking: None, context_window: Some(4096), thinking: Some(false), tools: Some(true), max_output: None }
         );
     }
 
@@ -712,7 +732,7 @@ mod tests {
         let one = r#"{"id":"claude-x","display_name":"X","max_input_tokens":1000000,"capabilities":{"thinking":{"supported":true}},"type":"model"}"#;
         let (endpoint, seen) = mock_provider(vec![("/v1/models/claude-x", one.to_string())]).await;
         let details = model_details(ProviderKind::Anthropic, &endpoint, "claude-x").await.expect("details");
-        assert_eq!(details, ModelDetails { context_window: Some(1_000_000), thinking: Some(true), tools: None, max_output: None });
+        assert_eq!(details, ModelDetails { adaptive_thinking: None, context_window: Some(1_000_000), thinking: Some(true), tools: None, max_output: None });
         let paths: Vec<String> = seen.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(p, _)| p.clone()).collect();
         assert_eq!(paths, vec!["/v1/models/claude-x".to_string()]);
     }
