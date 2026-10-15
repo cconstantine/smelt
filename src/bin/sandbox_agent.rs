@@ -487,12 +487,11 @@ impl Ending {
             };
             return Some((before.to_string(), meaning));
         }
-        let (before, code) = self.previous.as_deref().and_then(|m| split_marker(line, m))?;
-        let meaning = match stream {
-            Stream::Stdout => EndMarker::Exit(code),
-            Stream::Stderr => EndMarker::StderrEnd,
-        };
-        Some((before.to_string(), meaning))
+        // Dropped, and nothing else: counting it as the current command's
+        // would let that one end without waiting for its own stderr, and so
+        // on down the shell (review 1).
+        let (before, _) = self.previous.as_deref().and_then(|m| split_marker(line, m))?;
+        Some((before.to_string(), EndMarker::Stale))
     }
 
     /// The exit code, once both markers have come: clears the in-flight
@@ -1615,6 +1614,30 @@ async fn relay(client: tokio::net::TcpStream) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SME-122 review 1: the last command's marker turning up late (its
+    /// stderr was slow past the fallback) is dropped, and doesn't count as
+    /// the next command's: that one still waits for its own.
+    /// Whether `found` (from `Ending::find`) stands for the in-flight
+    /// command.
+    fn counts_for_current(found: &Option<(String, EndMarker)>) -> bool {
+        matches!(found, Some((_, EndMarker::Exit(_) | EndMarker::StderrEnd)))
+    }
+
+    #[test]
+    fn test_a_late_marker_of_the_last_command_changes_nothing() {
+        let marker = std::sync::Mutex::new(Some("M_A:".to_string()));
+        let mut ending = Ending::default();
+        assert!(ending.find(&marker, "M_A:0", Stream::Stdout).is_some());
+        ending.stdout_code = Some(0);
+        ending.stderr_seen = true; // given up on after the fallback
+        assert_eq!(ending.complete(&marker), Some(0));
+
+        *marker.lock().unwrap_or_else(|e| e.into_inner()) = Some("M_B:".to_string());
+        let late = ending.find(&marker, "M_A:0", Stream::Stderr);
+        assert!(late.is_some(), "the late marker is recognized, so it isn't shown");
+        assert!(!counts_for_current(&late), "it doesn't stand for the current command's marker");
+    }
 
     #[test]
     fn test_split_marker_finds_a_marker_alone_on_its_line() {
