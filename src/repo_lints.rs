@@ -23,7 +23,6 @@ const NOT_COUNTED: &[&str] = &["Cargo.lock", "assets/highlight.css"];
 /// its entry is removed.
 const EXCEPTIONS: &[(&str, Limit)] = &[
     ("src/frontend/pages/chat/transcript.rs", Limit { bytes: 42_561, lines: 917 }),
-    ("src/frontend/pages/providers.rs", Limit { bytes: 57_015, lines: 1_266 }),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
