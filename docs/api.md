@@ -88,6 +88,22 @@ One layer down, `anthropic::stream::stream_anthropic_message` retries a briefly 
 
 In [api/events.md](api/events.md).
 
+### Stopping a turn
+
+In [api/events.md](api/events.md#stopping-a-turn).
+
+### The model's questions (`ask_user`, SME-34)
+
+In [api/events.md](api/events.md#the-models-questions-ask_user-sme-34).
+
+### App-wide events and pods
+
+In [api/events.md](api/events.md#app-wide-events-and-pods).
+
+### The browsing panel's own live channel
+
+In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
+
 ## Current endpoints
 
 | Function | Method + path | Notes |

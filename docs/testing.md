@@ -40,6 +40,22 @@ mod tests {
 
 In [testing/sandbox.md](testing/sandbox.md).
 
+### The pod lifecycle tests (SME-94)
+
+In [testing/sandbox.md](testing/sandbox.md#the-pod-lifecycle-tests-sme-94).
+
+### Docker in the sandbox (SME-33)
+
+In [testing/sandbox.md](testing/sandbox.md#docker-in-the-sandbox-sme-33).
+
+### The sandbox agent's protocol (SME-53)
+
+In [testing/sandbox.md](testing/sandbox.md#the-sandbox-agents-protocol-sme-53).
+
+### Language servers (SME-35)
+
+In [testing/sandbox.md](testing/sandbox.md#language-servers-sme-35).
+
 ## Testing the Anthropic streaming client without the network
 
 In [testing/techniques.md](testing/techniques.md).
@@ -111,6 +127,18 @@ Most logic lives behind the `server` feature; plain `cargo test` compiles but sk
 ## Browser verification
 
 In [testing/browser.md](testing/browser.md).
+
+### Playwright (preferred)
+
+In [testing/browser.md](testing/browser.md#playwright-preferred).
+
+### `scripts/browser-check/` (fallback)
+
+In [testing/browser.md](testing/browser.md#scriptsbrowser-check-fallback).
+
+### `src/browser_tests.rs` (automated)
+
+In [testing/browser-tier.md](testing/browser-tier.md).
 
 ## What's not covered yet
 
