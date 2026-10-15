@@ -1,0 +1,7 @@
+services:
+  postgres:
+    ports:
+      - "5432:5432"
+  k3s:
+    ports:
+      - "6443:6443"

@@ -5727,8 +5727,8 @@ async fn scenario_turn_error_clears_on_a_later_turn(t: &Scenario<'_>) {
     assert!(wait_for_text(&page, "B19-TURN-ERROR", Duration::from_secs(10)).await, "the error never showed");
 
     // Another tab sends: its turn starts, and finishes without an error.
-    publish(conversation.id, ConversationEvent::TurnState { running: true });
-    publish(conversation.id, ConversationEvent::TurnState { running: false });
+    publish(conversation.id, ConversationEvent::TurnState { running: true, elapsed: 0 });
+    publish(conversation.id, ConversationEvent::TurnState { running: false, elapsed: 0 });
 
     assert!(
         wait_for_text_gone(&page, "B19-TURN-ERROR", Duration::from_secs(10)).await,

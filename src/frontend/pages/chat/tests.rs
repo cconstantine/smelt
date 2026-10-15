@@ -1622,9 +1622,9 @@ fn test_a_later_turn_clears_a_turns_error_but_not_a_failed_send() {
 #[test]
 fn test_apply_event_a_turn_starting_clears_an_earlier_error() {
     with_state(|state| {
-        assert_eq!(apply_event(state, ConversationEvent::TurnState { running: true }), EventEffect::TurnStarted);
+        assert_eq!(apply_event(state, ConversationEvent::TurnState { running: true, elapsed: 0 }), EventEffect::TurnStarted);
         assert!(*state.turn_running().peek());
-        assert_eq!(apply_event(state, ConversationEvent::TurnState { running: false }), EventEffect::None);
+        assert_eq!(apply_event(state, ConversationEvent::TurnState { running: false, elapsed: 0 }), EventEffect::None);
     });
 }
 
