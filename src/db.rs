@@ -4535,6 +4535,40 @@ mod tests {
         );
     }
 
+    /// B50 (SME-122): deleting a conversation keeps its calls in the spend
+    /// it was billed for, with no conversation; the conversation's own
+    /// spend goes with it.
+    #[sqlx::test]
+    async fn test_a_deleted_conversations_calls_stay_in_the_spend(pool: PgPool) {
+        let conversation = create_conversation(&pool).await.expect("conversation");
+        let provider = test_provider(&pool, "p").await;
+        record_model_call(
+            &pool,
+            &ModelCall {
+                conversation_id: conversation.id,
+                provider_id: provider.id,
+                model: "m",
+                kind: ModelCallKind::Turn,
+                usage: usage(10, 1, 0, 0),
+                cost_usd: Some(2.0),
+            },
+        )
+        .await
+        .expect("record");
+
+        delete_conversation(&pool, conversation.id).await.expect("delete");
+
+        let since = chrono::Utc::now().naive_utc() - chrono::Duration::days(30);
+        let spend = model_spend_since(&pool, since).await.expect("spend");
+        let rows: Vec<(&str, i64, Option<f64>)> = spend.iter().map(|s| (s.model.as_str(), s.calls, s.cost_usd)).collect();
+        assert_eq!(rows, vec![("m", 1, Some(2.0))], "the deleted conversation's call still counts");
+        let orphaned: Option<i64> = sqlx::query_scalar("SELECT conversation_id FROM model_call_usage")
+            .fetch_one(&pool)
+            .await
+            .expect("the call's row");
+        assert_eq!(orphaned, None);
+    }
+
     /// A turn reads its provider when it starts; the user may delete the
     /// provider before the reply finishes. The call is still recorded, with
     /// no provider, as rows the deletion itself nulls (code review 1).
