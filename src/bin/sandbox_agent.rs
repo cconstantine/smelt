@@ -440,7 +440,9 @@ async fn run_reader(
     finish_ended_shell(&terminal_id, &shell, seq, &tx).await;
 }
 
-/// The longest piece of a line sent as one `Output` (B13, SME-122).
+/// The most bytes of a line read into one `Output` (B13, SME-122); bytes
+/// that aren't UTF-8 decode to U+FFFD's three, so a piece sent is at most
+/// three times this.
 const MAX_OUTPUT_CHUNK: usize = 64 * 1024;
 
 /// How much of a long line's end `take_piece` holds back for the next
@@ -574,7 +576,8 @@ async fn fill_piece<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, buf: &mu
 /// its `\n` or `\r\n` (as `Lines` gave it), or the start of a long one.
 /// Of a long line it keeps the last `MARKER_TAIL` bytes in `buf` for the
 /// next piece, so a marker at its end is found whole, and splits it before
-/// a character's first byte, never inside one.
+/// a character's first byte, never inside one (bytes that aren't UTF-8 are
+/// cut where they fall). Each piece taken is never empty.
 fn take_piece(buf: &mut Vec<u8>) -> String {
     if buf.last() == Some(&b'\n') {
         buf.pop();
@@ -582,10 +585,16 @@ fn take_piece(buf: &mut Vec<u8>) -> String {
             buf.pop();
         }
     } else if buf.len() >= MAX_OUTPUT_CHUNK {
-        let mut at = buf.len() - MARKER_TAIL;
-        while at > 0 && (buf[at] & 0b1100_0000) == 0b1000_0000 {
-            at -= 1;
-        }
+        let cut = buf.len() - MARKER_TAIL;
+        // A character is at most 4 bytes, so its start is at most 3 back.
+        // Bytes that aren't UTF-8 (a run of continuation bytes) have none:
+        // they're cut where they are, which the lossy decode copes with
+        // (review 1: walking back to 0 took nothing and spun for good).
+        let at = (cut.saturating_sub(3)..=cut)
+            .rev()
+            .find(|&i| (buf[i] & 0b1100_0000) != 0b1000_0000)
+            .filter(|&i| i > 0)
+            .unwrap_or(cut);
         let piece = String::from_utf8_lossy(&buf[..at]).into_owned();
         buf.drain(..at);
         return piece;
@@ -2299,12 +2308,19 @@ mod socket_tests {
             ("head -c 200000 /dev/zero | tr '\\0' x; echo", "x".repeat(200_000)),
             ("head -c 200000 /dev/zero | tr '\\0' x", "x".repeat(200_000)),
             ("for i in $(seq 1 40001); do printf '\u{e9}'; done; echo", "\u{e9}".repeat(40_001)),
+            // Review 1: bytes that are all UTF-8 continuation bytes (8-bit
+            // audio's silence, a raw grey image) have no character start to
+            // split before.
+            ("head -c 70000 /dev/zero | tr '\\0' '\\200'; echo", "\u{FFFD}".repeat(70_000)),
         ];
         for (n, (command, line)) in cases.into_iter().enumerate() {
             let (stdout, _, code) = run_collect(&mut client, "t1", &format!("c{n}"), command).await;
             assert_eq!(code, 0, "{command}");
+            // The cap is on bytes read; decoding turns each byte that isn't
+            // UTF-8 into U+FFFD's three.
+            let cap = if line.contains('\u{FFFD}') { 3 * MAX_OUTPUT_CHUNK } else { MAX_OUTPUT_CHUNK };
             assert!(
-                stdout.iter().all(|piece| piece.len() <= MAX_OUTPUT_CHUNK),
+                stdout.iter().all(|piece| piece.len() <= cap),
                 "{command}: pieces of {:?} bytes",
                 stdout.iter().map(String::len).collect::<Vec<_>>()
             );
