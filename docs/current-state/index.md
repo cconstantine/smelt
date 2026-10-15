@@ -15,7 +15,7 @@ A single-user, 100%-Rust AI coding agent. Every conversation is a coding session
 
 ## Explicitly out of scope (v1)
 
-* Every tool is real (the `run_async` task suite and its stand-ins `add`/`count`/`echo` were removed by SME-54; long-running work goes through terminal commands) — see SME-28 for what's still open on top of them (repos and credentials in the sandbox have since shipped with SME-32).
+* Every tool is real (the `run_async` task suite and its stand-ins `add`/`count`/`echo` were removed by SME-54; long-running work goes through terminal commands) — SME-28's leftovers are SME-78 and SME-79 below (repos and credentials in the sandbox shipped with SME-32).
 * Multi-user accounts or login.
 * Renaming conversations. (Deleting is supported — see [api.md](<https://github.com/cconstantine/smelt/blob/main/docs/api.md>).)
 * A single shell dying (or the agent itself) while the rest of the pod survives isn't specifically detected — per SME-12's finding, a real OOM kill on this cluster always takes the whole pod down together, so this narrow case (something other than OOM — a bash bug, a stray signal — killing just one shell) is a real but lower-priority gap, not the common case.
@@ -23,10 +23,12 @@ A single-user, 100%-Rust AI coding agent. Every conversation is a coding session
 
 ## Goals for what comes next
 
-The open tickets, by theme (Backlog unless marked Todo):
+The open tickets, by theme (Backlog unless marked):
 
-* **What the model can do:** SME-28 (the rest of a coding session: deleting idle pods, a per-command time limit), SME-29 (model safety, including confirmation before destructive actions), SME-36 (a multi-file patch tool), SME-37 (skills), SME-38 (subagents), SME-31 (MCP servers running alongside the sandbox), SME-73 (compact and carry on when a turn overflows the context).
-* **The UI:** SME-44 (VS Code into a sandbox, Todo).
-* **Security:** SME-45 (previews only for signed-in users), SME-47 (unprivileged Docker, blocked on the homelab node's Linux 5.10), SME-48 (SSH keys encrypted and out of the model's reach), SME-63 (Chrome's sandbox, pod service-account tokens, network policy).
-* **Structure, from bug bash 3's review:** SME-55 (typed statuses), SME-57 (split the chat page: the components are split into `pages/chat/` in its first PR; the per-conversation store, the reducer, render performance and SME-58's chat-page items follow), SME-58 (frontend cleanups), SME-62 (robustness leftovers).
-* **Tests, CI and ops:** SME-66 (real-cluster tests for pypi/cargo installs), SME-87 (why dx's server build sometimes hangs in CI; since SME-67 the job stops it and carries on), SME-68 (a flaky browser test), SME-64 (language servers on the homelab cluster), SME-50 (a pod-exec script).
+* **What the model can do:** SME-78 (stop idle sandbox pods, Up Next), SME-79 (a time limit on a terminal command, Up Next), SME-73 (compact and carry on when a turn overflows the context, Up Next), SME-29 (model safety, including confirmation before destructive actions), SME-36 (a multi-file patch tool), SME-37 (skills), SME-38 (subagents), SME-31 (MCP servers running alongside the sandbox).
+* **Models and providers:** SME-162 (a provider's limit on concurrent requests, Up Next), SME-109 (pick a cost-effective provider), SME-110 (a ChatGPT plan), SME-74 and SME-98 (keep earlier reasoning across a model, prompt or tool change), SME-120 (thinking blocks whose text is omitted), SME-116 (reasoning priced higher reads low).
+* **The UI:** SME-71 (desktop notifications, Up Next), SME-44 (VS Code into a sandbox), SME-138 (Copy over plain HTTP), SME-160 ("Working" timer, In Progress), and design review 2 (SME-123, Todo).
+* **Security:** SME-45 (previews only for signed-in users), SME-47 (unprivileged Docker, blocked on the homelab node's Linux 5.10), SME-48 (SSH keys encrypted and out of the model's reach), SME-63 (Chrome's sandbox, pod service-account tokens, network policy), SME-128 (listen on loopback only), SME-131 (state-changing remote calls a timeout can cancel), SME-139 (a release build aborts on any panic).
+* **Bugs:** bug bash 4's SME-165 to SME-190, and SME-136, SME-146, SME-148, SME-150, SME-151.
+* **Structure:** SME-55 (typed statuses), SME-163 (a repo friendlier to LLM sessions, Up Next).
+* **Tests, CI and ops:** SME-96 (check servers' previews, Up Next), SME-66, SME-87, SME-64, SME-50, SME-97, SME-101, SME-103, SME-124, SME-130, SME-133, SME-140, SME-141, SME-142, SME-145, SME-147 and SME-161 (flaky tests), SME-149, SME-152, SME-154, SME-158, SME-159, SME-164.
