@@ -49,6 +49,21 @@ impl From<db::McpServerConfig> for McpServerSummary {
     }
 }
 
+/// Whether `url`, an authorization URL built from an MCP server's OAuth
+/// metadata, is safe for the browser to navigate to (B4, SME-122): only
+/// `http://` or `https://`, in any case. The metadata comes from the MCP
+/// server's authorization server, which smelt doesn't trust, and a
+/// `javascript:` (or `data:`) `authorization_endpoint` would run in
+/// smelt's own origin when Connect navigates to it. A leading space or
+/// control character is refused too: a browser strips those before reading
+/// the scheme. Checked by `mcp_oauth::start` before handing the URL out,
+/// and again by the edit page before it navigates.
+pub fn is_navigable_authorization_url(url: &str) -> bool {
+    let head: String = url.chars().take("https://".len()).collect();
+    let head = head.to_ascii_lowercase();
+    head.starts_with("https://") || head.starts_with("http://")
+}
+
 /// Whether a server's tools are actually reachable right now — driven by a
 /// real connection attempt (`crate::mcp::connection_check`), not a cached
 /// guess. See `/mcp-servers`' index badge and its edit page's full status.
@@ -225,6 +240,30 @@ pub async fn disconnect_mcp_server_oauth(id: i64) -> ServerFnResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_only_http_and_https_authorization_urls_are_navigable() {
+        for ok in [
+            "https://auth.example.com/authorize?state=x",
+            "http://127.0.0.1:9000/authorize",
+            "HTTPS://auth.example.com/authorize",
+        ] {
+            assert!(is_navigable_authorization_url(ok), "{ok:?} should be navigable");
+        }
+        for bad in [
+            "javascript:alert(1)//",
+            "JavaScript:alert(1)",
+            " javascript:alert(1)",
+            "\tjavascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "java\nscript:alert(1)",
+            "//evil.example.com/authorize",
+            "",
+            "https:",
+        ] {
+            assert!(!is_navigable_authorization_url(bad), "{bad:?} should be refused");
+        }
+    }
 
     /// Every status crosses to the browser as a server function's result.
     #[test]
