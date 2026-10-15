@@ -30,7 +30,7 @@ const EXCEPTIONS: &[(&str, Limit)] = &[
     ("src/frontend/pages/chat/tests.rs", Limit { bytes: 88_347, lines: 2_158 }),
     ("src/frontend/pages/chat/transcript.rs", Limit { bytes: 42_561, lines: 917 }),
     ("src/frontend/pages/providers.rs", Limit { bytes: 57_015, lines: 1_266 }),
-    ("src/git.rs", Limit { bytes: 123_125, lines: 2_624 }),
+    ("src/git/server.rs", Limit { bytes: 58_271, lines: 1_494 }),
     ("src/sandbox/agent.rs", Limit { bytes: 40_800, lines: 924 }),
     ("src/sandbox/agent_connection_tests.rs", Limit { bytes: 43_483, lines: 864 }),
     ("src/sandbox/manager.rs", Limit { bytes: 66_172, lines: 1_521 }),
