@@ -570,11 +570,16 @@ async fn sleep_until_or_never(deadline: Option<tokio::time::Instant>) {
 /// a line saying what happened; before, it stayed running for good.
 async fn finish_ended_shell(terminal_id: &str, shell: &Shell, seq: u64, tx: &mpsc::UnboundedSender<ShellEvent>) {
     let code = shell_exit_code(shell).await;
-    let in_flight = shell.marker.lock().unwrap_or_else(|e| e.into_inner()).take().is_some();
-    // Taken before the shell is marked ended, so a new shell's command
-    // can't be the one this exit goes to.
-    let id = shell.current.lock().await.take();
+    // All under `current`'s lock, which `start_command` claims a command
+    // under: a command claimed before this has its marker seen and gets its
+    // exit here, and one after it sees `ended` and goes to a new shell
+    // (review 2). The id is taken under the same lock, so a new shell's
+    // command can't be the one this exit goes to.
+    let mut current = shell.current.lock().await;
     shell.ended.store(true, Ordering::SeqCst);
+    let in_flight = shell.marker.lock().unwrap_or_else(|e| e.into_inner()).take().is_some();
+    let id = current.take();
+    drop(current);
     if in_flight {
         let _ = tx.send(ShellEvent::Line {
             terminal_id: terminal_id.to_string(),
@@ -1462,6 +1467,14 @@ async fn start_command(state: &Arc<AppState>, terminal_id: &str, id: String, com
     };
 
     let mut current = shell.current.lock().await;
+    // The shell ended between `shell_for_command` and this lock: its end
+    // has been handled (under this lock, `finish_ended_shell`), so a command
+    // claimed now would get no exit. Go round again for a new shell
+    // (review 2).
+    if shell.ended.load(Ordering::SeqCst) {
+        drop(current);
+        return Box::pin(start_command(state, terminal_id, id, command)).await;
+    }
     if current.is_some() {
         // Should already be prevented server-side (see SME-9's plan) — this is
         // a defensive backstop, not the primary enforcement, so a quiet
@@ -2637,6 +2650,32 @@ mod socket_tests {
             })
             .collect();
         assert_eq!(exits, vec![("c1".to_string(), 3), ("c2".to_string(), 0)], "{messages:?}");
+    }
+
+    /// SME-122 review 2: a command claimed just as an idle shell dies (it
+    /// holds `current` while the shell's end is being handled) still gets
+    /// an exit, instead of being lost and staying running for good.
+    #[tokio::test]
+    async fn test_a_command_claimed_as_the_shell_dies_still_exits() {
+        let state = new_state();
+        assert_eq!(super::create_terminal(&state, "t1".to_string()).await, Reply::TerminalCreated);
+        let shell = state.terminals.lock().await.get("t1").cloned().expect("the terminal");
+
+        // As `start_command` does, between its `ended` check and its claim.
+        let mut current = shell.current.lock().await;
+        signal::kill(Pid::from_raw(-(shell.bash_pid as i32)), Signal::SIGKILL).expect("kill the shell");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        *current = Some("cB".to_string());
+        *shell.marker.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_marker());
+        drop(current);
+
+        let mut exits = Vec::new();
+        while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(2), recv_shell_event(&state)).await {
+            if let Some(AgentMessage::Exit { id, .. }) = event_message(event) {
+                exits.push(id);
+            }
+        }
+        assert_eq!(exits, vec!["cB".to_string()]);
     }
 
     /// An event the agent took off the queue but couldn't send (smelt's end
