@@ -60,7 +60,8 @@ pub async fn watch_pods(pool: PgPool) {
             Ok(watcher::Event::Init) => listed.clear(),
             Ok(watcher::Event::InitApply(pod)) => {
                 if let Some(restart) = note_docker_restarts(&mut docker_restarts, &pod, true) {
-                    handle_docker_restart(&pool, restart).await;
+                    crate::telemetry::in_span(pod_event_span("docker_restart", &pod), handle_docker_restart(&pool, restart))
+                        .await;
                 }
                 crate::lsp::pods::note_server_stop(&mut stopped_servers, &pod, true);
                 if let Some(pod_id) = watched_pod_id(&pod) {
@@ -71,16 +72,21 @@ pub async fn watch_pods(pool: PgPool) {
             }
             Ok(watcher::Event::InitDone) => {
                 forget_unlisted_docker(&mut docker_restarts, &listed);
-                match db::live_pods_older_than(&pool, RECONCILE_MIN_AGE_SECS).await {
-                    Ok(rows) => {
-                        for row in rows.into_iter().filter(|row| !listed.contains(&row.id)) {
-                            close_if_gone(&pool, row.id).await;
+                let reconcile = async {
+                    match db::live_pods_older_than(&pool, RECONCILE_MIN_AGE_SECS).await {
+                        Ok(rows) => {
+                            for row in rows.into_iter().filter(|row| !listed.contains(&row.id)) {
+                                close_if_gone(&pool, row.id).await;
+                            }
                         }
+                        Err(e) => tracing::warn!(error = %e, "couldn't list pod records to reconcile"),
                     }
-                    Err(e) => tracing::warn!(error = %e, "couldn't list pod records to reconcile"),
-                }
+                };
+                crate::telemetry::in_span(tracing::info_span!("pod_reconcile"), reconcile).await;
             }
             Ok(watcher::Event::Apply(pod)) if pod_has_finished(&pod) => {
+                let span = pod_event_span("finished", &pod);
+                let _event = span.enter();
                 if let Some(stopped) = crate::lsp::pods::note_server_stop(&mut stopped_servers, &pod, false) {
                     crate::turn::notify(
                         &pool,
@@ -94,10 +100,13 @@ pub async fn watch_pods(pool: PgPool) {
             }
             Ok(watcher::Event::Apply(pod)) => {
                 if let Some(restart) = note_docker_restarts(&mut docker_restarts, &pod, false) {
-                    handle_docker_restart(&pool, restart).await;
+                    crate::telemetry::in_span(pod_event_span("docker_restart", &pod), handle_docker_restart(&pool, restart))
+                        .await;
                 }
             }
             Ok(watcher::Event::Delete(pod)) => {
+                let span = pod_event_span("deleted", &pod);
+                let _event = span.enter();
                 if let Some(pod_id) = watched_pod_id(&pod) {
                     docker_restarts.remove(&pod_id);
                     close_after_grace(pool.clone(), pod_id);
@@ -115,6 +124,18 @@ pub async fn watch_pods(pool: PgPool) {
 /// by their ids (Docker restarts, language server stops, closed records).
 pub(super) fn watcher_config(instance: &str) -> kube::runtime::watcher::Config {
     kube::runtime::watcher::Config::default().labels(&format!("{INSTANCE_LABEL}={instance}"))
+}
+
+/// The span for a pod event the watch acts on (SME-137): `event` says
+/// what it saw. The watch itself has none: a span that never ends never
+/// exports.
+pub(super) fn pod_event_span(event: &str, pod: &Pod) -> tracing::Span {
+    tracing::info_span!(
+        "pod_event",
+        event,
+        pod = pod.metadata.name.as_deref().unwrap_or_default(),
+        phase = pod.status.as_ref().and_then(|s| s.phase.as_deref()).unwrap_or_default(),
+    )
 }
 
 /// The smelt pod id behind a watched pod (`sandbox-{id}`), or `None` for

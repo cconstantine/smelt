@@ -122,7 +122,9 @@ pub async fn guard(request: Request, next: Next) -> Response {
     static ALLOWED: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(allowed_hosts_from_env);
     match refusal(request.method(), request.headers(), &ALLOWED) {
         Some(reason) => {
-            tracing::warn!(method = %request.method(), uri = %request.uri(), %reason, "refused a request");
+            // The path only: a query can carry an OAuth code, and this line is
+            // exported with the request's span (SME-137).
+            tracing::warn!(method = %request.method(), path = %request.uri().path(), %reason, "refused a request");
             (StatusCode::FORBIDDEN, reason).into_response()
         }
         None => next.run(request).await,

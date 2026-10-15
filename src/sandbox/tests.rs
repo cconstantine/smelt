@@ -100,6 +100,26 @@ fn test_pod_spec_leaves_the_sandbox_container_unprivileged() {
     );
 }
 
+/// Every image the system runs is built linux/amd64 only
+/// (`publish-images.yml` has no `platforms:`), so a sandbox pod must never
+/// be scheduled onto a node of another architecture, where its pull would
+/// fail on a platform mismatch. `kubernetes.io/arch: amd64` is that pin;
+/// x86_64 is what Kubernetes calls amd64.
+#[test]
+fn test_pod_spec_pins_pods_to_amd64_nodes() {
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let selector = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_selector.as_ref())
+        .expect("a pod should say the arch it may land on");
+    assert_eq!(
+        selector.get("kubernetes.io/arch").map(String::as_str),
+        Some("amd64"),
+        "every image is linux/amd64; a pod must never reach another arch"
+    );
+}
+
 #[test]
 fn test_pod_spec_shares_workspace_and_socket_but_keeps_docker_data_in_the_sidecar() {
     let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
@@ -600,6 +620,78 @@ fn test_pod_container_limits_include_the_docker_sidecar() {
     assert_eq!(
         pod_container_limits(&pod),
         (vec!["1Gi".to_string(), "2Gi".to_string()], Vec::<String>::new())
+    );
+}
+
+/// The setting is a deployment's, not a test's, so nothing here sets it: what
+/// the spec asks for has to be whatever `default_image_pull_policy` resolves
+/// to, for both containers, which is the whole point of one setting covering
+/// the pair.
+#[test]
+fn test_both_containers_fetch_their_image_with_the_same_policy() {
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let spec = pod.spec.expect("a pod spec");
+    for container in spec.containers.iter().chain(spec.init_containers.iter().flatten()) {
+        assert_eq!(
+            container.image_pull_policy.as_deref(),
+            Some(default_image_pull_policy()),
+            "{}: the pod's two images are fetched the same way",
+            container.name
+        );
+    }
+}
+
+#[test]
+fn test_an_unset_or_unrecognised_pull_policy_never_pulls() {
+    assert_eq!(image_pull_policy_from(None), "Never");
+    assert_eq!(image_pull_policy_from(Some("")), "Never", "an empty setting is no setting");
+    // A typo is the default, not a pod Kubernetes refuses to create;
+    // default_image_pull_policy logs what it ignored.
+    assert_eq!(image_pull_policy_from(Some("registry")), "Never");
+}
+
+#[test]
+fn test_a_pull_policy_is_read_in_any_case_with_the_spaces_trimmed() {
+    assert_eq!(image_pull_policy_from(Some("ifnotpresent")), "IfNotPresent", "Kubernetes spells it");
+    assert_eq!(image_pull_policy_from(Some(" ALWAYS ")), "Always");
+}
+
+/// A sandbox pod carries pull credentials only if the deployment names some,
+/// and names them for the pod as a whole rather than per container — the same
+/// one-setting-covers-both-images shape as the pull policy.
+#[test]
+fn test_a_pod_carries_the_pull_credentials_the_deployment_names() {
+    let pod = build_pod_spec("sandbox-1", "1Gi", &docker_for_conversation(42), &[], TEST_INSTANCE);
+    let named = |secrets: Option<Vec<LocalObjectReference>>| {
+        secrets.unwrap_or_default().into_iter().map(|secret| secret.name).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        named(pod.spec.expect("a pod spec").image_pull_secrets),
+        named(default_image_pull_secrets()),
+        "the pod asks for exactly the credentials the setting names"
+    );
+}
+
+#[test]
+fn test_a_pull_secret_setting_names_no_credentials_when_it_names_nothing() {
+    assert!(image_pull_secrets_from(None).is_empty());
+    assert!(image_pull_secrets_from(Some("")).is_empty(), "an empty setting is no setting");
+    assert!(image_pull_secrets_from(Some(" , ")).is_empty(), "a blank entry is no entry");
+}
+
+#[test]
+fn test_pull_secrets_are_named_one_per_comma_with_the_spaces_trimmed() {
+    let named = |setting: &str| {
+        image_pull_secrets_from(Some(setting))
+            .into_iter()
+            .map(|secret| secret.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(named("ghcr"), ["ghcr".to_string()]);
+    assert_eq!(
+        named("ghcr, smelt-park-harbor ,"),
+        ["ghcr".to_string(), "smelt-park-harbor".to_string()],
+        "several registries, and the trailing comma is no secret"
     );
 }
 
@@ -3779,8 +3871,17 @@ async fn test_sandbox_futures_stay_small() {
         // the wait for `Running` holds; these two do (SME-132 review 1).
         // The wait's bound is tighter than twice its 2760 bytes: its
         // timed-out report, unboxed, takes it to 4520.
-        ("create_pod_attempt", std::mem::size_of_val(&create_pod_attempt(&pool, 1, PodLimitOverrides::default())), 19000),
-        ("wait_for_running_with_timeout", std::mem::size_of_val(&wait_for_running_with_timeout(&pods_api(&client), "sandbox-1", Duration::from_secs(1))), 3600),
+        // SME-137: these two are their spans' wrappers, which box the work,
+        // so they stay small (unboxed, the wait's was 5984 bytes); the
+        // work's own futures, `_unspanned`, keep the bounds they had.
+        ("create_pod_attempt", std::mem::size_of_val(&create_pod_attempt(&pool, 1, PodLimitOverrides::default())), 1000),
+        ("wait_for_running_with_timeout", std::mem::size_of_val(&wait_for_running_with_timeout(&pods_api(&client), "sandbox-1", Duration::from_secs(1))), 1000),
+        ("wait_for_running_unspanned", std::mem::size_of_val(&wait_for_running_unspanned(&pods_api(&client), "sandbox-1", Duration::from_secs(1))), 3600),
+        ("create_pod_attempt_unspanned", std::mem::size_of_val(&create_pod_attempt_unspanned(&pool, 1, PodLimitOverrides::default())), 19000),
+        // Given spans on SME-137 (7664, 840 and 7200 bytes then).
+        ("start_or_get_pod", std::mem::size_of_val(&start_or_get_pod(&pool, 1)), 15400),
+        ("terminate_pod", std::mem::size_of_val(&terminate_pod(&pool, 1)), 1700),
+        ("teardown_conversation", std::mem::size_of_val(&teardown_conversation(&pool, 1, &[])), 14400),
         // SME-144 moved its publishes around the send: 664 bytes then.
         ("run_command", std::mem::size_of_val(&run_command(&pool, 1, 1, "cmd", "true")), 1300),
     ];
@@ -3790,6 +3891,43 @@ async fn test_sandbox_futures_stay_small() {
     for (name, size, bound) in sizes {
         assert!(size <= bound, "{name}'s future is {size} bytes, over its bound of {bound}");
     }
+}
+
+/// SME-137: a wait for `Running` is a `wait_for_running` span naming its
+/// pod and timeout, failed when the wait fails.
+#[tokio::test]
+async fn test_a_wait_that_cant_reach_the_cluster_is_a_failed_span() {
+    let client = unreachable_client();
+    let (waited, spans) = crate::telemetry::capture_spans(wait_for_running_with_timeout(
+        &pods_api(&client),
+        "sandbox-9137000001",
+        Duration::from_secs(5),
+    ))
+    .await;
+    assert!(waited.is_err());
+    let span = spans.iter().find(|span| span.name == "wait_for_running").expect("the wait's span");
+    assert!(span.attributes.iter().any(|kv| kv.key.as_str() == "pod" && kv.value == "sandbox-9137000001".into()), "{span:?}");
+    assert!(span.attributes.iter().any(|kv| kv.key.as_str() == "timeout_s" && kv.value == 5_i64.into()), "{span:?}");
+    assert!(matches!(span.status, opentelemetry::trace::Status::Error { .. }), "{:?}", span.status);
+}
+
+/// SME-137: a pod event the watch acts on is a short `pod_event` span with
+/// the pod and its phase.
+#[tokio::test]
+async fn test_a_pod_event_span_names_the_pod_and_phase() {
+    let mut pod = Pod::default();
+    pod.metadata.name = Some("sandbox-9137000002".to_string());
+    pod.status = Some(k8s_openapi::api::core::v1::PodStatus { phase: Some("Failed".to_string()), ..Default::default() });
+    let ((), spans) = crate::telemetry::capture_spans(async {
+        crate::telemetry::in_span(watch::pod_event_span("finished", &pod), async {}).await;
+    })
+    .await;
+    let [span] = spans.as_slice() else { panic!("one span: {spans:?}") };
+    assert_eq!(span.name, "pod_event");
+    let attribute = |key: &str| span.attributes.iter().find(|kv| kv.key.as_str() == key).map(|kv| kv.value.clone());
+    assert_eq!(attribute("pod"), Some("sandbox-9137000002".into()));
+    assert_eq!(attribute("phase"), Some("Failed".into()));
+    assert_eq!(attribute("event"), Some("finished".into()));
 }
 
 /// SME-94 review 1: `use_test_manager` refuses a multi-thread runtime,
@@ -3847,8 +3985,16 @@ mod cluster {
         });
         pods.create(&PostParams::default(), &pod).await.expect("create the pod");
 
-        let waited = wait_for_running_with_timeout(&pods, &name, Duration::from_secs(20)).await;
+        let (waited, spans) =
+            crate::telemetry::capture_spans(wait_for_running_with_timeout(&pods, &name, Duration::from_secs(20))).await;
         pods.delete(&name, &immediate_delete_params()).await.ok();
+
+        // SME-137: the timed-out wait is a failed span naming the pod.
+        let span = spans.iter().find(|span| span.name == "wait_for_running").expect("the wait's span");
+        assert!(span.attributes.iter().any(|kv| kv.key.as_str() == "pod" && kv.value == name.clone().into()), "{span:?}");
+        assert!(span.attributes.iter().any(|kv| kv.key.as_str() == "timeout_s" && kv.value == 20_i64.into()), "{span:?}");
+        let opentelemetry::trace::Status::Error { description } = &span.status else { panic!("{:?}", span.status) };
+        assert!(description.contains("FailedMount"), "the wait's detail: {description}");
 
         let detail = match waited {
             Err(SandboxError::Timeout(Some(detail))) => detail,

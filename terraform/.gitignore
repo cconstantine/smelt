@@ -1,0 +1,6 @@
+# Terraform state holds the generated database password in plain text, and the
+# test root's state is a sandbox artifact — never commit either.
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log

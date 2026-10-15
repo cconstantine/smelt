@@ -1,0 +1,138 @@
+name: Publish images
+
+# Builds and publishes the two images a real deployment runs on, from one
+# commit, so a server and its sandbox agent always come from the same tree.
+# CI (ci.yml) tests a tree against its own images built locally; this is the
+# one that makes images other machines can pull.
+#
+# Nothing here waits on CI: every branch push publishes its own images, tests
+# or no, and only main moves `latest`. Both are plain Docker builds — the
+# sandbox image is a normal image (docker/sandbox/Dockerfile needs nothing but
+# its own binary in its context), and publishing it is what retires the
+# registry-free `ctr images import` delivery in scripts/build-sandbox-image.sh
+# for a real deployment. What a deployment then sets is SANDBOX_IMAGE,
+# SANDBOX_IMAGE_PULL_POLICY (and SANDBOX_IMAGE_PULL_SECRET for a private
+# package); docs/setup.md's "Deploying" covers it.
+
+on:
+  # Every branch publishes its own images — the `<sha>` tag is what a
+  # deployment pins, and publishing from a branch is how a deployment gets
+  # tried before anything merges. Only main moves `latest`.
+  push:
+    branches: ['**']
+  workflow_dispatch:
+    inputs:
+      # Build something other than what you're running on. The tags come from
+      # whatever ref this runs on.
+      ref:
+        description: 'Ref to build (branch, tag or sha)'
+        required: false
+        default: 'main'
+
+concurrency:
+  # Queue, don't cancel: two pushes landing together should each end with an
+  # image of its own, and `latest` moving backwards would be worse than waiting.
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  server-image:
+    runs-on: ubuntu-latest
+    # A cold build is a full release `dx bundle` of the app, with nothing
+    # shared with CI's caches (those build a debug dev image, not this one).
+    # Measured: 8.5 min for the release build stage on 32 cores, so the 4-core
+    # runner needs roughly eight times that — and a quiet build long after
+    # "Client build completed successfully" is dx's server half hanging
+    # (SME-67), which is what this timeout, not a runner limit, ends.
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.sha }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR repository names must be lowercase, hence the tr. `<sha>` always;
+      # `latest` only for main, so a hand-run build of a branch can't move it.
+      - name: Image tags
+        id: meta
+        run: |
+          org=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          tags="ghcr.io/$org/smelt:${GITHUB_SHA::12}"
+          [ "$GITHUB_REF" = "refs/heads/main" ] && tags="$tags,ghcr.io/$org/smelt:latest"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      # `--target runtime` builds the server binary and its web bundle, then
+      # copies both into a slim runtime along with headless Chrome; the build
+      # stages are dropped. A quiet build long after "Client build completed
+      # successfully" is dx's server half hanging (SME-67) — the job's
+      # timeout, not a runner limit, is what ends that.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+
+  sandbox-image:
+    runs-on: ubuntu-latest
+    # The agent needs the same dependency tree compiled in release, minus the
+    # wasm half — and the build environment image on top of that.
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.sha }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The agent binary, compiled in the repo's own build environment rather
+      # than on the runner: the same image and toolchain the server image builds
+      # with, so its glibc matches what docker/sandbox/Dockerfile runs it on
+      # (docs/setup.md). scripts/build-sandbox-agent.sh leaves the result at
+      # target/sandbox-agent/sandbox_agent, which is the image's whole context.
+      - name: Build the sandbox agent
+        run: |
+          docker build -f Dockerfile --target build-env -t smelt-build-env .
+          docker run --rm -v "$PWD:/app" -w /app smelt-build-env \
+            scripts/build-sandbox-agent.sh --release
+
+      # As for the server image, plus the name this tree's agent sources hash
+      # to — the same 16 hex digits scripts/sandbox-image-ref prints — so the
+      # image a node was given through the old import route is still findable
+      # by the name it had there.
+      - name: Image tags
+        id: meta
+        run: |
+          org=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          hash=$(scripts/agent-sources-hash)
+          name="ghcr.io/$org/smelt-sandbox"
+          tags="$name:${GITHUB_SHA::12},$name:src-${hash:0:16}"
+          [ "$GITHUB_REF" = "refs/heads/main" ] && tags="$tags,$name:latest"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: target/sandbox-agent
+          file: docker/sandbox/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}

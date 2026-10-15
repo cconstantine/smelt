@@ -118,7 +118,7 @@ pub(super) fn tools() -> Vec<Tool> {
 
 async fn open_browser_session_tool(pool: &PgPool, conversation_id: i64) -> Result<String, String> {
     let sandbox = crate::egress_proxy::sandbox_dial(pool.clone(), conversation_id);
-    crate::browsing::open_session(conversation_id, sandbox).await?;
+    crate::browsing::open_session(conversation_id, Some(sandbox)).await?;
     Ok("browser session opened".to_string())
 }
 
