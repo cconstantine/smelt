@@ -58,7 +58,7 @@ scripts/build-sandbox-image.sh
 # (`open_browser_session`/`browser_navigate`/... plus the live panel) built
 # on the same shared browser, all navigate a real headless browser
 # (`chromiumoxide`, driving `chrome-headless-shell` over CDP) — not just
-# `src/browser_tests.rs`'s own test tier anymore. `scripts/browser-check/setup.sh`
+# `src/browser_tests/`'s own test tier anymore. `scripts/browser-check/setup.sh`
 # downloads the binary plus its missing shared libraries into
 # `.browser-check-cache/` (gitignored) — no root needed, safe to re-run.
 # `BROWSER_CHECK_CACHE` moves that directory, for setup.sh and for smelt

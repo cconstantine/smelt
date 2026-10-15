@@ -31,7 +31,7 @@ It comments on the ticket, `Project Manager: moved to Up Next because …`, nami
 
 Too much planned at once goes stale: once one plan merges, every other plan that changes the same files is out of date. So a ticket isn't planned while its plan would overlap work that hasn't shipped.
 - **When to stop.** A Planner first works out which files its plan would change. It stops if any of them is also changed by a ticket in **Planned, Todo or In Progress**, or if its plan would rest on such a ticket's code, schema, tools or decisions.
-- **What doesn't count:** `docs/*`, `Cargo.toml` and `Cargo.lock`, and new scenarios appended to `src/browser_tests.rs`. Rewriting an existing scenario counts.
+- **What doesn't count:** `docs/*`, `Cargo.toml` and `Cargo.lock`, and new scenarios added to `src/browser_tests/` (a file of their own, or appended to one). Rewriting an existing scenario counts.
 - **What it leaves behind.** It stops the plan where it is. It writes into the ticket what it found so far: the files, anything critical, and the tickets it waits for, each recorded as a "blocked by" relation in Linear. Then it moves the ticket back to **Up Next** and says so in its report.
 - **When it resumes.** The Project Manager starts no Planner for an Up Next ticket with an open blocker. Once every blocker is Done, the next pass starts a Planner, which begins from those notes.
 

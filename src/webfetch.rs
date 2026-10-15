@@ -1,6 +1,6 @@
 //! `webfetch`: navigates a real headless browser (`chromiumoxide`, driving
 //! `chrome-headless-shell` over CDP — the same binary/setup
-//! `src/browser_tests.rs` already uses) to a URL and returns its rendered,
+//! `src/browser_tests/` already uses) to a URL and returns its rendered,
 //! readable text. See SME-21 for the full design, including why a real
 //! browser (JS execution included) rather than a plain HTTP GET.
 //! `src/fetch_guard.rs` holds the URL-scheme check and response-text
@@ -253,7 +253,7 @@ pub async fn fetch(url: &str, sandbox: Option<SandboxDial>) -> Result<FetchResul
 }
 
 /// Real, `chrome-headless-shell`-backed tests — needs `scripts/browser-check/setup.sh`
-/// to have run first, same as `src/browser_tests.rs`. `#[ignore]`d and gated
+/// to have run first, same as `src/browser_tests/`. `#[ignore]`d and gated
 /// behind the same `browser-test` feature for the same reason: not
 /// something a plain `cargo test --features server` run should depend on
 /// having a real browser binary available.
@@ -374,7 +374,7 @@ mod browser_tests {
     }
 
     /// Deliberately one test, not several — same reason
-    /// `src/browser_tests.rs`'s own doc comment already names: each
+    /// `src/browser_tests/`'s own doc comment already names: each
     /// `#[tokio::test]` fn gets its *own* independent tokio runtime, and
     /// the shared `BROWSER` static's background handler task is tied to
     /// whichever runtime first launched it; once that runtime tears down

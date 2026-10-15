@@ -50,7 +50,7 @@ mod webfetch;
 mod browser_tests;
 
 /// The real Axum router `main()` serves — factored out so
-/// `src/browser_tests.rs` can build the exact same router, in-process, on a
+/// `src/browser_tests/` can build the exact same router, in-process, on a
 /// test-local port, without duplicating it. See
 /// SME-10.
 #[cfg(feature = "server")]

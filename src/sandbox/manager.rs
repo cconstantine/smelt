@@ -187,7 +187,7 @@ pub(super) static MANAGER: OnceLock<SandboxManager> = OnceLock::new();
 /// config (`KUBECONFIG`), or returns the one already built.
 pub async fn init() -> Result<&'static SandboxManager, SandboxError> {
     // `main()` already calls this before `init()` — but `init()` is also
-    // called directly by `browser_tests.rs`'s in-process test harness,
+    // called directly by `browser_tests`' in-process test harness,
     // which never runs through `main()` at all. Idempotent (`let _ = ...`
     // ignores the "already installed" error), so calling it again here is
     // safe regardless of caller. See `main()`'s own call site for the full

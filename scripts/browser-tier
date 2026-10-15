@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The automated browser tier (src/browser_tests.rs and webfetch's real-browser
+# The automated browser tier (src/browser_tests/ and webfetch's real-browser
 # test), against a database of its own (SME-72's retrospective):
 #
 #   scripts/browser-tier
