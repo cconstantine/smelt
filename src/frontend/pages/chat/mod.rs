@@ -452,7 +452,13 @@ fn ChatPanel(
                         && let Err(e) = get_messages(id).await
                         && server_error_message(&e) == "conversation not found"
                     {
+                        // Nothing of it stays under the message, and the
+                        // sidebar drops it (B44, SME-122): it kept the
+                        // transcript and the row until a reload.
+                        state.set(ConversationState { conversation: Some(id), ..ConversationState::default() });
+                        stream_errors.write().remove(&id);
                         load_error.set(Some(server_error_message(&e)));
+                        *conversations_changed.write() += 1;
                         break;
                     }
                     if let Ok(mut events) = subscribed {
