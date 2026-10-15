@@ -331,26 +331,28 @@ enum ShellEvent {
 /// The marker is matched at the end of a line, not only as a whole line:
 /// a command whose last output has no newline (`printf abc`, `head -c`)
 /// has the marker glued onto that output (SME-76). Lines come from
-/// `Lines::next_line`, which is cancel safe; `read_line` in this
-/// `select!` dropped half a stdout line whenever stderr won the race.
+/// `read_until` into a buffer kept across calls, which is cancel safe;
+/// `read_line` in this `select!` dropped half a stdout line whenever stderr
+/// won the race. Bytes that aren't UTF-8 are shown as U+FFFD (B2,
+/// SME-122): `Lines` ended the reader on them, wedging the terminal.
 /// One of these runs per terminal (spawned by `create_terminal`); while
 /// idle (no command in flight) both branches simply stay pending.
 async fn run_reader(
     terminal_id: String,
-    stdout: BufReader<ChildStdout>,
-    stderr: BufReader<ChildStderr>,
+    mut stdout: BufReader<ChildStdout>,
+    mut stderr: BufReader<ChildStderr>,
     marker: Arc<std::sync::Mutex<Option<String>>>,
     tx: mpsc::UnboundedSender<ShellEvent>,
 ) {
-    let mut stdout = stdout.lines();
-    let mut stderr = stderr.lines();
+    let (mut stdout_buf, mut stderr_buf) = (Vec::new(), Vec::new());
     let mut seq: u64 = 0;
     loop {
         tokio::select! {
-            result = stdout.next_line() => {
+            result = stdout.read_until(b'\n', &mut stdout_buf) => {
                 match result {
-                    Ok(None) | Err(_) => break, // bash exited or pipe error
-                    Ok(Some(line)) => {
+                    Ok(0) | Err(_) => break, // bash exited or pipe error
+                    Ok(_) => {
+                        let line = take_line(&mut stdout_buf);
                         let found = {
                             let mut marker = marker.lock().unwrap_or_else(|e| e.into_inner());
                             let found = marker
@@ -389,10 +391,11 @@ async fn run_reader(
                     }
                 }
             }
-            result = stderr.next_line() => {
+            result = stderr.read_until(b'\n', &mut stderr_buf) => {
                 match result {
-                    Ok(None) | Err(_) => break,
-                    Ok(Some(line)) => {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let line = take_line(&mut stderr_buf);
                         seq += 1;
                         if tx
                             .send(ShellEvent::Line {
@@ -410,6 +413,20 @@ async fn run_reader(
             }
         }
     }
+}
+
+/// One line read by `read_until`, without its `\n` or `\r\n` (as `Lines`
+/// gave it), decoded lossily, leaving `buf` empty for the next.
+fn take_line(buf: &mut Vec<u8>) -> String {
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    }
+    let line = String::from_utf8_lossy(buf).into_owned();
+    buf.clear();
+    line
 }
 
 /// One named terminal's state — what `AppState` used to hold once, at the
@@ -1991,6 +2008,17 @@ mod socket_tests {
         assert_eq!(
             run_to_exit("printf abc; sleep 0.3; echo err >&2; sleep 0.3; echo def").await,
             (vec!["abcdef".to_string()], 0)
+        );
+    }
+
+    /// B2 (SME-122): output that isn't UTF-8 (`cat` of a binary) used to
+    /// end the reader, so the command never finished and its terminal
+    /// wedged. It's shown with replacement characters instead.
+    #[tokio::test]
+    async fn test_output_that_isnt_utf8_still_finishes_the_command() {
+        assert_eq!(
+            run_to_exit("printf 'a\\xff\\xfeb\\n'; echo after").await,
+            (vec!["a\u{FFFD}\u{FFFD}b".to_string(), "after".to_string()], 0)
         );
     }
 
