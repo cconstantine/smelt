@@ -167,7 +167,7 @@ pub async fn upsert_conversation_usage(
 
 /// Current todo list for `conversation_id` — empty if `todowrite` has never
 /// been called for it. Mechanical mirror of `get_conversation_usage`
-/// (flagged per development-process.md's exception): same "last-known-only"
+/// (flagged per docs/process/tdd.md's exception): same "last-known-only"
 /// shape, just a JSONB list instead of four token counts. See
 /// SME-20.
 pub async fn get_conversation_todos(

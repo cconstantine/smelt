@@ -333,7 +333,7 @@ pub(super) enum ConnectError {
 ///
 /// A plain `fn` returning a boxed future, not `async fn`: `connect()`'s
 /// reader task calls this, this calls `connect()`, and that cycle defeats
-/// rustc's `Send` inference (development-process.md's documented hazard).
+/// rustc's `Send` inference (docs/process/rules-code.md's documented hazard).
 pub(super) fn connect_with_retry(
     pool: PgPool,
     pod_id: i64,

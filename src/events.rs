@@ -619,7 +619,7 @@ mod server {
 
         /// Characterization test, not test-first: the `Sandbox*` variants
         /// are a mechanical mirror of each other on this same bus — see
-        /// `docs/development-process.md`'s TDD exception for near-verbatim
+        /// `docs/process/tdd.md`'s TDD exception for near-verbatim
         /// mirrors. Proves each variant round-trips (serializes, publishes,
         /// and is delivered back equal to what was sent).
         #[tokio::test]

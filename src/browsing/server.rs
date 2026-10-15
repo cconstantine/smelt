@@ -42,7 +42,7 @@ pub struct PageState {
 }
 
 /// Bounds page navigation+load, same reasoning `webfetch::NAV_TIMEOUT`
-/// already established — "bound the boundaries" (development-process.md).
+/// already established — "bound the boundaries" (docs/process/rules-code.md).
 const NAV_TIMEOUT: Duration = Duration::from_secs(20);
 /// Same truncation cap `webfetch`/`http_request` already use.
 const MAX_TEXT_CHARS: usize = 20_000;

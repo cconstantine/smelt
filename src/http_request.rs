@@ -14,7 +14,7 @@ use serde::Serialize;
 use crate::fetch_guard;
 
 /// Bounds each individual HTTP request — "bound the boundaries"
-/// (development-process.md): a slow/hanging endpoint shouldn't tie up a
+/// (docs/process/rules-code.md): a slow/hanging endpoint shouldn't tie up a
 /// tool call indefinitely.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// A redirect chain longer than this is treated as a failure rather than

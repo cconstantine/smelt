@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The checks every commit must pass (docs/development-process.md, "Every
+# The checks every commit must pass (docs/process/rules-commits.md, "Every
 # commit builds for both targets"): the web build and the server build,
 # each with no warnings, no unexplained expect() or unwrap() outside tests
 # (scripts/lint-expects), and the server tests, run against this working

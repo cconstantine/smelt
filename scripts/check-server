@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A check server for hands-on checks: `dx serve` from a separate git worktree,
 # so saving a file in the working tree doesn't rebuild and restart it
-# (development-process.md, "Run hands-on checks against a server that doesn't
+# (docs/process/rules-running.md, "Run hands-on checks against a server that doesn't
 # watch the files you're editing").
 #
 #   scripts/check-server start [REF] [-- KEY=VALUE ...]   build and serve REF (default: HEAD)

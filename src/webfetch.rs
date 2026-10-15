@@ -20,7 +20,7 @@ use tokio::sync::OnceCell;
 use crate::egress_proxy::SandboxDial;
 use crate::fetch_guard;
 
-/// Bounds page navigation+load — "bound the boundaries" (development-process.md):
+/// Bounds page navigation+load — "bound the boundaries" (docs/process/rules-code.md):
 /// a slow/hanging page shouldn't tie up a tool call indefinitely.
 const NAV_TIMEOUT: Duration = Duration::from_secs(20);
 /// Final extracted-text cap, same shape `fetch_command_summary`'s tail
