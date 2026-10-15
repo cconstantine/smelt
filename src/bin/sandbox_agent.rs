@@ -312,15 +312,22 @@ fn edit_error_message(err: EditError) -> String {
 /// shared channel. `seq` resets to 0 every time a `Marker` is emitted,
 /// since it's scoped to the command that just finished, not the shell's
 /// whole lifetime — matches the WS protocol's per-command `seq` exactly.
+/// Each names its command (`id`, from the shell it came from), not left to
+/// be looked up by terminal when it's sent: by then the terminal may have
+/// a new shell, running another command (review 1).
 enum ShellEvent {
     Line {
         terminal_id: String,
+        /// The command in flight, or `""` for output between commands.
+        id: String,
         stream: Stream,
         seq: u64,
         data: String,
     },
     Marker {
         terminal_id: String,
+        /// The command that ended; `None` when none was in flight.
+        id: Option<String>,
         exit_code: i32,
     },
 }
@@ -368,9 +375,11 @@ async fn run_reader(
                         };
                         if meaning.is_none() || !data.is_empty() {
                             seq += 1;
+                            let id = shell.current.lock().await.clone().unwrap_or_default();
                             if tx
                                 .send(ShellEvent::Line {
                                     terminal_id: terminal_id.clone(),
+                                    id,
                                     stream: Stream::Stdout,
                                     seq,
                                     data,
@@ -402,9 +411,11 @@ async fn run_reader(
                         };
                         if found.is_none() || !data.is_empty() {
                             seq += 1;
+                            let id = shell.current.lock().await.clone().unwrap_or_default();
                             if tx
                                 .send(ShellEvent::Line {
                                     terminal_id: terminal_id.clone(),
+                                    id,
                                     stream: Stream::Stderr,
                                     seq,
                                     data,
@@ -426,7 +437,8 @@ async fn run_reader(
             }
         }
         if let Some(exit_code) = ending.complete(&marker) {
-            if tx.send(ShellEvent::Marker { terminal_id: terminal_id.clone(), exit_code }).is_err() {
+            let id = shell.current.lock().await.take();
+            if tx.send(ShellEvent::Marker { terminal_id: terminal_id.clone(), id, exit_code }).is_err() {
                 return;
             }
             seq = 0;
@@ -435,7 +447,8 @@ async fn run_reader(
     // Ended between the two markers: the command did finish.
     if let Some(exit_code) = ending.stdout_code.take() {
         marker.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if tx.send(ShellEvent::Marker { terminal_id: terminal_id.clone(), exit_code }).is_err() {
+        let id = shell.current.lock().await.take();
+        if tx.send(ShellEvent::Marker { terminal_id: terminal_id.clone(), id, exit_code }).is_err() {
             return;
         }
         seq = 0;
@@ -532,18 +545,22 @@ async fn sleep_until_or_never(deadline: Option<tokio::time::Instant>) {
 /// a line saying what happened; before, it stayed running for good.
 async fn finish_ended_shell(terminal_id: &str, shell: &Shell, seq: u64, tx: &mpsc::UnboundedSender<ShellEvent>) {
     let code = shell_exit_code(shell).await;
-    shell.ended.store(true, Ordering::SeqCst);
     let in_flight = shell.marker.lock().unwrap_or_else(|e| e.into_inner()).take().is_some();
+    // Taken before the shell is marked ended, so a new shell's command
+    // can't be the one this exit goes to.
+    let id = shell.current.lock().await.take();
+    shell.ended.store(true, Ordering::SeqCst);
     if in_flight {
         let _ = tx.send(ShellEvent::Line {
             terminal_id: terminal_id.to_string(),
+            id: id.clone().unwrap_or_default(),
             stream: Stream::Stderr,
             seq: seq + 1,
             data: format!(
                 "smelt: this terminal's shell exited (status {code}); its next command runs in a new shell, with the working directory and variables reset"
             ),
         });
-        let _ = tx.send(ShellEvent::Marker { terminal_id: terminal_id.to_string(), exit_code: code });
+        let _ = tx.send(ShellEvent::Marker { terminal_id: terminal_id.to_string(), id, exit_code: code });
     }
 }
 
@@ -762,31 +779,31 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 }
             }
             event = recv_shell_event(&state) => {
-                match event {
-                    Some(ShellEvent::Line { terminal_id, stream, seq, data }) => {
-                        let shell = state.terminals.lock().await.get(&terminal_id).cloned();
-                        let Some(shell) = shell else { continue };
-                        let id = shell.current.lock().await.clone().unwrap_or_default();
-                        if !send_or_keep(&mut socket, &state, AgentMessage::Output { id, terminal_id, stream, seq, data }).await {
-                            break;
-                        }
+                let Some(event) = event else {
+                    break; // AppState (and its events_tx) dropped — agent shutting down
+                };
+                if let Some(message) = event_message(event) {
+                    if !send_or_keep(&mut socket, &state, message).await {
+                        break;
                     }
-                    Some(ShellEvent::Marker { terminal_id, exit_code }) => {
-                        let shell = state.terminals.lock().await.get(&terminal_id).cloned();
-                        let Some(shell) = shell else { continue };
-                        let id = shell.current.lock().await.take();
-                        if let Some(id) = id {
-                            if !send_or_keep(&mut socket, &state, AgentMessage::Exit { id, terminal_id, code: exit_code }).await {
-                                break;
-                            }
-                        }
-                    }
-                    None => break, // AppState (and its events_tx) dropped — agent shutting down
                 }
             }
         }
     }
     state.release(connection);
+}
+
+/// The message a shell event becomes; `None` for a marker with no command
+/// in flight.
+fn event_message(event: ShellEvent) -> Option<AgentMessage> {
+    match event {
+        ShellEvent::Line { terminal_id, id, stream, seq, data } => {
+            Some(AgentMessage::Output { id, terminal_id, stream, seq, data })
+        }
+        ShellEvent::Marker { terminal_id, id, exit_code } => {
+            Some(AgentMessage::Exit { id: id?, terminal_id, code: exit_code })
+        }
+    }
 }
 
 /// Sends the event a failed send left in `unsent`, if there is one.
@@ -1405,16 +1422,16 @@ async fn start_command(state: &Arc<AppState>, terminal_id: &str, id: String, com
     };
     let shell = match shell {
         Ok(shell) => shell,
-        Err((ended, message)) => {
+        Err((_, message)) => {
             // The command still gets an exit, so it doesn't stay running.
-            *ended.current.lock().await = Some(id);
             let _ = state.events_tx.send(ShellEvent::Line {
                 terminal_id: terminal_id.to_string(),
+                id: id.clone(),
                 stream: Stream::Stderr,
                 seq: 1,
                 data: format!("smelt: {message}"),
             });
-            let _ = state.events_tx.send(ShellEvent::Marker { terminal_id: terminal_id.to_string(), exit_code: 127 });
+            let _ = state.events_tx.send(ShellEvent::Marker { terminal_id: terminal_id.to_string(), id: Some(id), exit_code: 127 });
             return;
         }
     };
@@ -2533,6 +2550,38 @@ mod socket_tests {
         let mut second = connect_ready(addr).await;
         assert!(matches!(next(&mut second).await, AgentMessage::Output { data, .. } if data == "later"));
         assert!(matches!(next(&mut second).await, AgentMessage::Exit { id, code: 0, .. } if id == "c1"));
+    }
+
+    /// SME-122 review 1, without a socket's timing: an ended shell's last
+    /// events, still queued when the terminal's next command starts its new
+    /// shell, belong to the command that ended it.
+    #[tokio::test]
+    async fn test_an_ended_shells_queued_events_name_its_own_command() {
+        let state = new_state();
+        assert_eq!(super::create_terminal(&state, "t1".to_string()).await, Reply::TerminalCreated);
+        let first = state.terminals.lock().await.get("t1").cloned().expect("the terminal");
+        start_command(&state, "t1", "c1".to_string(), "echo bye; exit 3").await;
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while !first.ended.load(Ordering::SeqCst) {
+            assert!(tokio::time::Instant::now() < deadline, "the shell didn't end");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Let the ended shell's last events reach the queue.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        start_command(&state, "t1", "c2".to_string(), "sleep 0.2; echo hi").await;
+
+        let mut messages = Vec::new();
+        while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(2), recv_shell_event(&state)).await {
+            messages.extend(event_message(event));
+        }
+        let exits: Vec<(String, i32)> = messages
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::Exit { id, code, .. } => Some((id.clone(), *code)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(exits, vec![("c1".to_string(), 3), ("c2".to_string(), 0)], "{messages:?}");
     }
 
     /// An event the agent took off the queue but couldn't send (smelt's end
