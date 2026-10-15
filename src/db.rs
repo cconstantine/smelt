@@ -2319,6 +2319,9 @@ pub struct ProviderModelRow {
     pub reported_max_output: Option<i32>,
     /// The user's cap on a reply's thinking, llama.cpp only (SME-111).
     pub reasoning_budget: Option<i32>,
+    /// Whether the model takes adaptive thinking, as last reported (B9,
+    /// SME-122).
+    pub reported_adaptive_thinking: Option<bool>,
     /// Added on the provider's page as a model its listing doesn't show,
     /// so it's shown even when the listing works and lacks it.
     pub added_by_hand: bool,
@@ -2406,15 +2409,18 @@ pub async fn set_provider_model_reported(
     thinking: Option<bool>,
     tools: Option<bool>,
     max_output: Option<i32>,
+    adaptive_thinking: Option<bool>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO provider_models
-             (provider_id, model, reported_context_window, reported_thinking, reported_tools, reported_max_output)
-         VALUES ($1, $2, $3, $4, $5, $6)
+             (provider_id, model, reported_context_window, reported_thinking, reported_tools, reported_max_output,
+              reported_adaptive_thinking)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (provider_id, model) DO UPDATE
          SET reported_context_window = COALESCE($3, provider_models.reported_context_window),
              reported_thinking = $4, reported_tools = $5,
-             reported_max_output = COALESCE($6, provider_models.reported_max_output)",
+             reported_max_output = COALESCE($6, provider_models.reported_max_output),
+             reported_adaptive_thinking = $7",
     )
     .bind(provider_id)
     .bind(model)
@@ -2422,6 +2428,7 @@ pub async fn set_provider_model_reported(
     .bind(thinking)
     .bind(tools)
     .bind(max_output)
+    .bind(adaptive_thinking)
     .execute(pool)
     .await?;
     Ok(())
@@ -4805,8 +4812,8 @@ mod tests {
     #[sqlx::test]
     async fn test_a_report_without_a_window_keeps_the_last_one(pool: PgPool) {
         let provider = test_provider(&pool, "p").await;
-        set_provider_model_reported(&pool, provider.id, "m", Some(8192), Some(true), Some(true), Some(4096)).await.expect("loaded");
-        set_provider_model_reported(&pool, provider.id, "m", None, Some(false), Some(true), None).await.expect("unloaded");
+        set_provider_model_reported(&pool, provider.id, "m", Some(8192), Some(true), Some(true), Some(4096), None).await.expect("loaded");
+        set_provider_model_reported(&pool, provider.id, "m", None, Some(false), Some(true), None, None).await.expect("unloaded");
         let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
         assert_eq!((row.reported_context_window, row.reported_thinking), (Some(8192), Some(false)));
         assert_eq!(row.reported_max_output, Some(4096), "kept like the window (SME-111)");
@@ -4815,9 +4822,9 @@ mod tests {
     #[sqlx::test]
     async fn test_model_overrides_and_reported_details_leave_each_other_alone(pool: PgPool) {
         let provider = test_provider(&pool, "p").await;
-        set_provider_model_reported(&pool, provider.id, "m", Some(4096), Some(false), Some(true), Some(1024)).await.expect("reported");
+        set_provider_model_reported(&pool, provider.id, "m", Some(4096), Some(false), Some(true), Some(1024), None).await.expect("reported");
         set_provider_model_overrides(&pool, provider.id, "m", Some(true), Some(32_768), None, Some(2048), Some(1024)).await.expect("overrides");
-        set_provider_model_reported(&pool, provider.id, "m", Some(8192), None, Some(true), Some(4096)).await.expect("reported");
+        set_provider_model_reported(&pool, provider.id, "m", Some(8192), None, Some(true), Some(4096), None).await.expect("reported");
 
         let row = get_provider_model(&pool, provider.id, "m").await.expect("get").expect("exists");
         assert_eq!(
@@ -4834,6 +4841,7 @@ mod tests {
                 max_output: Some(2048),
                 reported_max_output: Some(4096),
                 reasoning_budget: Some(1024),
+                reported_adaptive_thinking: None,
                 added_by_hand: false,
             }
         );
