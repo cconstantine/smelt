@@ -341,16 +341,20 @@ async fn run_reader(
     terminal_id: String,
     mut stdout: BufReader<ChildStdout>,
     mut stderr: BufReader<ChildStderr>,
-    marker: Arc<std::sync::Mutex<Option<String>>>,
+    shell: Arc<Shell>,
     tx: mpsc::UnboundedSender<ShellEvent>,
 ) {
+    let marker = shell.marker.clone();
     let (mut stdout_buf, mut stderr_buf) = (Vec::new(), Vec::new());
     let mut seq: u64 = 0;
-    loop {
+    // Both pipes are read to their end: the shell's last words on one
+    // mustn't be lost because the other closed first.
+    let (mut stdout_open, mut stderr_open) = (true, true);
+    while stdout_open || stderr_open {
         tokio::select! {
-            result = stdout.read_until(b'\n', &mut stdout_buf) => {
+            result = stdout.read_until(b'\n', &mut stdout_buf), if stdout_open => {
                 match result {
-                    Ok(0) | Err(_) => break, // bash exited or pipe error
+                    Ok(0) | Err(_) => stdout_open = false, // bash exited or pipe error
                     Ok(_) => {
                         let line = take_line(&mut stdout_buf);
                         let found = {
@@ -379,21 +383,21 @@ async fn run_reader(
                                 })
                                 .is_err()
                             {
-                                break;
+                                return;
                             }
                         }
                         if let Some(exit_code) = exit_code {
                             if tx.send(ShellEvent::Marker { terminal_id: terminal_id.clone(), exit_code }).is_err() {
-                                break;
+                                return;
                             }
                             seq = 0;
                         }
                     }
                 }
             }
-            result = stderr.read_until(b'\n', &mut stderr_buf) => {
+            result = stderr.read_until(b'\n', &mut stderr_buf), if stderr_open => {
                 match result {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => stderr_open = false,
                     Ok(_) => {
                         let line = take_line(&mut stderr_buf);
                         seq += 1;
@@ -406,12 +410,58 @@ async fn run_reader(
                             })
                             .is_err()
                         {
-                            break;
+                            return;
                         }
                     }
                 }
             }
         }
+    }
+    finish_ended_shell(&terminal_id, &shell, seq, &tx).await;
+}
+
+/// After a terminal's shell has ended (B11, SME-122): `exit`, `exec`, a
+/// `set -e` and a failure, or `terminate_terminal`'s kill. Marks it ended,
+/// so the terminal's next command starts a new shell (`start_command`),
+/// and finishes a command still in flight with the shell's own status and
+/// a line saying what happened; before, it stayed running for good.
+async fn finish_ended_shell(terminal_id: &str, shell: &Shell, seq: u64, tx: &mpsc::UnboundedSender<ShellEvent>) {
+    let code = shell_exit_code(shell).await;
+    shell.ended.store(true, Ordering::SeqCst);
+    let in_flight = shell.marker.lock().unwrap_or_else(|e| e.into_inner()).take().is_some();
+    if in_flight {
+        let _ = tx.send(ShellEvent::Line {
+            terminal_id: terminal_id.to_string(),
+            stream: Stream::Stderr,
+            seq: seq + 1,
+            data: format!(
+                "smelt: this terminal's shell exited (status {code}); its next command runs in a new shell, with the working directory and variables reset"
+            ),
+        });
+        let _ = tx.send(ShellEvent::Marker { terminal_id: terminal_id.to_string(), exit_code: code });
+    }
+}
+
+/// How long an ended shell's process has to be reaped once both its pipes
+/// have closed, before its process group is killed.
+const SHELL_EXIT_WAIT: Duration = Duration::from_secs(5);
+
+/// The ended shell's exit status as a shell reports one: its code, or 128
+/// plus the signal that killed it. A shell that closed its pipes but
+/// hasn't exited is killed first.
+async fn shell_exit_code(shell: &Shell) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    let mut child = shell.bash_child.lock().await;
+    let status = match tokio::time::timeout(SHELL_EXIT_WAIT, child.wait()).await {
+        Ok(status) => status,
+        Err(_) => {
+            let _ = signal::kill(Pid::from_raw(-(shell.bash_pid as i32)), Signal::SIGKILL);
+            child.wait().await
+        }
+    };
+    match status {
+        Ok(status) => status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+        Err(_) => 255,
     }
 }
 
@@ -448,10 +498,13 @@ struct Shell {
     /// The in-flight command's completion marker (`new_marker`), shared
     /// with this terminal's `run_reader`, which clears it on a match.
     marker: Arc<std::sync::Mutex<Option<String>>>,
-    /// Held only so the child isn't dropped early; never otherwise read.
+    /// The shell's process, waited on once it has ended (`shell_exit_code`).
     /// Not killed on drop (tokio's default) — `terminate_terminal`'s
     /// explicit `killpg` is what actually ends it.
-    _bash_child: AsyncMutex<Child>,
+    bash_child: AsyncMutex<Child>,
+    /// Set once the shell has ended (`finish_ended_shell`): the terminal's
+    /// next command starts a new one.
+    ended: std::sync::atomic::AtomicBool,
 }
 
 struct AppState {
@@ -1091,19 +1144,28 @@ async fn create_terminal(state: &Arc<AppState>, terminal_id: String) -> Reply {
     if state.terminals.lock().await.contains_key(&terminal_id) {
         return reply_error("terminal_id already exists");
     }
+    let shell = match spawn_shell(&terminal_id, &state.events_tx).await {
+        Ok(shell) => shell,
+        Err(message) => return reply_error(&message),
+    };
+    state
+        .terminals
+        .lock()
+        .await
+        .insert(terminal_id.clone(), shell);
 
-    let mut child = match Command::new("bash")
+    Reply::TerminalCreated
+}
+
+/// Starts a terminal's `bash`, set up for commands, and its reader.
+async fn spawn_shell(terminal_id: &str, events_tx: &mpsc::UnboundedSender<ShellEvent>) -> Result<Arc<Shell>, String> {
+    let mut child = Command::new("bash")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            return reply_error(&format!("failed to spawn shell: {e}"));
-        }
-    };
+        .map_err(|e| format!("failed to spawn shell: {e}"))?;
     #[expect(clippy::expect_used, reason = "a child that hasn't been waited on always has its pid")]
     let bash_pid = child
         .id()
@@ -1134,33 +1196,45 @@ async fn create_terminal(state: &Arc<AppState>, terminal_id: String) -> Reply {
     // against itself once a foreground job dies from it, taking the whole
     // shell down with it — see SME-9's "Signaling a running command."
     if let Err(e) = stdin.write_all(b"set -m\ntrap ':' INT\n").await {
-        return reply_error(&format!("failed to initialize shell: {e}"));
+        let _ = signal::kill(Pid::from_raw(-(bash_pid as i32)), Signal::SIGKILL);
+        return Err(format!("failed to initialize shell: {e}"));
     }
     let _ = stdin.flush().await;
-
-    let marker = Arc::new(std::sync::Mutex::new(None));
-    tokio::spawn(run_reader(
-        terminal_id.clone(),
-        stdout,
-        stderr,
-        marker.clone(),
-        state.events_tx.clone(),
-    ));
 
     let shell = Arc::new(Shell {
         stdin: AsyncMutex::new(stdin),
         bash_pid,
         current: AsyncMutex::new(None),
-        marker,
-        _bash_child: AsyncMutex::new(child),
+        marker: Arc::new(std::sync::Mutex::new(None)),
+        bash_child: AsyncMutex::new(child),
+        ended: std::sync::atomic::AtomicBool::new(false),
     });
-    state
-        .terminals
-        .lock()
-        .await
-        .insert(terminal_id.clone(), shell);
+    tokio::spawn(run_reader(
+        terminal_id.to_string(),
+        stdout,
+        stderr,
+        shell.clone(),
+        events_tx.clone(),
+    ));
+    Ok(shell)
+}
 
-    Reply::TerminalCreated
+/// The terminal's shell for its next command, starting a new one in its
+/// place if it has ended (B11, SME-122). `None` for an unknown terminal;
+/// `Err` with the ended shell when a new one couldn't be started.
+async fn shell_for_command(state: &Arc<AppState>, terminal_id: &str) -> Option<Result<Arc<Shell>, (Arc<Shell>, String)>> {
+    let mut terminals = state.terminals.lock().await;
+    let shell = terminals.get(terminal_id).cloned()?;
+    if !shell.ended.load(Ordering::SeqCst) {
+        return Some(Ok(shell));
+    }
+    Some(match spawn_shell(terminal_id, &state.events_tx).await {
+        Ok(new) => {
+            terminals.insert(terminal_id.to_string(), new.clone());
+            Ok(new)
+        }
+        Err(message) => Err((shell, message)),
+    })
 }
 
 /// `killpg` targeting just this terminal's own process group — safe in
@@ -1181,9 +1255,24 @@ async fn terminate_terminal(state: &Arc<AppState>, terminal_id: String) -> Reply
 }
 
 async fn start_command(state: &Arc<AppState>, terminal_id: &str, id: String, command: &str) {
-    let Some(shell) = state.terminals.lock().await.get(terminal_id).cloned() else {
+    let Some(shell) = shell_for_command(state, terminal_id).await else {
         tracing::warn!(%terminal_id, %id, "rejecting command: unknown terminal_id");
         return;
+    };
+    let shell = match shell {
+        Ok(shell) => shell,
+        Err((ended, message)) => {
+            // The command still gets an exit, so it doesn't stay running.
+            *ended.current.lock().await = Some(id);
+            let _ = state.events_tx.send(ShellEvent::Line {
+                terminal_id: terminal_id.to_string(),
+                stream: Stream::Stderr,
+                seq: 1,
+                data: format!("smelt: {message}"),
+            });
+            let _ = state.events_tx.send(ShellEvent::Marker { terminal_id: terminal_id.to_string(), exit_code: 127 });
+            return;
+        }
     };
 
     let mut current = shell.current.lock().await;
@@ -1991,6 +2080,45 @@ mod socket_tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
+    }
+
+    /// Runs `command` as `id` in `terminal_id` on an open client and
+    /// collects its stdout and stderr lines and exit code.
+    async fn run_collect(client: &mut Client, terminal_id: &str, id: &str, command: &str) -> (Vec<String>, Vec<String>, i32) {
+        run(client, terminal_id, id, command).await;
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        loop {
+            match next(client).await {
+                AgentMessage::Output { stream: Stream::Stdout, data, .. } => stdout.push(data),
+                AgentMessage::Output { stream: Stream::Stderr, data, .. } => stderr.push(data),
+                AgentMessage::Exit { id: exited, code, .. } => {
+                    assert_eq!(exited, id);
+                    return (stdout, stderr, code);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// B11 (SME-122): a command that ends its terminal's shell (`exit`,
+    /// `exec`) used to stay running for good, wedging the terminal. It
+    /// finishes with the shell's status and says so, and the terminal's
+    /// next command runs in a new shell.
+    #[tokio::test]
+    async fn test_a_command_that_ends_its_shell_finishes_and_the_terminal_keeps_working() {
+        let addr = serve_agent().await;
+        let mut client = connect_ready(addr).await;
+        create_terminal(&mut client, "t1").await;
+
+        let (stdout, stderr, code) = run_collect(&mut client, "t1", "c1", "echo bye; exit 3").await;
+        assert_eq!((stdout, code), (vec!["bye".to_string()], 3));
+        assert!(
+            stderr.iter().any(|line| line.contains("shell exited") && line.contains("new shell")),
+            "the command's output should say the shell ended: {stderr:?}"
+        );
+
+        let (stdout, _, code) = run_collect(&mut client, "t1", "c2", "echo again").await;
+        assert_eq!((stdout, code), (vec!["again".to_string()], 0));
     }
 
     #[tokio::test]
