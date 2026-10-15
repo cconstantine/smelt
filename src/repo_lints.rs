@@ -30,7 +30,6 @@ const EXCEPTIONS: &[(&str, Limit)] = &[
     ("src/frontend/pages/chat/transcript.rs", Limit { bytes: 42_561, lines: 917 }),
     ("src/frontend/pages/providers.rs", Limit { bytes: 57_015, lines: 1_266 }),
     ("src/sandbox/agent.rs", Limit { bytes: 40_800, lines: 924 }),
-    ("src/sandbox/manager.rs", Limit { bytes: 66_172, lines: 1_521 }),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
