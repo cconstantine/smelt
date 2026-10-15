@@ -407,6 +407,9 @@ mod server {
         /// Thinking blocks in messages up to this id were written for
         /// another provider or model, and aren't replayed.
         pub thinking_stripped_through: Option<i64>,
+        /// The model takes adaptive thinking; false when its listing said
+        /// it doesn't (Haiku 4.5), so it's sent a budget (B9, SME-122).
+        pub adaptive_thinking: bool,
     }
 
     /// A llama.cpp model's chat-template settings, already limited to
@@ -421,6 +424,9 @@ mod server {
     /// A reply's share of its budget that thinking may take by default
     /// (SME-111): three quarters, leaving at least `MIN_ANSWER_TOKENS`.
     pub const REASONING_SHARE: (u32, u32) = (3, 4);
+
+    /// The smallest `budget_tokens` Anthropic takes (B9, SME-122).
+    pub const MIN_THINKING_BUDGET: u32 = 1_024;
 
     /// What a reply keeps for its answer and any tool call, at least.
     pub const MIN_ANSWER_TOKENS: u32 = 4_096;
@@ -451,6 +457,15 @@ mod server {
                 ProviderKind::LlamaCpp => match reasoning_budget(reply_budget, self.reasoning_cap) {
                     0 => return None,
                     budget_tokens => crate::anthropic::ThinkingConfig::Enabled { budget_tokens },
+                },
+                // A model that can't take adaptive thinking (Haiku 4.5) is
+                // given a budget, which the API wants at least 1,024 and
+                // under the reply's (B9, SME-122).
+                _ if !self.adaptive_thinking => match reasoning_budget(reply_budget, self.reasoning_cap) {
+                    budget_tokens if budget_tokens >= MIN_THINKING_BUDGET => {
+                        crate::anthropic::ThinkingConfig::Enabled { budget_tokens }
+                    }
+                    _ => return None,
                 },
                 ProviderKind::Anthropic | ProviderKind::Ollama | ProviderKind::Other => {
                     crate::anthropic::ThinkingConfig::Adaptive
@@ -734,6 +749,7 @@ mod server {
             thinking: thinking(settings.as_ref()),
             context_window: context_window(&model, settings.as_ref()).0,
             thinking_stripped_through,
+            adaptive_thinking: settings.as_ref().and_then(|r| r.reported_adaptive_thinking) != Some(false),
             model,
         }))
     }
@@ -880,7 +896,7 @@ mod server {
         value.and_then(|v| i32::try_from(v).ok())
     }
 
-    async fn store_details(
+    pub(super) async fn store_details(
         pool: &PgPool,
         provider_id: i64,
         model: &str,
@@ -894,6 +910,7 @@ mod server {
             details.thinking,
             details.tools,
             to_column(details.max_output),
+            details.adaptive_thinking,
         )
         .await
         .map_err(|e| e.to_string())
@@ -904,6 +921,7 @@ mod server {
             || details.thinking.is_some()
             || details.tools.is_some()
             || details.max_output.is_some()
+            || details.adaptive_thinking.is_some()
     }
 
     /// How many of an Ollama server's models to ask about at once.
@@ -1342,6 +1360,7 @@ mod tests {
                 max_output: None,
                 reported_max_output: None,
                 reasoning_budget: None,
+                reported_adaptive_thinking: None,
                 added_by_hand: false,
             }
         }
@@ -1425,7 +1444,7 @@ mod tests {
             );
 
             db::set_default_model(&pool, ollama.id, "gemma4").await.expect("default");
-            db::set_provider_model_reported(&pool, ollama.id, "gemma4", Some(4096), Some(true), Some(false), None)
+            db::set_provider_model_reported(&pool, ollama.id, "gemma4", Some(4096), Some(true), Some(false), None, None)
                 .await
                 .expect("reported");
             let gemma = ModelChoice {
@@ -1490,6 +1509,7 @@ mod tests {
                     output_cap_is_models_own: false,
                     context_window: 64_000,
                     thinking_stripped_through: None,
+                    adaptive_thinking: true,
                 }
             );
             let kept = db::get_conversation_model(&pool, conversation.id).await.expect("read").expect("exists");
@@ -1674,7 +1694,7 @@ mod tests {
         }
 
         fn llama_turn_model(template: Option<TemplateSettings>) -> TurnModel {
-            TurnModel {
+            TurnModel { adaptive_thinking: true,
                 endpoint: Endpoint { base_url: "http://llama".to_string(), auth: Auth::Bearer("k".to_string()) },
                 provider_id: 1,
                 model: "flash-next".to_string(),
@@ -1719,6 +1739,43 @@ mod tests {
                     "{kind:?}"
                 );
             }
+        }
+
+        /// B9 (SME-122): a model whose listing said it can't take adaptive
+        /// thinking (Haiku 4.5) is sent a budget, at least the API's 1,024
+        /// and leaving room to answer; with too little room, no thinking.
+        #[test]
+        fn test_a_model_without_adaptive_thinking_is_sent_a_budget() {
+            use crate::anthropic::ThinkingConfig;
+            for kind in [ProviderKind::Anthropic, ProviderKind::Other] {
+                let haiku = TurnModel { kind, adaptive_thinking: false, ..llama_turn_model(None) };
+                assert_eq!(
+                    haiku.thinking_config(64_000),
+                    Some(ThinkingConfig::Enabled { budget_tokens: 48_000 }),
+                    "{kind:?}"
+                );
+                assert_eq!(haiku.thinking_config(5_000), None, "{kind:?}: under 1,024 to think in");
+                assert_eq!(TurnModel { thinking: false, ..haiku.clone() }.thinking_config(64_000), None);
+            }
+        }
+
+        /// B9 (SME-122): what the listing says about adaptive thinking is
+        /// kept with the model, and a turn on it is sent a budget.
+        #[sqlx::test]
+        async fn test_a_turn_on_a_model_without_adaptive_thinking_knows_it(pool: PgPool) {
+            let conversation = db::create_conversation_with_id(&pool, 9_172_000_009).await.expect("conversation");
+            let anthropic = provider(&pool, "anthropic", "api_key").await;
+            db::set_default_model(&pool, anthropic.id, "claude-haiku-4-5").await.expect("default");
+            let details = crate::anthropic::models::ModelDetails {
+                thinking: Some(true),
+                adaptive_thinking: Some(false),
+                ..Default::default()
+            };
+            super::super::server::store_details(&pool, anthropic.id, "claude-haiku-4-5", &details).await.expect("stored");
+
+            let turn = resolve_turn_model(&pool, conversation.id).await.expect("resolves");
+
+            assert!(turn.thinking && !turn.adaptive_thinking, "{turn:?}");
         }
 
         /// SME-111: what a llama.cpp request tells its chat template, with
@@ -2017,7 +2074,7 @@ mod tests {
             let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None, true)
                 .await
                 .expect("create");
-            db::set_provider_model_reported(&pool, p.id, "removed", Some(4096), None, Some(true), None)
+            db::set_provider_model_reported(&pool, p.id, "removed", Some(4096), None, Some(true), None, None)
                 .await
                 .expect("seen once");
             add_model(&pool, p.id, "by-hand").await.expect("add");

@@ -834,6 +834,8 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "markdown_bare_urls_streaming", 60, Box::pin(scenario_markdown_bare_urls_streaming(&t))).await;
     run_scenario(&t, only, r, k, "markdown_link_bidi_isolated", 60, Box::pin(scenario_markdown_link_bidi_isolated(&t))).await;
     run_scenario(&t, only, r, k, "terminal_command_indicator", 180, Box::pin(scenario_terminal_command_indicator(&t))).await;
+    run_scenario(&t, only, r, k, "turn_error_clears_on_a_later_turn", 30, Box::pin(scenario_turn_error_clears_on_a_later_turn(&t))).await;
+    run_scenario(&t, only, r, k, "deleted_in_another_tab", 60, Box::pin(scenario_deleted_in_another_tab(&t))).await;
     run_scenario(&t, only, r, k, "working_line_timer_survives_a_reload", 60, Box::pin(scenario_working_line_timer_survives_a_reload(&t))).await;
 
     let mut failures: Vec<String> = results
@@ -5704,4 +5706,69 @@ async fn scenario_terminal_command_indicator(t: &Scenario<'_>) {
 
     let _ = sandbox::terminate_terminal(pool, terminal).await;
     let _ = sandbox::terminate_pod(pool, conversation.id).await;
+}
+
+/// B19 (SME-122): a turn's error goes once a later turn starts, in every
+/// tab, not only the tab that sent it. Before, a success sent from another
+/// tab left the first tab showing the error.
+async fn scenario_turn_error_clears_on_a_later_turn(t: &Scenario<'_>) {
+    use crate::events::{ConversationEvent, publish};
+    let conversation = t.conversation().await;
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    publish(conversation.id, ConversationEvent::TurnError { message: "B19-TURN-ERROR".into() });
+    assert!(wait_for_text(&page, "B19-TURN-ERROR", Duration::from_secs(10)).await, "the error never showed");
+
+    // Another tab sends: its turn starts, and finishes without an error.
+    publish(conversation.id, ConversationEvent::TurnState { running: true });
+    publish(conversation.id, ConversationEvent::TurnState { running: false });
+
+    assert!(
+        wait_for_text_gone(&page, "B19-TURN-ERROR", Duration::from_secs(10)).await,
+        "the earlier turn's error should go once another turn starts"
+    );
+}
+
+/// B44 (SME-122): a conversation deleted in another tab leaves the open
+/// tab saying so, without the transcript under the message, and with the
+/// conversation gone from its sidebar. Before, the transcript stayed, and
+/// the sidebar listed it (highlighted) until a reload.
+async fn scenario_deleted_in_another_tab(t: &Scenario<'_>) {
+    let deleted = t.conversation().await;
+    db::create_message(
+        t.pool,
+        deleted.id,
+        "user",
+        &[anthropic::ContentBlock::Text { text: "B44-TRANSCRIPT-MARKER".to_string() }],
+    )
+    .await
+    .expect("save a message");
+    let other = t.conversation().await;
+    let row = format!(".conversation-item[data-conversation-id='{}']", deleted.id);
+
+    let open = t.tab(t.url(&format!("conversation/{}", deleted.id))).await;
+    wait_for_live_client(&open, deleted.id).await;
+    assert!(wait_for_text(&open, "B44-TRANSCRIPT-MARKER", Duration::from_secs(10)).await, "the transcript never showed");
+    assert!(wait_for_count(&open, &row, 1, Duration::from_secs(10)).await, "the sidebar should list it");
+
+    let deleter = t.tab(t.url(&format!("conversation/{}", other.id))).await;
+    wait_for_live_client(&deleter, other.id).await;
+    let delete_button = format!("{row} .delete-conversation");
+    wait_for_stable(&deleter, &delete_button, tokio::time::Instant::now() + Duration::from_secs(10)).await;
+    click_when_present(&deleter, &delete_button, Duration::from_secs(5)).await;
+    click_when_present(&deleter, &format!("{delete_button}.confirm"), Duration::from_secs(5)).await;
+    assert!(wait_for_count(&deleter, &row, 0, Duration::from_secs(10)).await, "the deleting tab's sidebar drops it");
+
+    assert!(
+        wait_for_text(&open, "doesn't exist", Duration::from_secs(15)).await,
+        "the open tab should say the conversation doesn't exist"
+    );
+    assert!(
+        wait_for_text_gone(&open, "B44-TRANSCRIPT-MARKER", Duration::from_secs(5)).await,
+        "the deleted conversation's transcript shouldn't stay under the message"
+    );
+    assert!(
+        wait_for_count(&open, &row, 0, Duration::from_secs(10)).await,
+        "the open tab's sidebar shouldn't list the deleted conversation"
+    );
 }

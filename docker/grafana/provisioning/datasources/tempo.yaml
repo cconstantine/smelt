@@ -1,0 +1,15 @@
+# Grafana's one data source (SME-137): the compose stack's Tempo. Read on
+# every Grafana start, so editing it in the UI doesn't stick.
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: true
+    editable: false
+    jsonData:
+      streamingEnabled:
+        search: true

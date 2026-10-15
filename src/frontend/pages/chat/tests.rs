@@ -508,6 +508,24 @@ fn test_a_cut_off_notice_reads_as_a_sentence() {
     assert_eq!(system_notice("Your last reply was cut off: it reached its limit of lots", &HashMap::new()), None);
 }
 
+/// B3 (SME-122): a refusal notice reads as one in the chat, naming a
+/// dropped call, and round-trips.
+#[test]
+fn test_a_refusal_notice_says_the_provider_stopped_the_reply() {
+    use crate::api::chat::{parse_refusal_notice, refusal_notice};
+    assert_eq!(parse_refusal_notice(&refusal_notice(None)), Some(None));
+    assert_eq!(parse_refusal_notice(&refusal_notice(Some("write_file"))), Some(Some("write_file".to_string())));
+    assert_eq!(parse_refusal_notice("Something else."), None);
+    assert_eq!(
+        system_notice(&refusal_notice(None), &HashMap::new()).as_deref(),
+        Some("The model's provider stopped this reply (a refusal).")
+    );
+    assert_eq!(
+        system_notice(&refusal_notice(Some("write_file")), &HashMap::new()).as_deref(),
+        Some("The model's provider stopped this reply (a refusal) in the middle of a `write_file` call, which didn't run.")
+    );
+}
+
 /// SME-126: a notice for a reply cut off in the middle of a tool call
 /// names the call, for the model and in the chat, and round-trips; a
 /// notice saved before SME-126 still parses and reads as it did.
@@ -1577,6 +1595,39 @@ fn test_apply_event_sandbox_preview_update_sets_the_pods_previews() {
     });
 }
 
+/// SME-122 review 1: a turn starting, or a pull that finds no kept error,
+/// ends a turn's error but not one only this tab saw (a failed send): the
+/// user's message would vanish with no error.
+#[test]
+fn test_a_later_turn_clears_a_turns_error_but_not_a_failed_send() {
+    let mut errors = ChatErrors::default();
+    errors.set_turn_error(1, "the turn failed".to_string());
+    errors.set_local_error(2, "couldn't send".to_string());
+    errors.clear_turn_error(1);
+    errors.clear_turn_error(2);
+    assert_eq!(errors.lines.get(&1), None);
+    assert_eq!(errors.lines.get(&2).map(String::as_str), Some("couldn't send"));
+
+    // A turn's error replaced by a local one stays too.
+    errors.set_turn_error(3, "the turn failed".to_string());
+    errors.set_local_error(3, "couldn't stop".to_string());
+    errors.clear_turn_error(3);
+    assert_eq!(errors.lines.get(&3).map(String::as_str), Some("couldn't stop"));
+    errors.clear(3);
+    assert_eq!(errors.lines.get(&3), None);
+}
+
+/// B19 (SME-122): a turn starting says so, so the page drops an earlier
+/// turn's error; one ending doesn't.
+#[test]
+fn test_apply_event_a_turn_starting_clears_an_earlier_error() {
+    with_state(|state| {
+        assert_eq!(apply_event(state, ConversationEvent::TurnState { running: true }), EventEffect::TurnStarted);
+        assert!(*state.turn_running().peek());
+        assert_eq!(apply_event(state, ConversationEvent::TurnState { running: false }), EventEffect::None);
+    });
+}
+
 #[test]
 fn test_apply_event_sandbox_terminal_update_adds_then_removes_the_terminal() {
     with_state(|state| {
@@ -1709,7 +1760,7 @@ fn test_apply_event_question_update_sets_and_clears_the_waiting_question() {
 fn test_apply_event_turn_state_sets_running_and_an_ended_turn_drops_its_reply() {
     with_state(|state| {
         let effect = apply_event(state, ConversationEvent::TurnState { running: true, elapsed: 0 });
-        assert_eq!(effect, EventEffect::None);
+        assert_eq!(effect, EventEffect::TurnStarted, "B19: an earlier error goes");
         assert!(*state.turn_running().peek());
         assert_eq!(*state.turn_elapsed().peek(), 0);
         // SME-160: the event carries the turn's age on the server's

@@ -3,6 +3,7 @@ Model-listing responses the parsers in `../models.rs` are tested against.
 - `llama_cpp_v1_models.json`: a real `GET /v1/models` from a llama.cpp server (2026-09-29).
 - `llama_cpp_props.json`: a real `GET /props` from the same llama.cpp server (build b11434, 2026-10-07), verbatim, chat template included.
 - `anthropic_v1_models.json`: the example response in Anthropic's List Models docs (https://platform.claude.com/docs/en/api/models/list), verbatim. Its `max_input_tokens` of 0 is the docs' placeholder.
+- `anthropic_v1_models_claude_haiku_4_5.json`, `anthropic_v1_models_claude_haiku_5_5.json` (B9, SME-122): real `GET /v1/models/claude-haiku-4-5` and `GET /v1/models/claude-haiku-5-5` from Anthropic's API (2026-10-15), verbatim but for indentation. Haiku 4.5's `capabilities.thinking.types` has `adaptive` unsupported and `enabled` supported; Haiku 5.5's the reverse.
 - `ollama_api_*.json`: the examples in Ollama's OpenAPI spec (https://docs.ollama.com/openapi.yaml) for `/api/tags`, `/api/show` (`model_info` trimmed) and `/api/ps`, converted from YAML.
 
 A streamed `POST /v1/messages` reply that `../stream.rs` and `../../turn/tests.rs` are tested against (SME-112):
