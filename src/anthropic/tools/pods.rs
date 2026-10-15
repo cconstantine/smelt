@@ -8,14 +8,21 @@ use super::server::{required_i64, required_str};
 use crate::{db, sandbox};
 use crate::anthropic::ToolDefinition;
 
-#[expect(clippy::too_many_lines, reason = "SME-163 splits it, a function per tool")]
 pub(super) fn tools() -> Vec<Tool> {
+    // --- Terminal: pod, terminal, and command are three separate,
+    // explicitly-guarded lifecycles. A conversation has at most one
+    // live pod at a time, each with N terminals — see
+    // SME-9 and
+    // SME-11's "One pod per conversation."
+    let mut tools = pod_tools();
+    tools.extend(terminal_tools());
+    tools.extend(command_tools());
+    tools
+}
+
+/// Creating, deleting and listing the conversation's pod.
+fn pod_tools() -> Vec<Tool> {
     vec![
-        // --- Terminal: pod, terminal, and command are three separate,
-        // explicitly-guarded lifecycles. A conversation has at most one
-        // live pod at a time, each with N terminals — see
-        // SME-9 and
-        // SME-11's "One pod per conversation."
         Tool {
             def: ToolDefinition {
                 name: "create_pod".to_string(),
@@ -63,6 +70,12 @@ pub(super) fn tools() -> Vec<Tool> {
             },
             run: run!(|c| list_pods_tool(c.pool, c.conversation_id)),
         },
+    ]
+}
+
+/// Creating, deleting and listing a pod's terminals.
+fn terminal_tools() -> Vec<Tool> {
+    vec![
         Tool {
             def: ToolDefinition {
                 name: "create_terminal".to_string(),
@@ -109,6 +122,12 @@ pub(super) fn tools() -> Vec<Tool> {
             },
             run: run!(|c| list_terminals_tool(c.pool, c.conversation_id)),
         },
+    ]
+}
+
+/// Running commands in a terminal, signalling them, and reading their output.
+fn command_tools() -> Vec<Tool> {
+    vec![
         Tool {
             def: ToolDefinition {
                 name: "run_terminal_command".to_string(),
