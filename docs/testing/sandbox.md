@@ -2,7 +2,7 @@
 
 Part of [testing.md](../testing.md). The real-cluster tests: pods, Docker, the agent's protocol and language servers.
 
-`src/sandbox/tests.rs`'s tests hit a real Kubernetes API, the same "real
+`src/sandbox/tests/`' tests hit a real Kubernetes API, the same "real
 dependency, not a mock" posture as the database tests above — there's no
 cheap way to fake the k8s API surface the way `anthropic::stream`'s mock
 upstream fakes a single HTTP endpoint. Unlike the database tests, there's
@@ -89,7 +89,7 @@ already gone.
 
 ## The pod lifecycle tests (SME-94)
 
-`src/sandbox/pod_lifecycle_tests.rs` runs the sandbox's own operations against real pods, one feature per test: pod creation and its guards, terminals, a finished command waking the model, the file tools, glob and grep, repos and project instructions, crash detection, the user's stop, the pods view, `watch_pods`, claims and volumes. A failure names the feature, and the rest still run. Each test:
+`src/sandbox/pod_lifecycle_tests/` runs the sandbox's own operations against real pods, one feature per test: pod creation and its guards, terminals, a finished command waking the model, the file tools, glob and grep, repos and project instructions, crash detection, the user's stop, the pods view, `watch_pods`, claims and volumes. A failure names the feature, and the rest still run. Each test:
 
 - starts with `own_sandbox(&pool)`: `db::test_support::start_ids_clear_of_other_runs` moves its conversation, pod and volume ids to a base no other test or run shares (pods, claims and labels are named after them, in one shared namespace), and `use_test_manager` gives `sandbox::get()` on the test's thread a manager of its own (see the cross-runtime hazard below);
 - runs its scenario through `run_then_tear_down(&pool, &client, limit, async { ... })`, which bounds it in time, then deletes every pod and claim of its database's conversations, every volume's claim and anything else labelled with its database's instance, pass, fail or timeout, before re-raising. First it takes each conversation's pod-start lock and keeps it: `create_pod` starts a pod in a task of its own, which a cut-off scenario leaves running, and it would otherwise make its pod after the deletes. That waits out every start already running or queued (for at most two running waits plus a minute, then it gives up and says so) and blocks any asked for afterwards;

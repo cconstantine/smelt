@@ -36,7 +36,7 @@ For a security boundary, also write down what it does *not* cover, and test the 
 
 1. Add struct to `src/models.rs` (see [models.md](../models.md))
 2. Add migration: `migrations/YYYYMMDDHHMMSS_description.sql`
-3. Add async CRUD functions to `src/db.rs` returning `Result<T, sqlx::Error>`
+3. Add async CRUD functions to the module for their tables under `src/db/` (re-exported by `src/db/mod.rs`, so callers write `db::name`), returning `Result<T, sqlx::Error>`
 4. Add server functions to `src/api/` (see [api.md](../api.md)) — there's no separate client fetch layer to add, the server function is directly callable from a component
 5. Create or extend a page in `src/frontend/pages/`
 6. Register a new page in `src/frontend/pages/mod.rs` and, if it needs its own route, `src/frontend/mod.rs`'s `Route` enum

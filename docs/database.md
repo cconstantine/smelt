@@ -5,7 +5,7 @@ Postgres via sqlx. `db.rs`'s CRUD functions take `pool: &PgPool` as an explicit 
 A process-wide `OnceLock<PgPool>` still exists for *production* wiring, so the pool is opened once, at startup:
 
 ```rust
-// src/db.rs
+// src/db/mod.rs
 static POOL: OnceLock<PgPool> = OnceLock::new();
 
 pub async fn init() -> &'static PgPool { /* connects (with retry), sets POOL */ }
