@@ -147,7 +147,15 @@ pub fn App() -> Element {
         // Without this a phone lays the page out at desktop width and
         // shrinks it to fit (SME-40 F8).
         document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
-        document::Stylesheet { href: asset!("/assets/chat.css") }
+        // The app's stylesheet, in parts (SME-163), linked in their order:
+        // a later part's rules win ties, as they did in one file.
+        document::Stylesheet { href: asset!("/assets/css/01-base.css") }
+        document::Stylesheet { href: asset!("/assets/css/02-transcript.css") }
+        document::Stylesheet { href: asset!("/assets/css/03-panels.css") }
+        document::Stylesheet { href: asset!("/assets/css/04-phone-and-composer.css") }
+        document::Stylesheet { href: asset!("/assets/css/05-mcp.css") }
+        document::Stylesheet { href: asset!("/assets/css/06-volumes-and-context.css") }
+        document::Stylesheet { href: asset!("/assets/css/07-pages.css") }
         // Code highlighting in the model's replies (SME-30).
         document::Stylesheet { href: asset!("/assets/highlight.css") }
         StaleBundleBanner {}

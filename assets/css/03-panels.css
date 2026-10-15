@@ -1,0 +1,525 @@
+/* Live browsing panel — lives in .side-panels-row, renders first
+   (leftmost/topmost) when a session is open since it's the most
+   attention-grabbing of the panels (a real live view, not just a status
+   list). The frame itself renders at a fixed size matching
+   `browsing::server`'s own `SCREENCAST_MAX_WIDTH`/`SCREENCAST_MAX_HEIGHT`
+   exactly (1280x800) — deliberately not responsive/scaled, since the
+   click/keyboard forwarding math assumes on-screen pixels equal real
+   frame pixels 1:1 (see `chat.rs`'s input handlers) — a real limitation
+   worth a proper coordinate-scaling pass if this needs to fit a smaller
+   viewport later. */
+.browsing-panel {
+    flex: 1 1 auto;
+    min-width: 0;
+    border-right: 1px solid var(--border);
+    background: var(--canvas);
+    padding: 16px;
+    overflow: auto;
+}
+
+.browsing-panel h3 {
+    margin: 0 0 12px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.browsing-panel-frame-wrap {
+    /* Scales down to fit the panel, keeping the page's 1280x800 shape;
+       clicks are scaled back up to page pixels (`frame_point`). */
+    width: 100%;
+    max-width: 1280px;
+    aspect-ratio: 1280 / 800;
+    background: var(--ink);
+    border-radius: 4px;
+    cursor: pointer;
+    outline: none;
+    position: relative;
+}
+
+.browsing-panel-frame {
+    display: block;
+    width: 100%;
+    height: auto;
+    -webkit-user-drag: none;
+    user-select: none;
+}
+
+.browsing-panel-empty {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+/* Todo panel — lives in .side-panels-row as a fixed-width sidebar
+   (border-right, scrolls independently). */
+.todo-panel {
+    width: 280px;
+    flex-shrink: 0;
+    border-right: 1px solid var(--border);
+    background: var(--canvas);
+    padding: 16px;
+    overflow-y: auto;
+}
+
+.todo-panel h3 {
+    margin: 0 0 12px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.todo-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.todo-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 13px;
+    line-height: 1.4;
+}
+
+/* Same marker box for every status — only its border/fill/glyph change —
+   so an item's status is legible without relying on color alone (a plain
+   empty box vs. a half-filled box vs. a checkmark), not just a repainted
+   dot. */
+.todo-item-marker {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    margin-top: 1px;
+    border-radius: 3px;
+    border: 1.5px solid var(--muted);
+    flex-shrink: 0;
+    font-size: 9px;
+    line-height: 1;
+    color: var(--surface);
+}
+
+.todo-item-in-progress .todo-item-marker {
+    border-color: var(--accent);
+    background: linear-gradient(135deg, var(--accent) 50%, transparent 50%);
+}
+
+.todo-item-completed .todo-item-marker {
+    border-color: #1baf7a;
+    background: #1baf7a;
+}
+
+.todo-item-completed .todo-item-marker::after {
+    content: "\2713";
+}
+
+.todo-item-content {
+    flex: 1;
+    min-width: 0;
+    word-break: break-word;
+}
+
+.todo-item-in-progress .todo-item-content {
+    font-weight: 600;
+}
+
+.todo-item-completed .todo-item-content {
+    color: var(--muted);
+    text-decoration: line-through;
+}
+
+/* Sandbox panel — takes whatever width .side-panels-row has left over.
+   Each pod groups its terminals, styled by .task-terminal/.task-terminal-*.
+
+   Neither this panel nor .sandbox-pod/.task-terminal-stack/.task-terminal
+   scroll or overflow on their own — they're a chain of flex columns that
+   just hands its bounded height (stretched from .side-panels-row) down to
+   .task-terminal-body, the one leaf that actually scrolls (see the
+   scoped override on .sandbox-panel .task-terminal-body below). That
+   keeps exactly one scrollbar per terminal and none anywhere above it —
+   no panel-level scrollbar, and no bleeding into a whole-page scrollbar
+   either (that was worse: it dragged the sidebar and transcript along
+   with it). A conversation has at most one live pod (see
+   SME-11's "One pod per conversation"), so
+   it's multiple *terminals within that pod* that split the available
+   height evenly via flex: 1, not multiple pods. */
+.sandbox-panel {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background: var(--canvas);
+    padding: 16px;
+}
+
+.sandbox-panel .sandbox-pod {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.sandbox-panel .sandbox-pod-header {
+    flex-shrink: 0;
+}
+
+.sandbox-panel .task-terminal-stack {
+    flex: 1;
+    min-height: 0;
+}
+
+.sandbox-panel .task-terminal {
+    flex: 1;
+    min-height: 0;
+}
+
+.sandbox-panel .task-terminal-titlebar {
+    flex-shrink: 0;
+}
+
+.sandbox-panel .task-terminal-body {
+    flex: 1;
+    min-height: 0;
+    max-height: none;
+    overflow-y: auto;
+}
+
+.sandbox-panel h3 {
+    flex-shrink: 0;
+    margin: 0 0 12px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.sandbox-pod {
+    margin-bottom: 16px;
+}
+
+.sandbox-pod-header {
+    display: flex;
+    justify-content: flex-end;
+    align-items: baseline;
+    margin-bottom: 8px;
+    font-size: 12px;
+    color: var(--text-2);
+}
+
+.sandbox-pod-status {
+    color: var(--muted);
+}
+
+/* Links to what the sandbox is serving, for the user's own browser
+   (SME-42): one per port the model shared. */
+.sandbox-panel .sandbox-previews {
+    flex-shrink: 0;
+}
+
+.sandbox-previews {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    margin-bottom: 8px;
+    font-size: 13px;
+}
+
+.sandbox-preview {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.sandbox-preview:hover,
+.sandbox-preview:focus-visible {
+    text-decoration: underline;
+}
+
+.sandbox-preview::after {
+    content: " \2197";
+}
+
+/* Each sandbox terminal gets its own terminal-window-styled widget,
+   stacked vertically. */
+.task-terminal-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.task-terminal {
+    display: flex;
+    flex-direction: column;
+    /* The titlebar's container queries (below) measure the card. */
+    container-type: inline-size;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #1e1e1e;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.task-terminal-titlebar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    background: #2d2d2d;
+    border-bottom: 1px solid #000;
+}
+
+.task-terminal-dots {
+    display: flex;
+    gap: 5px;
+    flex-shrink: 0;
+}
+
+.task-terminal-dots .dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+}
+
+.dot-red {
+    background: #ff5f56;
+}
+
+.dot-yellow {
+    background: #ffbd2e;
+}
+
+.dot-green {
+    background: #27c93f;
+}
+
+.task-terminal-id {
+    color: #888;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 12ch;
+    margin-right: auto;
+}
+
+.task-terminal-status {
+    white-space: nowrap;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: capitalize;
+    background: #444;
+    color: #ddd;
+    flex-shrink: 0;
+}
+
+@container (max-width: 240px) {
+    .task-terminal-status {
+        display: none;
+    }
+}
+
+@container (max-width: 160px) {
+    .task-terminal-id {
+        display: none;
+    }
+
+    .task-terminal-dots {
+        margin-right: auto;
+    }
+}
+
+/* The titlebar's pills, pushed right by the terminal's name
+   (`margin-right: auto`): the last command's status (SME-144), then the
+   terminal's connection. The titlebar sits outside .task-terminal-body,
+   the one part that scrolls, so the command's status stays in view however
+   much it prints. In a narrow card (720-1024px with a todo list beside the
+   sandbox, ~137-156px wide) the name shrinks first; below 240px the
+   connection pill is hidden (the titlebar's tooltip still says it), and
+   below 160px the name too. The dots and the command's pill always fit.
+   The terminal's palette is always dark, so these colours serve both
+   themes; each text/background pair is at least 6.5:1. */
+.task-terminal-command,
+.task-terminal-status {
+    box-sizing: border-box;
+    height: 18px;
+    line-height: 16px;
+}
+
+.task-terminal-command {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+    flex-shrink: 0;
+    background: #444;
+    color: #ddd;
+}
+
+.task-terminal-command-glyph {
+    line-height: 1;
+}
+
+.task-terminal-command-running {
+    background: #1f3a5f;
+    color: #9cc7ff;
+}
+
+.task-terminal-command-running .task-terminal-command-glyph {
+    animation: task-terminal-command-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes task-terminal-command-pulse {
+    50% {
+        opacity: 0.35;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .task-terminal-command-running .task-terminal-command-glyph {
+        animation: none;
+    }
+}
+
+.task-terminal-command-ok {
+    background: #1e4620;
+    color: #9be29f;
+}
+
+.task-terminal-command-failed {
+    background: #5c1f1f;
+    color: #ffaaa5;
+}
+
+.task-terminal-command-lost {
+    background: #5a4210;
+    color: #ffd27a;
+}
+
+.task-terminal-body {
+    padding: 8px 10px;
+    /* Was a fixed 220px, cramped even before the sandbox panel existed —
+       the whole side-panels-row has real vertical room now that it's a
+       full-width band under the transcript rather than a narrow sidebar,
+       so each card's body scrolls internally well before hitting this. */
+    max-height: 60vh;
+    overflow-y: auto;
+    /* Chrome's scroll anchoring pins a scroller that sits at its end onto
+       every new bottom as content arrives. A reader who scrolled up to read
+       and then grew the window gets clamped onto the bottom by that resize
+       once (no way to avoid that), and the anchoring then keeps dragging them
+       onto each new line after it — which is indistinguishable from the
+       follow they just switched off, and no amount of scroll logic can undo
+       it (SME-108 review 1: a window grow revived the follow through it).
+       The terminal follows its bottom through the app's own scroll (see
+       `StickyBottom`), so the browser has no need to guess here. */
+    overflow-anchor: none;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.task-terminal-line {
+    color: #d4d4d4;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.task-terminal-line-stderr {
+    color: #ff9d7a;
+}
+
+.task-terminal-empty {
+    color: #666;
+    font-style: italic;
+}
+
+/* One command's worth of history within a sandbox terminal's body — see
+   the plan discussion in the sandbox-visibility follow-up (SME-10): the panel now
+   shows a terminal's whole (bounded) command history, not just its
+   current command, so each command needs its own visual block rather
+   than one flat, unlabeled output stream. */
+.sandbox-command-block {
+    margin-bottom: 10px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--text);
+}
+
+.sandbox-command-block:last-child {
+    margin-bottom: 0;
+    padding-bottom: 0;
+    border-bottom: none;
+}
+
+.sandbox-command-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 4px;
+    color: #9cdcfe;
+}
+
+.sandbox-command-header code {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.sandbox-command-status {
+    flex-shrink: 0;
+    color: var(--muted);
+    font-size: 11px;
+}
+
+.task-terminal-cursor {
+    display: inline-block;
+    width: 7px;
+    height: 13px;
+    margin-top: 2px;
+    background: #d4d4d4;
+    animation: task-terminal-blink 1s steps(1) infinite;
+}
+
+@keyframes task-terminal-blink {
+    50% {
+        opacity: 0;
+    }
+}
+
+.composer {
+    display: flex;
+    gap: 10px;
+    padding: 16px 24px;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+}
+
+.composer input {
+    flex: 1;
+    padding: 10px 14px;
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    font-size: 15px;
+    transition: border-color 100ms ease, box-shadow 100ms ease;
+}
+

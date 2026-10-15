@@ -454,7 +454,7 @@ pub(super) async fn scenario_terminal_follow_after_switch(t: &Scenario<'_>) {
     // what the browser does by default — Chrome's scroll anchoring keeps a
     // scroller that sits at its end pinned onto every new bottom, which looks
     // exactly like a follow and which no scroll logic can undo; the body's
-    // `overflow-anchor: none` (assets/chat.css) is what stops it, and the growth
+    // `overflow-anchor: none` (assets/css/03-panels.css) is what stops it, and the growth
     // checked below is what it stops.
     page.execute(
         chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(1400, 900, 1.0, false),

@@ -1,0 +1,959 @@
+/* --- Pods (SME-26) --- */
+
+.pods-link,
+.sandbox-volumes-link {
+    display: block;
+    padding: 8px 10px;
+    border-radius: 8px;
+    color: var(--text-2);
+    font-size: 13px;
+    text-decoration: none;
+    text-align: center;
+    border: 1px solid var(--border);
+}
+
+.pods-link:hover,
+.sandbox-volumes-link:hover {
+    background: var(--subtle);
+    color: var(--ink);
+}
+
+/* A conversation with a live sandbox pod. */
+.live-pod-dot {
+    flex-shrink: 0;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #1baf7a;
+}
+
+.pods-page {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+}
+
+.pods-header {
+    margin-bottom: 24px;
+}
+
+.pods-back-link {
+    display: inline-block;
+    margin-bottom: 12px;
+    color: var(--text-2);
+    font-size: 13px;
+    text-decoration: none;
+}
+
+.pods-back-link:hover {
+    color: var(--ink);
+}
+
+.pods-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.pods-table th {
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-2);
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+}
+
+.pods-table td {
+    padding: 10px;
+    border-bottom: 1px solid var(--subtle);
+    vertical-align: middle;
+    white-space: nowrap;
+}
+
+.pods-table td:first-child {
+    white-space: normal;
+}
+
+.pods-table a {
+    color: var(--ink);
+}
+
+.pod-id {
+    font-size: 12px;
+}
+
+.pods-footnote {
+    margin-top: 16px;
+    font-size: 12px;
+}
+
+.pod-stop {
+    padding: 4px 10px;
+    border: 1px solid var(--danger);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--danger);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.pod-stop:hover {
+    background: var(--danger-bg);
+}
+
+.pod-stop.confirm {
+    background: var(--danger);
+    color: var(--surface);
+}
+
+.sandbox-pod-header .pod-stop {
+    margin-left: 10px;
+}
+
+/* The composer's Stop button, shown while a turn runs. */
+.composer button.stop-turn {
+    background: var(--surface);
+    color: var(--danger);
+    border: 1px solid var(--danger);
+}
+
+.composer button.stop-turn:hover:not(:disabled) {
+    background: var(--danger-bg);
+}
+
+.turn-stopped {
+    font-size: 13px;
+    margin: 4px 0;
+}
+
+/* A two-step button's label (`TwoStepLabel`): both labels share one grid
+   cell and the inactive one is hidden, so the button keeps the width of the
+   longer label in both states. */
+.two-step-label {
+    display: inline-grid;
+    justify-items: center;
+}
+
+.two-step-text {
+    grid-area: 1 / 1;
+}
+
+.two-step-text.hidden {
+    visibility: hidden;
+}
+
+/* --- A URL that isn't a page (SME-40 F10) --- */
+
+.not-found-page {
+    max-width: 480px;
+    margin: 80px auto;
+    padding: 0 16px;
+    text-align: center;
+}
+
+.not-found-page h1 {
+    font-size: 22px;
+    margin-bottom: 8px;
+}
+
+.not-found-home-link {
+    color: var(--text-2);
+    font-size: 14px;
+}
+
+/* Settings pages: intro text and empty states line up with the heading
+   instead of the 24px indent .muted gives elsewhere (SME-41 D6). */
+.mcp-servers-page p.muted,
+.pods-page p.muted,
+.sandbox-volumes-page p.muted {
+    padding: 0;
+}
+
+/* How long ago a conversation was active (SME-41 D8). */
+.conversation-age {
+    flex-shrink: 0;
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.conversation-item:hover .conversation-age,
+.conversation-item:focus-within .conversation-age {
+    visibility: hidden;
+}
+
+/* A conversation whose model turn is running (SME-41 D9): the same pulse
+   as the "Working..." line in the chat. */
+.conversation-busy {
+    flex-shrink: 0;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: turn-working-pulse 1.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .conversation-busy {
+        animation: none;
+    }
+}
+
+/* An empty conversation (SME-41 D12). */
+.conversation-empty {
+    align-self: center;
+    max-width: 560px;
+    margin: auto 0;
+    padding: 24px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    color: var(--text-2);
+}
+
+.conversation-empty h2 {
+    margin: 0;
+    font-size: 20px;
+    color: var(--ink);
+    text-wrap: balance;
+}
+
+.conversation-empty p {
+    margin: 0 0 6px;
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+.example-asks {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.example-ask {
+    text-align: left;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+}
+
+.example-ask:hover {
+    border-color: var(--border-strong);
+    background: var(--subtle);
+}
+
+.example-ask:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* --- Git settings (SME-32) --- reuses the sandbox volumes page's layout,
+   rows and forms. */
+
+.git-section {
+    margin-bottom: 32px;
+}
+
+.git-section h2 {
+    font-size: 17px;
+    margin: 0 0 8px;
+}
+
+.git-key-form h3 {
+    font-size: 15px;
+    margin: 0;
+}
+
+.git-key-row {
+    align-items: flex-start;
+}
+
+.git-key-row .sandbox-volume-summary {
+    min-width: 0;
+}
+
+.git-public-key {
+    font-size: 12px;
+    color: var(--text-2);
+    word-break: break-all;
+}
+
+.git-key-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    align-items: stretch;
+}
+
+.git-key-copy {
+    padding: 8px 16px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--ink);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.git-key-copy:hover {
+    background: var(--subtle);
+}
+
+.git-key-form {
+    margin-top: 16px;
+}
+
+.git-private-key-input {
+    padding: 8px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    resize: vertical;
+}
+
+.git-key-form-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.sandbox-volume-add-form button.git-key-mode {
+    border-color: var(--border-strong);
+    background: var(--surface);
+    color: var(--text-2);
+}
+
+.sandbox-volume-add-form button.git-key-mode:hover {
+    background: var(--subtle);
+    color: var(--ink);
+}
+
+@media (max-width: 720px) {
+    .git-key-row {
+        flex-direction: column;
+    }
+
+    .git-key-actions {
+        flex-direction: row;
+    }
+}
+
+/* A conversation's repos in the sandbox panel (SME-32). */
+
+.sandbox-repos {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 8px 0;
+}
+
+.sandbox-repo {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 10px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-left-width: 3px;
+    border-radius: 8px;
+    background: var(--surface);
+    font-size: 13px;
+    min-width: 0;
+}
+
+.sandbox-repo-ready {
+    border-left-color: var(--ok);
+}
+
+.sandbox-repo-cloning {
+    border-left-color: var(--muted);
+}
+
+.sandbox-repo-failed {
+    border-left-color: var(--danger);
+}
+
+.sandbox-repo-path {
+    font-weight: 600;
+    word-break: break-all;
+}
+
+.sandbox-repo-detail {
+    color: var(--text-2);
+}
+
+.sandbox-repo-error,
+.repo-attach-error {
+    flex-basis: 100%;
+    margin: 4px 0 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 12px;
+    color: var(--danger);
+}
+
+/* "Work on a repo" in a new conversation. */
+
+.repo-attach {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 16px 0;
+    text-align: left;
+}
+
+.repo-attach label {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.repo-attach-fields {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.repo-attach-fields input {
+    flex: 3 1 240px;
+    min-width: 0;
+    padding: 8px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 14px;
+}
+
+.repo-attach-fields input.repo-attach-branch {
+    flex: 1 1 120px;
+}
+
+.repo-attach-fields button {
+    padding: 8px 16px;
+    border: 1px solid var(--ink);
+    border-radius: 8px;
+    background: var(--ink);
+    color: var(--surface);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.repo-attach-fields button:disabled {
+    background: var(--border);
+    border-color: var(--border);
+    color: var(--muted);
+    cursor: not-allowed;
+}
+
+.sandbox-repo-instructions {
+    font-size: 12px;
+    color: var(--ok);
+}
+
+.context-detail-instructions {
+    margin: 6px 0;
+}
+
+.context-detail-instructions summary {
+    cursor: pointer;
+    font-size: 13px;
+}
+
+/* Asking the user whether to trust a repo's AGENTS.md (SME-32). */
+
+.trust-card {
+    margin: 12px 0;
+    padding: 14px 16px;
+    border: 1px solid var(--border-strong);
+    border-left: 3px solid var(--ink);
+    border-radius: 12px;
+    background: var(--surface);
+}
+
+.trust-card-question {
+    margin: 0 0 6px;
+    font-weight: 600;
+}
+
+.trust-card-question code {
+    word-break: break-all;
+}
+
+.trust-card-preview pre {
+    max-height: 240px;
+    overflow: auto;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: var(--subtle);
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.trust-card-preview summary {
+    cursor: pointer;
+    font-size: 13px;
+}
+
+.trust-card-buttons {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.trust-card-buttons button {
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.trust-card-trust {
+    border: 1px solid var(--ink);
+    background: var(--ink);
+    color: var(--surface);
+}
+
+.trust-card-decline {
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--ink);
+}
+
+/* SME-34: the model's question, waiting on the user, and the row it
+   becomes once answered. Shaped like the trust card: both are the model
+   asking the user to decide something. */
+.question-card {
+    margin: 12px 0;
+    padding: 14px 16px;
+    border: 1px solid var(--border-strong);
+    border-left: 3px solid var(--accent);
+    border-radius: 12px;
+    background: var(--surface);
+}
+
+.question-card-question {
+    margin: 0 0 12px;
+    padding: 0;
+    border: none;
+    min-width: 0;
+}
+
+.question-card-header {
+    padding: 0;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.question-card-text {
+    margin: 2px 0 8px;
+    color: var(--ink);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.question-card-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.question-option {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    max-width: 100%;
+    padding: 8px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--ink);
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+}
+
+.question-option:hover:not(:disabled) {
+    border-color: var(--accent);
+}
+
+.question-option.chosen {
+    border-color: var(--accent);
+    background: var(--subtle);
+    box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.question-option-label {
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.question-option-description {
+    color: var(--text-2);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
+.question-card-other {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+}
+
+.question-card-submit {
+    padding: 8px 16px;
+    border: 1px solid var(--ink);
+    border-radius: 8px;
+    background: var(--ink);
+    color: var(--surface);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.question-card-submit:disabled,
+.question-option:disabled {
+    opacity: 0.55;
+    cursor: default;
+}
+
+.question-answered {
+    margin: 6px 0;
+    padding: 8px 12px;
+    border-left: 2px solid var(--accent);
+    color: var(--text-2);
+    font-size: 13px;
+}
+
+.question-answered-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--muted);
+}
+
+.question-answered-icon {
+    font-weight: 700;
+    color: var(--accent);
+}
+
+.question-answered-question {
+    margin: 4px 0 0;
+    color: var(--text);
+    overflow-wrap: anywhere;
+}
+
+.question-answered-answer {
+    margin: 2px 0 0;
+    color: var(--ink);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+/* The sidebar's mark for a conversation waiting on the user's answer. */
+.conversation-waiting {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--surface);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+}
+
+/* SME-35: the language server page's catalog lookup. */
+.language-server-lookup-row {
+  display: flex;
+  gap: 8px;
+}
+.language-server-lookup-row input {
+  flex: 1;
+  min-width: 0;
+}
+.language-server-note {
+  margin: 6px 0 0;
+  padding: 6px 10px;
+  border-left: 3px solid #c8a200;
+  background: rgba(200, 162, 0, 0.08);
+  font-size: 0.9em;
+}
+.language-server-enabled {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* A sandbox's language servers, under its row on /pods (SME-35). */
+.pods-table tr.pod-servers td {
+    padding-top: 0;
+    font-size: 0.9em;
+}
+
+/* SME-72: the model picker above a conversation's message box. */
+.model-picker {
+    padding: 8px 24px 0;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    font-size: 13px;
+}
+.model-picker + .composer {
+    border-top: none;
+    padding-top: 8px;
+}
+.model-picker-current {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+.model-picker-label {
+    color: var(--text);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+.model-picker-button,
+.model-chooser button {
+    padding: 3px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--ink);
+    font-size: 12px;
+    cursor: pointer;
+}
+.model-picker-button:hover,
+.model-chooser button:hover:not(:disabled) {
+    background: var(--subtle);
+}
+.model-chooser button[type="submit"] {
+    background: var(--ink);
+    border-color: var(--ink);
+    color: var(--surface);
+    font-weight: 600;
+}
+.model-chooser button:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+.model-picker-warning {
+    padding: 2px 8px;
+    border-left: 3px solid #c8a200;
+    background: rgba(200, 162, 0, 0.08);
+    color: var(--text);
+    font-size: 12px;
+}
+.model-picker-setup {
+    margin: 0;
+    padding: 6px 10px;
+    border-left: 3px solid var(--accent);
+    background: var(--subtle);
+    color: var(--text);
+}
+.model-picker-setup .model-picker-button {
+    margin-left: 4px;
+}
+.model-picker-error {
+    margin: 6px 0 0;
+}
+.model-chooser {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+.model-chooser select,
+.model-chooser input,
+.provider-form select {
+    padding: 5px 8px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+}
+.model-chooser input {
+    flex: 1;
+    min-width: 12em;
+}
+.model-chooser-note {
+    flex-basis: 100%;
+    margin: 0;
+}
+/* SME-106: the providers page's last-30-days list, in the provider list's
+   stacked rows: the cost sits under the summary at any width. */
+.providers-spend {
+    margin-top: 24px;
+}
+.providers-spend .mcp-server-row {
+    gap: 4px;
+}
+.providers-spend-cost {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+/* SME-106: the checkbox sits beside its label, like the MCP form's radios. */
+.mcp-add-form label.provider-checkbox {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+}
+.mcp-add-form .provider-checkbox input {
+    margin: 0;
+    padding: 0;
+}
+
+/* SME-72: /providers. */
+.providers-default {
+    margin-bottom: 24px;
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+}
+.providers-default h2,
+.provider-models h2 {
+    margin: 0 0 4px;
+    font-size: 15px;
+}
+.provider-models {
+    margin-bottom: 24px;
+}
+.provider-model-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 10px 0;
+}
+.provider-model-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    font-size: 13px;
+}
+.provider-model-name {
+    flex: 1 1 14em;
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+.provider-model-window input,
+.provider-model-add input {
+    width: 12em;
+    max-width: 100%;
+    padding: 4px 8px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+}
+.provider-model-thinking {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.provider-model-row button,
+.provider-model-add button {
+    padding: 4px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--ink);
+    cursor: pointer;
+}
+.provider-model-add {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+}
+@media (max-width: 720px) {
+    .model-picker {
+        padding: 8px 12px 0;
+    }
+}
+.model-picker-setup a,
+.model-picker-warning a {
+    color: var(--accent);
+}
+
+/* The page's bundle is older than the server (SME-43): over everything,
+   since every page with a live stream can show it, and out of the way of
+   the composer at the bottom. */
+.stale-bundle-banner {
+    position: fixed;
+    top: 8px;
+    left: 0;
+    right: 0;
+    width: fit-content;
+    margin: 0 auto;
+    z-index: 200;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: calc(100vw - 32px);
+    padding: 6px 8px 6px 12px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+.stale-bundle-banner button {
+    flex: none;
+    padding: 3px 10px;
+    border: 1px solid var(--ink);
+    border-radius: 6px;
+    background: var(--ink);
+    color: var(--surface);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+}
+.stale-bundle-banner button:hover {
+    background: var(--ink-hover);
+}
+/* Below the phone header's Conversations button, not over it. */
+@media (max-width: 720px) {
+    .stale-bundle-banner {
+        top: 56px;
+        width: auto;
+        margin: 0 16px;
+        max-width: none;
+    }
+}

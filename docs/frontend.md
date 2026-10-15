@@ -39,7 +39,9 @@ frontend/
 pub fn App() -> Element {
     rsx! {
         document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
-        document::Stylesheet { href: asset!("/assets/chat.css") }
+        // The stylesheet's parts, in order (assets/css/, SME-163).
+        document::Stylesheet { href: asset!("/assets/css/01-base.css") }
+        // ... one line per part, through 07-pages.css
         Router::<Route> {}
     }
 }

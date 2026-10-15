@@ -22,7 +22,6 @@ const NOT_COUNTED: &[&str] = &["Cargo.lock", "assets/highlight.css"];
 /// the check, and so does one that is now under the ceiling (or gone), until
 /// its entry is removed.
 const EXCEPTIONS: &[(&str, Limit)] = &[
-    ("assets/chat.css", Limit { bytes: 76_167, lines: 3_518 }),
     ("src/frontend/pages/chat/tests.rs", Limit { bytes: 88_347, lines: 2_158 }),
     ("src/frontend/pages/chat/transcript.rs", Limit { bytes: 42_561, lines: 917 }),
     ("src/frontend/pages/providers.rs", Limit { bytes: 57_015, lines: 1_266 }),
@@ -132,6 +131,26 @@ mod tests {
         let exists = |p: &str| tracked.contains(p) || tracked.iter().any(|t| t.starts_with(&format!("{p}/")));
         let broken = links::broken_links(&docs, &exists);
         assert!(broken.is_empty(), "links that don't resolve:\n{}", broken.join("\n"));
+    }
+
+    /// The app links every part of its stylesheet, in order, and the browser
+    /// tier serves each (SME-163): a part left out would leave pages partly
+    /// unstyled, and parts out of order would change which rule wins a tie.
+    #[test]
+    fn test_every_stylesheet_part_is_linked_in_order() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut parts: Vec<String> = tracked_files()
+            .into_iter()
+            .filter(|p| p.starts_with("assets/css/") && p.ends_with(".css"))
+            .collect();
+        parts.sort();
+        assert!(parts.len() > 1, "the stylesheet's parts: {parts:?}");
+        let links = regex::Regex::new(r#"asset!\("/(assets/css/[^"]+)"\)"#).expect("a valid regex");
+        for file in ["src/frontend/mod.rs", "src/browser_tests/harness.rs"] {
+            let text = std::fs::read_to_string(root.join(file)).expect("read the file that links the stylesheet");
+            let linked: Vec<String> = links.captures_iter(&text).map(|c| c[1].to_string()).collect();
+            assert_eq!(linked, parts, "{file} should link every part of assets/css/, in order");
+        }
     }
 
     #[test]

@@ -18,13 +18,20 @@ pub(super) async fn scenario_terminals(t: &Scenario<'_>) {
     // Every scenario assumes the page is styled; a layout check on an
     // unstyled page proves nothing (SME-40 F17: the stylesheet was a 404
     // in this tier, so every page ran unstyled).
-    let stylesheet_status: u16 = page
-        .evaluate("fetch(document.querySelector('link[rel=stylesheet]').href).then(r => r.status)")
+    // Every part of it (SME-163: the stylesheet is in parts, one per file).
+    let stylesheets: Vec<(String, u16)> = page
+        .evaluate(
+            "Promise.all([...document.querySelectorAll('link[rel=stylesheet]')].map(l => \
+             fetch(l.href).then(r => [l.getAttribute('href'), r.status])))",
+        )
         .await
-        .expect("fetch the stylesheet")
+        .expect("fetch the stylesheets")
         .into_value()
-        .expect("a status code");
-    assert_eq!(stylesheet_status, 200, "the page's stylesheet doesn't load");
+        .expect("each stylesheet's address and status");
+    assert!(stylesheets.len() >= 8, "the app's seven parts and highlight.css, got {stylesheets:?}");
+    for (href, status) in &stylesheets {
+        assert_eq!(*status, 200, "the page's stylesheet {href} doesn't load");
+    }
     // Clicking its sidebar entry, same as a real user, though a direct
     // `/conversation/{id}` URL would work too now that routing exists. By
     // id: another scenario's conversation can sort first.

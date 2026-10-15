@@ -63,7 +63,13 @@ impl BrowserTestHarness {
         let stylesheets = {
             use dioxus::prelude::*;
             [
-                (asset!("/assets/chat.css").to_string(), "assets/chat.css"),
+                (asset!("/assets/css/01-base.css").to_string(), "assets/css/01-base.css"),
+                (asset!("/assets/css/02-transcript.css").to_string(), "assets/css/02-transcript.css"),
+                (asset!("/assets/css/03-panels.css").to_string(), "assets/css/03-panels.css"),
+                (asset!("/assets/css/04-phone-and-composer.css").to_string(), "assets/css/04-phone-and-composer.css"),
+                (asset!("/assets/css/05-mcp.css").to_string(), "assets/css/05-mcp.css"),
+                (asset!("/assets/css/06-volumes-and-context.css").to_string(), "assets/css/06-volumes-and-context.css"),
+                (asset!("/assets/css/07-pages.css").to_string(), "assets/css/07-pages.css"),
                 (asset!("/assets/highlight.css").to_string(), "assets/highlight.css"),
             ]
         };
