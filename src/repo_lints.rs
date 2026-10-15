@@ -32,7 +32,6 @@ const EXCEPTIONS: &[(&str, Limit)] = &[
     ("src/sandbox/agent.rs", Limit { bytes: 40_800, lines: 924 }),
     ("src/sandbox/agent_connection_tests.rs", Limit { bytes: 43_483, lines: 864 }),
     ("src/sandbox/manager.rs", Limit { bytes: 66_172, lines: 1_521 }),
-    ("src/sandbox/pod_lifecycle_tests.rs", Limit { bytes: 90_804, lines: 1_790 }),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
