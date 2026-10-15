@@ -73,7 +73,7 @@ const DOCKER_STARTUP_PROBE_PERIOD_SECS: i32 = 1;
 /// Matches `sandbox_agent`'s own `LISTEN_ADDR` port.
 const AGENT_PORT: u16 = 8088;
 /// The agent's relay into the pod's Docker networks (`RELAY_ADDR` in
-/// src/bin/sandbox_agent.rs), SME-33.
+/// src/bin/sandbox_agent/main.rs), SME-33.
 const RELAY_PORT: u16 = 8089;
 /// Longer than the relay's own 5s connect timeout, so its answer, or its
 /// giving up, arrives first.

@@ -99,7 +99,7 @@ pub(super) async fn dial_pod(
         .map_err(TerminalError::Sandbox)?;
     if let PodHost::Container(ip) = host {
         // The relay's one line, then its answer once it has connected
-        // (`RELAY_CONNECTED` in src/bin/sandbox_agent.rs). A target it
+        // (`RELAY_CONNECTED` in src/bin/sandbox_agent/main.rs). A target it
         // refuses, or can't reach, gets a stream that's already ended,
         // which reads the same as a port nothing listens on.
         use tokio::io::AsyncWriteExt;

@@ -1,5 +1,5 @@
 //! The sandbox agent's wire protocol (SME-53): every message smelt and the
-//! agent (`src/bin/sandbox_agent.rs`) send each other over the agent's
+//! agent (`src/bin/sandbox_agent/main.rs`) send each other over the agent's
 //! WebSocket, as JSON text frames. Shared by both: the agent compiles this
 //! file in with `#[path]`, as it does `docker_net.rs`, so it can use only
 //! `std` and `serde`, never `crate::` paths.

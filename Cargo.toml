@@ -221,7 +221,7 @@ browser-test = ["server"]
 # check` (no features) and only builds under `server`.
 [[bin]]
 name = "sandbox_agent"
-path = "src/bin/sandbox_agent.rs"
+path = "src/bin/sandbox_agent/main.rs"
 required-features = ["server"]
 
 # Standalone CLI, run by scripts/build-sandbox-image.sh — see

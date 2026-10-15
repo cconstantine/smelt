@@ -16,9 +16,11 @@ use sha2::{Digest, Sha256};
 const INPUTS: [&str; 4] = ["src", "assets", "Cargo.toml", "Cargo.lock"];
 
 /// What the sandbox image is built from, in `scripts/agent-sources-hash`'s
-/// order: that script hashes these files run together, and so does this.
-const AGENT_SOURCES: [&str; 6] = [
-    "src/bin/sandbox_agent.rs",
+/// order: every `.rs` file under this directory, sorted by their paths'
+/// bytes (the script's `LC_ALL=C sort`), then `AGENT_SOURCES`. That script
+/// hashes these files run together, and so does this.
+const AGENT_DIR: &str = "src/bin/sandbox_agent";
+const AGENT_SOURCES: [&str; 5] = [
     "src/agent_protocol.rs",
     "src/docker_net.rs",
     "docker/sandbox/Dockerfile",
@@ -49,8 +51,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The Dockerfile is the one agent source outside INPUTS.
     println!("cargo:rerun-if-changed=docker/sandbox/Dockerfile");
+    let mut agent_files = Vec::new();
+    collect(Path::new(AGENT_DIR), &mut agent_files)?;
+    let mut agent_files: Vec<String> = agent_files
+        .iter()
+        .filter(|f| f.extension().is_some_and(|e| e == "rs"))
+        .map(|f| f.to_string_lossy().into_owned())
+        .collect();
+    agent_files.sort();
     let mut agent = Sha256::new();
-    for file in AGENT_SOURCES {
+    for file in agent_files.iter().map(String::as_str).chain(AGENT_SOURCES) {
         agent.update(std::fs::read(file)?);
     }
     let hash: String = agent.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect();

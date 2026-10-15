@@ -1,6 +1,6 @@
 //! The address range a sandbox pod's Docker networks live in (SME-33), and
 //! which addresses in it smelt treats as a container. Shared by the server
-//! and the sandbox agent (`src/bin/sandbox_agent.rs` compiles this file in
+//! and the sandbox agent (`src/bin/sandbox_agent/main.rs` compiles this file in
 //! with `#[path]`), so both judge an address the same way.
 
 use std::net::Ipv4Addr;
