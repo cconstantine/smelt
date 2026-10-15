@@ -476,10 +476,29 @@ async fn click_conversation(page: &chromiumoxide::Page, id: i64) {
 /// replies are still open, so a scenario can wait for a reply to have
 /// finished (or been cut off) upstream instead of sleeping for as long as a
 /// reply takes.
+const DEFAULT_REPLY_WORDS: usize = 25;
+
+/// How long the mock's reply runs for: this many `content_block_delta`
+/// events, one every 200ms, so the default is about 5s. A scenario that
+/// needs the turn outlive a page reload, or two tabs, raises it (see
+/// `MockUpstream::longer_reply`).
 struct MockUpstream {
     addr: std::net::SocketAddr,
     chunks_sent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     open: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    reply_words: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Raises the mock's reply length for one scenario and puts the default
+/// back when it drops — including when the scenario fails, since every
+/// scenario in the run shares this one mock.
+struct LongerReply(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for LongerReply {
+    fn drop(&mut self) {
+        self.0
+            .store(DEFAULT_REPLY_WORDS, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Counts one open reply for as long as its body stream lives: the body is
@@ -499,14 +518,18 @@ impl MockUpstream {
         }
         let chunks_sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (sent, opened) = (chunks_sent.clone(), open.clone());
+        let reply_words =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(DEFAULT_REPLY_WORDS));
+        let (sent, opened, words) = (chunks_sent.clone(), open.clone(), reply_words.clone());
         let router = axum::Router::new().route(
             "/v1/messages",
             axum::routing::post(move || {
-                let (sent, opened) = (sent.clone(), opened.clone());
+                let (sent, opened, words) =
+                    (sent.clone(), opened.clone(), words.clone());
                 async move {
                     let mut chunks = vec![event("message_start", r#"{"type":"message_start"}"#)];
-                    for i in 0..25 {
+                    let words = words.load(std::sync::atomic::Ordering::SeqCst);
+                    for i in 0..words {
                         chunks.push(event(
                             "content_block_delta",
                             &format!(
@@ -548,11 +571,27 @@ impl MockUpstream {
         tokio::spawn(async move {
             axum::serve(listener, router).await.ok();
         });
-        Self { addr, chunks_sent, open }
+        Self {
+            addr,
+            chunks_sent,
+            open,
+            reply_words,
+        }
     }
 
     fn chunks_sent(&self) -> usize {
         self.chunks_sent.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Make the mock's reply `words` words long (200ms each) for as long
+    /// as the returned guard lives: 5s by default, which is not long
+    /// enough
+    /// for a scenario that reloads a page mid-turn or opens a second
+    /// tab into a running turn.
+    fn longer_reply(&self, words: usize) -> LongerReply {
+        self.reply_words
+            .store(words, std::sync::atomic::Ordering::SeqCst);
+        LongerReply(self.reply_words.clone())
     }
 
     fn open(&self) -> usize {
@@ -797,6 +836,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "terminal_command_indicator", 180, Box::pin(scenario_terminal_command_indicator(&t))).await;
     run_scenario(&t, only, r, k, "turn_error_clears_on_a_later_turn", 30, Box::pin(scenario_turn_error_clears_on_a_later_turn(&t))).await;
     run_scenario(&t, only, r, k, "deleted_in_another_tab", 60, Box::pin(scenario_deleted_in_another_tab(&t))).await;
+    run_scenario(&t, only, r, k, "working_line_timer_survives_a_reload", 60, Box::pin(scenario_working_line_timer_survives_a_reload(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
@@ -3846,7 +3886,7 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
     let live = t.tab(t.url(&format!("conversation/{}", streaming.id))).await;
     wait_for_live_client(&live, streaming.id).await;
     assert!(wait_for_count(&live, ".reply-copy", 1, Duration::from_secs(10)).await);
-    publish(streaming.id, ConversationEvent::TurnState { running: true });
+    publish(streaming.id, ConversationEvent::TurnState { running: true, elapsed: 0 });
     let asked = db::create_message(t.pool, streaming.id, "user", &[text("second")]).await.expect("save the ask");
     let partway = db::create_message(t.pool, streaming.id, "assistant", &[
         text("Saved before a call."),
@@ -3878,7 +3918,7 @@ async fn scenario_copy_reply(t: &Scenario<'_>) {
     let finished = db::create_message(t.pool, streaming.id, "assistant", &[text("Finished now.")]).await.expect("save part two");
     let finished_id = finished.id;
     publish(streaming.id, ConversationEvent::MessagesAppended { messages: vec![answered, finished] });
-    publish(streaming.id, ConversationEvent::TurnState { running: false });
+    publish(streaming.id, ConversationEvent::TurnState { running: false, elapsed: 0 });
     assert!(wait_for_count(&live, ".reply-copy", 2, Duration::from_secs(10)).await, "the button shows once the turn ends");
     assert_eq!(
         wait_for_copy_label(&live, finished_id, "Copy reply (2 parts)", Duration::from_secs(5)).await,
@@ -3995,6 +4035,95 @@ async fn scenario_markdown_long_reply(t: &Scenario<'_>) {
     assert!(lag < Duration::from_secs(3), "the page fell {lag:?} behind a long streamed reply");
 }
 
+/// The seconds a "Working…" line's timer shows, or -1 while it's absent:
+/// `Working… 12s` reads as 12, `Working… 2m 05s` as 125.
+async fn working_line_seconds(page: &chromiumoxide::Page) -> i64 {
+    page.evaluate(
+        r#"(() => { const line = document.querySelector('.turn-working');
+             if (!line) return -1;
+             const m = line.innerText.match(/(?:(\d+)m )?(\d+)s/);
+             return m ? (m[1] ? +m[1] * 60 : 0) + +m[2] : -1; })()"#,
+    )
+    .await
+    .expect("read the working line's timer")
+    .into_value()
+    .expect("a number")
+}
+
+/// `working_line_seconds` polled until the line has been drawn. A tab's
+/// first paint of it can lag the point where the client reports itself
+/// live, and a -1 read would otherwise be reported as the timer starting
+/// over. A line that never appears still reads -1, so the caller's
+/// assertion fails with its own message.
+async fn drawn_working_line_seconds(page: &chromiumoxide::Page) -> i64 {
+    let settled = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let shown = working_line_seconds(page).await;
+        if shown >= 0 || tokio::time::Instant::now() >= settled {
+            return shown;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// SME-160: the "Working…" timer counts from when the turn started, not
+/// from when a tab came to be. Both ways the report had: reload mid-turn
+/// and the timer comes back at the turn's real age on the server's clock
+/// instead of starting over at 0s; open a second tab mid-turn and it
+/// shows that same age straight away, rather than counting from its own
+/// load. The mock's reply is held at 75 words (15s) so the spell outlives
+/// the reload and the second tab both.
+async fn scenario_working_line_timer_survives_a_reload(t: &Scenario<'_>) {
+    let conversation = t.conversation().await;
+    let _long_reply = t.mock.longer_reply(75);
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&page, conversation.id).await;
+    send_from(&page, "how long will this take?").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let before = loop {
+        let shown = working_line_seconds(&page).await;
+        if shown >= 2 || tokio::time::Instant::now() >= deadline {
+            break shown;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        before >= 2,
+        "the working line should appear and count to at least 2s while the turn runs: {before}s"
+    );
+    // A second tab opened mid-spell: it has watched nothing, so its
+    // number can only come from the server. On the unfixed code it shows
+    // about 1s — the age of its own page.
+    let other = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    wait_for_live_client(&other, conversation.id).await;
+    let second_tab = drawn_working_line_seconds(&other).await;
+    assert!(
+        second_tab >= before,
+        "a tab opened mid-turn counted from its own load: {second_tab}s against the {before}s the first tab had shown"
+    );
+    page.reload().await.expect("reload mid-turn");
+    wait_for_live_client(&page, conversation.id).await;
+    // The reconnect pull runs before the page marks itself live, so the
+    // timer is already the turn's age on the server's clock; the poll is
+    // only for the re-render. The 300ms it used to sleep was a bet on a
+    // render whose lag nothing had measured, and a lost bet read as the
+    // timer having started over.
+    let after = drawn_working_line_seconds(&page).await;
+    assert!(
+        after >= second_tab,
+        "the timer started over with the reload: {before}s before it, {second_tab}s in a second tab opened mid-turn, {after}s after the reload"
+    );
+    // The turn finishes as usual, and the line goes with it.
+    assert!(
+        t.mock.wait_until_idle(Duration::from_secs(30)).await,
+        "the reply never finished upstream"
+    );
+    assert!(
+        wait_for_count(&page, ".turn-working", 0, Duration::from_secs(15)).await,
+        "the working line should go away once the turn has ended"
+    );
+}
+
 /// Streams a 100-delta reply into `conversation` (open in `page`, live)
 /// with a turn running, then lets the working line tick twice. Returns how
 /// long after the last delta its end showed, and the page's main-thread
@@ -4006,7 +4135,7 @@ async fn stream_and_measure(page: &chromiumoxide::Page, conversation: i64, marke
     let script_seconds =
         |metrics: Vec<Metric>| metrics.iter().find(|m| m.name == "ScriptDuration").map(|m| m.value).unwrap_or(0.0);
     let before = script_seconds(page.metrics().await.expect("read metrics"));
-    publish(conversation, ConversationEvent::TurnState { running: true });
+    publish(conversation, ConversationEvent::TurnState { running: true, elapsed: 0 });
     publish(conversation, ConversationEvent::ReplyReset {});
     let reply: String = (0..100).map(|i| format!("word{i} ")).collect::<String>() + marker;
     let chunk = reply.len().div_ceil(100);
@@ -4024,7 +4153,7 @@ async fn stream_and_measure(page: &chromiumoxide::Page, conversation: i64, marke
     // The working line ticks once a second.
     tokio::time::sleep(Duration::from_millis(2500)).await;
     let script = script_seconds(page.metrics().await.expect("read metrics")) - before;
-    publish(conversation, ConversationEvent::TurnState { running: false });
+    publish(conversation, ConversationEvent::TurnState { running: false, elapsed: 0 });
     (lag, script)
 }
 
@@ -5598,8 +5727,8 @@ async fn scenario_turn_error_clears_on_a_later_turn(t: &Scenario<'_>) {
     assert!(wait_for_text(&page, "B19-TURN-ERROR", Duration::from_secs(10)).await, "the error never showed");
 
     // Another tab sends: its turn starts, and finishes without an error.
-    publish(conversation.id, ConversationEvent::TurnState { running: true });
-    publish(conversation.id, ConversationEvent::TurnState { running: false });
+    publish(conversation.id, ConversationEvent::TurnState { running: true, elapsed: 0 });
+    publish(conversation.id, ConversationEvent::TurnState { running: false, elapsed: 0 });
 
     assert!(
         wait_for_text_gone(&page, "B19-TURN-ERROR", Duration::from_secs(10)).await,

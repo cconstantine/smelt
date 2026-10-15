@@ -1622,9 +1622,9 @@ fn test_a_later_turn_clears_a_turns_error_but_not_a_failed_send() {
 #[test]
 fn test_apply_event_a_turn_starting_clears_an_earlier_error() {
     with_state(|state| {
-        assert_eq!(apply_event(state, ConversationEvent::TurnState { running: true }), EventEffect::TurnStarted);
+        assert_eq!(apply_event(state, ConversationEvent::TurnState { running: true, elapsed: 0 }), EventEffect::TurnStarted);
         assert!(*state.turn_running().peek());
-        assert_eq!(apply_event(state, ConversationEvent::TurnState { running: false }), EventEffect::None);
+        assert_eq!(apply_event(state, ConversationEvent::TurnState { running: false, elapsed: 0 }), EventEffect::None);
     });
 }
 
@@ -1759,12 +1759,20 @@ fn test_apply_event_question_update_sets_and_clears_the_waiting_question() {
 #[test]
 fn test_apply_event_turn_state_sets_running_and_an_ended_turn_drops_its_reply() {
     with_state(|state| {
-        let effect = apply_event(state, ConversationEvent::TurnState { running: true });
+        let effect = apply_event(state, ConversationEvent::TurnState { running: true, elapsed: 0 });
         assert_eq!(effect, EventEffect::TurnStarted, "B19: an earlier error goes");
         assert!(*state.turn_running().peek());
+        assert_eq!(*state.turn_elapsed().peek(), 0);
+        // SME-160: the event carries the turn's age on the server's
+        // clock, and the state takes it as-is — the timer shows the
+        // turn's real age, not this tab's.
+        state.turn_elapsed().set(12);
+        apply_event(state, ConversationEvent::TurnState { running: true, elapsed: 87 });
+        assert_eq!(*state.turn_elapsed().peek(), 87);
         state.streaming_reply().set(Some("half a reply".to_string()));
-        apply_event(state, ConversationEvent::TurnState { running: false });
+        apply_event(state, ConversationEvent::TurnState { running: false, elapsed: 0 });
         assert!(!*state.turn_running().peek());
+        assert_eq!(*state.turn_elapsed().peek(), 0);
         assert_eq!(*state.streaming_reply().peek(), None);
     });
 }

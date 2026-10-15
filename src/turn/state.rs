@@ -38,6 +38,12 @@ pub(super) struct ConversationRuntime {
     /// How many turns are running or queued, for the Stop button
     /// (`TurnState`).
     turns_in_flight: usize,
+    /// When the current busy spell (`turns_in_flight` going 0 to 1)
+    /// started, on a monotonic clock: `Some` exactly while a turn runs, so
+    /// the "Working…" timer counts from the spell's start rather than from
+    /// when a tab connected (SME-160). A turn queued behind a running one
+    /// doesn't move it; the last turn ending does.
+    started_at: Option<std::time::Instant>,
     /// The last failed turn's error and the turn generation.
     kept: KeptTurnError,
 }
@@ -49,6 +55,7 @@ impl ConversationRuntime {
             && self.stops.is_none()
             && !self.paused
             && self.turns_in_flight == 0
+            && self.started_at.is_none()
             && self.kept.generation == 0
             && self.kept.error.is_none()
     }
@@ -197,12 +204,17 @@ impl TurnInFlight {
     pub(super) fn start(conversation_id: i64) -> Self {
         let first = with_runtime(conversation_id, |runtime| {
             runtime.turns_in_flight += 1;
-            runtime.turns_in_flight == 1
+            if runtime.turns_in_flight != 1 {
+                false
+            } else {
+                runtime.started_at = Some(std::time::Instant::now());
+                true
+            }
         });
         if first {
             crate::events::publish(
                 conversation_id,
-                crate::events::ConversationEvent::TurnState { running: true },
+                crate::events::ConversationEvent::TurnState { running: true, elapsed: 0 },
             );
             crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
         }
@@ -216,6 +228,9 @@ impl Drop for TurnInFlight {
         update_existing(self.0, |runtime| {
             runtime.turns_in_flight = runtime.turns_in_flight.saturating_sub(1);
             last = runtime.turns_in_flight == 0;
+            if last {
+                runtime.started_at = None;
+            }
         });
         if last {
             // A stopped or failed turn leaves no reply in progress.
@@ -223,7 +238,7 @@ impl Drop for TurnInFlight {
             release_idle_turn_state(self.0);
             crate::events::publish(
                 self.0,
-                crate::events::ConversationEvent::TurnState { running: false },
+                crate::events::ConversationEvent::TurnState { running: false, elapsed: 0 },
             );
             crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
         }
@@ -264,6 +279,17 @@ pub(crate) fn busy_conversations() -> Vec<i64> {
 /// Whether `conversation_id` has a turn running or queued.
 pub(crate) fn turn_running(conversation_id: i64) -> bool {
     read_runtime(conversation_id, |runtime| runtime.turns_in_flight > 0).unwrap_or(false)
+}
+
+/// How long `conversation_id`'s busy spell has been running, or `None`
+/// while no turn is: the "Working…" timer's age, counted on a monotonic
+/// clock from the spell's start, so a tab that connects (or reloads)
+/// mid-turn shows the turn's real age rather than starting over
+/// (SME-160).
+pub(crate) fn turn_started_elapsed(conversation_id: i64) -> Option<std::time::Duration> {
+    read_runtime(conversation_id, |runtime| runtime.started_at)
+        .flatten()
+        .map(|started| started.elapsed())
 }
 
 /// A conversation's last failed turn's error, until the user writes again,

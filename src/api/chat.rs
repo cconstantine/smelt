@@ -201,11 +201,18 @@ pub async fn stop_turn(id: i64) -> ServerFnResult<()> {
     Ok(())
 }
 
-/// Whether a turn is running in this conversation: the Stop button's
-/// snapshot on (re)connect, kept current by `ConversationEvent::TurnState`.
+/// Whether a turn is running in this conversation, and how many whole
+/// seconds its busy spell has been running on the server's clock (0 while
+/// none is): the Stop button's and the "Working…" timer's snapshot on
+/// (re)connect, kept current by `ConversationEvent::TurnState`. The age
+/// comes from the spell's start, so a reload mid-turn shows the turn's
+/// real age instead of starting the timer over (SME-160).
 #[get("/api/conversations/{id}/turn")]
-pub async fn get_turn_state(id: i64) -> ServerFnResult<bool> {
-    Ok(turn_running(id))
+pub async fn get_turn_state(id: i64) -> ServerFnResult<(bool, u64)> {
+    Ok(match turn_started_elapsed(id) {
+        Some(elapsed) => (true, elapsed.as_secs()),
+        None => (false, 0),
+    })
 }
 
 /// What the chat shows when a turn fails: the server's own message,
