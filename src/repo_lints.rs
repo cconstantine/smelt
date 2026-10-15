@@ -70,6 +70,12 @@ pub(crate) fn oversized(files: &[Measured], ceiling: Limit, exceptions: &[(&str,
     findings
 }
 
+/// A file's lines: its `\n`s, and a last line with no newline after it.
+pub(crate) fn line_count(bytes: &[u8]) -> u64 {
+    let newlines = bytes.iter().filter(|b| **b == b'\n').count() as u64;
+    newlines + u64::from(bytes.last().is_some_and(|b| *b != b'\n'))
+}
+
 /// Every file git tracks under the repo root, relative to it.
 fn tracked_files() -> Vec<String> {
     let root = env!("CARGO_MANIFEST_DIR");
@@ -102,7 +108,7 @@ fn measured_text_files() -> Vec<Measured> {
         if bytes.contains(&0) {
             continue;
         }
-        let lines = bytes.iter().filter(|b| **b == b'\n').count() as u64;
+        let lines = line_count(&bytes);
         files.push(Measured {
             path,
             bytes: bytes.len() as u64,
@@ -211,6 +217,16 @@ mod tests {
     }
 
     const SMALL: Limit = Limit { bytes: 100, lines: 10 };
+
+    /// Code review 1 (SME-163): a last line with no newline after it is a
+    /// line too.
+    #[test]
+    fn test_a_last_line_without_a_newline_counts() {
+        assert_eq!(line_count(b""), 0);
+        assert_eq!(line_count(b"one\ntwo\n"), 2);
+        assert_eq!(line_count(b"one\ntwo"), 2);
+        assert_eq!(line_count(b"one"), 1);
+    }
 
     #[test]
     fn test_a_file_under_the_ceiling_is_fine() {
