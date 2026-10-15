@@ -4075,10 +4075,20 @@ async fn scenario_working_line_timer_survives_a_reload(t: &Scenario<'_>) {
     );
     // A second tab opened mid-spell: it has watched nothing, so its
     // number can only come from the server. On the unfixed code it shows
-    // about 1s — the age of its own page.
+    // about 1s — the age of its own page. The line's first paint lags
+    // the live marker the way it does after a reload, so wait for it to
+    // exist before reading it: a -1 read here would look like the bug
+    // rather than like a tab that has not drawn the line yet.
     let other = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
     wait_for_live_client(&other, conversation.id).await;
-    let second_tab = working_line_seconds(&other).await;
+    let settled = tokio::time::Instant::now() + Duration::from_secs(5);
+    let second_tab = loop {
+        let shown = working_line_seconds(&other).await;
+        if shown >= 0 || tokio::time::Instant::now() >= settled {
+            break shown;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert!(
         second_tab >= before,
         "a tab opened mid-turn counted from its own load: {second_tab}s against the {before}s the first tab had shown"
