@@ -2,7 +2,7 @@
 
 ## Structure
 
-Tests are inline `#[cfg(test)]` modules in the same file as the code they cover — no separate `tests/*.rs` unit-test tree.
+Tests are `#[cfg(test)]` modules of the code they cover, not a separate `tests/*.rs` tree (smelt is a binary crate, so an integration test couldn't reach its `pub(crate)` items). A small module keeps them inline; once a file would cross the size ceiling (see [process/rules-commits.md](process/rules-commits.md#files-stay-under-the-ceiling)) they move to `foo/tests.rs`, declared `#[cfg(test)] mod tests;`, or to topic files `foo/tests/<topic>.rs` that start `use super::*;`, with the shared helpers in `foo/tests/mod.rs`. A test's helpers are visible to it either way, because a child module sees its parents' private items.
 
 ```rust
 #[cfg(test)]
