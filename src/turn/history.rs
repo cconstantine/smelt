@@ -60,8 +60,29 @@ pub(super) fn history_for_request(
                 .collect();
             anthropic::AnthropicMessage { role, content }
         })
+        // An empty or blank reply saved before B3's fix (SME-122): the API
+        // refuses one anywhere but last, so it's left out.
+        .filter_map(|mut message| {
+            if message.role == "assistant" {
+                message.content = without_blank_text(message.content);
+                if message.content.is_empty() {
+                    return None;
+                }
+            }
+            Some(message)
+        })
         .collect();
     Ok(answer_unfinished_tool_calls(history))
+}
+
+/// `blocks` without text blocks that are empty or only whitespace, which
+/// the API refuses (B3, SME-122). A reply left with no blocks isn't saved.
+#[cfg(feature = "server")]
+pub(super) fn without_blank_text(blocks: Vec<anthropic::ContentBlock>) -> Vec<anthropic::ContentBlock> {
+    blocks
+        .into_iter()
+        .filter(|block| !matches!(block, anthropic::ContentBlock::Text { text } if text.trim().is_empty()))
+        .collect()
 }
 
 /// `blocks` without their thinking blocks when `strip` is set (see

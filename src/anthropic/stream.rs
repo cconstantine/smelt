@@ -317,6 +317,13 @@ pub fn is_cut_off(stop_reason: &str) -> bool {
     matches!(stop_reason, "max_tokens" | "model_context_window_exceeded")
 }
 
+/// Whether a reply with this `stop_reason` stopped before it finished:
+/// cut off (`is_cut_off`), or refused by the provider (B3, SME-122). Either
+/// can stop it in the middle of a tool call, whose input may be cut short.
+pub fn stopped_early(stop_reason: &str) -> bool {
+    is_cut_off(stop_reason) || stop_reason == "refusal"
+}
+
 /// A reply's content blocks as they stream, keyed by each event's `index`
 /// (SME-112). A block is opened by its start or its first delta, and
 /// finished by its stop or the end of the stream; the reply's content is
@@ -411,7 +418,7 @@ impl Blocks {
     }
 
     /// Finishes every block still open and returns them all in index
-    /// order. When the reply was cut off (`is_cut_off`) and its last block
+    /// order. When the reply stopped early (`stopped_early`) and its last block
     /// is a tool call, that call is dropped, whether or not its input
     /// parsed, and its name returned (SME-126). A call left whose input
     /// doesn't parse fails the reply.
@@ -420,7 +427,7 @@ impl Blocks {
             self.stop(Some(index));
         }
         let mut cut_off_call = None;
-        if is_cut_off(stop_reason)
+        if stopped_early(stop_reason)
             && let Some(last) = self.done.last_entry()
             && let Some(name) = last.get().tool_name()
         {

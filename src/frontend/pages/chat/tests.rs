@@ -508,6 +508,24 @@ fn test_a_cut_off_notice_reads_as_a_sentence() {
     assert_eq!(system_notice("Your last reply was cut off: it reached its limit of lots", &HashMap::new()), None);
 }
 
+/// B3 (SME-122): a refusal notice reads as one in the chat, naming a
+/// dropped call, and round-trips.
+#[test]
+fn test_a_refusal_notice_says_the_provider_stopped_the_reply() {
+    use crate::api::chat::{parse_refusal_notice, refusal_notice};
+    assert_eq!(parse_refusal_notice(&refusal_notice(None)), Some(None));
+    assert_eq!(parse_refusal_notice(&refusal_notice(Some("write_file"))), Some(Some("write_file".to_string())));
+    assert_eq!(parse_refusal_notice("Something else."), None);
+    assert_eq!(
+        system_notice(&refusal_notice(None), &HashMap::new()).as_deref(),
+        Some("The model's provider stopped this reply (a refusal).")
+    );
+    assert_eq!(
+        system_notice(&refusal_notice(Some("write_file")), &HashMap::new()).as_deref(),
+        Some("The model's provider stopped this reply (a refusal) in the middle of a `write_file` call, which didn't run.")
+    );
+}
+
 /// SME-126: a notice for a reply cut off in the middle of a tool call
 /// names the call, for the model and in the chat, and round-trips; a
 /// notice saved before SME-126 still parses and reads as it did.

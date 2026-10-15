@@ -558,12 +558,15 @@ pub(super) fn run_turn_body<'a>(
             }
             let turn = turn.ok_or_else(|| ServerFnError::new(last_err))?;
             let cut_off = anthropic::stream::is_cut_off(&turn.stop_reason);
+            let refused = turn.stop_reason == "refusal";
 
-            // A cut-off reply that was nothing but the call it was cut in
-            // has nothing to save: the API refuses an empty assistant
-            // message (SME-126).
-            if !(cut_off && turn.content.is_empty()) {
-                let saved = db::create_message(pool, conversation_id, "assistant", &turn.content)
+            // An empty or blank reply has nothing to save: the API refuses
+            // an empty assistant message once it isn't the last, so saving
+            // one failed every later turn (B3, SME-122). A cut-off reply
+            // that was nothing but the call it was cut in is one (SME-126).
+            let reply = without_blank_text(turn.content.clone());
+            if !reply.is_empty() {
+                let saved = db::create_message(pool, conversation_id, "assistant", &reply)
                     .await
                     .map_err(ServerFnError::new)?;
                 record_saved(conversation_id, &mut persisted, saved);
@@ -576,7 +579,7 @@ pub(super) fn run_turn_body<'a>(
             // finished with no result. Saved straight after the reply, so
             // a failure after it can't leave them to be answered as
             // stopped mid-run (SME-126 review 1).
-            if cut_off {
+            if cut_off || refused {
                 let not_run: Vec<anthropic::ContentBlock> = turn
                     .content
                     .iter()
@@ -662,10 +665,16 @@ pub(super) fn run_turn_body<'a>(
                     limit => limit,
                 })),
             };
-            if let Some((tokens, limit)) = cut_off_by {
-                let notice = [anthropic::ContentBlock::Text {
-                    text: crate::api::chat::cut_off_notice(tokens, limit, turn.cut_off_call.as_deref()),
-                }];
+            // A refused reply says so, the same way (B3, SME-122): it was
+            // saved as if finished, and one refused in a call failed the
+            // turn on the call's half-written input.
+            let notice = match cut_off_by {
+                Some((tokens, limit)) => Some(crate::api::chat::cut_off_notice(tokens, limit, turn.cut_off_call.as_deref())),
+                None if refused => Some(crate::api::chat::refusal_notice(turn.cut_off_call.as_deref())),
+                None => None,
+            };
+            if let Some(notice) = notice {
+                let notice = [anthropic::ContentBlock::Text { text: notice }];
                 let saved = db::create_message(pool, conversation_id, "user", &notice)
                     .await
                     .map_err(ServerFnError::new)?;

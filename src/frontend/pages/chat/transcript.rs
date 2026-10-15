@@ -391,6 +391,10 @@ pub(super) fn system_notice(text: &str, commands: &HashMap<String, String>) -> O
             limit.hint()
         ));
     }
+    if let Some(cut_call) = crate::api::chat::parse_refusal_notice(text) {
+        let call = cut_call.map(|name| format!(" in the middle of a `{name}` call, which didn't run")).unwrap_or_default();
+        return Some(format!("The model's provider stopped this reply (a refusal){call}."));
+    }
     if text.starts_with("The user stopped sandbox pod ") {
         return Some(
             "You stopped the sandbox; its terminals are gone, and /workspace is kept".to_string(),
