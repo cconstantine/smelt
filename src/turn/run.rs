@@ -75,7 +75,7 @@ pub(crate) fn run_turn<'a>(
         conversation_id,
         Some(new_message),
         MAX_TURNS,
-        false,
+        None,
         false,
     )
 }
@@ -102,14 +102,17 @@ pub(super) fn record_saved(conversation_id: i64, persisted: &mut Vec<Message>, s
 /// get answered on the next request (`answer_unfinished_tool_calls`).
 /// `from_user` says `new_message` is the user's own (`start_turn`): only
 /// that dismisses a question the conversation waits on (SME-34), whether
-/// the turn runs or a Stop catches it queued (SME-170).
+/// the turn runs or a Stop catches it queued (SME-170). `keep_error` keeps
+/// the turn's failure for a tab that reconnects; it's the generation the
+/// caller took when the user acted (sending, answering), which stands in
+/// for the turn's own if it fails before it takes one (SME-179 review 2).
 #[cfg(feature = "server")]
 pub(super) fn run_turn_bounded<'a>(
     pool: &'a PgPool,
     conversation_id: i64,
     new_message: Option<anthropic::AnthropicMessage>,
     max_turns: usize,
-    keep_error: bool,
+    keep_error: Option<u64>,
     from_user: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TurnResult> + Send + 'a>>
 {
@@ -149,8 +152,8 @@ pub(super) fn run_turn_bounded<'a>(
             .await;
             // Kept for a tab that reconnects, unless a newer turn has started
             // since this one did: its outcome is the one to show (SME-91).
-            if keep_error
-                && let Some(generation) = generation
+            if let Some(generation) = generation.or(keep_error)
+                && keep_error.is_some()
                 && let Err(TurnFailure::Failed(e)) = &result
             {
                 keep_turn_error(conversation_id, generation, chat_error_text(e));
@@ -339,7 +342,7 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     resume_turns(id);
     // At once, not only when the turn starts: it may queue behind another,
     // and a turn already running mustn't keep its error over this one.
-    new_turn_generation(id);
+    let generation = new_turn_generation(id);
     let new_message = anthropic::AnthropicMessage {
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text: content }],
@@ -347,7 +350,7 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     // In the request's span, so the turn's is its child (SME-137).
     tokio::spawn(tracing::Instrument::in_current_span(async move {
         // Its failure is kept for a reconnecting tab (`keep_error`).
-        if let Err(e) = run_turn_bounded(&pool, id, Some(new_message), MAX_TURNS, true, true).await {
+        if let Err(e) = run_turn_bounded(&pool, id, Some(new_message), MAX_TURNS, Some(generation), true).await {
             let message = e.message();
             crate::events::publish(id, crate::events::ConversationEvent::TurnError { message });
         }

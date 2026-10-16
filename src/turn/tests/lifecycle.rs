@@ -396,8 +396,8 @@ async fn test_a_notice_after_a_delete_leaves_no_turn_state(pool: PgPool) {
     let sent = db::create_conversation(&pool).await.expect("create conversation").id;
     delete_as_the_api_does(&pool, sent).await;
     // `start_turn`'s own step, after its exists check passed.
-    new_turn_generation(sent);
-    let result = run_turn_bounded(&pool, sent, Some(hello()), MAX_TURNS, true, true).await;
+    let generation = new_turn_generation(sent);
+    let result = run_turn_bounded(&pool, sent, Some(hello()), MAX_TURNS, Some(generation), true).await;
     assert!(result.as_ref().is_err_and(|e| e.to_string().contains("not found")), "{result:?}");
     assert!(!has_turn_state(sent), "a send racing the delete left turn state");
 }
@@ -415,10 +415,10 @@ async fn test_a_delete_after_the_exists_check_leaves_no_turn_state(pool: PgPool)
     let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
     let (reached, release) = test_hooks::pause_after_message_saved(conversation_id);
 
-    new_turn_generation(conversation_id);
+    let generation = new_turn_generation(conversation_id);
     let turn = tokio::spawn({
         let pool = pool.clone();
-        async move { run_turn_bounded(&pool, conversation_id, Some(hello()), MAX_TURNS, true, true).await }
+        async move { run_turn_bounded(&pool, conversation_id, Some(hello()), MAX_TURNS, Some(generation), true).await }
     });
     tokio::time::timeout(std::time::Duration::from_secs(5), reached)
         .await
@@ -533,4 +533,28 @@ fn test_a_generation_taken_after_a_delete_and_a_new_lock_leaves_no_turn_state() 
     drop(turn);
 
     assert!(!has_turn_state(conversation_id), "the turn left turn state");
+}
+
+/// Review 2, finding 2, interleaving: the card's answer turn is queued
+/// behind a held lock, and fails before it can save the answer (here the
+/// database is gone: the pool is closed). Its error is kept for a tab
+/// that reloads, with the generation `answer_question` took, since no
+/// newer turn has started.
+#[sqlx::test]
+async fn test_an_answer_turn_failing_before_it_saves_the_answer_keeps_its_error(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    start_mock_upstream(&pool, vec![super::ask_user::ask_body()]).await;
+    run_turn(&pool, conversation_id, hello()).await.expect("asks");
+
+    let held = conversation_lock(conversation_id).lock_owned().await;
+    let answers = vec![crate::questions::QuestionAnswer { selected: vec!["No".to_string()], other: None }];
+    answer_question(pool.clone(), conversation_id, "toolu_ask".to_string(), answers).await.expect("answer");
+    wait_until("the answer turn is queued", || turns_in_flight(conversation_id) == 1).await;
+    pool.close().await;
+    drop(held);
+
+    wait_until("the answer turn ends", || !turn_running(conversation_id)).await;
+    assert!(last_turn_error(conversation_id).is_some(), "the answer turn's error isn't kept");
 }
