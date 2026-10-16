@@ -213,6 +213,26 @@ fn test_a_timed_out_install_names_only_a_read_error_that_is_still_the_latest() {
     assert!(watch.read(Ok(None)).is_some_and(|e| e.contains("deleted")));
 }
 
+/// Review 1: a server pod this cluster's kubelet really evicted (its
+/// ephemeral storage over its limit), its status captured live
+/// (`evicted_status.json`). Kubernetes says "Evicted" only in an event:
+/// the pod script's TERM trap exits 0, so the pod reads Succeeded, its
+/// container "Completed", with no pod-level reason. Nothing else stops
+/// that script with 0 short of deleting the pod.
+#[test]
+fn test_a_server_pod_really_evicted_says_it_was_most_likely_evicted() {
+    let status: k8s_openapi::api::core::v1::PodStatus =
+        serde_json::from_str(include_str!("tests/evicted_status.json")).expect("the captured status");
+    let pod = Pod {
+        metadata: unready_server_pod("a", "Running", None, false).metadata,
+        status: Some(status),
+        ..Default::default()
+    };
+    assert_eq!(stop_reason(&pod).as_deref(), Some("evicted by its node, most likely"));
+    let error = install_interrupted("lsp-7-ra", "a", Some(&pod)).expect("an evicted pod ends the wait");
+    assert!(error.ends_with("stopped during its install (evicted by its node, most likely)"), "{error}");
+}
+
 #[test]
 fn test_a_stop_explains_an_oom_and_names_any_other_reason() {
     assert!(stop_explanation(Some("OOMKilled")).contains("memory limit on the Language servers page"));

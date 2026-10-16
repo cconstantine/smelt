@@ -220,23 +220,21 @@ fn has_stopped(pod: &Pod) -> bool {
 }
 
 /// Why the server stopped, when Kubernetes says: the pod's own reason
-/// when its node stopped it (`Evicted`), else its container's
-/// (`OOMKilled`).
+/// when it has one (`Evicted`, on some clusters), else its container's
+/// (`OOMKilled`). A container that "Completed" was stopped by a TERM
+/// signal (the pod script's trap exits 0, and nothing else ends it). Short
+/// of a delete, which `install_interrupted`, `list_with` and
+/// `note_server_stop` rule out first, that's an eviction, which on k3s
+/// says "Evicted" only in an event (captured live, SME-171 review 1).
+/// `wait_running` doesn't rule a delete out, so a pod deleted as it
+/// starts may read so there too.
 fn stop_reason(pod: &Pod) -> Option<String> {
     let status = pod.status.as_ref()?;
     if let Some(reason) = &status.reason {
         return Some(reason.clone());
     }
-    status
-        .container_statuses
-        .as_ref()?
-        .first()?
-        .state
-        .as_ref()?
-        .terminated
-        .as_ref()?
-        .reason
-        .clone()
+    let reason = status.container_statuses.as_ref()?.first()?.state.as_ref()?.terminated.as_ref()?.reason.clone()?;
+    Some(if reason == "Completed" { "evicted by its node, most likely".to_string() } else { reason })
 }
 
 /// Why a server stopped, for a sentence about it: what an OOM kill
