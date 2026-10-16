@@ -3,9 +3,10 @@
 # the stubs and helpers their cases use. Sourced, never run. Each script
 # keeps its files, the stubs and the locks under its own
 # target/<script name>/, so no two share a lock. Needs no cluster or
-# database: cargo, dx, sqlx, curl, python3 and the image check are stubs,
-# and every lock lives under target/<script name>/locks (SMELT_LOCK_DIR),
-# never the real one. Claude Code's safety check refuses a command whose
+# database: cargo, dx, sqlx and the image check are stubs (dx serve's stub
+# really listens, on a port of the script's own, SME-175), and every lock
+# lives under target/<script name>/locks (SMELT_LOCK_DIR), never the real
+# one. Claude Code's safety check refuses a command whose
 # scripts remove files, so everything they write is kept, overwritten on
 # the next run.
 
@@ -82,9 +83,61 @@ if [ "$1" = test ] && [[ " $* " != *" --no-run "* ]]; then
 fi
 exit 0
 EOF
-# dx serve: runs until stopped, like the real one. It first records the
-# log settings it was started with (the server it runs inherits them) and
-# writes a line of its own to the log. dx build records the call and ends.
+# The real python3 and curl, found before any stub directory is on PATH
+# (test-cluster-lock puts a python3 stub in its own bin).
+export STUB_PYTHON3 STUB_REAL_CURL
+STUB_PYTHON3=$(command -v python3)
+STUB_REAL_CURL=$(command -v curl)
+# An HTTP server answering 200 to every GET (SME-175): the dx stub's server,
+# and the cases' foreign listeners.
+#   http-200.py HOST PORT [--own-group] [--ready FILE] [--delay SECONDS]
+#                         [--status CODE]
+# --own-group puts it in a process group of its own (a foreign listener),
+# unless it already leads one: setsid fails for a group leader, as a
+# background job is under job control. It also closes every descriptor
+# above 2 it inherited, so it never holds a lock its starter held (review
+# 1: a run under an outer flock, or a hook inside check-server's start). --ready writes its pid to FILE once
+# it listens; --delay waits before binding; --status answers CODE instead
+# of 200 (a server still building answers 500). A bind that fails ends it, as
+# a taken port ends a server. It ends itself after 600 s, so a run killed
+# before its cleanup leaves nothing behind for long.
+export STUB_HTTP_200=$dir/http-200.py
+cat >"$STUB_HTTP_200" <<'EOF'
+import http.server, os, signal, socket, sys, time
+host, port, args = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+if "--own-group" in args:
+    if os.getpgrp() != os.getpid():
+        os.setsid()
+    os.closerange(3, os.sysconf("SC_OPEN_MAX"))
+signal.alarm(600)
+if "--delay" in args:
+    time.sleep(float(args[args.index("--delay") + 1]))
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(int(args[args.index("--status") + 1]) if "--status" in args else 200)
+        self.send_header("Content-Length", "3")
+        self.end_headers()
+        self.wfile.write(b"ok\n")
+    def log_message(self, *_):
+        pass
+class Server(http.server.HTTPServer):
+    address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    # Never SO_REUSEPORT, which some Python releases turned on for
+    # HTTPServer: two stubs on one port must collide, as dx does (review 2).
+    allow_reuse_port = False
+server = Server((host, port), Handler)
+if "--ready" in args:
+    with open(args[args.index("--ready") + 1], "w") as ready:
+        ready.write(str(os.getpid()))
+server.serve_forever()
+EOF
+# dx serve: serves its --port until stopped, like the real one, with an
+# HTTP server on 0.0.0.0 answering 200 (SME-175; it was a `sleep`, which
+# only a curl stub that always succeeded made look up). It first records
+# the log settings it was started with (the server it runs inherits them)
+# and writes a line of its own to the log. DX_NO_LISTEN=1 keeps it alive
+# without binding; DX_BIND_DELAY=<s> waits before the bind; DX_STATUS
+# answers that code instead of 200. dx build records the call and ends.
 cat >"$dir/bin/dx" <<'EOF'
 #!/usr/bin/env bash
 if [ "$1" = build ]; then
@@ -94,7 +147,13 @@ fi
 echo "stub dx started as $$"
 printf 'RUST_LOG=%s\nNO_COLOR=%s\n' "${RUST_LOG-<unset>}" "${NO_COLOR-<unset>}" >"$DX_ENV.tmp"
 mv "$DX_ENV.tmp" "$DX_ENV"
-exec sleep 600
+port=""
+while [ $# -gt 0 ]; do
+    [ "$1" = --port ] && port=$2
+    shift
+done
+[ -n "${DX_NO_LISTEN:-}" ] && exec sleep 600
+exec "$STUB_PYTHON3" -I "$STUB_HTTP_200" 0.0.0.0 "$port" --delay "${DX_BIND_DELAY:-0}" --status "${DX_STATUS:-200}"
 EOF
 # sqlx: records each call, one per line, and to $ORDER when set (with the
 # cleanup stub's lines, so a case can check their order).
@@ -105,10 +164,14 @@ echo "$*" >>"$SQLX_CALLS"
 [ -n "${CALLS:-}" ] && echo "sqlx $* $(lock-state)" >>"$CALLS"
 exit 0
 EOF
-# curl: the server is up at once.
+# curl: the real one (SME-175: a stub that always succeeded was the bug's
+# own shape, any answer on the port passing for the server's). CURL_HOOK,
+# when set, runs first, so a case can change who listens on the port
+# between check-server's checks and its request.
 cat >"$dir/bin/curl" <<'EOF'
 #!/usr/bin/env bash
-exit 0
+[ -n "${CURL_HOOK:-}" ] && "$CURL_HOOK"
+exec "$STUB_REAL_CURL" "$@"
 EOF
 # The image check: the cluster has it.
 cat >"$dir/bin/import" <<'EOF'
@@ -129,6 +192,52 @@ printf 'KUBECONFIG=%s %s\n' "${KUBECONFIG-<unset>}" "$*" >>"$CLEANUP_CALLS"
 exit 0
 EOF
 chmod +x "$dir/bin/lock-state" "$dir/bin/cargo" "$dir/bin/dx" "$dir/bin/sqlx" "$dir/bin/curl" "$dir/bin/import" "$dir/bin/cleanup"
+
+# A TCP port nothing uses, from 20000-29999 and outside the kernel's
+# ephemeral range (ip_local_port_range): an outgoing connection takes its
+# source port from that range, and one landing on a case's port would make
+# its bind fail (SME-175 review 2). Never the dev server's (8080), a real
+# check server's (8081) or their previews' (8181, 8182): the dx stub really
+# binds the port, so a case on 8081 would collide with a persona's live
+# check server. A bind test says it's free on IPv4 (and IPv6's loopback,
+# when there is one); a port handed out before in this run is never handed
+# out again, so two cases' ports never meet.
+ports_given=$dir/ports-given
+: >"$ports_given"
+free_port() {
+    local p
+    p=$("$STUB_PYTHON3" -I - "$ports_given" <<'EOF'
+import random, socket, sys
+given = set(open(sys.argv[1]).read().split())
+low, high = map(int, open("/proc/sys/net/ipv4/ip_local_port_range").read().split())
+candidates = [p for p in range(20000, 30000)
+              if not low <= p <= high and p not in (8080, 8081, 8181, 8182) and str(p) not in given]
+random.shuffle(candidates)
+def free(family, host, port):
+    try:
+        s = socket.socket(family)
+    except OSError:
+        return family == socket.AF_INET6  # no IPv6 at all here
+    try:
+        s.bind((host, port))
+        return True
+    except OSError as e:
+        return family == socket.AF_INET6 and e.errno == 99  # no ::1 here
+    finally:
+        s.close()
+for port in candidates[:200]:
+    if free(socket.AF_INET, "0.0.0.0", port) and free(socket.AF_INET6, "::1", port):
+        print(port)
+        break
+else:
+    sys.exit(1)
+EOF
+) || return 1
+    echo "$p" >>"$ports_given"
+    echo "$p"
+}
+# The port check_server's servers use.
+port=$(free_port) || { echo "no free port" >&2; exit 1; }
 
 # The check worktree: a clone sharing this repo's objects, so it can check
 # out any commit here without registering a worktree. Reused across runs.
@@ -154,7 +263,7 @@ extra_env=()
 check_server() {
     env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR PATH="$dir/bin:$PATH" CHECK_WORKTREE="$worktree" \
         SANDBOX_IMAGE_IMPORT="$dir/bin/import" SANDBOX_INSTANCE_CLEANUP="$dir/bin/cleanup" \
-        DATABASE_URL=postgres://u@localhost/smelt_dev \
+        DATABASE_URL=postgres://u@localhost/smelt_dev CHECK_PORT="$port" \
         "${extra_env[@]}" scripts/check-server "$@" 2>&1
 }
 scratch_url=postgres://u@localhost/smelt_scratch_worktree

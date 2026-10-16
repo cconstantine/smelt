@@ -59,6 +59,18 @@
 # both default to 8181, so the second runs without previews and its links
 # point at the first's listener.
 #
+# The port lock keeps out other check servers only. start refuses a port
+# anything else already listens on (a hand-run ./server or dx serve, an
+# older copy of this script's server, another user's process), on any
+# address, before it checks anything out, naming the listener (SME-175).
+# It never stops a server it didn't start: stop that one yourself, or use
+# another CHECK_PORT. While it waits for the server, an answer counts only
+# when every listener on the port is in the server's own process group,
+# before and after each request; one that isn't, seen at any of those
+# checks, ends the start with exit 1, naming it, and leaves this server to
+# stop. Only this network namespace's sockets are seen, and a listener that
+# comes and goes between two checks isn't (SME-175 review 2).
+#
 # A start and a stop of the same scratch database take a lock on the
 # database's own name ($SMELT_LOCK_DIR/smelt-check-scratch-<name>.lock)
 # around every step that reads or writes that database or its state file,
@@ -262,6 +274,87 @@ port_holder() {
     echo "another worktree"
 }
 
+# The inodes of the sockets listening on TCP port $1, on any local address,
+# IPv4 or IPv6 (SME-175). Read from /proc, since the container has no ss or
+# lsof; a missing /proc/net/tcp6 (no IPv6) counts as none.
+port_listener_inodes() { # port
+    local hex file
+    local -a files=()
+    hex=$(printf '%04X' "$1")
+    for file in /proc/net/tcp /proc/net/tcp6; do
+        [ -r "$file" ] && files+=("$file")
+    done
+    [ ${#files[@]} -gt 0 ] || return 0
+    # State 0A is LISTEN; the local address ends in :<port, 4 hex digits>.
+    awk -v suffix=":$hex" '$4 == "0A" && substr($2, length($2) - 4) == suffix { print $10 }' "${files[@]}"
+}
+
+# The socket inodes the live processes of group $1 hold open.
+group_socket_inodes() { # pgid
+    local pid
+    for pid in $(pgrep -g "$1" 2>/dev/null); do
+        find "/proc/$pid/fd" -maxdepth 1 -lname 'socket:*' -printf '%l\n' 2>/dev/null || true
+    done | sed -n 's/^socket:\[\([0-9]*\)\]$/\1/p'
+}
+
+# The inodes of the sockets listening on port $2 that no process of group
+# $1 holds: with no group, every one of them. The listeners are read
+# before the group's sockets (SME-175 review 1): read the other way round,
+# a server binding between the two reads had its own new listener taken
+# for a foreign one. A listener of the first read that has closed by a
+# second one is left out too, since nothing listens there any more.
+foreign_listener_inodes() { # pgid (may be empty) port
+    local listeners ours="" inode
+    listeners=$(port_listener_inodes "$2")
+    # Tests only: runs between the two reads, so a case can make the
+    # server bind there. Its output goes to stderr: this function's
+    # stdout is the list of foreign inodes (SME-175 review 2).
+    if [ -n "$1" ] && [ -n "${CHECK_SERVER_TEST_OWNERSHIP_HOOK:-}" ]; then
+        "$CHECK_SERVER_TEST_OWNERSHIP_HOOK" >&2
+    fi
+    [ -n "$1" ] && ours=$(group_socket_inodes "$1")
+    local still
+    still=$(port_listener_inodes "$2")
+    for inode in $listeners; do
+        grep -qxF "$inode" <<<"$ours" && continue
+        grep -qxF "$inode" <<<"$still" && echo "$inode"
+    done
+    return 0
+}
+
+# Who holds the listening sockets $@ (inodes): "pid N (program) in <cwd>"
+# for each process this user can see holding one. The program's name only
+# (/proc/<pid>/comm), never its arguments, which can carry a secret
+# (SME-175 review 1). A socket no visible process holds is another user's
+# (named by its uid) or one that has closed since it was found (review 1:
+# both read as "can't see"). Only reads /proc; never signals anything.
+describe_listeners() { # inode...
+    local inode fd pid cmd cwd uid
+    local -a found=() seen=()
+    for inode in "$@"; do
+        local held=""
+        for fd in $(find /proc/[0-9]*/fd -maxdepth 1 -lname "socket:\[$inode\]" 2>/dev/null); do
+            pid=${fd#/proc/}
+            pid=${pid%%/*}
+            held=1
+            [[ " ${seen[*]} " == *" $pid "* ]] && continue
+            seen+=("$pid")
+            cmd=$(cat "/proc/$pid/comm" 2>/dev/null || echo "an unnamed program")
+            cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || echo "an unreadable directory")
+            found+=("pid $pid ($cmd) in $cwd")
+        done
+        [ -n "$held" ] && continue
+        uid=$(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk -v i="$inode" '$4 == "0A" && $10 == i { print $8; exit }' || true)
+        if [ -n "$uid" ]; then
+            found+=("a process of uid $uid that this user can't see (such as docker-proxy)")
+        else
+            found+=("a listener that has closed since")
+        fi
+    done
+    local IFS=";"
+    echo "${found[*]}" | sed 's/;/; /g'
+}
+
 # Whether a live process is in process group $1. pgrep counts a zombie, and
 # a process killed here stays a zombie until its parent notices it died: the
 # parent is often gone (the server runs in its own group and session), and
@@ -343,6 +436,13 @@ stop() {
 }
 
 start() {
+    # A plain decimal port, before anything else (SME-175 review 2): a
+    # leading zero is read as octal by the port checks, which then look at
+    # another port than dx binds, and names another lock file.
+    if ! [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$port" -gt 65535 ]; then
+        echo "CHECK_PORT must be a port number from 1 to 65535, written without a leading zero: '$port'" >&2
+        exit 2
+    fi
     local ref=HEAD
     if [ $# -gt 0 ] && [ "$1" != "--" ]; then
         ref=$1
@@ -390,6 +490,18 @@ start() {
     if ! flock -n 8; then
         echo "waiting for port $port: a check server from $(port_holder) holds it; scripts/check-server stop there, or use another CHECK_PORT" >&2
         flock 8
+    fi
+    # Anything else listening on the port, after the lock (a start that
+    # waited checks once the server before it has stopped) and before
+    # anything is checked out, created or started (SME-175): the lock keeps
+    # out other check servers only, and whatever else answers there would
+    # pass for this server. Exiting frees the locks; nothing is signalled.
+    local foreign
+    foreign=$(foreign_listener_inodes "" "$port")
+    if [ -n "$foreign" ]; then
+        # shellcheck disable=SC2086 # one inode per word
+        echo "port $port is taken: $(describe_listeners $foreign) listens on it. check-server never stops a server it didn't start: stop that one yourself, or use another CHECK_PORT" >&2
+        exit 1
     fi
     if [ -d "$worktree" ]; then
         git -C "$worktree" checkout -q --detach "$commit"
@@ -512,20 +624,44 @@ start() {
     echo "building $(git -C "$worktree" log --oneline -1) (log: $(log_file))"
     echo "logging at RUST_LOG=$log_level ($log_note)"
 
-    for _ in $(seq 1 360); do
-        if ! group_is_live "$pgid"; then
-            echo "dx serve exited; see $(log_file)" >&2
-            exit 1
-        fi
-        # A 2xx only: while dx is still building it answers with a 500,
-        # which once passed for up (SME-53).
-        if curl -sf -o /dev/null --max-time 60 "http://localhost:$port/"; then
+    local deadline=$((SECONDS + 720))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        port_owned_or_exit "$pgid"
+        # Only once a listener is up, and only ours (SME-175): any other
+        # listener's answer would pass for this server's. A 2xx only:
+        # while dx is still building it answers with a 500, which once
+        # passed for up (SME-53). -4 because dx binds IPv4 only, and curl
+        # tries localhost's ::1 first; the Host header stays localhost.
+        # --noproxy: curl sends even localhost through an http_proxy in the
+        # environment, whose answer isn't the server's (review 1).
+        if [ -n "$(port_listener_inodes "$port")" ] &&
+            curl -4 --noproxy '*' -sf -o /dev/null --max-time 60 "http://localhost:$port/"; then
+            # And still only ours once it answered.
+            port_owned_or_exit "$pgid"
             echo "check server up at http://localhost:$port/"
             return 0
         fi
-        sleep 2
+        sleep 0.5
     done
     echo "not up after 12 minutes; see $(log_file)" >&2
+    exit 1
+}
+
+# The readiness wait's check (SME-175): exits 1 when the server's group $1
+# has ended (dx serve exited), or when a process outside it listens on the
+# port, naming that one either way. A dx whose port was taken may exit or
+# stay alive, so both are checked. Leaves this server for stop, like the
+# wait's other failures; nothing is signalled.
+port_owned_or_exit() { # pgid
+    local dead="" foreign
+    group_is_live "$1" || dead=1
+    foreign=$(foreign_listener_inodes "$1" "$port")
+    [ -n "$dead$foreign" ] || return 0
+    [ -n "$dead" ] && echo "dx serve exited; see $(log_file)" >&2
+    if [ -n "$foreign" ]; then
+        # shellcheck disable=SC2086 # one inode per word
+        echo "port $port: $(describe_listeners $foreign) listens on it, not this check server, so its answers can't be told from this one's. check-server never stops a server it didn't start: stop that one yourself, or use another CHECK_PORT; scripts/check-server stop stops this one and leaves that one alone" >&2
+    fi
     exit 1
 }
 
@@ -540,7 +676,7 @@ case "${1:-}" in
         fi
         ;;
     *)
-        sed -n '2,67p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,79p' "$0" | sed 's/^# \{0,1\}//'
         exit 2
         ;;
 esac
