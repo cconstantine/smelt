@@ -60,7 +60,7 @@ fn test_an_expired_callback_error_is_refused_and_pruned() {
 
 /// Sends `params` through the real route handler and returns the
 /// `Location` it redirects to.
-async fn callback_location(id: i64, params: CallbackParams) -> String {
+pub(super) async fn callback_location(id: i64, params: CallbackParams) -> String {
     use axum::response::IntoResponse;
     let response = callback_handler(axum::extract::Path(id), axum::extract::Query(params))
         .await

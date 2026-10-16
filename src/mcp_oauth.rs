@@ -472,23 +472,92 @@ impl rmcp::transport::auth::OAuthHttpClient for ProviderHttpClient {
 /// provider's metadata advertised (RFC 9207, MCP's SEP-2468), and refuses a
 /// callback without one from a provider that says it sends it — GitHub
 /// and Linear both do (SME-65).
-pub async fn handle_callback(
+///
+/// Only a callback carrying the attempt's `state` ends it
+/// (`take_matching_attempt`, SME-177); any other is refused with the
+/// attempt left pending.
+async fn handle_callback(
     server_id: i64,
     code: &str,
     csrf_token: &str,
     issuer: Option<&str>,
-) -> Result<(), String> {
-    let mut attempt = PENDING.lock().await.remove(&server_id).ok_or_else(|| {
-        "no OAuth authorization attempt in progress for this server — it may have expired, or this callback link was already used".to_string()
-    })?;
+) -> Result<(), CallbackFailure> {
+    let mut attempt = take_matching_attempt(server_id, Some(csrf_token))
+        .await
+        .map_err(|unmatched| {
+            CallbackFailure::unmatched(match unmatched {
+                Unmatched::NoAttempt => NO_ATTEMPT_ERROR,
+                Unmatched::NotItsState => UNVERIFIED_ERROR,
+            })
+        })?;
     attempt
         .state
         .handle_callback_with_issuer(code, csrf_token, issuer)
         .await
-        .map_err(|e| match e {
-            AuthError::InternalError(reason) if reason == ADDRESS_CHANGED_ERROR => reason,
-            e => format!("OAuth callback failed: {e}"),
+        .map_err(|e| {
+            CallbackFailure::matched(match e {
+                AuthError::InternalError(reason) if reason == ADDRESS_CHANGED_ERROR => reason,
+                e => format!("OAuth callback failed: {e}"),
+            })
         })
+}
+
+const NO_ATTEMPT_ERROR: &str = "no OAuth authorization attempt in progress for this server — it may have expired, or this callback link was already used";
+
+/// Why a callback ended no attempt.
+enum Unmatched {
+    /// Nothing is pending for the server.
+    NoAttempt,
+    /// An attempt is pending, but the callback's `state` isn't its own (a
+    /// forged or replayed callback, or one for an attempt a second Connect
+    /// replaced), or the callback has none.
+    NotItsState,
+}
+
+/// Removes and returns `server_id`'s pending attempt only if `csrf_token`
+/// is its state, as recorded in the attempt's own state store (the one
+/// `rmcp` checks). The check and the removal happen under one `PENDING`
+/// guard, so a forged callback and the genuine one arriving together can't
+/// interleave between them: anyone can send a request to the callback
+/// route, so one without the state leaves the user's sign-in pending
+/// (SME-177 B23).
+async fn take_matching_attempt(
+    server_id: i64,
+    csrf_token: Option<&str>,
+) -> Result<PendingAttempt, Unmatched> {
+    let mut pending = PENDING.lock().await;
+    let attempt = pending.get(&server_id).ok_or(Unmatched::NoAttempt)?;
+    let csrf_token = csrf_token.ok_or(Unmatched::NotItsState)?;
+    // `InMemoryStateStore::load` only reads, and can't fail.
+    if attempt.stored.load(csrf_token).await.ok().flatten().is_none() {
+        return Err(Unmatched::NotItsState);
+    }
+    pending.remove(&server_id).ok_or(Unmatched::NoAttempt)
+}
+
+/// A failed callback: the text the edit page shows, and whether the
+/// callback carried a pending attempt's state (and so ended it).
+#[derive(Debug)]
+struct CallbackFailure {
+    message: String,
+    #[expect(dead_code, reason = "read by the callback error slot's rule, the next commit")]
+    matched: bool,
+}
+
+impl CallbackFailure {
+    fn matched(message: impl Into<String>) -> Self {
+        Self { message: message.into(), matched: true }
+    }
+
+    fn unmatched(message: impl Into<String>) -> Self {
+        Self { message: message.into(), matched: false }
+    }
+}
+
+impl std::fmt::Display for CallbackFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 /// Clears `config`'s stored OAuth credentials without touching anything
@@ -575,7 +644,7 @@ pub async fn callback_handler(
             axum::response::Redirect::to(&format!("/mcp-servers/{id}"))
         }
         Err(error) => {
-            record_callback_error(id, error);
+            record_callback_error(id, error.message);
             axum::response::Redirect::to(&format!("/mcp-servers/{id}?oauth_callback=1"))
         }
     }
@@ -587,48 +656,47 @@ pub async fn callback_handler(
 /// is only worth showing once it's checked.
 const UNVERIFIED_ERROR: &str = "smelt couldn't verify the authorization provider's response, so it was ignored. Click Connect to try again.";
 
-async fn complete_callback(id: i64, params: CallbackParams) -> Result<(), String> {
+async fn complete_callback(id: i64, params: CallbackParams) -> Result<(), CallbackFailure> {
     if let Some(error) = params.error {
         verify_error_callback(id, params.state.as_deref(), params.iss.as_deref()).await?;
-        return Err(params.error_description.unwrap_or(error));
+        return Err(CallbackFailure::matched(
+            params.error_description.unwrap_or(error),
+        ));
     }
-    let code = params
-        .code
-        .ok_or_else(|| "authorization callback is missing its code parameter".to_string())?;
-    let state = params
-        .state
-        .ok_or_else(|| "authorization callback is missing its state parameter".to_string())?;
+    // A missing parameter returns before `PENDING` is touched.
+    let code = params.code.ok_or_else(|| {
+        CallbackFailure::unmatched("authorization callback is missing its code parameter")
+    })?;
+    let state = params.state.ok_or_else(|| {
+        CallbackFailure::unmatched("authorization callback is missing its state parameter")
+    })?;
     handle_callback(id, &code, &state, params.iss.as_deref()).await?;
     crate::mcp::evict(id).await;
     Ok(())
 }
 
-/// Ends `server_id`'s pending attempt (a provider doesn't send a code
-/// after an error), and checks the error callback belongs to it: its
+/// Checks an error callback belongs to `server_id`'s pending attempt: its
 /// `state` must be the attempt's, and its `iss` must pass the check `rmcp`
 /// gives a code callback (RFC 9207 §2.4). `Err(UNVERIFIED_ERROR)` if not.
+/// A callback with the attempt's state ends it (a provider doesn't send a
+/// code after an error), whatever its `iss`: only the provider's redirect
+/// can carry the state. One without it leaves the attempt pending
+/// (SME-177 B23).
 async fn verify_error_callback(
     server_id: i64,
     csrf_token: Option<&str>,
     issuer: Option<&str>,
-) -> Result<(), String> {
-    let unverified = || UNVERIFIED_ERROR.to_string();
-    let attempt = PENDING
-        .lock()
+) -> Result<(), CallbackFailure> {
+    let attempt = take_matching_attempt(server_id, csrf_token)
         .await
-        .remove(&server_id)
-        .ok_or_else(unverified)?;
-    let stored = attempt
-        .stored
-        .load(csrf_token.ok_or_else(unverified)?)
-        .await
-        .ok()
-        .flatten()
-        .ok_or_else(unverified)?;
-    if issuer_accepted(&stored, issuer) {
-        Ok(())
-    } else {
-        Err(unverified())
+        .map_err(|_| CallbackFailure::unmatched(UNVERIFIED_ERROR))?;
+    let stored = match csrf_token {
+        Some(csrf_token) => attempt.stored.load(csrf_token).await.ok().flatten(),
+        None => None,
+    };
+    match stored {
+        Some(stored) if issuer_accepted(&stored, issuer) => Ok(()),
+        _ => Err(CallbackFailure::matched(UNVERIFIED_ERROR)),
     }
 }
 
