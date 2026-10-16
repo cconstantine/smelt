@@ -357,3 +357,27 @@ async fn test_a_calls_wait_for_a_slot_is_on_its_span() {
     let [span] = chats.as_slice() else { panic!("one chat span: {spans:?}") };
     assert_eq!(span_attribute(span, "smelt.slot_wait_ms"), None, "no limit, no wait");
 }
+
+/// SME-162 review 2: deleting a provider (to add it again, say) doesn't
+/// let the calls waiting on its slots all go at once: they still take
+/// their turn on the server.
+#[sqlx::test]
+async fn test_deleting_a_provider_keeps_its_waiting_calls_waiting(pool: sqlx::PgPool) {
+    let (addr, upstream) = start_gated_upstream(None, false).await;
+    let provider = provider_at(&pool, addr, 9_162_000_203, Some(1)).await;
+    let endpoint = crate::providers::endpoint(&provider);
+    let a = tokio::spawn(call(&endpoint, "a"));
+    upstream.wait_for_arrivals(1).await;
+    let b = tokio::spawn(call(&endpoint, "b"));
+    tokio::time::sleep(SETTLE).await;
+
+    crate::providers::delete_provider(&pool, provider.id).await.expect("delete");
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(upstream.arrivals(), ["a"], "b still waits for a's slot");
+
+    upstream.release_one();
+    finished(a).await;
+    upstream.wait_for_arrivals(2).await;
+    upstream.release_one();
+    finished(b).await;
+}

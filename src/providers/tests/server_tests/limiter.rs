@@ -72,7 +72,7 @@ fn test_clearing_a_limit_or_forgetting_a_provider_closes_its_pool() {
     assert!(!Arc::ptr_eq(&first, &set_again), "cleared and set again starts afresh");
     limiter::forget(id);
     assert!(limiter::current(id).is_none(), "forgotten");
-    assert!(set_again.is_closed());
+    assert!(!set_again.is_closed(), "a forgotten pool isn't closed");
 }
 
 #[test]
@@ -142,7 +142,7 @@ async fn test_deleting_a_provider_forgets_its_slots(pool: PgPool) {
     delete_provider(&pool, row.id).await.expect("delete");
 
     assert!(limiter::current(row.id).is_none(), "the deleted provider's pool was forgotten");
-    assert!(built.is_closed());
+    assert!(!built.is_closed(), "but not closed: its waiters still take their turn");
 }
 
 /// SME-162 review 1: saving a new limit sets the provider's pool at

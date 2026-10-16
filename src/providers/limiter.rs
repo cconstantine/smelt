@@ -59,11 +59,10 @@ pub fn current(provider_id: i64) -> Option<Arc<Semaphore>> {
     limits.get(&provider_id).and_then(|limit| limit.pool.as_ref()).map(|(_, slots)| slots.clone())
 }
 
-/// Forgets a deleted provider's pool. Requests holding its slots keep
-/// them until they end.
+/// Forgets a deleted provider's pool. It isn't closed: requests holding
+/// its slots keep them until they end, and requests waiting on it still
+/// take their turn (SME-162 review 2), rather than all going at once to
+/// a server that has as few slots as before.
 pub fn forget(provider_id: i64) {
-    let forgotten = LIMITS.lock().unwrap_or_else(|e| e.into_inner()).remove(&provider_id);
-    if let Some((_, slots)) = forgotten.and_then(|limit| limit.pool) {
-        slots.close();
-    }
+    LIMITS.lock().unwrap_or_else(|e| e.into_inner()).remove(&provider_id);
 }
