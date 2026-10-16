@@ -215,12 +215,16 @@ async fn test_a_connect_the_evict_did_not_interrupt_is_kept(pool: sqlx::PgPool) 
 
     evict(config.id).await;
     let mut held = a.hold("initialize");
-    let turn = list_tools_in_background(&pool, &config);
+    let interrupted = tokio::spawn({
+        let (pool, config) = (pool.clone(), config.clone());
+        async move { ensure_connected(&pool, &config, Attempt::Always).await.map_err(|e| e.message) }
+    });
     held.reached().await;
     evict(config.id).await;
     held.release();
-    connect_ended(config.id).await;
-    finish(turn).await;
+    let refused = finish(interrupted).await;
+    // The generation check refused it, not a failure that looks the same.
+    assert!(refused.as_ref().is_err_and(|e| e.contains("settings changed while connecting")), "{refused:?}");
     assert!(!connected(config.id).await, "an interrupted connect was kept");
     assert_eq!(tool_names(&pool, &config).await, named(&config, "tool_a"));
     assert!(connected(config.id).await, "the connect after it wasn't kept");
