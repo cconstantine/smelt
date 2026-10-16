@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use axum::Json;
 use axum::body::Bytes;
+use axum::extract::State;
 use axum::routing::{get, post};
 
 /// SME-113 review 1: GitHub's refusals, as its docs give them
@@ -86,7 +87,14 @@ async fn register_handler() -> Json<serde_json::Value> {
 /// `get_access_token()` call refreshes rather than reusing it, with no
 /// sleep needed. A `grant_type=refresh_token` request gets a
 /// distinctly-named token back so the test can tell which one it got.
-async fn token_handler(body: Bytes) -> Json<serde_json::Value> {
+async fn token_handler(
+    State(gate): State<Option<Arc<TokenGate>>>,
+    body: Bytes,
+) -> Json<serde_json::Value> {
+    if let Some(gate) = gate {
+        gate.arrived.notify_one();
+        gate.release.notified().await;
+    }
     let body = String::from_utf8_lossy(&body);
     let is_refresh = body.contains("grant_type=refresh_token");
     Json(serde_json::json!({
@@ -95,6 +103,16 @@ async fn token_handler(body: Bytes) -> Json<serde_json::Value> {
         "expires_in": if is_refresh { 3600 } else { 0 },
         "refresh_token": "test-refresh-token",
     }))
+}
+
+/// Holds the mock's token endpoint open (SME-166), so a test can change
+/// the server's row while a code exchange is in flight: the handler says
+/// it `arrived`, then waits for `release`. `Notify` keeps one permit, so
+/// neither side can miss the other.
+#[derive(Default)]
+struct TokenGate {
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 /// Which RFC 8414 metadata document the mock serves at
@@ -119,6 +137,13 @@ fn mock_issuer(base_url: &str) -> String {
 }
 
 async fn spawn_mock_oauth_server(metadata: MockMetadata) -> String {
+    spawn_gated_mock_oauth_server(metadata, None).await
+}
+
+async fn spawn_gated_mock_oauth_server(
+    metadata: MockMetadata,
+    gate: Option<Arc<TokenGate>>,
+) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock oauth server");
@@ -154,6 +179,7 @@ async fn spawn_mock_oauth_server(metadata: MockMetadata) -> String {
             get(move || async move { Json(document) }),
         );
     }
+    let app = app.with_state(gate);
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("mock oauth server");
     });
@@ -538,7 +564,7 @@ async fn test_start_and_handle_callback_persists_credentials_and_a_later_fetch_r
     let mut manager = rmcp::transport::auth::AuthorizationManager::new(base_url.as_str())
         .await
         .expect("new manager");
-    manager.set_credential_store(PgCredentialStore::new(pool.clone(), created.id));
+    manager.set_credential_store(PgCredentialStore::for_refreshes(pool.clone(), created.id));
     manager
         .initialize_from_store()
         .await
@@ -593,4 +619,112 @@ async fn test_disconnect_clears_stored_credentials(pool: PgPool) {
         .expect("get mcp server config")
         .expect("row should exist");
     assert!(after.oauth_credentials.is_none());
+}
+
+async fn change_url(pool: &PgPool, config: &McpServerConfig, name: &str, url: &str) {
+    db::update_mcp_server_config(pool, config.id, name, url, &HashMap::new(), &[], "oauth")
+        .await
+        .expect("update mcp server config")
+        .expect("row should exist");
+}
+
+/// A URL edit after Connect: the token issued for the old address isn't
+/// saved onto the new one, and the error says why.
+#[sqlx::test]
+async fn test_a_callback_after_a_url_edit_saves_nothing(pool: PgPool) {
+    let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
+    let config = create_oauth_server(&pool, &base_url).await;
+    let state = start_attempt(&pool, &config).await;
+
+    change_url(&pool, &config, &config.name, "http://127.0.0.1:1/elsewhere").await;
+    let error = complete_callback(config.id, code_callback(&state, None))
+        .await
+        .expect_err("a sign-in for the old address must not complete");
+
+    assert!(error.contains(ADDRESS_CHANGED_ERROR), "unexpected error: {error}");
+    assert!(
+        stored_credentials(&pool, config.id).await.is_none(),
+        "the old address's grant must not be saved onto the new URL"
+    );
+}
+
+/// The interleaving that dropping `PENDING` on an edit can't cover: the
+/// callback has already taken its attempt and is waiting on the
+/// provider's token endpoint when the URL changes.
+#[sqlx::test]
+async fn test_a_url_edit_during_the_code_exchange_saves_nothing(pool: PgPool) {
+    let gate = Arc::new(TokenGate::default());
+    let base_url = spawn_gated_mock_oauth_server(MockMetadata::None, Some(gate.clone())).await;
+    let config = create_oauth_server(&pool, &base_url).await;
+    let state = start_attempt(&pool, &config).await;
+
+    let id = config.id;
+    let callback =
+        tokio::spawn(async move { complete_callback(id, code_callback(&state, None)).await });
+    gate.arrived.notified().await;
+    assert!(
+        !PENDING.lock().await.contains_key(&config.id),
+        "the callback has taken its attempt before the exchange"
+    );
+    change_url(&pool, &config, &config.name, "http://127.0.0.1:1/elsewhere").await;
+    gate.release.notify_one();
+    let error = callback
+        .await
+        .expect("callback task")
+        .expect_err("a sign-in for the old address must not complete");
+
+    assert!(error.contains(ADDRESS_CHANGED_ERROR), "unexpected error: {error}");
+    assert!(
+        stored_credentials(&pool, config.id).await.is_none(),
+        "the old address's grant must not be saved onto the new URL"
+    );
+}
+
+#[sqlx::test]
+async fn test_a_callback_after_the_server_is_deleted_saves_nothing(pool: PgPool) {
+    let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
+    let config = create_oauth_server(&pool, &base_url).await;
+    let state = start_attempt(&pool, &config).await;
+
+    db::delete_mcp_server_config(&pool, config.id)
+        .await
+        .expect("delete mcp server config");
+    let error = complete_callback(config.id, code_callback(&state, None))
+        .await
+        .expect_err("a sign-in for a deleted server must not complete");
+
+    assert!(error.contains(ADDRESS_CHANGED_ERROR), "unexpected error: {error}");
+    assert!(
+        db::get_mcp_server_config(&pool, config.id)
+            .await
+            .expect("get mcp server config")
+            .is_none(),
+        "the deleted server must stay deleted"
+    );
+}
+
+/// The guard is on the URL alone: a rename, or an edit that puts the URL
+/// back, leaves the sign-in valid for the address the row now has.
+#[sqlx::test]
+async fn test_a_callback_after_edits_that_leave_the_url_as_it_was_saves(pool: PgPool) {
+    let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
+    for case in ["a rename", "a URL changed and changed back"] {
+        let config = create_oauth_server(&pool, &base_url).await;
+        let state = start_attempt(&pool, &config).await;
+
+        if case == "a rename" {
+            change_url(&pool, &config, "renamed", &config.url).await;
+        } else {
+            change_url(&pool, &config, &config.name, "http://127.0.0.1:1/elsewhere").await;
+            change_url(&pool, &config, &config.name, &config.url).await;
+        }
+        complete_callback(config.id, code_callback(&state, None))
+            .await
+            .unwrap_or_else(|e| panic!("case {case}: the sign-in should complete: {e}"));
+
+        assert!(
+            stored_credentials(&pool, config.id).await.is_some(),
+            "case {case}: the grant should be saved"
+        );
+    }
 }

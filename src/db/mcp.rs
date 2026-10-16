@@ -234,6 +234,29 @@ pub async fn set_mcp_server_oauth_credentials(
     Ok(())
 }
 
+/// Saves a new sign-in's grant only while the row's URL is still `url`,
+/// the address the sign-in started for (SME-166): a sign-in that finishes
+/// after a URL edit or a delete mustn't put the old address's token on the
+/// new one. One statement, so Postgres orders it against the edit's own
+/// `UPDATE` of the row. `false` when nothing matched.
+pub async fn save_mcp_server_sign_in(
+    pool: &PgPool,
+    id: i64,
+    url: &str,
+    credentials: serde_json::Value,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE mcp_servers SET oauth_credentials = $3, updated_at = now() \
+         WHERE id = $1 AND url = $2",
+    )
+    .bind(id)
+    .bind(url)
+    .bind(sqlx::types::Json(credentials))
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected() == 1)
+}
+
 /// Saves a refreshed grant only while the row still holds a grant for the
 /// same client: a refresh that finishes after a Disconnect, a URL change
 /// or a new Connect mustn't write back over what they wrote (SME-113).

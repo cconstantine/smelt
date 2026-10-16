@@ -457,3 +457,61 @@ async fn test_update_mcp_server_config_keeps_oauth_credentials_when_url_is_uncha
         "renaming without changing the URL must not disturb stored OAuth credentials"
     );
 }
+
+/// SME-166: a sign-in's grant is saved only while the row still has the
+/// URL the sign-in started for, so a token issued for one address never
+/// lands on another after an edit, or on a deleted server.
+#[sqlx::test]
+async fn test_save_mcp_server_sign_in_saves_only_onto_the_url_it_started_for(pool: PgPool) {
+    let created = create_mcp_server_config(
+        &pool,
+        "github",
+        "https://example.com/mcp",
+        &HashMap::new(),
+        "oauth",
+        None,
+        None,
+    )
+    .await
+    .expect("create mcp server config");
+    let stored = |pool: PgPool| async move {
+        get_mcp_server_config(&pool, created.id)
+            .await
+            .expect("get mcp server config")
+            .expect("row should exist")
+            .oauth_credentials
+            .map(|j| j.0)
+    };
+
+    let first = serde_json::json!({"client_id": "first"});
+    let saved = save_mcp_server_sign_in(&pool, created.id, "https://example.com/mcp", first.clone())
+        .await
+        .expect("save on the row's own URL");
+    assert!(saved, "a save on the row's own URL should match it");
+    assert_eq!(stored(pool.clone()).await, Some(first.clone()));
+
+    let saved = save_mcp_server_sign_in(
+        &pool,
+        created.id,
+        "https://example.com/mcp-v2",
+        serde_json::json!({"client_id": "for-another-url"}),
+    )
+    .await
+    .expect("save on another URL");
+    assert!(!saved, "a save for another URL must match nothing");
+    assert_eq!(
+        stored(pool.clone()).await,
+        Some(first),
+        "a save for another URL must leave the stored grant as it was"
+    );
+
+    let saved = save_mcp_server_sign_in(
+        &pool,
+        created.id + 1_000,
+        "https://example.com/mcp",
+        serde_json::json!({"client_id": "for-a-missing-row"}),
+    )
+    .await
+    .expect("save on a missing id");
+    assert!(!saved, "a save for a missing id must match nothing");
+}
