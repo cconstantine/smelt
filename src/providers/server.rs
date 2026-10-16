@@ -162,7 +162,7 @@ pub fn endpoint(provider: &db::InferenceProvider) -> Endpoint {
         Some(AuthKind::Bearer) => Auth::Bearer(provider.secret.clone()),
         _ => Auth::ApiKey(provider.secret.clone()),
     };
-    limiter::set(provider.id, resolved_max(provider));
+    limiter::set(provider.id, provider.updated_at, resolved_max(provider));
     Endpoint {
         base_url: provider.base_url.clone(),
         auth,
@@ -468,7 +468,7 @@ pub async fn create_provider(pool: &PgPool, input: ProviderInput) -> Result<Prov
     )
     .await
     .map_err(|e| save_error(&input.name, e))?;
-    limiter::set(provider.id, resolved_max(&provider));
+    limiter::set(provider.id, provider.updated_at, resolved_max(&provider));
     providers_changed();
     Ok(provider.into())
 }
@@ -509,7 +509,7 @@ pub async fn update_provider(
     .map_err(|e| save_error(&input.name, e))?
     .ok_or("That provider no longer exists.")?;
     // From each running turn's next model call (SME-162 review 1).
-    limiter::set(provider.id, resolved_max(&provider));
+    limiter::set(provider.id, provider.updated_at, resolved_max(&provider));
     providers_changed();
     Ok(provider.into())
 }
@@ -687,13 +687,15 @@ async fn read_llama_props(
         Ok(info) => {
             crate::anthropic::models::apply_llama_props(listed, &info);
             let value = serde_json::to_value(&info).map_err(|e| e.to_string())?;
-            db::set_inference_provider_server_caps(pool, provider.id, &value)
+            let updated_at = db::set_inference_provider_server_caps(pool, provider.id, &value)
                 .await
                 .map_err(|e| e.to_string())?;
             // An automatic limit takes the new count from each running
             // turn's next model call (SME-162 review 1).
-            let read = db::InferenceProvider { server_caps: Some(value), ..provider.clone() };
-            limiter::set(provider.id, resolved_max(&read));
+            if let Some(updated_at) = updated_at {
+                let read = db::InferenceProvider { server_caps: Some(value), updated_at, ..provider.clone() };
+                limiter::set(provider.id, read.updated_at, resolved_max(&read));
+            }
             Ok((Some(info), None))
         }
         Err(e) => Ok((server_caps(provider), Some(e))),

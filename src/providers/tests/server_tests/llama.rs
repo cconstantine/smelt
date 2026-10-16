@@ -254,6 +254,12 @@ async fn test_reading_props_sets_an_automatic_providers_pool_at_once(pool: PgPoo
 
     let slots = crate::providers::limiter::current(running.slots_of.expect("a model endpoint"));
     assert_eq!(slots.map(|s| s.available_permits()), Some(1), "the fixture's one slot");
+
+    // A turn that read the row before the page read `/props` builds its
+    // endpoint from it now: the pool the read set stays.
+    endpoint(&p);
+    let slots = crate::providers::limiter::current(p.id);
+    assert_eq!(slots.map(|s| s.available_permits()), Some(1), "an older row doesn't clear it");
 }
 
 /// SME-111 review 2: the picker's quick listing (no `/props`)

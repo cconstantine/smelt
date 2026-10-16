@@ -114,7 +114,7 @@ async fn start_gated_upstream(fail_first: Option<&'static str>, mid_body: bool) 
 /// `slots`. The pools are process-wide by provider id: each test uses
 /// an id of its own (9_162_000_1xx and 2xx).
 fn limited(addr: std::net::SocketAddr, id: i64, slots: Option<u32>) -> Endpoint {
-    crate::providers::limiter::set(id, slots);
+    crate::providers::limiter::set(id, chrono::NaiveDateTime::default(), slots);
     Endpoint { slots_of: Some(id), ..test_endpoint(addr) }
 }
 

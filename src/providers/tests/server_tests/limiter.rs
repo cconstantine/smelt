@@ -27,6 +27,11 @@ fn provider_row(id: i64, max: Option<i32>, total_slots: Option<u32>) -> db::Infe
     }
 }
 
+/// A row version (`updated_at`), `seconds` after the epoch.
+fn at(seconds: i64) -> chrono::NaiveDateTime {
+    chrono::DateTime::from_timestamp(seconds, 0).expect("a time").naive_utc()
+}
+
 /// The free slots of the provider an endpoint takes its slots from now.
 fn permits(endpoint: &Endpoint) -> Option<usize> {
     limiter::current(endpoint.slots_of.expect("a model endpoint")).map(|pool| pool.available_permits())
@@ -35,17 +40,17 @@ fn permits(endpoint: &Endpoint) -> Option<usize> {
 #[test]
 fn test_a_limit_keeps_one_pool_of_that_many_slots_until_it_changes() {
     let id = 9_162_000_001;
-    limiter::set(id, None);
+    limiter::set(id, at(10), None);
     assert!(limiter::current(id).is_none(), "no limit, no pool");
 
-    limiter::set(id, Some(2));
+    limiter::set(id, at(20), Some(2));
     let first = limiter::current(id).expect("a pool");
     assert_eq!(first.available_permits(), 2);
-    limiter::set(id, Some(2));
+    limiter::set(id, at(30), Some(2));
     assert!(Arc::ptr_eq(&first, &limiter::current(id).expect("a pool")), "the same limit keeps its pool");
 
     let held = first.clone().try_acquire_owned().expect("a free slot");
-    limiter::set(id, Some(3));
+    limiter::set(id, at(40), Some(3));
     let resized = limiter::current(id).expect("a pool");
     assert!(!Arc::ptr_eq(&first, &resized), "a new limit, a new pool");
     assert_eq!(resized.available_permits(), 3, "the old pool's held slot isn't counted");
@@ -56,13 +61,13 @@ fn test_a_limit_keeps_one_pool_of_that_many_slots_until_it_changes() {
 #[test]
 fn test_clearing_a_limit_or_forgetting_a_provider_closes_its_pool() {
     let id = 9_162_000_002;
-    limiter::set(id, Some(2));
+    limiter::set(id, at(50), Some(2));
     let first = limiter::current(id).expect("a pool");
-    limiter::set(id, None);
+    limiter::set(id, at(60), None);
     assert!(limiter::current(id).is_none(), "cleared");
     assert!(first.is_closed());
 
-    limiter::set(id, Some(2));
+    limiter::set(id, at(70), Some(2));
     let set_again = limiter::current(id).expect("a pool");
     assert!(!Arc::ptr_eq(&first, &set_again), "cleared and set again starts afresh");
     limiter::forget(id);
@@ -83,6 +88,26 @@ fn test_an_endpoint_names_its_provider_and_sets_its_pool() {
     assert_eq!(permits(&endpoint(&provider_row(9_162_000_004, None, Some(5)))), None, "no limit");
 }
 
+/// SME-162 review 1: a turn that read its provider's row before a save
+/// sets its pool from that older row; the newer pool stays, open.
+#[test]
+fn test_a_pool_set_from_an_older_row_is_ignored() {
+    let id = 9_162_000_008;
+    limiter::set(id, at(20), Some(1));
+    let newer = limiter::current(id).expect("a pool");
+    limiter::set(id, at(10), Some(2));
+    assert!(Arc::ptr_eq(&newer, &limiter::current(id).expect("a pool")), "the older row's 2 is ignored");
+    assert!(!newer.is_closed());
+    limiter::set(id, at(10), None);
+    assert!(limiter::current(id).is_some(), "and so is its no limit");
+    limiter::set(id, at(20), Some(3));
+    assert_eq!(limiter::current(id).map(|p| p.available_permits()), Some(3), "the same version may change it");
+    limiter::set(id, at(30), None);
+    assert!(limiter::current(id).is_none(), "a newer row clears it");
+    limiter::set(id, at(25), Some(1));
+    assert!(limiter::current(id).is_none(), "and an older one can't bring it back");
+}
+
 /// The user's answer 2: `0` takes the slot count the server reported
 /// (`/props`' total_slots), and is no limit until one is read.
 #[test]
@@ -92,9 +117,9 @@ fn test_automatic_takes_the_servers_slot_count_once_it_has_one() {
     assert_eq!(permits(&endpoint(&provider_row(id, Some(0), None))), None);
     assert_eq!(resolved_max(&provider_row(id, Some(0), Some(0))), None, "a server reporting no slots");
 
-    let three = endpoint(&provider_row(id, Some(0), Some(3)));
+    let three = endpoint(&db::InferenceProvider { updated_at: at(10), ..provider_row(id, Some(0), Some(3)) });
     assert_eq!(permits(&three), Some(3));
-    endpoint(&provider_row(id, Some(0), Some(1)));
+    endpoint(&db::InferenceProvider { updated_at: at(20), ..provider_row(id, Some(0), Some(1)) });
     assert_eq!(permits(&three), Some(1), "a new report applies to an endpoint built before it");
 }
 

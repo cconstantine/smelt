@@ -134,18 +134,19 @@ pub async fn update_inference_provider(
     .await
 }
 
-/// Keeps what a llama.cpp server last said about itself (SME-111).
+/// Keeps what a llama.cpp server last said about itself (SME-111), and
+/// returns the row's new `updated_at`: an automatic limit is read from it
+/// (SME-162). `None` when the provider is gone.
 pub async fn set_inference_provider_server_caps(
     pool: &PgPool,
     id: i64,
     server_caps: &serde_json::Value,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE inference_providers SET server_caps = $2 WHERE id = $1")
+) -> Result<Option<NaiveDateTime>, sqlx::Error> {
+    sqlx::query_scalar("UPDATE inference_providers SET server_caps = $2, updated_at = now() WHERE id = $1 RETURNING updated_at")
         .bind(id)
         .bind(server_caps)
-        .execute(pool)
-        .await?;
-    Ok(())
+        .fetch_optional(pool)
+        .await
 }
 
 /// Deletes a provider, first clearing it as the default and from every

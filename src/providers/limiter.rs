@@ -17,42 +17,53 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use chrono::NaiveDateTime;
 use tokio::sync::Semaphore;
 
-/// A provider's slots, and the count they were made for.
-struct Pool {
-    max: u32,
-    slots: Arc<Semaphore>,
+/// A provider's limit as of a version of its row, and its slots.
+struct Limit {
+    /// The row's `updated_at` it was set from: a set from an older row (a
+    /// turn that read it before a save) is ignored (SME-162 review 1).
+    version: NaiveDateTime,
+    /// The count and its slots; `None` for no limit.
+    pool: Option<(u32, Arc<Semaphore>)>,
 }
 
-static POOLS: LazyLock<Mutex<HashMap<i64, Pool>>> = LazyLock::new(Default::default);
+static LIMITS: LazyLock<Mutex<HashMap<i64, Limit>>> = LazyLock::new(Default::default);
 
 /// Sets how many requests at once a provider is sent, `None` for no
-/// limit. The same count keeps its pool; another count, or none, closes
-/// it, so the calls waiting on it look again (`current`).
-pub fn set(provider_id: i64, max: Option<u32>) {
+/// limit, as of `version` (its row's `updated_at`); a set from an older
+/// version than the last is ignored. The same count keeps its pool;
+/// another count, or none, closes it, so the calls waiting on it look
+/// again (`current`).
+pub fn set(provider_id: i64, version: NaiveDateTime, max: Option<u32>) {
     // Nothing panics while it's held, so a poisoned lock's map is whole.
-    let mut pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
-    if pools.get(&provider_id).map(|pool| pool.max) == max {
+    let mut limits = LIMITS.lock().unwrap_or_else(|e| e.into_inner());
+    let known = limits.get(&provider_id);
+    if known.is_some_and(|limit| limit.version > version) {
         return;
     }
-    let replaced = match max {
-        Some(max) => pools.insert(provider_id, Pool { max, slots: Arc::new(Semaphore::new(max as usize)) }),
-        None => pools.remove(&provider_id),
-    };
-    if let Some(old) = replaced {
-        old.slots.close();
+    let kept = known.and_then(|limit| limit.pool.clone()).filter(|(count, _)| Some(*count) == max);
+    let pool = kept.or_else(|| max.map(|count| (count, Arc::new(Semaphore::new(count as usize)))));
+    let replaced = limits.insert(provider_id, Limit { version, pool: pool.clone() });
+    if let Some((_, old)) = replaced.and_then(|limit| limit.pool)
+        && !pool.is_some_and(|(_, new)| Arc::ptr_eq(&new, &old))
+    {
+        old.close();
     }
 }
 
 /// The provider's pool now, `None` when it has no limit.
 pub fn current(provider_id: i64) -> Option<Arc<Semaphore>> {
-    let pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
-    pools.get(&provider_id).map(|pool| pool.slots.clone())
+    let limits = LIMITS.lock().unwrap_or_else(|e| e.into_inner());
+    limits.get(&provider_id).and_then(|limit| limit.pool.as_ref()).map(|(_, slots)| slots.clone())
 }
 
 /// Forgets a deleted provider's pool. Requests holding its slots keep
 /// them until they end.
 pub fn forget(provider_id: i64) {
-    set(provider_id, None);
+    let forgotten = LIMITS.lock().unwrap_or_else(|e| e.into_inner()).remove(&provider_id);
+    if let Some((_, slots)) = forgotten.and_then(|limit| limit.pool) {
+        slots.close();
+    }
 }
