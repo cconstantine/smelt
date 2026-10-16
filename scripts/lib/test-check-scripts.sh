@@ -129,8 +129,8 @@ EOF
 # only a curl stub that always succeeded made look up). It first records
 # the log settings it was started with (the server it runs inherits them)
 # and writes a line of its own to the log. DX_NO_LISTEN=1 keeps it alive
-# without binding; DX_BIND_DELAY=<s> waits before the bind. dx build
-# records the call and ends.
+# without binding; DX_BIND_DELAY=<s> waits before the bind; DX_STATUS
+# answers that code instead of 200. dx build records the call and ends.
 cat >"$dir/bin/dx" <<'EOF'
 #!/usr/bin/env bash
 if [ "$1" = build ]; then
@@ -146,7 +146,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 [ -n "${DX_NO_LISTEN:-}" ] && exec sleep 600
-exec "$STUB_PYTHON3" -I "$STUB_HTTP_200" 0.0.0.0 "$port" --delay "${DX_BIND_DELAY:-0}"
+exec "$STUB_PYTHON3" -I "$STUB_HTTP_200" 0.0.0.0 "$port" --delay "${DX_BIND_DELAY:-0}" --status "${DX_STATUS:-200}"
 EOF
 # sqlx: records each call, one per line, and to $ORDER when set (with the
 # cleanup stub's lines, so a case can check their order).

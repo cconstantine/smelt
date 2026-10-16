@@ -609,6 +609,24 @@ fi
 grep -qF "check server up at http://localhost:$fport/" <<<"$out" || fail "a dx that binds late: start said: $out"
 "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" scripts/check-server stop >/dev/null 2>&1
 
+# 17b. A proxy in the environment never answers for the server (review 1):
+# curl sends even localhost through http_proxy, so a 200 from the proxy
+# passed while dx, its own listener alone on the port, still answered 500.
+fport=$(free_port)
+proxy_port=$(free_port)
+if start_foreign 127.0.0.1 "$proxy_port"; then
+    out=$(timeout 5 "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" DX_STATUS=500 \
+        http_proxy="http://127.0.0.1:$proxy_port" HTTP_PROXY="http://127.0.0.1:$proxy_port" no_proxy= NO_PROXY= \
+        scripts/check-server start HEAD 2>&1)
+    rc=$?
+    [ "$rc" = 124 ] || fail "a 200 from http_proxy: start exited $rc rather than waiting for dx's 2xx: $out"
+    grep -q "check server up" <<<"$out" && fail "a 200 from http_proxy passed for the check server: $out"
+    "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" scripts/check-server stop >/dev/null 2>&1
+    stop_foreign "$foreign_pid"
+else
+    fail "the proxy listener never listened"
+fi
+
 # 18. dx binds between the ownership check's two reads (review 1): its own
 # listener is never taken for a foreign one. The hook holds the first
 # check of the wait between its reads until the stub dx (binding 1 s in)

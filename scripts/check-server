@@ -622,8 +622,10 @@ start() {
         # while dx is still building it answers with a 500, which once
         # passed for up (SME-53). -4 because dx binds IPv4 only, and curl
         # tries localhost's ::1 first; the Host header stays localhost.
+        # --noproxy: curl sends even localhost through an http_proxy in the
+        # environment, whose answer isn't the server's (review 1).
         if [ -n "$(port_listener_inodes "$port")" ] &&
-            curl -4 -sf -o /dev/null --max-time 60 "http://localhost:$port/"; then
+            curl -4 --noproxy '*' -sf -o /dev/null --max-time 60 "http://localhost:$port/"; then
             # And still only ours once it answered.
             port_owned_or_exit "$pgid"
             echo "check server up at http://localhost:$port/"
