@@ -123,8 +123,8 @@ async-trait = { version = "0.1", optional = true }
 # included. The same versions axum already pulls in.
 hyper = { version = "1", features = ["client", "server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
-# For src/mcp_oauth.rs's callback route — percent-encoding an OAuth error
-# message into a `?oauth_error=` redirect query param. Already present
+# Percent-decoding a database URL's name (src/telemetry.rs) and encoding/decoding
+# `file://` URIs for language servers (src/lsp/session.rs). Already present
 # transitively (pulled in by `url`, itself pulled in by rmcp's "auth"
 # feature), same "explicit edge" reasoning as `http`/`async-trait` above.
 percent-encoding = { version = "2", optional = true }
