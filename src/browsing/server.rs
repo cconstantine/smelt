@@ -524,24 +524,27 @@ pub fn normalize_address(input: &str) -> Result<String, String> {
         return Ok(input.to_string());
     }
     let scheme = match url::Url::parse(&format!("http://{input}")) {
-        Ok(url) if is_local_address(&url) => "http",
+        Ok(url) if is_local_address(&url, input) => "http",
         _ => "https",
     };
     Ok(format!("{scheme}://{input}"))
 }
 
 /// Whether Chromium would keep a typed `url` on plain http: an IP, a
-/// non-default port (443 excepted: there https is what can work), or a
+/// typed port (443 excepted: there https is what can work), or a
 /// name outside the public DNS. A short suffix list stands in for the
 /// Public Suffix List; `.home.arpa` is home-only, and smelt has no
 /// fallback to http if https fails, so it gets http too.
-fn is_local_address(url: &url::Url) -> bool {
+fn is_local_address(url: &url::Url, input: &str) -> bool {
     let name = match url.host() {
         Some(url::Host::Domain(name)) => name,
         Some(_) => return true,
         None => return false,
     };
-    if let Some(port) = url.port() {
+    // `port()` hides the scheme's default port, so a typed :80 shows only
+    // when parsed as https (review 1: https on port 80 can't load).
+    let https_port = || url::Url::parse(&format!("https://{input}")).ok()?.port();
+    if let Some(port) = url.port().or_else(https_port) {
         return port != 443;
     }
     let name = name.strip_suffix('.').unwrap_or(name);

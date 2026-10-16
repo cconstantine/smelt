@@ -166,6 +166,9 @@ fn test_normalize_address_gives_local_and_private_addresses_http() {
         ("x.home.arpa", "http://x.home.arpa"),
         ("localhost.", "http://localhost."),
         ("example.com:8443", "http://example.com:8443"),
+        // Review 1: a typed :80 is http's own port; https on it can't load.
+        ("example.com:80", "http://example.com:80"),
+        ("nas.corp:80", "http://nas.corp:80"),
     ]);
     assert!(wrong.is_empty(), "wrong scheme for:\n{}", wrong.join("\n"));
 }
@@ -175,7 +178,6 @@ fn test_normalize_address_gives_public_names_https() {
     let wrong = wrong_addresses(&[
         ("example.com", "https://example.com"),
         ("example.com/a?b=1", "https://example.com/a?b=1"),
-        ("example.com:80", "https://example.com:80"),
         ("sub.example.co.uk", "https://sub.example.co.uk"),
         // Only a whole label matches a local suffix: `contest` isn't `test`.
         ("shop.contest", "https://shop.contest"),
