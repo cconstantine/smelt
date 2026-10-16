@@ -451,3 +451,37 @@ async fn test_a_check_that_loses_a_refresh_race_is_not_reported_as_expired(pool:
     assert_eq!(check.await.expect("check task"), Ok(vec!["echo".to_string()]));
     evict(server.id).await;
 }
+
+/// SME-177 review 1: a status check whose refresh loses the compare-and-set
+/// (here to a Reconnect with the same client, while the provider took the
+/// old refresh token) gets rmcp's `InternalError`, not
+/// `AuthorizationRequired`. The grant changed meanwhile, so the check tries
+/// once more with it instead of reading Unreachable.
+#[sqlx::test]
+async fn test_a_check_whose_refresh_loses_to_a_reconnect_tries_the_new_grant(pool: sqlx::PgPool) {
+    let mock = oauth_http::spawn().await;
+    let server = oauth_http::create_server(&pool, &mock, None).await;
+    oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+    oauth_http::age_token(&pool, server.id).await;
+    let config = oauth_http::config(&pool, server.id).await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *mock.refresh_gate.lock().unwrap() = Some(gate.clone());
+
+    let check = tokio::spawn({
+        let (pool, config) = (pool.clone(), config.clone());
+        async move { connection_check(&pool, &config).await }
+    });
+    assert!(
+        wait_until(|| mock.refresh_client_ids.lock().unwrap().len() == 1).await,
+        "the check's refresh should reach the provider"
+    );
+    oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+    gate.add_permits(10);
+    let checked = tokio::time::timeout(std::time::Duration::from_secs(30), check)
+        .await
+        .expect("the check finishes once its refresh is let through")
+        .expect("check task");
+
+    assert_eq!(checked, Ok(vec!["echo".to_string()]), "the Reconnect's grant connects");
+    evict(server.id).await;
+}
