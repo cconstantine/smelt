@@ -51,10 +51,12 @@ pub fn uri_path(uri: &str) -> Option<String> {
     percent_encoding::percent_decode_str(path).decode_utf8().ok().map(|p| p.into_owned())
 }
 
-/// Whether `path` is a normalised absolute path under `/workspace`.
+/// Whether `path` is a normalised absolute path under `/workspace`: no
+/// `.` or `..`, and no empty part (`//`, a trailing `/`), so a file has
+/// one spelling.
 pub fn in_workspace(path: &str) -> bool {
     path.starts_with("/workspace/")
-        && !path.split('/').any(|part| part == ".." || part == ".")
+        && !path.split('/').skip(1).any(|part| part == ".." || part == "." || part.is_empty())
 }
 
 use std::collections::{HashMap, HashSet};
@@ -714,5 +716,10 @@ mod tests {
         assert!(!in_workspace("/home/sandbox/x.rs"));
         assert!(!in_workspace("/workspace/../etc/passwd"));
         assert!(!in_workspace("workspace/x.rs"));
+        // SME-172 review 2: one file, one spelling. A doubled slash would
+        // name a file the server spells without it, so a rename couldn't
+        // tell it was the file its position came from.
+        assert!(!in_workspace("/workspace/demo//src/main.rs"));
+        assert!(!in_workspace("/workspace/demo/src/"));
     }
 }
