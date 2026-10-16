@@ -199,6 +199,20 @@ fn test_an_evicted_server_says_it_was_evicted() {
     assert!(error.contains("(Evicted)"), "{error}");
 }
 
+/// Review 1: a read error the next read recovered from isn't what a
+/// timed-out install is blamed on.
+#[test]
+fn test_a_timed_out_install_names_only_a_read_error_that_is_still_the_latest() {
+    let running = || Ok(Some(unready_server_pod("a", "Running", None, false)));
+    let mut watch = InstallWatch { name: "lsp-7-ra", uid: "a", read_error: None };
+    assert_eq!(watch.read(Err("the API server is busy".to_string())), None, "a failed read isn't a death");
+    assert!(watch.timed_out().contains("(last error reading the pod: the API server is busy)"), "{}", watch.timed_out());
+    assert_eq!(watch.read(running()), None);
+    assert!(!watch.timed_out().contains("last error"), "{}", watch.timed_out());
+    assert!(watch.timed_out().starts_with("The install didn't finish within 10 minutes"), "{}", watch.timed_out());
+    assert!(watch.read(Ok(None)).is_some_and(|e| e.contains("deleted")));
+}
+
 #[test]
 fn test_a_stop_explains_an_oom_and_names_any_other_reason() {
     assert!(stop_explanation(Some("OOMKilled")).contains("memory limit on the Language servers page"));

@@ -312,6 +312,40 @@ async fn wait_running(pods: &kube::Api<Pod>, name: &str) -> Result<String, Strin
     }
 }
 
+/// What `wait_installed` makes of each read of its pod.
+struct InstallWatch<'a> {
+    name: &'a str,
+    uid: &'a str,
+    /// The last read's error, when the last read failed: a failed read
+    /// isn't a death (the API server may be busy), and goes in the
+    /// timeout's message only while it's still the latest news.
+    read_error: Option<String>,
+}
+
+impl InstallWatch<'_> {
+    /// The error to end the wait with, if the pod as read says so.
+    fn read(&mut self, pod: Result<Option<Pod>, String>) -> Option<String> {
+        match pod {
+            Ok(pod) => {
+                self.read_error = None;
+                install_interrupted(self.name, self.uid, pod.as_ref())
+            }
+            Err(e) => {
+                self.read_error = Some(e);
+                None
+            }
+        }
+    }
+
+    fn timed_out(&self) -> String {
+        format!(
+            "The install didn't finish within {} minutes{}",
+            INSTALL_TIMEOUT.as_secs() / 60,
+            self.read_error.as_ref().map(|e| format!(" (last error reading the pod: {e})")).unwrap_or_default()
+        )
+    }
+}
+
 /// Waits for the pod's install to finish; a failure comes back with its
 /// output. Pod `uid` stopping or going ends the wait at once, saying why
 /// (SME-171): its install can't finish then, and every exec into it
@@ -320,17 +354,10 @@ async fn wait_installed(client: &kube::Client, pods: &kube::Api<Pod>, name: &str
     #[cfg(test)]
     test_hooks::reached_install_wait(name);
     let started = std::time::Instant::now();
-    // A failed read isn't a death (the API server may be busy); it goes
-    // in the timeout's message if the wait runs out.
-    let mut read_error = None;
+    let mut watch = InstallWatch { name, uid, read_error: None };
     loop {
-        match pods.get_opt(name).await {
-            Ok(pod) => {
-                if let Some(error) = install_interrupted(name, uid, pod.as_ref()) {
-                    return Err(error);
-                }
-            }
-            Err(e) => read_error = Some(e.to_string()),
+        if let Some(error) = watch.read(pods.get_opt(name).await.map_err(|e| e.to_string())) {
+            return Err(error);
         }
         if let Some(rc) = install_rc(client, name).await {
             if rc == "0" {
@@ -343,11 +370,7 @@ async fn wait_installed(client: &kube::Client, pods: &kube::Api<Pod>, name: &str
             return Err(format!("The install failed (exit {rc}):\n{}", log.trim_end()));
         }
         if started.elapsed() > INSTALL_TIMEOUT {
-            return Err(format!(
-                "The install didn't finish within {} minutes{}",
-                INSTALL_TIMEOUT.as_secs() / 60,
-                read_error.map(|e| format!(" (last error reading the pod: {e})")).unwrap_or_default()
-            ));
+            return Err(watch.timed_out());
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
