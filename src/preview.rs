@@ -230,7 +230,8 @@ impl PreviewTemplate {
 /// A template's authority as a browser sends it back in `Host` and
 /// `Origin`: a scheme's default port, or an empty one, dropped, and any
 /// other port in plain decimal. An authority no browser's `Host` can
-/// match is refused: userinfo, an IP literal, or a non-ASCII name.
+/// match is refused: userinfo, an IP literal, a non-ASCII name, whitespace,
+/// `%` or `\`, a placeholder in the port, or more than one port.
 fn browser_authority(template: &str, scheme: &str, authority: &str) -> Result<String, String> {
     let invalid = |why: &str| format!("{template:?} {why}");
     if authority.contains('@') {
@@ -242,12 +243,22 @@ fn browser_authority(template: &str, scheme: &str, authority: &str) -> Result<St
     if !authority.is_ascii() {
         return Err(invalid("must be written in ASCII: give a non-ASCII name in its xn-- form"));
     }
+    if authority.contains(char::is_whitespace) {
+        return Err(invalid("must not hold a space or other whitespace"));
+    }
+    if authority.contains(['%', '\\']) {
+        return Err(invalid("must not hold % or \\: a browser decodes the one and reads the other as a path"));
+    }
     let Some((host, port)) = authority.rsplit_once(':') else {
         return Ok(authority.to_string());
     };
-    // `http://{conversation}.x.test:{port}`: the placeholder is the port.
+    // A browser leaves a default port out of `Host`, which a placeholder
+    // can't know to do, and a container's slot is no port at all.
     if port.contains('{') {
-        return Ok(authority.to_string());
+        return Err(invalid("can't hold a placeholder in its port"));
+    }
+    if host.contains(':') {
+        return Err(invalid("must have one port at most"));
     }
     if port.is_empty() {
         return Ok(host.to_string());

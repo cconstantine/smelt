@@ -155,11 +155,15 @@ fn test_a_trailing_dot_is_kept_in_links_and_matched() {
     assert_eq!(t.match_host("3000-42.preview.example.com."), Some((42, PodHost::Localhost, 3000)));
 }
 
+/// A placeholder can't be the port: a preview of port 80 would link to
+/// `…:80`, which a browser sends back without the port, and a container's
+/// `172-21-0-2-3000` is no port at all (SME-183's review).
 #[test]
-fn test_a_port_placeholder_in_the_port_is_left_alone() {
-    let t = template("http://{conversation}.x.test:{port}");
-    assert_eq!(t.url_for(42, PodHost::Localhost, 3000), "http://42.x.test:3000");
-    assert_eq!(t.match_host("42.x.test:3000"), Some((42, PodHost::Localhost, 3000)));
+fn test_a_placeholder_in_the_port_is_refused() {
+    for bad in ["http://{conversation}.x.test:{port}", "http://{port}-x.test:{conversation}", "http://{port}.x.test:8{conversation}"] {
+        let error = PreviewTemplate::parse(bad).expect_err(&format!("{bad:?} should be refused"));
+        assert!(error.contains("placeholder in its port"), "the error should say the port can't hold a placeholder: {error:?}");
+    }
 }
 
 /// Templates accepted before SME-183 that no browser's `Host` can match.
@@ -195,4 +199,34 @@ fn test_a_request_host_spelling_out_the_default_port_still_matches() {
     let t = template("http://{port}-{conversation}.preview.example.com");
     assert_eq!(t.match_request_host("3000-42.preview.example.com:80"), Some((42, PodHost::Localhost, 3000)));
     assert_eq!(t.match_request_host("3000-42.preview.example.com:443"), None);
+}
+
+/// A colon left in the host after the port is split off (SME-183's review).
+#[test]
+fn test_a_template_with_more_than_one_port_is_refused() {
+    for bad in [
+        "https://{port}-{conversation}.x.test:8181:8181",
+        "https://{port}-{conversation}.x.test::8181",
+        "https://{port}-{conversation}.x.test:8181:",
+        "https://a:{port}-{conversation}.x.test",
+    ] {
+        assert!(PreviewTemplate::parse(bad).is_err(), "{bad:?} should be refused");
+    }
+}
+
+/// Characters a browser's `Host` never carries: it percent-decodes, reads
+/// a backslash as a path, and refuses spaces (SME-183's review).
+#[test]
+fn test_a_template_with_spaces_percent_or_backslash_is_refused() {
+    for (bad, named) in [
+        ("https://{port}-{conversation}.x.test ", "space"),
+        ("https://{port}-{conversation}.x .test", "space"),
+        ("https://{port}-{conversation}.x.test:443 ", "space"),
+        ("https://{port}-{conversation}.x.test\t", "space"),
+        ("https://{port}-{conversation}.%41.test", "%"),
+        ("https://{port}-{conversation}.x.test\\", "\\"),
+    ] {
+        let error = PreviewTemplate::parse(bad).expect_err(&format!("{bad:?} should be refused"));
+        assert!(error.contains(named), "the error for {bad:?} should name {named:?}: {error:?}");
+    }
 }
