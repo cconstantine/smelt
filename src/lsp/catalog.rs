@@ -668,8 +668,13 @@ mod tests {
     #[test]
     fn test_shell_word_round_trips_through_sh() {
         let dir = scratch("round-trip");
-        for value in ["'", "\"", "$HOME", "`", "\\", "a b", "*", "~x", "#x", "{a,b}", "é", "it's \"$(x)\""] {
+        // Something for an unquoted `*` to match, so a missing quote shows.
+        std::fs::write(dir.join("a-file"), "").expect("a file to glob");
+        for value in ["'", "\"", "$HOME", "`", "\\", "a b", "*", "~", "~x", "#x", "{a,b}", "é", "it's \"$(x)\""] {
             let word = shell_word(value).expect("quotable");
+            // `sh` may be dash, which has no brace expansion, and `~x` names
+            // no user: unquoted, those would come back unchanged too.
+            assert!(word.starts_with('\''), "{value} needs quoting, got {word}");
             let out = sh(&dir, &format!("printf %s {word}"));
             assert!(out.status.success(), "{value}: {out:?}");
             assert_eq!(String::from_utf8_lossy(&out.stdout), value, "{value} as {word}");
