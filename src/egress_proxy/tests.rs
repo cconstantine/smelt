@@ -14,6 +14,7 @@ fn test_parse_connect_gives_a_tunnel_target() {
             host: "example.com".to_string(),
             port: 443,
             forward_head: None,
+            upgrading: false,
             source: fetch_guard::RequestSource {
                 method: "CONNECT".to_string(),
                 ..Default::default()
@@ -453,4 +454,192 @@ async fn test_dropping_a_routed_proxy_stops_it_accepting() {
         !matches!(result, Ok(Ok(n)) if n > 0),
         "a dropped proxy must not answer, got {result:?}"
     );
+}
+
+/// A stand-in for a server in the pod that ignores the proxy's
+/// `Connection: close` (SME-165): on each connection it reads one request
+/// head and records it, writes `reply` one chunk at a time, 100 ms apart,
+/// then echoes whatever else arrives, never closing first unless
+/// `close_after`.
+async fn start_raw_upstream(reply: Vec<Vec<u8>>, close_after: bool) -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = heads.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let reply = reply.clone();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let Ok((head, _)) = read_head_from(&mut stream, Vec::new()).await else { return };
+                seen.lock().unwrap().push(String::from_utf8_lossy(&head).to_string());
+                for (i, chunk) in reply.iter().enumerate() {
+                    if i > 0 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    if stream.write_all(chunk).await.is_err() {
+                        return;
+                    }
+                }
+                if close_after {
+                    return;
+                }
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 || stream.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, heads)
+}
+
+/// The model's own navigation to the sandbox, which the SME-90 check lets through.
+const NAVIGATION: &str = "GET http://localhost:3000/ HTTP/1.1\r\nHost: localhost:3000\r\n\
+                          Sec-Fetch-Site: none\r\nSec-Fetch-Mode: navigate\r\n\r\n";
+
+/// Sends `head` through a sandbox-routed proxy to an upstream answering
+/// `reply`, and reads back `expected.len()` bytes (fewer if the stream
+/// ends first, or nothing more comes for 5 s). Returns the stream too, still
+/// open.
+async fn exchange(reply: Vec<&[u8]>, head: &str, expected: &str) -> (String, TcpStream) {
+    let (upstream, _) = start_raw_upstream(reply.into_iter().map(<[u8]>::to_vec).collect(), false).await;
+    let proxy = start_with_sandbox(dial_to(upstream, Arc::new(std::sync::Mutex::new(Vec::new()))))
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(proxy.addr).await.unwrap();
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let got = read_up_to(&mut stream, expected.len()).await;
+    // Dropping the proxy stops its accepting; this connection lives on.
+    drop(proxy);
+    (got, stream)
+}
+
+async fn read_up_to(stream: &mut TcpStream, len: usize) -> String {
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while got.len() < len {
+        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => got.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy(&got).to_string()
+}
+
+/// SME-165: a pod server answering keep-alive has its reply marked
+/// `Connection: close`, so Chrome never sends a second, unchecked request
+/// down the connection. The head arrives split across writes, one break
+/// inside a header name.
+#[tokio::test]
+async fn test_a_sandbox_reply_is_marked_connection_close() {
+    let expected = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\nX-Kept: 1\r\n\
+                    Content-Length: 5\r\n\r\nhello";
+    let (got, _) = exchange(
+        vec![
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nconn",
+            b"ection: Keep-Alive\r\nKeep-Alive: timeout=60\r\nProxy-Connection: keep-alive\r\nX-Kept: 1\r\n\
+              Content-Length: 5\r\n\r\nhel",
+            b"lo",
+        ],
+        NAVIGATION,
+        expected,
+    )
+    .await;
+    assert_eq!(got, expected);
+}
+
+/// Chrome finds a status line after up to four bytes of anything, in any
+/// case, and a head's end at a bare `\n\n` (`HttpUtil::LocateStartOfStatusLine`,
+/// `LocateEndOfHeaders`): such a reply is closed too.
+#[tokio::test]
+async fn test_a_sandbox_reply_chrome_would_still_read_is_closed() {
+    for (reply, expected) in [
+        (
+            &b"\r\n  http/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nhi"[..],
+            "http/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi",
+        ),
+        (
+            &b"HTTP/1.1 200 OK\nConnection: keep-alive\nContent-Length: 2\n\nhi"[..],
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi",
+        ),
+    ] {
+        let (got, _) = exchange(vec![reply], NAVIGATION, expected).await;
+        assert_eq!(got, expected);
+    }
+}
+
+/// An interim `103` goes through unchanged and the final reply after it is
+/// the one closed: Chrome decides on the final head (SME-165).
+#[tokio::test]
+async fn test_a_sandbox_reply_after_early_hints_is_closed() {
+    let hints = "HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\nConnection: keep-alive\r\n\r\n";
+    let expected = format!("{hints}HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
+    let (got, _) = exchange(
+        vec![hints.as_bytes(), b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nhi"],
+        NAVIGATION,
+        &expected,
+    )
+    .await;
+    assert_eq!(got, expected);
+}
+
+/// A `101` to a request that didn't ask to upgrade is skipped by Chrome
+/// like any 1xx, so the reply after it, in the same write here, is closed.
+#[tokio::test]
+async fn test_a_sandbox_reply_after_an_unasked_101_is_closed() {
+    let switching = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+    let expected = format!("{switching}HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
+    let reply = format!("{switching}HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+    let (got, _) = exchange(vec![reply.as_bytes()], NAVIGATION, &expected).await;
+    assert_eq!(got, expected);
+}
+
+/// A `101` to a request that asked to upgrade goes through unchanged, and
+/// the connection is a tunnel both ways from there.
+#[tokio::test]
+async fn test_a_sandbox_upgrade_stays_a_tunnel() {
+    let switching = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+    let (got, mut stream) = exchange(
+        vec![switching.as_bytes()],
+        "GET http://localhost:3000/ws HTTP/1.1\r\nHost: localhost:3000\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nSec-Fetch-Site: none\r\nSec-Fetch-Mode: navigate\r\n\r\n",
+        switching,
+    )
+    .await;
+    assert_eq!(got, switching);
+    stream.write_all(b"ping").await.unwrap();
+    assert_eq!(read_up_to(&mut stream, 4).await, "ping", "the tunnel should carry bytes both ways");
+}
+
+/// A reply head too large to check is refused, saying why.
+#[tokio::test]
+async fn test_a_sandbox_reply_head_too_large_is_refused() {
+    let reply = format!("HTTP/1.1 200 OK\r\nX-Filler: {}\r\n\r\n", "a".repeat(70 * 1024));
+    let (got, _) = exchange(vec![reply.as_bytes()], NAVIGATION, &"x".repeat(1024)).await;
+    assert!(got.starts_with("HTTP/1.1 502"), "got {:?}", &got[..got.len().min(200)]);
+    assert!(got.contains("too large"), "the reply should say why: {:?}", &got[..got.len().min(200)]);
+}
+
+/// Bytes that aren't an HTTP reply (Chrome reads them as HTTP/0.9, which
+/// it never reuses) pass through as they come, without waiting for a head.
+#[tokio::test]
+async fn test_a_sandbox_reply_that_isnt_http_passes_through() {
+    let banner = "SSH-2.0-OpenSSH_9.6\r\n";
+    let (got, _) = exchange(vec![banner.as_bytes()], NAVIGATION, banner).await;
+    assert_eq!(got, banner);
+}
+
+/// A reply that ends partway through its head reaches the page as far as
+/// it got, and the connection ends.
+#[tokio::test]
+async fn test_a_sandbox_reply_cut_off_in_its_head_is_passed_on() {
+    let (upstream, _) = start_raw_upstream(vec![b"HTTP/1.1 200 OK\r\nContent-Le".to_vec()], true).await;
+    let proxy = start_with_sandbox(dial_to(upstream, Arc::new(std::sync::Mutex::new(Vec::new()))))
+        .await
+        .unwrap();
+    let reply = send_raw(proxy.addr, NAVIGATION).await;
+    assert_eq!(reply, "HTTP/1.1 200 OK\r\nContent-Le");
 }

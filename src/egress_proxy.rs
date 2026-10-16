@@ -7,8 +7,11 @@
 //! Handles the two forms a browser sends to an HTTP proxy: `CONNECT
 //! host:port` (HTTPS, WebSockets) becomes a raw tunnel, and absolute-form
 //! `GET http://host/path` is forwarded as origin-form with `Connection:
-//! close`, so the browser never reuses one upstream connection for a
-//! different host. Every other host is resolved and connected to directly —
+//! close`. Chrome pools a proxy connection per destination, so it reuses
+//! one only for the same host and port; on the sandbox route, where each
+//! request is checked when its connection opens, the pod's reply is marked
+//! `Connection: close` too, so each connection carries one request
+//! (SME-165, `reply`). Every other host is resolved and connected to directly —
 //! addresses are no longer filtered (SME-155), but resolving here rather
 //! than letting the connection resolve itself keeps the checked address and
 //! the connected one identical.
@@ -23,6 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::fetch_guard;
+use reply::Relayed;
 use crate::sandbox::{PodHost, PodIo};
 use sqlx::PgPool;
 
@@ -205,9 +209,11 @@ async fn handle(mut client: TcpStream, sandbox: Option<SandboxDial>) -> Result<(
 
 /// The sandbox route: `request` goes to its port in the conversation's pod,
 /// through `dial`. There's no address to check — `dial` can only reach that
-/// one pod. A plain request's first reply bytes are read before anything
-/// goes back, so a port nothing listens on (the stream ends without a
-/// byte) becomes a readable 502 rather than an empty reply. The tunnel then
+/// one pod. A plain request's reply heads are read before anything goes
+/// back, so a port nothing listens on (the stream ends without a byte)
+/// becomes a readable 502 rather than an empty reply, and the final head is
+/// marked `Connection: close`: the request was checked when its connection
+/// opened, so the connection carries no other (SME-165). The tunnel then
 /// runs until either side closes; nothing here waits on the pod side's end
 /// of stream, which a port-forward reports about a second late.
 async fn handle_sandbox(
@@ -286,18 +292,32 @@ async fn handle_sandbox(
         let _ = to_pod.shutdown().await;
     });
     if request.forward_head.is_some() {
-        let mut first = vec![0u8; 16 * 1024];
-        let n = from_pod.read(&mut first).await.map_err(io)?;
-        if n == 0 {
-            page_to_pod.abort();
-            let message = format!(
+        // The final reply head goes on marked `Connection: close`, so the
+        // browser never sends a second request, which nothing would
+        // check, down this connection (SME-165).
+        let relayed = reply::relay_reply_heads(&mut from_pod, &mut to_page, request.upgrading, MAX_HEAD_BYTES).await;
+        let refusal = match relayed.map_err(io)? {
+            Relayed::CopyRest => None,
+            Relayed::Ended => {
+                page_to_pod.abort();
+                let _ = to_page.shutdown().await;
+                return Ok(());
+            }
+            Relayed::Nothing => Some(format!(
                 "Nothing is listening on {} in this conversation's sandbox.",
                 describe(host, request.port)
-            );
+            )),
+            Relayed::TooLarge => Some(format!(
+                "The server at {} in this conversation's sandbox sent a reply head too large to check.",
+                describe(host, request.port)
+            )),
+        };
+        if let Some(message) = refusal {
+            page_to_pod.abort();
             respond_with_body(&mut to_page, "502 Bad Gateway", &message).await;
+            let _ = to_page.shutdown().await;
             return Err(message);
         }
-        to_page.write_all(&first[..n]).await.map_err(io)?;
     }
     let result = tokio::io::copy(&mut from_pod, &mut to_page).await;
     let _ = to_page.shutdown().await;
@@ -359,6 +379,9 @@ struct ProxyRequest {
     /// The request head to send upstream, rewritten to origin-form; `None`
     /// for `CONNECT`, which tunnels raw bytes instead.
     forward_head: Option<Vec<u8>>,
+    /// Whether it asks to upgrade the connection (a WebSocket's handshake
+    /// sent without `CONNECT`): only then does a `101` reply start a tunnel.
+    upgrading: bool,
     /// Who sent it, for the sandbox route (`fetch_guard::allows_request_from`).
     /// A `CONNECT`'s real request is inside its tunnel, so this is read there.
     source: fetch_guard::RequestSource,
@@ -408,6 +431,7 @@ fn parse_request_head(head: &[u8]) -> Result<ProxyRequest, String> {
             host,
             port,
             forward_head: None,
+            upgrading: false,
             source: request_source(head),
         });
     }
@@ -443,6 +467,7 @@ fn parse_request_head(head: &[u8]) -> Result<ProxyRequest, String> {
         host,
         port,
         forward_head: Some(forward.into_bytes()),
+        upgrading,
         source: request_source(head),
     })
 }
@@ -476,6 +501,8 @@ pub(crate) fn dial_to(
         })
     })
 }
+
+mod reply;
 
 #[cfg(test)]
 mod tests;
