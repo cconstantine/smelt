@@ -197,7 +197,7 @@ grep -qF "$log_file" <<<"$out" || fail "status when stopped doesn't name the log
 
 
 cs_env=(env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR PATH="$dir/bin:$PATH" SANDBOX_IMAGE_IMPORT="$dir/bin/import"
-    SANDBOX_INSTANCE_CLEANUP="$dir/bin/cleanup" DATABASE_URL=postgres://u@localhost/smelt_dev)
+    SANDBOX_INSTANCE_CLEANUP="$dir/bin/cleanup" DATABASE_URL=postgres://u@localhost/smelt_dev CHECK_PORT="$port")
 
 # 10. check-server takes no cluster lock, and the server it starts never
 # holds it, even when start runs under an old outer flock (SME-100).
@@ -220,7 +220,7 @@ check_server stop >/dev/null
 # 11. The port lock: held by the running server's process group, freed by
 # stop or by the group dying; a second start on the same port waits for it,
 # naming the first's worktree; refusals never wait.
-port_lock=$SMELT_LOCK_DIR/smelt-check-server-8081.lock
+port_lock=$SMELT_LOCK_DIR/smelt-check-server-$port.lock
 port_is_free() { flock -n "$port_lock" true; }
 worktree2=$dir/worktree2
 [ -d "$worktree2/.git" ] || git clone -q --shared --no-checkout "$PWD" "$worktree2" || exit 1
@@ -240,13 +240,14 @@ check_server start HEAD >/dev/null || fail "start before a second one on the sam
 out=$(timeout 3 "${cs_env[@]}" CHECK_WORKTREE="$worktree2" scripts/check-server start HEAD 2>&1)
 rc=$?
 [ "$rc" = 124 ] || fail "check-server: a second start on the same port didn't wait (exit $rc): $out"
-grep -qF "waiting for port 8081: a check server from $worktree holds it" <<<"$out" ||
+grep -qF "waiting for port $port: a check server from $worktree holds it" <<<"$out" ||
     fail "check-server: the second start's waiting line: $out"
 [ -s "$worktree2/.check-server.pid" ] && fail "check-server: a waiting start wrote its pid file"
-if ! out=$(timeout 20 "${cs_env[@]}" CHECK_WORKTREE="$worktree2" CHECK_PORT=8091 scripts/check-server start HEAD 2>&1); then
+other_port=$(free_port) || fail "no second free port"
+if ! out=$(timeout 20 "${cs_env[@]}" CHECK_WORKTREE="$worktree2" CHECK_PORT="$other_port" scripts/check-server start HEAD 2>&1); then
     fail "check-server: a start on another port while one runs: $out"
 fi
-"${cs_env[@]}" CHECK_WORKTREE="$worktree2" CHECK_PORT=8091 scripts/check-server stop >/dev/null 2>&1
+"${cs_env[@]}" CHECK_WORKTREE="$worktree2" CHECK_PORT="$other_port" scripts/check-server stop >/dev/null 2>&1
 # Refused starts exit at once, even while the port is held.
 out=$(timeout 5 "${cs_env[@]}" CHECK_WORKTREE="$worktree" scripts/check-server start HEAD 2>&1)
 rc=$?
