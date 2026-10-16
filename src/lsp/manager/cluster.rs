@@ -127,6 +127,33 @@ async fn test_rust_analyzer_from_the_catalog_answers_across_files(pool: PgPool) 
         let main = read(&client, &sandbox, MAIN).await;
         assert!(main.contains("fn sum_areas(") && main.contains("sum_areas(&[&square])"), "{main}");
 
+        // SME-172: files open in the server (shapes.rs, since References
+        // above) that change on disk are brought up to date before each
+        // operation. B16: a rename touching one changed in a terminal works
+        // the first time, rather than being refused for good.
+        let appended = format!("{SHAPES_RS}// appended\n");
+        write_files(&client, &sandbox, &[(SHAPES, &appended)]).await;
+        let tile = OperationInput { new_name: Some("Tile".to_string()), ..at(MAIN, 9, 18) };
+        let renamed = operate(&pool, &client, &sandbox, Operation::Rename, &tile).await;
+        assert!(renamed.as_ref().is_ok_and(|r| r.contains("Renamed to Tile in 2 files")), "{renamed:?}");
+        let shapes = read(&client, &sandbox, SHAPES).await;
+        assert!(shapes.contains("pub struct Tile") && shapes.ends_with("}\n// appended\n"), "{shapes}");
+        let main = read(&client, &sandbox, MAIN).await;
+        assert!(main.contains("let square = Tile {"), "{main}");
+
+        // Positions in a file changed on disk are the ones on disk now: a
+        // line put above `fn area` moves it from line 2 to 3.
+        write_files(&client, &sandbox, &[(SHAPES, &format!("// moved\n{shapes}"))]).await;
+        let refs = operate(&pool, &client, &sandbox, Operation::References, &at(MAIN, 5, 30)).await.expect("references");
+        assert!(refs.lines().any(|l| l.contains("shapes.rs:3:") && l.contains("fn area")), "{refs}");
+
+        // A deleted open file is closed, so the server sees it's gone.
+        let removed = crate::sandbox::exec_with(&client, &sandbox.pod_name, "sandbox", &["rm", SHAPES], None).await.expect("rm");
+        assert_eq!(removed.exit_code, 0, "{}", removed.stderr);
+        let missing = until_contains(&pool, &client, &sandbox, Operation::Diagnostics, &at(MAIN, 1, 1), "error").await;
+        assert!(missing.contains("mod shapes;"), "{missing}");
+        write_files(&client, &sandbox, &[(SHAPES, &shapes)]).await;
+
         // The server process dies; the next request reconnects.
         let pod_name = pods::server_pod_name(sandbox.pod_id, &config.name);
         let killed = crate::sandbox::exec_with(&client, &pod_name, "server", &["sh", "-c", "kill $(pidof rust-analyzer)"], None).await.expect("kill");

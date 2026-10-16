@@ -248,6 +248,28 @@ impl Session {
         self.documents.lock().unwrap_or_else(|e| e.into_inner()).get(&file_uri(path)).map(|d| d.text.clone())
     }
 
+    /// Every file the server has been told about and not told to forget,
+    /// by path, with the text it was last told, in path order.
+    pub fn open_documents(&self) -> Vec<(String, String)> {
+        let documents = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+        let mut open: Vec<(String, String)> = documents
+            .iter()
+            .filter_map(|(uri, document)| Some((uri_path(uri)?, document.text.clone())))
+            .collect();
+        open.sort();
+        open
+    }
+
+    /// Tells the server `path` is closed (`didClose`), so it goes back to
+    /// the disk, and forgets it: a later `sync` opens it again.
+    pub async fn close(&self, path: &str) -> Result<(), LspError> {
+        let uri = file_uri(path);
+        if self.documents.lock().unwrap_or_else(|e| e.into_inner()).remove(&uri).is_none() {
+            return Ok(());
+        }
+        self.client.notify("textDocument/didClose", json!({"textDocument": {"uri": uri}})).await
+    }
+
     /// `path`'s diagnostics from version `version` on: waits up to `wait`
     /// for the server to publish them (or asks, if it takes pull requests).
     pub async fn diagnostics(&self, path: &str, version: i64, since: Instant, wait: Duration) -> FileDiagnostics {
@@ -513,6 +535,43 @@ mod tests {
         // The same text again tells the server nothing new.
         assert_eq!(session.sync("/workspace/a.rs", "fn a() { 1 }").await, Ok(2));
         assert_eq!(session.synced_text("/workspace/a.rs").as_deref(), Some("fn a() { 1 }"));
+    }
+
+    /// A closed file is forgotten: the server hears `didClose`, it's no
+    /// longer listed as open, and syncing it again opens it at version 1
+    /// (SME-172: a file deleted on disk is closed, so the server reads the
+    /// disk again).
+    #[tokio::test]
+    async fn test_a_closed_file_is_forgotten_and_opened_again_from_version_one() {
+        let (reader, writer, mut server) = connect();
+        let opening = tokio::spawn(Session::open(reader, writer, config(None), "/workspace"));
+        server.handshake(json!({})).await;
+        let session = opening.await.unwrap().expect("open");
+        session.sync("/workspace/b.rs", "fn b() {}").await.expect("sync b");
+        session.sync("/workspace/a.rs", "fn a() {}").await.expect("sync a");
+        session.sync("/workspace/a.rs", "fn a() { 1 }").await.expect("change a");
+        for _ in 0..6 {
+            server.next().await;
+        }
+        assert_eq!(
+            session.open_documents(),
+            vec![
+                ("/workspace/a.rs".to_string(), "fn a() { 1 }".to_string()),
+                ("/workspace/b.rs".to_string(), "fn b() {}".to_string()),
+            ]
+        );
+
+        session.close("/workspace/a.rs").await.expect("close");
+        let closed = server.next().await;
+        assert_eq!(closed["method"], "textDocument/didClose");
+        assert_eq!(closed["params"]["textDocument"]["uri"], "file:///workspace/a.rs");
+        assert_eq!(session.open_documents(), vec![("/workspace/b.rs".to_string(), "fn b() {}".to_string())]);
+        assert_eq!(session.synced_text("/workspace/a.rs"), None);
+
+        assert_eq!(session.sync("/workspace/a.rs", "fn a() { 1 }").await, Ok(1));
+        let reopened = server.next().await;
+        assert_eq!(reopened["method"], "textDocument/didOpen");
+        assert_eq!(reopened["params"]["textDocument"]["version"], 1);
     }
 
     /// Diagnostics a server published without a version, before the file

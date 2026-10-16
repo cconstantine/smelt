@@ -270,6 +270,70 @@ fn sha256(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
+/// What to do with each open file, given the SHA-256 of each on disk now
+/// (`-` for one that's gone), in the same order: the files to sync again,
+/// and the files to close. `None` when the hashes don't line up with the
+/// files (the exec printed something else).
+fn stale_files(open: &[(String, String)], hashes: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+    if open.len() != hashes.len() {
+        return None;
+    }
+    let (mut resync, mut close) = (Vec::new(), Vec::new());
+    for ((path, synced), hash) in open.iter().zip(hashes) {
+        if hash == "-" {
+            close.push(path.clone());
+        } else if *hash != sha256(synced) {
+            resync.push(path.clone());
+        }
+    }
+    Some((resync, close))
+}
+
+/// Brings the server's open files up to date with the disk (SME-172): once
+/// a file is open, the server stops reading it from disk, so one changed
+/// by anything but smelt (a terminal) would stay stale. One exec hashes
+/// them all; a changed file is synced again, and a deleted one (or one
+/// that can no longer be read for the server) is closed, so the server
+/// goes back to the disk. An exec that fails skips this, as before; a
+/// notification that fails means the session is broken.
+async fn refresh_open_files(client: &kube::Client, pod_name: &str, session: &Session) -> Result<(), LspError> {
+    let open = session.open_documents();
+    if open.is_empty() {
+        return Ok(());
+    }
+    // One line per file, in order, so no path is parsed out of the output.
+    let script = r#"for f; do if [ -f "$f" ] && h=$(sha256sum < "$f"); then echo "${h%% *}"; else echo -; fi; done"#;
+    let mut argv = vec!["sh", "-c", script, "_"];
+    argv.extend(open.iter().map(|(path, _)| path.as_str()));
+    let hashes = match crate::sandbox::exec_with(client, pod_name, "server", &argv, None).await {
+        Ok(result) if result.exit_code == 0 => result.stdout.lines().map(str::to_string).collect::<Vec<_>>(),
+        Ok(result) => {
+            tracing::info!(pod_name, stderr = %result.stderr.trim(), "couldn't check a language server's open files");
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::info!(pod_name, error = %e, "couldn't check a language server's open files");
+            return Ok(());
+        }
+    };
+    let Some((resync, mut close)) = stale_files(&open, &hashes) else {
+        tracing::info!(pod_name, files = open.len(), lines = hashes.len(), "a language server's open files didn't hash one line each");
+        return Ok(());
+    };
+    for path in resync {
+        match read_in_pod(client, pod_name, &path).await {
+            Ok(text) => {
+                session.sync(&path, &text).await?;
+            }
+            Err(_) => close.push(path),
+        }
+    }
+    for path in close {
+        session.close(&path).await?;
+    }
+    Ok(())
+}
+
 /// Where each of `markers` would be, in every directory from `path`'s up
 /// to `/workspace`.
 fn marker_candidates(path: &str, markers: &[String]) -> Vec<String> {
@@ -425,6 +489,7 @@ pub async fn operate(
     {
         return Err(format!("{} doesn't support {}.", config.name, operation.name()));
     }
+    refresh_open_files(client, &pod_name, &session).await.map_err(|e| request_error(&config, e))?;
 
     // The file as it is on disk now, told to the server.
     let mut file = None;
@@ -620,6 +685,7 @@ async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::C
         });
     }
     let session = session_for(client, &pod_name, &config, &root).await.ok()?;
+    refresh_open_files(client, &pod_name, &session).await.ok()?;
     let text = read_in_pod(client, &pod_name, path).await.ok()?;
     let since = Instant::now();
     let version = session.sync(path, &text).await.ok()?;
