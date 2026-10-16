@@ -167,6 +167,38 @@ fn test_an_install_whose_pod_went_or_is_going_says_it_was_deleted() {
     }
 }
 
+/// A pod stopped by its node (`Evicted`) says so in its own status, not
+/// its container's: the container's reason, if it has one, is only how it
+/// was stopped (SME-171).
+fn evicted_server_pod(container_reason: Option<&str>) -> Pod {
+    let containers = match container_reason {
+        Some(reason) => serde_json::json!([{
+            "name": "server", "image": "rust:1", "imageID": "", "ready": false, "restartCount": 0,
+            "state": {"terminated": {"exitCode": 137, "reason": reason}},
+        }]),
+        None => serde_json::json!([]),
+    };
+    serde_json::from_value(serde_json::json!({
+        "metadata": {"name": "lsp-7-rust-analyzer", "uid": "a"},
+        "status": {
+            "phase": "Failed",
+            "reason": "Evicted",
+            "message": "The node was low on resource: memory.",
+            "containerStatuses": containers,
+        },
+    }))
+    .expect("a pod")
+}
+
+#[test]
+fn test_an_evicted_server_says_it_was_evicted() {
+    assert_eq!(stop_reason(&evicted_server_pod(None)).as_deref(), Some("Evicted"));
+    assert_eq!(stop_reason(&evicted_server_pod(Some("Error"))).as_deref(), Some("Evicted"));
+    assert_eq!(stop_reason(&unready_server_pod("a", "Failed", Some("OOMKilled"), false)).as_deref(), Some("OOMKilled"));
+    let error = install_interrupted("lsp-7-ra", "a", Some(&evicted_server_pod(None))).expect("an evicted pod ends the wait");
+    assert!(error.contains("(Evicted)"), "{error}");
+}
+
 #[test]
 fn test_a_stop_explains_an_oom_and_names_any_other_reason() {
     assert!(stop_explanation(Some("OOMKilled")).contains("memory limit on the Language servers page"));

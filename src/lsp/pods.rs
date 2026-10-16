@@ -219,10 +219,15 @@ fn has_stopped(pod: &Pod) -> bool {
     matches!(pod.status.as_ref().and_then(|s| s.phase.as_deref()), Some("Failed" | "Succeeded"))
 }
 
-/// Why the server container stopped, when Kubernetes says (`OOMKilled`).
+/// Why the server stopped, when Kubernetes says: the pod's own reason
+/// when its node stopped it (`Evicted`), else its container's
+/// (`OOMKilled`).
 fn stop_reason(pod: &Pod) -> Option<String> {
-    pod.status
-        .as_ref()?
+    let status = pod.status.as_ref()?;
+    if let Some(reason) = &status.reason {
+        return Some(reason.clone());
+    }
+    status
         .container_statuses
         .as_ref()?
         .first()?
