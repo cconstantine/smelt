@@ -193,8 +193,11 @@ pub async fn evict(server_id: i64) {
         registry.remove(&server_id);
         *lock_generations().entry(server_id).or_default() += 1;
         lock_failures().remove(&server_id);
+        // Under the same guard, so no connect at the new generation can
+        // reuse the old `AuthClient` (review 1). Lock order: `REGISTRY`,
+        // then `OAUTH_CLIENTS`; nothing takes them the other way round.
+        OAUTH_CLIENTS.lock().await.remove(&server_id);
     }
-    OAUTH_CLIENTS.lock().await.remove(&server_id);
 }
 
 /// An OAuth server's HTTP client: rmcp's `AuthClient`, which gets a token
