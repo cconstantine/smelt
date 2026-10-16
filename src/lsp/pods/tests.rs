@@ -130,6 +130,50 @@ fn test_a_server_pod_stopped_by_smelt_or_before_is_not_reported() {
     assert_eq!(note_server_stop(&mut seen, &unready_server_pod("c", "Failed", Some("StartError"), false), false), None);
 }
 
+/// SME-171: what a start waiting on an install makes of its pod.
+#[test]
+fn test_a_running_install_is_not_interrupted() {
+    assert_eq!(install_interrupted("lsp-7-ra", "a", Some(&unready_server_pod("a", "Running", None, false))), None);
+    assert_eq!(install_interrupted("lsp-7-ra", "a", Some(&unready_server_pod("a", "Pending", None, false))), None);
+}
+
+#[test]
+fn test_an_install_killed_for_memory_says_so_and_what_to_change() {
+    let error = install_interrupted("lsp-7-ra", "a", Some(&unready_server_pod("a", "Failed", Some("OOMKilled"), false)))
+        .expect("a stopped pod ends the wait");
+    assert!(error.contains("lsp-7-ra") && error.contains("stopped during its install"), "{error}");
+    assert!(error.contains("OOMKilled") && error.contains("memory limit"), "{error}");
+}
+
+#[test]
+fn test_an_install_that_stopped_any_other_way_gives_its_reason() {
+    let error = install_interrupted("lsp-7-ra", "a", Some(&unready_server_pod("a", "Failed", Some("Error"), false)))
+        .expect("a stopped pod ends the wait");
+    assert!(error.contains("(Error)"), "{error}");
+    let error = install_interrupted("lsp-7-ra", "a", Some(&unready_server_pod("a", "Succeeded", None, false)))
+        .expect("a pod whose container exited ends the wait");
+    assert!(error.contains("stopped during its install") && !error.contains("()"), "{error}");
+}
+
+#[test]
+fn test_an_install_whose_pod_went_or_is_going_says_it_was_deleted() {
+    for (what, pod) in [
+        ("gone", None),
+        ("being deleted", Some(unready_server_pod("a", "Running", None, true))),
+        ("replaced", Some(unready_server_pod("b", "Running", None, false))),
+    ] {
+        let error = install_interrupted("lsp-7-ra", "a", pod.as_ref()).unwrap_or_else(|| panic!("{what}: kept waiting"));
+        assert!(error.contains("lsp-7-ra was deleted during its install"), "{what}: {error}");
+    }
+}
+
+#[test]
+fn test_a_stop_explains_an_oom_and_names_any_other_reason() {
+    assert!(stop_explanation(Some("OOMKilled")).contains("memory limit on the Language servers page"));
+    assert_eq!(stop_explanation(Some("Error")), " (Error)");
+    assert_eq!(stop_explanation(None), "");
+}
+
 #[test]
 fn test_an_empty_install_still_records_success() {
     assert!(pod_script("  ").contains("( true )"));
