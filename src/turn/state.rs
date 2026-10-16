@@ -12,7 +12,9 @@ static RUNTIMES: LazyLock<Mutex<HashMap<i64, ConversationRuntime>>> = LazyLock::
 /// stop counter and reply are freed when idle (`release_idle_turn_state`);
 /// the entry itself goes only when nothing in it is in use, which, once a
 /// turn has run (its generation), is when the conversation is deleted: a
-/// few bytes per conversation, as the separate kept-error map was.
+/// few bytes per conversation, as the separate kept-error map was. A turn
+/// that finds its conversation already deleted forgets its generation
+/// (SME-179).
 #[derive(Default)]
 pub(super) struct ConversationRuntime {
     /// The turn lock. A live `send_message` call and a notice's `run_turn`
@@ -24,7 +26,8 @@ pub(super) struct ConversationRuntime {
     lock: Option<Arc<tokio::sync::Mutex<()>>>,
     /// The reply text streamed so far in the current model call, for a tab
     /// that connects mid-reply (`get_reply_in_progress`). Cleared when a
-    /// call starts, when its reply is saved, and when the turn ends.
+    /// call starts, when its reply is saved, when its turn fails or is
+    /// stopped, and when the last turn ends.
     reply: Option<String>,
     /// The stop counter and the last stop noted (`TurnStops`).
     stops: Option<TurnStops>,
@@ -331,9 +334,11 @@ pub(crate) fn turn_started_elapsed(conversation_id: i64) -> Option<std::time::Du
 
 /// A conversation's last failed turn's error, until the user writes again,
 /// for a tab that connects after the `TurnError` event (SME-51 B11), and
-/// its turn generation: bumped by the user sending and by every turn
-/// starting, so a turn's failure is kept only if no newer turn has started
-/// since it did (SME-91).
+/// its turn generation: bumped by the user sending or answering, by a turn
+/// with a message of its own or an answer once it holds the turn lock, and
+/// by a wake once it has notices for the model, so a turn's failure is
+/// kept only if no newer turn has started since it did (SME-91). A wake
+/// with nothing to do leaves it alone (SME-179).
 #[derive(Default)]
 pub(super) struct KeptTurnError {
     generation: u64,
