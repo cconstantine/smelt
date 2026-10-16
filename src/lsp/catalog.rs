@@ -706,6 +706,41 @@ mod tests {
         assert!(empty.contains("an empty value"), "{empty}");
     }
 
+    /// A github package with one Linux asset.
+    fn github_package(file: &str, asset_bin: Option<&str>, bin_key: &str) -> String {
+        let asset_bin = asset_bin.map(|b| format!("      bin: {}\n", serde_json::to_string(b).expect("JSON"))).unwrap_or_default();
+        let file = serde_json::to_string(file).expect("JSON");
+        let bin_key = serde_json::to_string(bin_key).expect("JSON");
+        format!("name: tool\nsource:\n  id: pkg:github/owner/tool@v1\n  asset:\n    - target: linux_x64\n      file: {file}\n{asset_bin}bin:\n  {bin_key}: \"{{{{source.asset.bin}}}}\"\n")
+    }
+
+    #[test]
+    fn test_every_github_download_shape_quotes_and_every_kind_refuses() {
+        let install = |yaml: &str| suggest(yaml, HELIX).expect("a suggestion").config.install_command;
+        let release = "https://github.com/owner/tool/releases/download/v1";
+        assert_eq!(
+            install(&github_package("tool $X.gz", None, "tool")),
+            format!("mkdir -p /tmp/home/bin && curl -fsSL '{release}/tool $X.gz' | gunzip > /tmp/home/bin/tool && chmod +x /tmp/home/bin/tool")
+        );
+        assert_eq!(
+            install(&github_package("tool.zip", Some("a b/tool"), "tool")),
+            format!("mkdir -p /tmp/home/bin /tmp/home/opt && curl -fsSL -o /tmp/home/release.zip {release}/tool.zip && unzip -q /tmp/home/release.zip -d /tmp/home/opt && ln -sf '/tmp/home/opt/a b/tool' /tmp/home/bin/tool")
+        );
+        assert_eq!(
+            install(&github_package("tool;x.tar.xz", None, "tool")),
+            format!("mkdir -p /tmp/home/bin /tmp/home/opt && curl -fsSL '{release}/tool;x.tar.xz' | tar -xJ -C /tmp/home/opt && ln -sf /tmp/home/opt/tool /tmp/home/bin/tool")
+        );
+
+        for (yaml, why) in [
+            ("name: tool\nsource:\n  id: pkg:golang/-toolexec=evil@v1\n".to_string(), "starts with"),
+            (github_package("tool", None, "t\no"), "control character"),
+        ] {
+            let s = suggest(&yaml, HELIX).expect("a partial suggestion");
+            assert_eq!(s.config.install_command, "", "{yaml}");
+            assert!(s.notes.iter().any(|n| n.contains("won't put") && n.contains(why)), "{why}: {:?}", s.notes);
+        }
+    }
+
     #[test]
     fn test_a_refused_install_leaves_no_notes_about_the_command_it_dropped() {
         // An unfilled template in the file (noted first), then a refused
