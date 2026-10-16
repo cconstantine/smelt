@@ -567,13 +567,15 @@ if has_ipv6_loopback; then
     hook=$dir/curl-hook
     hook_done=$dir/curl-hook-done
     hook_ready=$dir/curl-hook-ready
+    hook_pid=$dir/curl-hook-pid
     cat >"$hook" <<'EOF'
 #!/usr/bin/env bash
-# Once: a foreign listener on [::1]:$HOOK_PORT, without the locks start holds.
+# Once: a foreign listener on [::1]:$HOOK_PORT (it closes the locks start
+# holds), its pid recorded at once so the test can always stop it.
 [ -s "$HOOK_DONE" ] && exit 0
 echo 1 >"$HOOK_DONE"
-exec 8>&- 9>&-
 "$STUB_PYTHON3" -I "$STUB_HTTP_200" ::1 "$HOOK_PORT" --own-group --ready "$HOOK_READY" </dev/null >/dev/null 2>&1 &
+echo $! >"$HOOK_PID"
 for _ in $(seq 1 50); do
     [ -s "$HOOK_READY" ] && exit 0
     sleep 0.1
@@ -582,7 +584,8 @@ EOF
     chmod +x "$hook"
     : >"$hook_done"
     : >"$hook_ready"
-    start_in_background "$fport" CURL_HOOK="$hook" HOOK_DONE="$hook_done" HOOK_READY="$hook_ready" HOOK_PORT="$fport"
+    : >"$hook_pid"
+    start_in_background "$fport" CURL_HOOK="$hook" HOOK_DONE="$hook_done" HOOK_READY="$hook_ready" HOOK_PID="$hook_pid" HOOK_PORT="$fport"
     wait "$starter"
     rc=$?
     out=$(cat "$start_out")
@@ -594,8 +597,10 @@ EOF
     "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" scripts/check-server stop >/dev/null 2>&1
     if [ -n "$foreign_pid" ]; then
         pid_is_live "$foreign_pid" || fail "start or stop signalled the listener beside the server's"
-        kill "$foreign_pid" 2>/dev/null
     fi
+    # By the pid the hook recorded at once, so even one that never got
+    # ready is stopped.
+    [ -s "$hook_pid" ] && kill "$(cat "$hook_pid")" 2>/dev/null
 else
     echo "note: ::1 can't be bound here; skipping the listener-beside case"
 fi

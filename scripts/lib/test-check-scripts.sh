@@ -94,7 +94,9 @@ STUB_REAL_CURL=$(command -v curl)
 #                         [--status CODE]
 # --own-group puts it in a process group of its own (a foreign listener),
 # unless it already leads one: setsid fails for a group leader, as a
-# background job is under job control. --ready writes its pid to FILE once
+# background job is under job control. It also closes every descriptor
+# above 2 it inherited, so it never holds a lock its starter held (review
+# 1: a run under an outer flock, or a hook inside check-server's start). --ready writes its pid to FILE once
 # it listens; --delay waits before binding; --status answers CODE instead
 # of 200 (a server still building answers 500). A bind that fails ends it, as
 # a taken port ends a server. It ends itself after 600 s, so a run killed
@@ -103,8 +105,10 @@ export STUB_HTTP_200=$dir/http-200.py
 cat >"$STUB_HTTP_200" <<'EOF'
 import http.server, os, signal, socket, sys, time
 host, port, args = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
-if "--own-group" in args and os.getpgrp() != os.getpid():
-    os.setsid()
+if "--own-group" in args:
+    if os.getpgrp() != os.getpid():
+        os.setsid()
+    os.closerange(3, os.sysconf("SC_OPEN_MAX"))
 signal.alarm(600)
 if "--delay" in args:
     time.sleep(float(args[args.index("--delay") + 1]))
