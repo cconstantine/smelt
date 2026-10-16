@@ -59,7 +59,7 @@ pub(super) async fn scenario_cut_off_in_a_call(t: &Scenario<'_>) {
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    let provider = db::create_inference_provider(t.pool, &unique_id("cut-off"), "anthropic", &address, "api_key", "key", false, None, true)
+    let provider = db::create_inference_provider(t.pool, &unique_id("cut-off"), "anthropic", &address, "api_key", "key", false, None, true, None)
         .await
         .expect("save the cut-off provider");
     let conversation = t.conversation().await;
@@ -176,7 +176,7 @@ pub(super) async fn scenario_llama_cpp_provider(t: &Scenario<'_>) {
     wait_for_element(&form, "#provider-keep-reasoning", Duration::from_secs(5)).await;
     assert_eq!(kind(&form).await, "llama_cpp");
 
-    let provider = db::create_inference_provider(t.pool, &unique_id("llama"), "llama_cpp", &address, "bearer", "key", false, None, true)
+    let provider = db::create_inference_provider(t.pool, &unique_id("llama"), "llama_cpp", &address, "bearer", "key", false, None, true, None)
         .await
         .expect("create a llama.cpp provider");
     let page = t.tab(t.url(&format!("providers/{}", provider.id))).await;

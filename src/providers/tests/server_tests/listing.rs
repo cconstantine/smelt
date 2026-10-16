@@ -33,7 +33,7 @@ async fn mock_ollama() -> String {
 #[sqlx::test]
 async fn test_an_ollama_providers_models_come_with_their_details(pool: PgPool) {
     let base = mock_ollama().await;
-    let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None, true)
+    let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None, true, None)
         .await
         .expect("create");
     set_model_settings(&pool, p.id, "typed-by-hand", settings(None, Some(16_384), None)).await.expect("set");
@@ -63,7 +63,7 @@ async fn test_an_ollama_providers_models_come_with_their_details(pool: PgPool) {
 #[sqlx::test]
 async fn test_a_quick_listing_skips_the_per_model_questions(pool: PgPool) {
     let base = mock_ollama().await;
-    let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None, true)
+    let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None, true, None)
         .await
         .expect("create");
     let listing = provider_models(&pool, p.id, false).await.expect("models");
@@ -95,7 +95,7 @@ async fn test_adding_a_model_by_id_keeps_its_settings(pool: PgPool) {
 #[sqlx::test]
 async fn test_a_model_the_provider_dropped_isnt_shown(pool: PgPool) {
     let base = mock_ollama().await;
-    let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None, true)
+    let p = db::create_inference_provider(&pool, "o", "ollama", &base, "api_key", "k", false, None, true, None)
         .await
         .expect("create");
     db::set_provider_model_reported(&pool, p.id, "removed", Some(4096), None, Some(true), None, None)
@@ -137,7 +137,7 @@ async fn test_ollamas_loaded_models_are_fetched_once(pool: PgPool) {
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    let p = db::create_inference_provider(&pool, "o", "ollama", &format!("http://{addr}"), "api_key", "k", false, None, true)
+    let p = db::create_inference_provider(&pool, "o", "ollama", &format!("http://{addr}"), "api_key", "k", false, None, true, None)
         .await
         .expect("create");
 
@@ -161,7 +161,7 @@ async fn test_an_anthropic_models_reported_cap_is_kept_and_used(pool: PgPool) {
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    let p = db::create_inference_provider(&pool, "a", "anthropic", &format!("http://{addr}"), "api_key", "k", false, None, true)
+    let p = db::create_inference_provider(&pool, "a", "anthropic", &format!("http://{addr}"), "api_key", "k", false, None, true, None)
         .await
         .expect("create");
     let listing = provider_models(&pool, p.id, true).await.expect("models");
@@ -173,7 +173,7 @@ async fn test_an_anthropic_models_reported_cap_is_kept_and_used(pool: PgPool) {
 
 #[sqlx::test]
 async fn test_an_unreachable_providers_models_still_list_what_is_stored(pool: PgPool) {
-    let p = db::create_inference_provider(&pool, "gone", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None, true)
+    let p = db::create_inference_provider(&pool, "gone", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None, true, None)
         .await
         .expect("create");
     set_model_settings(&pool, p.id, "claude-opus-5", settings(Some(true), None, None)).await.expect("set");

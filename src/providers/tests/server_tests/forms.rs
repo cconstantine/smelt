@@ -28,6 +28,7 @@ async fn test_a_provider_form_is_checked_and_the_secret_never_comes_back(pool: P
             price_catalog_provider: None,
             keep_reasoning: true,
             server_caps: None,
+            max_concurrent_requests: None,
         }
     );
     assert!(received(&mut app_events, &crate::events::AppEvent::ProvidersChanged));
@@ -64,12 +65,47 @@ async fn test_a_provider_form_is_checked_and_the_secret_never_comes_back(pool: P
     );
 }
 
+/// SME-162: the form's max concurrent requests is saved and shown: a
+/// count, `0` for the server's own count, or blank for no limit; one the
+/// column can't hold is refused, naming the field.
+#[sqlx::test]
+async fn test_a_providers_max_concurrent_requests_is_saved_and_shown(pool: PgPool) {
+    // Saving sets the provider's slots, which are process-wide by id
+    // (SME-162 review 2): an id no other test uses.
+    sqlx::query("ALTER TABLE inference_providers ALTER COLUMN id RESTART WITH 9162000011")
+        .execute(&pool)
+        .await
+        .expect("renumber");
+    let limited = |max| ProviderInput { max_concurrent_requests: max, ..input("Home", "http://ollama:11434", "secret-1234567890") };
+    let one = create_provider(&pool, limited(Some(1))).await.expect("create");
+    assert_eq!(one.max_concurrent_requests, Some(1));
+
+    let too_many = Some(i32::MAX as u32 + 1);
+    let refused = update_provider(&pool, one.id, limited(too_many)).await.expect_err("too many");
+    assert!(refused.contains("Max concurrent requests"), "{refused}");
+    let stored = db::get_inference_provider(&pool, one.id).await.expect("get").expect("exists");
+    assert_eq!(stored.max_concurrent_requests, Some(1), "nothing saved");
+
+    // SME-162 review 1: only a llama.cpp server reports a slot count.
+    let not_llama = update_provider(&pool, one.id, limited(Some(0))).await.expect_err("0 on Ollama");
+    assert!(not_llama.contains("llama.cpp"), "{not_llama}");
+    let llama = ProviderInput { kind: ProviderKind::LlamaCpp, ..limited(Some(0)) };
+    let auto = update_provider(&pool, one.id, llama).await.expect("automatic");
+    assert_eq!(auto.max_concurrent_requests, Some(0), "0 is automatic on a llama.cpp provider");
+    let cleared = update_provider(&pool, one.id, limited(None)).await.expect("clear");
+    assert_eq!(cleared.max_concurrent_requests, None, "blank is no limit");
+    let set_again = update_provider(&pool, one.id, limited(Some(3))).await.expect("set");
+    assert_eq!(set_again.max_concurrent_requests, Some(3));
+    let most = update_provider(&pool, one.id, limited(Some(i32::MAX as u32))).await.expect("the column's most");
+    assert_eq!(most.max_concurrent_requests, Some(i32::MAX as u32));
+}
+
 /// Effort is kept per model and sent only on an Anthropic provider:
 /// another server may refuse the field (SME-106).
 #[sqlx::test]
 async fn test_a_models_effort_is_kept_and_sent_only_to_anthropic(pool: PgPool) {
     use crate::anthropic::Effort;
-    let anthropic = db::create_inference_provider(&pool, "a", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None, true)
+    let anthropic = db::create_inference_provider(&pool, "a", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None, true, None)
         .await
         .expect("anthropic provider");
     let ollama = provider(&pool, "o", "api_key").await;

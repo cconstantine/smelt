@@ -2,7 +2,7 @@ use super::*;
 
 fn llama_turn_model(template: Option<TemplateSettings>) -> TurnModel {
     TurnModel { adaptive_thinking: true,
-        endpoint: Endpoint { base_url: "http://llama".to_string(), auth: Auth::Bearer("k".to_string()) },
+        endpoint: Endpoint { base_url: "http://llama".to_string(), auth: Auth::Bearer("k".to_string()), slots_of: None },
         provider_id: 1,
         model: "flash-next".to_string(),
         thinking: true,
@@ -124,6 +124,7 @@ fn llama_provider(caps: Option<serde_json::Value>, keep_reasoning: bool) -> db::
         price_catalog_provider: None,
         keep_reasoning,
         server_caps: caps,
+        max_concurrent_requests: None,
         created_at: chrono::NaiveDateTime::default(),
         updated_at: chrono::NaiveDateTime::default(),
     }
@@ -202,7 +203,7 @@ async fn test_a_llama_cpp_providers_props_are_kept_and_used_by_its_turns(pool: P
     use crate::anthropic::Effort;
     let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let base = mock_llama_cpp(up.clone()).await;
-    let p = db::create_inference_provider(&pool, "llama", "llama_cpp", &base, "bearer", "k", false, None, false)
+    let p = db::create_inference_provider(&pool, "llama", "llama_cpp", &base, "bearer", "k", false, None, false, None)
         .await
         .expect("create");
     set_model_settings(&pool, p.id, "flash-next", settings(None, None, Some(Effort::Low))).await.expect("effort");
@@ -231,6 +232,137 @@ async fn test_a_llama_cpp_providers_props_are_kept_and_used_by_its_turns(pool: P
     assert_eq!(listing.server_caps, Some(caps));
 }
 
+/// SME-162 review 1: an automatic provider's page reading `/props`
+/// sets its pool from the count at once, so a turn already running
+/// takes it from its next model call.
+#[sqlx::test]
+async fn test_reading_props_sets_an_automatic_providers_pool_at_once(pool: PgPool) {
+    let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let base = mock_llama_cpp(up).await;
+    // The pools are process-wide by provider id: an id of its own.
+    sqlx::query("ALTER TABLE inference_providers ALTER COLUMN id RESTART WITH 9162000301")
+        .execute(&pool)
+        .await
+        .expect("renumber");
+    let p = db::create_inference_provider(&pool, "llama", "llama_cpp", &base, "bearer", "k", false, None, false, Some(0))
+        .await
+        .expect("create");
+    let running = endpoint(&p);
+    assert!(crate::providers::limiter::current(p.id).is_none(), "nothing read yet: no limit");
+
+    provider_models(&pool, p.id, true).await.expect("models");
+
+    let slots = crate::providers::limiter::current(running.slots_of.expect("a model endpoint"));
+    assert_eq!(slots.map(|s| s.available_permits()), Some(1), "the fixture's one slot");
+
+    // A turn that read the row before the page read `/props` builds its
+    // endpoint from it now: the pool the read set stays.
+    endpoint(&p);
+    let slots = crate::providers::limiter::current(p.id);
+    assert_eq!(slots.map(|s| s.available_permits()), Some(1), "an older row doesn't clear it");
+}
+
+/// A llama.cpp-shaped mock whose `/v1/models` waits until `release`
+/// has a permit, so a test can act while a listing is in flight;
+/// `arrived` says a listing has reached it.
+async fn gated_llama_cpp() -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::Arc<tokio::sync::Semaphore>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let arrived = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let (seen, gate) = (arrived.clone(), release.clone());
+    let app = axum::Router::new()
+        .route(
+            "/v1/models",
+            axum::routing::get(move || {
+                let (seen, gate) = (seen.clone(), gate.clone());
+                async move {
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    gate.acquire().await.expect("the gate stays open").forget();
+                    ([(axum::http::header::CONTENT_TYPE, "application/json")],
+                     include_str!("../../../anthropic/fixtures/llama_cpp_v1_models.json"))
+                }
+            }),
+        )
+        .route(
+            "/props",
+            axum::routing::get(|| async { include_str!("../../../anthropic/fixtures/llama_cpp_props.json") }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (format!("http://{addr}"), arrived, release)
+}
+
+/// SME-162 review 2: a limit saved while the page's listing is in
+/// flight isn't undone when that listing's `/props` read lands: the pool
+/// comes from the row the read wrote, not the row the listing started
+/// with. And a read for an address the provider no longer has keeps
+/// nothing.
+#[sqlx::test]
+async fn test_a_props_read_doesnt_undo_a_save_made_meanwhile(pool: PgPool) {
+    let (base, arrived, release) = gated_llama_cpp().await;
+    sqlx::query("ALTER TABLE inference_providers ALTER COLUMN id RESTART WITH 9162000302")
+        .execute(&pool)
+        .await
+        .expect("renumber");
+    let p = db::create_inference_provider(&pool, "llama", "llama_cpp", &base, "bearer", "k", false, None, true, Some(0))
+        .await
+        .expect("create");
+    let llama = |max, url: &str| ProviderInput {
+        kind: ProviderKind::LlamaCpp,
+        max_concurrent_requests: max,
+        ..input("llama", url, "")
+    };
+
+    let listing = tokio::spawn({
+        let pool = pool.clone();
+        async move { provider_models(&pool, p.id, true).await }
+    });
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !arrived.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "the listing reached the server");
+    update_provider(&pool, p.id, llama(Some(4), &base)).await.expect("save 4");
+    release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), listing)
+        .await
+        .expect("the listing ends")
+        .expect("the task ran")
+        .expect("models");
+    let slots = crate::providers::limiter::current(p.id).map(|s| s.available_permits());
+    assert_eq!(slots, Some(4), "the saved 4, not the server's 1 slot");
+
+    // The address changes while a listing of the old one is in flight.
+    arrived.store(false, std::sync::atomic::Ordering::SeqCst);
+    let listing = tokio::spawn({
+        let pool = pool.clone();
+        async move { provider_models(&pool, p.id, true).await }
+    });
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !arrived.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "the listing reached the server");
+    update_provider(&pool, p.id, ProviderInput { secret: "k".to_string(), ..llama(Some(0), "http://127.0.0.1:1") })
+        .await
+        .expect("a new address");
+    release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), listing)
+        .await
+        .expect("the listing ends")
+        .expect("the task ran")
+        .expect("models");
+    let stored = db::get_inference_provider(&pool, p.id).await.expect("get").expect("exists");
+    assert_eq!(stored.server_caps, None, "the old server's /props isn't kept for the new address");
+    assert!(crate::providers::limiter::current(p.id).is_none(), "automatic, nothing read: no limit");
+}
+
 /// SME-111 review 2: the picker's quick listing (no `/props`)
 /// doesn't replace the slot window and tool support `/props` gave
 /// with `/v1/models`' whole-server `meta.n_ctx` and no tool flag.
@@ -238,7 +370,7 @@ async fn test_a_llama_cpp_providers_props_are_kept_and_used_by_its_turns(pool: P
 async fn test_a_quick_llama_cpp_listing_keeps_what_props_said(pool: PgPool) {
     let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let base = mock_llama_cpp(up).await;
-    let p = db::create_inference_provider(&pool, "llama", "llama_cpp", &base, "bearer", "k", false, None, true)
+    let p = db::create_inference_provider(&pool, "llama", "llama_cpp", &base, "bearer", "k", false, None, true, None)
         .await
         .expect("create");
     // A four-slot server: each slot has a quarter of the 262,144.
@@ -246,7 +378,10 @@ async fn test_a_quick_llama_cpp_listing_keeps_what_props_said(pool: PgPool) {
         "n_ctx": 65536, "total_slots": 4, "model_alias": "flash-next",
         "template_caps": {"supports_tool_calls": false}
     });
-    db::set_inference_provider_server_caps(&pool, p.id, &caps).await.expect("caps");
+    db::set_inference_provider_server_caps(&pool, p.id, &p.kind, &p.base_url, &caps)
+        .await
+        .expect("caps")
+        .expect("written");
 
     let listing = provider_models(&pool, p.id, false).await.expect("models");
 
