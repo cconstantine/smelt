@@ -117,7 +117,9 @@ pub async fn update_inference_provider(
              keep_reasoning = $9, max_concurrent_requests = $10,
              -- Another server's caps don't describe this one (SME-111 review 2).
              server_caps = CASE WHEN kind = $3 AND base_url = $4 THEN server_caps END,
-             updated_at = now()
+             -- Always later than the last: the request limit is versioned
+             -- by it, even across a clock step (SME-162 review 2).
+             updated_at = GREATEST(now(), updated_at + interval '1 microsecond')
          WHERE id = $1 RETURNING *",
     )
     .bind(id)
@@ -147,7 +149,8 @@ pub async fn set_inference_provider_server_caps(
     server_caps: &serde_json::Value,
 ) -> Result<Option<InferenceProvider>, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
-        "UPDATE inference_providers SET server_caps = $4, updated_at = now()
+        "UPDATE inference_providers SET server_caps = $4,
+             updated_at = GREATEST(now(), updated_at + interval '1 microsecond')
          WHERE id = $1 AND kind = $2 AND base_url = $3 RETURNING *",
     )
     .bind(id)

@@ -191,3 +191,29 @@ async fn test_saving_a_limit_sets_the_providers_pool_at_once(pool: PgPool) {
     update_provider(&pool, created.id, input("h", "http://h", "")).await.expect("clear");
     assert!(limiter::current(created.id).is_none(), "cleared on update");
 }
+
+/// SME-162 review 2: a save always makes a newer version than the last,
+/// even when the clock has stepped back (here, a row stamped a day
+/// ahead), so the saved limit isn't ignored as older.
+#[sqlx::test]
+async fn test_a_save_after_a_clock_step_back_still_sets_the_limit(pool: PgPool) {
+    sqlx::query("ALTER TABLE inference_providers ALTER COLUMN id RESTART WITH 9162000010")
+        .execute(&pool)
+        .await
+        .expect("renumber");
+    let created = create_provider(&pool, input("h", "http://h", "k")).await.expect("create");
+    sqlx::query("UPDATE inference_providers SET updated_at = now() + interval '1 day' WHERE id = $1")
+        .bind(created.id)
+        .execute(&pool)
+        .await
+        .expect("stamp ahead");
+    let ahead = db::get_inference_provider(&pool, created.id).await.expect("get").expect("exists");
+    endpoint(&ahead);
+
+    update_provider(&pool, created.id, ProviderInput { max_concurrent_requests: Some(1), ..input("h", "http://h", "") })
+        .await
+        .expect("save 1");
+    assert_eq!(limiter::current(created.id).map(|p| p.available_permits()), Some(1), "the save is newer");
+    let saved = db::get_inference_provider(&pool, created.id).await.expect("get").expect("exists");
+    assert!(saved.updated_at > ahead.updated_at);
+}
