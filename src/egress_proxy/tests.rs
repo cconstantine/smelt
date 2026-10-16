@@ -787,3 +787,24 @@ async fn test_a_sandbox_connection_waiting_for_a_reply_ends_when_the_page_closes
     drop(page);
     assert!(dropped_in_time(&dropped).await, "the pod's connection outlived the page's");
 }
+
+/// A pod connection that fails while the reply heads are read is let go
+/// at once, not held until the page closes its side (SME-165 review 2).
+#[tokio::test]
+async fn test_a_sandbox_connection_that_fails_is_let_go() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let proxy = start_with_sandbox(tracked_dial(upstream, dropped.clone(), true)).await.unwrap();
+    // The page keeps its connection open throughout.
+    let mut page = TcpStream::connect(proxy.addr).await.unwrap();
+    page.write_all(NAVIGATION.as_bytes()).await.unwrap();
+    assert!(dropped_in_time(&dropped).await, "a failed pod connection was held while the page stayed open");
+    drop(page);
+}

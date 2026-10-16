@@ -325,7 +325,16 @@ async fn handle_sandbox(
                 return Ok(());
             }
         };
-        let refusal = match relayed.map_err(io)? {
+        let relayed = match relayed {
+            Ok(relayed) => relayed,
+            Err(e) => {
+                // The pod's connection broke: let it go now, not when the
+                // page next sends something (SME-165 review 2).
+                page_to_pod.abort();
+                return Err(io(e));
+            }
+        };
+        let refusal = match relayed {
             Relayed::CopyRest => None,
             Relayed::Ended => {
                 page_to_pod.abort();
