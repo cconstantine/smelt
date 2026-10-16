@@ -130,7 +130,9 @@ pub fn stored_previews(rows: &[(String, u16)]) -> Vec<(PodHost, u16)> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreviewTemplate {
     scheme: String,
-    /// The authority, lowercased, split around its two placeholders.
+    /// The authority, lowercased, with its port in the form a browser
+    /// sends in `Host` (a scheme's default port dropped, SME-183), split
+    /// around its two placeholders.
     before: String,
     between: String,
     after: String,
@@ -155,6 +157,7 @@ impl PreviewTemplate {
         if authority.matches(PORT).count() != 1 || authority.matches(CONVERSATION).count() != 1 {
             return Err(format!("{template:?} must hold {PORT} and {CONVERSATION} once each"));
         }
+        let authority = browser_authority(template, scheme, &authority)?;
         #[expect(clippy::expect_used, reason = "both placeholders were counted exactly once above")]
         let port_at = authority.find(PORT).expect("counted above");
         #[expect(clippy::expect_used, reason = "both placeholders were counted exactly once above")]
@@ -212,6 +215,43 @@ impl PreviewTemplate {
         let conversation: i64 = conversation.parse().ok().filter(|&c| c > 0)?;
         let (pod_host, port) = parse_port_slot(slot)?;
         Some((conversation, pod_host, port))
+    }
+}
+
+/// A template's authority as a browser sends it back in `Host` and
+/// `Origin`: a scheme's default port, or an empty one, dropped, and any
+/// other port in plain decimal. An authority no browser's `Host` can
+/// match is refused: userinfo, an IP literal, or a non-ASCII name.
+fn browser_authority(template: &str, scheme: &str, authority: &str) -> Result<String, String> {
+    let invalid = |why: &str| format!("{template:?} {why}");
+    if authority.contains('@') {
+        return Err(invalid("must not hold a user name (no user@)"));
+    }
+    if authority.contains(['[', ']']) {
+        return Err(invalid("must be a host name, not an IP address in [brackets]"));
+    }
+    if !authority.is_ascii() {
+        return Err(invalid("must be written in ASCII: give a non-ASCII name in its xn-- form"));
+    }
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return Ok(authority.to_string());
+    };
+    // `http://{conversation}.x.test:{port}`: the placeholder is the port.
+    if port.contains('{') {
+        return Ok(authority.to_string());
+    }
+    if port.is_empty() {
+        return Ok(host.to_string());
+    }
+    let number = if port.bytes().all(|b| b.is_ascii_digit()) { port.parse::<u16>().ok().filter(|&n| n != 0) } else { None };
+    let Some(number) = number else {
+        return Err(invalid("has an invalid port"));
+    };
+    let default = if scheme == "https" { 443 } else { 80 };
+    if number == default {
+        Ok(host.to_string())
+    } else {
+        Ok(format!("{host}:{number}"))
     }
 }
 
