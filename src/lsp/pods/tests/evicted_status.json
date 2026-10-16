@@ -1,0 +1,113 @@
+{
+  "observedGeneration": 1,
+  "phase": "Succeeded",
+  "conditions": [
+    {
+      "type": "PodReadyToStartContainers",
+      "observedGeneration": 1,
+      "status": "False",
+      "lastProbeTime": null,
+      "lastTransitionTime": "2026-10-16T04:55:40Z"
+    },
+    {
+      "type": "Initialized",
+      "observedGeneration": 1,
+      "status": "True",
+      "lastProbeTime": null,
+      "lastTransitionTime": "2026-10-16T04:55:32Z",
+      "reason": "PodCompleted"
+    },
+    {
+      "type": "Ready",
+      "observedGeneration": 1,
+      "status": "False",
+      "lastProbeTime": null,
+      "lastTransitionTime": "2026-10-16T04:55:40Z",
+      "reason": "PodCompleted"
+    },
+    {
+      "type": "ContainersReady",
+      "observedGeneration": 1,
+      "status": "False",
+      "lastProbeTime": null,
+      "lastTransitionTime": "2026-10-16T04:55:40Z",
+      "reason": "PodCompleted"
+    },
+    {
+      "type": "PodScheduled",
+      "observedGeneration": 1,
+      "status": "True",
+      "lastProbeTime": null,
+      "lastTransitionTime": "2026-10-16T04:55:32Z"
+    }
+  ],
+  "hostIP": "172.20.0.4",
+  "hostIPs": [
+    {
+      "ip": "172.20.0.4"
+    }
+  ],
+  "podIP": "10.42.0.38",
+  "podIPs": [
+    {
+      "ip": "10.42.0.38"
+    }
+  ],
+  "startTime": "2026-10-16T04:55:32Z",
+  "containerStatuses": [
+    {
+      "name": "server",
+      "state": {
+        "terminated": {
+          "exitCode": 0,
+          "reason": "Completed",
+          "startedAt": "2026-10-16T04:55:32Z",
+          "finishedAt": "2026-10-16T04:55:40Z",
+          "containerID": "containerd://bbf18633c99909818f8bbb8a07f52b71d654336e6ee899d755aa465cf33fc6fd"
+        }
+      },
+      "lastState": {},
+      "ready": false,
+      "restartCount": 0,
+      "image": "docker.io/library/debian:trixie-slim",
+      "imageID": "docker.io/library/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a",
+      "containerID": "containerd://bbf18633c99909818f8bbb8a07f52b71d654336e6ee899d755aa465cf33fc6fd",
+      "started": false,
+      "allocatedResources": {
+        "cpu": "50m",
+        "ephemeral-storage": "1Mi",
+        "memory": "64Mi"
+      },
+      "resources": {
+        "limits": {
+          "cpu": "1",
+          "ephemeral-storage": "2Mi",
+          "memory": "128Mi"
+        },
+        "requests": {
+          "cpu": "50m",
+          "ephemeral-storage": "1Mi",
+          "memory": "64Mi"
+        }
+      },
+      "volumeMounts": [
+        {
+          "name": "kube-api-access-q5r7c",
+          "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+          "readOnly": true,
+          "recursiveReadOnly": "Disabled"
+        }
+      ],
+      "user": {
+        "linux": {
+          "uid": 1000,
+          "gid": 1000,
+          "supplementalGroups": [
+            1000
+          ]
+        }
+      }
+    }
+  ],
+  "qosClass": "Burstable"
+}

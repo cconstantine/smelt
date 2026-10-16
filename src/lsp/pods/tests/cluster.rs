@@ -595,3 +595,82 @@ async fn test_stopping_a_server_everywhere_deletes_its_pods() {
     })
     .await;
 }
+
+/// Starts `config`'s server, and once the start is waiting on the
+/// install (past waiting for the pod to run), runs `meanwhile` with the
+/// server pod's name. The start's outcome, which must come within 120 s
+/// of `meanwhile`: the install itself would wait 10 minutes.
+async fn start_and_meanwhile<F, Fut>(
+    client: &kube::Client,
+    sandbox: &SandboxRef,
+    config: &LanguageServerConfig,
+    meanwhile: F,
+) -> Result<Started, String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let name = server_pod_name(sandbox.pod_id, &config.name);
+    let waiting = test_hooks::on_install_wait(&name);
+    let start = start_with(client, sandbox, config, "v1");
+    tokio::pin!(start);
+    tokio::select! {
+        ended = &mut start => panic!("the start ended before it waited on the install: {ended:?}"),
+        reached = tokio::time::timeout(Duration::from_secs(300), waiting) => {
+            reached.expect("the start never waited on the install").expect("the hook was dropped");
+        }
+    }
+    meanwhile(name).await;
+    tokio::time::timeout(Duration::from_secs(120), start)
+        .await
+        .expect("the start kept waiting on an install whose pod had died")
+}
+
+/// SME-171: an install the kernel kills for running out of memory ends
+/// the start at once, saying so, and leaves no pod. The install waits
+/// for `/tmp/go`, made once the start waits on it, so the kill can't
+/// land while the start is still waiting for the pod to run.
+#[tokio::test]
+async fn test_an_install_that_runs_out_of_memory_says_so_at_once() {
+    with_sandbox(|client, sandbox| async move {
+    let config = echo_server("hungry-install", "while [ ! -e /tmp/go ]; do sleep 0.2; done; head -c 1G /dev/zero | tail");
+    let started = start_and_meanwhile(&client, &sandbox, &config, |name| {
+        let client = client.clone();
+        async move {
+            let go = crate::sandbox::exec_with(&client, &name, "server", &["touch", "/tmp/go"], None).await.expect("exec");
+            assert_eq!(go.exit_code, 0, "touch /tmp/go: {}", go.stderr);
+        }
+    })
+    .await;
+    let listed = list_with(&client, sandbox.conversation_id, &sandbox.instance).await.expect("list");
+    let error = started.expect_err("an install killed for memory started");
+    assert!(error.contains("OOMKilled") && error.contains("memory limit"), "{error}");
+    assert!(listed.is_empty(), "the killed server's pod was left: {listed:?}");
+    })
+    .await;
+}
+
+/// SME-171: a server pod deleted while its install runs (its sandbox
+/// went, the user stopped the server, or a restart replaced it) ends the
+/// start at once, saying so.
+#[tokio::test]
+async fn test_a_server_pod_deleted_during_its_install_ends_the_start() {
+    with_sandbox(|client, sandbox| async move {
+    let config = echo_server("slow-install", "sleep 600");
+    let started = start_and_meanwhile(&client, &sandbox, &config, |name| {
+        let client = client.clone();
+        async move {
+            crate::sandbox::pods_api(&client)
+                .delete(&name, &DeleteParams { grace_period_seconds: Some(0), ..Default::default() })
+                .await
+                .expect("delete the server pod");
+        }
+    })
+    .await;
+    let listed = list_with(&client, sandbox.conversation_id, &sandbox.instance).await.expect("list");
+    let error = started.expect_err("a deleted server pod started");
+    assert!(error.contains("slow-install") && error.contains("deleted"), "{error}");
+    assert!(listed.is_empty(), "{listed:?}");
+    })
+    .await;
+}
