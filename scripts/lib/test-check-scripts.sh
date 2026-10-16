@@ -190,19 +190,48 @@ exit 0
 EOF
 chmod +x "$dir/bin/lock-state" "$dir/bin/cargo" "$dir/bin/dx" "$dir/bin/sqlx" "$dir/bin/curl" "$dir/bin/import" "$dir/bin/cleanup"
 
-# A TCP port nothing listens on, from the kernel's ephemeral range, and
-# never the dev server's (8080), a real check server's (8081) or their
-# previews' (8181, 8182) (SME-175): the dx stub really binds the port, so a
-# case on 8081 would collide with a persona's live check server.
+# A TCP port nothing uses, from 20000-29999 and outside the kernel's
+# ephemeral range (ip_local_port_range): an outgoing connection takes its
+# source port from that range, and one landing on a case's port would make
+# its bind fail (SME-175 review 2). Never the dev server's (8080), a real
+# check server's (8081) or their previews' (8181, 8182): the dx stub really
+# binds the port, so a case on 8081 would collide with a persona's live
+# check server. A bind test says it's free on IPv4 (and IPv6's loopback,
+# when there is one); a port handed out before in this run is never handed
+# out again, so two cases' ports never meet.
+ports_given=$dir/ports-given
+: >"$ports_given"
 free_port() {
     local p
-    for _ in $(seq 1 20); do
-        p=$("$STUB_PYTHON3" -I -c 'import socket; s = socket.socket(); s.bind(("0.0.0.0", 0)); print(s.getsockname()[1])') || return 1
-        case "$p" in 8080 | 8081 | 8181 | 8182) continue ;; esac
-        echo "$p"
-        return 0
-    done
-    return 1
+    p=$("$STUB_PYTHON3" -I - "$ports_given" <<'EOF'
+import random, socket, sys
+given = set(open(sys.argv[1]).read().split())
+low, high = map(int, open("/proc/sys/net/ipv4/ip_local_port_range").read().split())
+candidates = [p for p in range(20000, 30000)
+              if not low <= p <= high and p not in (8080, 8081, 8181, 8182) and str(p) not in given]
+random.shuffle(candidates)
+def free(family, host, port):
+    try:
+        s = socket.socket(family)
+    except OSError:
+        return family == socket.AF_INET6  # no IPv6 at all here
+    try:
+        s.bind((host, port))
+        return True
+    except OSError as e:
+        return family == socket.AF_INET6 and e.errno == 99  # no ::1 here
+    finally:
+        s.close()
+for port in candidates[:200]:
+    if free(socket.AF_INET, "0.0.0.0", port) and free(socket.AF_INET6, "::1", port):
+        print(port)
+        break
+else:
+    sys.exit(1)
+EOF
+) || return 1
+    echo "$p" >>"$ports_given"
+    echo "$p"
 }
 # The port check_server's servers use.
 port=$(free_port) || { echo "no free port" >&2; exit 1; }
