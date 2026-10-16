@@ -161,17 +161,46 @@ struct Connection {
 /// `initialize` handshake, the same reasoning `sandbox.rs`'s per-pod
 /// connection registry uses. `update_mcp_server`/`delete_mcp_server`
 /// (`src/api/mcp.rs`) call `evict` to drop a row's stale entry when its
-/// config changes.
+/// config changes. An entry is only ever a connection built from the row
+/// as it was after the server's last `evict` (SME-167).
 static REGISTRY: LazyLock<AsyncMutex<HashMap<i64, Connection>>> =
     LazyLock::new(|| AsyncMutex::new(HashMap::new()));
 
-/// Drops a server's cached connection, if any — called after an edit or
-/// delete so a stale connection (old URL, old headers) is never reused.
-/// A future `tool_definitions_for`/`call_tool` call reconnects fresh.
+/// How many times each server has been evicted. A connect records it
+/// before reading the row and keeps its result only if it hasn't moved
+/// (SME-167). Read and written only under `REGISTRY`'s guard, which
+/// `generation` takes to say so, so a check and the write it guards are
+/// one step.
+static GENERATION: LazyLock<std::sync::Mutex<HashMap<i64, u64>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn lock_generations() -> std::sync::MutexGuard<'static, HashMap<i64, u64>> {
+    GENERATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn generation(_registry: &HashMap<i64, Connection>, server_id: i64) -> u64 {
+    lock_generations().get(&server_id).copied().unwrap_or(0)
+}
+
+/// Drops a server's cached connection, if any — called after an edit,
+/// a delete, a Disconnect or a new sign-in, so a stale connection (old
+/// URL, old headers, old grant) is never reused. A connect already in
+/// flight is discarded when it finishes (SME-167). A future
+/// `tool_definitions_for`/`call_tool` call reconnects from the row.
 pub async fn evict(server_id: i64) {
-    REGISTRY.lock().await.remove(&server_id);
-    OAUTH_CLIENTS.lock().await.remove(&server_id);
-    lock_failures().remove(&server_id);
+    {
+        let mut registry = REGISTRY.lock().await;
+        registry.remove(&server_id);
+        *lock_generations().entry(server_id).or_default() += 1;
+        lock_failures().remove(&server_id);
+        // Under the same guard, so the entry from before this evict is
+        // gone before any connect at the new generation looks (review 1).
+        // A build still running can insert one afterwards; it's reused
+        // only for the same URL and grant client, and loads the grant
+        // per request (`OAUTH_CLIENTS`). Lock order: `REGISTRY`, then
+        // `OAUTH_CLIENTS`; nothing takes them the other way round.
+        OAUTH_CLIENTS.lock().await.remove(&server_id);
+    }
 }
 
 /// An OAuth server's HTTP client: rmcp's `AuthClient`, which gets a token
@@ -487,7 +516,11 @@ async fn ensure_connected(
         }
         match service.list_all_tools().await {
             Ok(tools) => {
-                if let Some(conn) = REGISTRY.lock().await.get_mut(&config.id) {
+                // Only onto the connection it listed, not one that replaced
+                // it meanwhile (SME-167).
+                if let Some(conn) = REGISTRY.lock().await.get_mut(&config.id)
+                    && Arc::ptr_eq(&conn.service, &service)
+                {
                     conn.tools = tools;
                 }
                 return Ok(());
@@ -509,16 +542,49 @@ async fn ensure_connected(
     let lock = server_lock(&CONNECTING, config.id);
     let _connecting = lock.lock().await;
     // Someone else may have connected, or failed, while this waited.
-    if REGISTRY.lock().await.contains_key(&config.id) {
-        return Ok(());
-    }
+    let started = {
+        let registry = REGISTRY.lock().await;
+        if registry.contains_key(&config.id) {
+            return Ok(());
+        }
+        generation(&registry, config.id)
+    };
     if attempt == Attempt::SkipRecentFailures && failed_recently(config.id) {
         return Err(skip_error().into());
     }
-    match retry_once(|| connect(pool, config)).await {
+    // The row as it is now, not the caller's copy, which may predate an
+    // edit whose `evict` came before `started` (SME-167). An edit that
+    // commits after this read evicts after it too, which the check
+    // below sees, or which removes the entry.
+    let row = match crate::db::get_mcp_server_config(pool, config.id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return Err(format!("MCP server {:?} no longer exists", config.name).into()),
+        Err(e) => return Err(format!("couldn't read MCP server {:?}'s settings: {e}", config.name).into()),
+    };
+    // No retry once an evict has come: it would only be refused, and a
+    // caller queued on `CONNECTING` would wait it out (review 1).
+    let (first, row) = (&AtomicBool::new(true), &row);
+    let result = retry_once(|| async move {
+        if !first.swap(false, Ordering::SeqCst) && generation(&*REGISTRY.lock().await, config.id) != started {
+            return Err(ConnectError::from("evicted while connecting".to_string()));
+        }
+        connect(pool, row).await
+    })
+    .await;
+    let mut registry = REGISTRY.lock().await;
+    if generation(&registry, config.id) != started {
+        // Evicted while connecting: nothing is kept or recorded, and the
+        // connection (if any) is dropped, which closes it.
+        return Err(format!(
+            "MCP server {:?}'s settings changed while connecting; it connects again on the next call",
+            config.name
+        )
+        .into());
+    }
+    match result {
         Ok(connection) => {
             lock_failures().remove(&config.id);
-            REGISTRY.lock().await.insert(config.id, connection);
+            registry.insert(config.id, connection);
             Ok(())
         }
         Err(e) => {

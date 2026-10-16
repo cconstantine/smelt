@@ -130,6 +130,133 @@ fn test_a_server_pod_stopped_by_smelt_or_before_is_not_reported() {
     assert_eq!(note_server_stop(&mut seen, &unready_server_pod("c", "Failed", Some("StartError"), false), false), None);
 }
 
+/// SME-171: what a start waiting on an install makes of its pod.
+#[test]
+fn test_a_running_install_is_not_interrupted() {
+    assert_eq!(install_interrupted("lsp-7-ra", "a", Some(&unready_server_pod("a", "Running", None, false))), None);
+    assert_eq!(install_interrupted("lsp-7-ra", "a", Some(&unready_server_pod("a", "Pending", None, false))), None);
+}
+
+#[test]
+fn test_an_install_killed_for_memory_says_so_and_what_to_change() {
+    let error = install_interrupted("lsp-7-ra", "a", Some(&unready_server_pod("a", "Failed", Some("OOMKilled"), false)))
+        .expect("a stopped pod ends the wait");
+    assert!(error.contains("lsp-7-ra") && error.contains("stopped during its install"), "{error}");
+    assert!(error.contains("OOMKilled") && error.contains("memory limit"), "{error}");
+}
+
+#[test]
+fn test_an_install_that_stopped_any_other_way_gives_its_reason() {
+    let error = install_interrupted("lsp-7-ra", "a", Some(&unready_server_pod("a", "Failed", Some("Error"), false)))
+        .expect("a stopped pod ends the wait");
+    assert!(error.contains("(Error)"), "{error}");
+    let error = install_interrupted("lsp-7-ra", "a", Some(&unready_server_pod("a", "Succeeded", None, false)))
+        .expect("a pod whose container exited ends the wait");
+    assert!(error.contains("stopped during its install") && !error.contains("()"), "{error}");
+}
+
+#[test]
+fn test_an_install_whose_pod_went_or_is_going_says_it_was_deleted() {
+    for (what, pod) in [
+        ("gone", None),
+        ("being deleted", Some(unready_server_pod("a", "Running", None, true))),
+        ("replaced", Some(unready_server_pod("b", "Running", None, false))),
+    ] {
+        let error = install_interrupted("lsp-7-ra", "a", pod.as_ref()).unwrap_or_else(|| panic!("{what}: kept waiting"));
+        assert!(error.contains("lsp-7-ra was deleted during its install"), "{what}: {error}");
+    }
+}
+
+/// A pod stopped by its node (`Evicted`) says so in its own status, not
+/// its container's: the container's reason, if it has one, is only how it
+/// was stopped (SME-171).
+fn evicted_server_pod(container_reason: Option<&str>) -> Pod {
+    let containers = match container_reason {
+        Some(reason) => serde_json::json!([{
+            "name": "server", "image": "rust:1", "imageID": "", "ready": false, "restartCount": 0,
+            "state": {"terminated": {"exitCode": 137, "reason": reason}},
+        }]),
+        None => serde_json::json!([]),
+    };
+    serde_json::from_value(serde_json::json!({
+        "metadata": {"name": "lsp-7-rust-analyzer", "uid": "a"},
+        "status": {
+            "phase": "Failed",
+            "reason": "Evicted",
+            "message": "The node was low on resource: memory.",
+            "containerStatuses": containers,
+        },
+    }))
+    .expect("a pod")
+}
+
+#[test]
+fn test_an_evicted_server_says_it_was_evicted() {
+    assert_eq!(stop_reason(&evicted_server_pod(None)).as_deref(), Some("Evicted"));
+    assert_eq!(stop_reason(&evicted_server_pod(Some("Error"))).as_deref(), Some("Evicted"));
+    assert_eq!(stop_reason(&unready_server_pod("a", "Failed", Some("OOMKilled"), false)).as_deref(), Some("OOMKilled"));
+    let error = install_interrupted("lsp-7-ra", "a", Some(&evicted_server_pod(None))).expect("an evicted pod ends the wait");
+    assert!(error.contains("(Evicted)"), "{error}");
+}
+
+/// Review 1: a read error the next read recovered from isn't what a
+/// timed-out install is blamed on.
+#[test]
+fn test_a_timed_out_install_names_only_a_read_error_that_is_still_the_latest() {
+    let running = || Ok(Some(unready_server_pod("a", "Running", None, false)));
+    let mut watch = InstallWatch { name: "lsp-7-ra", uid: "a", read_error: None };
+    assert_eq!(watch.read(Err("the API server is busy".to_string())), None, "a failed read isn't a death");
+    assert!(watch.timed_out().contains("(last error reading the pod: the API server is busy)"), "{}", watch.timed_out());
+    assert_eq!(watch.read(running()), None);
+    assert!(!watch.timed_out().contains("last error"), "{}", watch.timed_out());
+    assert!(watch.timed_out().starts_with("The install didn't finish within 10 minutes"), "{}", watch.timed_out());
+    assert!(watch.read(Ok(None)).is_some_and(|e| e.contains("deleted")));
+}
+
+/// A server pod with `status`, a status captured live.
+fn captured_server_pod(status: &str) -> Pod {
+    Pod {
+        metadata: unready_server_pod("a", "Running", None, false).metadata,
+        status: Some(serde_json::from_str(status).expect("the captured status")),
+        ..Default::default()
+    }
+}
+
+/// Review 1: a server pod this cluster's kubelet really evicted (its
+/// ephemeral storage over its limit) *after* its install, as `/pods` and
+/// `note_server_stop` see it, its status captured live
+/// (`evicted_status.json`). Kubernetes says "Evicted" only in an event:
+/// the pod script's TERM trap exits 0, so the pod reads Succeeded, its
+/// container "Completed", with no pod-level reason. Nothing else stops
+/// that script with 0 short of deleting the pod.
+#[test]
+fn test_a_server_pod_really_evicted_says_it_was_most_likely_evicted() {
+    let pod = captured_server_pod(include_str!("tests/evicted_status.json"));
+    assert_eq!(stop_reason(&pod).as_deref(), Some("evicted by its node, most likely"));
+    let error = install_interrupted("lsp-7-ra", "a", Some(&pod)).expect("an evicted pod ends the wait");
+    assert!(error.ends_with("stopped during its install (evicted by its node, most likely)"), "{error}");
+}
+
+/// Review 2: the same eviction landing *during* the install, as the
+/// start waiting on it sees it, captured live
+/// (`evicted_during_install_status.json`, the pod script of the time).
+/// The trap isn't set yet, so the kubelet's TERM goes unanswered and its
+/// KILL fails the pod: the container reads "Error" (137), and only the
+/// pod's own reason says "Evicted".
+#[test]
+fn test_a_server_pod_evicted_during_its_install_says_it_was_evicted() {
+    let pod = captured_server_pod(include_str!("tests/evicted_during_install_status.json"));
+    let error = install_interrupted("lsp-7-ra", "a", Some(&pod)).expect("an evicted pod ends the wait");
+    assert!(error.ends_with("stopped during its install (Evicted)"), "{error}");
+}
+
+#[test]
+fn test_a_stop_explains_an_oom_and_names_any_other_reason() {
+    assert!(stop_explanation(Some("OOMKilled")).contains("memory limit on the Language servers page"));
+    assert_eq!(stop_explanation(Some("Error")), " (Error)");
+    assert_eq!(stop_explanation(None), "");
+}
+
 #[test]
 fn test_an_empty_install_still_records_success() {
     assert!(pod_script("  ").contains("( true )"));

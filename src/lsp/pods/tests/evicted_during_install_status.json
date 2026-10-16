@@ -1,0 +1,114 @@
+{
+  "observedGeneration": 1,
+  "phase": "Failed",
+  "conditions": [
+    {
+      "type": "PodReadyToStartContainers",
+      "observedGeneration": 1,
+      "status": "False",
+      "lastProbeTime": null,
+      "lastTransitionTime": "2026-10-16T05:37:50Z"
+    },
+    {
+      "type": "Initialized",
+      "observedGeneration": 1,
+      "status": "True",
+      "lastProbeTime": null,
+      "lastTransitionTime": "2026-10-16T05:37:40Z"
+    },
+    {
+      "type": "Ready",
+      "observedGeneration": 1,
+      "status": "False",
+      "lastProbeTime": null,
+      "lastTransitionTime": "2026-10-16T05:37:50Z",
+      "reason": "PodFailed"
+    },
+    {
+      "type": "ContainersReady",
+      "observedGeneration": 1,
+      "status": "False",
+      "lastProbeTime": null,
+      "lastTransitionTime": "2026-10-16T05:37:50Z",
+      "reason": "PodFailed"
+    },
+    {
+      "type": "PodScheduled",
+      "observedGeneration": 1,
+      "status": "True",
+      "lastProbeTime": null,
+      "lastTransitionTime": "2026-10-16T05:37:40Z"
+    }
+  ],
+  "message": "Pod ephemeral local storage usage exceeds the total limit of containers 2Mi. ",
+  "reason": "Evicted",
+  "hostIP": "172.20.0.4",
+  "hostIPs": [
+    {
+      "ip": "172.20.0.4"
+    }
+  ],
+  "podIP": "10.42.0.118",
+  "podIPs": [
+    {
+      "ip": "10.42.0.118"
+    }
+  ],
+  "startTime": "2026-10-16T05:37:40Z",
+  "containerStatuses": [
+    {
+      "name": "server",
+      "state": {
+        "terminated": {
+          "exitCode": 137,
+          "reason": "Error",
+          "startedAt": "2026-10-16T05:37:41Z",
+          "finishedAt": "2026-10-16T05:37:50Z",
+          "containerID": "containerd://46fb2ae177b94a2bba4447973650b2a2bc8b81d0fa2bc09553f8bdfcb39cc22f"
+        }
+      },
+      "lastState": {},
+      "ready": false,
+      "restartCount": 0,
+      "image": "docker.io/library/debian:trixie-slim",
+      "imageID": "docker.io/library/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a",
+      "containerID": "containerd://46fb2ae177b94a2bba4447973650b2a2bc8b81d0fa2bc09553f8bdfcb39cc22f",
+      "started": false,
+      "allocatedResources": {
+        "cpu": "50m",
+        "ephemeral-storage": "1Mi",
+        "memory": "64Mi"
+      },
+      "resources": {
+        "limits": {
+          "cpu": "1",
+          "ephemeral-storage": "2Mi",
+          "memory": "128Mi"
+        },
+        "requests": {
+          "cpu": "50m",
+          "ephemeral-storage": "1Mi",
+          "memory": "64Mi"
+        }
+      },
+      "volumeMounts": [
+        {
+          "name": "kube-api-access-lgnws",
+          "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+          "readOnly": true,
+          "recursiveReadOnly": "Disabled"
+        }
+      ],
+      "user": {
+        "linux": {
+          "uid": 1000,
+          "gid": 1000,
+          "supplementalGroups": [
+            1000
+          ]
+        }
+      }
+    }
+  ],
+  "qosClass": "Burstable"
+}

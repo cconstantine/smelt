@@ -16,17 +16,16 @@ async fn test_ensure_default_servers_adds_exa_search(pool: sqlx::PgPool) {
 /// and depends on Exa's unpublished free limits, so it only runs when
 /// `SMELT_LIVE_EXA=1` is set — never in CI, which runs every ignored
 /// test in its browser job:
-/// `SMELT_LIVE_EXA=1 cargo test --features server live_exa -- --ignored`
-#[tokio::test]
+/// `SMELT_LIVE_EXA=1 scripts/cluster-test --features server -- --ignored --exact mcp::tests::client::test_live_exa_search_through_smelt_mcp_client`
+/// (a connect reads its server's row, so it needs the test database).
+#[sqlx::test]
 #[ignore]
-async fn test_live_exa_search_through_smelt_mcp_client() {
+async fn test_live_exa_search_through_smelt_mcp_client(pool: sqlx::PgPool) {
     if std::env::var("SMELT_LIVE_EXA").as_deref() != Ok("1") {
         eprintln!("skipped: set SMELT_LIVE_EXA=1 to run against the real Exa service");
         return;
     }
-    let pool = test_pool();
-    let mut config = test_config(990_101, "exa");
-    config.url = EXA_MCP_URL.to_string();
+    let config = create_static_server(&pool, EXA_MCP_URL).await;
 
     let tools = connection_check(&pool, &config)
         .await
