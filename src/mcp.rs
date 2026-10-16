@@ -193,9 +193,12 @@ pub async fn evict(server_id: i64) {
         registry.remove(&server_id);
         *lock_generations().entry(server_id).or_default() += 1;
         lock_failures().remove(&server_id);
-        // Under the same guard, so no connect at the new generation can
-        // reuse the old `AuthClient` (review 1). Lock order: `REGISTRY`,
-        // then `OAUTH_CLIENTS`; nothing takes them the other way round.
+        // Under the same guard, so the entry from before this evict is
+        // gone before any connect at the new generation looks (review 1).
+        // A build still running can insert one afterwards; it's reused
+        // only for the same URL and grant client, and loads the grant
+        // per request (`OAUTH_CLIENTS`). Lock order: `REGISTRY`, then
+        // `OAUTH_CLIENTS`; nothing takes them the other way round.
         OAUTH_CLIENTS.lock().await.remove(&server_id);
     }
 }
