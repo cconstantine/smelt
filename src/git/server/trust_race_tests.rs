@@ -225,6 +225,29 @@ async fn test_a_decline_and_a_conversation_delete_dont_deadlock(pool: PgPool) {
     assert!(decline_waited, "Decline waited for the delete rather than running first");
 }
 
+/// SME-181 review 1, finding 2. Interleaving: deleting conversation B
+/// (a card about the remote) is held at its cascade into B's card while
+/// Decline answers A's card and has listed B's card among the others.
+/// A conversation deleted meanwhile is skipped, not a failed decision.
+#[sqlx::test]
+async fn test_a_conversation_deleted_while_a_decline_drops_its_card_doesnt_fail_it(pool: PgPool) {
+    let (a, card_a, b, repo_b) = a_card_and_b(&pool).await;
+    db::request_instruction(&pool, b, repo_b.id, "AGENTS.md", &file("asked")).await.expect("a card in B");
+
+    let holding = hold_rows(&pool, "instruction_requests", repo_b.id).await;
+    let delete = spawn_delete(&pool, b);
+    assert!(waiters_or_finished(&pool, 1, &delete).await, "the delete never reached B's card");
+    let decline = spawn_decide(&pool, a, &card_a, false);
+    let decline_waited = waiters_or_finished(&pool, 2, &decline).await;
+    holding.rollback().await.expect("release B's card");
+
+    join(delete, "the delete").await.expect("the delete succeeds");
+    let notices = join(decline, "Decline").await.expect("Decline succeeds");
+    assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("trust"), Some(false));
+    assert!(notices.iter().all(|(id, _)| *id != b), "nothing is told to a deleted conversation: {notices:?}");
+    assert!(decline_waited, "Decline waited for the delete rather than running first");
+}
+
 /// SME-181 review 1, finding 1, the deciding conversation's own delete.
 /// Interleaving: Trust on A's card is held at its load while A is
 /// deleted. Trust took its card before its load's foreign key took a

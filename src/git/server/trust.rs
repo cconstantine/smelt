@@ -113,10 +113,10 @@ async fn settle(
     let mut others = Vec::new();
     for other in db::list_instruction_requests_for_remote(&mut *tx, remote_key).await.map_err(e)? {
         db::delete_instruction_request(&mut *tx, other.id).await.map_err(e)?;
-        let other_repo = db::get_conversation_repo(&mut *tx, other.repo_id)
-            .await
-            .map_err(e)?
-            .ok_or_else(|| "No such repo.".to_string())?;
+        // Its conversation was deleted since the list: nothing to tell.
+        let Some(other_repo) = db::get_conversation_repo(&mut *tx, other.repo_id).await.map_err(e)? else {
+            continue;
+        };
         let other_file = format!("{}/{}/{}", crate::sandbox::WORKSPACE_DIR, other_repo.dir, other.path);
         others.push((other, other_file));
     }
