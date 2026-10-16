@@ -150,7 +150,9 @@ pub enum LoadOutcome {
 
 /// Loads `file` (`rel_path` of `repo`) into the conversation's context
 /// if the user trusts the repo's remote, or asks them. A remote they
-/// declined is refused.
+/// declined is refused. One transaction under the remote's trust lock
+/// (SME-181), so a decision lands wholly before or after it: never
+/// between reading the trust and loading or asking.
 pub async fn request_or_load(
     pool: &PgPool,
     conversation_id: i64,
@@ -158,33 +160,37 @@ pub async fn request_or_load(
     rel_path: &str,
     file: &db::InstructionsFile,
 ) -> Result<LoadOutcome, String> {
-    let trusted = db::get_repo_trust(pool, &repo.remote_key)
-        .await
-        .map_err(|e| e.to_string())?;
-    match trusted {
+    let e = |e: sqlx::Error| e.to_string();
+    let mut tx = pool.begin().await.map_err(e)?;
+    db::lock_remote_trust(&mut *tx, &repo.remote_key).await.map_err(e)?;
+    let outcome = match db::get_repo_trust(&mut *tx, &repo.remote_key).await.map_err(e)? {
         Some(true) => {
-            db::load_instruction(pool, conversation_id, repo.id, rel_path, file)
+            db::load_instruction(&mut *tx, conversation_id, repo.id, rel_path, file)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(e)?;
             // A card still asking about this file (the remote was
             // trusted some other way meanwhile) has nothing left to ask.
-            db::delete_instruction_request_for(pool, repo.id, rel_path)
+            db::delete_instruction_request_for(&mut *tx, repo.id, rel_path)
                 .await
-                .map_err(|e| e.to_string())?;
-            Ok(LoadOutcome::Loaded)
+                .map_err(e)?;
+            LoadOutcome::Loaded
         }
-        Some(false) => Err(format!(
-            "The user doesn't trust {}, so its AGENTS.md files aren't loaded. Don't follow \
-                 them unless the user asks you to.",
-            repo.url
-        )),
+        Some(false) => {
+            return Err(format!(
+                "The user doesn't trust {}, so its AGENTS.md files aren't loaded. Don't follow \
+                     them unless the user asks you to.",
+                repo.url
+            ));
+        }
         None => {
-            db::request_instruction(pool, conversation_id, repo.id, rel_path, file)
+            db::request_instruction(&mut *tx, conversation_id, repo.id, rel_path, file)
                 .await
-                .map_err(|e| e.to_string())?;
-            Ok(LoadOutcome::AwaitingTrust)
+                .map_err(e)?;
+            LoadOutcome::AwaitingTrust
         }
-    }
+    };
+    tx.commit().await.map_err(e)?;
+    Ok(outcome)
 }
 
 /// What `load_instructions` tells the model when it can't reach the

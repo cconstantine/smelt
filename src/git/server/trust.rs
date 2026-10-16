@@ -1,5 +1,17 @@
 use super::*;
 
+const ANSWERED: &str = "No such request in this conversation (it may have been answered already).";
+
+/// What a decision changed, from its transaction, for the notices.
+struct Settled {
+    repo: db::ConversationRepo,
+    file: String,
+    /// The remote's other cards it dropped, and their files.
+    others: Vec<(db::InstructionRequest, String)>,
+    /// Declined: `(conversation, file)` of each file unloaded.
+    unloaded: Vec<(i64, String)>,
+}
+
 /// The user's answer on the trust card for request `request_id`, from
 /// conversation `conversation_id`. Remembered for the repo's remote;
 /// on Trust, exactly the file the card showed is loaded. Other
@@ -7,6 +19,12 @@ use super::*;
 /// Returns what to tell each affected conversation's model, the
 /// deciding one first, for the caller to deliver: delivering waits for
 /// a running turn, which mustn't hold up the user's click.
+///
+/// Settled once (SME-181): the whole decision is one transaction under
+/// the remote's trust lock, and it takes its card, so a second answer
+/// to the same remote (another tab, or another conversation's card)
+/// waits for it and then finds no card to answer. Any error rolls the
+/// whole decision back, card included.
 pub async fn decide_trust(
     pool: &PgPool,
     conversation_id: i64,
@@ -14,43 +32,109 @@ pub async fn decide_trust(
     shown_hash: &str,
     trusted: bool,
 ) -> Result<Vec<(i64, String)>, String> {
+    // Unlocked, only to find which remote to lock; the take below decides.
     let request = db::get_instruction_request(pool, request_id)
         .await
         .map_err(|e| e.to_string())?
         .filter(|r| r.conversation_id == conversation_id)
-        .ok_or_else(|| "No such request in this conversation (it may have been answered already).".to_string())?;
+        .ok_or_else(|| ANSWERED.to_string())?;
+    let remote_key = get_repo(pool, request.repo_id).await?.remote_key;
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let settled = settle(&mut tx, conversation_id, request_id, &remote_key, shown_hash, trusted).await?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    // Only committed state is published, so no tab refetches a decision
+    // that could still roll back.
+    let mut touched = std::collections::BTreeSet::from([conversation_id]);
+    touched.extend(settled.others.iter().map(|(other, _)| other.conversation_id));
+    touched.extend(settled.unloaded.iter().map(|(id, _)| *id));
+    for id in touched {
+        publish_repos(pool, id).await;
+    }
+    Ok(notices(conversation_id, trusted, &settled))
+}
+
+/// The decision's writes, in `tx` under the remote's lock.
+async fn settle(
+    tx: &mut sqlx::PgConnection,
+    conversation_id: i64,
+    request_id: i64,
+    remote_key: &str,
+    shown_hash: &str,
+    trusted: bool,
+) -> Result<Settled, String> {
+    let e = |e: sqlx::Error| e.to_string();
+    db::lock_remote_trust(&mut *tx, remote_key).await.map_err(e)?;
+    // A conversation delete locks its row and then cascades through its
+    // repos, loaded files and cards, in whatever order it finds the rows.
+    // A decision writes those of every conversation with this remote,
+    // so it first share-locks all their conversation rows, in id order,
+    // before touching any of their rows: a delete then either finishes
+    // first or waits for the decision, and neither can hold a row the
+    // other needs (SME-181 reviews 1 and 2).
+    db::share_lock_conversations_for(&mut *tx, conversation_id, remote_key).await.map_err(e)?;
+    let request = db::take_instruction_request(&mut *tx, request_id, conversation_id)
+        .await
+        .map_err(e)?
+        .ok_or_else(|| ANSWERED.to_string())?;
+    let repo = db::get_conversation_repo(&mut *tx, request.repo_id)
+        .await
+        .map_err(e)?
+        .ok_or_else(|| "No such repo.".to_string())?;
+    if repo.remote_key != remote_key {
+        return Err("The repo's remote changed while you decided. Try again.".to_string());
+    }
     // Trust loads only the version the user read: the model asking
     // again replaces the request's copy, and the card follows.
     if trusted && request.hash != shown_hash {
         return Err("The file changed since the card showed it. Read the card again, then decide.".to_string());
     }
-    let repo = get_repo(pool, request.repo_id).await?;
-    db::set_repo_trust(pool, &repo.remote_key, trusted)
-        .await
-        .map_err(|e| e.to_string())?;
+    db::set_repo_trust(&mut *tx, remote_key, trusted).await.map_err(e)?;
     let file = format!("{}/{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir, request.path);
     if trusted {
         // Exactly what the card showed, not whatever the file says now.
-        db::load_instruction(pool, conversation_id, repo.id, &request.path, &request.file())
+        db::load_instruction(&mut *tx, conversation_id, repo.id, &request.path, &request.file())
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(e)?;
     }
-    db::delete_instruction_request(pool, request.id)
-        .await
-        .map_err(|e| e.to_string())?;
+
+    // Declined: nothing from this remote stays in any conversation's
+    // instructions, including a version loaded while it was trusted.
+    let mut unloaded = Vec::new();
+    if !trusted {
+        for (id, dir, path) in db::unload_instructions_for_remote(&mut *tx, remote_key).await.map_err(e)? {
+            unloaded.push((id, format!("{}/{dir}/{path}", crate::sandbox::WORKSPACE_DIR)));
+        }
+    }
 
     // Other requests about this remote: their files weren't shown, so
     // they're dropped, and their conversations told where things stand.
-    let others = db::list_instruction_requests_for_remote(pool, &repo.remote_key)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut touched = std::collections::BTreeSet::from([conversation_id]);
+    let mut others = Vec::new();
+    for other in db::list_instruction_requests_for_remote(&mut *tx, remote_key).await.map_err(e)? {
+        db::delete_instruction_request(&mut *tx, other.id).await.map_err(e)?;
+        // Its conversation was deleted since the list: nothing to tell.
+        let Some(other_repo) = db::get_conversation_repo(&mut *tx, other.repo_id).await.map_err(e)? else {
+            continue;
+        };
+        let other_file = format!("{}/{}/{}", crate::sandbox::WORKSPACE_DIR, other_repo.dir, other.path);
+        others.push((other, other_file));
+    }
+
+    Ok(Settled { repo, file, others, unloaded })
+}
+
+/// What to tell each conversation's model about a decision, the
+/// deciding one first.
+fn notices(conversation_id: i64, trusted: bool, settled: &Settled) -> Vec<(i64, String)> {
+    let Settled { repo, file, others, unloaded } = settled;
     let mut also_mine = Vec::new();
     let mut others_told = Vec::new();
-    for other in others {
-        let _ = db::delete_instruction_request(pool, other.id).await;
-        let other_repo = get_repo(pool, other.repo_id).await?;
-        let other_file = format!("{}/{}/{}", crate::sandbox::WORKSPACE_DIR, other_repo.dir, other.path);
+    for (other, other_file) in others {
+        if other.conversation_id == conversation_id {
+            also_mine.push(other_file.clone());
+            continue;
+        }
         let notice = if trusted {
             format!(
                 "The user now trusts {}. {other_file} wasn't loaded; call load_instructions \
@@ -63,18 +147,9 @@ pub async fn decide_trust(
                 repo.url
             )
         };
-        if other.conversation_id == conversation_id {
-            also_mine.push(other_file);
-        } else {
-            others_told.push((other.conversation_id, notice));
-        }
-        touched.insert(other.conversation_id);
-    }
-    for id in touched {
-        publish_repos(pool, id).await;
+        others_told.push((other.conversation_id, notice));
     }
 
-    let mut touched_after = std::collections::BTreeSet::new();
     let mut notice = if trusted {
         format!(
             "The user trusts {}: {file} is now in your Project instructions, as they read it. \
@@ -98,26 +173,15 @@ pub async fn decide_trust(
             format!(" {files} won't be loaded either.")
         });
     }
-    // Declined: nothing from this remote stays in any conversation's
-    // instructions, including a version loaded while it was trusted.
     let mut unloaded_elsewhere: std::collections::BTreeMap<i64, Vec<String>> = Default::default();
-    if !trusted {
-        let unloaded = db::unload_instructions_for_remote(pool, &repo.remote_key)
-            .await
-            .map_err(|e| e.to_string())?;
-        for (id, dir, path) in unloaded {
-            let file = format!("{}/{dir}/{path}", crate::sandbox::WORKSPACE_DIR);
-            if id == conversation_id {
-                notice.push_str(&format!(" {file} is no longer in your instructions either."));
-            } else {
-                unloaded_elsewhere.entry(id).or_default().push(file);
-            }
-            touched_after.insert(id);
+    for (id, file) in unloaded {
+        if *id == conversation_id {
+            notice.push_str(&format!(" {file} is no longer in your instructions either."));
+        } else {
+            unloaded_elsewhere.entry(*id).or_default().push(file.clone());
         }
     }
-    for id in touched_after {
-        publish_repos(pool, id).await;
-    }
+
     let mut notices = vec![(conversation_id, notice)];
     notices.extend(others_told);
     for (id, files) in unloaded_elsewhere {
@@ -133,5 +197,5 @@ pub async fn decide_trust(
             ),
         ));
     }
-    Ok(notices)
+    notices
 }
