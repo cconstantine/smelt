@@ -24,9 +24,13 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::db::{self, McpServerConfig};
 
 /// Postgres-backed `CredentialStore` for one server's OAuth grant, bound to
-/// a single `mcp_servers.id`. Plugged into each `AuthorizationManager`
-/// smelt builds (`start`, and `connection_manager` for connections); it
-/// keeps nothing in memory, so every load reads the row fresh. Takes its pool
+/// a single `mcp_servers.id` and to the URL the manager it's plugged into
+/// was built for. Plugged into each `AuthorizationManager` smelt builds
+/// (`start`, and `connection_manager` for connections), each with the rule
+/// its saves follow (`SaveRule`); it keeps nothing in memory, so every load
+/// reads the row fresh. A grant is only ever loaded or saved while the
+/// row's URL is still the store's: a token goes only to the address it was
+/// issued for (SME-166). Takes its pool
 /// explicitly rather than reaching for `db::get()` internally — same
 /// testable-all-the-way-down convention every other `db.rs`-touching
 /// function in this codebase already follows (see `anthropic::tools`'
@@ -36,23 +40,42 @@ use crate::db::{self, McpServerConfig};
 pub struct PgCredentialStore {
     pool: PgPool,
     server_id: i64,
-    /// Set for a connection's manager, whose only saves are refreshes:
-    /// see `save`.
-    refresh_only: bool,
+    /// The address the manager was built for, and the only one whose
+    /// grant this store loads or saves.
+    url: String,
+    rule: SaveRule,
+}
+
+/// What a `PgCredentialStore`'s `save` may write over. `clear` has no
+/// rule: removing a grant never sends one anywhere.
+#[derive(Clone)]
+enum SaveRule {
+    /// A login attempt's store (`start`): the new grant is saved while the
+    /// row's URL is still the store's, the address the provider issued the
+    /// grant for (SME-166).
+    SignIn,
+    /// A connection's manager, whose only saves are refreshes: saved only
+    /// over a grant for the same client (SME-113), at the store's URL.
+    RefreshOnly,
 }
 
 impl PgCredentialStore {
-    /// The store a login attempt saves its new grant through,
-    /// unconditionally.
-    pub fn new(pool: PgPool, server_id: i64) -> Self {
-        Self { pool, server_id, refresh_only: false }
+    /// The store a login attempt for `url` saves its new grant through.
+    fn for_sign_in(pool: PgPool, server_id: i64, url: String) -> Self {
+        Self { pool, server_id, url, rule: SaveRule::SignIn }
     }
 
-    /// The store a connection's manager refreshes through (SME-113).
-    fn for_refreshes(pool: PgPool, server_id: i64) -> Self {
-        Self { pool, server_id, refresh_only: true }
+    /// The store a connection's manager for `url` refreshes through
+    /// (SME-113).
+    fn for_refreshes(pool: PgPool, server_id: i64, url: String) -> Self {
+        Self { pool, server_id, url, rule: SaveRule::RefreshOnly }
     }
 }
+
+/// Why a sign-in's grant wasn't saved: the server's row no longer has the
+/// URL the sign-in started for (SME-166). The callback shows it as it is,
+/// not wrapped in rmcp's "Internal error" (review 1).
+const ADDRESS_CHANGED_ERROR: &str = "This MCP server's address was changed, or the server deleted, while you were signing in, so the sign-in wasn't saved. Click Connect to sign in to its current address.";
 
 #[async_trait::async_trait]
 impl CredentialStore for PgCredentialStore {
@@ -63,6 +86,13 @@ impl CredentialStore for PgCredentialStore {
             .ok_or_else(|| {
                 AuthError::InternalError(format!("no MCP server config with id {}", self.server_id))
             })?;
+        // A manager built for an address the row has since moved off (a
+        // connection that outlived an edit) gets no grant: the row's grant
+        // is for its new address (SME-166 review 2). rmcp then reports
+        // `AuthorizationRequired`.
+        if config.url != self.url {
+            return Ok(None);
+        }
         match config.oauth_credentials {
             None => Ok(None),
             Some(json) => serde_json::from_value(json.0)
@@ -71,34 +101,40 @@ impl CredentialStore for PgCredentialStore {
         }
     }
 
-    /// A refresh saves only over a grant for the same client, so one that
-    /// finishes after a Disconnect, a URL change or a new Connect doesn't
-    /// bring the old grant back. It then fails, so the request it was for
-    /// doesn't go on with a grant the user removed or replaced (SME-113).
+    /// A sign-in saves only while the row's URL is the one it started for,
+    /// so one that finishes after a URL edit or a delete never puts the old
+    /// address's token on the new one; the callback then fails with
+    /// `ADDRESS_CHANGED_ERROR` (SME-166). A refresh saves only over a grant
+    /// for the same client, at the URL its connection was built for, so one that finishes after a Disconnect, a URL
+    /// change or a new Connect doesn't bring the old grant back. It then
+    /// fails, so the request it was for doesn't go on with a grant the user
+    /// removed or replaced (SME-113). Each check is in the `UPDATE` itself,
+    /// so nothing can change between it and the write.
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
         let value = serde_json::to_value(&credentials)
             .map_err(|e| AuthError::InternalError(e.to_string()))?;
-        if self.refresh_only {
-            let saved = db::save_refreshed_mcp_server_oauth_credentials(
-                &self.pool,
-                self.server_id,
-                &credentials.client_id,
-                value,
-            )
-            .await
-            .map_err(|e| AuthError::InternalError(e.to_string()))?;
-            return if saved {
-                Ok(())
-            } else {
-                Err(AuthError::InternalError(
-                    "the sign-in was removed or replaced while its token was being refreshed"
-                        .to_string(),
-                ))
-            };
+        let (saved, refused) = match &self.rule {
+            SaveRule::SignIn => (
+                db::save_mcp_server_sign_in(&self.pool, self.server_id, &self.url, value).await,
+                ADDRESS_CHANGED_ERROR,
+            ),
+            SaveRule::RefreshOnly => (
+                db::save_refreshed_mcp_server_oauth_credentials(
+                    &self.pool,
+                    self.server_id,
+                    &self.url,
+                    &credentials.client_id,
+                    value,
+                )
+                .await,
+                "the sign-in was removed or replaced while its token was being refreshed",
+            ),
+        };
+        match saved {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(AuthError::InternalError(refused.to_string())),
+            Err(e) => Err(AuthError::InternalError(e.to_string())),
         }
-        db::set_mcp_server_oauth_credentials(&self.pool, self.server_id, Some(value))
-            .await
-            .map_err(|e| AuthError::InternalError(e.to_string()))
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
@@ -111,7 +147,9 @@ impl CredentialStore for PgCredentialStore {
 /// One in-flight authorization attempt per server id — holds the whole
 /// `OAuthState::Session` and its state store (the PKCE verifier, CSRF token
 /// and expected issuer for this attempt) between `start` and the callback,
-/// which ends it whatever the outcome. In-memory only: a
+/// which ends it whatever the outcome. An attempt is bound to the URL it
+/// started for: its manager's store saves the grant only while the row
+/// still has that URL (SME-166), so an edit or a delete needn't touch it. In-memory only: a
 /// restart mid-login just means starting over, the same class of accepted
 /// limitation as `mcp.rs`'s connection registry — see SME-16's "Key
 /// discovery."
@@ -145,7 +183,11 @@ pub async fn start(
                 config.name
             )
         })?;
-    manager.set_credential_store(PgCredentialStore::new(pool.clone(), config.id));
+    manager.set_credential_store(PgCredentialStore::for_sign_in(
+        pool.clone(),
+        config.id,
+        config.url.clone(),
+    ));
     let stored = InMemoryStateStore::new();
     manager.set_state_store(stored.clone());
 
@@ -224,7 +266,11 @@ pub async fn connection_manager(
                     config.name
                 )
             })?;
-    manager.set_credential_store(PgCredentialStore::for_refreshes(pool.clone(), config.id));
+    manager.set_credential_store(PgCredentialStore::for_refreshes(
+        pool.clone(),
+        config.id,
+        config.url.clone(),
+    ));
     let restored = manager.initialize_from_store().await.map_err(|e| {
         format!(
             "failed to load stored OAuth credentials for MCP server {:?}: {e}",
@@ -395,14 +441,16 @@ pub async fn handle_callback(
         .state
         .handle_callback_with_issuer(code, csrf_token, issuer)
         .await
-        .map_err(|e| format!("OAuth callback failed: {e}"))
+        .map_err(|e| match e {
+            AuthError::InternalError(reason) if reason == ADDRESS_CHANGED_ERROR => reason,
+            e => format!("OAuth callback failed: {e}"),
+        })
 }
 
 /// Clears `config`'s stored OAuth credentials without touching anything
 /// else about the row — the edit page's "Disconnect" button.
 pub async fn disconnect(pool: &PgPool, config: &McpServerConfig) -> Result<(), String> {
-    PgCredentialStore::new(pool.clone(), config.id)
-        .clear()
+    db::set_mcp_server_oauth_credentials(pool, config.id, None)
         .await
         .map_err(|e| format!("failed to disconnect MCP server {:?}: {e}", config.name))
 }
