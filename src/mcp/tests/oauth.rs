@@ -34,6 +34,36 @@ async fn test_a_tool_call_after_the_token_expires_uses_a_refreshed_token(pool: s
     evict(server.id).await;
 }
 
+/// SME-177 review 1: the refresh's compare-and-set is against the grant
+/// as Postgres wrote it. A provider can send any extra field in its token
+/// response, and serde_json (without `float_roundtrip`) doesn't parse and
+/// re-serialise every 17-digit float to the same number, so comparing
+/// against a re-serialised `Value` refused every refresh of such a grant.
+#[sqlx::test]
+async fn test_a_grant_holding_a_float_serde_json_does_not_round_trip_still_refreshes(
+    pool: sqlx::PgPool,
+) {
+    let mock = oauth_http::spawn().await;
+    let server = oauth_http::create_server(&pool, &mock, None).await;
+    oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+    sqlx::query(
+        "UPDATE mcp_servers SET oauth_credentials = jsonb_set(oauth_credentials, \
+             '{token_response,issued_at}', '55281517.519135030'::jsonb) WHERE id = $1",
+    )
+    .bind(server.id)
+    .execute(&pool)
+    .await
+    .expect("a provider's extra float field");
+    oauth_http::age_token(&pool, server.id).await;
+    let config = oauth_http::config(&pool, server.id).await;
+
+    let result = call_tool(&pool, &config, "echo", serde_json::json!({})).await;
+
+    assert_eq!(result, Ok("called with access-2".to_string()), "the refresh was saved");
+    assert_eq!(mock.refresh_count(), 1);
+    evict(server.id).await;
+}
+
 /// SME-113: a token the provider stopped accepting before its expiry
 /// (revoked, or a clock out by more than the refresh margin) is
 /// refreshed once and the request retried.

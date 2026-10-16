@@ -616,7 +616,7 @@ async fn test_a_refresh_is_saved_only_onto_the_url_its_connection_was_built_for(
         &pool,
         created.id,
         "https://example.com/old-mcp",
-        &grant,
+        &grant.to_string(),
         "abc",
         serde_json::json!({"client_id": "abc", "refreshed": "for-the-old-url"}),
     )
@@ -628,7 +628,7 @@ async fn test_a_refresh_is_saved_only_onto_the_url_its_connection_was_built_for(
         &pool,
         created.id,
         "https://example.com/mcp",
-        &grant,
+        &grant.to_string(),
         "abc",
         serde_json::json!({"client_id": "abc", "refreshed": true}),
     )
@@ -664,7 +664,7 @@ async fn test_a_refresh_is_saved_only_over_the_grant_it_refreshed(pool: PgPool) 
         &pool,
         created.id,
         "https://example.com/mcp",
-        &old,
+        &old.to_string(),
         "gh-client",
         serde_json::json!({"client_id": "gh-client", "token_response": {"access_token": "old-refreshed"}}),
     )
@@ -678,7 +678,7 @@ async fn test_a_refresh_is_saved_only_over_the_grant_it_refreshed(pool: PgPool) 
         &pool,
         created.id,
         "https://example.com/mcp",
-        &new,
+        &new.to_string(),
         "gh-client",
         refreshed.clone(),
     )
@@ -736,7 +736,7 @@ async fn test_a_refresh_racing_a_reconnect_keeps_the_new_grant(pool: PgPool) {
                 &pool,
                 id,
                 "https://example.com/mcp",
-                &x,
+                &x.to_string(),
                 "gh-client",
                 serde_json::json!({"client_id": "gh-client", "token_response": {"access_token": "y"}}),
             )

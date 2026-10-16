@@ -46,13 +46,15 @@ pub struct PgCredentialStore {
     /// grant this store loads or saves.
     url: String,
     rule: SaveRule,
-    /// The grant the last `load` read from the row, raw, so comparing it
-    /// with the row is exact; `None` when that load found none (or the
-    /// row was at another URL). rmcp's refresh is a `load`, the provider
+    /// The grant the last `load` read from the row, as Postgres's own text
+    /// rather than a parsed `Value`, so comparing it with the row is exact
+    /// (serde_json doesn't round-trip every float, review 1); `None` when
+    /// that load found none (or the row was at another URL), and after a
+    /// save, since rmcp loads before each save it makes. rmcp's refresh is a `load`, the provider
     /// request, then a `save`, under the manager's mutex, and each manager
     /// has a store of its own, so this is the grant the refresh refreshed
     /// (SME-177).
-    loaded: Arc<StdMutex<Option<serde_json::Value>>>,
+    loaded: Arc<StdMutex<Option<String>>>,
 }
 
 /// What a `PgCredentialStore`'s `save` may write over. `clear` has no
@@ -90,7 +92,7 @@ const ADDRESS_CHANGED_ERROR: &str = "This MCP server's address was changed, or t
 #[async_trait::async_trait]
 impl CredentialStore for PgCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
-        let config = db::get_mcp_server_config(&self.pool, self.server_id)
+        let (url, grant) = db::get_mcp_server_grant(&self.pool, self.server_id)
             .await
             .map_err(|e| AuthError::InternalError(e.to_string()))?
             .ok_or_else(|| {
@@ -100,14 +102,11 @@ impl CredentialStore for PgCredentialStore {
         // connection that outlived an edit) gets no grant: the row's grant
         // is for its new address (SME-166 review 2). rmcp then reports
         // `AuthorizationRequired`.
-        let grant = config
-            .oauth_credentials
-            .filter(|_| config.url == self.url)
-            .map(|json| json.0);
+        let grant = grant.filter(|_| url == self.url);
         self.set_loaded(grant.clone());
         match grant {
             None => Ok(None),
-            Some(json) => serde_json::from_value(json)
+            Some(json) => serde_json::from_str(&json)
                 .map(Some)
                 .map_err(|e| AuthError::InternalError(e.to_string())),
         }
@@ -132,7 +131,7 @@ impl CredentialStore for PgCredentialStore {
             "the sign-in was removed or replaced while its token was being refreshed";
         let (saved, refused) = match &self.rule {
             SaveRule::SignIn => (
-                db::save_mcp_server_sign_in(&self.pool, self.server_id, &self.url, value.clone()).await,
+                db::save_mcp_server_sign_in(&self.pool, self.server_id, &self.url, value).await,
                 ADDRESS_CHANGED_ERROR,
             ),
             SaveRule::RefreshOnly => {
@@ -146,7 +145,7 @@ impl CredentialStore for PgCredentialStore {
                         &self.url,
                         &refreshed,
                         &credentials.client_id,
-                        value.clone(),
+                        value,
                     )
                     .await,
                     REFRESH_REFUSED,
@@ -155,7 +154,7 @@ impl CredentialStore for PgCredentialStore {
         };
         match saved {
             Ok(true) => {
-                self.set_loaded(Some(value));
+                self.set_loaded(None);
                 Ok(())
             }
             Ok(false) => Err(AuthError::InternalError(refused.to_string())),
@@ -181,12 +180,12 @@ impl CredentialStore for PgCredentialStore {
 }
 
 impl PgCredentialStore {
-    fn loaded(&self) -> Option<serde_json::Value> {
+    fn loaded(&self) -> Option<String> {
         // No critical section leaves the value half-changed.
         self.loaded.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    fn set_loaded(&self, grant: Option<serde_json::Value>) {
+    fn set_loaded(&self, grant: Option<String>) {
         *self.loaded.lock().unwrap_or_else(|e| e.into_inner()) = grant;
     }
 }
