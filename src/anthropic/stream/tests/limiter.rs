@@ -323,3 +323,37 @@ async fn save_limit(pool: &sqlx::PgPool, provider: &crate::db::InferenceProvider
     };
     crate::providers::update_provider(pool, provider.id, input).await.expect("save the limit");
 }
+
+/// SME-162 review 1: a call's wait for a slot is on its span, so time
+/// queued in smelt isn't taken for the model's; a call with no limit
+/// has none.
+#[tokio::test]
+async fn test_a_calls_wait_for_a_slot_is_on_its_span() {
+    let (addr, upstream) = start_gated_upstream(None, false).await;
+    upstream.release.add_permits(10);
+    let endpoint = limited(addr, 9_162_000_116, Some(1));
+    let held = crate::providers::limiter::current(9_162_000_116)
+        .expect("a pool")
+        .try_acquire_owned()
+        .expect("the only slot");
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        drop(held);
+    });
+    let (result, spans) = crate::telemetry::capture_spans(call(&endpoint, "a")).await;
+    result.expect("the call succeeds");
+    let chats = chat_spans(&spans);
+    let [span] = chats.as_slice() else { panic!("one chat span: {spans:?}") };
+    let waited = match span_attribute(span, "smelt.slot_wait_ms") {
+        Some(opentelemetry::Value::I64(ms)) => *ms,
+        other => panic!("smelt.slot_wait_ms: {other:?}"),
+    };
+    assert!((250..5_000).contains(&waited), "waited {waited} ms");
+
+    let unlimited = limited(addr, 9_162_000_117, None);
+    let (result, spans) = crate::telemetry::capture_spans(call(&unlimited, "b")).await;
+    result.expect("the call succeeds");
+    let chats = chat_spans(&spans);
+    let [span] = chats.as_slice() else { panic!("one chat span: {spans:?}") };
+    assert_eq!(span_attribute(span, "smelt.slot_wait_ms"), None, "no limit, no wait");
+}

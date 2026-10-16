@@ -643,6 +643,7 @@ pub async fn stream_anthropic_message(
         gen_ai.response.finish_reasons = Empty,
         smelt.retries = Empty,
         smelt.binding = Empty,
+        smelt.slot_wait_ms = Empty,
         otel.status_code = Empty,
         otel.status_description = Empty,
     );
@@ -694,8 +695,14 @@ async fn stream_message(
     mut on_delta: impl FnMut(&str),
     tries: &mut Tries,
 ) -> Result<StreamedTurn, String> {
-    // Held through the retries and the whole stream (SME-162).
-    let _slot = endpoint.slot().await;
+    // Held through the retries and the whole stream (SME-162); the wait
+    // for it is on the span, apart from the model's time (review 1).
+    let waiting = std::time::Instant::now();
+    let slot = endpoint.slot().await;
+    if slot.is_some() {
+        let waited = i64::try_from(waiting.elapsed().as_millis()).unwrap_or(i64::MAX);
+        tracing::Span::current().record("smelt.slot_wait_ms", waited);
+    }
     // Retried only here, before anything has streamed: nothing has been
     // shown to the viewer yet, so a retry is invisible to them.
     let mut attempt = 0;
