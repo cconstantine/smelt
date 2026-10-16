@@ -13,11 +13,16 @@ through the sub-agents' own reports, so this only watches statuses.
 
 It polls Linear's GraphQL API every --interval seconds (default 60) and
 compares the board with a snapshot kept in
-~/.local/state/smelt/pm-board-snapshot.json (or $SMELT_PM_STATE_DIR). The
-snapshot is saved when the script exits, and loaded when it starts, so a
-change made between two runs (by the user, or by the Project Manager's own
+~/.local/state/smelt/pm-board-snapshot.json (or $SMELT_PM_STATE_DIR). Each
+poll is compared with the one before it, and the snapshot is saved after
+every successful poll, so a ticket that leaves a wake state and comes back
+(Up Next -> Planned -> Up Next, a plan being revised) wakes it when a poll
+sees it return. The snapshot is loaded when the script starts, so the first
+poll is compared with the board at the previous run's last successful poll,
+and a change made after it (by the user, or by the Project Manager's own
 pass) is reported at once. The Project Manager's own moves therefore cause at
-most one extra wake, and nothing the user does in between is missed.
+most one extra wake. A ticket that leaves and comes back between two polls,
+or while no run is going, is missed: no poll saw it leave.
 
 The API key is a Linear personal API key (read-only is enough), read from
 ~/.config/smelt/linear-api-key, or the file $SMELT_LINEAR_KEY_FILE names. The
@@ -237,14 +242,17 @@ class _Stop(Exception):
 
 def _run(polls, once=False):
     """One run of the script, as main() makes it, against scripted polls: each
-    is a board, or an exception the fetch raises. Returns (status, stdout
-    lines, stderr); the status is "killed" when the polls ran out first."""
+    is a board, an exception the fetch raises, or a function called at that
+    poll that returns one of those. Returns (status, stdout lines, stderr); the
+    status is "killed" when the polls ran out first."""
     polls = list(polls)
 
     def fetch():
         if not polls:
             raise _Stop()
         p = polls.pop(0)
+        if callable(p):
+            p = p()
         if isinstance(p, BaseException):
             raise p
         return p
@@ -303,6 +311,85 @@ def _loop_cases(b):
         _expect(p, "says the key was refused", "refused the key" in err, True)
         return p
 
+    # SME-176: every successful poll becomes the board the next one is
+    # compared with, in memory and in the snapshot file.
+    def out_and_back_within_one_run_wakes():
+        p = []
+        save_snapshot(b(SME_1="Up Next"))
+        status, out, _ = _run([b(SME_1="Planned"), b(SME_1="Up Next")])
+        _expect(p, "status", status, 0)
+        _expect(p, "stdout", out, ["SME-1: Planned -> Up Next"])
+        return p
+
+    def out_and_back_across_a_restart_wakes():
+        p = []
+        save_snapshot(b(SME_1="Up Next"))
+        status, out, _ = _run([b(SME_1="Planned")])
+        _expect(p, "run 1 status", status, "killed")
+        _expect(p, "run 1 snapshot", load_snapshot(), b(SME_1="Planned"))
+        status, out, _ = _run([b(SME_1="Up Next")])
+        _expect(p, "run 2 status", status, 0)
+        _expect(p, "run 2 stdout", out, ["SME-1: Planned -> Up Next"])
+        return p
+
+    def a_failed_poll_changes_nothing():
+        p = []
+        save_snapshot(b(SME_1="Up Next"))
+        seen = []
+
+        def fails_and_reads_the_snapshot():
+            seen.append(load_snapshot())
+            return urllib.error.URLError("down")
+
+        status, out, _ = _run([b(SME_1="Planned"), fails_and_reads_the_snapshot, b(SME_1="Up Next")])
+        _expect(p, "status", status, 0)
+        _expect(p, "stdout", out, ["SME-1: Planned -> Up Next"])
+        _expect(p, "snapshot at the failure", seen, [b(SME_1="Planned")])
+        return p
+
+    def a_move_between_runs_wakes_once():
+        p = []
+        save_snapshot(b(SME_1="Backlog", SME_2="Backlog"))
+        status, out, _ = _run([b(SME_1="Up Next", SME_2="Backlog")])
+        _expect(p, "run 1 status", status, 0)
+        # The Project Manager's own pass moves SME-2 while no waiter runs.
+        status, out, _ = _run([b(SME_1="Up Next", SME_2="Up Next")])
+        _expect(p, "run 2 status", status, 0)
+        _expect(p, "run 2 stdout", out, ["SME-2: Backlog -> Up Next"])
+        status, out, _ = _run([b(SME_1="Up Next", SME_2="Up Next")] * 3)
+        _expect(p, "run 3 status", status, "killed")
+        _expect(p, "run 3 stdout", out, [])
+        return p
+
+    def once_with_nothing_changed_saves_the_board():
+        p = []
+        save_snapshot(b(SME_1="Up Next"))
+        status, out, _ = _run([b(SME_1="Planned")], once=True)
+        _expect(p, "first --once status", status, 1)
+        _expect(p, "snapshot", load_snapshot(), b(SME_1="Planned"))
+        status, out, _ = _run([b(SME_1="Up Next")], once=True)
+        _expect(p, "second --once status", status, 0)
+        _expect(p, "second --once stdout", out, ["SME-1: Planned -> Up Next"])
+        return p
+
+    def limit_out_and_back_between_two_polls_is_missed():
+        # The documented limit: no poll saw it leave, so no poll can see it
+        # come back.
+        p = []
+        save_snapshot(b(SME_1="Up Next"))
+        status, out, _ = _run([b(SME_1="Up Next")])
+        _expect(p, "status", status, "killed")
+        _expect(p, "stdout", out, [])
+        return p
+
+    def leaving_the_board_and_coming_back_wakes():
+        p = []
+        save_snapshot(b(SME_1="Up Next", SME_2="Backlog"))
+        status, out, _ = _run([b(SME_2="Backlog"), b(SME_1="Up Next", SME_2="Backlog")])
+        _expect(p, "status", status, 0)
+        _expect(p, "stdout", out, ["SME-1: new -> Up Next"])
+        return p
+
     return [
         (f.__name__, f)
         for f in (
@@ -310,6 +397,13 @@ def _loop_cases(b):
             a_move_into_a_wake_state_wakes,
             failed_polls_give_up_after_the_limit,
             a_refused_key_exits_at_once,
+            out_and_back_within_one_run_wakes,
+            out_and_back_across_a_restart_wakes,
+            a_failed_poll_changes_nothing,
+            a_move_between_runs_wakes_once,
+            once_with_nothing_changed_saves_the_board,
+            limit_out_and_back_between_two_polls_is_missed,
+            leaving_the_board_and_coming_back_wakes,
         )
     ]
 
@@ -366,7 +460,6 @@ def watch(fetch, sleep, old, once, interval):
         if old is None:
             # First run: nothing to compare with yet. Keep this as the baseline.
             save_snapshot(board)
-            old = board
             print("pm-wait-for-board: no snapshot yet; took one, watching from now", file=sys.stderr)
         else:
             found = changes(old, board)
@@ -374,6 +467,11 @@ def watch(fetch, sleep, old, once, interval):
                 save_snapshot(board)
                 print("\n".join(found))
                 return 0
+            # Nothing to report: this poll is what the next one, or the next
+            # run, compares with (SME-176). Otherwise a ticket that leaves a
+            # wake state and comes back looks unchanged.
+            save_snapshot(board)
+        old = board
         if once:
             return 1
         sleep(interval)
