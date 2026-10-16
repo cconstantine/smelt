@@ -163,10 +163,22 @@ def changes(old, new):
 
 
 def load_snapshot():
+    """The saved board, or None when there's none to compare with. A snapshot
+    that can't be used (corrupt, not a board, unreadable) is said on stderr,
+    and the first poll then takes a new baseline (SME-176 review 1)."""
+    path = state_path()
     try:
-        with open(state_path()) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+        with open(path) as f:
+            board = json.load(f)
+        if not isinstance(board, dict) or not all(
+            isinstance(v, dict) and "state" in v for v in board.values()
+        ):
+            raise ValueError("not a board")
+        return board
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        print(f"pm-wait-for-board: the snapshot at {path} can't be used ({e})", file=sys.stderr)
         return None
 
 
@@ -246,6 +258,8 @@ def self_test():
                 os.environ["SMELT_PM_STATE_DIR"] = case_dir
                 try:
                     problems = case()
+                except Exception as e:  # noqa: BLE001 - reported as the case's failure
+                    problems = [f"raised {e!r}"]
                 finally:
                     os.chmod(case_dir, 0o700)
                 if problems:
@@ -417,6 +431,24 @@ def _loop_cases(b):
         _expect(p, "stdout", out, ["SME-1: new -> Up Next"])
         return p
 
+    def a_bad_snapshot_is_named_and_replaced():
+        # Corrupt, not a board, or unreadable: said on stderr, then a new
+        # baseline, never a traceback or a silent one.
+        p = []
+        for what, write in (
+            ("corrupt", lambda f: f.write('{"SME-1": {"state": "Up')),
+            ("not a board", lambda f: f.write("[]")),
+            ("unreadable", lambda f: (f.write("{}"), os.chmod(state_path(), 0))),
+        ):
+            os.makedirs(os.path.dirname(state_path()), exist_ok=True)
+            with open(state_path(), "w") as f:
+                write(f)
+            status, out, err = _run([b(SME_1="Up Next")], once=True)
+            _expect(p, f"{what}: status", status, 1)
+            _expect(p, f"{what}: says so", f"the snapshot at {state_path()} can't be used" in err, True)
+            _expect(p, f"{what}: new baseline", load_snapshot(), b(SME_1="Up Next"))
+        return p
+
     def make_saves_fail():
         # A state directory nothing can be written in. self_test makes it
         # writable again after the case.
@@ -485,6 +517,7 @@ def _loop_cases(b):
     return [
         (f.__name__, f)
         for f in (
+            a_bad_snapshot_is_named_and_replaced,
             a_second_waiters_save_mid_write_breaks_neither,
             a_wake_whose_save_fails_still_reports_the_change,
             a_failed_save_with_nothing_to_report_exits_2,
