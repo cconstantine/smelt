@@ -213,3 +213,39 @@ fn test_browser_input_event_for_key_leaves_ctrl_and_cmd_shortcuts_to_the_viewer(
         );
     }
 }
+
+fn loaded(id: i64, ok: bool) -> (i64, Result<Vec<Message>, ServerFnError>) {
+    (id, if ok { Ok(Vec::new()) } else { Err(ServerFnError::new("boom")) })
+}
+
+/// SME-185 B38: switching from 1 to 2, the messages resource still holds
+/// 1's load until 2's lands. That's no reason for 2's start screen.
+#[test]
+fn test_the_start_screen_waits_for_the_open_conversations_own_load() {
+    assert!(
+        !shows_start_screen(Some(2), Some(&loaded(1, true)), true, false, false),
+        "the conversation left's load showed the start screen"
+    );
+    assert!(!shows_start_screen(Some(2), None, true, false, false), "nothing loaded yet");
+}
+
+/// SME-185 B38: the open conversation's own load has landed, but the
+/// effect that copies it into the transcript runs after this render. A
+/// load with messages in it is no empty conversation, even for that frame.
+#[test]
+fn test_the_start_screen_waits_for_a_loaded_list_to_reach_the_transcript() {
+    let with_a_message = (2, Ok(vec![user_text(5, "hello")]));
+    assert!(
+        !shows_start_screen(Some(2), Some(&with_a_message), true, false, false),
+        "a load holding a message showed the start screen before the transcript had it"
+    );
+}
+
+#[test]
+fn test_the_start_screen_shows_only_for_an_empty_idle_loaded_conversation() {
+    assert!(shows_start_screen(Some(2), Some(&loaded(2, true)), true, false, false));
+    assert!(!shows_start_screen(Some(2), Some(&loaded(2, true)), false, false, false), "it has messages");
+    assert!(!shows_start_screen(Some(2), Some(&loaded(2, true)), true, true, false), "a turn is running");
+    assert!(!shows_start_screen(Some(2), Some(&loaded(2, true)), true, false, true), "it's missing");
+    assert!(!shows_start_screen(Some(2), Some(&loaded(2, false)), true, false, false), "its load failed");
+}
