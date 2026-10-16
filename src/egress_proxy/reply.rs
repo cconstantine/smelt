@@ -156,6 +156,10 @@ pub(super) async fn relay_reply_heads(
     limit: usize,
 ) -> std::io::Result<Relayed> {
     let mut buf: Vec<u8> = Vec::new();
+    // How far the search for the head's end got: it picks up 3 bytes
+    // before there (the longest end, `\n\r\n`), as Chrome's does, so a
+    // head arriving a byte at a time is scanned once, not once per read.
+    let mut scanned: usize = 0;
     let mut sent_any = false;
     let mut chunk = vec![0u8; 16 * 1024];
     loop {
@@ -166,8 +170,9 @@ pub(super) async fn relay_reply_heads(
             to_page.write_all(&buf).await?;
             return Ok(if sent_any { Relayed::Ended } else { Relayed::CopyRest });
         }
-        if let Some(start) = status_line_start(&buf)
-            && let Some(end) = end_of_head(&buf, start)
+        let start = status_line_start(&buf);
+        if let Some(start) = start
+            && let Some(end) = end_of_head(&buf, start.max(scanned.saturating_sub(3)))
         {
             if end - start > limit {
                 return Ok(Relayed::TooLarge);
@@ -179,6 +184,7 @@ pub(super) async fn relay_reply_heads(
             if code / 100 == 1 {
                 to_page.write_all(head).await?;
                 buf = after;
+                scanned = 0;
                 continue;
             }
             to_page.write_all(&close_response_head(head)).await?;
@@ -187,6 +193,9 @@ pub(super) async fn relay_reply_heads(
         }
         if buf.len() > limit {
             return Ok(Relayed::TooLarge);
+        }
+        if start.is_some() {
+            scanned = buf.len();
         }
         let n = from_pod.read(&mut chunk).await?;
         if n == 0 {
@@ -203,6 +212,40 @@ pub(super) async fn relay_reply_heads(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader that gives one byte per read, as a pod server writing its
+    /// head a byte at a time would arrive.
+    struct Trickle(std::collections::VecDeque<u8>);
+
+    impl AsyncRead for Trickle {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some(byte) = self.0.pop_front() {
+                buf.put_slice(&[byte]);
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A head sent a byte at a time is scanned once, not once per read
+    /// from its start: the search picks up where the last one stopped, as
+    /// Chrome's own does (`FindAndParseResponseHeaders`). Rescanning made a
+    /// 64 KiB head take about 2 billion steps (SME-165 review 2).
+    #[tokio::test]
+    async fn test_a_head_sent_a_byte_at_a_time_is_scanned_once() {
+        let head = format!("HTTP/1.1 200 OK\r\nX-Filler: {}\r\n\r\n", "a".repeat(64 * 1024));
+        let mut from_pod = Trickle(head.into_bytes().into());
+        let mut to_page = Vec::new();
+        let started = std::time::Instant::now();
+        let relayed = relay_reply_heads(&mut from_pod, &mut to_page, 256 * 1024).await.expect("relayed");
+        let took = started.elapsed();
+        assert!(matches!(relayed, Relayed::CopyRest), "the head should be relayed whole");
+        assert!(to_page.starts_with(b"HTTP/1.1 200 OK\r\nConnection: close\r\nX-Filler: aaa"));
+        assert!(took < std::time::Duration::from_secs(2), "scanning the head took {took:?}");
+    }
 
     fn closed(head: &str) -> String {
         String::from_utf8(close_response_head(head.as_bytes())).expect("UTF-8")
