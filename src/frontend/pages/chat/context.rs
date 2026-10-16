@@ -199,7 +199,9 @@ mod detail_body_tests {
 
     #[test]
     fn test_a_failed_context_fetch_says_why_instead_of_loading() {
-        let html = dioxus::ssr::render_element(render_context_detail_body(Some(&Err("boom".to_string()))));
+        // A transport error's text ends in a space ("Failed to fetch "),
+        // which used to sit before the full stop.
+        let html = dioxus::ssr::render_element(render_context_detail_body(Some(&Err("boom ".to_string()))));
         // SSR escapes the apostrophe.
         assert!(html.contains("Couldn&#39;t load the context: boom."), "{html}");
         assert!(!html.contains("Loading…"), "{html}");
@@ -312,10 +314,11 @@ mod context_usage_tests {
 pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSnapshot, String>>) -> Element {
     match detail {
         None => rsx! { p { "Loading…" } },
+        // A transport error's text ends in a space ("Failed to fetch ").
         Some(Err(reason)) => rsx! {
             // The heading keeps the × (placed top right) clear of the text.
             h3 { "Context" }
-            ErrorText { message: Some(format!("Couldn't load the context: {reason}. Close it and open it again to retry.")) }
+            ErrorText { message: Some(format!("Couldn't load the context: {}. Close it and open it again to retry.", reason.trim_end())) }
         },
         Some(Ok(detail)) => rsx! {
             h3 { "Context" }
