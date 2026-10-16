@@ -166,6 +166,35 @@ async fn test_a_caller_holding_the_config_from_before_an_edit_connects_to_the_ne
     evict(config.id).await;
 }
 
+/// A `tools/list_changed` re-list on a connection that was evicted and
+/// replaced meanwhile wrote the old server's tools onto the new one.
+#[sqlx::test]
+async fn test_a_relist_finishing_after_an_evict_does_not_overwrite_the_new_connection(pool: sqlx::PgPool) {
+    let (a, b) = (gated_http::spawn("tool_a").await, gated_http::spawn("tool_b").await);
+    let config = create_static_server(&pool, &a.url).await;
+    assert_eq!(connection_check(&pool, &config).await, Ok(vec!["tool_a".to_string()]));
+    REGISTRY.lock().await.get(&config.id).expect("connected").stale.store(true, Ordering::SeqCst);
+    let mut held = a.hold("tools/list");
+    let relist = tokio::spawn({
+        let (pool, config) = (pool.clone(), config.clone());
+        async move { ensure_connected(&pool, &config, Attempt::Always).await.map_err(|e| e.message) }
+    });
+    held.reached().await;
+
+    let edited = edit(&pool, &config, &b.url, &[]).await;
+    assert_eq!(connection_check(&pool, &edited).await, Ok(vec!["tool_b".to_string()]));
+    held.release();
+    let relisted = finish(relist).await;
+
+    assert!(relisted.is_ok(), "{relisted:?}");
+    assert_eq!(
+        connection_check(&pool, &edited).await,
+        Ok(vec!["tool_b".to_string()]),
+        "the old connection's re-list overwrote the new connection's tools"
+    );
+    evict(config.id).await;
+}
+
 /// Guards the check against refusing too much: a connect no evict of
 /// its own server interrupted is kept (another server's evict doesn't
 /// count), and after an interrupted one, the next connect is kept.

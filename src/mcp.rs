@@ -510,7 +510,11 @@ async fn ensure_connected(
         }
         match service.list_all_tools().await {
             Ok(tools) => {
-                if let Some(conn) = REGISTRY.lock().await.get_mut(&config.id) {
+                // Only onto the connection it listed, not one that replaced
+                // it meanwhile (SME-167).
+                if let Some(conn) = REGISTRY.lock().await.get_mut(&config.id)
+                    && Arc::ptr_eq(&conn.service, &service)
+                {
                     conn.tools = tools;
                 }
                 return Ok(());
