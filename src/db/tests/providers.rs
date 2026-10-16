@@ -47,7 +47,11 @@ async fn test_a_providers_server_caps_go_when_its_address_or_kind_changes(pool: 
         let pool = pool.clone();
         let caps = caps.clone();
         async move {
-            set_inference_provider_server_caps(&pool, p.id, &caps).await.expect("caps");
+            let now = get_inference_provider(&pool, p.id).await.expect("get").expect("exists");
+            set_inference_provider_server_caps(&pool, p.id, &now.kind, &now.base_url, &caps)
+                .await
+                .expect("caps")
+                .expect("written for the server it points at");
             update_inference_provider(&pool, p.id, name, kind, url, "bearer", None, false, None, false, None)
                 .await
                 .expect("update")
@@ -58,6 +62,31 @@ async fn test_a_providers_server_caps_go_when_its_address_or_kind_changes(pool: 
     assert_eq!(caps_after("renamed", "llama_cpp", "http://one").await, Some(caps.clone()), "same server");
     assert_eq!(caps_after("renamed", "llama_cpp", "http://two").await, None, "another address");
     assert_eq!(caps_after("renamed", "other", "http://two").await, None, "another kind");
+}
+
+/// SME-162 review 2: a server's `/props` is kept only while the provider
+/// still points at that server: one read before an address change is
+/// dropped, not stored for the new address.
+#[sqlx::test]
+async fn test_server_caps_are_kept_only_for_the_server_they_came_from(pool: PgPool) {
+    let caps = serde_json::json!({"total_slots": 4});
+    let p = create_inference_provider(&pool, "llama", "llama_cpp", "http://one", "bearer", "k", false, None, true, Some(0))
+        .await
+        .expect("create");
+    update_inference_provider(&pool, p.id, "llama", "llama_cpp", "http://two", "bearer", Some("k"), false, None, true, Some(0))
+        .await
+        .expect("update")
+        .expect("exists");
+    let written = set_inference_provider_server_caps(&pool, p.id, "llama_cpp", "http://one", &caps).await.expect("caps");
+    assert_eq!(written, None, "read from the old address");
+    let stored = get_inference_provider(&pool, p.id).await.expect("get").expect("exists");
+    assert_eq!(stored.server_caps, None);
+    let written = set_inference_provider_server_caps(&pool, p.id, "llama_cpp", "http://two", &caps)
+        .await
+        .expect("caps")
+        .expect("written");
+    assert_eq!(written.server_caps, Some(caps));
+    assert!(written.updated_at > stored.updated_at, "a new version");
 }
 
 #[sqlx::test]

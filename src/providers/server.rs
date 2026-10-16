@@ -691,14 +691,15 @@ async fn read_llama_props(
         Ok(info) => {
             crate::anthropic::models::apply_llama_props(listed, &info);
             let value = serde_json::to_value(&info).map_err(|e| e.to_string())?;
-            let updated_at = db::set_inference_provider_server_caps(pool, provider.id, &value)
-                .await
-                .map_err(|e| e.to_string())?;
+            let written =
+                db::set_inference_provider_server_caps(pool, provider.id, &provider.kind, &provider.base_url, &value)
+                    .await
+                    .map_err(|e| e.to_string())?;
             // An automatic limit takes the new count from each running
-            // turn's next model call (SME-162 review 1).
-            if let Some(updated_at) = updated_at {
-                let read = db::InferenceProvider { server_caps: Some(value), updated_at, ..provider.clone() };
-                limiter::set(provider.id, read.updated_at, resolved_max(&read));
+            // turn's next model call (SME-162 review 1), from the row as
+            // written: a limit saved while this was read stands (review 2).
+            if let Some(row) = written {
+                limiter::set(row.id, row.updated_at, resolved_max(&row));
             }
             Ok((Some(info), None))
         }
