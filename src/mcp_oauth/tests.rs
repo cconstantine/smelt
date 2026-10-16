@@ -659,9 +659,20 @@ async fn test_a_url_edit_during_the_code_exchange_saves_nothing(pool: PgPool) {
     let state = start_attempt(&pool, &config).await;
 
     let id = config.id;
-    let callback =
+    let mut callback =
         tokio::spawn(async move { complete_callback(id, code_callback(&state, None)).await });
-    gate.arrived.notified().await;
+    // Bounded, and ended by a callback that fails before the token
+    // endpoint, so a regression fails here instead of holding the cluster
+    // lock forever (review 2).
+    tokio::select! {
+        () = gate.arrived.notified() => {}
+        result = &mut callback => {
+            panic!("the callback ended before reaching the token endpoint: {result:?}")
+        }
+        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+            panic!("the callback never reached the token endpoint")
+        }
+    }
     assert!(
         !PENDING.lock().await.contains_key(&config.id),
         "the callback has taken its attempt before the exchange"
