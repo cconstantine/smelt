@@ -28,8 +28,9 @@ use crate::db::{self, McpServerConfig};
 /// a single `mcp_servers.id` and to the URL the manager it's plugged into
 /// was built for. Plugged into each `AuthorizationManager` smelt builds
 /// (`start`, and `connection_manager` for connections), each with the rule
-/// its saves follow (`SaveRule`); it keeps nothing in memory, so every load
-/// reads the row fresh. A grant is only ever loaded or saved while the
+/// its saves follow (`SaveRule`); every load reads the row fresh, and the
+/// store keeps only what its last load read (`loaded`), for a refresh's
+/// save and a `clear` to check against. A grant is only ever loaded or saved while the
 /// row's URL is still the store's: a token goes only to the address it was
 /// issued for (SME-166). Takes its pool
 /// explicitly rather than reaching for `db::get()` internally — same
@@ -45,6 +46,15 @@ pub struct PgCredentialStore {
     /// grant this store loads or saves.
     url: String,
     rule: SaveRule,
+    /// The grant the last `load` read from the row, as Postgres's own text
+    /// rather than a parsed `Value`, so comparing it with the row is exact
+    /// (serde_json doesn't round-trip every float, review 1); `None` when
+    /// that load found none (or the row was at another URL), and after a
+    /// save, since rmcp loads before each save it makes. rmcp's refresh is a `load`, the provider
+    /// request, then a `save`, under the manager's mutex, and each manager
+    /// has a store of its own, so this is the grant the refresh refreshed
+    /// (SME-177).
+    loaded: Arc<StdMutex<Option<String>>>,
 }
 
 /// What a `PgCredentialStore`'s `save` may write over. `clear` has no
@@ -56,20 +66,21 @@ enum SaveRule {
     /// grant for (SME-166).
     SignIn,
     /// A connection's manager, whose only saves are refreshes: saved only
-    /// over a grant for the same client (SME-113), at the store's URL.
+    /// over the exact grant the refresh read (SME-177), for the same client
+    /// (SME-113), at the store's URL.
     RefreshOnly,
 }
 
 impl PgCredentialStore {
     /// The store a login attempt for `url` saves its new grant through.
     fn for_sign_in(pool: PgPool, server_id: i64, url: String) -> Self {
-        Self { pool, server_id, url, rule: SaveRule::SignIn }
+        Self { pool, server_id, url, rule: SaveRule::SignIn, loaded: Arc::default() }
     }
 
     /// The store a connection's manager for `url` refreshes through
     /// (SME-113).
     fn for_refreshes(pool: PgPool, server_id: i64, url: String) -> Self {
-        Self { pool, server_id, url, rule: SaveRule::RefreshOnly }
+        Self { pool, server_id, url, rule: SaveRule::RefreshOnly, loaded: Arc::default() }
     }
 }
 
@@ -81,7 +92,7 @@ const ADDRESS_CHANGED_ERROR: &str = "This MCP server's address was changed, or t
 #[async_trait::async_trait]
 impl CredentialStore for PgCredentialStore {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
-        let config = db::get_mcp_server_config(&self.pool, self.server_id)
+        let (url, grant) = db::get_mcp_server_grant(&self.pool, self.server_id)
             .await
             .map_err(|e| AuthError::InternalError(e.to_string()))?
             .ok_or_else(|| {
@@ -91,12 +102,11 @@ impl CredentialStore for PgCredentialStore {
         // connection that outlived an edit) gets no grant: the row's grant
         // is for its new address (SME-166 review 2). rmcp then reports
         // `AuthorizationRequired`.
-        if config.url != self.url {
-            return Ok(None);
-        }
-        match config.oauth_credentials {
+        let grant = grant.filter(|_| url == self.url);
+        self.set_loaded(grant.clone());
+        match grant {
             None => Ok(None),
-            Some(json) => serde_json::from_value(json.0)
+            Some(json) => serde_json::from_str(&json)
                 .map(Some)
                 .map_err(|e| AuthError::InternalError(e.to_string())),
         }
@@ -106,49 +116,85 @@ impl CredentialStore for PgCredentialStore {
     /// so one that finishes after a URL edit or a delete never puts the old
     /// address's token on the new one; the callback then fails with
     /// `ADDRESS_CHANGED_ERROR` (SME-166). A refresh saves only over a grant
-    /// for the same client, at the URL its connection was built for, so one that finishes after a Disconnect, a URL
-    /// change or a new Connect doesn't bring the old grant back. It then
-    /// fails, so the request it was for doesn't go on with a grant the user
-    /// removed or replaced (SME-113). Each check is in the `UPDATE` itself,
-    /// so nothing can change between it and the write.
+    /// for the same client, at the URL its connection was built for, and
+    /// only over the exact grant it refreshed (`loaded`), so one that
+    /// finishes after a Disconnect, a URL change or a new Connect, a
+    /// Reconnect with the same pre-registered client included (SME-177),
+    /// doesn't bring the old grant back. It then fails, so the request it
+    /// was for doesn't go on with a grant the user removed or replaced
+    /// (SME-113). Each check is in the `UPDATE` itself, so nothing can
+    /// change between it and the write.
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
         let value = serde_json::to_value(&credentials)
             .map_err(|e| AuthError::InternalError(e.to_string()))?;
+        const REFRESH_REFUSED: &str =
+            "the sign-in was removed or replaced while its token was being refreshed";
         let (saved, refused) = match &self.rule {
             SaveRule::SignIn => (
                 db::save_mcp_server_sign_in(&self.pool, self.server_id, &self.url, value).await,
                 ADDRESS_CHANGED_ERROR,
             ),
-            SaveRule::RefreshOnly => (
-                db::save_refreshed_mcp_server_oauth_credentials(
-                    &self.pool,
-                    self.server_id,
-                    &self.url,
-                    &credentials.client_id,
-                    value,
+            SaveRule::RefreshOnly => {
+                let Some(refreshed) = self.loaded() else {
+                    return Err(AuthError::InternalError(REFRESH_REFUSED.to_string()));
+                };
+                (
+                    db::save_refreshed_mcp_server_oauth_credentials(
+                        &self.pool,
+                        self.server_id,
+                        &self.url,
+                        &refreshed,
+                        &credentials.client_id,
+                        value,
+                    )
+                    .await,
+                    REFRESH_REFUSED,
                 )
-                .await,
-                "the sign-in was removed or replaced while its token was being refreshed",
-            ),
+            }
         };
         match saved {
-            Ok(true) => Ok(()),
+            Ok(true) => {
+                self.set_loaded(None);
+                Ok(())
+            }
             Ok(false) => Err(AuthError::InternalError(refused.to_string())),
             Err(e) => Err(AuthError::InternalError(e.to_string())),
         }
     }
 
+    /// rmcp clears a store only in `initialize_from_store`, when the grant
+    /// it just loaded is bound to a provider whose issuer has since
+    /// changed. So only that grant is cleared: a newer one saved since the
+    /// load (a Reconnect) stays, and with nothing loaded nothing is
+    /// cleared (SME-177). Disconnect doesn't come through here.
     async fn clear(&self) -> Result<(), AuthError> {
-        db::set_mcp_server_oauth_credentials(&self.pool, self.server_id, None)
+        let Some(loaded) = self.loaded() else {
+            return Ok(());
+        };
+        db::clear_mcp_server_oauth_credentials_if(&self.pool, self.server_id, &self.url, &loaded)
             .await
-            .map_err(|e| AuthError::InternalError(e.to_string()))
+            .map_err(|e| AuthError::InternalError(e.to_string()))?;
+        self.set_loaded(None);
+        Ok(())
+    }
+}
+
+impl PgCredentialStore {
+    fn loaded(&self) -> Option<String> {
+        // No critical section leaves the value half-changed.
+        self.loaded.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set_loaded(&self, grant: Option<String>) {
+        *self.loaded.lock().unwrap_or_else(|e| e.into_inner()) = grant;
     }
 }
 
 /// One in-flight authorization attempt per server id — holds the whole
 /// `OAuthState::Session` and its state store (the PKCE verifier, CSRF token
-/// and expected issuer for this attempt) between `start` and the callback,
-/// which ends it whatever the outcome. An attempt is bound to the URL it
+/// and expected issuer for this attempt) between `start` and the callback
+/// carrying its state, which ends it whatever the outcome; a callback
+/// without its state leaves it pending (SME-177). An attempt is bound to the URL it
 /// started for: its manager's store saves the grant only while the row
 /// still has that URL (SME-166), so an edit or a delete needn't touch it. In-memory only: a
 /// restart mid-login just means starting over, the same class of accepted
@@ -174,28 +220,53 @@ const CALLBACK_ERROR_TTL: Duration = Duration::from_secs(5 * 60);
 /// edit page takes the text from here (`take_callback_error`), so no text
 /// in a link can show as smelt's own error. A successful callback clears
 /// the slot; a take empties it; an entry older than `CALLBACK_ERROR_TTL`
-/// is refused on take and pruned on the next record. In memory: a restart
+/// is refused on take and pruned on the next record. An error from a
+/// callback that matched no attempt (`record_unmatched_callback_error`)
+/// never replaces an unexpired one from a callback that did, so a forged
+/// callback can't swap the real error out before the page takes it
+/// (SME-177). In memory: a restart
 /// between the callback and its page load loses the text, and the status
 /// section still says the server isn't connected. A plain `Mutex`: nothing
 /// is awaited while it's held.
-static CALLBACK_ERRORS: LazyLock<StdMutex<HashMap<i64, (String, Instant)>>> =
+static CALLBACK_ERRORS: LazyLock<StdMutex<HashMap<i64, KeptCallbackError>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-fn callback_errors() -> std::sync::MutexGuard<'static, HashMap<i64, (String, Instant)>> {
+struct KeptCallbackError {
+    message: String,
+    kept: Instant,
+    /// Whether the callback carried a pending attempt's state.
+    matched: bool,
+}
+
+fn callback_errors() -> std::sync::MutexGuard<'static, HashMap<i64, KeptCallbackError>> {
     // No critical section leaves the map half-changed.
     CALLBACK_ERRORS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Keeps `message` as server `id`'s callback error, replacing any earlier
-/// one, after pruning the expired entries.
+/// Keeps `message`, from a callback that matched an attempt, as server
+/// `id`'s callback error, replacing any earlier one, after pruning the
+/// expired entries.
 fn record_callback_error(id: i64, message: String) {
     record_callback_error_at(id, message, Instant::now());
 }
 
 fn record_callback_error_at(id: i64, message: String, at: Instant) {
+    record(id, KeptCallbackError { message, kept: at, matched: true });
+}
+
+/// Keeps `message`, from a callback that matched no attempt, unless the
+/// slot holds an unexpired error from one that did.
+fn record_unmatched_callback_error(id: i64, message: String) {
+    record(id, KeptCallbackError { message, kept: Instant::now(), matched: false });
+}
+
+fn record(id: i64, error: KeptCallbackError) {
     let mut errors = callback_errors();
-    errors.retain(|_, (_, kept)| kept.elapsed() < CALLBACK_ERROR_TTL);
-    errors.insert(id, (message, at));
+    errors.retain(|_, kept| kept.kept.elapsed() < CALLBACK_ERROR_TTL);
+    if !error.matched && errors.get(&id).is_some_and(|kept| kept.matched) {
+        return;
+    }
+    errors.insert(id, error);
 }
 
 fn clear_callback_error(id: i64) {
@@ -205,8 +276,8 @@ fn clear_callback_error(id: i64) {
 /// Server `id`'s kept callback error, removed so it shows once; `None` if
 /// there's none or it's older than `CALLBACK_ERROR_TTL`.
 pub fn take_callback_error(id: i64) -> Option<String> {
-    let (message, kept) = callback_errors().remove(&id)?;
-    (kept.elapsed() < CALLBACK_ERROR_TTL).then_some(message)
+    let error = callback_errors().remove(&id)?;
+    (error.kept.elapsed() < CALLBACK_ERROR_TTL).then_some(error.message)
 }
 
 /// Starts an OAuth authorization attempt for `config` and returns the
@@ -459,8 +530,8 @@ impl rmcp::transport::auth::OAuthHttpClient for ProviderHttpClient {
     }
 }
 
-/// Completes an in-flight authorization attempt — pops `server_id`'s
-/// pending `OAuthState`, exchanges `code` for tokens, and persists them via
+/// Completes an in-flight authorization attempt — takes `server_id`'s
+/// pending `OAuthState` if `csrf_token` is its state, exchanges `code` for tokens, and persists them via
 /// `PgCredentialStore` (through `OAuthState::handle_callback_with_issuer`'s
 /// own call into the manager's configured credential store).
 /// `code`/`csrf_token`/`issuer` come straight from the callback request's
@@ -472,23 +543,91 @@ impl rmcp::transport::auth::OAuthHttpClient for ProviderHttpClient {
 /// provider's metadata advertised (RFC 9207, MCP's SEP-2468), and refuses a
 /// callback without one from a provider that says it sends it — GitHub
 /// and Linear both do (SME-65).
-pub async fn handle_callback(
+///
+/// Only a callback carrying the attempt's `state` ends it
+/// (`take_matching_attempt`, SME-177); any other is refused with the
+/// attempt left pending.
+async fn handle_callback(
     server_id: i64,
     code: &str,
     csrf_token: &str,
     issuer: Option<&str>,
-) -> Result<(), String> {
-    let mut attempt = PENDING.lock().await.remove(&server_id).ok_or_else(|| {
-        "no OAuth authorization attempt in progress for this server — it may have expired, or this callback link was already used".to_string()
-    })?;
+) -> Result<(), CallbackFailure> {
+    let mut attempt = take_matching_attempt(server_id, Some(csrf_token))
+        .await
+        .map_err(|unmatched| {
+            CallbackFailure::unmatched(match unmatched {
+                Unmatched::NoAttempt => NO_ATTEMPT_ERROR,
+                Unmatched::NotItsState => UNVERIFIED_ERROR,
+            })
+        })?;
     attempt
         .state
         .handle_callback_with_issuer(code, csrf_token, issuer)
         .await
-        .map_err(|e| match e {
-            AuthError::InternalError(reason) if reason == ADDRESS_CHANGED_ERROR => reason,
-            e => format!("OAuth callback failed: {e}"),
+        .map_err(|e| {
+            CallbackFailure::matched(match e {
+                AuthError::InternalError(reason) if reason == ADDRESS_CHANGED_ERROR => reason,
+                e => format!("OAuth callback failed: {e}"),
+            })
         })
+}
+
+const NO_ATTEMPT_ERROR: &str = "no OAuth authorization attempt in progress for this server — it may have expired, or this callback link was already used";
+
+/// Why a callback ended no attempt.
+enum Unmatched {
+    /// Nothing is pending for the server.
+    NoAttempt,
+    /// An attempt is pending, but the callback's `state` isn't its own (a
+    /// forged or replayed callback, or one for an attempt a second Connect
+    /// replaced), or the callback has none.
+    NotItsState,
+}
+
+/// Removes and returns `server_id`'s pending attempt only if `csrf_token`
+/// is its state, as recorded in the attempt's own state store (the one
+/// `rmcp` checks). The check and the removal happen under one `PENDING`
+/// guard, so a forged callback and the genuine one arriving together can't
+/// interleave between them: anyone can send a request to the callback
+/// route, so one without the state leaves the user's sign-in pending
+/// (SME-177 B23).
+async fn take_matching_attempt(
+    server_id: i64,
+    csrf_token: Option<&str>,
+) -> Result<PendingAttempt, Unmatched> {
+    let mut pending = PENDING.lock().await;
+    let attempt = pending.get(&server_id).ok_or(Unmatched::NoAttempt)?;
+    let csrf_token = csrf_token.ok_or(Unmatched::NotItsState)?;
+    // `InMemoryStateStore::load` only reads, and can't fail.
+    if attempt.stored.load(csrf_token).await.ok().flatten().is_none() {
+        return Err(Unmatched::NotItsState);
+    }
+    pending.remove(&server_id).ok_or(Unmatched::NoAttempt)
+}
+
+/// A failed callback: the text the edit page shows, and whether the
+/// callback carried a pending attempt's state (and so ended it).
+#[derive(Debug)]
+struct CallbackFailure {
+    message: String,
+    matched: bool,
+}
+
+impl CallbackFailure {
+    fn matched(message: impl Into<String>) -> Self {
+        Self { message: message.into(), matched: true }
+    }
+
+    fn unmatched(message: impl Into<String>) -> Self {
+        Self { message: message.into(), matched: false }
+    }
+}
+
+impl std::fmt::Display for CallbackFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 /// Clears `config`'s stored OAuth credentials without touching anything
@@ -574,8 +713,12 @@ pub async fn callback_handler(
             clear_callback_error(id);
             axum::response::Redirect::to(&format!("/mcp-servers/{id}"))
         }
-        Err(error) => {
-            record_callback_error(id, error);
+        Err(CallbackFailure { message, matched: true }) => {
+            record_callback_error(id, message);
+            axum::response::Redirect::to(&format!("/mcp-servers/{id}?oauth_callback=1"))
+        }
+        Err(CallbackFailure { message, matched: false }) => {
+            record_unmatched_callback_error(id, message);
             axum::response::Redirect::to(&format!("/mcp-servers/{id}?oauth_callback=1"))
         }
     }
@@ -587,48 +730,47 @@ pub async fn callback_handler(
 /// is only worth showing once it's checked.
 const UNVERIFIED_ERROR: &str = "smelt couldn't verify the authorization provider's response, so it was ignored. Click Connect to try again.";
 
-async fn complete_callback(id: i64, params: CallbackParams) -> Result<(), String> {
+async fn complete_callback(id: i64, params: CallbackParams) -> Result<(), CallbackFailure> {
     if let Some(error) = params.error {
         verify_error_callback(id, params.state.as_deref(), params.iss.as_deref()).await?;
-        return Err(params.error_description.unwrap_or(error));
+        return Err(CallbackFailure::matched(
+            params.error_description.unwrap_or(error),
+        ));
     }
-    let code = params
-        .code
-        .ok_or_else(|| "authorization callback is missing its code parameter".to_string())?;
-    let state = params
-        .state
-        .ok_or_else(|| "authorization callback is missing its state parameter".to_string())?;
+    // A missing parameter returns before `PENDING` is touched.
+    let code = params.code.ok_or_else(|| {
+        CallbackFailure::unmatched("authorization callback is missing its code parameter")
+    })?;
+    let state = params.state.ok_or_else(|| {
+        CallbackFailure::unmatched("authorization callback is missing its state parameter")
+    })?;
     handle_callback(id, &code, &state, params.iss.as_deref()).await?;
     crate::mcp::evict(id).await;
     Ok(())
 }
 
-/// Ends `server_id`'s pending attempt (a provider doesn't send a code
-/// after an error), and checks the error callback belongs to it: its
+/// Checks an error callback belongs to `server_id`'s pending attempt: its
 /// `state` must be the attempt's, and its `iss` must pass the check `rmcp`
 /// gives a code callback (RFC 9207 §2.4). `Err(UNVERIFIED_ERROR)` if not.
+/// A callback with the attempt's state ends it (a provider doesn't send a
+/// code after an error), whatever its `iss`: only the provider's redirect
+/// can carry the state. One without it leaves the attempt pending
+/// (SME-177 B23).
 async fn verify_error_callback(
     server_id: i64,
     csrf_token: Option<&str>,
     issuer: Option<&str>,
-) -> Result<(), String> {
-    let unverified = || UNVERIFIED_ERROR.to_string();
-    let attempt = PENDING
-        .lock()
+) -> Result<(), CallbackFailure> {
+    let attempt = take_matching_attempt(server_id, csrf_token)
         .await
-        .remove(&server_id)
-        .ok_or_else(unverified)?;
-    let stored = attempt
-        .stored
-        .load(csrf_token.ok_or_else(unverified)?)
-        .await
-        .ok()
-        .flatten()
-        .ok_or_else(unverified)?;
-    if issuer_accepted(&stored, issuer) {
-        Ok(())
-    } else {
-        Err(unverified())
+        .map_err(|_| CallbackFailure::unmatched(UNVERIFIED_ERROR))?;
+    let stored = match csrf_token {
+        Some(csrf_token) => attempt.stored.load(csrf_token).await.ok().flatten(),
+        None => None,
+    };
+    match stored {
+        Some(stored) if issuer_accepted(&stored, issuer) => Ok(()),
+        _ => Err(CallbackFailure::matched(UNVERIFIED_ERROR)),
     }
 }
 

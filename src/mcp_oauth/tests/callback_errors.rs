@@ -60,7 +60,7 @@ fn test_an_expired_callback_error_is_refused_and_pruned() {
 
 /// Sends `params` through the real route handler and returns the
 /// `Location` it redirects to.
-async fn callback_location(id: i64, params: CallbackParams) -> String {
+pub(super) async fn callback_location(id: i64, params: CallbackParams) -> String {
     use axum::response::IntoResponse;
     let response = callback_handler(axum::extract::Path(id), axum::extract::Query(params))
         .await
@@ -147,4 +147,47 @@ async fn test_a_successful_callback_clears_an_earlier_error(pool: PgPool) {
     assert_eq!(location, format!("/mcp-servers/{}", config.id));
     assert!(stored_credentials(&pool, config.id).await.is_some());
     assert_eq!(take_callback_error(config.id), None, "success leaves nothing to show");
+}
+
+/// SME-177: a callback that matched no attempt (anyone can send one)
+/// doesn't replace an unexpired error from one that did, so a forged
+/// callback can't swap the real error out before the page takes it. It
+/// still writes over an unmatched error, and into an expired slot.
+#[sqlx::test]
+async fn test_a_forged_callback_does_not_replace_a_real_callback_error(pool: PgPool) {
+    let base_url = spawn_mock_oauth_server(MockMetadata::Issuer {
+        iss_supported: true,
+    })
+    .await;
+    let config = create_oauth_server(&pool, &base_url).await;
+    let state = start_attempt(&pool, &config).await;
+    let forged = || error_callback(Some("forged"), None);
+
+    callback_location(
+        config.id,
+        error_callback_with_marker(Some(&state), Some(&mock_issuer(&base_url))),
+    )
+    .await;
+    callback_location(config.id, forged()).await;
+    assert_eq!(
+        take_callback_error(config.id).as_deref(),
+        Some(MARKER),
+        "the real callback's error is kept"
+    );
+
+    callback_location(config.id, code_callback("forged", None)).await;
+    callback_location(config.id, forged()).await;
+    assert_eq!(
+        take_callback_error(config.id).as_deref(),
+        Some(UNVERIFIED_ERROR),
+        "an unmatched error is replaced by the next one"
+    );
+
+    record_callback_error_at(config.id, MARKER.to_string(), expired());
+    callback_location(config.id, forged()).await;
+    assert_eq!(
+        take_callback_error(config.id).as_deref(),
+        Some(UNVERIFIED_ERROR),
+        "an expired error is written over"
+    );
 }
