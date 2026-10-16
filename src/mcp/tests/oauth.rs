@@ -34,6 +34,36 @@ async fn test_a_tool_call_after_the_token_expires_uses_a_refreshed_token(pool: s
     evict(server.id).await;
 }
 
+/// SME-177 review 1: the refresh's compare-and-set is against the grant
+/// as Postgres wrote it. A provider can send any extra field in its token
+/// response, and serde_json (without `float_roundtrip`) doesn't parse and
+/// re-serialise every 17-digit float to the same number, so comparing
+/// against a re-serialised `Value` refused every refresh of such a grant.
+#[sqlx::test]
+async fn test_a_grant_holding_a_float_serde_json_does_not_round_trip_still_refreshes(
+    pool: sqlx::PgPool,
+) {
+    let mock = oauth_http::spawn().await;
+    let server = oauth_http::create_server(&pool, &mock, None).await;
+    oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+    sqlx::query(
+        "UPDATE mcp_servers SET oauth_credentials = jsonb_set(oauth_credentials, \
+             '{token_response,issued_at}', '55281517.519135030'::jsonb) WHERE id = $1",
+    )
+    .bind(server.id)
+    .execute(&pool)
+    .await
+    .expect("a provider's extra float field");
+    oauth_http::age_token(&pool, server.id).await;
+    let config = oauth_http::config(&pool, server.id).await;
+
+    let result = call_tool(&pool, &config, "echo", serde_json::json!({})).await;
+
+    assert_eq!(result, Ok("called with access-2".to_string()), "the refresh was saved");
+    assert_eq!(mock.refresh_count(), 1);
+    evict(server.id).await;
+}
+
 /// SME-113: a token the provider stopped accepting before its expiry
 /// (revoked, or a clock out by more than the refresh margin) is
 /// refreshed once and the request retried.
@@ -202,6 +232,38 @@ async fn test_a_refresh_finishing_after_a_new_grant_keeps_the_new_grant(pool: sq
     let _ = call.await.expect("call task");
 
     assert_eq!(stored_client_id(&pool, server.id).await.as_deref(), Some("client-1"));
+    evict(server.id).await;
+}
+
+/// SME-177 B24: a Reconnect with a pre-registered client keeps the client
+/// id, so the client-id check alone let a refresh of the old grant,
+/// finishing after the Reconnect, overwrite the new grant.
+#[sqlx::test]
+async fn test_a_refresh_finishing_after_a_same_client_reconnect_keeps_the_new_grant(
+    pool: sqlx::PgPool,
+) {
+    let mock = oauth_http::spawn().await;
+    let server = oauth_http::create_server(&pool, &mock, None).await;
+    oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+    oauth_http::age_token(&pool, server.id).await;
+    let config = oauth_http::config(&pool, server.id).await;
+    let (call, gate) = call_held_at_refresh(&pool, &mock, &config).await;
+
+    let reconnected = oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+    evict(server.id).await;
+    gate.add_permits(1);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), call)
+        .await
+        .expect("the call finishes once the refresh is let through")
+        .expect("call task");
+
+    let stored = oauth_http::config(&pool, server.id).await.oauth_credentials.expect("a grant");
+    assert_eq!(
+        stored.0["token_response"]["access_token"].as_str(),
+        Some(reconnected.as_str()),
+        "the Reconnect's grant stays"
+    );
+    assert!(result.is_err(), "the call went on with the replaced grant: {result:?}");
     evict(server.id).await;
 }
 
@@ -387,5 +449,39 @@ async fn test_a_check_that_loses_a_refresh_race_is_not_reported_as_expired(pool:
     gate.add_permits(1);
 
     assert_eq!(check.await.expect("check task"), Ok(vec!["echo".to_string()]));
+    evict(server.id).await;
+}
+
+/// SME-177 review 1: a status check whose refresh loses the compare-and-set
+/// (here to a Reconnect with the same client, while the provider took the
+/// old refresh token) gets rmcp's `InternalError`, not
+/// `AuthorizationRequired`. The grant changed meanwhile, so the check tries
+/// once more with it instead of reading Unreachable.
+#[sqlx::test]
+async fn test_a_check_whose_refresh_loses_to_a_reconnect_tries_the_new_grant(pool: sqlx::PgPool) {
+    let mock = oauth_http::spawn().await;
+    let server = oauth_http::create_server(&pool, &mock, None).await;
+    oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+    oauth_http::age_token(&pool, server.id).await;
+    let config = oauth_http::config(&pool, server.id).await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *mock.refresh_gate.lock().unwrap() = Some(gate.clone());
+
+    let check = tokio::spawn({
+        let (pool, config) = (pool.clone(), config.clone());
+        async move { connection_check(&pool, &config).await }
+    });
+    assert!(
+        wait_until(|| mock.refresh_client_ids.lock().unwrap().len() == 1).await,
+        "the check's refresh should reach the provider"
+    );
+    oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+    gate.add_permits(10);
+    let checked = tokio::time::timeout(std::time::Duration::from_secs(30), check)
+        .await
+        .expect("the check finishes once its refresh is let through")
+        .expect("check task");
+
+    assert_eq!(checked, Ok(vec!["echo".to_string()]), "the Reconnect's grant connects");
     evict(server.id).await;
 }
