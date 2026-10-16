@@ -21,13 +21,54 @@ impl std::fmt::Debug for Auth {
 
 /// A model provider to send requests to: its base URL and credential,
 /// from its `inference_providers` row (`providers::endpoint`).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Endpoint {
     pub base_url: String,
     pub auth: Auth,
+    /// The provider's request slots when it has a max concurrent
+    /// requests (SME-162): a model call holds one from before it sends
+    /// until it ends. `None` is no limit, and for every probe.
+    pub limiter: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 }
 
+// By hand: the slots aren't part of which provider it is.
+impl PartialEq for Endpoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.base_url == other.base_url && self.auth == other.auth
+    }
+}
+
+/// How long a model call waits for a request slot before it says so in
+/// the log (SME-162).
+const SLOW_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl Endpoint {
+    /// Waits for one of the provider's request slots, when it has a limit
+    /// (SME-162), and holds it until the returned permit drops: when the
+    /// call ends, fails, or is dropped (a Stop). A wait past
+    /// `SLOW_SLOT_WAIT` is logged once, naming the host only.
+    pub(super) async fn slot(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, String> {
+        let Some(pool) = self.limiter.clone() else {
+            return Ok(None);
+        };
+        let acquire = pool.acquire_owned();
+        tokio::pin!(acquire);
+        let permit = tokio::select! {
+            permit = &mut acquire => permit,
+            () = tokio::time::sleep(SLOW_SLOT_WAIT) => {
+                let host = url::Url::parse(&self.base_url).ok().and_then(|u| u.host_str().map(str::to_string));
+                tracing::warn!(
+                    waited_secs = SLOW_SLOT_WAIT.as_secs(),
+                    host = host.as_deref().unwrap_or(""),
+                    "waiting for a free request slot on the model provider"
+                );
+                acquire.await
+            }
+        };
+        // Only a closed pool refuses, and no pool is ever closed.
+        permit.map(Some).map_err(|_| "the model provider's request slots were closed".to_string())
+    }
+
     /// `path` (starting with `/`) under the base URL.
     pub fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url.trim_end_matches('/'))

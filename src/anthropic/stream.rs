@@ -694,6 +694,8 @@ async fn stream_message(
     mut on_delta: impl FnMut(&str),
     tries: &mut Tries,
 ) -> Result<StreamedTurn, String> {
+    // Held through the retries and the whole stream (SME-162).
+    let _slot = endpoint.slot().await?;
     // Retried only here, before anything has streamed: nothing has been
     // shown to the viewer yet, so a retry is invisible to them.
     let mut attempt = 0;

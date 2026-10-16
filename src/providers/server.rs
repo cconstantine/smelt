@@ -143,6 +143,20 @@ pub fn template_settings(provider: &db::InferenceProvider, row: Option<&db::Prov
     }
 }
 
+/// How many requests at once `provider` is sent (SME-162): its max
+/// concurrent requests, or with `0` the slot count its server last
+/// reported (`server_caps`). `None` is no limit: none set, or automatic
+/// with no count read yet.
+pub fn resolved_max(provider: &db::InferenceProvider) -> Option<u32> {
+    match provider.max_concurrent_requests? {
+        0 => server_caps(provider)?.total_slots,
+        n => u32::try_from(n).ok(),
+    }
+    // A pool of none would never send anything.
+    .filter(|n| *n > 0)
+}
+
+/// The provider's address, credential and request slots (SME-162).
 pub fn endpoint(provider: &db::InferenceProvider) -> Endpoint {
     let auth = match AuthKind::parse(&provider.auth_kind) {
         Some(AuthKind::Bearer) => Auth::Bearer(provider.secret.clone()),
@@ -151,6 +165,7 @@ pub fn endpoint(provider: &db::InferenceProvider) -> Endpoint {
     Endpoint {
         base_url: provider.base_url.clone(),
         auth,
+        limiter: limiter::slots(provider.id, resolved_max(provider)),
     }
 }
 
@@ -509,6 +524,7 @@ pub async fn delete_provider(pool: &PgPool, id: i64) -> Result<(), String> {
             Err(e) => return Err(e.to_string()),
         }
     }
+    limiter::forget(id);
     providers_changed();
     Ok(())
 }

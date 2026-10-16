@@ -2,7 +2,7 @@ use super::*;
 
 fn llama_turn_model(template: Option<TemplateSettings>) -> TurnModel {
     TurnModel { adaptive_thinking: true,
-        endpoint: Endpoint { base_url: "http://llama".to_string(), auth: Auth::Bearer("k".to_string()) },
+        endpoint: Endpoint { base_url: "http://llama".to_string(), auth: Auth::Bearer("k".to_string()), limiter: None },
         provider_id: 1,
         model: "flash-next".to_string(),
         thinking: true,

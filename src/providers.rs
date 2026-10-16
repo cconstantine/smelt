@@ -370,6 +370,9 @@ pub use server::*;
 #[cfg(feature = "server")]
 mod server;
 
+#[cfg(feature = "server")]
+pub mod limiter;
+
 #[cfg(test)]
 mod tests;
 

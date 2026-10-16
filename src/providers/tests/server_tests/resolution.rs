@@ -116,6 +116,7 @@ async fn test_a_turn_takes_the_default_and_keeps_it(pool: PgPool) {
             endpoint: Endpoint {
                 base_url: "http://ollama:11434".to_string(),
                 auth: Auth::Bearer("the-secret".to_string()),
+                limiter: None,
             },
             provider_id: bearer.id,
             model: "m1".to_string(),
