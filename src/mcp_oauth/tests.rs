@@ -564,7 +564,11 @@ async fn test_start_and_handle_callback_persists_credentials_and_a_later_fetch_r
     let mut manager = rmcp::transport::auth::AuthorizationManager::new(base_url.as_str())
         .await
         .expect("new manager");
-    manager.set_credential_store(PgCredentialStore::for_refreshes(pool.clone(), created.id));
+    manager.set_credential_store(PgCredentialStore::for_refreshes(
+        pool.clone(),
+        created.id,
+        created.url.clone(),
+    ));
     manager
         .initialize_from_store()
         .await
@@ -738,4 +742,47 @@ async fn test_a_callback_after_edits_that_leave_the_url_as_it_was_saves(pool: Pg
             "case {case}: the grant should be saved"
         );
     }
+}
+
+/// SME-166 review 2: the read side of the same rule. A connection's
+/// manager built for X can outlive a URL edit (SME-167's stale
+/// connection, or a call still holding its client after `evict`); it
+/// reads the store on every request, so once the row holds Y's grant it
+/// must not hand that grant out for X.
+#[sqlx::test]
+async fn test_a_connection_manager_for_an_old_url_does_not_use_the_new_urls_grant(pool: PgPool) {
+    let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
+    let config = create_oauth_server(&pool, &base_url).await;
+    let state = start_attempt(&pool, &config).await;
+    complete_callback(config.id, code_callback(&state, None))
+        .await
+        .expect("sign in for X");
+    let signed_in = db::get_mcp_server_config(&pool, config.id)
+        .await
+        .expect("get mcp server config")
+        .expect("row should exist");
+    let manager = connection_manager(&pool, &signed_in)
+        .await
+        .expect("a connection manager for X");
+
+    change_url(&pool, &config, &config.name, "http://127.0.0.1:1/elsewhere").await;
+    let mut for_y = signed_in.oauth_credentials.clone().expect("X's grant").0;
+    for_y["token_response"]["access_token"] = "token-for-y".into();
+    for_y["token_response"]
+        .as_object_mut()
+        .expect("token response")
+        .remove("expires_in");
+    db::set_mcp_server_oauth_credentials(&pool, config.id, Some(for_y))
+        .await
+        .expect("save Y's grant");
+
+    let token = manager.get_access_token().await;
+    assert!(
+        !matches!(&token, Ok(t) if t == "token-for-y"),
+        "a manager for X must not send Y's token: {token:?}"
+    );
+    assert!(
+        matches!(token, Err(rmcp::transport::auth::AuthError::AuthorizationRequired)),
+        "it should need a sign-in instead: {token:?}"
+    );
 }

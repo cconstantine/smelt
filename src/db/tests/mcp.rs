@@ -591,3 +591,46 @@ async fn test_an_edit_racing_a_url_change_still_clears_the_grant(pool: PgPool) {
         "Y's grant must not stay on the row once it's back at X"
     );
 }
+
+/// SME-166 review 2: a refresh is saved only while the row still has the
+/// URL the refreshing connection was built for, as well as the client.
+#[sqlx::test]
+async fn test_a_refresh_is_saved_only_onto_the_url_its_connection_was_built_for(pool: PgPool) {
+    let created = create_mcp_server_config(
+        &pool,
+        "github",
+        "https://example.com/mcp",
+        &HashMap::new(),
+        "oauth",
+        None,
+        None,
+    )
+    .await
+    .expect("create mcp server config");
+    let grant = serde_json::json!({"client_id": "abc"});
+    set_mcp_server_oauth_credentials(&pool, created.id, Some(grant.clone()))
+        .await
+        .expect("set oauth credentials");
+
+    let saved = save_refreshed_mcp_server_oauth_credentials(
+        &pool,
+        created.id,
+        "https://example.com/old-mcp",
+        "abc",
+        serde_json::json!({"client_id": "abc", "refreshed": "for-the-old-url"}),
+    )
+    .await
+    .expect("refresh for another URL");
+    assert!(!saved, "a refresh for another URL must match nothing");
+
+    let saved = save_refreshed_mcp_server_oauth_credentials(
+        &pool,
+        created.id,
+        "https://example.com/mcp",
+        "abc",
+        serde_json::json!({"client_id": "abc", "refreshed": true}),
+    )
+    .await
+    .expect("refresh for the row's URL");
+    assert!(saved, "a refresh for the row's URL and client should save");
+}
