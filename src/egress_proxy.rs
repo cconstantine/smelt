@@ -265,9 +265,13 @@ async fn handle_sandbox(
             (source, first)
         }
     };
-    if !fetch_guard::allows_request_from(&source, fetch_guard::browser_sends_sec_fetch(&request.host), |host, _| {
-        fetch_guard::sandbox_host(host).is_some()
-    }) {
+    // Only `localhost` on another port is same-site with `localhost`, and
+    // that's the sandbox too (SME-173 review 1).
+    let destination = fetch_guard::Destination {
+        sends_sec_fetch: fetch_guard::browser_sends_sec_fetch(&request.host),
+        same_site_is_home: true,
+    };
+    if !fetch_guard::allows_request_from(&source, destination, |host, _| fetch_guard::sandbox_host(host).is_some()) {
         let from = source.origin.as_deref().map(|o| format!(" ({o})")).unwrap_or_default();
         let message = format!(
             "Refused: a page from another site{from} tried to reach {} in this conversation's \
