@@ -454,6 +454,20 @@ expect_refused_port() { # host
     stop_foreign "$foreign_pid"
 }
 expect_refused_port 127.0.0.1
+# 12b. The refusal names the listener by its program name, never its
+# arguments (review 1): a hand-run process can carry a secret there
+# (`postgres://user:pass@…`, `--token=…`), and the refusal lands in the
+# session's output and logs.
+fport=$(free_port)
+if start_foreign 127.0.0.1 "$fport" "--token=sme175-not-a-real-secret"; then
+    out=$(timeout 10 "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" scripts/check-server start HEAD 2>&1)
+    grep -q "sme175-not-a-real-secret" <<<"$out" && fail "the refusal prints the listener's arguments: $out"
+    grep -qF "pid $foreign_pid (python3)" <<<"$out" || fail "the refusal doesn't name the listener's program: $out"
+    stop_foreign "$foreign_pid"
+else
+    fail "the listener with an argument never listened"
+fi
+
 # 13. The same for a listener on IPv6's loopback only, which curl tries
 # first for localhost and which dx's IPv4 bind doesn't collide with.
 if has_ipv6_loopback; then

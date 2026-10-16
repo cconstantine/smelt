@@ -319,9 +319,11 @@ foreign_listener_inodes() { # pgid (may be empty) port
     return 0
 }
 
-# Who holds the listening sockets $@ (inodes): "pid N (command) in <cwd>"
+# Who holds the listening sockets $@ (inodes): "pid N (program) in <cwd>"
 # for each process this user can see holding one, else that it can't see
-# it. Only reads /proc; never signals anything.
+# it. The program's name only (/proc/<pid>/comm), never its arguments,
+# which can carry a secret (SME-175 review 1). Only reads /proc; never
+# signals anything.
 describe_listeners() { # inode...
     local inode fd pid cmd cwd
     local -a found=() seen=()
@@ -331,9 +333,9 @@ describe_listeners() { # inode...
             pid=${pid%%/*}
             [[ " ${seen[*]} " == *" $pid "* ]] && continue
             seen+=("$pid")
-            cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)
+            cmd=$(cat "/proc/$pid/comm" 2>/dev/null || echo "an unnamed program")
             cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || echo "an unreadable directory")
-            found+=("pid $pid (${cmd% }) in $cwd")
+            found+=("pid $pid ($cmd) in $cwd")
         done
     done
     if [ ${#found[@]} -eq 0 ]; then
