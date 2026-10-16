@@ -434,6 +434,13 @@ stop() {
 }
 
 start() {
+    # A plain decimal port, before anything else (SME-175 review 2): a
+    # leading zero is read as octal by the port checks, which then look at
+    # another port than dx binds, and names another lock file.
+    if ! [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$port" -gt 65535 ]; then
+        echo "CHECK_PORT must be a port number from 1 to 65535, written without a leading zero: '$port'" >&2
+        exit 2
+    fi
     local ref=HEAD
     if [ $# -gt 0 ] && [ "$1" != "--" ]; then
         ref=$1

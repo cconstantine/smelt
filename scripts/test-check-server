@@ -468,6 +468,21 @@ else
     fail "the listener with an argument never listened"
 fi
 
+# 12c. A CHECK_PORT that isn't a plain decimal port is refused at once
+# (review 2): `048811` read as octal made both port checks look at port 0
+# and the lock file name another port than dx's.
+for bad in "0$port" abc 0 70000 "$port "; do
+    : >"$SQLX_CALLS"
+    : >"$pid_file"
+    out=$(timeout 10 "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$bad" CHECK_SCRATCH_DB=1 scripts/check-server start HEAD 2>&1)
+    rc=$?
+    [ "$rc" = 2 ] || fail "CHECK_PORT='$bad': start exited $rc: $out"
+    grep -qF "CHECK_PORT" <<<"$out" || fail "CHECK_PORT='$bad': the refusal doesn't name CHECK_PORT: $out"
+    [ -s "$SQLX_CALLS" ] && fail "CHECK_PORT='$bad': start called sqlx: $(cat "$SQLX_CALLS")"
+    [ -s "$pid_file" ] && fail "CHECK_PORT='$bad': start wrote a pid file"
+    "${cs_env[@]}" CHECK_WORKTREE="$worktree" scripts/check-server stop >/dev/null 2>&1
+done
+
 # 13. The same for a listener on IPv6's loopback only, which curl tries
 # first for localhost and which dx's IPv4 bind doesn't collide with.
 if has_ipv6_loopback; then
