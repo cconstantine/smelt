@@ -228,13 +228,29 @@ impl Purl {
 /// `-` (quoted, it's still an option to npm, pip, go or cargo), or holding
 /// a control character.
 fn shell_word(value: &str) -> Result<Cow<'_, str>, String> {
-    if value.is_empty() || value.starts_with('-') || value.chars().any(char::is_control) {
+    let refuse = |shown: String, why: &str| {
+        Err(format!(
+            "The catalog's install details include {shown}, which {why}, so smelt won't put it in a command: fill in the install command."
+        ))
+    };
+    if value.is_empty() {
+        return refuse("an empty value".to_string(), "is empty");
+    }
+    // The text around the first control character, so it shows however
+    // far into a long word (a URL) it is.
+    let first_bad = value.chars().position(char::is_control);
+    let shown = |from: usize| {
         const SHOWN: usize = 80;
-        let shown: String = value.chars().take(SHOWN).collect();
-        let more = if value.chars().nth(SHOWN).is_some() { "…" } else { "" };
-        return Err(format!(
-            "The catalog's install details include {shown:?}{more}, which smelt won't put in a command: fill in the install command."
-        ));
+        let text: String = value.chars().skip(from).take(SHOWN).collect();
+        let before = if from > 0 { "…" } else { "" };
+        let after = if value.chars().nth(from + SHOWN).is_some() { "…" } else { "" };
+        format!("{before}{text:?}{after}")
+    };
+    if let Some(at) = first_bad {
+        return refuse(shown(at.saturating_sub(20)), "holds a control character");
+    }
+    if value.starts_with('-') {
+        return refuse(shown(0), "starts with \"-\" (an option to the installer)");
     }
     if value.chars().all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c)) {
         Ok(Cow::Borrowed(value))
@@ -645,7 +661,7 @@ mod tests {
         let cases = [
             (package_with_extras("pkg", "pkg:npm/pkg@1.0.0", &["--registry=http://evil.test"]), r#""--registry=http://evil.test""#, "node:22-slim"),
             (package_with_extras("pkg", "pkg:npm/pkg@1.0.0", &["a\nb"]), r#""a\nb""#, "node:22-slim"),
-            (package_with_extras("pkg", "pkg:npm/pkg@1.0.0", &[""]), r#""""#, "node:22-slim"),
+            (package_with_extras("pkg", "pkg:npm/pkg@1.0.0", &[""]), "an empty value", "node:22-slim"),
             (package_with_extras("pkg", "pkg:pypi/pkg@1.0", &[long.as_str()]), long_shown.as_str(), "python:3-slim"),
             ("name: pkg\nlanguages:\n  - Python\nsource:\n  id: pkg:cargo/pkg@-x\n".to_string(), r#""-x""#, "rust:1"),
         ];
@@ -663,6 +679,27 @@ mod tests {
             assert_eq!(c.command, "pkg", "{shown}");
             assert_eq!(c.file_types.get("py").map(String::as_str), Some("python"), "{shown}");
         }
+    }
+
+    #[test]
+    fn test_a_refusal_note_says_why_and_shows_where() {
+        let note = |yaml: &str| {
+            let s = suggest(yaml, HELIX).expect("a partial suggestion");
+            assert_eq!(s.config.install_command, "", "{yaml}");
+            s.notes.into_iter().find(|n| n.contains("won't put")).expect("a refusal note")
+        };
+        // A control character past the first 80 characters of a long word
+        // (the URL) is still shown.
+        let late = note(
+            "name: tool\nsource:\n  id: pkg:github/owner/tool@v1\n  asset:\n    - target: linux_x64\n      file: \"tool_linux_amd64_with_a_long_enough_name_to_push_it_past_eighty\\n.tar.gz\"\n",
+        );
+        assert!(late.contains(r"\n.tar.gz"), "{late}");
+        assert!(late.contains("control character"), "{late}");
+
+        let option = note(&package_with_extras("pkg", "pkg:npm/pkg@1.0.0", &["--registry=http://evil.test"]));
+        assert!(option.contains("starts with \"-\""), "{option}");
+        let empty = note(&package_with_extras("pkg", "pkg:npm/pkg@1.0.0", &[""]));
+        assert!(empty.contains("an empty value"), "{empty}");
     }
 
     #[test]
