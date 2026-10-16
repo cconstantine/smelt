@@ -196,6 +196,15 @@ impl PreviewTemplate {
         format!("{}://{}{first}{}{second}{}", self.scheme, self.before, self.between, self.after)
     }
 
+    /// `match_host` for the listener's own `Host` header, which a proxy in
+    /// front of it may write with the scheme's default port
+    /// (`$host:$server_port`), though a browser never does (SME-183's
+    /// review). `Origin` and `Referer` stay matched exactly.
+    pub fn match_request_host(&self, host: &str) -> Option<(i64, PodHost, u16)> {
+        let default = if self.scheme == "https" { ":443" } else { ":80" };
+        self.match_host(host.strip_suffix(default).unwrap_or(host))
+    }
+
     /// The conversation, host in its pod, and port a request's `Host`
     /// header names, if it's a preview address at all.
     pub fn match_host(&self, host: &str) -> Option<(i64, PodHost, u16)> {
@@ -402,7 +411,7 @@ mod server {
     async fn handle(mut request: Request<Incoming>, preview: &Preview<'_>, cached: &CachedUpstream) -> Response<Body> {
         let template = preview.template;
         let host = request.headers().get(HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
-        let Some((conversation, pod_host, port)) = template.match_host(host) else {
+        let Some((conversation, pod_host, port)) = template.match_request_host(host) else {
             return text_response(StatusCode::NOT_FOUND, "This isn't a sandbox preview address.");
         };
         // Only this conversation's own previews, and someone opening the link

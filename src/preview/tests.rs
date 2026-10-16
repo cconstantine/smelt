@@ -181,3 +181,18 @@ fn test_templates_no_browser_host_can_match_are_refused() {
     let error = PreviewTemplate::parse("https://{port}-{conversation}.bücher.example").expect_err("non-ASCII");
     assert!(error.contains("xn--"), "the error should say to write the xn-- form: {error:?}");
 }
+
+/// A proxy in front of the listener may write the default port into
+/// `Host` (nginx's `$host:$server_port`); `Origin` is still matched
+/// exactly, as a browser writes it (SME-183's review).
+#[test]
+fn test_a_request_host_spelling_out_the_default_port_still_matches() {
+    let t = template("https://{port}-{conversation}.preview.example.com:443");
+    assert_eq!(t.match_request_host("3000-42.preview.example.com:443"), Some((42, PodHost::Localhost, 3000)));
+    assert_eq!(t.match_request_host("3000-42.preview.example.com"), Some((42, PodHost::Localhost, 3000)));
+    assert_eq!(t.match_request_host("3000-42.preview.example.com:80"), None);
+    assert_eq!(t.match_host("3000-42.preview.example.com:443"), None, "an Origin spelling out :443 isn't a browser's");
+    let t = template("http://{port}-{conversation}.preview.example.com");
+    assert_eq!(t.match_request_host("3000-42.preview.example.com:80"), Some((42, PodHost::Localhost, 3000)));
+    assert_eq!(t.match_request_host("3000-42.preview.example.com:443"), None);
+}
