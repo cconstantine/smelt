@@ -130,6 +130,7 @@ pub(super) async fn sandbox_routes() {
     );
 
     scenario_open_after_a_poisoned_session_lock().await;
+    scenario_a_sandbox_connection_carries_one_request().await;
 }
 
 /// SME-119: once a browsing call has panicked while holding the
@@ -169,4 +170,100 @@ async fn scenario_open_after_a_poisoned_session_lock() {
         .expect("close_session should succeed");
     assert_eq!(current_url(conversation_id), None);
     assert!(!SESSIONS.is_poisoned(), "the lock should be healthy again");
+}
+
+/// A stand-in for a server in the pod that ignores the proxy's
+/// `Connection: close`: it answers every request on a connection with an
+/// HTTP/1.1 keep-alive reply and reads on. Returns its address and, per
+/// connection it accepted, the request lines that connection carried.
+async fn start_keep_alive_server(
+    page: &'static str,
+) -> (std::net::SocketAddr, std::sync::Arc<Mutex<Vec<Vec<String>>>>, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a test-local port");
+    let addr = listener.local_addr().expect("local addr");
+    let connections = std::sync::Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let seen = connections.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let index = {
+                let mut all = seen.lock().unwrap();
+                all.push(Vec::new());
+                all.len() - 1
+            };
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    while let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        buf.drain(..end + 4);
+                        let line = head.lines().next().unwrap_or_default().to_string();
+                        seen.lock().unwrap()[index].push(line.clone());
+                        let body = if line.split(' ').nth(1).is_some_and(|t| t == "/" || t.ends_with(":4600/")) {
+                            page.to_string()
+                        } else {
+                            "ok".to_string()
+                        };
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                             Connection: keep-alive\r\nKeep-Alive: timeout=60\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if stream.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+            });
+        }
+    });
+    (addr, connections, task)
+}
+
+/// SME-165: a server in the pod that answers keep-alive can't make Chrome
+/// send a second request down one proxy connection, where the proxy would
+/// pass it on unchecked. Each request to the sandbox comes on a
+/// connection of its own, the one the proxy checked.
+async fn scenario_a_sandbox_connection_carries_one_request() {
+    let page: &'static str = "<html><body><div id=\"out\">pending</div><script>\
+             (async () => {\
+               for (const p of ['/a', '/b', '/c']) { await (await fetch(p)).text(); }\
+               document.getElementById('out').innerText = 'done';\
+             })().catch(e => { document.getElementById('out').innerText = 'failed ' + e; });\
+             </script></body></html>";
+    let (pod_addr, connections, _server) = start_keep_alive_server(page).await;
+    let dialed = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let conversation_id: i64 = 900_165;
+    open_session(
+        conversation_id,
+        Some(crate::egress_proxy::dial_to(pod_addr, dialed.clone())),
+    )
+    .await
+    .expect("open a routed session");
+    let loaded = navigate(conversation_id, "http://localhost:4600/").await;
+    let mut text = loaded.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while loaded.is_ok() && text.contains("pending") && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        text = read(conversation_id).await.map(|s| s.text).unwrap_or_default();
+    }
+    close_session(conversation_id).await.expect("close the routed session");
+    loaded.expect("a routed session should load the sandbox's page");
+    assert!(text.contains("done"), "the page's fetches didn't finish: {text:?}");
+    let connections = connections.lock().unwrap().clone();
+    let requests: usize = connections.iter().map(Vec::len).sum();
+    assert!(requests >= 4, "expected the page and its three fetches, got {connections:?}");
+    assert!(
+        connections.iter().all(|c| c.len() == 1),
+        "a proxy connection to the sandbox carried more than one request, the later ones unchecked: {connections:?}"
+    );
 }
