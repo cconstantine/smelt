@@ -397,7 +397,7 @@ fn tool_result(tool_use_id: &str, content: &str) -> anthropic::ContentBlock {
 #[sqlx::test]
 async fn test_a_written_answer_caught_queued_by_a_stop_dismisses_the_question(pool: PgPool) {
     let _guard = lock_turn_tests();
-    let conversation = db::create_conversation_with_id(&pool, 9_100_000_309).await.expect("conversation");
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_312).await.expect("conversation");
     let requests = start_recording_mock_upstream(&pool, vec![ask_body(), text_reply_body("OK.")]).await;
     run_turn(&pool, conversation.id, hello()).await.expect("asks");
 
