@@ -227,7 +227,9 @@ impl Purl {
 /// saved install command runs in the server pod's `sh -c` as written, so
 /// this is the only place it can be quoted. As is when every character is
 /// in CPython `shlex.quote`'s safe set (every real registry value but the
-/// unfilled templates), else in single quotes, POSIX style. Refused, with
+/// unfilled templates), else in single quotes, POSIX style. `value` is a
+/// whole word as `install()` puts it together (`pkg@1.0`, a URL), so a
+/// part inside one can be empty or start with `-` harmlessly. Refused, with
 /// the note to show, when quoting can't make it safe: empty, starting with
 /// `-` (quoted, it's still an option to npm, pip, go or cargo), or holding
 /// a control character, or one that shows as something else ([`invisible`]).
