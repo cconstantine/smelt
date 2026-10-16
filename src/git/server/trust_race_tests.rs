@@ -1,9 +1,10 @@
 //! SME-181: a trust decision and a load racing for the same remote.
 //! Each test forces one named interleaving with a row lock (the pattern
-//! in tdd.md): the test's own uncommitted transaction holds the row the
-//! first caller's insert conflicts with, so that caller stops mid-way;
-//! the second caller then runs, and the test rolls back once it has
-//! finished or is waiting too.
+//! in tdd.md): the test's own uncommitted transaction holds a row the
+//! first caller needs (an inserted row its insert conflicts with, or an
+//! existing row held `FOR UPDATE` that its delete must wait for), so
+//! that caller stops mid-way; the second caller then runs, and the test
+//! rolls back once it has finished or is waiting too.
 
 use super::db_tests::{cloned_repo, file, only_repo};
 use super::*;
