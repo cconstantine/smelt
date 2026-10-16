@@ -124,13 +124,70 @@ fn test_mouse_event_params_wheel_holds_no_button() {
     assert_eq!(params.delta_y, Some(120.0));
 }
 
+/// Each `(typed, expected)` case that `normalize_address` gets wrong,
+/// so a failure names every wrong case at once rather than the first.
+fn wrong_addresses(cases: &[(&str, &str)]) -> Vec<String> {
+    cases
+        .iter()
+        .filter_map(|&(typed, expected)| {
+            let got = normalize_address(typed);
+            (got.as_deref() != Ok(expected))
+                .then(|| format!("{typed:?}: expected {expected:?}, got {got:?}"))
+        })
+        .collect()
+}
+
 #[test]
-fn test_normalize_address_adds_https_to_a_bare_host() {
-    assert_eq!(normalize_address("example.com").unwrap(), "https://example.com");
-    assert_eq!(
-        normalize_address("localhost:8080/a?b=1").unwrap(),
-        "https://localhost:8080/a?b=1"
-    );
+fn test_normalize_address_gives_local_and_private_addresses_http() {
+    // SME-184: as in Chromium's omnibox, an IP literal, an explicit port
+    // other than 443, a single-label name or a local-only suffix gets
+    // plain http, since a dev server in the sandbox speaks no TLS.
+    let wrong = wrong_addresses(&[
+        ("localhost:5173", "http://localhost:5173"),
+        ("localhost", "http://localhost"),
+        ("LOCALHOST:5173/x", "http://LOCALHOST:5173/x"),
+        ("localhost:8080/a?b=1", "http://localhost:8080/a?b=1"),
+        ("app.localhost:5173", "http://app.localhost:5173"),
+        ("app.localhost", "http://app.localhost"),
+        ("127.0.0.1:3000", "http://127.0.0.1:3000"),
+        ("127.1", "http://127.1"),
+        ("10.0.0.5", "http://10.0.0.5"),
+        ("192.168.1.20:8080", "http://192.168.1.20:8080"),
+        ("172.16.0.1", "http://172.16.0.1"),
+        ("[::1]:5173", "http://[::1]:5173"),
+        ("[fd00::1]", "http://[fd00::1]"),
+        ("8.8.8.8", "http://8.8.8.8"),
+        ("myhost", "http://myhost"),
+        ("myhost/path", "http://myhost/path"),
+        ("nas.lan", "http://nas.lan"),
+        ("foo.internal", "http://foo.internal"),
+        ("printer.local", "http://printer.local"),
+        ("site.test", "http://site.test"),
+        ("x.home.arpa", "http://x.home.arpa"),
+        ("localhost.", "http://localhost."),
+        ("example.com:8443", "http://example.com:8443"),
+    ]);
+    assert!(wrong.is_empty(), "wrong scheme for:\n{}", wrong.join("\n"));
+}
+
+#[test]
+fn test_normalize_address_gives_public_names_https() {
+    let wrong = wrong_addresses(&[
+        ("example.com", "https://example.com"),
+        ("example.com/a?b=1", "https://example.com/a?b=1"),
+        ("example.com:80", "https://example.com:80"),
+        ("sub.example.co.uk", "https://sub.example.co.uk"),
+        // Only a whole label matches a local suffix: `contest` isn't `test`.
+        ("shop.contest", "https://shop.contest"),
+        // A private suffix not on the short list stays https (a trade-off).
+        ("nas.corp", "https://nas.corp"),
+        // 443 is https's own port (Chromium would send http, which fails).
+        ("example.com:443", "https://example.com:443"),
+        // Not a parseable host: kept as before, for `navigate` to refuse.
+        ("::1", "https://::1"),
+        ("localhost:99999", "https://localhost:99999"),
+    ]);
+    assert!(wrong.is_empty(), "wrong scheme for:\n{}", wrong.join("\n"));
 }
 
 #[test]
