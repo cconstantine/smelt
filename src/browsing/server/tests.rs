@@ -188,6 +188,9 @@ fn test_normalize_address_gives_public_names_https() {
         ("nas.corp", "https://nas.corp"),
         // 443 is https's own port (Chromium would send http, which fails).
         ("example.com:443", "https://example.com:443"),
+        // Review 2: an IP typed with :443 too.
+        ("127.0.0.1:443", "https://127.0.0.1:443"),
+        ("[::1]:443", "https://[::1]:443"),
         // Not a parseable host: kept as before, for `navigate` to refuse.
         ("::1", "https://::1"),
         ("localhost:99999", "https://localhost:99999"),
