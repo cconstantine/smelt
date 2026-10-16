@@ -33,12 +33,12 @@ async fn test_an_mcp_call_is_a_span_under_its_caller() {
 
 /// The connects a turn's tool list starts run in the background, but
 /// as the turn's children, not roots of their own.
-#[tokio::test]
-async fn test_a_tool_lists_connect_is_a_child_of_its_caller() {
-    let config = test_config(-137_003, "nowhere");
+#[sqlx::test]
+async fn test_a_tool_lists_connect_is_a_child_of_its_caller(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
     let (_, spans) = crate::telemetry::capture_spans(async {
         crate::telemetry::in_span(tracing::info_span!("caller"), async {
-            tool_definitions_for(&test_pool(), std::slice::from_ref(&config)).await
+            tool_definitions_for(&pool, std::slice::from_ref(&config)).await
         })
         .await
     })
@@ -51,16 +51,15 @@ async fn test_a_tool_lists_connect_is_a_child_of_its_caller() {
 /// Review 1: a failed connect's error quotes the server's URL, and a
 /// query can hold its key (`?apiKey=`). Neither a span's status nor the
 /// tool list's warning exports it.
-#[tokio::test]
-async fn test_a_failed_connect_exports_no_query_from_the_servers_url() {
-    let mut config = test_config(-137_004, "keyed");
-    config.url = "http://127.0.0.1:1/mcp?apiKey=SECRET-KEY".to_string();
+#[sqlx::test]
+async fn test_a_failed_connect_exports_no_query_from_the_servers_url(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, "http://127.0.0.1:1/mcp?apiKey=SECRET-KEY").await;
     let (_, spans) = crate::telemetry::capture_spans(async {
         crate::telemetry::in_span(tracing::info_span!("caller"), async {
-            let _ = connection_check(&test_pool(), &config).await;
+            let _ = connection_check(&pool, &config).await;
             evict(config.id).await;
             lock_failures().remove(&config.id);
-            tool_definitions_for(&test_pool(), std::slice::from_ref(&config)).await
+            tool_definitions_for(&pool, std::slice::from_ref(&config)).await
         })
         .await
     })
@@ -115,8 +114,8 @@ fn test_a_transport_failures_span_description_quotes_no_reply_body() {
 /// that answers `tools/call` with an HTTP 500 whose plain-text body
 /// echoes the call's input. rmcp quotes that body in a transport
 /// error; the model gets it, the exported spans don't.
-#[tokio::test]
-async fn test_a_tools_call_answered_with_a_non_json_rpc_500_exports_none_of_the_body() {
+#[sqlx::test]
+async fn test_a_tools_call_answered_with_a_non_json_rpc_500_exports_none_of_the_body(pool: sqlx::PgPool) {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     async fn handler(axum::Json(request): axum::Json<serde_json::Value>) -> axum::response::Response {
@@ -145,9 +144,9 @@ async fn test_a_tools_call_answered_with_a_non_json_rpc_500_exports_none_of_the_
     let app = axum::Router::new().route("/mcp", axum::routing::post(handler));
     tokio::spawn(async move { axum::serve(listener, app).await });
 
-    let config = config_at(-137_006, format!("http://{addr}/mcp"));
+    let config = create_static_server(&pool, &format!("http://{addr}/mcp")).await;
     let (result, spans) = crate::telemetry::capture_spans(async {
-        call_tool(&test_pool(), &config, "search", serde_json::json!({"q": "SECRET-ECHOED-INPUT"})).await
+        call_tool(&pool, &config, "search", serde_json::json!({"q": "SECRET-ECHOED-INPUT"})).await
     })
     .await;
     evict(config.id).await;
@@ -160,10 +159,10 @@ async fn test_a_tools_call_answered_with_a_non_json_rpc_500_exports_none_of_the_
     assert!(!exported.contains("SECRET"), "{exported}");
 }
 
-#[tokio::test]
-async fn test_a_failed_mcp_connect_is_a_failed_span() {
-    let config = test_config(-137_002, "nowhere");
-    let (result, spans) = crate::telemetry::capture_spans(connection_check(&test_pool(), &config)).await;
+#[sqlx::test]
+async fn test_a_failed_mcp_connect_is_a_failed_span(pool: sqlx::PgPool) {
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let (result, spans) = crate::telemetry::capture_spans(connection_check(&pool, &config)).await;
     assert!(result.is_err());
     let connects: Vec<_> = spans.iter().filter(|span| span.name == "mcp connect").collect();
     assert!(!connects.is_empty(), "{spans:?}");

@@ -177,9 +177,9 @@ async fn register_test_connection(server_id: i64, second_tool_disabled: bool) ->
 }
 
 /// Never actually connected to — every test below either pre-populates
-/// `REGISTRY` directly (so `connect` is never reached) or uses a
-/// `static_headers` config (so `mcp_oauth::connection_manager`, the
-/// only path that touches the pool, is never reached either). Same lazy-fake-pool
+/// `REGISTRY` directly (so `connect`, which reads the server's row, is
+/// never reached). Tests that connect use a `#[sqlx::test]` pool and a
+/// row (`create_static_server`). Same lazy-fake-pool
 /// pattern `anthropic::tools`' own tests already use for the same
 /// reason. OAuth-touching behavior gets its own `#[sqlx::test]`s in
 /// `mcp_oauth.rs`.
@@ -203,11 +203,28 @@ fn test_config(id: i64, name: &str) -> McpServerConfig {
     }
 }
 
-fn config_at(id: i64, url: String) -> McpServerConfig {
-    McpServerConfig {
-        url,
-        ..test_config(id, "unreachable")
-    }
+/// Makes the next row `pool`'s database inserts into `mcp_servers` take
+/// an id no other test in the process uses, and returns it: `REGISTRY`
+/// and the other maps are shared by every test in the process, while
+/// each `#[sqlx::test]` database numbers rows from 1.
+async fn next_server_id(pool: &sqlx::PgPool) -> i64 {
+    static NEXT_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(20_000_000);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    sqlx::query(&format!("ALTER TABLE mcp_servers ALTER COLUMN id RESTART WITH {id}"))
+        .execute(pool)
+        .await
+        .expect("set the next mcp_servers id");
+    id
+}
+
+/// A `static_headers` server row at `url`, with an id of its own: since
+/// SME-167 a connect reads its server's row, so a test that reaches
+/// `connect` needs one.
+async fn create_static_server(pool: &sqlx::PgPool, url: &str) -> McpServerConfig {
+    let id = next_server_id(pool).await;
+    crate::db::create_mcp_server_config(pool, &format!("static-{id}"), url, &HashMap::new(), "static_headers", None, None)
+        .await
+        .expect("create mcp server config")
 }
 
 /// SME-113: an MCP server over real HTTP that checks bearer tokens, and
@@ -475,20 +492,14 @@ mod oauth_http {
         mock
     }
 
-    /// An `oauth` server row pointing at `mock`, with an id of its own:
-    /// `REGISTRY` and the other maps are shared by every test in the
-    /// process, while each `#[sqlx::test]` database numbers rows from 1.
+    /// An `oauth` server row pointing at `mock`, with an id of its own
+    /// (`next_server_id`).
     pub async fn create_server(
         pool: &sqlx::PgPool,
         mock: &Mock,
         client: Option<(&str, &str)>,
     ) -> McpServerConfig {
-        static NEXT_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(20_000_000);
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        sqlx::query(&format!("ALTER TABLE mcp_servers ALTER COLUMN id RESTART WITH {id}"))
-            .execute(pool)
-            .await
-            .expect("set the next mcp_servers id");
+        let id = next_server_id(pool).await;
         crate::db::create_mcp_server_config(
             pool,
             &format!("oauth-http-{id}"),
@@ -548,7 +559,9 @@ mod oauth_http {
     }
 }
 
+mod gated_http;
 mod client;
+mod registry;
 mod spans;
 mod connection;
 mod hanging;

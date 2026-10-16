@@ -54,14 +54,13 @@ async fn test_connection_check_reports_tool_names_for_a_connected_server() {
     REGISTRY.lock().await.remove(&server_id);
 }
 
-#[tokio::test]
-async fn test_connection_check_errors_for_an_unconfigured_server() {
+#[sqlx::test]
+async fn test_connection_check_errors_for_an_unconfigured_server(pool: sqlx::PgPool) {
     // No `register_test_connection` call — nothing in the registry, and
-    // `test_config`'s URL is deliberately unroutable, so this must
-    // report an error rather than panicking or hanging.
-    let server_id = -1005;
-    let result =
-        connection_check(&test_pool(), &test_config(server_id, "unreachable-server")).await;
+    // the row's URL is deliberately unroutable, so this must report an
+    // error rather than panicking or hanging.
+    let config = create_static_server(&pool, &test_config(0, "unused").url).await;
+    let result = connection_check(&pool, &config).await;
     assert!(
         result.is_err(),
         "expected an unreachable server to report Err, got {result:?}"
