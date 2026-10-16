@@ -296,9 +296,9 @@ async fn test_a_javascript_authorization_endpoint_is_refused(pool: PgPool) {
 /// Pulls `state`'s value out of the authorization URL `start` returns
 /// — standing in for the real browser round-trip a live flow would
 /// need (the provider's `/authorize` page reflecting it back on
-/// redirect). Percent-decodes with the same crate already used for
-/// `callback_handler`'s error encoding, rather than adding a URL-
-/// parsing dependency just for this.
+/// redirect). Percent-decodes with the `percent_encoding` crate smelt
+/// already depends on, rather than adding a URL-parsing dependency just
+/// for this.
 fn extract_query_param(url: &str, key: &str) -> Option<String> {
     let query = url.split_once('?')?.1;
     query.split('&').find_map(|pair| {
@@ -321,7 +321,7 @@ async fn assert_attempt_cleared(server_id: i64, state: &str, base_url: &str) {
     .await;
     let error = retry.expect_err("the attempt should be gone after a rejected callback");
     assert!(
-        error.contains("no OAuth authorization attempt in progress"),
+        error.message.contains("no OAuth authorization attempt in progress"),
         "unexpected error: {error}"
     );
 }
@@ -340,7 +340,7 @@ async fn test_a_callback_without_the_advertised_issuer_is_rejected(pool: PgPool)
         .expect_err("a provider that advertises iss must send it");
 
     assert!(
-        error.contains("missing required issuer"),
+        error.message.contains("missing required issuer"),
         "unexpected error: {error}"
     );
     assert!(stored_credentials(&pool, config.id).await.is_none());
@@ -364,7 +364,7 @@ async fn test_a_callback_from_a_different_issuer_is_rejected(pool: PgPool) {
     .expect_err("an iss other than the advertised issuer must be refused");
 
     assert!(
-        error.contains("issuer mismatch"),
+        error.message.contains("issuer mismatch"),
         "unexpected error: {error}"
     );
     assert!(stored_credentials(&pool, config.id).await.is_none());
@@ -420,41 +420,66 @@ async fn test_an_error_callback_from_the_advertised_issuer_shows_its_error_and_e
     .await
     .expect_err("an error callback is a failed attempt");
 
-    assert_eq!(error, "The user denied access");
+    assert_eq!(error.message, "The user denied access");
     assert_attempt_cleared(config.id, &state, &base_url).await;
 }
 
-/// An error callback smelt can't tie to the attempt and its issuer shows
-/// `UNVERIFIED_ERROR`, not the provider's text, and still ends the
-/// attempt.
+/// An error callback with the attempt's state but an issuer smelt can't
+/// verify shows `UNVERIFIED_ERROR`, not the provider's text, and still ends
+/// the attempt: only the provider's redirect can carry the state.
 #[sqlx::test]
-async fn test_an_error_callback_that_cannot_be_verified_hides_its_text(pool: PgPool) {
+async fn test_an_error_callback_with_the_state_but_an_unverified_issuer_hides_its_text(
+    pool: PgPool,
+) {
+    let base_url = spawn_mock_oauth_server(MockMetadata::Issuer {
+        iss_supported: true,
+    })
+    .await;
+    let config = create_oauth_server(&pool, &base_url).await;
+    let cases: [(&str, Option<&str>); 2] = [
+        ("no iss", None),
+        ("a different iss", Some("https://attacker.example")),
+    ];
+    for (case, iss) in cases {
+        let state = start_attempt(&pool, &config).await;
+
+        let error = complete_callback(config.id, error_callback(Some(&state), iss))
+            .await
+            .expect_err("an error callback is a failed attempt");
+
+        assert_eq!(error.message, UNVERIFIED_ERROR, "case: {case}");
+        assert_attempt_cleared(config.id, &state, &base_url).await;
+    }
+}
+
+/// SME-177 B23: an error callback without the attempt's state shows
+/// `UNVERIFIED_ERROR` and leaves the attempt pending, so the user's own
+/// callback still completes it.
+#[sqlx::test]
+async fn test_an_error_callback_without_the_state_hides_its_text_and_keeps_the_attempt(
+    pool: PgPool,
+) {
     let base_url = spawn_mock_oauth_server(MockMetadata::Issuer {
         iss_supported: true,
     })
     .await;
     let config = create_oauth_server(&pool, &base_url).await;
     let issuer = mock_issuer(&base_url);
-    let cases: [(&str, Option<&str>, Option<&str>); 4] = [
-        ("no iss", Some("STATE"), None),
-        (
-            "a different iss",
-            Some("STATE"),
-            Some("https://attacker.example"),
-        ),
-        ("an unknown state", Some("not-the-state"), Some(&issuer)),
-        ("no state", None, Some(&issuer)),
+    let cases: [(&str, Option<&str>); 2] = [
+        ("an unknown state", Some("not-the-state")),
+        ("no state", None),
     ];
-    for (case, state_param, iss) in cases {
+    for (case, state_param) in cases {
         let state = start_attempt(&pool, &config).await;
-        let state_param = state_param.map(|s| if s == "STATE" { state.as_str() } else { s });
 
-        let error = complete_callback(config.id, error_callback(state_param, iss))
+        let error = complete_callback(config.id, error_callback(state_param, Some(&issuer)))
             .await
             .expect_err("an error callback is a failed attempt");
+        assert_eq!(error.message, UNVERIFIED_ERROR, "case: {case}");
 
-        assert_eq!(error, UNVERIFIED_ERROR, "case: {case}");
-        assert_attempt_cleared(config.id, &state, &base_url).await;
+        complete_callback(config.id, code_callback(&state, Some(&issuer)))
+            .await
+            .unwrap_or_else(|e| panic!("case {case}: the attempt should still complete: {e}"));
     }
 }
 
@@ -467,7 +492,7 @@ async fn test_an_error_callback_with_no_pending_attempt_hides_its_text(pool: PgP
         .await
         .expect_err("an error callback is a failed attempt");
 
-    assert_eq!(error, UNVERIFIED_ERROR);
+    assert_eq!(error.message, UNVERIFIED_ERROR);
 }
 
 /// SEP-2468 only requires `iss` from a provider that advertises it, on
@@ -490,7 +515,7 @@ async fn test_an_error_callback_without_iss_shows_its_error_when_the_provider_do
             .await
             .expect_err("an error callback is a failed attempt");
 
-        assert_eq!(error, "The user denied access");
+        assert_eq!(error.message, "The user denied access");
     }
 }
 
@@ -588,6 +613,7 @@ async fn test_handle_callback_without_a_pending_attempt_is_a_clear_error(pool: P
     assert!(
         result
             .unwrap_err()
+            .message
             .contains("no OAuth authorization attempt in progress")
     );
 }
@@ -645,7 +671,7 @@ async fn test_a_callback_after_a_url_edit_saves_nothing(pool: PgPool) {
         .await
         .expect_err("a sign-in for the old address must not complete");
 
-    assert_eq!(error, ADDRESS_CHANGED_ERROR, "the page shows the reason alone");
+    assert_eq!(error.message, ADDRESS_CHANGED_ERROR, "the page shows the reason alone");
     assert!(
         stored_credentials(&pool, config.id).await.is_none(),
         "the old address's grant must not be saved onto the new URL"
@@ -688,7 +714,7 @@ async fn test_a_url_edit_during_the_code_exchange_saves_nothing(pool: PgPool) {
         .expect("callback task")
         .expect_err("a sign-in for the old address must not complete");
 
-    assert_eq!(error, ADDRESS_CHANGED_ERROR, "the page shows the reason alone");
+    assert_eq!(error.message, ADDRESS_CHANGED_ERROR, "the page shows the reason alone");
     assert!(
         stored_credentials(&pool, config.id).await.is_none(),
         "the old address's grant must not be saved onto the new URL"
@@ -708,7 +734,7 @@ async fn test_a_callback_after_the_server_is_deleted_saves_nothing(pool: PgPool)
         .await
         .expect_err("a sign-in for a deleted server must not complete");
 
-    assert_eq!(error, ADDRESS_CHANGED_ERROR, "the page shows the reason alone");
+    assert_eq!(error.message, ADDRESS_CHANGED_ERROR, "the page shows the reason alone");
     assert!(
         db::get_mcp_server_config(&pool, config.id)
             .await
@@ -786,3 +812,29 @@ async fn test_a_connection_manager_for_an_old_url_does_not_use_the_new_urls_gran
         "it should need a sign-in instead: {token:?}"
     );
 }
+
+/// SME-177 B24: rmcp clears a connection's store when the provider's
+/// issuer changed since its load (`initialize_from_store`). A grant saved
+/// after that load (a Reconnect) is not the one it judged, and stays.
+#[sqlx::test]
+async fn test_a_connection_stores_clear_leaves_a_grant_saved_after_its_load(pool: PgPool) {
+    let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
+    let config = create_oauth_server(&pool, &base_url).await;
+    let x = serde_json::json!({"client_id": "c", "token_response": null, "granted_scopes": []});
+    let w = serde_json::json!({"client_id": "c", "token_response": null, "granted_scopes": ["w"]});
+    db::set_mcp_server_oauth_credentials(&pool, config.id, Some(x))
+        .await
+        .expect("save X");
+    let store = PgCredentialStore::for_refreshes(pool.clone(), config.id, config.url.clone());
+    store.load().await.expect("load X").expect("X is stored");
+
+    db::set_mcp_server_oauth_credentials(&pool, config.id, Some(w.clone()))
+        .await
+        .expect("save W");
+    store.clear().await.expect("clear");
+
+    assert_eq!(stored_credentials(&pool, config.id).await, Some(w), "W stays");
+}
+
+mod callback_errors;
+mod pending_attempt;

@@ -83,3 +83,66 @@ fn paths_in_finds_each_file_once() {
     paths_in(&result, &mut paths);
     assert_eq!(paths, vec!["/workspace/a.rs", "/workspace/b.rs", "/workspace/c.rs"]);
 }
+
+/// SME-172: open files are compared with the disk by hash; a changed one
+/// is synced again and a deleted one closed, each matched to its own line.
+#[test]
+fn stale_files_resyncs_the_changed_and_closes_the_deleted() {
+    let open = |files: &[(&str, &str)]| -> Vec<(String, String)> {
+        files.iter().map(|(p, t)| (p.to_string(), t.to_string())).collect()
+    };
+    let files = open(&[("/workspace/a.rs", "fn a() {}"), ("/workspace/b.rs", "fn b() {}"), ("/workspace/c.rs", "fn c() {}")]);
+    // Every file as the server has it: nothing to do.
+    let same: Vec<String> = files.iter().map(|(_, t)| sha256(t)).collect();
+    assert_eq!(stale_files(&files, &same), Some((vec![], vec![])));
+    // b changed, c is gone.
+    let hashes = vec![sha256("fn a() {}"), sha256("fn b() { 2 }"), "-".to_string()];
+    assert_eq!(stale_files(&files, &hashes), Some((vec!["/workspace/b.rs".to_string()], vec!["/workspace/c.rs".to_string()])));
+    // a is gone and c changed: each answer goes with its own file.
+    let hashes = vec!["-".to_string(), sha256("fn b() {}"), sha256("fn c() { 3 }")];
+    assert_eq!(stale_files(&files, &hashes), Some((vec!["/workspace/c.rs".to_string()], vec!["/workspace/a.rs".to_string()])));
+    // A file that isn't UTF-8 was synced as lossy text, which never hashes
+    // like the bytes on disk: it's read again (and `sync` sends nothing,
+    // the lossy text being the same).
+    let lossy = open(&[("/workspace/bin.rs", &String::from_utf8_lossy(b"\xff\xfe"))]);
+    let bytes = {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(b"\xff\xfe"))
+    };
+    assert_eq!(stale_files(&lossy, &[bytes]), Some((vec!["/workspace/bin.rs".to_string()], vec![])));
+    // An answer that doesn't line up with the files is no answer.
+    assert_eq!(stale_files(&files, &same[..2]), None);
+    assert_eq!(stale_files(&files, &[same.clone(), vec!["-".to_string()]].concat()), None);
+}
+
+/// SME-172: a rename's edits are applied only to files the server saw as
+/// they are now; a file changed since, or never sent, is listed.
+#[test]
+fn rename_check_lists_files_the_server_saw_otherwise() {
+    let touched = |path: &str, current: &str, synced: Option<&str>| (path.to_string(), current.to_string(), synced.map(str::to_string));
+    assert_eq!(rename_check(&[touched("/workspace/a.rs", "fn a() {}", Some("fn a() {}"))]), Vec::<String>::new());
+    assert_eq!(
+        rename_check(&[
+            touched("/workspace/a.rs", "fn a() {}", Some("fn a() {}")),
+            touched("/workspace/b.rs", "fn b() {}\n// more\n", Some("fn b() {}\n")),
+            touched("/workspace/c.rs", "fn c() {}", None),
+        ]),
+        vec!["/workspace/b.rs".to_string(), "/workspace/c.rs".to_string()]
+    );
+}
+
+/// SME-172 review 1: a rename is asked again only while its position still
+/// holds: a change to the named file itself stops it, and so do spent rounds.
+#[test]
+fn a_rename_asks_again_only_while_its_position_still_holds() {
+    let named = "/workspace/main.rs";
+    let other = vec!["/workspace/shapes.rs".to_string()];
+    assert_eq!(rename_step(named, &[], 1), RenameStep::Write);
+    assert_eq!(rename_step(named, &[], RENAME_ROUNDS), RenameStep::Write, "a clean last round writes");
+    assert_eq!(rename_step(named, &other, 1), RenameStep::AskAgain);
+    assert_eq!(rename_step(named, &other, RENAME_ROUNDS - 1), RenameStep::AskAgain);
+    assert_eq!(rename_step(named, &other, RENAME_ROUNDS), RenameStep::GiveUp);
+    let with_named = vec!["/workspace/shapes.rs".to_string(), named.to_string()];
+    assert_eq!(rename_step(named, &with_named, 1), RenameStep::NamedFileChanged);
+    assert_eq!(rename_step(named, &with_named, RENAME_ROUNDS), RenameStep::NamedFileChanged);
+}

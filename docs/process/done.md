@@ -28,6 +28,7 @@ Gate per-target dead code with `#[cfg(feature = "...")]` rather than leaving a w
 - a slow or failing dependency (a slow page, a refused request, a timeout);
 - unusual input — non-ASCII, empty, very long, secrets such as passwords.
 - a change that multiplies how often a resource is opened (a connection, a port-forward, a pod): what ends each one's life, a far side that never closes included. On SME-165 one port-forward per request instead of per pooled connection turned a rare leak (a pod server that ignores the end of the request) into one a polling page piles up.
+- a change that multiplies how often a shared file or record is written: list every writer that can run at once, and check the write path is safe for all of them (a temporary name per writer, or a lock). On SME-176 saving the board snapshot every poll instead of only at a wake turned a fixed `.tmp` name that had never been hit into a corrupt snapshot whenever two waiters overlapped.
 
 For a security boundary, also write down what it does *not* cover, and test the paths around it. On `web-browsing`, most of the 21 bugs three reviews found sat at exactly these edges. One of them was an SSRF guard that only watched one page, while popups, WebSockets and service workers went around it — a gap nobody had written down.
 

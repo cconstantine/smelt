@@ -37,7 +37,7 @@ fn ask_input() -> serde_json::Value {
     ]})
 }
 
-fn ask_body() -> String {
+pub(super) fn ask_body() -> String {
     tool_calls_body(&[("toolu_ask", crate::questions::ASK_USER, ask_input())])
 }
 

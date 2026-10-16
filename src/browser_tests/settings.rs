@@ -337,3 +337,85 @@ pub(super) async fn scenario_transcript_scroll(t: &Scenario<'_>) {
         "a 10px scroll up should stay where it was put, but the transcript is {distance}px from its bottom"
     );
 }
+
+/// SME-168: no text in a link shows as the edit page's sign-in error. A
+/// failed callback keeps its error on the server and redirects with only
+/// `?oauth_callback=1`; the page takes the text from the server, once.
+pub(super) async fn scenario_oauth_callback_error_link(t: &Scenario<'_>) {
+    const MARKER: &str = "Your session expired. Call support at 555-0100";
+    const UNVERIFIED: &str = "smelt couldn't verify the authorization provider's response";
+    const NOT_CONNECTED: &str = "Not connected \u{2014} use Connect below.";
+    let pool = t.pool;
+    let server = db::create_mcp_server_config(
+        pool,
+        &unique_id("oauth-callback-error"),
+        "http://127.0.0.1:9/mcp",
+        &std::collections::HashMap::new(),
+        "oauth",
+        None,
+        None,
+    )
+    .await
+    .expect("create an OAuth server");
+    let id = server.id;
+    let mut failures: Vec<String> = Vec::new();
+    // The status shows first; the error, if any, comes from an effect
+    // after mount, so give it a moment before saying none came.
+    let settle = |page: chromiumoxide::Page| async move {
+        let settled = wait_for_text(&page, NOT_CONNECTED, Duration::from_secs(15)).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let text: String = page.evaluate("document.body.innerText").await.ok().and_then(|v| v.into_value().ok()).unwrap_or_default();
+        let errors: usize = page
+            .evaluate("document.querySelectorAll('.mcp-oauth-panel .error').length")
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok())
+            .unwrap_or(usize::MAX);
+        (settled, text, errors)
+    };
+    let encoded: String = percent_encoding::utf8_percent_encode(MARKER, percent_encoding::NON_ALPHANUMERIC).collect();
+
+    // A link carrying its own text: nothing shows.
+    let forged = t.tab(t.url(&format!("mcp-servers/{id}?oauth_error={encoded}"))).await;
+    let (settled, text, errors) = settle(forged).await;
+    if !settled || text.contains(MARKER) || errors != 0 {
+        failures.push(format!("?oauth_error= link: settled {settled}, {errors} errors, marker shown {}", text.contains(MARKER)));
+    }
+
+    // The real route, with a forged error callback: the redirect carries
+    // only the flag, the page strips it and shows smelt's own text.
+    let callback = t
+        .tab(t.url(&format!("oauth/mcp-callback/{id}?error=access_denied&error_description={encoded}&state=forged")))
+        .await;
+    let shown = wait_for_text(&callback, UNVERIFIED, Duration::from_secs(15)).await;
+    let delivered: String = callback
+        .evaluate("performance.getEntriesByType('navigation')[0].name")
+        .await
+        .ok()
+        .and_then(|v| v.into_value().ok())
+        .unwrap_or_default();
+    let search: String = callback.evaluate("location.search").await.ok().and_then(|v| v.into_value().ok()).unwrap_or_default();
+    let text: String = callback.evaluate("document.body.innerText").await.ok().and_then(|v| v.into_value().ok()).unwrap_or_default();
+    if !shown || !delivered.ends_with(&format!("/mcp-servers/{id}?oauth_callback=1")) || !search.is_empty() || text.contains(MARKER) {
+        failures.push(format!(
+            "callback: unverified shown {shown}, delivered {delivered:?}, search {search:?}, marker shown {}",
+            text.contains(MARKER)
+        ));
+    }
+    callback.reload().await.expect("reload the edit page");
+    let (settled, _, errors) = settle(callback).await;
+    if !settled || errors != 0 {
+        failures.push(format!("after a reload: settled {settled}, {errors} errors"));
+    }
+
+    // A bare flag with nothing kept: nothing shows.
+    let flag_only = t.tab(t.url(&format!("mcp-servers/{id}?oauth_callback=1"))).await;
+    let (settled, _, errors) = settle(flag_only).await;
+    if !settled || errors != 0 {
+        failures.push(format!("bare flag: settled {settled}, {errors} errors"));
+    }
+
+    // Deleted before the checks, so a failing one doesn't leave it behind.
+    db::delete_mcp_server_config(pool, id).await.expect("delete the OAuth server");
+    assert!(failures.is_empty(), "{failures:#?}");
+}

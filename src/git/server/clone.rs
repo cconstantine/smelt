@@ -546,7 +546,7 @@ async fn clone_repo_row(
     repo: &db::ConversationRepo,
     guard: CloneGuard,
 ) -> Result<(), String> {
-    let outcome = match sandbox::PodShell::for_pod(pod_id) {
+    let outcome = match sandbox::PodShell::for_pod(pool, pod_id).await {
         Ok(shell) => clone_into_pod(&shell, &repo.url, repo.branch.as_deref(), &repo.dir)
             .await
             .map(|cloned| (shell, cloned)),

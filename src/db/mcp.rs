@@ -260,27 +260,71 @@ pub async fn save_mcp_server_sign_in(
     Ok(updated.rows_affected() == 1)
 }
 
-/// Saves a refreshed grant only while the row still holds a grant for the
-/// same client: a refresh that finishes after a Disconnect, a URL change
-/// or a new Connect mustn't write back over what they wrote (SME-113).
-/// And only while the row's URL is still `url`, the address the
-/// refreshing connection was built for (SME-166 review 2). `false` when
-/// nothing matched.
+/// A server's URL and its stored grant as Postgres's own text (`None` for
+/// no grant), read together; `None` when there's no such server. The text
+/// is what a compare-and-set binds back (`$n::jsonb`): a grant parsed into
+/// a `serde_json::Value` and serialised again isn't always the same JSONB,
+/// since serde_json doesn't round-trip every float (SME-177 review 1).
+pub async fn get_mcp_server_grant(
+    pool: &PgPool,
+    id: i64,
+) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
+    sqlx::query_as("SELECT url, oauth_credentials::text FROM mcp_servers WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Saves a refreshed grant only while the row still holds `refreshed`,
+/// the exact grant the refresh read (as `get_mcp_server_grant`'s text), and that grant is for the same
+/// client: a refresh that finishes after a Disconnect, a URL change or a
+/// new Connect mustn't write back over what they wrote (SME-113). A
+/// Reconnect with a pre-registered client keeps the client id, so the
+/// client alone didn't tell its grant from the old one (SME-177 B24). And
+/// only while the row's URL is still `url`, the address the refreshing
+/// connection was built for (SME-166 review 2). One statement: a write
+/// still uncommitted when it runs makes it wait, and its `WHERE` is then
+/// checked against the committed row. `false` when nothing matched.
 pub async fn save_refreshed_mcp_server_oauth_credentials(
     pool: &PgPool,
     id: i64,
     url: &str,
+    refreshed: &str,
     client_id: &str,
     credentials: serde_json::Value,
 ) -> Result<bool, sqlx::Error> {
     let updated = sqlx::query(
-        "UPDATE mcp_servers SET oauth_credentials = $4, updated_at = now() \
-         WHERE id = $1 AND url = $2 AND oauth_credentials->>'client_id' = $3",
+        "UPDATE mcp_servers SET oauth_credentials = $5, updated_at = now() \
+         WHERE id = $1 AND url = $2 AND oauth_credentials = $3::jsonb \
+           AND oauth_credentials->>'client_id' = $4",
     )
     .bind(id)
     .bind(url)
+    .bind(refreshed)
     .bind(client_id)
     .bind(sqlx::types::Json(credentials))
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected() == 1)
+}
+
+/// Clears a server's grant only while the row still holds `loaded`, the
+/// grant its caller judged (as `get_mcp_server_grant`'s text), at `url`: a connection's store clearing a
+/// grant bound to a provider whose issuer changed mustn't remove a newer
+/// one saved since its load (SME-177). `false` when nothing matched.
+pub async fn clear_mcp_server_oauth_credentials_if(
+    pool: &PgPool,
+    id: i64,
+    url: &str,
+    loaded: &str,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE mcp_servers SET oauth_credentials = NULL, updated_at = now() \
+         WHERE id = $1 AND url = $2 AND oauth_credentials = $3::jsonb",
+    )
+    .bind(id)
+    .bind(url)
+    .bind(loaded)
     .execute(pool)
     .await?;
     Ok(updated.rows_affected() == 1)

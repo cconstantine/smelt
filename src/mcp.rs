@@ -709,12 +709,14 @@ async fn check_sign_in(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<
         };
         let grant_before = stored_grant(pool, config.id).await;
         let mut fetched = fetch(client.clone()).await?;
-        if matches!(fetched, Err(rmcp::transport::auth::AuthError::AuthorizationRequired))
+        use rmcp::transport::auth::AuthError::{AuthorizationRequired, InternalError};
+        if matches!(fetched, Err(AuthorizationRequired | InternalError(_)))
             && stored_grant(pool, config.id).await != grant_before
         {
-            // The provider refused this refresh, but the grant changed
-            // meanwhile: another manager refreshed first with the same
-            // refresh token (review 2). Its new grant is what counts.
+            // The provider refused this refresh, or its save lost the
+            // compare-and-set (SME-177), but the grant changed meanwhile:
+            // another manager refreshed first with the same refresh token
+            // (review 2), or a Reconnect saved a new one. That's what counts.
             fetched = fetch(client).await?;
         }
         fetched.map_err(|e| match e {
