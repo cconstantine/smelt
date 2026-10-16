@@ -223,6 +223,9 @@ pub(super) async fn scenario_markdown_deep_code(t: &Scenario<'_>) {
             ],
         };
         failures.extend(problems.into_iter().map(|p| format!("depth {depth}: {p}")));
+        // Closed before the next depth, however this one ended: a tab still
+        // busy in a hung render would take the CPU the next one needs.
+        t.close_tabs().await;
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
