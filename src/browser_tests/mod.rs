@@ -229,6 +229,7 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "ask_user_card", 60, Box::pin(scenario_ask_user_card(&t))).await;
     run_scenario(&t, only, r, k, "markdown_reply", 60, Box::pin(scenario_markdown_reply(&t))).await;
     run_scenario(&t, only, r, k, "markdown_streaming", 60, Box::pin(scenario_markdown_streaming(&t))).await;
+    run_scenario(&t, only, r, k, "markdown_deep_code", 240, Box::pin(scenario_markdown_deep_code(&t))).await;
     run_scenario(&t, only, r, k, "copy_reply", 120, Box::pin(scenario_copy_reply(&t))).await;
     run_scenario(&t, only, r, k, "markdown_late_image", 90, Box::pin(scenario_markdown_late_image(&t))).await;
     run_scenario(&t, only, r, k, "markdown_long_reply", 90, Box::pin(scenario_markdown_long_reply(&t))).await;

@@ -22,6 +22,17 @@ pub enum Span {
 /// slow on large inputs.
 pub const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
 
+/// The deepest a highlighted tree's spans nest (SME-174). Scopes past it
+/// open no span: their text goes into the innermost span kept, and takes
+/// its colour. The tree is rendered, cloned, compared and dropped
+/// recursively, in the browser too, so an unbounded one could kill the tab
+/// on every load of the conversation: syntect caps its context stack at
+/// 100, but one context can push several scopes, and D's `$(` nests a
+/// scope per `$(` with no bound (about 32,000 deep under
+/// `MAX_HIGHLIGHT_BYTES`); R, TSX and bash reach about 200. Real code
+/// measured reached 47 at most (a large TypeScript `.d.ts`).
+pub const MAX_SPAN_DEPTH: usize = 64;
+
 /// `code` highlighted as `lang` (a fence's info string: a language name
 /// or file extension, matched case-insensitively), or `None` when the
 /// language isn't known, the code is too long, or a grammar fails on it.
@@ -37,6 +48,10 @@ pub fn highlight(lang: &str, code: &str) -> Option<Vec<Span>> {
     let mut scopes = ScopeStack::new();
     // Open spans, innermost last; the first is the root.
     let mut open: Vec<(String, Vec<Span>)> = vec![(String::new(), Vec::new())];
+    // Scopes pushed past `MAX_SPAN_DEPTH`, which opened no span. They're
+    // always the innermost of syntect's scope stack (the hook sees its
+    // basic ops in stack order), so a pop takes one of them first.
+    let mut flattened = 0usize;
     for line in LinesWithEndings::from(code) {
         let ops = state.parse_line(line, syntaxes).ok()?;
         let mut at = 0;
@@ -47,7 +62,10 @@ pub fn highlight(lang: &str, code: &str) -> Option<Vec<Span>> {
             }
             scopes
                 .apply_with_hook(&op, |basic, _| match basic {
+                    // `open` holds the root as well as the spans.
+                    BasicScopeStackOp::Push(_) if open.len() > MAX_SPAN_DEPTH => flattened += 1,
                     BasicScopeStackOp::Push(scope) => open.push((classes_for(scope), Vec::new())),
+                    BasicScopeStackOp::Pop if flattened > 0 => flattened -= 1,
                     BasicScopeStackOp::Pop => close_span(&mut open),
                 })
                 .ok()?;
@@ -204,5 +222,84 @@ mod tests {
     #[test]
     fn test_an_empty_block_is_empty() {
         assert_eq!(highlight("rust", "").map(|s| flatten(&s)), Some(String::new()));
+    }
+
+    /// How deep a tree's spans nest, walked with an explicit stack: a deep
+    /// tree must not make the test itself recurse.
+    fn depth_of(spans: &[Span]) -> usize {
+        let mut deepest = 0;
+        let mut stack: Vec<(&Span, usize)> = spans.iter().map(|s| (s, 0)).collect();
+        while let Some((span, depth)) = stack.pop() {
+            if let Span::Scoped { children, .. } = span {
+                deepest = deepest.max(depth + 1);
+                stack.extend(children.iter().map(|c| (c, depth + 1)));
+            }
+        }
+        deepest
+    }
+
+    /// `flatten`, with an explicit stack.
+    fn text_of(spans: &[Span]) -> String {
+        let mut out = String::new();
+        let mut stack: Vec<&Span> = spans.iter().rev().collect();
+        while let Some(span) = stack.pop() {
+            match span {
+                Span::Text(t) => out.push_str(t),
+                Span::Scoped { children, .. } => stack.extend(children.iter().rev()),
+            }
+        }
+        out
+    }
+
+    /// The deepest syntect's scope stack gets on `code`, from the same
+    /// basic ops `highlight` sees.
+    fn scope_depth(lang: &str, code: &str) -> usize {
+        let syntaxes = syntaxes();
+        let syntax = syntaxes.find_syntax_by_token(lang).expect("a known language");
+        let mut state = ParseState::new(syntax);
+        let mut scopes = ScopeStack::new();
+        let (mut depth, mut deepest) = (0usize, 0usize);
+        for line in LinesWithEndings::from(code) {
+            for (_, op) in state.parse_line(line, syntaxes).expect("parse") {
+                scopes
+                    .apply_with_hook(&op, |basic, _| match basic {
+                        BasicScopeStackOp::Push(_) => {
+                            depth += 1;
+                            deepest = deepest.max(depth);
+                        }
+                        BasicScopeStackOp::Pop => depth = depth.saturating_sub(1),
+                    })
+                    .expect("apply");
+            }
+        }
+        deepest
+    }
+
+    /// SME-174: D's `$(` nests one scope deeper each time, with no bound in
+    /// syntect: unfixed, the longest block `highlight` takes was a tree
+    /// about 32,000 spans deep, and dropping it overflowed the test's
+    /// stack. Past `MAX_SPAN_DEPTH` scopes open no span; their text goes
+    /// into the innermost span kept. 8,000 deep (the browser tier's
+    /// deepest) rather than 32,000: syntect's parse slows with depth, about
+    /// 5 s here in a debug build against 80 s.
+    #[test]
+    fn test_deep_nesting_is_flattened_and_keeps_its_text() {
+        let code = "$(".repeat(8_000);
+        let spans = highlight("d", &code).expect("d is a known language");
+        assert_eq!(depth_of(&spans), MAX_SPAN_DEPTH, "the spans' depth");
+        assert_eq!(text_of(&spans), code);
+        // The tree is dropped here, recursively: a deep one would overflow.
+    }
+
+    /// Under the cap nothing is flattened: one span for every scope syntect
+    /// opened.
+    #[test]
+    fn test_nesting_under_the_cap_is_untouched() {
+        let code = "$(".repeat(40);
+        let spans = highlight("d", &code).expect("d is a known language");
+        let depth = depth_of(&spans);
+        assert!((40..=MAX_SPAN_DEPTH).contains(&depth), "depth {depth}");
+        assert_eq!(depth, scope_depth("d", &code), "a span for every scope");
+        assert_eq!(text_of(&spans), code);
     }
 }
