@@ -195,13 +195,35 @@ async fn test_a_preview_only_answers_its_own_pages_and_direct_visits() {
         let body = response.text().await.unwrap();
         assert!(body.contains("another site"), "the refusal should say why: {body:?}");
     }
+    // Every preview is same-site with every other, so a GET that isn't a
+    // page load needs a Referer from this conversation (SME-173).
+    let other_conversation_page = format!("{other_conversation}/");
+    let refused_gets: [&[(&str, &str)]; 2] = [
+        // Conversation 7's <img> of this preview.
+        &[("sec-fetch-site", "same-site"), ("sec-fetch-mode", "no-cors"), ("referer", &other_conversation_page)],
+        // The same from a no-referrer page, or smelt's markdown image.
+        &[("sec-fetch-site", "same-site"), ("sec-fetch-mode", "no-cors")],
+    ];
+    for headers in refused_gets {
+        let mut request = client.get(&url);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 403, "{headers:?}");
+    }
     assert!(dials.lock().unwrap().is_empty(), "a refused request must not reach the sandbox");
 
-    let allowed: [&[(&str, &str)]; 2] = [
+    let other_port_page = format!("{other_port}/");
+    let allowed: [&[(&str, &str)]; 4] = [
         // Opening the link from smelt's sandbox panel.
         &[("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "navigate")],
         // The conversation's frontend calling its API on another port.
         &[("origin", &other_port), ("sec-fetch-site", "same-site"), ("sec-fetch-mode", "cors")],
+        // The same link where smelt shares the previews' site (noreferrer).
+        &[("sec-fetch-site", "same-site"), ("sec-fetch-mode", "navigate"), ("upgrade-insecure-requests", "1")],
+        // The conversation's frontend loading a script from another port.
+        &[("sec-fetch-site", "same-site"), ("sec-fetch-mode", "no-cors"), ("referer", &other_port_page)],
     ];
     for headers in allowed {
         let mut request = client.get(&url);

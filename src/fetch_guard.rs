@@ -70,8 +70,13 @@ pub fn browser_sends_sec_fetch(host: &str) -> bool {
 /// Browsers send `Origin` on every cross-origin request that could change
 /// something and on every WebSocket handshake (which carries no
 /// `Sec-Fetch-*`), so a present `Origin` must be home. Otherwise
-/// `Sec-Fetch-Site` decides: only a cross-site GET/HEAD page load (a link
-/// someone followed) gets through.
+/// `Sec-Fetch-Site` decides: a cross-site request gets through only as a
+/// GET/HEAD page load (a link someone followed). `same-site` says nothing
+/// on its own: every preview is same-site with every other, and with smelt
+/// when they share a domain. So a same-site request also needs to be a
+/// GET/HEAD page load, or a GET/HEAD whose `Referer` is home (SME-173).
+/// smelt's own preview links send no `Referer` (`noreferrer`), so they get
+/// through as page loads.
 ///
 /// `sends_sec_fetch` says whether the browser sends `Sec-Fetch-*` to the
 /// address it used (`browser_sends_sec_fetch`). Where it does, a request
@@ -95,13 +100,17 @@ pub fn allows_request_from(
         return url_is_home(origin);
     }
     let get_or_head = matches!(source.method.to_ascii_uppercase().as_str(), "GET" | "HEAD");
+    let navigation = get_or_head && source.sec_fetch_mode.as_deref() == Some("navigate");
+    let referer_is_home = get_or_head && source.referer.as_deref().is_some_and(url_is_home);
     match source.sec_fetch_site.as_deref() {
-        Some("cross-site") => source.sec_fetch_mode.as_deref() == Some("navigate") && get_or_head,
-        Some(_) => true,
+        Some("same-origin" | "none") => true,
+        // Every preview shares a site with the others (and with smelt when
+        // they share a domain), so `same-site` alone says nothing (SME-173).
+        Some("same-site") => navigation || referer_is_home,
+        // `cross-site`, and any value browsers don't send.
+        Some(_) => navigation,
         None if sends_sec_fetch => true,
-        None => {
-            get_or_head && (source.upgrade_insecure_requests || source.referer.as_deref().is_some_and(url_is_home))
-        }
+        None => referer_is_home || (get_or_head && source.upgrade_insecure_requests),
     }
 }
 
@@ -336,6 +345,62 @@ mod tests {
         ] {
             assert!(!allows_request_from(&s, true, sandbox_home), "{what} should be refused");
         }
+    }
+
+    /// `source` with the page's `Referer` and `Upgrade-Insecure-Requests`.
+    fn from_page(site: &str, mode: &str, referer: Option<&str>, page_load: bool) -> RequestSource {
+        RequestSource {
+            referer: referer.map(str::to_string),
+            upgrade_insecure_requests: page_load,
+            ..source("GET", None, Some(site), Some(mode))
+        }
+    }
+
+    /// Home as conversation 42's preview judges it: any of its own
+    /// `<port>-42.preview.localhost` hosts.
+    fn preview_42(host: &str, _port: Option<u16>) -> bool {
+        host.strip_suffix(".preview.localhost")
+            .and_then(|label| label.rsplit_once('-'))
+            .is_some_and(|(_, conversation)| conversation == "42")
+    }
+
+    /// Every preview is same-site with every other (`preview.localhost` is
+    /// one site), so `same-site` says nothing about who sent it. The header
+    /// sets are the ones real Chromium 1243 sent in SME-173's spike.
+    #[test]
+    fn test_same_site_requests_from_other_previews_or_smelt_are_refused() {
+        let cases = [
+            ("conversation 7's <img>", from_page("same-site", "no-cors", Some("http://3000-7.preview.localhost:8181/"), false)),
+            ("an <img> with no referrer (smelt's markdown, or a no-referrer page)", from_page("same-site", "no-cors", None, false)),
+            ("conversation 7's no-cors fetch", from_page("same-site", "no-cors", Some("http://3000-7.preview.localhost:8181/app"), false)),
+            ("an image on smelt's own page", from_page("same-site", "no-cors", Some("http://localhost:8180/c/1"), false)),
+            ("an unparseable referrer", from_page("same-site", "no-cors", Some("not a url"), false)),
+            ("a same-site POST with no Origin", RequestSource { method: "POST".to_string(), ..from_page("same-site", "navigate", None, true) }),
+            ("an unknown Sec-Fetch-Site value", from_page("same-ish", "no-cors", None, false)),
+        ];
+        let let_in: Vec<&str> = cases
+            .iter()
+            .filter(|(_, s)| allows_request_from(s, true, preview_42))
+            .map(|(what, _)| *what)
+            .collect();
+        assert!(let_in.is_empty(), "these should be refused: {let_in:#?}");
+    }
+
+    #[test]
+    fn test_same_site_navigations_and_the_previews_own_pages_are_allowed() {
+        for (what, s) in [
+            ("the sandbox panel's link (noreferrer)", from_page("same-site", "navigate", None, true)),
+            ("an <iframe> in smelt", from_page("same-site", "navigate", Some("http://localhost:8180/c/42"), false)),
+            ("the preview's own script from :5173", from_page("same-site", "no-cors", Some("http://3000-42.preview.localhost:8181/"), false)),
+            ("a url() in the preview's own stylesheet", from_page("same-site", "no-cors", Some("http://5173-42.preview.localhost:8181/style.css"), false)),
+            ("the preview's own image", from_page("same-origin", "no-cors", Some("http://3000-42.preview.localhost:8181/"), false)),
+            ("a typed URL", from_page("none", "navigate", None, true)),
+        ] {
+            assert!(allows_request_from(&s, true, preview_42), "{what} should be allowed");
+        }
+        // The model's browser: a sandbox page's image from another port.
+        let image = from_page("same-site", "no-cors", Some("http://localhost:4400/"), false);
+        assert!(allows_request_from(&image, true, sandbox_or_container), "the sandbox page's own image");
     }
 
     #[test]
