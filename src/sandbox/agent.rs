@@ -29,17 +29,13 @@ pub(super) trait AgentDialer: Send + Sync {
 
 /// A port-forward to the agent's port in the pod. Another database's pod
 /// of the same name reads as absent and is never dialed (SME-115).
-pub(super) struct ClusterDialer(kube::Client, db::SmeltInstance);
+pub(super) struct ClusterDialer(pub(super) kube::Client, pub(super) db::SmeltInstance);
 
 impl AgentDialer for ClusterDialer {
     fn dial(&self, pod_id: i64) -> BoxFuture<'_, Result<Box<dyn AgentIo>, SandboxError>> {
         Box::pin(async move {
             let name = pod_name(pod_id);
-            if let Some(pod) = pods_api(&self.0).get_opt(&name).await?
-                && !counts_as_ours(&pod.metadata, &self.1)
-            {
-                return Err(SandboxError::NotOurs { ownership: ownership(&pod.metadata, &self.1.id), name });
-            }
+            refuse_foreign(&pods_api(&self.0), &name, &self.1).await?;
             let mut forward = pods_api(&self.0).portforward(&name, &[AGENT_PORT]).await?;
             let stream = require_stream(forward.take_stream(AGENT_PORT), "the agent port's port-forward")?;
             Ok(Box::new(stream) as Box<dyn AgentIo>)

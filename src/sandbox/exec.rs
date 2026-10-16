@@ -10,6 +10,9 @@ pub struct Sandbox {
     // sandbox agent.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) client: kube::Client,
+    /// The instance the pod was made for, which `shell` checks it against.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) instance: db::SmeltInstance,
     pub(super) cleanup_tx: mpsc::UnboundedSender<String>,
 }
 
@@ -42,7 +45,7 @@ impl Sandbox {
     /// A `PodShell` into this pod, with the test's own client.
     #[cfg(test)]
     pub fn shell(&self) -> PodShell {
-        PodShell::new(self.client.clone(), self.pod_name.clone())
+        PodShell::new(self.client.clone(), self.pod_name.clone(), self.instance.clone())
     }
 }
 
@@ -50,40 +53,52 @@ impl Sandbox {
 /// sees its exit code and can feed it stdin: how git clones, reads a
 /// checkout's `AGENTS.md` files and installs keys. The model's own
 /// commands go through the sandbox agent's terminals instead.
+///
+/// Every `run` first reads the pod and refuses one that isn't this
+/// database's (SME-180), as the agent dial does: never a cached answer,
+/// since a pod's name can be taken by another database's pod once ours
+/// is gone.
 pub struct PodShell {
     client: kube::Client,
     pod_name: String,
+    instance: db::SmeltInstance,
 }
 
 impl PodShell {
     /// A shell into the Kubernetes pod named `pod_name`, through `client`
-    /// (a real-cluster test brings its own).
-    pub fn new(client: kube::Client, pod_name: String) -> Self {
-        PodShell { client, pod_name }
+    /// (a real-cluster test brings its own), for a server of `instance`.
+    pub fn new(client: kube::Client, pod_name: String, instance: db::SmeltInstance) -> Self {
+        PodShell { client, pod_name, instance }
     }
 
     /// A shell into smelt's pod `pod_id`.
-    pub fn for_pod(pod_id: i64) -> Result<Self, SandboxError> {
-        Ok(Self::new(kube_client()?, pod_name(pod_id)))
+    pub async fn for_pod(pool: &PgPool, pod_id: i64) -> Result<Self, SandboxError> {
+        let instance = db::smelt_instance(pool).await.map_err(SandboxError::Db)?;
+        Ok(Self::new(kube_client()?, pod_name(pod_id), instance))
     }
 
     /// A shell into `conversation_id`'s live pod.
     pub async fn for_conversation(pool: &PgPool, conversation_id: i64) -> Result<Self, TerminalError> {
-        Ok(Self::for_pod(live_pod_id(pool, conversation_id).await?)?)
+        Ok(Self::for_pod(pool, live_pod_id(pool, conversation_id).await?).await?)
     }
 
     /// Runs `command` in the sandbox container, with `stdin` written and
-    /// closed when given (see `exec_with`).
+    /// closed when given (see `exec_with`), once the pod reads as this
+    /// database's: another database's is `NotOurs`, and nothing runs.
     pub async fn run(&self, command: &[&str], stdin: Option<&[u8]>) -> Result<ExecResult, SandboxError> {
+        refuse_foreign(&pods_api(&self.client), &self.pod_name, &self.instance).await?;
         exec_with(&self.client, &self.pod_name, "sandbox", command, stdin).await
     }
 }
 
-/// kube exec in `pod_name`'s `container`. `stdin`, when given, is written
-/// and then closed, so a command like `cat > file` sees its end. kube
-/// closes just the stdin stream on a v5 connection (k3s has it); an older
-/// server closes the whole connection and the exit code comes back
-/// missing, which callers treat as a failure.
+/// kube exec in `pod_name`'s `container`, unchecked: the caller makes
+/// sure the pod is this database's first (`PodShell::run` reads it before
+/// every exec; the language servers' callers check where each request
+/// starts). `stdin`, when given, is written and then closed, so a command
+/// like `cat > file` sees its end. kube closes just the stdin stream on a
+/// v5 connection (k3s has it); an older server closes the whole
+/// connection and the exit code comes back missing, which callers treat
+/// as a failure.
 pub(crate) async fn exec_with(
     client: &kube::Client,
     pod_name: &str,

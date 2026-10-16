@@ -269,3 +269,117 @@ async fn test_conversation_pod_id_resolves_the_live_pod_and_errors_with_no_pod_o
         .expect("should resolve");
     assert_eq!(resolved, pod.id);
 }
+
+/// SME-180: git's kube exec (`PodShell`, which clones, reads `AGENTS.md`
+/// files and installs keys) and the agent dial refuse a pod of the name
+/// that is another database's, or an unadopted one from before SME-115
+/// that this database doesn't own, and nothing runs in it. A database
+/// that owns unadopted pods still runs in one. Also prints what the
+/// check costs: the pod read against the exec it guards.
+///
+/// Harmless if killed: a unique name, no conversation label, another
+/// database's instance (then none), and `activeDeadlineSeconds`, so the
+/// kubelet fails a leftover.
+#[tokio::test]
+async fn test_kube_exec_and_the_agent_dial_refuse_another_databases_pod() {
+    let client = test_client().await;
+    let pods = pods_api(&client);
+    let pod_id = unused_conversation_id();
+    let name = pod_name(pod_id);
+    let docker = DockerSidecar { memory: "512Mi".to_string(), storage: PodStorage::Ephemeral };
+    let mut pod = build_pod_spec(&name, "256Mi", &docker, &[], "another-smelt-database");
+    pod.spec.as_mut().expect("a pod spec").active_deadline_seconds = Some(600);
+    pods.create(&PostParams::default(), &pod).await.expect("create the pod");
+
+    let failures = tokio::time::timeout(Duration::from_secs(240), refusals(&client, &name, pod_id)).await;
+    pods.delete(&name, &immediate_delete_params()).await.ok();
+    let failures = failures.expect("the checks took over 240s");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// What `test_kube_exec_and_the_agent_dial_refuse_another_databases_pod`
+/// found wrong, each check run whatever the others found.
+async fn refusals(client: &kube::Client, name: &str, pod_id: i64) -> Vec<String> {
+    let pods = pods_api(client);
+    wait_for_running_with_timeout(&pods, name, Duration::from_secs(180)).await.expect("the pod runs");
+    let mut failures = Vec::new();
+    let marker: &[&str] = &["sh", "-c", "touch /tmp/sme-180"];
+    // Unchecked, so it sees the pod whoever's it is.
+    let marked = || async {
+        exec_with(client, name, "sandbox", &["test", "-e", "/tmp/sme-180"], None).await.expect("look for the marker").exit_code == 0
+    };
+    let shell = |owns_unlabelled| {
+        PodShell::new(client.clone(), name.to_string(), db::SmeltInstance { owns_unlabelled, ..test_instance() })
+    };
+
+    // Another database's pod.
+    match shell(false).run(marker, None).await {
+        Err(SandboxError::NotOurs { ownership: Ownership::Foreign, .. }) => {}
+        other => failures.push(format!("another database's pod: run gave {:?}", other.map(|r| r.exit_code))),
+    }
+    if marked().await {
+        failures.push("another database's pod: the refused command ran".to_string());
+    }
+    match ClusterDialer(client.clone(), test_instance()).dial(pod_id).await {
+        Err(SandboxError::NotOurs { ownership: Ownership::Foreign, .. }) => {}
+        Err(e) => failures.push(format!("another database's pod: dial gave {e:?}")),
+        Ok(_) => failures.push("another database's pod: dial connected".to_string()),
+    }
+
+    // The same pod with no instance label, as from before SME-115.
+    let unlabel = serde_json::json!({"metadata": {"labels": {INSTANCE_LABEL: null}}});
+    pods.patch(name, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&unlabel))
+        .await
+        .expect("drop the instance label");
+    match shell(false).run(marker, None).await {
+        Err(SandboxError::NotOurs { ownership: Ownership::Unlabelled, .. }) => {}
+        other => failures.push(format!("an unadopted pod we don't own: run gave {:?}", other.map(|r| r.exit_code))),
+    }
+    if marked().await {
+        failures.push("an unadopted pod we don't own: the refused command ran".to_string());
+    }
+    match shell(true).run(marker, None).await {
+        Ok(result) if result.exit_code == 0 => {}
+        other => failures.push(format!("an unadopted pod we own: run gave {:?}", other.map(|r| r.exit_code))),
+    }
+    if !marked().await {
+        failures.push("an unadopted pod we own: the command didn't run".to_string());
+    }
+
+    // No pod of the name: the exec's own 404, not a refusal.
+    let missing = PodShell::new(client.clone(), pod_name(unused_conversation_id()), test_instance());
+    match missing.run(&["true"], None).await {
+        Err(SandboxError::Kube(_)) => {}
+        other => failures.push(format!("no pod: run gave {:?}", other.map(|r| r.exit_code))),
+    }
+
+    print_check_cost(client, name).await;
+    failures
+}
+
+/// The pod read `PodShell::run` adds, against the exec it guards (SME-180
+/// asks for the measured cost), ten of each in the order `run` makes
+/// them. On k3s a read takes about 2 ms on a warm connection, but the
+/// exec's upgrade takes that connection, so each read after an exec opens
+/// a new one: about 44 ms against an exec's 16 to 20 (SME-180's What
+/// shipped).
+async fn print_check_cost(client: &kube::Client, name: &str) {
+    let pods = pods_api(client);
+    let owner = db::SmeltInstance { owns_unlabelled: true, ..test_instance() };
+    let median = |times: &[Duration]| {
+        let mut times = times.to_vec();
+        times.sort();
+        times[times.len() / 2]
+    };
+    let (mut reads, mut execs) = (Vec::new(), Vec::new());
+    for _ in 0..10 {
+        let start = std::time::Instant::now();
+        refuse_foreign(&pods, name, &owner).await.expect("read the pod");
+        reads.push(start.elapsed());
+        let start = std::time::Instant::now();
+        exec_with(client, name, "sandbox", &["true"], None).await.expect("exec");
+        execs.push(start.elapsed());
+    }
+    println!("SME-180 cost: pod reads {reads:?}, execs {execs:?}");
+    println!("SME-180 cost: pod read median {:?}, exec median {:?}", median(&reads), median(&execs));
+}

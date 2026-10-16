@@ -131,6 +131,28 @@ pub(in crate::sandbox) async fn read_our_pod(
     Ok(pods.get_opt(name).await?.filter(|pod| counts_as_ours(&pod.metadata, instance)))
 }
 
+/// `NotOurs` when `name`'s pod is another database's (or an unadopted one
+/// from before SME-115 this database doesn't own), before smelt execs into
+/// or dials it by name (SME-180). No pod is fine here: the exec or
+/// port-forward that follows fails with Kubernetes' own 404.
+pub(in crate::sandbox) async fn refuse_foreign(
+    pods: &Api<Pod>,
+    name: &str,
+    instance: &db::SmeltInstance,
+) -> Result<(), SandboxError> {
+    // Only the ownership is kept across the await, not the `Pod`
+    // (SME-115's future-size lesson).
+    let foreign = pods
+        .get_opt(name)
+        .await?
+        .filter(|pod| !counts_as_ours(&pod.metadata, instance))
+        .map(|pod| ownership(&pod.metadata, &instance.id));
+    match foreign {
+        Some(ownership) => Err(SandboxError::NotOurs { name: name.to_string(), ownership }),
+        None => Ok(()),
+    }
+}
+
 /// `force_terminate_pod` with the cluster's delete passed in, so a test can
 /// make it fail.
 pub(in crate::sandbox) async fn terminate_pod_with(

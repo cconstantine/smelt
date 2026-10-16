@@ -140,6 +140,7 @@ impl SandboxManager {
         Ok(Sandbox {
             pod_name: name,
             client: self.client.clone(),
+            instance: instance.clone(),
             cleanup_tx: self.cleanup_tx.clone(),
         })
     }
