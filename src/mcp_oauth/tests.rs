@@ -641,7 +641,7 @@ async fn test_a_callback_after_a_url_edit_saves_nothing(pool: PgPool) {
         .await
         .expect_err("a sign-in for the old address must not complete");
 
-    assert!(error.contains(ADDRESS_CHANGED_ERROR), "unexpected error: {error}");
+    assert_eq!(error, ADDRESS_CHANGED_ERROR, "the page shows the reason alone");
     assert!(
         stored_credentials(&pool, config.id).await.is_none(),
         "the old address's grant must not be saved onto the new URL"
@@ -673,7 +673,7 @@ async fn test_a_url_edit_during_the_code_exchange_saves_nothing(pool: PgPool) {
         .expect("callback task")
         .expect_err("a sign-in for the old address must not complete");
 
-    assert!(error.contains(ADDRESS_CHANGED_ERROR), "unexpected error: {error}");
+    assert_eq!(error, ADDRESS_CHANGED_ERROR, "the page shows the reason alone");
     assert!(
         stored_credentials(&pool, config.id).await.is_none(),
         "the old address's grant must not be saved onto the new URL"
@@ -693,7 +693,7 @@ async fn test_a_callback_after_the_server_is_deleted_saves_nothing(pool: PgPool)
         .await
         .expect_err("a sign-in for a deleted server must not complete");
 
-    assert!(error.contains(ADDRESS_CHANGED_ERROR), "unexpected error: {error}");
+    assert_eq!(error, ADDRESS_CHANGED_ERROR, "the page shows the reason alone");
     assert!(
         db::get_mcp_server_config(&pool, config.id)
             .await

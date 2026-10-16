@@ -66,8 +66,9 @@ impl PgCredentialStore {
 }
 
 /// Why a sign-in's grant wasn't saved: the server's row no longer has the
-/// URL the sign-in started for (SME-166).
-const ADDRESS_CHANGED_ERROR: &str = "this MCP server's address was changed, or the server deleted, while you were signing in, so the sign-in wasn't saved. Click Connect to sign in to its current address.";
+/// URL the sign-in started for (SME-166). The callback shows it as it is,
+/// not wrapped in rmcp's "Internal error" (review 1).
+const ADDRESS_CHANGED_ERROR: &str = "This MCP server's address was changed, or the server deleted, while you were signing in, so the sign-in wasn't saved. Click Connect to sign in to its current address.";
 
 #[async_trait::async_trait]
 impl CredentialStore for PgCredentialStore {
@@ -421,7 +422,10 @@ pub async fn handle_callback(
         .state
         .handle_callback_with_issuer(code, csrf_token, issuer)
         .await
-        .map_err(|e| format!("OAuth callback failed: {e}"))
+        .map_err(|e| match e {
+            AuthError::InternalError(reason) if reason == ADDRESS_CHANGED_ERROR => reason,
+            e => format!("OAuth callback failed: {e}"),
+        })
 }
 
 /// Clears `config`'s stored OAuth credentials without touching anything
