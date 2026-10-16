@@ -222,6 +222,15 @@ pub async fn start_mcp_server_oauth(id: i64) -> ServerFnResult<String> {
         .map_err(ServerFnError::new)
 }
 
+/// Server `id`'s last failed OAuth callback's error, if one is kept and
+/// unread (SME-168): the edit page calls it once when the callback's
+/// redirect brought it there with `?oauth_callback=1`. A `post`, since it
+/// removes what it reads (`mcp_oauth::take_callback_error`).
+#[post("/api/mcp-servers/{id}/oauth/callback-error")]
+pub async fn take_mcp_server_oauth_error(id: i64) -> ServerFnResult<Option<String>> {
+    Ok(crate::mcp_oauth::take_callback_error(id))
+}
+
 /// Clears server `id`'s stored OAuth credentials without deleting the
 /// server row — the edit page's "Disconnect" button.
 #[post("/api/mcp-servers/{id}/oauth/disconnect")]
