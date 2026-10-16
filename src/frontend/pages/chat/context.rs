@@ -191,6 +191,27 @@ mod spend_tests {
     }
 }
 
+/// SME-185 B37. The first tests in the repo that render markup, through
+/// `dioxus::ssr` (which comes with `dioxus/server`).
+#[cfg(all(test, feature = "server"))]
+mod detail_body_tests {
+    use super::*;
+
+    #[test]
+    fn test_a_failed_context_fetch_says_why_instead_of_loading() {
+        let html = dioxus::ssr::render_element(render_context_detail_body(Some(&Err("boom".to_string()))));
+        // SSR escapes the apostrophe.
+        assert!(html.contains("Couldn&#39;t load the context: boom."), "{html}");
+        assert!(!html.contains("Loading…"), "{html}");
+    }
+
+    #[test]
+    fn test_the_context_view_says_loading_until_its_fetch_lands() {
+        let html = dioxus::ssr::render_element(render_context_detail_body(None));
+        assert!(html.contains("Loading…"), "{html}");
+    }
+}
+
 #[cfg(test)]
 mod context_usage_tests {
     use super::*;
@@ -285,6 +306,77 @@ mod context_usage_tests {
     }
 }
 
+/// The context dialog's body: "Loading…" until its fetch lands, then the
+/// snapshot, or why it couldn't load (SME-185 B37: a failed fetch used to
+/// leave "Loading…" for good). A plain function, so a test can render it.
+pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSnapshot, String>>) -> Element {
+    match detail {
+        None => rsx! { p { "Loading…" } },
+        Some(Err(reason)) => rsx! {
+            // The heading keeps the × (placed top right) clear of the text.
+            h3 { "Context" }
+            ErrorText { message: Some(format!("Couldn't load the context: {reason}. Close it and open it again to retry.")) }
+        },
+        Some(Ok(detail)) => rsx! {
+            h3 { "Context" }
+            if !detail.instructions.is_empty() {
+                h4 { class: "context-detail-heading", "Project instructions ({detail.instructions.len()})" }
+                p { class: "muted", "AGENTS.md files from this conversation's repos, sent with every turn as part of the system prompt below." }
+                for doc in &detail.instructions {
+                    details { class: "context-detail-instructions",
+                        summary {
+                            code { "{doc.path}" }
+                            span { class: "muted", " {instructions_source(doc)}" }
+                        }
+                        pre { class: "context-detail-prompt", "{doc.content}" }
+                    }
+                }
+            }
+            h4 { class: "context-detail-heading", "System prompt" }
+            if let Some(system) = &detail.system {
+                // Its own line breaks and headings, not one
+                // run-together paragraph (SME-41 D7).
+                pre { class: "context-detail-prompt", "{system}" }
+            } else {
+                p { class: "muted", "None set." }
+            }
+            p { "Messages: {detail.message_count}" }
+            if let Some(usage) = &detail.usage {
+                p {
+                    "Tokens — input: {usage.input_tokens}, output: {usage.output_tokens}, "
+                    "cache creation: {usage.cache_creation_input_tokens}, cache read: {usage.cache_read_input_tokens}"
+                }
+                {render_context_meter(&context_usage_breakdown(usage, detail.context_window))}
+            }
+            p { "Context window: {detail.context_window}" }
+            h4 { class: "context-detail-heading", "Spent so far" }
+            p { "{spend_cost_text(&detail.spend)}" }
+            if detail.spend.calls > 0 {
+                p {
+                    "{crate::models::calls_text(detail.spend.calls)} — uncached input: {detail.spend.input_tokens}, "
+                    "cache write: {detail.spend.cache_creation_input_tokens}, cache read: {detail.spend.cache_read_input_tokens}, "
+                    "output: {detail.spend.output_tokens}"
+                }
+                p { class: "muted",
+                    "Completed calls only: a stopped or failed call isn't counted. Each call is priced from models.dev's list "
+                    "when it finished, without time-of-day surcharges such as DeepSeek's peak hours."
+                    if let Some(at) = detail.prices_as_of {
+                        {format!(" Prices as of {} UTC.", at.format("%Y-%m-%d %H:%M"))}
+                    }
+                }
+            }
+            h4 { "Tools ({detail.tools.len()})" }
+            for tool in &detail.tools {
+                div { class: "context-detail-tool",
+                    strong { "{tool.name}" }
+                    p { "{tool.description}" }
+                    pre { "{tool.input_schema}" }
+                }
+            }
+        },
+    }
+}
+
 /// The context usage bar above the transcript and, when it's clicked,
 /// the context detail dialog (SME-18, SME-82).
 #[component]
@@ -307,6 +399,9 @@ pub(super) fn ContextUsage(
         }
     };
 
+    // Counts the opens, so only the latest one's fetch lands (SME-185 B37).
+    let mut detail_request = use_signal(|| 0u64);
+
     // Fetches a fresh detail snapshot every time it's opened, rather than
     // caching — matches the idea's "most recently sent request" decision;
     // reopening after a new turn should show that turn's numbers, not a
@@ -316,10 +411,15 @@ pub(super) fn ContextUsage(
         context_detail_open.set(true);
         // Not the last snapshot, possibly another conversation's (SME-51 B11).
         context_detail.set(None);
+        let request = *detail_request.peek() + 1;
+        detail_request.set(request);
         spawn(async move {
-            if let Ok(detail) = get_context_detail(id).await
-                && selected() == Some(id)
-            {
+            // A failure is shown too, not dropped (SME-185 B37). Only onto
+            // this conversation's view (SME-51 B11), and only the latest
+            // open's: after a close and a reopen, an older fetch landing
+            // late would overwrite the newer one's result.
+            let detail = get_context_detail(id).await.map_err(|e| server_error_message(&e));
+            if selected() == Some(id) && *detail_request.peek() == request {
                 context_detail.set(Some(detail));
             }
         });
@@ -393,66 +493,7 @@ pub(super) fn ContextUsage(
                         onclick: move |_| close_context_detail(),
                         "×"
                     }
-                    match context_detail() {
-                        None => rsx! { p { "Loading…" } },
-                        Some(detail) => rsx! {
-                            h3 { "Context" }
-                            if !detail.instructions.is_empty() {
-                                h4 { class: "context-detail-heading", "Project instructions ({detail.instructions.len()})" }
-                                p { class: "muted", "AGENTS.md files from this conversation's repos, sent with every turn as part of the system prompt below." }
-                                for doc in &detail.instructions {
-                                    details { class: "context-detail-instructions",
-                                        summary {
-                                            code { "{doc.path}" }
-                                            span { class: "muted", " {instructions_source(doc)}" }
-                                        }
-                                        pre { class: "context-detail-prompt", "{doc.content}" }
-                                    }
-                                }
-                            }
-                            h4 { class: "context-detail-heading", "System prompt" }
-                            if let Some(system) = &detail.system {
-                                // Its own line breaks and headings, not one
-                                // run-together paragraph (SME-41 D7).
-                                pre { class: "context-detail-prompt", "{system}" }
-                            } else {
-                                p { class: "muted", "None set." }
-                            }
-                            p { "Messages: {detail.message_count}" }
-                            if let Some(usage) = &detail.usage {
-                                p {
-                                    "Tokens — input: {usage.input_tokens}, output: {usage.output_tokens}, "
-                                    "cache creation: {usage.cache_creation_input_tokens}, cache read: {usage.cache_read_input_tokens}"
-                                }
-                                {render_context_meter(&context_usage_breakdown(usage, detail.context_window))}
-                            }
-                            p { "Context window: {detail.context_window}" }
-                            h4 { class: "context-detail-heading", "Spent so far" }
-                            p { "{spend_cost_text(&detail.spend)}" }
-                            if detail.spend.calls > 0 {
-                                p {
-                                    "{crate::models::calls_text(detail.spend.calls)} — uncached input: {detail.spend.input_tokens}, "
-                                    "cache write: {detail.spend.cache_creation_input_tokens}, cache read: {detail.spend.cache_read_input_tokens}, "
-                                    "output: {detail.spend.output_tokens}"
-                                }
-                                p { class: "muted",
-                                    "Completed calls only: a stopped or failed call isn't counted. Each call is priced from models.dev's list "
-                                    "when it finished, without time-of-day surcharges such as DeepSeek's peak hours."
-                                    if let Some(at) = detail.prices_as_of {
-                                        {format!(" Prices as of {} UTC.", at.format("%Y-%m-%d %H:%M"))}
-                                    }
-                                }
-                            }
-                            h4 { "Tools ({detail.tools.len()})" }
-                            for tool in &detail.tools {
-                                div { class: "context-detail-tool",
-                                    strong { "{tool.name}" }
-                                    p { "{tool.description}" }
-                                    pre { "{tool.input_schema}" }
-                                }
-                            }
-                        },
-                    }
+                    {render_context_detail_body(context_detail().as_ref())}
                 }
                 div {
                     class: "focus-sentinel",

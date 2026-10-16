@@ -79,8 +79,9 @@ pub(super) struct ConversationState {
     /// `None` until the first `ContextUsageUpdate`/`get_context_usage`
     /// pull: a new conversation has no turn yet to report on (SME-18).
     pub(super) context_usage: Option<ContextUsageSnapshot>,
-    /// The context bar's detail view, fetched when it opens.
-    pub(super) context_detail: Option<ContextDetailSnapshot>,
+    /// The context bar's detail view, fetched when it opens: `None` while
+    /// loading, then the snapshot or why it couldn't load (SME-185 B37).
+    pub(super) context_detail: Option<Result<ContextDetailSnapshot, String>>,
     pub(super) context_detail_open: bool,
     /// A snap to the bottom that a layout change asked for, waiting for the
     /// pointer to leave the transcript (SME-75).
