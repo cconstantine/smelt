@@ -608,7 +608,9 @@ pub async fn operate(
                 let new_name = input.new_name.clone().ok_or("rename needs a new_name.")?;
                 let mut params = position()?;
                 params["newName"] = json!(new_name);
-                rename(client, &pod_name, &session, &config, &new_name, params).await?
+                #[expect(clippy::expect_used, reason = "position() above has already required the path")]
+                let (named, ..) = file.as_ref().expect("a path");
+                rename(client, &pod_name, &session, &config, named, &new_name, params).await?
             }
         }
     };
@@ -619,15 +621,42 @@ pub async fn operate(
 /// to have changed since the server saw them.
 const RENAME_ROUNDS: usize = 3;
 
+/// What a rename does after a round's check (review 1): write when every
+/// touched file is as the server saw it; otherwise ask again, unless the
+/// rounds are spent, or the named file itself changed (its position was
+/// worked out from the text before, so asking again could rename another
+/// symbol).
+#[derive(Debug, PartialEq)]
+enum RenameStep {
+    Write,
+    AskAgain,
+    NamedFileChanged,
+    GiveUp,
+}
+
+fn rename_step(named: &str, stale: &[String], round: usize) -> RenameStep {
+    if stale.is_empty() {
+        RenameStep::Write
+    } else if stale.iter().any(|path| path == named) {
+        RenameStep::NamedFileChanged
+    } else if round >= RENAME_ROUNDS {
+        RenameStep::GiveUp
+    } else {
+        RenameStep::AskAgain
+    }
+}
+
 /// A rename (`params` holds the position and new name): its edits are
 /// applied only to files the server saw as they are on disk now. A file it
 /// touches that changed since, or was never sent, is synced and the rename
-/// asked again (SME-172), up to `RENAME_ROUNDS` times.
+/// asked again (SME-172), up to `RENAME_ROUNDS` times; but not when that
+/// file is `named`, whose position was worked out from its older text.
 async fn rename(
     client: &kube::Client,
     pod_name: &str,
     session: &Session,
     config: &LanguageServerConfig,
+    named: &str,
     new_name: &str,
     params: Value,
 ) -> Result<String, String> {
@@ -648,7 +677,8 @@ async fn rename(
             touched.push((path.clone(), current, synced));
         }
         let stale = rename_check(&touched);
-        if stale.is_empty() {
+        let step = rename_step(named, &stale, round);
+        if step == RenameStep::Write {
             let mut planned = Vec::new();
             for ((path, edits), (_, current, _)) in files.iter().zip(touched) {
                 let updated = ops::apply_text_edits(&current, edits)?;
@@ -659,11 +689,19 @@ async fn rename(
         for (path, current, _) in touched.iter().filter(|(path, ..)| stale.contains(path)) {
             session.sync(path, current).await.map_err(|e| request_error(config, e))?;
         }
-        if round == RENAME_ROUNDS {
-            return Err(format!(
-                "{} kept changing while being renamed; nothing was renamed. They're synced now: try again.",
-                stale.join(", ")
-            ));
+        match step {
+            RenameStep::NamedFileChanged => {
+                return Err(format!(
+                    "{named} changed while it was being renamed; nothing was renamed. Read it again and give the position again."
+                ));
+            }
+            RenameStep::GiveUp => {
+                return Err(format!(
+                    "{} kept changing while being renamed; nothing was renamed. They're synced now: try again.",
+                    stale.join(", ")
+                ));
+            }
+            RenameStep::Write | RenameStep::AskAgain => {}
         }
     };
     // A write can still be refused midway (the file changed in between),

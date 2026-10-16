@@ -130,3 +130,19 @@ fn rename_check_lists_files_the_server_saw_otherwise() {
         vec!["/workspace/b.rs".to_string(), "/workspace/c.rs".to_string()]
     );
 }
+
+/// SME-172 review 1: a rename is asked again only while its position still
+/// holds: a change to the named file itself stops it, and so do spent rounds.
+#[test]
+fn a_rename_asks_again_only_while_its_position_still_holds() {
+    let named = "/workspace/main.rs";
+    let other = vec!["/workspace/shapes.rs".to_string()];
+    assert_eq!(rename_step(named, &[], 1), RenameStep::Write);
+    assert_eq!(rename_step(named, &[], RENAME_ROUNDS), RenameStep::Write, "a clean last round writes");
+    assert_eq!(rename_step(named, &other, 1), RenameStep::AskAgain);
+    assert_eq!(rename_step(named, &other, RENAME_ROUNDS - 1), RenameStep::AskAgain);
+    assert_eq!(rename_step(named, &other, RENAME_ROUNDS), RenameStep::GiveUp);
+    let with_named = vec!["/workspace/shapes.rs".to_string(), named.to_string()];
+    assert_eq!(rename_step(named, &with_named, 1), RenameStep::NamedFileChanged);
+    assert_eq!(rename_step(named, &with_named, RENAME_ROUNDS), RenameStep::NamedFileChanged);
+}
