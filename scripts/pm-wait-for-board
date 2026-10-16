@@ -36,7 +36,7 @@ lines are printed first). With --once a failed poll isn't retried.
 
     scripts/pm-wait-for-board                 # wait for the next change
     scripts/pm-wait-for-board --once          # check once: report and exit 0, or exit 1 if nothing changed
-    scripts/pm-wait-for-board --self-test     # run the comparison's tests (no network)
+    scripts/pm-wait-for-board --self-test     # run its tests (no network; a temporary state dir, never the real one)
 """
 
 import argparse
@@ -543,7 +543,7 @@ def main():
     )
     p.add_argument("--interval", type=int, default=60, help="seconds between polls (default 60)")
     p.add_argument("--once", action="store_true", help="check once and exit (1 if nothing changed)")
-    p.add_argument("--self-test", action="store_true", help="run the comparison's tests and exit")
+    p.add_argument("--self-test", action="store_true", help="run the comparison's and poll loop's tests and exit")
     args = p.parse_args()
     if args.self_test:
         return self_test()
