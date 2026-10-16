@@ -171,12 +171,24 @@ def load_snapshot():
 
 
 def save_snapshot(board):
+    # A temporary file of this save's own: two waiters can run at once, and
+    # with a shared one each truncated and moved the other's (SME-176 review
+    # 1). The last move wins, and the file in place is always a whole board.
     path = state_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(board, f, sort_keys=True)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(
+        dir=os.path.dirname(path), prefix=os.path.basename(path) + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(board, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def _save_or_fail(board):
@@ -230,8 +242,12 @@ def self_test():
     try:
         with tempfile.TemporaryDirectory(prefix="pm-wait-for-board-self-test.") as root:
             for name, case in _loop_cases(b):
-                os.environ["SMELT_PM_STATE_DIR"] = tempfile.mkdtemp(dir=root)
-                problems = case()
+                case_dir = tempfile.mkdtemp(dir=root)
+                os.environ["SMELT_PM_STATE_DIR"] = case_dir
+                try:
+                    problems = case()
+                finally:
+                    os.chmod(case_dir, 0o700)
                 if problems:
                     failed += 1
                     for p in problems:
@@ -402,8 +418,39 @@ def _loop_cases(b):
         return p
 
     def make_saves_fail():
-        # A directory where save_snapshot writes its temporary file.
-        os.makedirs(state_path() + ".tmp")
+        # A state directory nothing can be written in. self_test makes it
+        # writable again after the case.
+        os.makedirs(os.path.dirname(state_path()), exist_ok=True)
+        os.chmod(os.path.dirname(state_path()), 0o500)
+
+    def a_second_waiters_save_mid_write_breaks_neither():
+        # Two waiters can run at once (the ticket's Trade-offs). Forced
+        # interleaving: waiter B saves a whole snapshot while waiter A is
+        # between opening its temporary file and moving it into place. With
+        # one shared temporary file, B's save truncated and moved A's, so A's
+        # write landed in the live snapshot (corrupt when shorter) and A's
+        # move failed: exit 2.
+        p = []
+        save_snapshot(b(SME_1="Up Next", SME_22="Backlog", SME_333="Backlog"))
+        real_dump = json.dump
+        other = b(SME_1="Planned", SME_22="Backlog", SME_333="Backlog")
+
+        def dump_with_b_saving_first(obj, f, **kw):
+            json.dump = real_dump
+            save_snapshot(other)
+            real_dump(obj, f, **kw)
+
+        json.dump = dump_with_b_saving_first
+        try:
+            status, out, err = _run([b(SME_1="Planned")], once=True)
+        finally:
+            json.dump = real_dump
+        _expect(p, "A's status", status, 1)
+        _expect(p, "A's stderr", err, "")
+        _expect(p, "snapshot (A moved last)", load_snapshot(), b(SME_1="Planned"))
+        leftovers = sorted(set(os.listdir(os.path.dirname(state_path()))) - {"pm-board-snapshot.json"})
+        _expect(p, "temporary files left", leftovers, [])
+        return p
 
     def a_wake_whose_save_fails_still_reports_the_change():
         # Printed before the save: a kill or a failure between the two can
@@ -438,6 +485,7 @@ def _loop_cases(b):
     return [
         (f.__name__, f)
         for f in (
+            a_second_waiters_save_mid_write_breaks_neither,
             a_wake_whose_save_fails_still_reports_the_change,
             a_failed_save_with_nothing_to_report_exits_2,
             a_failed_baseline_save_exits_2,
