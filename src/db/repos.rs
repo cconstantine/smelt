@@ -151,13 +151,24 @@ pub async fn request_instruction(
     .await
 }
 
-/// Share-locks the conversation's row until the transaction ends, as a
-/// foreign key to it would, so deleting the conversation waits (SME-181).
-pub async fn share_lock_conversation(executor: impl sqlx::PgExecutor<'_>, id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT 1 FROM conversations WHERE id = $1 FOR KEY SHARE")
-        .bind(id)
-        .execute(executor)
-        .await?;
+/// Share-locks, in id order, the rows of conversation `id` and of every
+/// conversation with a repo of this remote, until the transaction ends,
+/// as a foreign key to them would: deleting any of them then waits, or
+/// finishes first (SME-181).
+pub async fn share_lock_conversations_for(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: i64,
+    remote_key: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT 1 FROM conversations
+          WHERE id = $1 OR id IN (SELECT conversation_id FROM conversation_repos WHERE remote_key = $2)
+          ORDER BY id FOR KEY SHARE",
+    )
+    .bind(id)
+    .bind(remote_key)
+    .execute(executor)
+    .await?;
     Ok(())
 }
 

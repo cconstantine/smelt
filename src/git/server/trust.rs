@@ -66,13 +66,14 @@ async fn settle(
 ) -> Result<Settled, String> {
     let e = |e: sqlx::Error| e.to_string();
     db::lock_remote_trust(&mut *tx, remote_key).await.map_err(e)?;
-    // Row locks in a conversation delete's order (its row, then its
-    // cascade into loaded_instructions, then instruction_requests), so
-    // a decision and a delete wait for each other instead of
-    // deadlocking (SME-181 review 1). The deciding conversation's row
-    // first: the load's foreign key would share-lock it only after the
-    // card is taken.
-    db::share_lock_conversation(&mut *tx, conversation_id).await.map_err(e)?;
+    // A conversation delete locks its row and then cascades through its
+    // repos, loaded files and cards, in whatever order it finds the rows.
+    // A decision writes those of every conversation with this remote,
+    // so it first share-locks all their conversation rows, in id order,
+    // before touching any of their rows: a delete then either finishes
+    // first or waits for the decision, and neither can hold a row the
+    // other needs (SME-181 reviews 1 and 2).
+    db::share_lock_conversations_for(&mut *tx, conversation_id, remote_key).await.map_err(e)?;
     let request = db::take_instruction_request(&mut *tx, request_id, conversation_id)
         .await
         .map_err(e)?
@@ -100,7 +101,6 @@ async fn settle(
 
     // Declined: nothing from this remote stays in any conversation's
     // instructions, including a version loaded while it was trusted.
-    // Before the other cards: a delete cascades into loaded files first.
     let mut unloaded = Vec::new();
     if !trusted {
         for (id, dir, path) in db::unload_instructions_for_remote(&mut *tx, remote_key).await.map_err(e)? {

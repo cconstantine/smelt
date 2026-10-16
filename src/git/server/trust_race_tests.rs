@@ -11,6 +11,13 @@ use std::time::{Duration, Instant};
 
 const LIMIT: Duration = Duration::from_secs(10);
 
+/// One race test at a time. Each holds about four connections at once
+/// (the held row, two callers, the poll), and every `#[sqlx::test]` in
+/// the process shares sqlx's parent pool of 20: run together, they ran
+/// out (`PoolTimedOut`). A tokio mutex, since each test has its own
+/// runtime.
+static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Sessions in this test's database waiting on a lock (a row lock or
 /// the remote's advisory lock).
 async fn lock_waiters(pool: &PgPool) -> i64 {
@@ -77,6 +84,7 @@ fn spawn_decide(
 /// Trust stands and Decline is refused.
 #[sqlx::test]
 async fn test_trust_and_decline_on_one_card_settle_once(pool: PgPool) {
+    let _turn = ONE_AT_A_TIME.lock().await;
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let repo = cloned_repo(&pool, conversation.id).await;
     request_or_load(&pool, conversation.id, &repo, "AGENTS.md", &file("x")).await.expect("ask");
@@ -105,6 +113,7 @@ async fn test_trust_and_decline_on_one_card_settle_once(pool: PgPool) {
 /// Trust settles the remote, and B's card went with it.
 #[sqlx::test]
 async fn test_trust_and_decline_on_two_conversations_cards_settle_once(pool: PgPool) {
+    let _turn = ONE_AT_A_TIME.lock().await;
     let a = db::create_conversation(&pool).await.expect("conversation A");
     let b = db::create_conversation(&pool).await.expect("conversation B");
     let repo_a = cloned_repo(&pool, a.id).await;
@@ -141,6 +150,7 @@ async fn test_trust_and_decline_on_two_conversations_cards_settle_once(pool: PgP
 /// card and tells B, rather than leave it asking about a declined remote.
 #[sqlx::test]
 async fn test_a_card_asked_for_while_a_decline_waits_is_dropped_by_it(pool: PgPool) {
+    let _turn = ONE_AT_A_TIME.lock().await;
     let a = db::create_conversation(&pool).await.expect("conversation A");
     let b = db::create_conversation(&pool).await.expect("conversation B");
     let repo_a = cloned_repo(&pool, a.id).await;
@@ -206,6 +216,7 @@ fn spawn_delete(pool: &PgPool, conversation_id: i64) -> tokio::task::JoinHandle<
 /// way round, and Postgres aborted one of the two as a deadlock.
 #[sqlx::test]
 async fn test_a_decline_and_a_conversation_delete_dont_deadlock(pool: PgPool) {
+    let _turn = ONE_AT_A_TIME.lock().await;
     let (a, card_a, b, repo_b) = a_card_and_b(&pool).await;
     db::load_instruction(&pool, b, repo_b.id, "AGENTS.md", &file("loaded")).await.expect("loaded in B");
     db::request_instruction(&pool, b, repo_b.id, "web/AGENTS.md", &file("asked")).await.expect("a card in B");
@@ -231,6 +242,7 @@ async fn test_a_decline_and_a_conversation_delete_dont_deadlock(pool: PgPool) {
 /// A conversation deleted meanwhile is skipped, not a failed decision.
 #[sqlx::test]
 async fn test_a_conversation_deleted_while_a_decline_drops_its_card_doesnt_fail_it(pool: PgPool) {
+    let _turn = ONE_AT_A_TIME.lock().await;
     let (a, card_a, b, repo_b) = a_card_and_b(&pool).await;
     db::request_instruction(&pool, b, repo_b.id, "AGENTS.md", &file("asked")).await.expect("a card in B");
 
@@ -255,6 +267,7 @@ async fn test_a_conversation_deleted_while_a_decline_drops_its_card_doesnt_fail_
 /// so the two deadlocked. Trust now locks A's row first.
 #[sqlx::test]
 async fn test_a_trust_and_a_delete_of_its_own_conversation_dont_deadlock(pool: PgPool) {
+    let _turn = ONE_AT_A_TIME.lock().await;
     let (a, card_a, _, _) = a_card_and_b(&pool).await;
     let repo_a = only_repo(&pool, a).await;
 
@@ -270,4 +283,84 @@ async fn test_a_trust_and_a_delete_of_its_own_conversation_dont_deadlock(pool: P
     trusted.expect("Trust succeeds");
     deleted.expect("the delete succeeds");
     assert!(delete_waited, "the delete waited for Trust rather than running first");
+}
+
+/// Physical order of `table`'s rows for `repo_id`, by id.
+async fn physical_order(pool: &PgPool, table: &str, repo_id: i64) -> Vec<i64> {
+    sqlx::query_scalar(&format!("SELECT id FROM {table} WHERE repo_id = $1 ORDER BY ctid"))
+        .bind(repo_id)
+        .fetch_all(pool)
+        .await
+        .expect("physical order")
+}
+
+/// Holds one row of `table` with `SELECT … FOR UPDATE`, uncommitted.
+async fn hold_one<'a>(pool: &'a PgPool, table: &str, id: i64) -> sqlx::Transaction<'a, sqlx::Postgres> {
+    let mut holding = pool.begin().await.expect("begin the holding transaction");
+    sqlx::query(&format!("SELECT 1 FROM {table} WHERE id = $1 FOR UPDATE"))
+        .bind(id)
+        .execute(&mut *holding)
+        .await
+        .expect("hold the row");
+    holding
+}
+
+/// Runs B's delete held at `held`, then Decline on A's card, releases
+/// `held`, and checks both went through.
+async fn decline_while_deleting(pool: &PgPool, a: i64, card_a: &TrustRequest, b: i64, holding: sqlx::Transaction<'_, sqlx::Postgres>) {
+    let delete = spawn_delete(pool, b);
+    assert!(waiters_or_finished(pool, 1, &delete).await, "the delete never reached the held row");
+    let decline = spawn_decide(pool, a, card_a, false);
+    let decline_waited = waiters_or_finished(pool, 2, &decline).await;
+    holding.rollback().await.expect("release the held row");
+
+    let deleted = join(delete, "the delete").await;
+    let declined = join(decline, "Decline").await;
+    deleted.expect("the delete succeeds");
+    declined.expect("Decline succeeds");
+    assert_eq!(db::get_repo_trust(pool, "github.com/o/r").await.expect("trust"), Some(false));
+    assert!(decline_waited, "Decline waited for the delete rather than running first");
+}
+
+/// SME-181 review 2, finding 1, cards. Interleaving: B has two cards
+/// about the remote, the first asked for again so its row moved past
+/// the second's. B's delete cascades into them in that physical order
+/// and is held at the second card while Decline answers A's card, which
+/// drops B's cards in id order.
+#[sqlx::test]
+async fn test_a_decline_and_a_delete_of_a_conversation_with_two_cards_dont_deadlock(pool: PgPool) {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let (a, card_a, b, repo_b) = a_card_and_b(&pool).await;
+    let first = db::request_instruction(&pool, b, repo_b.id, "AGENTS.md", &file("x1")).await.expect("first card");
+    let second = db::request_instruction(&pool, b, repo_b.id, "web/AGENTS.md", &file("y")).await.expect("second card");
+    db::request_instruction(&pool, b, repo_b.id, "AGENTS.md", &file("x2")).await.expect("the first, asked again");
+    assert_eq!(
+        physical_order(&pool, "instruction_requests", repo_b.id).await,
+        vec![second.id, first.id],
+        "the first card's row moved past the second's"
+    );
+
+    let holding = hold_one(&pool, "instruction_requests", second.id).await;
+    decline_while_deleting(&pool, a, &card_a, b, holding).await;
+}
+
+/// SME-181 review 2, finding 1, loaded files. Interleaving: B has two
+/// files loaded from the remote, the first loaded again so its row
+/// moved. B's delete is held at the second while Decline answers A's
+/// card and unloads both through the index.
+#[sqlx::test]
+async fn test_a_decline_and_a_delete_of_a_conversation_with_two_loaded_files_dont_deadlock(pool: PgPool) {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let (a, card_a, b, repo_b) = a_card_and_b(&pool).await;
+    let first = db::load_instruction(&pool, b, repo_b.id, "AGENTS.md", &file("x1")).await.expect("first file");
+    let second = db::load_instruction(&pool, b, repo_b.id, "web/AGENTS.md", &file("y")).await.expect("second file");
+    db::load_instruction(&pool, b, repo_b.id, "AGENTS.md", &file("x2")).await.expect("the first, loaded again");
+    assert_eq!(
+        physical_order(&pool, "loaded_instructions", repo_b.id).await,
+        vec![second.id, first.id],
+        "the first file's row moved past the second's"
+    );
+
+    let holding = hold_one(&pool, "loaded_instructions", second.id).await;
+    decline_while_deleting(&pool, a, &card_a, b, holding).await;
 }
