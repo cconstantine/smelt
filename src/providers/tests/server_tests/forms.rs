@@ -70,6 +70,12 @@ async fn test_a_provider_form_is_checked_and_the_secret_never_comes_back(pool: P
 /// column can't hold is refused, naming the field.
 #[sqlx::test]
 async fn test_a_providers_max_concurrent_requests_is_saved_and_shown(pool: PgPool) {
+    // Saving sets the provider's slots, which are process-wide by id
+    // (SME-162 review 2): an id no other test uses.
+    sqlx::query("ALTER TABLE inference_providers ALTER COLUMN id RESTART WITH 9162000011")
+        .execute(&pool)
+        .await
+        .expect("renumber");
     let limited = |max| ProviderInput { max_concurrent_requests: max, ..input("Home", "http://ollama:11434", "secret-1234567890") };
     let one = create_provider(&pool, limited(Some(1))).await.expect("create");
     assert_eq!(one.max_concurrent_requests, Some(1));
