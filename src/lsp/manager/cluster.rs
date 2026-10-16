@@ -143,23 +143,26 @@ async fn test_rust_analyzer_from_the_catalog_answers_across_files(pool: PgPool) 
         // operation. B16: a rename touching one changed in a terminal works
         // the first time, rather than being refused for good. garden.rs was
         // never sent to the server: the rename syncs it and asks again.
-        let appended = format!("{SHAPES_RS}// appended\n");
-        write_files(&client, &sandbox, &[(SHAPES, &appended)]).await;
+        // The terminal's line goes on top, moving every position in the
+        // file: edits from the server's old view would land a line off
+        // (review 1: an append alone moved nothing).
+        let changed = format!("// changed in a terminal\n{SHAPES_RS}// appended\n");
+        write_files(&client, &sandbox, &[(SHAPES, &changed)]).await;
         let tile = OperationInput { new_name: Some("Tile".to_string()), ..at(MAIN, 9, 18) };
         let renamed = operate(&pool, &client, &sandbox, Operation::Rename, &tile).await;
         assert!(renamed.as_ref().is_ok_and(|r| r.contains("Renamed to Tile in 3 files")), "{renamed:?}");
         let shapes = read(&client, &sandbox, SHAPES).await;
-        assert!(shapes.contains("pub struct Tile") && shapes.ends_with("}\n// appended\n"), "{shapes}");
+        assert_eq!(shapes, changed.replace("Square", "Tile"));
         let main = read(&client, &sandbox, MAIN).await;
         assert!(main.contains("let square = Tile {"), "{main}");
         let garden = read(&client, &sandbox, GARDEN).await;
         assert!(garden.contains("pub fn plot() -> Tile {"), "{garden}");
 
         // Positions in a file changed on disk are the ones on disk now: a
-        // line put above `fn area` moves it from line 2 to 3.
+        // line put above `fn area` moves it from line 3 to 4.
         write_files(&client, &sandbox, &[(SHAPES, &format!("// moved\n{shapes}"))]).await;
         let refs = operate(&pool, &client, &sandbox, Operation::References, &at(MAIN, 5, 30)).await.expect("references");
-        assert!(refs.lines().any(|l| l.contains("shapes.rs:3:") && l.contains("fn area")), "{refs}");
+        assert!(refs.lines().any(|l| l.contains("shapes.rs:4:") && l.contains("fn area")), "{refs}");
 
         // A deleted open file is closed, so the server sees it's gone.
         let removed = crate::sandbox::exec_with(&client, &sandbox.pod_name, "sandbox", &["rm", SHAPES], None).await.expect("rm");
