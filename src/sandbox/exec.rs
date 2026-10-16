@@ -5,6 +5,9 @@ use super::*;
 
 pub struct Sandbox {
     pub(super) pod_name: String,
+    /// The uid of the pod this `Sandbox` made or reused: deleting it is
+    /// held to that pod, never one that took its name since.
+    pub(super) uid: Option<String>,
     // Only read by the test-only `exec` and `shell` below; production
     // code reaches a pod's sandbox container through `PodShell` or the
     // sandbox agent.
@@ -13,7 +16,7 @@ pub struct Sandbox {
     /// The instance the pod was made for, which `shell` checks it against.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) instance: db::SmeltInstance,
-    pub(super) cleanup_tx: mpsc::UnboundedSender<String>,
+    pub(super) cleanup_tx: mpsc::UnboundedSender<(String, Option<String>)>,
 }
 
 pub struct ExecResult {
@@ -180,6 +183,6 @@ pub(super) fn extract_exit_code(
 impl Drop for Sandbox {
     fn drop(&mut self) {
         tracing::info!(pod = %self.pod_name, "Sandbox dropped, queuing cleanup");
-        let _ = self.cleanup_tx.send(self.pod_name.clone());
+        let _ = self.cleanup_tx.send((self.pod_name.clone(), self.uid.clone()));
     }
 }

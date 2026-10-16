@@ -12,7 +12,7 @@ pub(crate) fn kube_client() -> Result<kube::Client, SandboxError> {
 
 pub struct SandboxManager {
     pub(super) client: kube::Client,
-    pub(super) cleanup_tx: mpsc::UnboundedSender<String>,
+    pub(super) cleanup_tx: mpsc::UnboundedSender<(String, Option<String>)>,
 }
 
 impl SandboxManager {
@@ -91,7 +91,7 @@ impl SandboxManager {
         // ours to delete if it never reaches `Running` below; a reused
         // pod's non-`Running` status could be a transient blip on
         // something another part of the system still depends on.
-        let just_created = match pods.get_opt(&name).await? {
+        let (just_created, uid) = match pods.get_opt(&name).await? {
             // Never another database's pod (SME-115): its agent runs
             // commands for whoever connects.
             Some(pod) if ownership(&pod.metadata, &instance.id) != Ownership::Ours => {
@@ -111,16 +111,17 @@ impl SandboxManager {
                 // Reuse: what makes an active conversation's sandbox
                 // survive a smelt server restart, see SME-7's "Restart
                 // behavior" section.
-                false
+                (false, pod.metadata.uid)
             }
             None => {
                 ensure_volume_claims(&self.client, volumes, instance).await?;
-                pods.create(
-                    &PostParams::default(),
-                    &build_pod_spec(&name, memory, docker, volumes, &instance.id),
-                )
-                .await?;
-                true
+                let made = pods
+                    .create(
+                        &PostParams::default(),
+                        &build_pod_spec(&name, memory, docker, volumes, &instance.id),
+                    )
+                    .await?;
+                (true, made.metadata.uid)
             }
         };
 
@@ -132,13 +133,14 @@ impl SandboxManager {
                 // it sits forever — worse, a caller that derives this same
                 // pod name deterministically (as `sandbox_volume_pvc_name`
                 // does) collides with it on every subsequent attempt.
-                pods.delete(&name, &pod_delete_params()).await.ok();
+                pods.delete(&name, &sandbox_delete_params(uid.as_deref())).await.ok();
             }
             return Err(e);
         }
 
         Ok(Sandbox {
             pod_name: name,
+            uid,
             client: self.client.clone(),
             instance: instance.clone(),
             cleanup_tx: self.cleanup_tx.clone(),
@@ -149,10 +151,19 @@ impl SandboxManager {
     /// queues the same cleanup: for a pod whose start failed after it was
     /// made (its git install), and for tests that assert on the pod's
     /// absence right after deleting it, without racing the cleanup queue.
+    ///
+    /// Only the pod this `Sandbox` made or reused, by its uid: once that pod
+    /// is gone, another database's pod can take its name, and is left
+    /// (SME-180 review 1).
     pub async fn delete(&self, sandbox: Sandbox) -> Result<(), SandboxError> {
         let pods = pods_api(&self.client);
-        pods.delete(&sandbox.pod_name, &pod_delete_params())
-            .await?;
+        match pods.delete(&sandbox.pod_name, &sandbox_delete_params(sandbox.uid.as_deref())).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 409 => {
+                tracing::warn!(pod = %sandbox.pod_name, "the pod was replaced since this sandbox made it; the new one is left");
+            }
+            Err(e) => return Err(e.into()),
+        }
         // Disarms Drop: safe to skip since none of Sandbox's fields have
         // meaningful Drop side effects of their own (a String, a
         // cheaply-Clone/Arc-backed kube::Client, an UnboundedSender whose
@@ -162,16 +173,22 @@ impl SandboxManager {
     }
 }
 
-pub(super) async fn drain_cleanup_queue(client: kube::Client, mut rx: mpsc::UnboundedReceiver<String>) {
+pub(super) async fn drain_cleanup_queue(
+    client: kube::Client,
+    mut rx: mpsc::UnboundedReceiver<(String, Option<String>)>,
+) {
     let pods = pods_api(&client);
-    while let Some(name) = rx.recv().await {
+    while let Some((name, uid)) = rx.recv().await {
         match tokio::time::timeout(
             Duration::from_secs(30),
-            pods.delete(&name, &pod_delete_params()),
+            pods.delete(&name, &sandbox_delete_params(uid.as_deref())),
         )
         .await
         {
             Ok(Ok(_)) => tracing::info!(pod = %name, "cleaned up dropped sandbox"),
+            Ok(Err(kube::Error::Api(e))) if e.code == 409 => {
+                tracing::warn!(pod = %name, "a dropped sandbox's pod was replaced; the new one is left")
+            }
             Ok(Err(e)) => {
                 tracing::error!(pod = %name, error = %e, "failed to clean up dropped sandbox")
             }
