@@ -503,11 +503,33 @@ async fn test_an_answer_turn_with_nothing_to_do_keeps_the_kept_error(pool: PgPoo
 fn test_a_generation_taken_after_a_delete_leaves_no_turn_state() {
     let conversation_id = 9_179_000_003;
     let turn = TurnInFlight::start(conversation_id);
-    let held = conversation_lock(conversation_id).try_lock_owned().expect("the lock is free");
+    let lock = conversation_lock(conversation_id);
+    let held = lock.clone().try_lock_owned().expect("the lock is free");
     forget_conversation_lock(conversation_id);
 
-    let _ = take_turn_generation(conversation_id);
+    let _ = take_turn_generation(conversation_id, &lock);
     drop(held);
+    drop(lock);
+    drop(turn);
+
+    assert!(!has_turn_state(conversation_id), "the turn left turn state");
+}
+
+/// Review 2, finding 1: as the test above, with a fresh turn lock made
+/// after the delete's forget (a notice for the deleted conversation asks
+/// for one), so the entry has a lock again, but not the turn's own.
+#[test]
+fn test_a_generation_taken_after_a_delete_and_a_new_lock_leaves_no_turn_state() {
+    let conversation_id = 9_179_000_004;
+    let turn = TurnInFlight::start(conversation_id);
+    let lock = conversation_lock(conversation_id);
+    let held = lock.clone().try_lock_owned().expect("the lock is free");
+    forget_conversation_lock(conversation_id);
+    drop(conversation_lock(conversation_id));
+
+    assert_eq!(take_turn_generation(conversation_id, &lock), None, "a generation was taken");
+    drop(held);
+    drop(lock);
     drop(turn);
 
     assert!(!has_turn_state(conversation_id), "the turn left turn state");

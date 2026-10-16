@@ -220,12 +220,12 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
             }
         };
         if new_message.is_some() {
-            *generation = take_turn_generation(conversation_id);
+            *generation = take_turn_generation(conversation_id, &lock);
         }
         // Checked after the generation is taken, both under the lock: a
         // delete landing before the check is seen here, and one landing
         // after it forgets the generation itself (`forget_conversation_lock`),
-        // after which no generation is taken (`take_turn_generation`), so
+        // after which this turn takes no generation (`take_turn_generation`), so
         // the turn's state ends idle either way (SME-179 B31).
         if !db::conversation_exists(pool, conversation_id)
             .await
@@ -246,7 +246,7 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
             Some((saved, content)) => {
                 // An answer turn's answer, saved as its message.
                 if generation.is_none() {
-                    *generation = take_turn_generation(conversation_id);
+                    *generation = take_turn_generation(conversation_id, &lock);
                 }
                 #[cfg(test)]
                 test_hooks::after_message_saved(conversation_id).await;
@@ -256,7 +256,7 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
             None => None,
         };
         tokio::select! {
-            result = run_turn_body(pool, conversation_id, guard, persisted, new_content, max_turns, generation) => return result.map_err(TurnFailure::Failed),
+            result = run_turn_body(pool, conversation_id, guard, lock.clone(), persisted, new_content, max_turns, generation) => return result.map_err(TurnFailure::Failed),
             _ = stop.changed() => {}
         }
         // Stopped mid-turn: the body, and its hold on the lock, is gone.
@@ -368,7 +368,8 @@ impl Drop for TurnSteps {
     }
 }
 
-/// The turn itself, holding the turn lock (`turn_lock`) until it ends:
+/// The turn itself, holding the turn lock (`turn_lock`, of mutex `held`)
+/// until it ends:
 /// `persisted` starts with the turn's own message, already saved by
 /// `run_turn_bounded`, and `new_content` is that message's content
 /// (`None` for a wake). `generation` is the turn's generation, if it has
@@ -382,6 +383,7 @@ pub(super) fn run_turn_body<'a: 'b, 'b>(
     pool: &'a PgPool,
     conversation_id: i64,
     turn_lock: tokio::sync::OwnedMutexGuard<()>,
+    held: Arc<tokio::sync::Mutex<()>>,
     persisted: Vec<Message>,
     new_content: Option<Vec<anthropic::ContentBlock>>,
     max_turns: usize,
@@ -391,7 +393,7 @@ pub(super) fn run_turn_body<'a: 'b, 'b>(
     Box::pin(async move {
         // Moved in, so the lock is held for as long as the turn runs.
         let _turn = turn_lock;
-        let result = run_turn_steps(pool, conversation_id, persisted, new_content, max_turns, generation).await;
+        let result = run_turn_steps(pool, conversation_id, &held, persisted, new_content, max_turns, generation).await;
         if result.is_err() {
             clear_reply_in_progress(conversation_id);
             crate::events::publish(conversation_id, crate::events::ConversationEvent::ReplyReset {});
@@ -406,6 +408,7 @@ pub(super) fn run_turn_body<'a: 'b, 'b>(
 fn run_turn_steps<'a: 'b, 'b>(
     pool: &'a PgPool,
     conversation_id: i64,
+    held: &'b Arc<tokio::sync::Mutex<()>>,
     mut persisted: Vec<Message>,
     new_content: Option<Vec<anthropic::ContentBlock>>,
     max_turns: usize,
@@ -483,7 +486,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             // turn, so it replaces the kept error, once, as it first calls
             // the model (SME-179).
             if generation.is_none() {
-                *generation = take_turn_generation(conversation_id);
+                *generation = take_turn_generation(conversation_id, &held);
             }
 
             let turn_model = match resolved_model.take() {

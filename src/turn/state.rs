@@ -364,14 +364,17 @@ pub(super) fn new_turn_generation(conversation_id: i64) -> u64 {
 }
 
 /// Starts a new turn generation for `conversation_id` from inside a turn
-/// that holds its turn lock, as `new_turn_generation`, and returns it;
-/// `None` once the conversation's delete has forgotten its turn state
-/// (no lock in it while this turn still holds one: an unheld lock is
-/// the only one ever freed). A generation taken then would keep the
-/// entry for good (SME-179 review 1).
-pub(super) fn take_turn_generation(conversation_id: i64) -> Option<u64> {
+/// that holds its turn lock `held`, as `new_turn_generation`, and returns
+/// it; `None` once the conversation's delete has forgotten its turn
+/// state, when the entry no longer has `held` as its lock (none, or a
+/// fresh one made since: an unheld lock is the only one ever freed). A
+/// generation taken then would keep the entry for good (SME-179 reviews
+/// 1 and 2).
+pub(super) fn take_turn_generation(conversation_id: i64, held: &Arc<tokio::sync::Mutex<()>>) -> Option<u64> {
     update_existing_with(conversation_id, |runtime| {
-        runtime.lock.as_ref()?;
+        if !runtime.lock.as_ref().is_some_and(|lock| Arc::ptr_eq(lock, held)) {
+            return None;
+        }
         runtime.kept.generation += 1;
         runtime.kept.error = None;
         Some(runtime.kept.generation)
