@@ -62,7 +62,7 @@ pub struct LoadedInstruction {
 /// Loads `path` of repo `repo_id` into the conversation's context, or
 /// replaces what was loaded from it.
 pub async fn load_instruction(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     conversation_id: i64,
     repo_id: i64,
     path: &str,
@@ -82,7 +82,7 @@ pub async fn load_instruction(
     .bind(file.file_bytes)
     .bind(&file.hash)
     .bind(file.commit.as_deref())
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
@@ -127,7 +127,7 @@ impl InstructionRequest {
 /// Asks about `path` of repo `repo_id`, replacing an earlier request for
 /// the same file (the card then shows the newest copy).
 pub async fn request_instruction(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     conversation_id: i64,
     repo_id: i64,
     path: &str,
@@ -147,7 +147,23 @@ pub async fn request_instruction(
     .bind(file.file_bytes)
     .bind(&file.hash)
     .bind(file.commit.as_deref())
-    .fetch_one(pool)
+    .fetch_one(executor)
+    .await
+}
+
+/// Takes the card `id` from conversation `conversation_id` to answer it:
+/// `None` when it's gone (answered already, or not this conversation's).
+pub async fn take_instruction_request(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: i64,
+    conversation_id: i64,
+) -> Result<Option<InstructionRequest>, sqlx::Error> {
+    sqlx::query_as::<_, InstructionRequest>(
+        "DELETE FROM instruction_requests WHERE id = $1 AND conversation_id = $2 RETURNING *",
+    )
+    .bind(id)
+    .bind(conversation_id)
+    .fetch_optional(executor)
     .await
 }
 
@@ -172,7 +188,7 @@ pub async fn list_instruction_requests(
 
 /// Every conversation's requests about repos with this remote.
 pub async fn list_instruction_requests_for_remote(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     remote_key: &str,
 ) -> Result<Vec<InstructionRequest>, sqlx::Error> {
     sqlx::query_as::<_, InstructionRequest>(
@@ -181,7 +197,7 @@ pub async fn list_instruction_requests_for_remote(
           WHERE c.remote_key = $1 ORDER BY r.id ASC",
     )
     .bind(remote_key)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
@@ -189,7 +205,7 @@ pub async fn list_instruction_requests_for_remote(
 /// (the user declined it). Returns `(conversation, checkout dir, path)` of
 /// each file unloaded.
 pub async fn unload_instructions_for_remote(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     remote_key: &str,
 ) -> Result<Vec<(i64, String, String)>, sqlx::Error> {
     sqlx::query_as(
@@ -199,32 +215,32 @@ pub async fn unload_instructions_for_remote(
       RETURNING l.conversation_id, c.dir, l.path",
     )
     .bind(remote_key)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 /// Drops a pending request for `path` of repo `repo_id`, if there is one.
-pub async fn delete_instruction_request_for(pool: &PgPool, repo_id: i64, path: &str) -> Result<(), sqlx::Error> {
+pub async fn delete_instruction_request_for(executor: impl sqlx::PgExecutor<'_>, repo_id: i64, path: &str) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM instruction_requests WHERE repo_id = $1 AND path = $2")
         .bind(repo_id)
         .bind(path)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
 }
 
-pub async fn delete_instruction_request(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
+pub async fn delete_instruction_request(executor: impl sqlx::PgExecutor<'_>, id: i64) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM instruction_requests WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
 }
 
-pub async fn get_conversation_repo(pool: &PgPool, id: i64) -> Result<Option<ConversationRepo>, sqlx::Error> {
+pub async fn get_conversation_repo(executor: impl sqlx::PgExecutor<'_>, id: i64) -> Result<Option<ConversationRepo>, sqlx::Error> {
     sqlx::query_as::<_, ConversationRepo>("SELECT * FROM conversation_repos WHERE id = $1")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
@@ -235,22 +251,35 @@ pub struct RepoTrust {
     pub decided_at: NaiveDateTime,
 }
 
+/// Takes the remote's trust lock (SME-181), held until the transaction
+/// ends: a trust decision and a load for one remote then come wholly
+/// before or after each other. An advisory lock, since an undecided
+/// remote has no `repo_trust` row to lock; two remotes whose keys hash
+/// alike only take turns.
+pub async fn lock_remote_trust(executor: impl sqlx::PgExecutor<'_>, remote_key: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('repo_trust:' || $1, 0))")
+        .bind(remote_key)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
 /// `Some(trusted)` once the user has decided about this remote.
-pub async fn get_repo_trust(pool: &PgPool, remote_key: &str) -> Result<Option<bool>, sqlx::Error> {
+pub async fn get_repo_trust(executor: impl sqlx::PgExecutor<'_>, remote_key: &str) -> Result<Option<bool>, sqlx::Error> {
     sqlx::query_scalar("SELECT trusted FROM repo_trust WHERE remote_key = $1")
         .bind(remote_key)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
-pub async fn set_repo_trust(pool: &PgPool, remote_key: &str, trusted: bool) -> Result<(), sqlx::Error> {
+pub async fn set_repo_trust(executor: impl sqlx::PgExecutor<'_>, remote_key: &str, trusted: bool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO repo_trust (remote_key, trusted) VALUES ($1, $2)
          ON CONFLICT (remote_key) DO UPDATE SET trusted = $2, decided_at = now()",
     )
     .bind(remote_key)
     .bind(trusted)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
