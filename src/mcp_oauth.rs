@@ -174,28 +174,53 @@ const CALLBACK_ERROR_TTL: Duration = Duration::from_secs(5 * 60);
 /// edit page takes the text from here (`take_callback_error`), so no text
 /// in a link can show as smelt's own error. A successful callback clears
 /// the slot; a take empties it; an entry older than `CALLBACK_ERROR_TTL`
-/// is refused on take and pruned on the next record. In memory: a restart
+/// is refused on take and pruned on the next record. An error from a
+/// callback that matched no attempt (`record_unmatched_callback_error`)
+/// never replaces an unexpired one from a callback that did, so a forged
+/// callback can't swap the real error out before the page takes it
+/// (SME-177). In memory: a restart
 /// between the callback and its page load loses the text, and the status
 /// section still says the server isn't connected. A plain `Mutex`: nothing
 /// is awaited while it's held.
-static CALLBACK_ERRORS: LazyLock<StdMutex<HashMap<i64, (String, Instant)>>> =
+static CALLBACK_ERRORS: LazyLock<StdMutex<HashMap<i64, KeptCallbackError>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-fn callback_errors() -> std::sync::MutexGuard<'static, HashMap<i64, (String, Instant)>> {
+struct KeptCallbackError {
+    message: String,
+    kept: Instant,
+    /// Whether the callback carried a pending attempt's state.
+    matched: bool,
+}
+
+fn callback_errors() -> std::sync::MutexGuard<'static, HashMap<i64, KeptCallbackError>> {
     // No critical section leaves the map half-changed.
     CALLBACK_ERRORS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Keeps `message` as server `id`'s callback error, replacing any earlier
-/// one, after pruning the expired entries.
+/// Keeps `message`, from a callback that matched an attempt, as server
+/// `id`'s callback error, replacing any earlier one, after pruning the
+/// expired entries.
 fn record_callback_error(id: i64, message: String) {
     record_callback_error_at(id, message, Instant::now());
 }
 
 fn record_callback_error_at(id: i64, message: String, at: Instant) {
+    record(id, KeptCallbackError { message, kept: at, matched: true });
+}
+
+/// Keeps `message`, from a callback that matched no attempt, unless the
+/// slot holds an unexpired error from one that did.
+fn record_unmatched_callback_error(id: i64, message: String) {
+    record(id, KeptCallbackError { message, kept: Instant::now(), matched: false });
+}
+
+fn record(id: i64, error: KeptCallbackError) {
     let mut errors = callback_errors();
-    errors.retain(|_, (_, kept)| kept.elapsed() < CALLBACK_ERROR_TTL);
-    errors.insert(id, (message, at));
+    errors.retain(|_, kept| kept.kept.elapsed() < CALLBACK_ERROR_TTL);
+    if !error.matched && errors.get(&id).is_some_and(|kept| kept.matched) {
+        return;
+    }
+    errors.insert(id, error);
 }
 
 fn clear_callback_error(id: i64) {
@@ -205,8 +230,8 @@ fn clear_callback_error(id: i64) {
 /// Server `id`'s kept callback error, removed so it shows once; `None` if
 /// there's none or it's older than `CALLBACK_ERROR_TTL`.
 pub fn take_callback_error(id: i64) -> Option<String> {
-    let (message, kept) = callback_errors().remove(&id)?;
-    (kept.elapsed() < CALLBACK_ERROR_TTL).then_some(message)
+    let error = callback_errors().remove(&id)?;
+    (error.kept.elapsed() < CALLBACK_ERROR_TTL).then_some(error.message)
 }
 
 /// Starts an OAuth authorization attempt for `config` and returns the
@@ -540,7 +565,6 @@ async fn take_matching_attempt(
 #[derive(Debug)]
 struct CallbackFailure {
     message: String,
-    #[expect(dead_code, reason = "read by the callback error slot's rule, the next commit")]
     matched: bool,
 }
 
@@ -643,8 +667,12 @@ pub async fn callback_handler(
             clear_callback_error(id);
             axum::response::Redirect::to(&format!("/mcp-servers/{id}"))
         }
-        Err(error) => {
-            record_callback_error(id, error.message);
+        Err(CallbackFailure { message, matched: true }) => {
+            record_callback_error(id, message);
+            axum::response::Redirect::to(&format!("/mcp-servers/{id}?oauth_callback=1"))
+        }
+        Err(CallbackFailure { message, matched: false }) => {
+            record_unmatched_callback_error(id, message);
             axum::response::Redirect::to(&format!("/mcp-servers/{id}?oauth_callback=1"))
         }
     }
