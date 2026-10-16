@@ -29,6 +29,8 @@ pub struct Mock {
     gate: StdMutex<Option<Gate>>,
     /// Set by `Held::fail`: every later request gets a 500.
     failing: AtomicBool,
+    /// Every `initialize` that arrived, held, failed or answered.
+    initializes: std::sync::atomic::AtomicU32,
     initialize_headers: StdMutex<Vec<Option<String>>>,
 }
 
@@ -47,7 +49,12 @@ impl Mock {
         Held { reached, answer }
     }
 
-    /// The `HEADER` value each `initialize` so far carried, in order.
+    /// How many `initialize` requests arrived: one per connect attempt.
+    pub fn initializes(&self) -> u32 {
+        self.initializes.load(Ordering::SeqCst)
+    }
+
+    /// The `HEADER` value each answered `initialize` carried, in order.
     pub fn initialize_headers(&self) -> Vec<Option<String>> {
         self.initialize_headers.lock().unwrap().clone()
     }
@@ -80,6 +87,9 @@ async fn handler(
     axum::Json(request): axum::Json<serde_json::Value>,
 ) -> Response {
     let method = request["method"].as_str().unwrap_or_default().to_string();
+    if method == "initialize" {
+        mock.initializes.fetch_add(1, Ordering::SeqCst);
+    }
     let gate = {
         let mut gate = mock.gate.lock().unwrap();
         if gate.as_ref().is_some_and(|(held, ..)| *held == method) { gate.take() } else { None }
@@ -134,6 +144,7 @@ pub async fn spawn(tool: &'static str) -> Arc<Mock> {
         tool,
         gate: StdMutex::new(None),
         failing: AtomicBool::new(false),
+        initializes: std::sync::atomic::AtomicU32::new(0),
         initialize_headers: StdMutex::new(Vec::new()),
     });
     let app = axum::Router::new()

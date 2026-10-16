@@ -145,6 +145,9 @@ async fn test_a_connect_failing_after_an_edit_is_not_recorded_as_a_failure(pool:
     finish(turn).await;
 
     assert!(!failed_recently(config.id), "the old URL's failure was recorded against the server");
+    // Review 1: no retry against the row the evict made stale, which a
+    // status check queued behind this connect would also wait out.
+    assert_eq!(a.initializes(), 1, "the connect retried the old URL after the edit");
     assert_eq!(tool_names(&pool, &edited).await, named(&edited, "tool_b"));
     evict(config.id).await;
 }

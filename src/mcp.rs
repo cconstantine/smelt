@@ -555,7 +555,16 @@ async fn ensure_connected(
         Ok(None) => return Err(format!("MCP server {:?} no longer exists", config.name).into()),
         Err(e) => return Err(format!("couldn't read MCP server {:?}'s settings: {e}", config.name).into()),
     };
-    let result = retry_once(|| connect(pool, &row)).await;
+    // No retry once an evict has come: it would only be refused, and a
+    // caller queued on `CONNECTING` would wait it out (review 1).
+    let (first, row) = (&AtomicBool::new(true), &row);
+    let result = retry_once(|| async move {
+        if !first.swap(false, Ordering::SeqCst) && generation(&*REGISTRY.lock().await, config.id) != started {
+            return Err(ConnectError::from("evicted while connecting".to_string()));
+        }
+        connect(pool, row).await
+    })
+    .await;
     let mut registry = REGISTRY.lock().await;
     if generation(&registry, config.id) != started {
         // Evicted while connecting: nothing is kept or recorded, and the
