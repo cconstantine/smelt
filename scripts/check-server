@@ -59,6 +59,13 @@
 # both default to 8181, so the second runs without previews and its links
 # point at the first's listener.
 #
+# The port lock keeps out other check servers only. start refuses a port
+# anything else already listens on (a hand-run ./server or dx serve, an
+# older copy of this script's server, another user's process), on any
+# address, before it checks anything out, naming the listener (SME-175).
+# It never stops a server it didn't start: stop that one yourself, or use
+# another CHECK_PORT.
+#
 # A start and a stop of the same scratch database take a lock on the
 # database's own name ($SMELT_LOCK_DIR/smelt-check-scratch-<name>.lock)
 # around every step that reads or writes that database or its state file,
@@ -262,6 +269,64 @@ port_holder() {
     echo "another worktree"
 }
 
+# The inodes of the sockets listening on TCP port $1, on any local address,
+# IPv4 or IPv6 (SME-175). Read from /proc, since the container has no ss or
+# lsof; a missing /proc/net/tcp6 (no IPv6) counts as none.
+port_listener_inodes() { # port
+    local hex file
+    local -a files=()
+    hex=$(printf '%04X' "$1")
+    for file in /proc/net/tcp /proc/net/tcp6; do
+        [ -r "$file" ] && files+=("$file")
+    done
+    [ ${#files[@]} -gt 0 ] || return 0
+    # State 0A is LISTEN; the local address ends in :<port, 4 hex digits>.
+    awk -v suffix=":$hex" '$4 == "0A" && substr($2, length($2) - 4) == suffix { print $10 }' "${files[@]}"
+}
+
+# The socket inodes the live processes of group $1 hold open.
+group_socket_inodes() { # pgid
+    local pid
+    for pid in $(pgrep -g "$1" 2>/dev/null); do
+        find "/proc/$pid/fd" -maxdepth 1 -lname 'socket:*' -printf '%l\n' 2>/dev/null || true
+    done | sed -n 's/^socket:\[\([0-9]*\)\]$/\1/p'
+}
+
+# The inodes of the sockets listening on port $2 that no process of group
+# $1 holds: with no group, every one of them.
+foreign_listener_inodes() { # pgid (may be empty) port
+    local ours="" inode
+    [ -n "$1" ] && ours=$(group_socket_inodes "$1")
+    for inode in $(port_listener_inodes "$2"); do
+        grep -qxF "$inode" <<<"$ours" || echo "$inode"
+    done
+}
+
+# Who holds the listening sockets $@ (inodes): "pid N (command) in <cwd>"
+# for each process this user can see holding one, else that it can't see
+# it. Only reads /proc; never signals anything.
+describe_listeners() { # inode...
+    local inode fd pid cmd cwd
+    local -a found=() seen=()
+    for inode in "$@"; do
+        for fd in $(find /proc/[0-9]*/fd -maxdepth 1 -lname "socket:\[$inode\]" 2>/dev/null); do
+            pid=${fd#/proc/}
+            pid=${pid%%/*}
+            [[ " ${seen[*]} " == *" $pid "* ]] && continue
+            seen+=("$pid")
+            cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)
+            cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || echo "an unreadable directory")
+            found+=("pid $pid (${cmd% }) in $cwd")
+        done
+    done
+    if [ ${#found[@]} -eq 0 ]; then
+        echo "a process this user can't see (another user's, such as docker-proxy)"
+    else
+        local IFS=";"
+        echo "${found[*]}" | sed 's/;/; /g'
+    fi
+}
+
 # Whether a live process is in process group $1. pgrep counts a zombie, and
 # a process killed here stays a zombie until its parent notices it died: the
 # parent is often gone (the server runs in its own group and session), and
@@ -390,6 +455,18 @@ start() {
     if ! flock -n 8; then
         echo "waiting for port $port: a check server from $(port_holder) holds it; scripts/check-server stop there, or use another CHECK_PORT" >&2
         flock 8
+    fi
+    # Anything else listening on the port, after the lock (a start that
+    # waited checks once the server before it has stopped) and before
+    # anything is checked out, created or started (SME-175): the lock keeps
+    # out other check servers only, and whatever else answers there would
+    # pass for this server. Exiting frees the locks; nothing is signalled.
+    local foreign
+    foreign=$(foreign_listener_inodes "" "$port")
+    if [ -n "$foreign" ]; then
+        # shellcheck disable=SC2086 # one inode per word
+        echo "port $port is taken: $(describe_listeners $foreign) listens on it. check-server never stops a server it didn't start: stop that one yourself, or use another CHECK_PORT" >&2
+        exit 1
     fi
     if [ -d "$worktree" ]; then
         git -C "$worktree" checkout -q --detach "$commit"
@@ -540,7 +617,7 @@ case "${1:-}" in
         fi
         ;;
     *)
-        sed -n '2,67p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,74p' "$0" | sed 's/^# \{0,1\}//'
         exit 2
         ;;
 esac

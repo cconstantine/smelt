@@ -387,4 +387,79 @@ grep -qF "waiting for the scratch lock" <<<"$out" || fail "the waiting start's l
 wait "$stopper" || fail "the stop holding the scratch lock failed"
 scratch_is_free || fail "the scratch lock is still held after the stop ended"
 
+# SME-175: listeners that aren't the check server's. Each is a python HTTP
+# server answering 200, in a process group of its own, which this script
+# starts and stops by the pid it recorded, and only those.
+foreign_ready=$dir/foreign-ready
+# Starts one on HOST:PORT and waits until it listens; sets foreign_pid,
+# checked to be the server itself (its own pid, written once it listens).
+# Fails when it can't bind.
+start_foreign() { # host port
+    : >"$foreign_ready"
+    "$STUB_PYTHON3" -I "$STUB_HTTP_200" "$1" "$2" --own-group --ready "$foreign_ready" </dev/null >/dev/null 2>&1 &
+    foreign_pid=$!
+    for _ in $(seq 1 50); do
+        if [ -s "$foreign_ready" ]; then
+            [ "$(cat "$foreign_ready")" = "$foreign_pid" ] && return 0
+            fail "the foreign listener's pid is $(cat "$foreign_ready"), not $foreign_pid"
+            return 1
+        fi
+        pid_is_live "$foreign_pid" || return 1
+        sleep 0.1
+    done
+    return 1
+}
+stop_foreign() { # pid
+    kill "$1" 2>/dev/null
+    wait "$1" 2>/dev/null
+}
+# Whether IPv6's loopback can be bound here (a container may have no IPv6).
+has_ipv6_loopback() {
+    "$STUB_PYTHON3" -I -c 'import socket; s = socket.socket(socket.AF_INET6); s.bind(("::1", 0))' 2>/dev/null
+}
+
+# 12. A port something else already listens on is refused before anything
+# is checked out, created or started: no sqlx or cleanup call, no state
+# file written, the check worktree where it was, the port lock freed. The
+# refusal names the listener, which is never signalled, by start or by a
+# stop after it.
+expect_refused_port() { # host
+    local host=$1 fport out rc head_before
+    fport=$(free_port) || { fail "no free port for $host"; return; }
+    if ! start_foreign "$host" "$fport"; then
+        fail "the foreign listener on [$host]:$fport never listened"
+        return
+    fi
+    head_before=$(git -C "$worktree" rev-parse HEAD)
+    : >"$SQLX_CALLS"
+    : >"$CLEANUP_CALLS"
+    : >"$pid_file"
+    : >"$scratch_file"
+    out=$(timeout 10 "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" CHECK_SCRATCH_DB=1 \
+        scripts/check-server start HEAD~1 2>&1)
+    rc=$?
+    [ "$rc" = 1 ] || fail "[$host]: start on a port another process listens on exited $rc: $out"
+    grep -q "check server up" <<<"$out" && fail "[$host]: start on a taken port said it was up: $out"
+    grep -qw "pid $foreign_pid" <<<"$out" || fail "[$host]: the refusal doesn't name the listener's pid $foreign_pid: $out"
+    grep -q "CHECK_PORT" <<<"$out" || fail "[$host]: the refusal doesn't say to use another CHECK_PORT: $out"
+    [ -s "$SQLX_CALLS" ] && fail "[$host]: a refused start called sqlx: $(cat "$SQLX_CALLS")"
+    [ -s "$CLEANUP_CALLS" ] && fail "[$host]: a refused start ran the cleanup: $(cat "$CLEANUP_CALLS")"
+    [ -s "$pid_file" ] && fail "[$host]: a refused start wrote a pid file: '$(cat "$pid_file")'"
+    [ -s "$scratch_file" ] && fail "[$host]: a refused start wrote a scratch file: '$(cat "$scratch_file")'"
+    [ "$(git -C "$worktree" rev-parse HEAD)" = "$head_before" ] || fail "[$host]: a refused start checked out another commit"
+    flock -n "$SMELT_LOCK_DIR/smelt-check-server-$fport.lock" true || fail "[$host]: a refused start left its port lock held"
+    pid_is_live "$foreign_pid" || fail "[$host]: start signalled the listener it refused"
+    "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" scripts/check-server stop >/dev/null 2>&1
+    pid_is_live "$foreign_pid" || fail "[$host]: stop signalled a listener it didn't start"
+    stop_foreign "$foreign_pid"
+}
+expect_refused_port 127.0.0.1
+# 13. The same for a listener on IPv6's loopback only, which curl tries
+# first for localhost and which dx's IPv4 bind doesn't collide with.
+if has_ipv6_loopback; then
+    expect_refused_port ::1
+else
+    echo "note: ::1 can't be bound here; skipping the IPv6-only listener case"
+fi
+
 finish

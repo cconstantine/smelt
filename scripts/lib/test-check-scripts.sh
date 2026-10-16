@@ -91,16 +91,17 @@ STUB_REAL_CURL=$(command -v curl)
 # An HTTP server answering 200 to every GET (SME-175): the dx stub's server,
 # and the cases' foreign listeners.
 #   http-200.py HOST PORT [--own-group] [--ready FILE] [--delay SECONDS]
-# --own-group puts it in a process group of its own (a foreign listener);
-# --ready writes its pid to FILE once it listens; --delay waits before
-# binding. A bind that fails ends it, as a taken port ends a server. It
-# ends itself after 600 s, so a run killed before its cleanup leaves
-# nothing behind for long.
+# --own-group puts it in a process group of its own (a foreign listener),
+# unless it already leads one: setsid fails for a group leader, as a
+# background job is under job control. --ready writes its pid to FILE once
+# it listens; --delay waits before binding. A bind that fails ends it, as
+# a taken port ends a server. It ends itself after 600 s, so a run killed
+# before its cleanup leaves nothing behind for long.
 export STUB_HTTP_200=$dir/http-200.py
 cat >"$STUB_HTTP_200" <<'EOF'
 import http.server, os, signal, socket, sys, time
 host, port, args = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
-if "--own-group" in args:
+if "--own-group" in args and os.getpgrp() != os.getpid():
     os.setsid()
 signal.alarm(600)
 if "--delay" in args:
