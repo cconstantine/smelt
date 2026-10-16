@@ -122,6 +122,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 class Server(http.server.HTTPServer):
     address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    # Never SO_REUSEPORT, which some Python releases turned on for
+    # HTTPServer: two stubs on one port must collide, as dx does (review 2).
+    allow_reuse_port = False
 server = Server((host, port), Handler)
 if "--ready" in args:
     with open(args[args.index("--ready") + 1], "w") as ready:
