@@ -394,9 +394,9 @@ foreign_ready=$dir/foreign-ready
 # Starts one on HOST:PORT and waits until it listens; sets foreign_pid,
 # checked to be the server itself (its own pid, written once it listens).
 # Fails when it can't bind.
-start_foreign() { # host port
+start_foreign() { # host port [http-200.py options]
     : >"$foreign_ready"
-    "$STUB_PYTHON3" -I "$STUB_HTTP_200" "$1" "$2" --own-group --ready "$foreign_ready" </dev/null >/dev/null 2>&1 &
+    "$STUB_PYTHON3" -I "$STUB_HTTP_200" "$@" --own-group --ready "$foreign_ready" </dev/null >/dev/null 2>&1 &
     foreign_pid=$!
     for _ in $(seq 1 50); do
         if [ -s "$foreign_ready" ]; then
@@ -526,6 +526,22 @@ grep -q "check server up" <<<"$out" && fail "a listener while dx never binds pas
 grep -qw "pid $foreign_pid" <<<"$out" || fail "a listener while dx never binds isn't named (pid $foreign_pid): $out"
 "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" scripts/check-server stop >/dev/null 2>&1
 pid_is_live "$foreign_pid" || fail "start or stop signalled the never-binds listener"
+stop_foreign "$foreign_pid"
+
+# 15b. The same for a listener that answers 500, as a server still building
+# does (review 1): no answer of its would pass, so only the check before
+# the request ends the start; without it, start would wait 12 minutes.
+fport=$(free_port)
+start_in_background "$fport" DX_NO_LISTEN=1
+wait_for_pid_file || fail "the 500 case's start wrote no pid file: $(cat "$start_out")"
+start_foreign 0.0.0.0 "$fport" --status 500 || fail "the 500 foreign listener never listened"
+wait "$starter"
+rc=$?
+out=$(cat "$start_out")
+[ "$rc" = 1 ] || fail "a listener answering 500 while dx never binds: start exited $rc (124: it waited): $out"
+grep -qw "pid $foreign_pid" <<<"$out" || fail "a listener answering 500 isn't named (pid $foreign_pid): $out"
+"${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" scripts/check-server stop >/dev/null 2>&1
+pid_is_live "$foreign_pid" || fail "start or stop signalled the listener answering 500"
 stop_foreign "$foreign_pid"
 
 # 16. A listener beside the server's, on IPv6's loopback (dx binds IPv4
