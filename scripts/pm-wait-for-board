@@ -30,8 +30,9 @@ file must not be readable by group or others (chmod 600). The key is never
 printed.
 
 Exit status: 0 with one line per change on stdout; 1 for --once with nothing
-changed; 2 when the key is missing, refused (401/403, no retry) or the API keeps
-failing (the message says why). With --once a failed poll isn't retried.
+changed; 2 when the key is missing, refused (401/403, no retry), the API keeps
+failing, or the snapshot can't be saved (the message says why; any change
+lines are printed first). With --once a failed poll isn't retried.
 
     scripts/pm-wait-for-board                 # wait for the next change
     scripts/pm-wait-for-board --once          # check once: report and exit 0, or exit 1 if nothing changed
@@ -176,6 +177,16 @@ def save_snapshot(board):
     with open(tmp, "w") as f:
         json.dump(board, f, sort_keys=True)
     os.replace(tmp, path)
+
+
+def _save_or_fail(board):
+    # An unsaved snapshot is SME-176's missed wake again at the next restart,
+    # and a state directory that can't be written is a setup problem the
+    # Project Manager should see.
+    try:
+        save_snapshot(board)
+    except OSError as e:
+        fail(f"can't save the board snapshot at {state_path()}: {e}")
 
 
 def self_test():
@@ -390,9 +401,46 @@ def _loop_cases(b):
         _expect(p, "stdout", out, ["SME-1: new -> Up Next"])
         return p
 
+    def make_saves_fail():
+        # A directory where save_snapshot writes its temporary file.
+        os.makedirs(state_path() + ".tmp")
+
+    def a_wake_whose_save_fails_still_reports_the_change():
+        # Printed before the save: a kill or a failure between the two can
+        # repeat a wake at the next run, never lose one.
+        p = []
+        save_snapshot(b(SME_1="Backlog"))
+        make_saves_fail()
+        status, out, err = _run([b(SME_1="Up Next")])
+        _expect(p, "status", status, 2)
+        _expect(p, "stdout", out, ["SME-1: Backlog -> Up Next"])
+        _expect(p, "says why", "can't save the board snapshot at " + state_path() in err, True)
+        return p
+
+    def a_failed_save_with_nothing_to_report_exits_2():
+        p = []
+        save_snapshot(b(SME_1="Up Next"))
+        make_saves_fail()
+        status, out, err = _run([b(SME_1="Planned"), b(SME_1="Up Next")])
+        _expect(p, "status", status, 2)
+        _expect(p, "stdout", out, [])
+        _expect(p, "says why", "can't save the board snapshot at " + state_path() in err, True)
+        return p
+
+    def a_failed_baseline_save_exits_2():
+        p = []
+        make_saves_fail()
+        status, out, err = _run([b(SME_1="Up Next")])
+        _expect(p, "status", status, 2)
+        _expect(p, "says why", "can't save the board snapshot at " + state_path() in err, True)
+        return p
+
     return [
         (f.__name__, f)
         for f in (
+            a_wake_whose_save_fails_still_reports_the_change,
+            a_failed_save_with_nothing_to_report_exits_2,
+            a_failed_baseline_save_exits_2,
             first_run_takes_a_baseline,
             a_move_into_a_wake_state_wakes,
             failed_polls_give_up_after_the_limit,
@@ -459,18 +507,20 @@ def watch(fetch, sleep, old, once, interval):
             continue
         if old is None:
             # First run: nothing to compare with yet. Keep this as the baseline.
-            save_snapshot(board)
+            _save_or_fail(board)
             print("pm-wait-for-board: no snapshot yet; took one, watching from now", file=sys.stderr)
         else:
             found = changes(old, board)
             if found:
-                save_snapshot(board)
-                print("\n".join(found))
+                # Printed before the save: a kill between the two then
+                # repeats this wake at the next run instead of losing it.
+                print("\n".join(found), flush=True)
+                _save_or_fail(board)
                 return 0
             # Nothing to report: this poll is what the next one, or the next
             # run, compares with (SME-176). Otherwise a ticket that leaves a
             # wake state and comes back looks unchanged.
-            save_snapshot(board)
+            _save_or_fail(board)
         old = board
         if once:
             return 1
