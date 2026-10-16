@@ -102,7 +102,7 @@ async fn test_wait_for_clones_waits_for_a_clone_to_finish(pool: PgPool) {
     finisher.await.expect("finisher");
 }
 
-fn file(content: &str) -> db::InstructionsFile {
+pub(super) fn file(content: &str) -> db::InstructionsFile {
     db::InstructionsFile {
         content: content.to_string(),
         file_bytes: content.len() as i64,
@@ -111,7 +111,7 @@ fn file(content: &str) -> db::InstructionsFile {
     }
 }
 
-async fn cloned_repo(pool: &PgPool, conversation_id: i64) -> db::ConversationRepo {
+pub(super) async fn cloned_repo(pool: &PgPool, conversation_id: i64) -> db::ConversationRepo {
     let repo = db::create_conversation_repo(pool, conversation_id, "git@github.com:o/r.git", "github.com/o/r", None, "r")
         .await
         .expect("repo");
@@ -119,7 +119,7 @@ async fn cloned_repo(pool: &PgPool, conversation_id: i64) -> db::ConversationRep
     db::get_conversation_repo(pool, repo.id).await.expect("get").expect("exists")
 }
 
-async fn only_repo(pool: &PgPool, conversation_id: i64) -> RepoSummary {
+pub(super) async fn only_repo(pool: &PgPool, conversation_id: i64) -> RepoSummary {
     let mut repos = list_repos(pool, conversation_id).await.expect("list");
     assert_eq!(repos.len(), 1, "{repos:?}");
     repos.remove(0)
