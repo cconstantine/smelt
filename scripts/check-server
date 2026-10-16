@@ -320,30 +320,36 @@ foreign_listener_inodes() { # pgid (may be empty) port
 }
 
 # Who holds the listening sockets $@ (inodes): "pid N (program) in <cwd>"
-# for each process this user can see holding one, else that it can't see
-# it. The program's name only (/proc/<pid>/comm), never its arguments,
-# which can carry a secret (SME-175 review 1). Only reads /proc; never
-# signals anything.
+# for each process this user can see holding one. The program's name only
+# (/proc/<pid>/comm), never its arguments, which can carry a secret
+# (SME-175 review 1). A socket no visible process holds is another user's
+# (named by its uid) or one that has closed since it was found (review 1:
+# both read as "can't see"). Only reads /proc; never signals anything.
 describe_listeners() { # inode...
-    local inode fd pid cmd cwd
+    local inode fd pid cmd cwd uid
     local -a found=() seen=()
     for inode in "$@"; do
+        local held=""
         for fd in $(find /proc/[0-9]*/fd -maxdepth 1 -lname "socket:\[$inode\]" 2>/dev/null); do
             pid=${fd#/proc/}
             pid=${pid%%/*}
+            held=1
             [[ " ${seen[*]} " == *" $pid "* ]] && continue
             seen+=("$pid")
             cmd=$(cat "/proc/$pid/comm" 2>/dev/null || echo "an unnamed program")
             cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || echo "an unreadable directory")
             found+=("pid $pid ($cmd) in $cwd")
         done
+        [ -n "$held" ] && continue
+        uid=$(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk -v i="$inode" '$4 == "0A" && $10 == i { print $8; exit }' || true)
+        if [ -n "$uid" ]; then
+            found+=("a process of uid $uid that this user can't see (such as docker-proxy)")
+        else
+            found+=("a listener that has closed since")
+        fi
     done
-    if [ ${#found[@]} -eq 0 ]; then
-        echo "a process this user can't see (another user's, such as docker-proxy)"
-    else
-        local IFS=";"
-        echo "${found[*]}" | sed 's/;/; /g'
-    fi
+    local IFS=";"
+    echo "${found[*]}" | sed 's/;/; /g'
 }
 
 # Whether a live process is in process group $1. pgrep counts a zombie, and
