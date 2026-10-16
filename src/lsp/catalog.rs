@@ -3,6 +3,8 @@
 //! (how to run it, and which files it takes). Pure functions over the
 //! fetched text; the page shows the result for the user to check and edit.
 
+use std::borrow::Cow;
+
 use crate::models::LanguageServerConfig;
 
 /// Where a server pod's installs go: its HOME (SME-35's spike).
@@ -46,7 +48,17 @@ pub fn suggest(package_yaml: &str, languages_toml: &str) -> Result<Suggestion, S
         .or_else(|| package.bin.keys().next().cloned())
         .unwrap_or_else(|| package.name.clone());
 
-    let (install_command, command) = install(&purl, source, &bin, &mut notes);
+    let notes_before_install = notes.len();
+    let (install_command, command) = match install(&purl, source, &bin, &mut notes) {
+        Ok(install) => install,
+        Err(note) => {
+            // Notes about the command it was building would be about
+            // nothing now.
+            notes.truncate(notes_before_install);
+            notes.push(note);
+            (String::new(), bin.clone())
+        }
+    };
     let image = image_for(&purl, &package.languages);
 
     let (file_types, root_markers) = languages(&helix, &package.name, &package.languages);
@@ -211,25 +223,118 @@ impl Purl {
     }
 }
 
-/// The install command and the path it leaves the executable at.
-fn install(purl: &Purl, source: &Source, bin: &str, notes: &mut Vec<String>) -> (String, String) {
+/// One shell word for `value`, a value from the catalog (SME-182): the
+/// saved install command runs in the server pod's `sh -c` as written, so
+/// this is the only place it can be quoted. As is when every character is
+/// in CPython `shlex.quote`'s safe set (every real registry value but the
+/// unfilled templates), else in single quotes, POSIX style. `value` is a
+/// whole word as `install()` puts it together (`pkg@1.0`, a URL), so a
+/// part inside one can be empty or start with `-` harmlessly. Refused, with
+/// the note to show, when quoting can't make it safe: empty, starting with
+/// `-` (quoted, it's still an option to npm, pip, go or cargo), or holding
+/// a control character, or one that shows as something else ([`invisible`]).
+fn shell_word(value: &str) -> Result<Cow<'_, str>, String> {
+    let refuse = |shown: String, why: &str| {
+        Err(format!(
+            "The catalog's install details include {shown}, which {why}, so smelt won't put it in a command: fill in the install command, and the command to run once it's installed."
+        ))
+    };
+    if value.is_empty() {
+        return refuse("an empty value".to_string(), "is empty");
+    }
+    // The text around the first control character, so it shows however
+    // far into a long word (a URL) it is.
+    let first_bad = value.chars().position(char::is_control);
+    let shown = |from: usize| {
+        const SHOWN: usize = 80;
+        let text: String = value.chars().skip(from).take(SHOWN).collect();
+        let before = if from > 0 { "…" } else { "" };
+        let after = if value.chars().nth(from + SHOWN).is_some() { "…" } else { "" };
+        // `{:?}` leaves some invisible characters as they are (a Hangul
+        // filler is a letter to it): escape those too, so the note shows them.
+        let escaped: String = format!("{text:?}")
+            .chars()
+            .map(|c| if invisible(c) { format!("\\u{{{:x}}}", u32::from(c)) } else { c.to_string() })
+            .collect();
+        format!("{before}{escaped}{after}")
+    };
+    if let Some(at) = first_bad {
+        return refuse(shown(at.saturating_sub(20)), "holds a control character");
+    }
+    // Shell-safe once quoted, but the user reviewing the command would
+    // see something else (Trojan Source); the note's escaping shows them.
+    if let Some(at) = value.chars().position(invisible) {
+        return refuse(shown(at.saturating_sub(20)), "holds an invisible or direction-changing character");
+    }
+    if value.starts_with('-') {
+        return refuse(shown(0), "starts with \"-\" (an option to the installer)");
+    }
+    if value.chars().all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c)) {
+        Ok(Cow::Borrowed(value))
+    } else {
+        Ok(Cow::Owned(format!("'{}'", value.replace('\'', r"'\''"))))
+    }
+}
+
+/// Whether `c` changes how the text around it shows without showing
+/// itself: Unicode's Default_Ignorable_Code_Point set (DerivedCoreProperties:
+/// bidi controls, zero-width characters, variation selectors, Hangul
+/// fillers, the tag block used to smuggle hidden text), plus the line and
+/// paragraph separators and the interlinear annotation characters.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFFB}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// The install command and the path it leaves the executable at, or the
+/// note to show when a catalog value can't go in a command.
+fn install(purl: &Purl, source: &Source, bin: &str, notes: &mut Vec<String>) -> Result<(String, String), String> {
     let home = POD_HOME;
-    let extras = source.extra_packages.join(" ");
-    let with_extras = |base: String| if extras.is_empty() { base } else { format!("{base} {extras}") };
-    match purl.kind.as_str() {
+    let with_extras = |base: String| -> Result<String, String> {
+        let mut command = base;
+        for extra in &source.extra_packages {
+            command.push(' ');
+            command.push_str(&shell_word(extra)?);
+        }
+        Ok(command)
+    };
+    let versioned = |separator: &str| shell_word(&format!("{}{separator}{}", purl.path, purl.version)).map(Cow::into_owned);
+    Ok(match purl.kind.as_str() {
         "npm" => (
-            with_extras(format!("npm install --prefix {home}/lsp {}@{}", purl.path, purl.version)),
+            with_extras(format!("npm install --prefix {home}/lsp {}", versioned("@")?))?,
             format!("{home}/lsp/node_modules/.bin/{bin}"),
         ),
         "pypi" => (
-            with_extras(format!("python -m venv {home}/venv && {home}/venv/bin/pip install {}=={}", purl.path, purl.version)),
+            with_extras(format!("python -m venv {home}/venv && {home}/venv/bin/pip install {}", versioned("==")?))?,
             format!("{home}/venv/bin/{bin}"),
         ),
         // GOBIN: Go's image sets GOPATH to /go, so without it the binary
         // lands in /go/bin.
-        "golang" => (format!("GOBIN={home}/go/bin go install {}@{}", purl.path, purl.version), format!("{home}/go/bin/{bin}")),
+        "golang" => (format!("GOBIN={home}/go/bin go install {}", versioned("@")?), format!("{home}/go/bin/{bin}")),
         "cargo" => (
-            format!("cargo install {} --version {} --root {home}/cargo", purl.name(), purl.version),
+            format!(
+                "cargo install {} --version {} --root {home}/cargo",
+                shell_word(purl.name())?,
+                shell_word(&purl.version)?
+            ),
             format!("{home}/cargo/bin/{bin}"),
         ),
         "github" => match github_asset(source) {
@@ -238,20 +343,22 @@ fn install(purl: &Purl, source: &Source, bin: &str, notes: &mut Vec<String>) -> 
                 if file.contains("{{") {
                     notes.push(format!("The release asset's name ({file}) has a template smelt doesn't fill in: check the install command."));
                 }
-                let url = format!("https://github.com/{}/releases/download/{}/{file}", purl.path, purl.version);
                 let target = format!("{home}/bin/{bin}");
-                let inner = inner.unwrap_or_else(|| bin.to_string());
+                let url = shell_word(&format!("https://github.com/{}/releases/download/{}/{file}", purl.path, purl.version))?
+                    .into_owned();
+                let to = shell_word(&target)?;
+                let inner = shell_word(&format!("{home}/opt/{}", inner.as_deref().unwrap_or(bin)))?.into_owned();
                 let command = if file.ends_with(".tar.gz") || file.ends_with(".tgz") {
-                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL {url} | tar -xz -C {home}/opt && ln -sf {home}/opt/{inner} {target}")
+                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL {url} | tar -xz -C {home}/opt && ln -sf {inner} {to}")
                 } else if file.ends_with(".tar.xz") {
-                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL {url} | tar -xJ -C {home}/opt && ln -sf {home}/opt/{inner} {target}")
+                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL {url} | tar -xJ -C {home}/opt && ln -sf {inner} {to}")
                 } else if file.ends_with(".zip") {
                     notes.push("The release is a .zip: the image needs unzip.".to_string());
-                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL -o {home}/release.zip {url} && unzip -q {home}/release.zip -d {home}/opt && ln -sf {home}/opt/{inner} {target}")
+                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL -o {home}/release.zip {url} && unzip -q {home}/release.zip -d {home}/opt && ln -sf {inner} {to}")
                 } else if file.ends_with(".gz") {
-                    format!("mkdir -p {home}/bin && curl -fsSL {url} | gunzip > {target} && chmod +x {target}")
+                    format!("mkdir -p {home}/bin && curl -fsSL {url} | gunzip > {to} && chmod +x {to}")
                 } else {
-                    format!("mkdir -p {home}/bin && curl -fsSL -o {target} {url} && chmod +x {target}")
+                    format!("mkdir -p {home}/bin && curl -fsSL -o {to} {url} && chmod +x {to}")
                 };
                 (command, target)
             }
@@ -264,7 +371,7 @@ fn install(purl: &Purl, source: &Source, bin: &str, notes: &mut Vec<String>) -> 
             notes.push(format!("smelt can't suggest an install for pkg:{other} packages: fill in the install command."));
             (String::new(), bin.to_string())
         }
-    }
+    })
 }
 
 /// The Linux x86-64 release asset: its file, and the executable's path
@@ -371,147 +478,4 @@ fn merge(base: &mut serde_json::Value, extra: &serde_json::Value) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A stand-in for mason's registry and Helix's file, on a local port.
-    async fn stand_in() -> String {
-        let router = axum::Router::new()
-            .route(
-                "/packages/pyright/package.yaml",
-                axum::routing::get(|| async { include_str!("fixtures/mason-pyright.yaml") }),
-            )
-            .route("/languages.toml", axum::routing::get(|| async { HELIX }))
-            .route(
-                "/packages/huge/package.yaml",
-                axum::routing::get(|| async { "x".repeat(3 * 1024 * 1024) }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move { axum::serve(listener, router).await.expect("serve") });
-        format!("http://{addr}")
-    }
-
-    #[test]
-    fn test_empty_source_urls_fall_back_to_the_defaults() {
-        assert_eq!(
-            sources(Some(""), Some("")),
-            (DEFAULT_MASON_REGISTRY_URL.to_string(), DEFAULT_HELIX_LANGUAGES_URL.to_string())
-        );
-    }
-
-    #[test]
-    fn test_unset_source_urls_are_the_defaults() {
-        assert_eq!(
-            sources(None, None),
-            (DEFAULT_MASON_REGISTRY_URL.to_string(), DEFAULT_HELIX_LANGUAGES_URL.to_string())
-        );
-    }
-
-    #[test]
-    fn test_set_source_urls_are_used_as_given() {
-        assert_eq!(
-            sources(Some("http://registry.test"), Some("http://helix.test/languages.toml")),
-            ("http://registry.test".to_string(), "http://helix.test/languages.toml".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_a_lookup_fetches_both_files_and_suggests() {
-        let base = stand_in().await;
-        let helix = format!("{base}/languages.toml");
-        let found = lookup("pyright", &base, &helix).await.expect("found");
-        assert_eq!(found.config.name, "pyright");
-
-        let missing = lookup("no-such-server", &base, &helix).await.expect_err("404");
-        assert!(missing.contains("no-such-server"), "{missing}");
-
-        let huge = lookup("huge", &base, &helix).await.expect_err("too big");
-        assert!(huge.contains("too big"), "{huge}");
-
-        let odd = lookup("../etc/passwd", &base, &helix).await.expect_err("not a package name");
-        assert!(odd.contains("package name"), "{odd}");
-    }
-
-    const HELIX: &str = include_str!("fixtures/helix-languages-excerpt.toml");
-
-    fn suggest_for(package: &str) -> Suggestion {
-        let yaml = std::fs::read_to_string(format!("{}/src/lsp/fixtures/mason-{package}.yaml", env!("CARGO_MANIFEST_DIR")))
-            .expect("fixture");
-        suggest(&yaml, HELIX).expect("a suggestion")
-    }
-
-    #[test]
-    fn test_rust_analyzer_comes_from_its_release_and_keeps_its_own_target_dir() {
-        let s = suggest_for("rust-analyzer");
-        let c = &s.config;
-        assert_eq!(c.name, "rust-analyzer");
-        assert_eq!(c.image, "rust:1", "rust-analyzer runs cargo, so it needs Rust's image");
-        assert!(
-            c.install_command.contains(
-                "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-21/rust-analyzer-x86_64-unknown-linux-gnu.gz"
-            ),
-            "{}",
-            c.install_command
-        );
-        assert_eq!(c.command, "/tmp/home/bin/rust-analyzer");
-        assert!(c.args.is_empty());
-        assert_eq!(c.file_types, [("rs".to_string(), "rust".to_string())].into());
-        assert_eq!(c.root_markers, vec!["Cargo.toml", "Cargo.lock"]);
-        let init = c.initialization_options.as_ref().expect("initialization options");
-        assert_eq!(init["files"]["watcher"], "server", "Helix's config is kept");
-        assert_eq!(init["cargo"]["targetDir"], true, "its own target dir, so it doesn't block the sandbox's cargo");
-        assert!(c.enabled);
-    }
-
-    #[test]
-    fn test_pyright_is_an_npm_install_in_nodes_image_found_by_its_language() {
-        let c = suggest_for("pyright").config;
-        assert_eq!(c.image, "node:22-slim");
-        assert_eq!(c.install_command, "npm install --prefix /tmp/home/lsp pyright@1.1.414");
-        assert_eq!(c.command, "/tmp/home/lsp/node_modules/.bin/pyright-langserver");
-        assert_eq!(c.args, vec!["--stdio"]);
-        // Helix doesn't list pyright for Python; mason's `languages` does.
-        assert_eq!(c.file_types.get("py").map(String::as_str), Some("python"));
-        assert!(!c.file_types.keys().any(|k| k.contains('*') || k.starts_with('.')), "globs are left out");
-        assert_eq!(c.root_markers[0], "pyproject.toml");
-    }
-
-    #[test]
-    fn test_typescript_brings_its_extra_package_and_every_language_it_serves() {
-        let c = suggest_for("typescript-language-server").config;
-        assert_eq!(
-            c.install_command,
-            "npm install --prefix /tmp/home/lsp typescript-language-server@6.0.1 typescript@6.0.3"
-        );
-        assert_eq!(c.args, vec!["--stdio"]);
-        for (ext, id) in [("ts", "typescript"), ("tsx", "typescriptreact"), ("js", "javascript"), ("jsx", "javascriptreact")] {
-            assert_eq!(c.file_types.get(ext).map(String::as_str), Some(id), "{ext}");
-        }
-    }
-
-    #[test]
-    fn test_gopls_is_a_go_install() {
-        let c = suggest_for("gopls").config;
-        assert_eq!(c.image, "golang:1");
-        assert_eq!(c.install_command, "GOBIN=/tmp/home/go/bin go install golang.org/x/tools/gopls@v0.23.0");
-        assert_eq!(c.command, "/tmp/home/go/bin/gopls");
-        assert_eq!(c.file_types.get("go").map(String::as_str), Some("go"));
-    }
-
-    #[test]
-    fn test_a_package_it_cant_install_says_so_but_still_suggests_the_rest() {
-        let yaml = "name: solargraph\nlanguages:\n  - Ruby\nsource:\n  id: pkg:gem/solargraph@0.50.0\nbin:\n  solargraph: gem:solargraph\n";
-        let s = suggest(yaml, HELIX).expect("a partial suggestion");
-        assert!(s.config.install_command.is_empty());
-        assert!(s.notes.iter().any(|n| n.contains("pkg:gem")), "{:?}", s.notes);
-        // Nothing in the Helix excerpt knows solargraph or Ruby.
-        assert!(s.notes.iter().any(|n| n.contains("file types")), "{:?}", s.notes);
-    }
-
-    #[test]
-    fn test_something_that_isnt_a_mason_package_is_refused() {
-        assert!(suggest("not: [a, package", HELIX).is_err());
-        assert!(suggest("name: x\n", HELIX).is_err(), "no source");
-    }
-}
+mod tests;
