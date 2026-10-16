@@ -579,4 +579,32 @@ fi
 grep -qF "check server up at http://localhost:$fport/" <<<"$out" || fail "a dx that binds late: start said: $out"
 "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" scripts/check-server stop >/dev/null 2>&1
 
+# 18. dx binds between the ownership check's two reads (review 1): its own
+# listener is never taken for a foreign one. The hook holds the first
+# check of the wait between its reads until the stub dx (binding 1 s in)
+# listens.
+fport=$(free_port)
+hook=$dir/ownership-hook
+hook_done=$dir/ownership-hook-done
+cat >"$hook" <<'EOF'
+#!/usr/bin/env bash
+# Once: wait up to 10 s for a listener on $HOOK_PORT.
+[ -s "$HOOK_DONE" ] && exit 0
+echo 1 >"$HOOK_DONE"
+suffix=$(printf ':%04X' "$HOOK_PORT")
+for _ in $(seq 1 100); do
+    awk -v s="$suffix" '$4 == "0A" && substr($2, length($2) - 4) == s { f = 1 } END { exit !f }' /proc/net/tcp && exit 0
+    sleep 0.1
+done
+EOF
+chmod +x "$hook"
+: >"$hook_done"
+out=$(timeout 30 "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" DX_BIND_DELAY=1 \
+    CHECK_SERVER_TEST_OWNERSHIP_HOOK="$hook" HOOK_DONE="$hook_done" HOOK_PORT="$fport" scripts/check-server start HEAD 2>&1)
+rc=$?
+[ -s "$hook_done" ] || fail "the ownership hook never ran"
+[ "$rc" = 0 ] || fail "dx binding between the ownership reads: start exited $rc: $out"
+grep -qF "check server up at http://localhost:$fport/" <<<"$out" || fail "dx binding between the ownership reads: start said: $out"
+"${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" scripts/check-server stop >/dev/null 2>&1
+
 finish

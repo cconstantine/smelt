@@ -296,13 +296,27 @@ group_socket_inodes() { # pgid
 }
 
 # The inodes of the sockets listening on port $2 that no process of group
-# $1 holds: with no group, every one of them.
+# $1 holds: with no group, every one of them. The listeners are read
+# before the group's sockets (SME-175 review 1): read the other way round,
+# a server binding between the two reads had its own new listener taken
+# for a foreign one. A listener of the first read that has closed by a
+# second one is left out too, since nothing listens there any more.
 foreign_listener_inodes() { # pgid (may be empty) port
-    local ours="" inode
+    local listeners ours="" inode
+    listeners=$(port_listener_inodes "$2")
+    # Tests only: runs between the two reads, so a case can make the
+    # server bind there.
+    if [ -n "$1" ] && [ -n "${CHECK_SERVER_TEST_OWNERSHIP_HOOK:-}" ]; then
+        "$CHECK_SERVER_TEST_OWNERSHIP_HOOK"
+    fi
     [ -n "$1" ] && ours=$(group_socket_inodes "$1")
-    for inode in $(port_listener_inodes "$2"); do
-        grep -qxF "$inode" <<<"$ours" || echo "$inode"
+    local still
+    still=$(port_listener_inodes "$2")
+    for inode in $listeners; do
+        grep -qxF "$inode" <<<"$ours" && continue
+        grep -qxF "$inode" <<<"$still" && echo "$inode"
     done
+    return 0
 }
 
 # Who holds the listening sockets $@ (inodes): "pid N (command) in <cwd>"
