@@ -279,7 +279,8 @@ async fn test_conversation_pod_id_resolves_the_live_pod_and_errors_with_no_pod_o
 ///
 /// Harmless if killed: a unique name, no conversation label, another
 /// database's instance (then none), and `activeDeadlineSeconds`, so the
-/// kubelet fails a leftover.
+/// kubelet fails a leftover. A check that panics still deletes the pod
+/// (review 1).
 #[tokio::test]
 async fn test_kube_exec_and_the_agent_dial_refuse_another_databases_pod() {
     let client = test_client().await;
@@ -291,9 +292,13 @@ async fn test_kube_exec_and_the_agent_dial_refuse_another_databases_pod() {
     pod.spec.as_mut().expect("a pod spec").active_deadline_seconds = Some(600);
     pods.create(&PostParams::default(), &pod).await.expect("create the pod");
 
-    let failures = tokio::time::timeout(Duration::from_secs(240), refusals(&client, &name, pod_id)).await;
+    let checks = tokio::time::timeout(Duration::from_secs(240), refusals(&client, &name, pod_id));
+    let outcome = std::panic::AssertUnwindSafe(checks).catch_unwind().await;
     pods.delete(&name, &immediate_delete_params()).await.ok();
-    let failures = failures.expect("the checks took over 240s");
+    let failures = match outcome {
+        Ok(finished) => finished.expect("the checks took over 240s"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
