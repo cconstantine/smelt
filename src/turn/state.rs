@@ -49,6 +49,29 @@ pub(super) struct ConversationRuntime {
 }
 
 impl ConversationRuntime {
+    /// A receiver for the stop counter, with its current value already
+    /// seen, so only a later stop wakes it.
+    fn stop_receiver(&mut self) -> tokio::sync::watch::Receiver<u64> {
+        let mut receiver = self.stops.get_or_insert_with(TurnStops::default).counter.subscribe();
+        receiver.borrow_and_update();
+        receiver
+    }
+
+    /// Frees the turn lock and stop counter once no one has them (SME-91):
+    /// the lock only when this is the last handle, so one in use is never
+    /// replaced by a fresh one, and the stop counter when no turn listens
+    /// to it (a stop with nothing running only pauses). Each is made again
+    /// on next use. Not the kept error: a turn starting meanwhile has its
+    /// generation there already (SME-91 review).
+    fn release_idle(&mut self) {
+        if self.lock.as_ref().is_some_and(|lock| Arc::strong_count(lock) == 1) {
+            self.lock = None;
+        }
+        if self.stops.as_ref().is_some_and(|stops| stops.counter.receiver_count() == 0) {
+            self.stops = None;
+        }
+    }
+
     fn is_idle(&self) -> bool {
         self.lock.is_none()
             && self.reply.is_none()
@@ -152,11 +175,7 @@ impl Default for TurnStops {
 /// A receiver for `conversation_id`'s stop counter, with its current value
 /// already seen, so only a later stop wakes it.
 pub(super) fn stop_receiver(conversation_id: i64) -> tokio::sync::watch::Receiver<u64> {
-    with_runtime(conversation_id, |runtime| {
-        let mut receiver = runtime.stops.get_or_insert_with(TurnStops::default).counter.subscribe();
-        receiver.borrow_and_update();
-        receiver
-    })
+    with_runtime(conversation_id, ConversationRuntime::stop_receiver)
 }
 
 /// Notes stop `stopped_by` (the stop counter's value) in
@@ -197,71 +216,89 @@ pub(super) fn resume_turns(conversation_id: i64) {
 
 /// Counts a turn as in flight for as long as it lives, including when it's
 /// dropped part-way by a stop, and publishes `TurnState` when the
-/// conversation goes from idle to busy or back.
-pub(super) struct TurnInFlight(i64);
+/// conversation goes from idle to busy or back. It holds the turn's stop
+/// receiver, made when it's counted.
+///
+/// Its start and its end are each one critical section of the turn
+/// state, publishing `TurnState` inside it (SME-179 B29): a turn counted
+/// as another ends comes wholly before or after that end, so tabs are
+/// told `running: false` and `running: true` in the order they happened,
+/// the end can't clear the new turn's reply, and a Stop can't land
+/// between the count and the receiver. `events::publish` only sends on a
+/// broadcast channel, under its own map's lock (the same order
+/// `append_reply` takes them in).
+pub(super) struct TurnInFlight {
+    conversation_id: i64,
+    /// `None` only once dropped.
+    stop: Option<tokio::sync::watch::Receiver<u64>>,
+}
 
 impl TurnInFlight {
     pub(super) fn start(conversation_id: i64) -> Self {
-        let first = with_runtime(conversation_id, |runtime| {
+        let (first, stop) = with_runtime(conversation_id, |runtime| {
             runtime.turns_in_flight += 1;
-            if runtime.turns_in_flight != 1 {
-                false
-            } else {
+            let stop = runtime.stop_receiver();
+            let first = runtime.turns_in_flight == 1;
+            if first {
                 runtime.started_at = Some(std::time::Instant::now());
-                true
+                crate::events::publish(
+                    conversation_id,
+                    crate::events::ConversationEvent::TurnState { running: true, elapsed: 0 },
+                );
             }
+            (first, stop)
         });
         if first {
-            crate::events::publish(
-                conversation_id,
-                crate::events::ConversationEvent::TurnState { running: true, elapsed: 0 },
-            );
+            // Only tells the sidebar to fetch the busy list again.
             crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
         }
-        TurnInFlight(conversation_id)
+        TurnInFlight { conversation_id, stop: Some(stop) }
+    }
+
+    /// The turn's stop receiver: it changes when the user stops the
+    /// conversation after the turn was counted.
+    pub(super) fn stop(&mut self) -> &mut tokio::sync::watch::Receiver<u64> {
+        let conversation_id = self.conversation_id;
+        self.stop.get_or_insert_with(|| stop_receiver(conversation_id))
     }
 }
 
 impl Drop for TurnInFlight {
     fn drop(&mut self) {
+        let conversation_id = self.conversation_id;
+        let stop = self.stop.take();
         let mut last = false;
-        update_existing(self.0, |runtime| {
+        update_existing(conversation_id, |runtime| {
+            // First, so the release below sees no listener of this turn's:
+            // the last turn ending frees the stop counter.
+            drop(stop);
             runtime.turns_in_flight = runtime.turns_in_flight.saturating_sub(1);
             last = runtime.turns_in_flight == 0;
             if last {
                 runtime.started_at = None;
+                // A stopped or failed turn leaves no reply in progress.
+                runtime.reply = None;
+                runtime.release_idle();
+                crate::events::publish(
+                    conversation_id,
+                    crate::events::ConversationEvent::TurnState { running: false, elapsed: 0 },
+                );
             }
         });
+        #[cfg(test)]
+        super::test_hooks::after_in_flight_changed(conversation_id);
         if last {
-            // A stopped or failed turn leaves no reply in progress.
-            clear_reply_in_progress(self.0);
-            release_idle_turn_state(self.0);
-            crate::events::publish(
-                self.0,
-                crate::events::ConversationEvent::TurnState { running: false, elapsed: 0 },
-            );
             crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
         }
     }
 }
 
 /// Frees `conversation_id`'s turn lock and stop counter once no one has
-/// them (SME-91): the lock only when the state's is the last handle, so
-/// one in use is never replaced by a fresh one, and the stop counter when
-/// no turn listens to it (a stop with nothing running only pauses). Each
-/// is made again on next use. Under the state's lock, which handing one
-/// out also takes. Not the kept error: a turn starting meanwhile has its
-/// generation there already (SME-91 review); it's a few bytes per
-/// conversation, freed on delete.
+/// them (`ConversationRuntime::release_idle`), under the state's lock,
+/// which handing one out also takes. The kept error stays: it's a few
+/// bytes per conversation, freed on delete.
 pub(super) fn release_idle_turn_state(conversation_id: i64) {
-    update_existing(conversation_id, |runtime| {
-        if runtime.lock.as_ref().is_some_and(|lock| Arc::strong_count(lock) == 1) {
-            runtime.lock = None;
-        }
-        if runtime.stops.as_ref().is_some_and(|stops| stops.counter.receiver_count() == 0) {
-            runtime.stops = None;
-        }
-    });
+    update_existing(conversation_id, ConversationRuntime::release_idle);
 }
 
 /// Every conversation with a turn running or queued, for the sidebar's

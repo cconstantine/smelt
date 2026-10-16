@@ -166,13 +166,15 @@ pub(super) fn run_turn_bounded<'a>(
             otel.status_description = Empty,
         );
         crate::telemetry::in_span(span.clone(), async move {
-            // Before the stop receiver, so it's dropped after it: the last turn
-            // ending frees the stop counter once nothing listens to it.
-            let _in_flight = TurnInFlight::start(conversation_id);
-            let mut stop = stop_receiver(conversation_id);
+            // Counted with its stop receiver made in one step, so a Stop from
+            // here on ends it (SME-179 B29).
+            let mut in_flight = TurnInFlight::start(conversation_id);
+            #[cfg(test)]
+            test_hooks::after_turn_counted(conversation_id).await;
             // Any new turn replaces the last failure (SME-51 code review 1).
             let generation = new_turn_generation(conversation_id);
-            let result = run_turn_stoppable(pool, conversation_id, new_message, max_turns, from_user, &mut stop).await;
+            let result =
+                run_turn_stoppable(pool, conversation_id, new_message, max_turns, from_user, in_flight.stop()).await;
             // Kept for a tab that reconnects, unless a newer turn has started
             // since this one did: its outcome is the one to show (SME-91).
             if keep_error && let Err(TurnFailure::Failed(e)) = &result {
