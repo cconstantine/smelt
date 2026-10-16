@@ -36,6 +36,8 @@ mod tests {
 
 `#[sqlx::test]` connects to the Postgres server at `DATABASE_URL`, creates a new database per test, runs all migrations against it, and tears it down afterward — no shared fixture, no manual setup/teardown, and no cross-test interference since each test is fully isolated. This requires a reachable Postgres server while running tests (`docker compose up -d postgres`).
 
+**A test that holds several connections at once shares a pool with every other test.** Each `#[sqlx::test]` database is created through sqlx's one parent pool for the process, 20 connections, and a test's own pool draws on it too. A held-row race test (see [tdd.md](process/tdd.md)) holds about four at once: the held transaction, each caller under test, and the `pg_stat_activity` watcher. On SME-181 eight of them running together ran out and failed with `PoolTimedOut`. Such tests take turns through a process-wide `tokio::sync::Mutex` (a `static` the test locks first, as `git::server::trust_race_tests` does).
+
 ## Sandbox tests
 
 In [testing/sandbox.md](testing/sandbox.md).
