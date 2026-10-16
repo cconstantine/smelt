@@ -270,6 +270,81 @@ fn sha256(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
+/// What to do with each open file, given the SHA-256 of each on disk now
+/// (`-` for one that's gone), in the same order: the files to sync again,
+/// and the files to close. `None` when the hashes don't line up with the
+/// files (the exec printed something else).
+fn stale_files(open: &[(String, String)], hashes: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+    if open.len() != hashes.len() {
+        return None;
+    }
+    let (mut resync, mut close) = (Vec::new(), Vec::new());
+    for ((path, synced), hash) in open.iter().zip(hashes) {
+        if hash == "-" {
+            close.push(path.clone());
+        } else if *hash != sha256(synced) {
+            resync.push(path.clone());
+        }
+    }
+    Some((resync, close))
+}
+
+/// The files a rename touches whose text on disk (`current`) isn't what
+/// the server was told (`synced`, `None` if never): the rename's positions
+/// would be for other text.
+fn rename_check(touched: &[(String, String, Option<String>)]) -> Vec<String> {
+    touched
+        .iter()
+        .filter(|(_, current, synced)| synced.as_deref() != Some(current.as_str()))
+        .map(|(path, ..)| path.clone())
+        .collect()
+}
+
+/// Brings the server's open files up to date with the disk (SME-172): once
+/// a file is open, the server stops reading it from disk, so one changed
+/// by anything but smelt (a terminal) would stay stale. One exec hashes
+/// them all; a changed file is synced again, and a deleted one (or one
+/// that can no longer be read for the server) is closed, so the server
+/// goes back to the disk. An exec that fails skips this, as before; a
+/// notification that fails means the session is broken.
+async fn refresh_open_files(client: &kube::Client, pod_name: &str, session: &Session) -> Result<(), LspError> {
+    let open = session.open_documents();
+    if open.is_empty() {
+        return Ok(());
+    }
+    // One line per file, in order, so no path is parsed out of the output.
+    let script = r#"for f; do if [ -f "$f" ] && h=$(sha256sum < "$f"); then echo "${h%% *}"; else echo -; fi; done"#;
+    let mut argv = vec!["sh", "-c", script, "_"];
+    argv.extend(open.iter().map(|(path, _)| path.as_str()));
+    let hashes = match crate::sandbox::exec_with(client, pod_name, "server", &argv, None).await {
+        Ok(result) if result.exit_code == 0 => result.stdout.lines().map(str::to_string).collect::<Vec<_>>(),
+        Ok(result) => {
+            tracing::info!(pod_name, stderr = %result.stderr.trim(), "couldn't check a language server's open files");
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::info!(pod_name, error = %e, "couldn't check a language server's open files");
+            return Ok(());
+        }
+    };
+    let Some((resync, mut close)) = stale_files(&open, &hashes) else {
+        tracing::info!(pod_name, files = open.len(), lines = hashes.len(), "a language server's open files didn't hash one line each");
+        return Ok(());
+    };
+    for path in resync {
+        match read_in_pod(client, pod_name, &path).await {
+            Ok(text) => {
+                session.sync(&path, &text).await?;
+            }
+            Err(_) => close.push(path),
+        }
+    }
+    for path in close {
+        session.close(&path).await?;
+    }
+    Ok(())
+}
+
 /// Where each of `markers` would be, in every directory from `path`'s up
 /// to `/workspace`.
 fn marker_candidates(path: &str, markers: &[String]) -> Vec<String> {
@@ -425,6 +500,7 @@ pub async fn operate(
     {
         return Err(format!("{} doesn't support {}.", config.name, operation.name()));
     }
+    refresh_open_files(client, &pod_name, &session).await.map_err(|e| request_error(&config, e))?;
 
     // The file as it is on disk now, told to the server.
     let mut file = None;
@@ -532,47 +608,121 @@ pub async fn operate(
                 let new_name = input.new_name.clone().ok_or("rename needs a new_name.")?;
                 let mut params = position()?;
                 params["newName"] = json!(new_name);
-                let edit = request("textDocument/rename", params).await?;
-                let files = ops::workspace_edit_files(&edit)?;
-                if files.is_empty() {
-                    break 'answer "Nothing to rename there.".to_string();
-                }
-                // Every file is read and edited first, so one that can't be
-                // stops the rename before anything is written. A write can
-                // still be refused midway (the file changed in between), and
-                // then the error says which files were already changed.
-                let mut planned = Vec::new();
-                for (path, edits) in &files {
-                    let current = read_in_pod(client, &pod_name, path).await?;
-                    if let Some(seen) = session.synced_text(path)
-                        && seen != current
-                    {
-                        return Err(format!("{path} changed since the server last saw it; nothing was renamed. Try again."));
-                    }
-                    let updated = ops::apply_text_edits(&current, edits)?;
-                    planned.push((path.clone(), current, updated, edits.len()));
-                }
-                let mut report = Vec::new();
-                let mut written = Vec::new();
-                for (i, (path, current, updated, count)) in planned.iter().enumerate() {
-                    if let Err(error) = write_in_pod(client, &pod_name, path, updated, &sha256(current)).await {
-                        let rest: Vec<String> = planned[i + 1..].iter().map(|(p, ..)| p.clone()).collect();
-                        return Err(partial_rename_error(&new_name, &written, path, &error, &rest));
-                    }
-                    written.push(path.clone());
-                    let _ = session.sync(path, updated).await;
-                    report.push(format!("{path} ({count} edit{})", if *count == 1 { "" } else { "s" }));
-                }
-                format!(
-                    "Renamed to {new_name} in {} file{}:\n{}\nRead a file again before editing it.",
-                    report.len(),
-                    if report.len() == 1 { "" } else { "s" },
-                    report.join("\n")
-                )
+                #[expect(clippy::expect_used, reason = "position() above has already required the path")]
+                let (named, ..) = file.as_ref().expect("a path");
+                rename(client, &pod_name, &session, &config, named, &new_name, params).await?
             }
         }
     };
     Ok(note_indexing(answer, session.is_indexing(), &config.name))
+}
+
+/// How many times a rename is asked for while files it touches turn out
+/// to have changed since the server saw them.
+const RENAME_ROUNDS: usize = 3;
+
+/// What a rename does after a round's check (review 1): write when every
+/// touched file is as the server saw it; otherwise ask again, unless the
+/// rounds are spent, or the named file itself changed (its position was
+/// worked out from the text before, so asking again could rename another
+/// symbol).
+#[derive(Debug, PartialEq)]
+enum RenameStep {
+    Write,
+    AskAgain,
+    NamedFileChanged,
+    GiveUp,
+}
+
+fn rename_step(named: &str, stale: &[String], round: usize) -> RenameStep {
+    if stale.is_empty() {
+        RenameStep::Write
+    } else if stale.iter().any(|path| path == named) {
+        RenameStep::NamedFileChanged
+    } else if round >= RENAME_ROUNDS {
+        RenameStep::GiveUp
+    } else {
+        RenameStep::AskAgain
+    }
+}
+
+/// A rename (`params` holds the position and new name): its edits are
+/// applied only to files the server saw as they are on disk now. A file it
+/// touches that changed since, or was never sent, is synced and the rename
+/// asked again (SME-172), up to `RENAME_ROUNDS` times; but not when that
+/// file is `named`, whose position was worked out from its older text.
+async fn rename(
+    client: &kube::Client,
+    pod_name: &str,
+    session: &Session,
+    config: &LanguageServerConfig,
+    named: &str,
+    new_name: &str,
+    params: Value,
+) -> Result<String, String> {
+    let mut round = 0;
+    let planned = loop {
+        round += 1;
+        let edit = request_retrying(session, "textDocument/rename", params.clone()).await.map_err(|e| request_error(config, e))?;
+        let files = ops::workspace_edit_files(&edit)?;
+        if files.is_empty() {
+            return Ok("Nothing to rename there.".to_string());
+        }
+        // Every file is read and edited first, so one that can't be stops
+        // the rename before anything is written.
+        let mut touched = Vec::new();
+        for (path, _) in &files {
+            let current = read_in_pod(client, pod_name, path).await?;
+            let synced = session.synced_text(path);
+            touched.push((path.clone(), current, synced));
+        }
+        let stale = rename_check(&touched);
+        let step = rename_step(named, &stale, round);
+        if step == RenameStep::Write {
+            let mut planned = Vec::new();
+            for ((path, edits), (_, current, _)) in files.iter().zip(touched) {
+                let updated = ops::apply_text_edits(&current, edits)?;
+                planned.push((path.clone(), current, updated, edits.len()));
+            }
+            break planned;
+        }
+        for (path, current, _) in touched.iter().filter(|(path, ..)| stale.contains(path)) {
+            session.sync(path, current).await.map_err(|e| request_error(config, e))?;
+        }
+        match step {
+            RenameStep::NamedFileChanged => {
+                return Err(format!(
+                    "{named} changed while it was being renamed; nothing was renamed. Read it again and give the position again."
+                ));
+            }
+            RenameStep::GiveUp => {
+                return Err(format!(
+                    "{} kept changing while being renamed; nothing was renamed. They're synced now: try again.",
+                    stale.join(", ")
+                ));
+            }
+            RenameStep::Write | RenameStep::AskAgain => {}
+        }
+    };
+    // A write can still be refused midway (the file changed in between),
+    // and then the error says which files were already changed.
+    let mut report = Vec::new();
+    let mut written = Vec::new();
+    for (i, (path, current, updated, count)) in planned.iter().enumerate() {
+        if let Err(error) = write_in_pod(client, pod_name, path, updated, &sha256(current)).await {
+            let rest: Vec<String> = planned[i + 1..].iter().map(|(p, ..)| p.clone()).collect();
+            return Err(partial_rename_error(new_name, &written, path, &error, &rest));
+        }
+        written.push(path.clone());
+        let _ = session.sync(path, updated).await;
+        report.push(format!("{path} ({count} edit{})", if *count == 1 { "" } else { "s" }));
+    }
+    Ok(format!(
+        "Renamed to {new_name} in {} file{}:\n{}\nRead a file again before editing it.",
+        report.len(),
+        if report.len() == 1 { "" } else { "s" },
+        report.join("\n")
+    ))
 }
 
 /// An empty answer from a server that's still indexing may just be early:
@@ -620,9 +770,14 @@ async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::C
         });
     }
     let session = session_for(client, &pod_name, &config, &root).await.ok()?;
+    refresh_open_files(client, &pod_name, &session).await.ok()?;
     let text = read_in_pod(client, &pod_name, path).await.ok()?;
-    let since = Instant::now();
     let version = session.sync(path, &text).await.ok()?;
+    // When the server was told this text, by the refresh (which syncs the
+    // edited file too when the server has it open) or by the sync:
+    // diagnostics published without a version before then are for older
+    // text.
+    let since = session.changed_at(path).unwrap_or_else(Instant::now);
     let found = session.diagnostics(path, version, since, EDIT_DIAGNOSTICS_WAIT).await;
     let lines: Vec<&str> = text.lines().collect();
     let listed = ops::format_diagnostics(&found.items, &mut |l| lines.get(l as usize).map(|s| s.to_string()), true);
