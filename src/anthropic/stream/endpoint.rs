@@ -38,39 +38,48 @@ const SLOW_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Endpoint {
     /// Waits for one of the provider's request slots, when it has a limit
-    /// (SME-162), and holds it until the returned permit drops: when the
+    /// (SME-162), and holds it until the returned slot drops: when the
     /// call ends, fails, or is dropped (a Stop). A new count resizes the
     /// pool it waits on; a pool closed while it waits (the limit was
     /// cleared) sends it on at once, or to the pool set since. A wait past
-    /// `SLOW_SLOT_WAIT` is logged once, naming the host only.
-    pub(super) async fn slot(&self) -> Option<crate::providers::limiter::Slot> {
+    /// `SLOW_SLOT_WAIT` is logged once, naming the host only. `None` when
+    /// the provider has no limit; otherwise the slot, if it ended with one,
+    /// and how long it waited (review 2: either way).
+    pub(super) async fn slot(&self) -> Option<(Option<crate::providers::limiter::Slot>, std::time::Duration)> {
         let provider_id = self.slots_of?;
-        let slow = tokio::time::Instant::now() + SLOW_SLOT_WAIT;
+        let mut pool = crate::providers::limiter::current(provider_id)?;
+        let started = tokio::time::Instant::now();
+        let slow = started + SLOW_SLOT_WAIT;
         let mut warned = false;
         loop {
-            let pool = crate::providers::limiter::current(provider_id)?;
-            let acquire = pool.acquire();
-            tokio::pin!(acquire);
-            let acquired = if warned {
-                acquire.await
-            } else {
-                tokio::select! {
-                    acquired = &mut acquire => acquired,
-                    () = tokio::time::sleep_until(slow) => {
-                        warned = true;
-                        let host = url::Url::parse(&self.base_url).ok().and_then(|u| u.host_str().map(str::to_string));
-                        tracing::warn!(
-                            waited_secs = SLOW_SLOT_WAIT.as_secs(),
-                            host = host.as_deref().unwrap_or(""),
-                            "waiting for a free request slot on the model provider"
-                        );
-                        acquire.await
+            let acquired = {
+                let acquire = pool.acquire();
+                tokio::pin!(acquire);
+                if warned {
+                    acquire.await
+                } else {
+                    tokio::select! {
+                        acquired = &mut acquire => acquired,
+                        () = tokio::time::sleep_until(slow) => {
+                            warned = true;
+                            let host = url::Url::parse(&self.base_url).ok().and_then(|u| u.host_str().map(str::to_string));
+                            tracing::warn!(
+                                waited_secs = SLOW_SLOT_WAIT.as_secs(),
+                                host = host.as_deref().unwrap_or(""),
+                                "waiting for a free request slot on the model provider"
+                            );
+                            acquire.await
+                        }
                     }
                 }
             };
+            if acquired.is_some() {
+                return Some((acquired, started.elapsed()));
+            }
             // Only a pool whose limit was cleared refuses: look again.
-            if let Some(slot) = acquired {
-                return Some(slot);
+            match crate::providers::limiter::current(provider_id) {
+                Some(next) => pool = next,
+                None => return Some((None, started.elapsed())),
             }
         }
     }

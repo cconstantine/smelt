@@ -697,10 +697,9 @@ async fn stream_message(
 ) -> Result<StreamedTurn, String> {
     // Held through the retries and the whole stream (SME-162); the wait
     // for it is on the span, apart from the model's time (review 1).
-    let waiting = std::time::Instant::now();
-    let slot = endpoint.slot().await;
-    if slot.is_some() {
-        let waited = i64::try_from(waiting.elapsed().as_millis()).unwrap_or(i64::MAX);
+    let (_slot, waited) = endpoint.slot().await.unzip();
+    if let Some(waited) = waited {
+        let waited = i64::try_from(waited.as_millis()).unwrap_or(i64::MAX);
         tracing::Span::current().record("smelt.slot_wait_ms", waited);
     }
     // Retried only here, before anything has streamed: nothing has been

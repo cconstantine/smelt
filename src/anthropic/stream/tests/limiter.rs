@@ -436,3 +436,29 @@ async fn test_a_raised_limit_counts_the_calls_already_running(pool: sqlx::PgPool
     }
     assert_eq!(upstream.peak.load(Ordering::SeqCst), 2);
 }
+
+/// SME-162 review 2: a call let go by its limit being cleared, after a
+/// wait, still has the wait on its span.
+#[tokio::test]
+async fn test_a_wait_ended_by_clearing_the_limit_is_on_the_span() {
+    let (addr, upstream) = start_gated_upstream(None, false).await;
+    upstream.release.add_permits(10);
+    let id = 9_162_000_118;
+    let endpoint = limited(addr, id, Some(1));
+    let held = crate::providers::limiter::current(id).expect("a pool").try_acquire().expect("the only slot");
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let later = chrono::DateTime::from_timestamp(60, 0).expect("a time").naive_utc();
+        crate::providers::limiter::set(id, later, None);
+    });
+    let (result, spans) = crate::telemetry::capture_spans(call(&endpoint, "a")).await;
+    result.expect("the call succeeds");
+    drop(held);
+    let chats = chat_spans(&spans);
+    let [span] = chats.as_slice() else { panic!("one chat span: {spans:?}") };
+    let waited = match span_attribute(span, "smelt.slot_wait_ms") {
+        Some(opentelemetry::Value::I64(ms)) => *ms,
+        other => panic!("smelt.slot_wait_ms: {other:?}"),
+    };
+    assert!((250..5_000).contains(&waited), "waited {waited} ms");
+}
