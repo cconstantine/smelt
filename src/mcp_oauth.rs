@@ -28,8 +28,9 @@ use crate::db::{self, McpServerConfig};
 /// a single `mcp_servers.id` and to the URL the manager it's plugged into
 /// was built for. Plugged into each `AuthorizationManager` smelt builds
 /// (`start`, and `connection_manager` for connections), each with the rule
-/// its saves follow (`SaveRule`); it keeps nothing in memory, so every load
-/// reads the row fresh. A grant is only ever loaded or saved while the
+/// its saves follow (`SaveRule`); every load reads the row fresh, and the
+/// store keeps only what its last load read (`loaded`), for a refresh's
+/// save and a `clear` to check against. A grant is only ever loaded or saved while the
 /// row's URL is still the store's: a token goes only to the address it was
 /// issued for (SME-166). Takes its pool
 /// explicitly rather than reaching for `db::get()` internally — same
@@ -45,6 +46,13 @@ pub struct PgCredentialStore {
     /// grant this store loads or saves.
     url: String,
     rule: SaveRule,
+    /// The grant the last `load` read from the row, raw, so comparing it
+    /// with the row is exact; `None` when that load found none (or the
+    /// row was at another URL). rmcp's refresh is a `load`, the provider
+    /// request, then a `save`, under the manager's mutex, and each manager
+    /// has a store of its own, so this is the grant the refresh refreshed
+    /// (SME-177).
+    loaded: Arc<StdMutex<Option<serde_json::Value>>>,
 }
 
 /// What a `PgCredentialStore`'s `save` may write over. `clear` has no
@@ -56,20 +64,21 @@ enum SaveRule {
     /// grant for (SME-166).
     SignIn,
     /// A connection's manager, whose only saves are refreshes: saved only
-    /// over a grant for the same client (SME-113), at the store's URL.
+    /// over the exact grant the refresh read (SME-177), for the same client
+    /// (SME-113), at the store's URL.
     RefreshOnly,
 }
 
 impl PgCredentialStore {
     /// The store a login attempt for `url` saves its new grant through.
     fn for_sign_in(pool: PgPool, server_id: i64, url: String) -> Self {
-        Self { pool, server_id, url, rule: SaveRule::SignIn }
+        Self { pool, server_id, url, rule: SaveRule::SignIn, loaded: Arc::default() }
     }
 
     /// The store a connection's manager for `url` refreshes through
     /// (SME-113).
     fn for_refreshes(pool: PgPool, server_id: i64, url: String) -> Self {
-        Self { pool, server_id, url, rule: SaveRule::RefreshOnly }
+        Self { pool, server_id, url, rule: SaveRule::RefreshOnly, loaded: Arc::default() }
     }
 }
 
@@ -91,12 +100,14 @@ impl CredentialStore for PgCredentialStore {
         // connection that outlived an edit) gets no grant: the row's grant
         // is for its new address (SME-166 review 2). rmcp then reports
         // `AuthorizationRequired`.
-        if config.url != self.url {
-            return Ok(None);
-        }
-        match config.oauth_credentials {
+        let grant = config
+            .oauth_credentials
+            .filter(|_| config.url == self.url)
+            .map(|json| json.0);
+        self.set_loaded(grant.clone());
+        match grant {
             None => Ok(None),
-            Some(json) => serde_json::from_value(json.0)
+            Some(json) => serde_json::from_value(json)
                 .map(Some)
                 .map_err(|e| AuthError::InternalError(e.to_string())),
         }
@@ -106,42 +117,77 @@ impl CredentialStore for PgCredentialStore {
     /// so one that finishes after a URL edit or a delete never puts the old
     /// address's token on the new one; the callback then fails with
     /// `ADDRESS_CHANGED_ERROR` (SME-166). A refresh saves only over a grant
-    /// for the same client, at the URL its connection was built for, so one that finishes after a Disconnect, a URL
-    /// change or a new Connect doesn't bring the old grant back. It then
-    /// fails, so the request it was for doesn't go on with a grant the user
-    /// removed or replaced (SME-113). Each check is in the `UPDATE` itself,
-    /// so nothing can change between it and the write.
+    /// for the same client, at the URL its connection was built for, and
+    /// only over the exact grant it refreshed (`loaded`), so one that
+    /// finishes after a Disconnect, a URL change or a new Connect, a
+    /// Reconnect with the same pre-registered client included (SME-177),
+    /// doesn't bring the old grant back. It then fails, so the request it
+    /// was for doesn't go on with a grant the user removed or replaced
+    /// (SME-113). Each check is in the `UPDATE` itself, so nothing can
+    /// change between it and the write.
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
         let value = serde_json::to_value(&credentials)
             .map_err(|e| AuthError::InternalError(e.to_string()))?;
+        const REFRESH_REFUSED: &str =
+            "the sign-in was removed or replaced while its token was being refreshed";
         let (saved, refused) = match &self.rule {
             SaveRule::SignIn => (
-                db::save_mcp_server_sign_in(&self.pool, self.server_id, &self.url, value).await,
+                db::save_mcp_server_sign_in(&self.pool, self.server_id, &self.url, value.clone()).await,
                 ADDRESS_CHANGED_ERROR,
             ),
-            SaveRule::RefreshOnly => (
-                db::save_refreshed_mcp_server_oauth_credentials(
-                    &self.pool,
-                    self.server_id,
-                    &self.url,
-                    &credentials.client_id,
-                    value,
+            SaveRule::RefreshOnly => {
+                let Some(refreshed) = self.loaded() else {
+                    return Err(AuthError::InternalError(REFRESH_REFUSED.to_string()));
+                };
+                (
+                    db::save_refreshed_mcp_server_oauth_credentials(
+                        &self.pool,
+                        self.server_id,
+                        &self.url,
+                        &refreshed,
+                        &credentials.client_id,
+                        value.clone(),
+                    )
+                    .await,
+                    REFRESH_REFUSED,
                 )
-                .await,
-                "the sign-in was removed or replaced while its token was being refreshed",
-            ),
+            }
         };
         match saved {
-            Ok(true) => Ok(()),
+            Ok(true) => {
+                self.set_loaded(Some(value));
+                Ok(())
+            }
             Ok(false) => Err(AuthError::InternalError(refused.to_string())),
             Err(e) => Err(AuthError::InternalError(e.to_string())),
         }
     }
 
+    /// rmcp clears a store only in `initialize_from_store`, when the grant
+    /// it just loaded is bound to a provider whose issuer has since
+    /// changed. So only that grant is cleared: a newer one saved since the
+    /// load (a Reconnect) stays, and with nothing loaded nothing is
+    /// cleared (SME-177). Disconnect doesn't come through here.
     async fn clear(&self) -> Result<(), AuthError> {
-        db::set_mcp_server_oauth_credentials(&self.pool, self.server_id, None)
+        let Some(loaded) = self.loaded() else {
+            return Ok(());
+        };
+        db::clear_mcp_server_oauth_credentials_if(&self.pool, self.server_id, &self.url, &loaded)
             .await
-            .map_err(|e| AuthError::InternalError(e.to_string()))
+            .map_err(|e| AuthError::InternalError(e.to_string()))?;
+        self.set_loaded(None);
+        Ok(())
+    }
+}
+
+impl PgCredentialStore {
+    fn loaded(&self) -> Option<serde_json::Value> {
+        // No critical section leaves the value half-changed.
+        self.loaded.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set_loaded(&self, grant: Option<serde_json::Value>) {
+        *self.loaded.lock().unwrap_or_else(|e| e.into_inner()) = grant;
     }
 }
 

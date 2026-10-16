@@ -616,6 +616,7 @@ async fn test_a_refresh_is_saved_only_onto_the_url_its_connection_was_built_for(
         &pool,
         created.id,
         "https://example.com/old-mcp",
+        &grant,
         "abc",
         serde_json::json!({"client_id": "abc", "refreshed": "for-the-old-url"}),
     )
@@ -627,10 +628,145 @@ async fn test_a_refresh_is_saved_only_onto_the_url_its_connection_was_built_for(
         &pool,
         created.id,
         "https://example.com/mcp",
+        &grant,
         "abc",
         serde_json::json!({"client_id": "abc", "refreshed": true}),
     )
     .await
     .expect("refresh for the row's URL");
     assert!(saved, "a refresh for the row's URL and client should save");
+}
+
+/// SME-177 B24: a refresh is saved only over the exact grant it refreshed.
+/// A Reconnect with a pre-registered client (GitHub) keeps the client id,
+/// so a client-id match alone let the old grant's refresh overwrite the
+/// new grant.
+#[sqlx::test]
+async fn test_a_refresh_is_saved_only_over_the_grant_it_refreshed(pool: PgPool) {
+    let created = create_mcp_server_config(
+        &pool,
+        "github",
+        "https://example.com/mcp",
+        &HashMap::new(),
+        "oauth",
+        Some("gh-client"),
+        None,
+    )
+    .await
+    .expect("create mcp server config");
+    let old = serde_json::json!({"client_id": "gh-client", "token_response": {"access_token": "old"}});
+    let new = serde_json::json!({"client_id": "gh-client", "token_response": {"access_token": "new"}});
+    set_mcp_server_oauth_credentials(&pool, created.id, Some(new.clone()))
+        .await
+        .expect("the Reconnect's grant");
+
+    let saved = save_refreshed_mcp_server_oauth_credentials(
+        &pool,
+        created.id,
+        "https://example.com/mcp",
+        &old,
+        "gh-client",
+        serde_json::json!({"client_id": "gh-client", "token_response": {"access_token": "old-refreshed"}}),
+    )
+    .await
+    .expect("refresh of the old grant");
+    assert!(!saved, "a refresh of a grant no longer stored must match nothing");
+    assert_eq!(stored_grant(&pool, created.id).await, Some(new.clone()), "the new grant stays");
+
+    let refreshed = serde_json::json!({"client_id": "gh-client", "token_response": {"access_token": "new-refreshed"}});
+    let saved = save_refreshed_mcp_server_oauth_credentials(
+        &pool,
+        created.id,
+        "https://example.com/mcp",
+        &new,
+        "gh-client",
+        refreshed.clone(),
+    )
+    .await
+    .expect("refresh of the stored grant");
+    assert!(saved, "a refresh of the stored grant saves");
+    assert_eq!(stored_grant(&pool, created.id).await, Some(refreshed));
+}
+
+async fn stored_grant(pool: &PgPool, id: i64) -> Option<serde_json::Value> {
+    get_mcp_server_config(pool, id)
+        .await
+        .expect("get mcp server config")
+        .expect("row should exist")
+        .oauth_credentials
+        .map(|json| json.0)
+}
+
+/// SME-177 B24, the race itself, forced with a row lock: the refresh read
+/// X; a Reconnect's save of W (same client) is uncommitted when the
+/// refresh's `UPDATE` runs, so Postgres makes it wait, then re-checks its
+/// `WHERE` against the committed W.
+#[sqlx::test]
+async fn test_a_refresh_racing_a_reconnect_keeps_the_new_grant(pool: PgPool) {
+    let created = create_mcp_server_config(
+        &pool,
+        "github",
+        "https://example.com/mcp",
+        &HashMap::new(),
+        "oauth",
+        Some("gh-client"),
+        None,
+    )
+    .await
+    .expect("create mcp server config");
+    let x = serde_json::json!({"client_id": "gh-client", "token_response": {"access_token": "x"}});
+    let w = serde_json::json!({"client_id": "gh-client", "token_response": {"access_token": "w"}});
+    set_mcp_server_oauth_credentials(&pool, created.id, Some(x.clone()))
+        .await
+        .expect("the grant the refresh reads");
+
+    let mut reconnect = pool.begin().await.expect("begin the Reconnect");
+    sqlx::query("UPDATE mcp_servers SET oauth_credentials = $2 WHERE id = $1")
+        .bind(created.id)
+        .bind(sqlx::types::Json(w.clone()))
+        .execute(&mut *reconnect)
+        .await
+        .expect("save W, uncommitted");
+
+    let mut refresh = tokio::spawn({
+        let pool = pool.clone();
+        let id = created.id;
+        async move {
+            save_refreshed_mcp_server_oauth_credentials(
+                &pool,
+                id,
+                "https://example.com/mcp",
+                &x,
+                "gh-client",
+                serde_json::json!({"client_id": "gh-client", "token_response": {"access_token": "y"}}),
+            )
+            .await
+        }
+    });
+    // Commit only once the refresh is waiting on the Reconnect's row lock.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+                  WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("pg_stat_activity");
+        if waiting > 0 {
+            break;
+        }
+        assert!(!refresh.is_finished(), "the refresh ended without waiting on the Reconnect");
+        assert!(std::time::Instant::now() < deadline, "the refresh never waited on the Reconnect");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    reconnect.commit().await.expect("commit the Reconnect");
+
+    let saved = tokio::time::timeout(std::time::Duration::from_secs(10), &mut refresh)
+        .await
+        .expect("the refresh finishes once the Reconnect commits")
+        .expect("refresh task")
+        .expect("refresh");
+    assert!(!saved, "the refresh must not save over the Reconnect's grant");
+    assert_eq!(stored_grant(&pool, created.id).await, Some(w), "the Reconnect's grant stays");
 }

@@ -205,6 +205,38 @@ async fn test_a_refresh_finishing_after_a_new_grant_keeps_the_new_grant(pool: sq
     evict(server.id).await;
 }
 
+/// SME-177 B24: a Reconnect with a pre-registered client keeps the client
+/// id, so the client-id check alone let a refresh of the old grant,
+/// finishing after the Reconnect, overwrite the new grant.
+#[sqlx::test]
+async fn test_a_refresh_finishing_after_a_same_client_reconnect_keeps_the_new_grant(
+    pool: sqlx::PgPool,
+) {
+    let mock = oauth_http::spawn().await;
+    let server = oauth_http::create_server(&pool, &mock, None).await;
+    oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+    oauth_http::age_token(&pool, server.id).await;
+    let config = oauth_http::config(&pool, server.id).await;
+    let (call, gate) = call_held_at_refresh(&pool, &mock, &config).await;
+
+    let reconnected = oauth_http::save_grant(&pool, server.id, &mock, "client-0").await;
+    evict(server.id).await;
+    gate.add_permits(1);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), call)
+        .await
+        .expect("the call finishes once the refresh is let through")
+        .expect("call task");
+
+    let stored = oauth_http::config(&pool, server.id).await.oauth_credentials.expect("a grant");
+    assert_eq!(
+        stored.0["token_response"]["access_token"].as_str(),
+        Some(reconnected.as_str()),
+        "the Reconnect's grant stays"
+    );
+    assert!(result.is_err(), "the call went on with the replaced grant: {result:?}");
+    evict(server.id).await;
+}
+
 /// SME-113: a grant the provider won't refresh any more shows as such,
 /// not as Connected from the cached connection, and the connection is
 /// dropped.

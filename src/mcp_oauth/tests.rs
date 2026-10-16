@@ -813,5 +813,28 @@ async fn test_a_connection_manager_for_an_old_url_does_not_use_the_new_urls_gran
     );
 }
 
+/// SME-177 B24: rmcp clears a connection's store when the provider's
+/// issuer changed since its load (`initialize_from_store`). A grant saved
+/// after that load (a Reconnect) is not the one it judged, and stays.
+#[sqlx::test]
+async fn test_a_connection_stores_clear_leaves_a_grant_saved_after_its_load(pool: PgPool) {
+    let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
+    let config = create_oauth_server(&pool, &base_url).await;
+    let x = serde_json::json!({"client_id": "c", "token_response": null, "granted_scopes": []});
+    let w = serde_json::json!({"client_id": "c", "token_response": null, "granted_scopes": ["w"]});
+    db::set_mcp_server_oauth_credentials(&pool, config.id, Some(x))
+        .await
+        .expect("save X");
+    let store = PgCredentialStore::for_refreshes(pool.clone(), config.id, config.url.clone());
+    store.load().await.expect("load X").expect("X is stored");
+
+    db::set_mcp_server_oauth_credentials(&pool, config.id, Some(w.clone()))
+        .await
+        .expect("save W");
+    store.clear().await.expect("clear");
+
+    assert_eq!(stored_credentials(&pool, config.id).await, Some(w), "W stays");
+}
+
 mod callback_errors;
 mod pending_attempt;
