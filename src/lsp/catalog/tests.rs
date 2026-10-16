@@ -302,6 +302,24 @@ fn test_every_github_download_shape_quotes_and_every_kind_refuses() {
 }
 
 #[test]
+fn test_a_value_that_would_show_as_something_else_is_refused() {
+    // A right-to-left override shows `evil` the other way round in the
+    // form; a zero-width space or a soft hyphen doesn't show at all.
+    for (extra, escaped) in [("pkg\u{202E}live", r"\u{202e}"), ("type\u{200B}script", r"\u{200b}"), ("a\u{2066}b", r"\u{2066}"), ("x\u{AD}y", r"\u{ad}")] {
+        let s = suggest(&package_with_extras("pkg", "pkg:npm/pkg@1.0.0", &[extra]), HELIX).expect("a partial suggestion");
+        assert_eq!(s.config.install_command, "", "{escaped}");
+        assert!(
+            s.notes.iter().any(|n| n.contains("won't put") && n.contains(escaped) && n.contains("invisible")),
+            "{escaped}: {:?}",
+            s.notes
+        );
+    }
+    // Other non-ASCII text is quoted, not refused.
+    let s = suggest(&package_with_extras("pkg", "pkg:npm/pkg@1.0.0", &["café"]), HELIX).expect("a suggestion");
+    assert_eq!(s.config.install_command, "npm install --prefix /tmp/home/lsp pkg@1.0.0 'café'");
+}
+
+#[test]
 fn test_a_refused_install_leaves_no_notes_about_the_command_it_dropped() {
     // An unfilled template in the file (noted first), then a refused
     // archive path.

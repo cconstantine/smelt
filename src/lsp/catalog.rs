@@ -230,7 +230,7 @@ impl Purl {
 /// unfilled templates), else in single quotes, POSIX style. Refused, with
 /// the note to show, when quoting can't make it safe: empty, starting with
 /// `-` (quoted, it's still an option to npm, pip, go or cargo), or holding
-/// a control character.
+/// a control character, or one that shows as something else ([`invisible`]).
 fn shell_word(value: &str) -> Result<Cow<'_, str>, String> {
     let refuse = |shown: String, why: &str| {
         Err(format!(
@@ -253,6 +253,11 @@ fn shell_word(value: &str) -> Result<Cow<'_, str>, String> {
     if let Some(at) = first_bad {
         return refuse(shown(at.saturating_sub(20)), "holds a control character");
     }
+    // Shell-safe once quoted, but the user reviewing the command would
+    // see something else (Trojan Source); the note's escaping shows them.
+    if let Some(at) = value.chars().position(invisible) {
+        return refuse(shown(at.saturating_sub(20)), "holds an invisible or direction-changing character");
+    }
     if value.starts_with('-') {
         return refuse(shown(0), "starts with \"-\" (an option to the installer)");
     }
@@ -261,6 +266,24 @@ fn shell_word(value: &str) -> Result<Cow<'_, str>, String> {
     } else {
         Ok(Cow::Owned(format!("'{}'", value.replace('\'', r"'\''"))))
     }
+}
+
+/// Whether `c` changes how the text around it shows without showing
+/// itself: bidi controls (U+061C, U+200E/F, U+202A–U+202E, U+2066–U+2069),
+/// zero-width and invisible characters (U+00AD, U+180E, U+200B–U+200D,
+/// U+2060–U+2064, U+FEFF), and the line and paragraph separators.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 /// The install command and the path it leaves the executable at, or the
