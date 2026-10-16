@@ -48,9 +48,13 @@ pub fn suggest(package_yaml: &str, languages_toml: &str) -> Result<Suggestion, S
         .or_else(|| package.bin.keys().next().cloned())
         .unwrap_or_else(|| package.name.clone());
 
+    let notes_before_install = notes.len();
     let (install_command, command) = match install(&purl, source, &bin, &mut notes) {
         Ok(install) => install,
         Err(note) => {
+            // Notes about the command it was building would be about
+            // nothing now.
+            notes.truncate(notes_before_install);
             notes.push(note);
             (String::new(), bin.clone())
         }
@@ -230,7 +234,7 @@ impl Purl {
 fn shell_word(value: &str) -> Result<Cow<'_, str>, String> {
     let refuse = |shown: String, why: &str| {
         Err(format!(
-            "The catalog's install details include {shown}, which {why}, so smelt won't put it in a command: fill in the install command."
+            "The catalog's install details include {shown}, which {why}, so smelt won't put it in a command: fill in the install command, and the command to run once it's installed."
         ))
     };
     if value.is_empty() {
@@ -700,6 +704,19 @@ mod tests {
         assert!(option.contains("starts with \"-\""), "{option}");
         let empty = note(&package_with_extras("pkg", "pkg:npm/pkg@1.0.0", &[""]));
         assert!(empty.contains("an empty value"), "{empty}");
+    }
+
+    #[test]
+    fn test_a_refused_install_leaves_no_notes_about_the_command_it_dropped() {
+        // An unfilled template in the file (noted first), then a refused
+        // archive path.
+        let yaml = "name: tool\nsource:\n  id: pkg:github/owner/tool@v1\n  asset:\n    - target: linux_x64\n      file: tool_{{ version | x }}.tar.gz\n      bin: \"dir\\n/tool\"\nbin:\n  tool: \"{{source.asset.bin}}\"\n";
+        let s = suggest(yaml, HELIX).expect("a partial suggestion");
+        assert_eq!(s.config.install_command, "");
+        assert!(!s.notes.iter().any(|n| n.contains("template")), "no note about a command that isn't there: {:?}", s.notes);
+        let refusal = s.notes.iter().find(|n| n.contains("won't put")).expect("a refusal note");
+        assert!(refusal.contains("and the command to run"), "the command is only the bare name now: {refusal}");
+        assert_eq!(s.config.command, "tool");
     }
 
     #[test]
