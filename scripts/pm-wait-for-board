@@ -34,10 +34,13 @@ failing (the message says why). With --once a failed poll isn't retried.
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import stat
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -203,8 +206,112 @@ def self_test():
         if got != want:
             failed += 1
             print(f"case {i}: want {want}, got {got}")
-    print(f"{len(cases) - failed} passed, {failed} failed")
+    passed = len(cases) - failed
+
+    # The poll loop, driven with scripted polls in a state directory of the
+    # test's own: it never reads the real snapshot or the key.
+    saved_dir = os.environ.get("SMELT_PM_STATE_DIR")
+    try:
+        with tempfile.TemporaryDirectory(prefix="pm-wait-for-board-self-test.") as root:
+            for name, case in _loop_cases(b):
+                os.environ["SMELT_PM_STATE_DIR"] = tempfile.mkdtemp(dir=root)
+                problems = case()
+                if problems:
+                    failed += 1
+                    for p in problems:
+                        print(f"{name}: {p}")
+                else:
+                    passed += 1
+    finally:
+        if saved_dir is None:
+            os.environ.pop("SMELT_PM_STATE_DIR", None)
+        else:
+            os.environ["SMELT_PM_STATE_DIR"] = saved_dir
+    print(f"{passed} passed, {failed} failed")
     return 1 if failed else 0
+
+
+class _Stop(Exception):
+    """The scripted polls ran out: stands for the waiter being killed."""
+
+
+def _run(polls, once=False):
+    """One run of the script, as main() makes it, against scripted polls: each
+    is a board, or an exception the fetch raises. Returns (status, stdout
+    lines, stderr); the status is "killed" when the polls ran out first."""
+    polls = list(polls)
+
+    def fetch():
+        if not polls:
+            raise _Stop()
+        p = polls.pop(0)
+        if isinstance(p, BaseException):
+            raise p
+        return p
+
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            status = watch(fetch, lambda s: None, load_snapshot(), once, 60)
+        except _Stop:
+            status = "killed"
+        except SystemExit as e:
+            status = e.code
+        except Exception as e:  # noqa: BLE001 - a case reports it as its result
+            status = f"raised {e!r}"
+    return status, out.getvalue().splitlines(), err.getvalue()
+
+
+def _expect(problems, what, got, want):
+    if got != want:
+        problems.append(f"{what}: want {want!r}, got {got!r}")
+
+
+def _loop_cases(b):
+    def first_run_takes_a_baseline():
+        p = []
+        status, out, _ = _run([b(SME_1="Up Next")], once=True)
+        _expect(p, "status", status, 1)
+        _expect(p, "stdout", out, [])
+        _expect(p, "snapshot", load_snapshot(), b(SME_1="Up Next"))
+        return p
+
+    def a_move_into_a_wake_state_wakes():
+        p = []
+        save_snapshot(b(SME_1="Backlog"))
+        status, out, _ = _run([b(SME_1="Backlog"), b(SME_1="Up Next")])
+        _expect(p, "status", status, 0)
+        _expect(p, "stdout", out, ["SME-1: Backlog -> Up Next"])
+        _expect(p, "snapshot", load_snapshot(), b(SME_1="Up Next"))
+        return p
+
+    def failed_polls_give_up_after_the_limit():
+        p = []
+        save_snapshot(b(SME_1="Backlog"))
+        polls = [urllib.error.URLError("down")] * MAX_FAILURES + [b(SME_1="Up Next")]
+        status, out, _ = _run(polls)
+        _expect(p, "status", status, 2)
+        _expect(p, "stdout", out, [])
+        return p
+
+    def a_refused_key_exits_at_once():
+        p = []
+        save_snapshot(b(SME_1="Backlog"))
+        refused = urllib.error.HTTPError(API_URL, 401, "Unauthorized", {}, None)
+        status, _, err = _run([refused, b(SME_1="Up Next")])
+        _expect(p, "status", status, 2)
+        _expect(p, "says the key was refused", "refused the key" in err, True)
+        return p
+
+    return [
+        (f.__name__, f)
+        for f in (
+            first_run_takes_a_baseline,
+            a_move_into_a_wake_state_wakes,
+            failed_polls_give_up_after_the_limit,
+            a_refused_key_exits_at_once,
+        )
+    ]
 
 
 def main():
@@ -221,11 +328,18 @@ def main():
         p.error("--interval must be at least 10 seconds")
 
     key = read_key()
-    old = load_snapshot()
+    return watch(lambda: fetch_board(key), time.sleep, load_snapshot(), args.once, args.interval)
+
+
+def watch(fetch, sleep, old, once, interval):
+    """Poll `fetch()` until the board changes in a way that needs the Project
+    Manager, comparing with `old` (None: no snapshot yet). Returns the exit
+    status. `fetch` returns a board or raises what fetch_board raises; `sleep`
+    waits that many seconds."""
     failures = 0
     while True:
         try:
-            board = fetch_board(key)
+            board = fetch()
             failures = 0
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
@@ -235,19 +349,19 @@ def main():
                     "Security & access > API keys)."
                 )
             failures += 1
-            if args.once or failures >= MAX_FAILURES:
+            if once or failures >= MAX_FAILURES:
                 print(f"pm-wait-for-board: giving up after {failures} failed polls: {e}", file=sys.stderr)
                 return 2
             print(f"pm-wait-for-board: poll failed ({e}); retrying", file=sys.stderr)
-            time.sleep(min(args.interval * failures, 600))
+            sleep(min(interval * failures, 600))
             continue
         except (urllib.error.URLError, OSError, RuntimeError, KeyError, ValueError) as e:
             failures += 1
-            if args.once or failures >= MAX_FAILURES:
+            if once or failures >= MAX_FAILURES:
                 print(f"pm-wait-for-board: giving up after {failures} failed polls: {e}", file=sys.stderr)
                 return 2
             print(f"pm-wait-for-board: poll failed ({e}); retrying", file=sys.stderr)
-            time.sleep(min(args.interval * failures, 600))
+            sleep(min(interval * failures, 600))
             continue
         if old is None:
             # First run: nothing to compare with yet. Keep this as the baseline.
@@ -260,9 +374,9 @@ def main():
                 save_snapshot(board)
                 print("\n".join(found))
                 return 0
-        if args.once:
+        if once:
             return 1
-        time.sleep(args.interval)
+        sleep(interval)
 
 
 if __name__ == "__main__":
