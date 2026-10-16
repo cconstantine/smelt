@@ -319,3 +319,172 @@ async fn test_the_question_is_recorded_before_the_replys_other_tools_run(pool: P
         .collect();
     assert_eq!(order, vec!["question", "results"]);
 }
+
+// --- A message a Stop catches queued (SME-170) ---
+
+/// Holds the turn lock while `queue` starts a turn that queues behind it,
+/// waits until that turn is in flight, stops it, then releases the lock.
+/// Returns every event the conversation published until it went idle.
+/// The interleaving is forced, not timed: the queued turn publishes
+/// `TurnState { running: true }` just before it makes its stop receiver,
+/// with no await in between, so the Stop reaches it while it waits for
+/// the lock, and it takes the stop before the lock is free (code review
+/// 1: releasing the lock straight after the stop let the turn run and
+/// save its message the normal way about half the time). It asserts the
+/// message wasn't saved by the turn running.
+async fn stop_while_queued(conversation_id: i64, queue: impl std::future::Future<Output = ()>) -> Vec<events::ConversationEvent> {
+    let mut rx = events::subscribe(conversation_id);
+    // Only the run path reaches this hook. Its release is dropped, so a
+    // run-path save doesn't wait on it: it only tells the test it happened.
+    let (mut ran, _) = test_hooks::pause_after_message_saved(conversation_id);
+    let lock = conversation_lock(conversation_id);
+    let running = lock.lock().await;
+    queue.await;
+    let mut seen = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let event = rx.recv().await.expect("event");
+            let started = matches!(event, events::ConversationEvent::TurnState { running: true, .. });
+            seen.push(event);
+            if started {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the queued turn is in flight");
+    stop_turn_now(conversation_id);
+    // The stop woke the queued turn. Yielding lets it run while the lock is
+    // still held, so its `select!` finds only the stop ready (the test
+    // runtime is current-thread). Dropping the lock first would make both
+    // arms ready at once, and the `select!` would pick one at random.
+    tokio::task::yield_now().await;
+    drop(running);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let event = rx.recv().await.expect("event");
+            let idle = matches!(event, events::ConversationEvent::TurnState { running: false, .. });
+            seen.push(event);
+            if idle {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the stopped turn ends");
+    assert!(ran.try_recv().is_err(), "the message was saved by the turn running, not by the stop while it was queued");
+    seen
+}
+
+/// The saved message holding `text`, as blocks.
+async fn saved_message_with_text(pool: &PgPool, conversation_id: i64, text: &str) -> Vec<anthropic::ContentBlock> {
+    saved_blocks(pool, conversation_id)
+        .await
+        .into_iter()
+        .map(|(_, blocks)| blocks)
+        .find(|blocks| blocks.iter().any(|b| matches!(b, anthropic::ContentBlock::Text { text: t } if t == text)))
+        .expect("the message is saved")
+}
+
+fn tool_result(tool_use_id: &str, content: &str) -> anthropic::ContentBlock {
+    anthropic::ContentBlock::ToolResult { tool_use_id: tool_use_id.to_string(), content: content.to_string(), is_error: None }
+}
+
+/// The user writes instead of answering, and a Stop catches the message
+/// queued behind another turn: the message still dismisses the question,
+/// as it does when it runs, and the model later gets one result for the
+/// call, the user's text right after it.
+#[sqlx::test]
+async fn test_a_written_answer_caught_queued_by_a_stop_dismisses_the_question(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_312).await.expect("conversation");
+    let requests = start_recording_mock_upstream(&pool, vec![ask_body(), text_reply_body("OK.")]).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("asks");
+
+    let seen = stop_while_queued(conversation.id, async {
+        start_turn(pool.clone(), conversation.id, "keep it, do X instead".to_string())
+            .await
+            .expect("the message is sent");
+    })
+    .await;
+
+    assert_eq!(db::get_pending_question(&pool, conversation.id).await.expect("read"), None, "the question is dismissed");
+    assert_eq!(
+        saved_message_with_text(&pool, conversation.id, "keep it, do X instead").await,
+        vec![tool_result("toolu_ask", crate::questions::NOT_ANSWERED), text_block("keep it, do X instead")]
+    );
+    assert!(
+        seen.iter().any(|e| matches!(e, events::ConversationEvent::QuestionUpdate { question: None })),
+        "every tab's card goes: {seen:?}"
+    );
+
+    start_turn(pool.clone(), conversation.id, "go on".to_string()).await.expect("the next message");
+    wait_for_requests(&requests, 2).await;
+    let request = requests.lock().expect("requests")[1].clone();
+    let after = message_after_call(&request, "toolu_ask");
+    assert_eq!(after["content"][0]["tool_use_id"], "toolu_ask", "{after}");
+    assert_eq!(after["content"][0]["content"], crate::questions::NOT_ANSWERED);
+    assert_eq!(after["content"][1]["text"], "keep it, do X instead", "{after}");
+    let results = request["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+        .filter(|b| b["type"] == "tool_result" && b["tool_use_id"] == "toolu_ask")
+        .count();
+    assert_eq!(results, 1, "one result for the call: {request}");
+}
+
+/// A notice a Stop catches queued isn't the user's reply: the question
+/// still waits, and the notice is saved as it is.
+#[sqlx::test]
+async fn test_a_notice_caught_queued_by_a_stop_leaves_the_question_waiting(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_310).await.expect("conversation");
+    start_mock_upstream(&pool, vec![ask_body(), text_reply_body("unreached")]).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("asks");
+
+    let text = "Terminal command c1 finished: exit code 0.";
+    let queued = std::sync::Mutex::new(None);
+    stop_while_queued(conversation.id, async {
+        let pool = pool.clone();
+        *queued.lock().expect("queued") =
+            Some(tokio::spawn(async move { run_turn(&pool, conversation.id, notice(text)).await }));
+    })
+    .await;
+    let result = queued.lock().expect("queued").take().expect("spawned").await.expect("join");
+    assert!(matches!(result, Err(TurnFailure::Stopped)), "{result:?}");
+
+    assert_eq!(saved_message_with_text(&pool, conversation.id, text).await, notice(text).content);
+    assert!(pending_question(&pool, conversation.id).await.expect("read").is_some(), "still waiting");
+    resume_turns(conversation.id);
+}
+
+/// An answer recorded from the card before the Stop goes first in the
+/// stopped message, as it would in a turn that ran.
+#[sqlx::test]
+async fn test_an_answer_recorded_before_the_stop_goes_with_the_stopped_message(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9_100_000_311).await.expect("conversation");
+    start_mock_upstream(&pool, vec![ask_body(), text_reply_body("unreached")]).await;
+    run_turn(&pool, conversation.id, hello()).await.expect("asks");
+    let answers = vec![crate::questions::QuestionAnswer { selected: vec!["Yes (Recommended)".to_string()], other: None }];
+    assert!(
+        db::answer_pending_question(&pool, conversation.id, "toolu_ask", &answers).await.expect("answer"),
+        "the answer is recorded"
+    );
+
+    stop_while_queued(conversation.id, async {
+        start_turn(pool.clone(), conversation.id, "and then X".to_string())
+            .await
+            .expect("the message is sent");
+    })
+    .await;
+
+    assert_eq!(
+        saved_message_with_text(&pool, conversation.id, "and then X").await,
+        vec![tool_result("toolu_ask", "The user answered:\n1. Delete: Yes (Recommended)"), text_block("and then X")]
+    );
+    assert_eq!(db::get_pending_question(&pool, conversation.id).await.expect("read"), None);
+    resume_turns(conversation.id);
+}
