@@ -166,8 +166,23 @@ pub(super) fn send_action(
         // turn. Keyed by `id`: the viewer may switch away meanwhile.
         spawn(async move {
             stream_errors.write().clear(id);
-            if let Err(e) = send_message(id, content).await {
-                stream_errors.write().set_local_error(id, server_error_message(&e));
+            if let Err(e) = send_message(id, content.clone()).await {
+                // Not sent (SME-185 B36): the copy goes, so a resend shows
+                // the message once, and its text goes back in the box if
+                // the viewer is still here and hasn't typed anything since
+                // (`input` outlives a switch, so on another conversation it
+                // would land in the wrong box). After a switch the store was
+                // reset and holds no `temp_id`, so the withdraw is a no-op.
+                withdraw_unsent(&mut messages.write(), temp_id);
+                let restored = draft_after_failed_send(&input.peek(), &content);
+                if *selected.peek() == Some(id)
+                    && let Some(draft) = restored
+                {
+                    input.set(draft);
+                }
+                stream_errors
+                    .write()
+                    .set_local_error(id, format!("Couldn't send the message: {}", server_error_message(&e)));
             }
             // The first message titles a conversation, and any send moves
             // it up the list — refresh the sidebar even if the viewer has
@@ -175,4 +190,20 @@ pub(super) fn send_action(
             *conversations_changed.write() += 1;
         });
     }
+}
+
+/// Takes a failed send's optimistic copy back off the transcript (SME-185
+/// B36), by its temporary id. By id, not by text: another copy with the
+/// same text may be a send still in flight, and a saved copy that already
+/// replaced this one (the response was lost after the server saved it)
+/// stays.
+pub(super) fn withdraw_unsent(messages: &mut Vec<Message>, temp_id: i64) {
+    messages.retain(|m| m.id != temp_id);
+}
+
+/// What the message box should hold after a send of `sent` failed, given
+/// what it holds now (SME-185 B36): the sent text back when the box is
+/// empty, and nothing when the viewer has typed something new since.
+pub(super) fn draft_after_failed_send(draft: &str, sent: &str) -> Option<String> {
+    draft.trim().is_empty().then(|| sent.to_string())
 }

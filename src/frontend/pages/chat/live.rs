@@ -49,7 +49,7 @@ pub(super) fn use_timezone_offset(tz_offset_minutes: Signal<i32>) {
 /// Takes the conversation's messages once they load, and opens it at its
 /// latest message.
 pub(super) fn use_initial_messages(
-    initial_messages: Resource<Option<Result<Vec<Message>, ServerFnError>>>,
+    initial_messages: Resource<Option<(i64, Result<Vec<Message>, ServerFnError>)>>,
     selected: Memo<Option<i64>>,
     state: Store<ConversationState>,
     transcript_scroll: StickyBottom,
@@ -57,18 +57,19 @@ pub(super) fn use_initial_messages(
     let mut messages = state.messages();
     let mut load_error = state.load_error();
     use_effect(move || match initial_messages() {
-        Some(Some(Ok(list))) => {
-            if let Some(id) = *selected.peek() {
-                let merged = apply_loaded_messages(&messages.peek(), list, id);
-                messages.set(merged);
-            }
+        // Only the open conversation's load (SME-185 B38); one for a
+        // conversation since left is followed by the open one's.
+        Some(Some((id, _))) if *selected.peek() != Some(id) => {}
+        Some(Some((id, Ok(list)))) => {
+            let merged = apply_loaded_messages(&messages.peek(), list, id);
+            messages.set(merged);
             load_error.set(None);
             // A freshly loaded conversation should open scrolled to its
             // latest message, regardless of where a previous conversation
             // was left scrolled.
             transcript_scroll.stick();
         }
-        Some(Some(Err(e))) => load_error.set(Some(server_error_message(&e))),
+        Some(Some((_, Err(e)))) => load_error.set(Some(server_error_message(&e))),
         Some(None) => {
             messages.set(Vec::new());
             transcript_scroll.stick();

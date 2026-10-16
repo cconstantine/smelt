@@ -161,11 +161,14 @@ fn ChatPanel(
     turns_changed: Signal<u64>,
     questions_changed: Signal<u64>,
 ) -> Element {
+    // Tagged with its conversation (SME-185 B38): a restarted resource
+    // keeps its last value until the new load lands, so on a switch it
+    // still holds the conversation left. The id tells the two apart.
     let initial_messages = use_resource(move || {
         let id = selected();
         async move {
             match id {
-                Some(id) => Some(get_messages(id).await),
+                Some(id) => Some((id, get_messages(id).await)),
                 None => None,
             }
         }
