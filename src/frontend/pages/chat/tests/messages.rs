@@ -79,6 +79,38 @@ fn test_accept_saved_messages_replaces_one_copy_per_saved_message() {
     assert_eq!(existing.len(), 2, "a repeat of an already shown message changes nothing");
 }
 
+/// SME-185 B36: a send that failed takes its copy back, so sending it
+/// again shows the message once, not twice.
+#[test]
+fn test_a_resend_after_a_failed_send_shows_the_message_once() {
+    let mut shown = vec![user_text(1, "earlier"), user_text(-1, "hello once")];
+    withdraw_unsent(&mut shown, -1);
+    shown.push(user_text(-2, "hello once"));
+    accept_saved_messages(&mut shown, vec![user_text(5, "hello once")]);
+    assert_eq!(ids(&shown), vec![1, 5], "one copy of the resent message, the saved one");
+}
+
+/// SME-185 B36: the response was lost after the server saved the message,
+/// and the saved copy has already replaced the optimistic one. The
+/// withdraw goes by id, so it leaves the saved copy alone.
+#[test]
+fn test_withdrawing_a_send_leaves_its_saved_copy() {
+    let mut shown = vec![user_text(-1, "hi"), user_text(-2, "hi")];
+    accept_saved_messages(&mut shown, vec![user_text(5, "hi")]);
+    assert_eq!(ids(&shown), vec![-2, 5]);
+    withdraw_unsent(&mut shown, -1);
+    assert_eq!(ids(&shown), vec![-2, 5], "nothing with id -1 left; the in-flight -2 and the saved 5 stay");
+}
+
+/// SME-185 B36: the sent text goes back into an empty box, never over
+/// something typed since.
+#[test]
+fn test_a_failed_send_gives_its_text_back_only_to_an_empty_box() {
+    assert_eq!(draft_after_failed_send("", "hi").as_deref(), Some("hi"));
+    assert_eq!(draft_after_failed_send("  \n", "hi").as_deref(), Some("hi"));
+    assert_eq!(draft_after_failed_send("new text", "hi"), None);
+}
+
 /// Code review 1 (SME-34): a message sent while a question waits is
 /// saved with the question's result in front of the user's text. Its
 /// optimistic copy (just the text) is still replaced.
