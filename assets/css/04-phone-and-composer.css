@@ -1,0 +1,149 @@
+/* A phone-width window (SME-40 F8): the sidebar becomes a strip across
+   the top with a capped, scrollable height, and the chat gets the full
+   width below it, instead of the sidebar keeping its 272px beside a chat
+   squeezed to ~100px. */
+@media (max-width: 720px) {
+    .chat-layout {
+        flex-direction: column;
+    }
+
+    /* The list folds behind a button in a slim bar, so the conversation
+       fills the screen (SME-41 D4). */
+    .sidebar {
+        width: auto;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+        gap: 8px;
+        padding: 8px 12px;
+        overflow: visible;
+    }
+
+    .sidebar-toggle {
+        display: block;
+    }
+
+    .sidebar:not(.sidebar-open) .sidebar-body {
+        display: none;
+    }
+
+    .sidebar-open .sidebar-body {
+        max-height: 60vh;
+        overflow-y: auto;
+    }
+
+    /* The conversation first; the sandbox and task panels below it. */
+    .chat-main {
+        order: -1;
+        flex: 1 1 auto;
+        min-height: 55vh;
+    }
+
+    .side-panels-row {
+        flex: 0 0 auto;
+        flex-direction: column;
+        max-height: 40vh;
+        overflow-y: auto;
+    }
+
+    /* Wide tables scroll in their own box rather than the page. */
+    .pods-table {
+        display: block;
+        overflow-x: auto;
+    }
+
+    .chat-panel {
+        min-height: 0;
+    }
+
+    .messages,
+    .composer {
+        padding-left: 12px;
+        padding-right: 12px;
+    }
+
+    .composer input {
+        min-width: 0;
+    }
+}
+
+.composer input:focus {
+    outline: none;
+    border-color: var(--ink);
+    box-shadow: 0 0 0 3px rgba(17, 17, 17, 0.08);
+}
+
+.composer input:disabled {
+    background: var(--canvas);
+    color: var(--muted);
+}
+
+.composer button {
+    padding: 10px 18px;
+    border: none;
+    border-radius: 10px;
+    background: var(--ink);
+    color: var(--surface);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color 120ms ease, transform 80ms ease;
+}
+
+.composer button:hover:not(:disabled) {
+    background: var(--ink-hover);
+}
+
+.composer button:active:not(:disabled) {
+    transform: scale(0.98);
+}
+
+.composer button:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+/* Text for a screen reader only: the message box's label (SME-58). */
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+.error {
+    color: var(--danger);
+    background: var(--danger-bg);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 13px;
+    overflow-wrap: break-word;
+    word-break: break-word;
+}
+
+.mcp-servers-link {
+    display: block;
+    padding: 8px 10px;
+    border-radius: 8px;
+    color: var(--text-2);
+    font-size: 13px;
+    text-decoration: none;
+    text-align: center;
+    border: 1px solid var(--border);
+}
+
+.mcp-servers-link:hover {
+    background: var(--subtle);
+    color: var(--ink);
+}
+
+.mcp-servers-page {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+}
+

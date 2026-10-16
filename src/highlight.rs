@@ -169,7 +169,7 @@ mod tests {
 
     /// What `assets/highlight.css` should hold: two-face's OneHalfLight
     /// theme, and OneHalfDark when the system is in dark mode (as
-    /// `assets/chat.css` does), with smelt's class prefix.
+    /// `assets/css/` does), with smelt's class prefix.
     fn generated_css() -> String {
         use syntect::html::{ClassStyle, css_for_theme_with_class_style};
         use two_face::theme::EmbeddedThemeName;

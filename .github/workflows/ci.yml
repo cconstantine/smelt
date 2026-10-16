@@ -176,9 +176,9 @@ jobs:
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
             smelt scripts/ci-web-bundle
 
-      # Also creates a real sandbox pod (see src/browser_tests.rs) — same
+      # Also creates a real sandbox pod (see src/browser_tests/) — same
       # reasoning as the step above.
-      - name: Browser tests (src/browser_tests.rs)
+      - name: Browser tests (src/browser_tests/)
         run: |
           docker compose run --rm \
             -e SANDBOX_RUNNING_WAIT_TIMEOUT_SECS=120 \

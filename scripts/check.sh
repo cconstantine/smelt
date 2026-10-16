@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The checks every commit must pass (docs/development-process.md, "Every
+# The checks every commit must pass (docs/process/rules-commits.md, "Every
 # commit builds for both targets"): the web build and the server build,
 # each with no warnings, no unexplained expect() or unwrap() outside tests
 # (scripts/lint-expects), and the server tests, run against this working
@@ -16,7 +16,7 @@
 # The shell tests of the scripts themselves (scripts/test-*) run here too.
 # None needs a cluster or a database, and together they take about a minute
 # (SME-157's retrospective: nothing ran any of them, so a regression in the
-# code they cover went uncaught). scripts/test-check-scripts runs this script
+# code they cover went uncaught). scripts/test-gate-scripts runs this script
 # under stubs to check how it uses the cluster lock, so it sets
 # SMELT_SKIP_SCRIPT_TESTS to ask for this step to be skipped instead of
 # running itself again.
@@ -64,7 +64,7 @@ lint_output=$(scripts/lint-expects 2>&1) || {
 # a minute together, and none of them needs a cluster or a database.
 echo "== script tests"
 if [ -z "${SMELT_SKIP_SCRIPT_TESTS:-}" ]; then
-    for t in test-start-dockerd test-cluster-doctor test-ci-web-bundle test-check-scripts; do
+    for t in test-start-dockerd test-cluster-doctor test-ci-web-bundle test-check-server test-cluster-lock test-gate-scripts; do
         echo "-- scripts/$t"
         "scripts/$t" || {
             echo "scripts/$t failed"

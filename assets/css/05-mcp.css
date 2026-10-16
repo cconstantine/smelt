@@ -1,0 +1,436 @@
+.mcp-servers-header {
+    margin-bottom: 24px;
+}
+
+.mcp-back-link {
+    display: inline-block;
+    margin-bottom: 12px;
+    color: var(--text-2);
+    font-size: 13px;
+    text-decoration: none;
+}
+
+.mcp-back-link:hover {
+    color: var(--ink);
+}
+
+.mcp-add-form,
+.mcp-edit-form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+    margin-bottom: 24px;
+}
+
+.mcp-add-form label,
+.mcp-edit-form label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+}
+
+.mcp-add-form input,
+.mcp-edit-form input {
+    padding: 8px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    font-size: 14px;
+}
+
+.mcp-add-form input:focus,
+.mcp-edit-form input:focus {
+    outline: none;
+    border-color: var(--ink);
+    box-shadow: 0 0 0 3px rgba(17, 17, 17, 0.08);
+}
+
+.mcp-add-form button[type="submit"],
+.mcp-edit-form button[type="submit"] {
+    align-self: flex-start;
+    padding: 8px 16px;
+    border: 1px solid var(--ink);
+    border-radius: 8px;
+    background: var(--ink);
+    color: var(--surface);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.mcp-add-form button[type="submit"]:hover,
+.mcp-edit-form button[type="submit"]:hover {
+    background: var(--ink-hover);
+}
+
+.mcp-save-edit:disabled {
+    background: var(--border);
+    border-color: var(--border);
+    color: var(--muted);
+    cursor: not-allowed;
+}
+
+.mcp-save-edit.saving:disabled {
+    background: var(--ink);
+    border-color: var(--ink);
+    color: var(--surface);
+    cursor: default;
+}
+
+.mcp-save-spinner {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    margin-right: 6px;
+    vertical-align: -1px;
+    border: 2px solid rgba(255, 255, 255, 0.35);
+    border-top-color: var(--surface);
+    border-radius: 50%;
+    animation: mcp-save-spin 0.7s linear infinite;
+}
+
+@keyframes mcp-save-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.mcp-header-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.mcp-header-row {
+    display: flex;
+    gap: 8px;
+}
+
+.mcp-header-row input {
+    flex: 1;
+}
+
+.mcp-header-existing-name {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    font-size: 14px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--text);
+    background: var(--canvas);
+    border: 1px solid transparent;
+    border-radius: 8px;
+}
+
+.mcp-remove-header,
+.mcp-add-header {
+    padding: 6px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text-2);
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.mcp-remove-header:hover,
+.mcp-add-header:hover {
+    background: var(--subtle);
+}
+
+.mcp-server-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.mcp-server-row {
+    padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.mcp-server-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.mcp-server-name {
+    font-weight: 600;
+    font-size: 15px;
+}
+
+.mcp-server-url {
+    font-size: 13px;
+    color: var(--text-2);
+    word-break: break-all;
+}
+
+/* The destructive action: the same shape as every other button, in red
+   outline (SME-41 D6). */
+.mcp-delete {
+    padding: 8px 16px;
+    border: 1px solid var(--danger) !important;
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--danger) !important;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.mcp-delete.confirm {
+    background: var(--danger) !important;
+    color: var(--surface) !important;
+}
+
+.mcp-new-server-link {
+    display: inline-block;
+    margin-top: 12px;
+    padding: 8px 16px;
+    border: 1px solid var(--ink);
+    border-radius: 8px;
+    background: var(--ink);
+    color: var(--surface);
+    font-size: 13px;
+    font-weight: 600;
+    text-decoration: none;
+}
+
+.mcp-new-server-link:hover {
+    background: var(--ink-hover);
+}
+
+.mcp-server-row-link {
+    color: inherit;
+    text-decoration: none;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.mcp-server-row-link:hover {
+    border-color: var(--border-strong);
+    background: var(--canvas);
+}
+
+.mcp-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.mcp-status::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+}
+
+.mcp-status-checking {
+    background: var(--subtle);
+    color: var(--muted);
+}
+
+.mcp-status-connected {
+    background: var(--ok-bg);
+    color: var(--ok);
+}
+
+.mcp-status-unreachable {
+    background: var(--danger-bg);
+    color: var(--danger);
+}
+
+div.mcp-status-connected,
+div.mcp-status-unreachable {
+    display: block;
+    border-radius: 10px;
+    padding: 12px 14px;
+    white-space: normal;
+}
+
+div.mcp-status-connected::before,
+div.mcp-status-unreachable::before {
+    content: none;
+}
+
+.mcp-status-section,
+.mcp-danger-section {
+    margin-bottom: 24px;
+}
+
+.mcp-status-section h2,
+.mcp-danger-section h2 {
+    font-size: 14px;
+    margin-bottom: 8px;
+}
+
+.mcp-tool-list {
+    margin: 8px 0 0;
+    padding-left: 18px;
+    font-size: 13px;
+    color: var(--text);
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+.mcp-tool-list li {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding: 1px 0;
+}
+
+.mcp-refresh-status {
+    margin-top: 10px;
+    padding: 6px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text-2);
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.mcp-refresh-status:hover {
+    background: var(--subtle);
+}
+
+.mcp-refresh-status:disabled {
+    cursor: default;
+    color: var(--muted);
+}
+
+.mcp-refresh-status:disabled:hover {
+    background: var(--surface);
+}
+
+.mcp-refresh-spinner {
+    /* .mcp-save-spinner's white ring is invisible on this button's light
+       background — same spinner shape, just recolored for a light button. */
+    border-color: rgba(0, 0, 0, 0.15);
+    border-top-color: var(--text-2);
+}
+
+/* --- OAuth (SME-16) --- */
+
+.mcp-status-not-connected {
+    background: var(--subtle);
+    color: var(--muted);
+}
+
+div.mcp-status-not-connected {
+    display: block;
+    border-radius: 10px;
+    padding: 12px 14px;
+    white-space: normal;
+}
+
+div.mcp-status-not-connected::before {
+    content: none;
+}
+
+/* A sign-in that can't be refreshed (SME-113): not the network's fault,
+   so amber rather than Unreachable's red. */
+.mcp-status-needs-reconnect {
+    background: var(--warn-bg);
+    color: var(--warn);
+}
+
+div.mcp-status-needs-reconnect {
+    display: block;
+    border-radius: 10px;
+    padding: 12px 14px;
+    white-space: normal;
+}
+
+div.mcp-status-needs-reconnect::before {
+    content: none;
+}
+
+div.mcp-status-needs-reconnect .mcp-status-detail {
+    color: var(--text-2);
+    font-weight: 400;
+    overflow-wrap: anywhere;
+}
+
+.mcp-auth-mode-choice {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 16px;
+}
+
+/* Scoped under the form so it outranks the form's stacked label rule;
+   the radio sits beside its label (SME-41 D13). */
+.mcp-add-form .mcp-auth-mode-choice label,
+.mcp-edit-form .mcp-auth-mode-choice label {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    font-weight: normal;
+    cursor: pointer;
+}
+
+.mcp-add-form input[type="radio"],
+.mcp-edit-form input[type="radio"] {
+    margin: 0;
+    padding: 0;
+}
+
+.mcp-oauth-panel {
+    margin-bottom: 24px;
+}
+
+.mcp-oauth-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 10px;
+}
+
+.mcp-oauth-connect,
+.mcp-oauth-disconnect {
+    padding: 6px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.mcp-oauth-connect {
+    border: 1px solid var(--ok);
+    background: var(--ok-bg);
+    color: var(--ok);
+}
+
+.mcp-oauth-connect:hover {
+    background: var(--ok-bg);
+}
+
+.mcp-oauth-disconnect {
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--danger);
+}
+
+.mcp-oauth-disconnect:hover {
+    background: var(--danger-bg);
+}
+

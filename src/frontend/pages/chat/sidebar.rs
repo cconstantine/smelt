@@ -138,7 +138,7 @@ pub(super) fn ConversationSidebar(
 
     rsx! {
         aside { class: if open_on_phone() { "sidebar sidebar-open" } else { "sidebar" },
-            // Phone only (see chat.css): the list folds behind this, so the
+            // Phone only (see assets/css/01-base.css): the list folds behind this, so the
             // conversation, not the list, fills the screen (SME-41 D4).
             button {
                 class: "sidebar-toggle",

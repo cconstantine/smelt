@@ -315,7 +315,6 @@ pub fn McpServerNew() -> Element {
 /// re-create is the escape hatch for this pass).
 #[component]
 pub fn McpServerEdit(id: i64) -> Element {
-    let navigator = use_navigator();
 
     let initial_server = use_resource(move || get_mcp_server(id));
     let mut loaded = use_signal(|| false);
@@ -369,10 +368,11 @@ pub fn McpServerEdit(id: i64) -> Element {
     // `mcp_oauth::callback_handler`) — read once on mount via a JS eval
     // (there's no query-param extraction wired into `Route` yet) and strip
     // it from the URL so a later refresh doesn't keep re-showing it.
-    let mut oauth_error: Signal<Option<String>> = use_signal(|| None);
+    let oauth_error: Signal<Option<String>> = use_signal(|| None);
     #[cfg(feature = "web")]
     use_effect(move || {
         spawn(async move {
+            let mut oauth_error = oauth_error;
             let script = "const p = new URLSearchParams(window.location.search);
                  const err = p.get('oauth_error');
                  if (err !== null) {
@@ -405,6 +405,109 @@ pub fn McpServerEdit(id: i64) -> Element {
     // button's spinner needs, without a second signal to keep in sync.
     let status_loading = matches!(status.state()(), UseResourceState::Pending);
 
+    rsx! {
+        div { class: "mcp-servers-page",
+            div { class: "mcp-servers-header",
+                Link { to: Route::McpServersRoute {}, class: "mcp-back-link", "\u{2190} Back to MCP servers" }
+                h1 { "Edit MCP server" }
+            }
+
+            super::ErrorText { message: load_error() }
+
+            if !loaded() {
+                p { class: "muted", "Loading..." }
+            } else {
+                div { class: "mcp-status-section",
+                    h2 { "Status" }
+                    {match status() {
+                        None => rsx! { p { class: "muted", "Checking connection\u{2026}" } },
+                        Some(Ok(McpConnectionStatus::Connected { tool_names })) => rsx! {
+                            div { class: "mcp-status mcp-status-connected",
+                                p { "{status_summary(&tool_names)}" }
+                                ul { class: "mcp-tool-list",
+                                    for name in tool_names {
+                                        li { key: "{name}", "{name}" }
+                                    }
+                                }
+                            }
+                        },
+                        Some(Ok(McpConnectionStatus::Unreachable { error })) => rsx! {
+                            div { class: "mcp-status mcp-status-unreachable",
+                                p { "Unreachable" }
+                                p { class: "error", "{error}" }
+                            }
+                        },
+                        Some(Ok(McpConnectionStatus::NotConnected)) => rsx! {
+                            div { class: "mcp-status mcp-status-not-connected",
+                                p { "Not connected \u{2014} use Connect below." }
+                            }
+                        },
+                        Some(Ok(McpConnectionStatus::NeedsReconnect { error })) => rsx! {
+                            div { class: "mcp-status mcp-status-needs-reconnect",
+                                p { "Sign-in expired \u{2014} use Reconnect below." }
+                                p { class: "mcp-status-detail", "{error}" }
+                            }
+                        },
+                        Some(Err(e)) => rsx! {
+                            div { class: "mcp-status mcp-status-unreachable",
+                                super::ErrorText { message: Some(super::server_error_message(&e)) }
+                            }
+                        },
+                    }}
+                    button {
+                        class: if status_loading { "mcp-refresh-status loading" } else { "mcp-refresh-status" },
+                        r#type: "button",
+                        disabled: status_loading,
+                        onclick: move |_| status_reload.set(status_reload() + 1),
+                        if status_loading {
+                            span { class: "mcp-save-spinner mcp-refresh-spinner" }
+                            "Refreshing\u{2026}"
+                        } else {
+                            "Refresh"
+                        }
+                    }
+                }
+
+                McpServerEditForm {
+                    id,
+                    edit_name,
+                    edit_url,
+                    edit_auth_mode,
+                    saved_name,
+                    saved_url,
+                    existing_header_edits,
+                    status_reload,
+                }
+
+                if edit_auth_mode() == "oauth" {
+                    McpOAuthPanel {
+                        id,
+                        oauth_client_id,
+                        has_oauth_client_secret,
+                        oauth_error,
+                        status_reload,
+                        signed_in: matches!(status(), Some(Ok(McpConnectionStatus::Connected { .. } | McpConnectionStatus::NeedsReconnect { .. }))),
+                        can_disconnect: matches!(status(), Some(Ok(McpConnectionStatus::Connected { .. } | McpConnectionStatus::Unreachable { .. } | McpConnectionStatus::NeedsReconnect { .. }))),
+                    }
+                }
+
+                McpDeleteSection { id }
+            }
+        }
+    }
+}
+
+/// The edit form: name, URL and headers, saved together. Its own state is
+/// the header rows being added or removed and the save in flight; the
+/// values it edits are the page's, which loads them.
+#[component]
+fn McpServerEditForm(id: i64, edit_name: Signal<String>, edit_url: Signal<String>, edit_auth_mode: Signal<String>, saved_name: Signal<String>, saved_url: Signal<String>, existing_header_edits: Signal<Vec<(String, String)>>, status_reload: Signal<u32>) -> Element {
+    let mut edit_name = edit_name;
+    let mut edit_url = edit_url;
+    let mut saved_name = saved_name;
+    let mut saved_url = saved_url;
+    let mut existing_header_edits = existing_header_edits;
+    let mut status_reload = status_reload;
     // Names marked for removal via an existing header row's "Remove"
     // button — separate from `existing_header_edits` since removing a
     // header is a distinct intent from "leave it alone" (a blank value
@@ -470,6 +573,85 @@ pub fn McpServerEdit(id: i64) -> Element {
         });
     };
 
+    rsx! {
+        form { class: "mcp-edit-form", onsubmit: save_all,
+            label { r#for: "mcp-edit-name", "Name" }
+            input {
+                id: "mcp-edit-name",
+                class: "mcp-edit-name",
+                r#type: "text",
+                value: "{edit_name}",
+                oninput: move |e| edit_name.set(e.value()),
+            }
+            label { r#for: "mcp-edit-url", "URL" }
+            input {
+                id: "mcp-edit-url",
+                class: "mcp-edit-url",
+                r#type: "text",
+                value: "{edit_url}",
+                oninput: move |e| edit_url.set(e.value()),
+            }
+
+            // An OAuth server takes extra headers too (SME-76: GitHub's
+            // X-MCP-Toolsets); OAuth sets its Authorization.
+            label {
+                if edit_auth_mode() == "oauth" {
+                    "Extra headers (sent with the OAuth token)"
+                } else {
+                    "Headers"
+                }
+            }
+            if !existing_header_edits().is_empty() {
+                div { class: "mcp-header-rows",
+                    for (index , (name , value)) in existing_header_edits().into_iter().enumerate() {
+                        div { key: "{name}", class: "mcp-header-row",
+                            span { class: "mcp-header-existing-name", "{name}" }
+                            input {
+                                r#type: "text",
+                                class: "mcp-header-value",
+                                "aria-label": "New value for {name}",
+                                placeholder: "(unchanged)",
+                                value: "{value}",
+                                oninput: move |e| existing_header_edits.write()[index].1 = e.value(),
+                            }
+                            button {
+                                r#type: "button",
+                                class: "mcp-remove-header",
+                                onclick: move |_| {
+                                    let (removed_name, _) = existing_header_edits.write().remove(index);
+                                    removed_header_names.write().push(removed_name);
+                                },
+                                "Remove"
+                            }
+                        }
+                    }
+                }
+            }
+            {header_rows(new_header_rows, "Header value")}
+
+            super::ErrorText { message: save_error() }
+            button {
+                class: if saving() { "mcp-save-edit saving" } else { "mcp-save-edit" },
+                r#type: "submit",
+                disabled: saving() || !is_dirty,
+                if saving() {
+                    span { class: "mcp-save-spinner" }
+                    "Saving\u{2026}"
+                } else {
+                    "Save"
+                }
+            }
+        }
+    }
+}
+
+/// The OAuth connection: which client signs in, and Connect, Reconnect
+/// and Disconnect. `signed_in` and `can_disconnect` come from the page's
+/// connection status.
+#[component]
+fn McpOAuthPanel(id: i64, oauth_client_id: Signal<Option<String>>, has_oauth_client_secret: Signal<bool>, oauth_error: Signal<Option<String>>, status_reload: Signal<u32>, signed_in: bool, can_disconnect: bool) -> Element {
+    let mut oauth_error = oauth_error;
+    let mut status_reload = status_reload;
     // --- OAuth connect/reconnect/disconnect ---
     let mut oauth_connecting = use_signal(|| false);
 
@@ -528,6 +710,51 @@ pub fn McpServerEdit(id: i64) -> Element {
         });
     };
 
+    rsx! {
+        div { class: "mcp-oauth-panel",
+            h2 { "OAuth connection" }
+            p { class: "muted",
+                if let Some(client_id) = oauth_client_id() {
+                    "Pre-registered client ID: {client_id}"
+                    if has_oauth_client_secret() {
+                        " (with a client secret)"
+                    }
+                } else {
+                    "Using dynamic client registration \u{2014} no pre-registered client."
+                }
+            }
+            super::ErrorText { message: oauth_error() }
+            super::ErrorText { message: disconnect_error() }
+            div { class: "mcp-oauth-actions",
+                button {
+                    class: "mcp-oauth-connect",
+                    r#type: "button",
+                    disabled: oauth_connecting(),
+                    onclick: connect_oauth,
+                    if signed_in {
+                        "Reconnect"
+                    } else {
+                        "Connect"
+                    }
+                }
+                if can_disconnect {
+                    button {
+                        class: "mcp-oauth-disconnect",
+                        r#type: "button",
+                        onclick: disconnect_oauth,
+                        "Disconnect"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Deleting the server, in two steps; a delete that works goes back to
+/// the list.
+#[component]
+fn McpDeleteSection(id: i64) -> Element {
+    let navigator = use_navigator();
     // --- Delete (arm/confirm, same pattern as ConversationSidebar) ---
     let mut pending_delete = use_signal(|| false);
     let mut delete_error: Signal<Option<String>> = use_signal(|| None);
@@ -544,188 +771,16 @@ pub fn McpServerEdit(id: i64) -> Element {
     };
 
     rsx! {
-        div { class: "mcp-servers-page",
-            div { class: "mcp-servers-header",
-                Link { to: Route::McpServersRoute {}, class: "mcp-back-link", "\u{2190} Back to MCP servers" }
-                h1 { "Edit MCP server" }
-            }
-
-            super::ErrorText { message: load_error() }
-
-            if !loaded() {
-                p { class: "muted", "Loading..." }
-            } else {
-                div { class: "mcp-status-section",
-                    h2 { "Status" }
-                    {match status() {
-                        None => rsx! { p { class: "muted", "Checking connection\u{2026}" } },
-                        Some(Ok(McpConnectionStatus::Connected { tool_names })) => rsx! {
-                            div { class: "mcp-status mcp-status-connected",
-                                p { "{status_summary(&tool_names)}" }
-                                ul { class: "mcp-tool-list",
-                                    for name in tool_names {
-                                        li { key: "{name}", "{name}" }
-                                    }
-                                }
-                            }
-                        },
-                        Some(Ok(McpConnectionStatus::Unreachable { error })) => rsx! {
-                            div { class: "mcp-status mcp-status-unreachable",
-                                p { "Unreachable" }
-                                p { class: "error", "{error}" }
-                            }
-                        },
-                        Some(Ok(McpConnectionStatus::NotConnected)) => rsx! {
-                            div { class: "mcp-status mcp-status-not-connected",
-                                p { "Not connected \u{2014} use Connect below." }
-                            }
-                        },
-                        Some(Ok(McpConnectionStatus::NeedsReconnect { error })) => rsx! {
-                            div { class: "mcp-status mcp-status-needs-reconnect",
-                                p { "Sign-in expired \u{2014} use Reconnect below." }
-                                p { class: "mcp-status-detail", "{error}" }
-                            }
-                        },
-                        Some(Err(e)) => rsx! {
-                            div { class: "mcp-status mcp-status-unreachable",
-                                super::ErrorText { message: Some(super::server_error_message(&e)) }
-                            }
-                        },
-                    }}
-                    button {
-                        class: if status_loading { "mcp-refresh-status loading" } else { "mcp-refresh-status" },
-                        r#type: "button",
-                        disabled: status_loading,
-                        onclick: move |_| status_reload.set(status_reload() + 1),
-                        if status_loading {
-                            span { class: "mcp-save-spinner mcp-refresh-spinner" }
-                            "Refreshing\u{2026}"
-                        } else {
-                            "Refresh"
-                        }
-                    }
-                }
-
-                form { class: "mcp-edit-form", onsubmit: save_all,
-                    label { r#for: "mcp-edit-name", "Name" }
-                    input {
-                        id: "mcp-edit-name",
-                        class: "mcp-edit-name",
-                        r#type: "text",
-                        value: "{edit_name}",
-                        oninput: move |e| edit_name.set(e.value()),
-                    }
-                    label { r#for: "mcp-edit-url", "URL" }
-                    input {
-                        id: "mcp-edit-url",
-                        class: "mcp-edit-url",
-                        r#type: "text",
-                        value: "{edit_url}",
-                        oninput: move |e| edit_url.set(e.value()),
-                    }
-
-                    // An OAuth server takes extra headers too (SME-76: GitHub's
-                    // X-MCP-Toolsets); OAuth sets its Authorization.
-                    label {
-                        if edit_auth_mode() == "oauth" {
-                            "Extra headers (sent with the OAuth token)"
-                        } else {
-                            "Headers"
-                        }
-                    }
-                    if !existing_header_edits().is_empty() {
-                        div { class: "mcp-header-rows",
-                            for (index , (name , value)) in existing_header_edits().into_iter().enumerate() {
-                                div { key: "{name}", class: "mcp-header-row",
-                                    span { class: "mcp-header-existing-name", "{name}" }
-                                    input {
-                                        r#type: "text",
-                                        class: "mcp-header-value",
-                                        "aria-label": "New value for {name}",
-                                        placeholder: "(unchanged)",
-                                        value: "{value}",
-                                        oninput: move |e| existing_header_edits.write()[index].1 = e.value(),
-                                    }
-                                    button {
-                                        r#type: "button",
-                                        class: "mcp-remove-header",
-                                        onclick: move |_| {
-                                            let (removed_name, _) = existing_header_edits.write().remove(index);
-                                            removed_header_names.write().push(removed_name);
-                                        },
-                                        "Remove"
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    {header_rows(new_header_rows, "Header value")}
-
-                    super::ErrorText { message: save_error() }
-                    button {
-                        class: if saving() { "mcp-save-edit saving" } else { "mcp-save-edit" },
-                        r#type: "submit",
-                        disabled: saving() || !is_dirty,
-                        if saving() {
-                            span { class: "mcp-save-spinner" }
-                            "Saving\u{2026}"
-                        } else {
-                            "Save"
-                        }
-                    }
-                }
-
-                if edit_auth_mode() == "oauth" {
-                    div { class: "mcp-oauth-panel",
-                        h2 { "OAuth connection" }
-                        p { class: "muted",
-                            if let Some(client_id) = oauth_client_id() {
-                                "Pre-registered client ID: {client_id}"
-                                if has_oauth_client_secret() {
-                                    " (with a client secret)"
-                                }
-                            } else {
-                                "Using dynamic client registration \u{2014} no pre-registered client."
-                            }
-                        }
-                        super::ErrorText { message: oauth_error() }
-                        super::ErrorText { message: disconnect_error() }
-                        div { class: "mcp-oauth-actions",
-                            button {
-                                class: "mcp-oauth-connect",
-                                r#type: "button",
-                                disabled: oauth_connecting(),
-                                onclick: connect_oauth,
-                                if matches!(status(), Some(Ok(McpConnectionStatus::Connected { .. } | McpConnectionStatus::NeedsReconnect { .. }))) {
-                                    "Reconnect"
-                                } else {
-                                    "Connect"
-                                }
-                            }
-                            if matches!(status(), Some(Ok(McpConnectionStatus::Connected { .. } | McpConnectionStatus::Unreachable { .. } | McpConnectionStatus::NeedsReconnect { .. }))) {
-                                button {
-                                    class: "mcp-oauth-disconnect",
-                                    r#type: "button",
-                                    onclick: disconnect_oauth,
-                                    "Disconnect"
-                                }
-                            }
-                        }
-                    }
-                }
-
-                div { class: "mcp-danger-section",
-                    h2 { "Delete" }
-                    super::ErrorText { message: delete_error() }
-                    super::TwoStepButton {
-                        armed: pending_delete(),
-                        class: "mcp-delete",
-                        idle: "Delete server",
-                        confirm: "Confirm delete?",
-                        on_arm: move |_| pending_delete.set(true),
-                        on_confirm: confirm_delete,
-                    }
-                }
+        div { class: "mcp-danger-section",
+            h2 { "Delete" }
+            super::ErrorText { message: delete_error() }
+            super::TwoStepButton {
+                armed: pending_delete(),
+                class: "mcp-delete",
+                idle: "Delete server",
+                confirm: "Confirm delete?",
+                on_arm: move |_| pending_delete.set(true),
+                on_confirm: confirm_delete,
             }
         }
     }

@@ -9,8 +9,19 @@
 # cluster says which sources built it (SME-102). build.rs hashes the same
 # files in the same order for the server's default image (SME-121): change
 # the list in both.
+#
+# The agent's own sources are every .rs file under src/bin/sandbox_agent/,
+# in byte order, so a module added there names the image too (SME-163;
+# src/sandbox/tests/image.rs and scripts/test-cluster-doctor check it).
+# With --list, prints the files instead of their hash.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cat src/bin/sandbox_agent.rs src/agent_protocol.rs src/docker_net.rs docker/sandbox/Dockerfile \
-    Cargo.toml Cargo.lock \
-    | sha256sum | cut -d' ' -f1
+files() {
+    find src/bin/sandbox_agent -name '*.rs' -type f | LC_ALL=C sort
+    printf '%s\n' src/agent_protocol.rs src/docker_net.rs docker/sandbox/Dockerfile Cargo.toml Cargo.lock
+}
+if [ "${1:-}" = "--list" ]; then
+    files
+    exit 0
+fi
+files | while IFS= read -r f; do cat "$f"; done | sha256sum | cut -d' ' -f1

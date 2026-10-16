@@ -33,6 +33,8 @@ mod preview;
 mod pricing;
 mod providers;
 mod questions;
+#[cfg(all(test, feature = "server"))]
+mod repo_lints;
 #[cfg(feature = "server")]
 mod request_guard;
 #[cfg(feature = "server")]
@@ -48,7 +50,7 @@ mod webfetch;
 mod browser_tests;
 
 /// The real Axum router `main()` serves — factored out so
-/// `src/browser_tests.rs` can build the exact same router, in-process, on a
+/// `src/browser_tests/` can build the exact same router, in-process, on a
 /// test-local port, without duplicating it. See
 /// SME-10.
 #[cfg(feature = "server")]

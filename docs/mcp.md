@@ -27,7 +27,7 @@ An update or delete calls `mcp::evict(id)`, so a connection to the old URL or wi
 
 ### The built-in Exa server
 
-At startup `mcp::ensure_default_servers` inserts each of `DEFAULT_MCP_SERVERS` that isn't there yet, by name (`db::ensure_mcp_server`, `ON CONFLICT (name) DO NOTHING`). Today that's `exa` at `EXA_MCP_URL`, keyless web search (SME-24). A failure is logged, not fatal. What this means for the user (keyless limits, edits kept, deleting doesn't stick) is in [setup.md](setup.md#built-in-mcp-servers).
+At startup `mcp::ensure_default_servers` inserts each of `DEFAULT_MCP_SERVERS` that isn't there yet, by name (`db::ensure_mcp_server`, `ON CONFLICT (name) DO NOTHING`). Today that's `exa` at `EXA_MCP_URL`, keyless web search (SME-24). A failure is logged, not fatal. What this means for the user (keyless limits, edits kept, deleting doesn't stick) is in [setup/sandbox.md](setup/sandbox.md#built-in-mcp-servers).
 
 ## Connections
 

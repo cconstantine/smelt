@@ -4,7 +4,7 @@
 # Builds first, unlocked, then runs the same command under the lock
 # (scripts/with-cluster-lock), so the lock is never held while compiling:
 #
-#   scripts/cluster-test --features server -- --exact sandbox::tests::test_x
+#   scripts/cluster-test --features server -- --exact sandbox::tests::manager::test_x
 #
 # The arguments are cargo test's own; this adds no features. The build is
 # the same command with --no-run put before the first `--` (or last when

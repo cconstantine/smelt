@@ -16,7 +16,7 @@
 //!
 //! Standalone rather than reusing `src/sandbox.rs`'s `Sandbox`/
 //! `SandboxManager`: this crate has no `lib.rs`, so a `src/bin/*.rs` binary
-//! (a separate crate root, same as `sandbox_agent.rs`) can't reach
+//! (a separate crate root, same as the `sandbox_agent` binary) can't reach
 //! `main.rs`'s private module tree. Small enough to duplicate directly
 //! rather than restructuring the crate for one script's sake.
 

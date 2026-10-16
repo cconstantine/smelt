@@ -68,7 +68,7 @@ impl StickyBottom {
     /// were means they stopped. Nothing else scrolls the view while the
     /// follow is off — the browser's own habit of pinning a scroller that sits
     /// at its end onto each new bottom is turned off for these elements by
-    /// `overflow-anchor: none` (assets/chat.css), which is what makes that
+    /// `overflow-anchor: none` (assets/css/01-base.css and 03-panels.css), which is what makes that
     /// reading safe. The scroll height is not part of the test: it grows with
     /// streaming output on every event, whether or not the user is scrolling.
     pub(super) fn scrolled(mut self, data: &ScrollData) {

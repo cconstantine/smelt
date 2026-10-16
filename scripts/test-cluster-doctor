@@ -34,7 +34,7 @@ hash=$(scripts/agent-sources-hash)
 copy="$tmp/copy"
 mkdir -p "$copy/scripts" "$copy/src/bin" "$copy/docker/sandbox"
 cp scripts/agent-sources-hash "$copy/scripts/"
-cp src/bin/sandbox_agent.rs "$copy/src/bin/"
+cp -r src/bin/sandbox_agent "$copy/src/bin/"
 cp src/agent_protocol.rs src/docker_net.rs "$copy/src/"
 cp docker/sandbox/Dockerfile "$copy/docker/sandbox/"
 cp Cargo.lock Cargo.toml "$copy/"
@@ -44,6 +44,15 @@ echo "# changed" >>"$copy/Cargo.lock"
 cp Cargo.lock "$copy/Cargo.lock"
 echo "# changed" >>"$copy/Cargo.toml"
 [ "$("$copy/scripts/agent-sources-hash")" != "$before" ] || fail "changing Cargo.toml didn't change the agent-sources hash"
+cp Cargo.toml "$copy/Cargo.toml"
+# Every file of the agent names the image, not only its main.rs (SME-163):
+# otherwise an edit to one of its modules would leave the old image's name.
+for f in $(cd "$copy" && find src/bin/sandbox_agent -name '*.rs' -type f | LC_ALL=C sort); do
+    cp "$copy/$f" "$tmp/agent-file"
+    echo "// changed" >>"$copy/$f"
+    [ "$("$copy/scripts/agent-sources-hash")" != "$before" ] || fail "changing $f didn't change the agent-sources hash"
+    cp "$tmp/agent-file" "$copy/$f"
+done
 
 # With no SANDBOX_IMAGE, the doctor checks that reference and the sidecar's.
 rm -f "$STUB_ARGS"

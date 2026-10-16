@@ -1,0 +1,382 @@
+/* Colour tokens: one light palette, and a dark one that follows the
+   system setting (SME-41 D5). Components use these, never literals; the
+   terminal's always-dark palette and the context meter's data colours are
+   the only exceptions. */
+:root {
+    color-scheme: light;
+    --canvas: #fafafa;
+    --surface: #ffffff;
+    --subtle: #f2f2f3;
+    --border: #e5e5e6;
+    --border-strong: #d0d0d3;
+    --ink: #111113;
+    --ink-hover: #2b2b2e;
+    --text: #333336;
+    --text-2: #56565c;
+    --muted: #85858c;
+    --danger: #c0392b;
+    --danger-bg: #fdecea;
+    --ok: #1e7e34;
+    --ok-bg: #e8f7ed;
+    --warn: #9a6700;
+    --warn-bg: #fff4d6;
+    --accent: #3b6fd8;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        color-scheme: dark;
+        --canvas: #141518;
+        --surface: #1c1d21;
+        --subtle: #25262b;
+        --border: #2e3036;
+        --border-strong: #41444c;
+        --ink: #ececf1;
+        --ink-hover: #d4d5dc;
+        --text: #d7d8de;
+        --text-2: #b0b2bb;
+        --muted: #8a8d97;
+        --danger: #f0786a;
+        --danger-bg: #3a1b18;
+        --ok: #5cc98a;
+        --ok-bg: #16301f;
+        --warn: #e3b341;
+        --warn-bg: #3a2e10;
+        --accent: #7aa2ff;
+    }
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: var(--ink);
+    background: var(--canvas);
+    -webkit-font-smoothing: antialiased;
+}
+
+.chat-layout {
+    display: flex;
+    height: 100vh;
+}
+
+/* The phone-only button that opens the conversation list. */
+.sidebar-toggle {
+    display: none;
+    padding: 8px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+}
+
+.sidebar-body {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-height: 0;
+}
+
+.sidebar {
+    width: 272px;
+    flex-shrink: 0;
+    border-right: 1px solid var(--border);
+    background: var(--surface);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    overflow-y: auto;
+}
+
+.new-conversation {
+    padding: 10px 14px;
+    border: 1px solid var(--ink);
+    border-radius: 10px;
+    background: var(--ink);
+    color: var(--surface);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color 120ms ease, transform 80ms ease;
+}
+
+.new-conversation:hover {
+    background: var(--ink-hover);
+}
+
+.new-conversation:active {
+    transform: scale(0.98);
+}
+
+.conversation-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.conversation-item {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 10px;
+    border-radius: 8px;
+    font-size: 14px;
+    cursor: pointer;
+    border-left: 3px solid transparent;
+    transition: background-color 100ms ease, border-color 100ms ease;
+}
+
+.conversation-item:hover {
+    background: var(--subtle);
+}
+
+.conversation-item.active {
+    background: var(--subtle);
+    border-left-color: var(--ink);
+    font-weight: 600;
+}
+
+.conversation-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Laid over the end of the row rather than taking room from the title
+   (SME-41 D8); it covers the age while shown. */
+.delete-conversation {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    flex-shrink: 0;
+    padding: 4px 9px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text-2);
+    font-size: 12px;
+    line-height: 1.4;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 100ms ease, background-color 100ms ease, color 100ms ease, border-color 100ms ease;
+}
+
+/* Kept clickable/focusable at all times; just visually quiet until the row
+   is engaged, so the affordance doesn't read as a wall of buttons. */
+.conversation-item:hover .delete-conversation,
+.conversation-item:focus-within .delete-conversation,
+.delete-conversation:focus-visible {
+    opacity: 1;
+}
+
+.delete-conversation:hover {
+    background: var(--canvas);
+    border-color: var(--border-strong);
+    color: var(--text);
+}
+
+.delete-conversation.confirm {
+    opacity: 1;
+    background: var(--danger);
+    border-color: var(--danger);
+    color: var(--surface);
+}
+
+/* Bold in both states (hidden while idle), so the width the button
+   reserves for it is the width it has when armed (SME-40 F9). */
+.delete-conversation .two-step-confirm {
+    font-weight: 600;
+}
+
+.delete-conversation.confirm:hover {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: var(--surface);
+}
+
+/* Below WIDE_LAYOUT_BREAKPOINT (see the media query further down): the
+   side-panels row (todos, the live browser, sandbox terminals) and chat (messages
+   + composer) stack vertically, each taking the full width left over from
+   .sidebar — not side by side. A narrow window makes a side-by-side
+   terminal cramped; stacking gives both regions the whole width instead of
+   splitting it. Side panels on top, chat on the bottom — DOM order (below)
+   drives the visual order here, since neither uses `order` at this width.
+   At/above the breakpoint this flips to a row (chat | side panels) — see
+   the media query at the bottom of this section. */
+.chat-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+}
+
+/* The conversation column — messages plus composer. Its own flex column.
+   `border-top` is the seam between it and .side-panels-row above it in the
+   stacked (narrow) layout — the wide-layout media query swaps this for a
+   `border-right` instead, since chat sits to the side-panels-row's left
+   there, not below it. */
+.chat-main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    border-top: 1px solid var(--border);
+}
+
+/* The stacked region above chat (narrow layout): the todo panel and/or
+   the sandbox panel, side by side with each other (still a row between
+   just the two of them) but full-width and taking roughly the other half
+   of the viewport's height, independently scrollable from the transcript
+   below. */
+.side-panels-row {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    min-height: 0;
+    /* Lets a wide panel (the live browser) shrink instead of pushing the
+       chat off screen (SME-40 F2). */
+    min-width: 0;
+}
+
+/* At this width or above, a stacked layout leaves real horizontal space
+   unused (chat bubbles cap at 65ch; the sandbox panel doesn't need the
+   full viewport width either) — go side by side instead: chat on the
+   left (order: -1 overrides its DOM position, which is second — see the
+   comment on .chat-panel), side panels on the right. Below it, falls back
+   to the stacked layout above, unchanged. */
+@media (min-width: 1024px) {
+    .chat-panel {
+        flex-direction: row;
+    }
+
+    .chat-main {
+        order: -1;
+        flex: 3;
+        /* Room to read and type, however wide the side panels want to be. */
+        min-width: 360px;
+        border-top: none;
+        border-right: 1px solid var(--border);
+    }
+
+    /* The side panels stack in a column, each the column's full width,
+       instead of sitting side by side: three of them in a row shared
+       ~450px, so the live browser was tiny and the terminal pushed out of
+       sight (SME-41 D16). Small panels (todos) size to
+       their content; the sandbox takes the rest; the column scrolls if it
+       must. With a browsing session open the column widens to half. */
+    .side-panels-row {
+        flex: 2;
+        flex-direction: column;
+        overflow-y: auto;
+    }
+
+    .chat-panel:has(.browsing-panel) .side-panels-row {
+        flex: 3;
+    }
+}
+
+@media (min-width: 1024px), (max-width: 720px) {
+    .side-panels-row > .todo-panel {
+        width: auto;
+        flex: 0 0 auto;
+        max-height: 30vh;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .side-panels-row > .browsing-panel {
+        flex: 0 0 auto;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .side-panels-row > .sandbox-panel {
+        flex: 1 0 320px;
+    }
+}
+
+.empty-state {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 14px;
+}
+
+.muted {
+    color: var(--muted);
+    padding: 24px;
+    font-size: 14px;
+}
+
+.messages {
+    flex: 1;
+    overflow-y: auto;
+    /* The transcript follows its bottom through the app's own scroll, and
+       keeps what is under the pointer still through its own anchor snap
+       (SME-75, SME-83) — the browser guessing on top of that is how a resize
+       came to look like a user scrolling up (SME-108), and pinning a reader
+       who sits at the end onto each new message is the same confusion from
+       the other side: a reader scrolled up to read who a resize then clamped
+       onto the bottom would ride every new message along while the app's own
+       follow said it was off. Same reasoning as `.task-terminal-body`. */
+    overflow-anchor: none;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.message {
+    max-width: 65ch;
+    padding: 10px 14px;
+    border-radius: 14px;
+    line-height: 1.5;
+    font-size: 15px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+/* A message's own text keeps its line breaks; a rendered reply
+   (`.message-markdown`, below) doesn't need them. */
+.message-text {
+    white-space: pre-wrap;
+}
+
+/* A message that couldn't be read says so in the error colours. */
+.message.message-error {
+    color: var(--danger);
+    background: var(--danger-bg);
+}
+
+.message-user {
+    align-self: flex-end;
+    background: var(--ink);
+    color: var(--surface);
+    border-bottom-right-radius: 4px;
+}
+
+.message-assistant {
+    align-self: flex-start;
+    background: var(--subtle);
+    color: var(--ink);
+    border-bottom-left-radius: 4px;
+}
+
+.message-streaming {
+    opacity: 0.85;
+}
+

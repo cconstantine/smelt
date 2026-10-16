@@ -1,0 +1,613 @@
+/* The model's replies render as markdown (SME-30): `.message-text`'s
+   pre-wrap is for plain text, so rendered replies use normal wrapping and
+   their own block spacing. Wide tables and code scroll inside the bubble
+   rather than widening it, at every window width. */
+.message-markdown,
+.message-streaming {
+    white-space: normal;
+    min-width: 0;
+}
+
+.markdown {
+    overflow-wrap: anywhere;
+}
+
+.markdown p,
+.markdown ul,
+.markdown ol,
+.markdown blockquote,
+.markdown .md-table-wrap,
+.markdown .md-code,
+.markdown .md-html {
+    margin: 0 0 10px;
+}
+
+.markdown .md-html {
+    white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    color: var(--text-2);
+}
+
+.markdown .md-heading {
+    margin: 14px 0 6px;
+    line-height: 1.3;
+    color: var(--ink);
+}
+
+.markdown h1.md-heading { font-size: 1.3em; }
+.markdown h2.md-heading { font-size: 1.18em; }
+.markdown h3.md-heading { font-size: 1.06em; }
+.markdown h4.md-heading,
+.markdown h5.md-heading,
+.markdown h6.md-heading { font-size: 1em; }
+
+.markdown ul,
+.markdown ol {
+    padding-left: 22px;
+}
+
+.markdown li > ul,
+.markdown li > ol {
+    margin: 2px 0;
+}
+
+/* A task item's checkbox takes its bullet's place; its text and any
+   nested list stay at the normal indent. */
+.markdown li.md-task {
+    list-style: none;
+}
+
+.markdown li.md-task > input {
+    margin: 0 6px 0 -20px;
+    vertical-align: -1px;
+}
+
+.markdown blockquote {
+    padding: 2px 0 2px 12px;
+    border-left: 3px solid var(--border-strong);
+    color: var(--text-2);
+}
+
+.markdown hr {
+    border: 0;
+    border-top: 1px solid var(--border-strong);
+    margin: 12px 0;
+}
+
+.markdown a {
+    color: var(--accent);
+    /* A bidi control in the text around a link (an RLO the reply left
+       open) mustn't reorder how the link shows (SME-104). */
+    unicode-bidi: isolate;
+}
+
+.markdown .md-inline-code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.9em;
+    padding: 1px 4px;
+    border-radius: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+}
+
+.markdown .md-image {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    border-radius: 8px;
+}
+
+.markdown .md-table-wrap {
+    overflow-x: auto;
+    max-width: 100%;
+}
+
+.markdown table {
+    border-collapse: collapse;
+    font-size: 14px;
+}
+
+.markdown th,
+.markdown td {
+    border: 1px solid var(--border-strong);
+    padding: 4px 8px;
+    text-align: left;
+    vertical-align: top;
+}
+
+.markdown th {
+    background: var(--surface);
+}
+
+.markdown .md-code {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--surface);
+}
+
+.markdown .md-code-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 2px 4px 2px 10px;
+    font-size: 12px;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+}
+
+.markdown .md-code-copy {
+    border: 0;
+    background: none;
+    color: var(--text-2);
+    font-size: 12px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.markdown .md-code-copy:hover,
+.markdown .md-code-copy:focus-visible {
+    background: var(--subtle);
+    color: var(--ink);
+}
+
+/* After the block rules above, so a reply that starts with a heading
+   doesn't open with a gap. */
+.markdown > :first-child {
+    margin-top: 0;
+}
+
+.markdown > :last-child {
+    margin-bottom: 0;
+}
+
+.markdown .md-pre {
+    margin: 0;
+    padding: 8px 10px;
+    overflow-x: auto;
+    white-space: pre;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    line-height: 1.45;
+}
+
+/* Subtle timestamp on every rendered block — small and low-contrast so it
+   reads as a detail, not competing with the actual content. */
+.timestamp {
+    font-size: 11px;
+    opacity: 0.55;
+    line-height: 1;
+}
+
+.message .timestamp {
+    display: block;
+    margin-top: 4px;
+    text-align: right;
+}
+
+/* A finished reply's last bubble: its Copy reply button left of the
+   timestamp (SME-105). Wraps rather than widening a narrow bubble. */
+.message-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 4px 12px;
+    margin-top: 4px;
+}
+
+.message-footer .timestamp {
+    margin-top: 0;
+    margin-left: auto;
+}
+
+/* Like a code block's Copy, but its hover is the page's surface: the
+   bubble is already `--subtle`. */
+.reply-copy {
+    border: 0;
+    background: none;
+    color: var(--text-2);
+    font: inherit;
+    font-size: 12px;
+    line-height: 1.2;
+    padding: 2px 6px;
+    margin-left: -6px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.reply-copy:hover,
+.reply-copy:focus-visible {
+    background: var(--surface);
+    color: var(--ink);
+}
+
+.reply-copy:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+/* The outline the button draws round what it copies is `ReplyOutline`'s
+   rule in transcript.rs: an `outline`, which no bubble has otherwise. */
+
+@media (pointer: coarse) {
+    .reply-copy {
+        min-height: 32px;
+        padding: 6px 10px;
+        margin-left: -10px;
+    }
+}
+
+.tool-call-header .timestamp,
+.tool-result-header .timestamp {
+    margin-left: auto;
+    font-weight: 400;
+}
+
+/* Tool calls/results — deliberately *not* styled like a message bubble
+   (no user/assistant alignment, no bubble shape) so a tool call reads as
+   "the agent doing something" rather than "someone said something." */
+.tool-call,
+.tool-result {
+    align-self: center;
+    width: 100%;
+    max-width: 65ch;
+    border: 1px solid var(--border);
+    border-left-width: 3px;
+    border-radius: 8px;
+    padding: 10px 14px;
+    background: var(--surface);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.tool-call {
+    border-left-color: var(--muted);
+}
+
+.tool-result {
+    border-left-color: var(--ok);
+}
+
+.tool-result-error {
+    border-left-color: var(--danger);
+}
+
+.tool-call-header,
+.tool-result-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-2);
+}
+
+.tool-result-error .tool-result-header {
+    color: var(--danger);
+}
+
+.tool-call-icon,
+.tool-result-icon {
+    font-size: 12px;
+    line-height: 1;
+}
+
+.tool-call-name {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    background: var(--subtle);
+    padding: 1px 6px;
+    border-radius: 4px;
+    color: var(--ink);
+}
+
+.tool-result-content {
+    margin: 6px 0 0;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: 12.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text);
+}
+
+/* The model is working (SME-41 D1): shown under the transcript for as
+   long as a turn runs, in every tab watching. */
+.turn-working {
+    align-self: flex-start;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.turn-working-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: turn-working-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes turn-working-pulse {
+    0%, 100% { opacity: 0.25; }
+    50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .turn-working-dot {
+        animation: none;
+    }
+}
+
+/* Something that happened, not something anyone said (SME-41 D3): a
+   command finishing, the sandbox stopping. */
+.system-notice {
+    align-self: center;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    max-width: min(640px, 100%);
+    font-size: 12.5px;
+    color: var(--muted);
+    text-align: center;
+}
+
+.system-notice .timestamp {
+    color: var(--muted);
+    font-size: 11px;
+}
+
+/* A tool call as one compact line with its result folded in (SME-41 D2):
+   the answer, not the tool traffic, is what the transcript is for. */
+.tool-row {
+    align-self: flex-start;
+    max-width: min(760px, 100%);
+    font-size: 13px;
+    color: var(--text-2);
+}
+
+.tool-row-summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+    cursor: pointer;
+    list-style: none;
+}
+
+.tool-row-summary::-webkit-details-marker {
+    display: none;
+}
+
+.tool-row-summary:hover .tool-row-text {
+    color: var(--ink);
+}
+
+.tool-row-marker {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--ok);
+    flex-shrink: 0;
+}
+
+.tool-row-failed .tool-row-marker {
+    background: var(--danger);
+}
+
+.tool-row-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tool-row[open] .tool-row-text {
+    white-space: normal;
+}
+
+.tool-row-status {
+    color: var(--danger);
+    font-weight: 600;
+}
+
+.tool-row-detail {
+    margin: 4px 0 6px 15px;
+    padding: 8px 10px;
+    border-left: 2px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.tool-row-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+}
+
+.tool-row-input,
+.tool-row-result {
+    margin: 0;
+    font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text);
+    max-height: 320px;
+    overflow: auto;
+}
+
+.tool-row-failed .tool-row-result {
+    color: var(--danger);
+}
+
+.tool-row-failure {
+    padding: 6px 12px;
+    font-size: 13px;
+    color: var(--danger);
+}
+
+/* `edit_file`'s diff card — same shape/border-left-accent as .tool-call,
+   its body a real line-level diff (see diff_lines) instead of a raw
+   old_string/new_string JSON dump. See
+   SME-11's "Diff rendering." */
+.file-edit-diff {
+    align-self: center;
+    width: 100%;
+    max-width: 65ch;
+    border: 1px solid var(--border);
+    border-left-width: 3px;
+    border-left-color: var(--muted);
+    border-radius: 8px;
+    padding: 10px 14px;
+    background: var(--surface);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.file-edit-diff-body {
+    margin: 6px 0 0;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: 12.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.file-edit-diff-line {
+    padding: 0 8px;
+    color: var(--text);
+}
+
+.file-edit-diff-line-removed {
+    background: var(--danger-bg);
+    color: var(--danger);
+}
+
+.file-edit-diff-line-added {
+    background: var(--ok-bg);
+    color: var(--ok);
+}
+
+/* A model's reasoning, when present — a collapsed-by-default <details>,
+   so it costs one quiet line rather than a wall of text on every single
+   turn. */
+.thinking-block {
+    align-self: center;
+    width: 100%;
+    max-width: 65ch;
+}
+
+.thinking-summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 4px;
+    font-size: 12.5px;
+    color: var(--muted);
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+    font-style: italic;
+}
+
+.thinking-summary::-webkit-details-marker {
+    display: none;
+}
+
+.thinking-summary::before {
+    content: "▸";
+    font-size: 9px;
+    color: var(--muted);
+    transition: transform 100ms ease;
+}
+
+.thinking-block[open] > .thinking-summary::before {
+    transform: rotate(90deg);
+}
+
+.thinking-icon {
+    font-size: 11px;
+    font-style: normal;
+}
+
+.thinking-summary .timestamp {
+    margin-left: auto;
+}
+
+.thinking-body {
+    margin: 2px 0 6px 17px;
+    font-size: 12.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--muted);
+    font-style: italic;
+}
+
+/* Auto-compaction's own transcript entry — a visible divider, distinct
+   from an ordinary assistant message (dashed rule, no chat-bubble
+   background) since it's the model's own housekeeping, not something it
+   said. Collapsed by default, same pattern as .thinking-block. See
+   SME-18. */
+.compaction-summary-block {
+    align-self: center;
+    width: 100%;
+    max-width: 65ch;
+    margin: 12px 0;
+    border-top: 1px dashed var(--border-strong);
+    border-bottom: 1px dashed var(--border-strong);
+    padding: 6px 0;
+}
+
+.compaction-summary-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 4px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-2);
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+}
+
+.compaction-summary-header::-webkit-details-marker {
+    display: none;
+}
+
+.compaction-summary-header::before {
+    content: "▸";
+    font-size: 9px;
+    color: var(--muted);
+    transition: transform 100ms ease;
+}
+
+.compaction-summary-block[open] > .compaction-summary-header::before {
+    transform: rotate(90deg);
+}
+
+.compaction-summary-icon {
+    font-size: 12px;
+}
+
+.compaction-summary-header .timestamp {
+    margin-left: auto;
+}
+
+.compaction-summary-body {
+    margin: 4px 4px 4px 17px;
+    font-size: 13px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text-2);
+}
+

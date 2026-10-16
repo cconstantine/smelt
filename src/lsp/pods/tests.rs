@@ -1,0 +1,140 @@
+use super::*;
+
+fn sandbox() -> SandboxRef {
+    SandboxRef {
+        conversation_id: 42,
+        pod_id: 7,
+        pod_name: "sandbox-7".to_string(),
+        pod_uid: "uid-7".to_string(),
+        node: "node-a".to_string(),
+        instance: "instance-a".to_string(),
+    }
+}
+
+fn config() -> LanguageServerConfig {
+    LanguageServerConfig {
+        name: "rust-analyzer".to_string(),
+        image: "rust:1".to_string(),
+        install_command: "rustup component add rust-analyzer".to_string(),
+        command: "rust-analyzer".to_string(),
+        env: [("RA_LOG".to_string(), "info".to_string())].into(),
+        file_types: [("rs".to_string(), "rust".to_string())].into(),
+        memory_limit: "3Gi".to_string(),
+        cpu_limit: "2".to_string(),
+        enabled: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_a_server_pod_sits_next_to_its_sandbox_and_goes_with_it() {
+    let pod = server_pod_spec(&sandbox(), &config(), "2026-09-28T08:00:00");
+    let meta = &pod.metadata;
+    assert_eq!(meta.name.as_deref(), Some("lsp-7-rust-analyzer"));
+    let labels = meta.labels.as_ref().expect("labels");
+    assert_eq!(labels.get(LSP_OF_LABEL).map(String::as_str), Some("42"));
+    assert_eq!(labels.get(LSP_SERVER_LABEL).map(String::as_str), Some("rust-analyzer"));
+    assert_eq!(labels.get(LSP_POD_LABEL).map(String::as_str), Some("7"));
+    assert!(!labels.contains_key("smelt/conversation"), "the sandbox pod's own label would make create_pod wait on it");
+    assert_eq!(labels.get(crate::sandbox::INSTANCE_LABEL).map(String::as_str), Some("instance-a"), "SME-115");
+    assert_eq!(
+        meta.annotations.as_ref().and_then(|a| a.get(CONFIG_VERSION_ANNOTATION)).map(String::as_str),
+        Some("2026-09-28T08:00:00")
+    );
+    let owner = &meta.owner_references.as_ref().expect("owner")[0];
+    assert_eq!((owner.kind.as_str(), owner.name.as_str(), owner.uid.as_str()), ("Pod", "sandbox-7", "uid-7"));
+
+    let spec = pod.spec.as_ref().expect("spec");
+    assert_eq!(spec.node_name.as_deref(), Some("node-a"), "local-path claims can only be shared on one node");
+    assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
+    let security = spec.security_context.as_ref().expect("security context");
+    assert_eq!((security.run_as_user, security.run_as_group), (Some(1000), Some(1000)));
+    let volume = &spec.volumes.as_ref().expect("volumes")[0];
+    assert_eq!(
+        volume.persistent_volume_claim.as_ref().map(|c| c.claim_name.as_str()),
+        Some("sandbox-workspace-42")
+    );
+
+    let container = &spec.containers[0];
+    assert_eq!(container.image.as_deref(), Some("rust:1"));
+    assert_eq!(container.volume_mounts.as_ref().expect("mounts")[0].mount_path, "/workspace");
+    let env: Vec<(String, String)> = container
+        .env
+        .as_ref()
+        .expect("env")
+        .iter()
+        .map(|e| (e.name.clone(), e.value.clone().unwrap_or_default()))
+        .collect();
+    assert!(env.contains(&("HOME".to_string(), POD_HOME.to_string())));
+    assert!(env.contains(&("RA_LOG".to_string(), "info".to_string())));
+    let resources = container.resources.as_ref().expect("resources");
+    let limits = resources.limits.as_ref().expect("limits");
+    assert_eq!(limits.get("memory").map(|q| q.0.as_str()), Some("3Gi"));
+    assert_eq!(limits.get("cpu").map(|q| q.0.as_str()), Some("2"));
+    // Small requests: with only the namespace's defaults the spike's
+    // pods couldn't be scheduled.
+    assert_eq!(resources.requests.as_ref().and_then(|r| r.get("memory")).map(|q| q.0.as_str()), Some("64Mi"));
+    let script = container.command.as_ref().expect("command").join(" ");
+    assert!(script.contains("rustup component add rust-analyzer"), "{script}");
+    assert!(script.contains(INSTALL_RC) && script.contains("trap 'exit 0' TERM"), "{script}");
+}
+
+fn server_pod(uid: &str, phase: &str, reason: Option<&str>, deleting: bool) -> Pod {
+    let mut pod = unready_server_pod(uid, phase, reason, deleting);
+    pod.metadata.annotations = Some([(READY_ANNOTATION.to_string(), "true".to_string())].into());
+    pod
+}
+
+/// A server pod whose install never finished.
+fn unready_server_pod(uid: &str, phase: &str, reason: Option<&str>, deleting: bool) -> Pod {
+    serde_json::from_value(serde_json::json!({
+        "metadata": {
+            "name": "lsp-7-rust-analyzer",
+            "uid": uid,
+            "labels": {LSP_OF_LABEL: "42", LSP_SERVER_LABEL: "rust-analyzer", LSP_POD_LABEL: "7"},
+            "deletionTimestamp": if deleting { Some("2026-09-28T00:00:00Z") } else { None },
+        },
+        "status": {
+            "phase": phase,
+            "containerStatuses": [{
+                "name": "server", "image": "rust:1", "imageID": "", "ready": false, "restartCount": 0,
+                "state": {"terminated": {"exitCode": 137, "reason": reason}},
+            }],
+        },
+    }))
+    .expect("a pod")
+}
+
+#[test]
+fn test_a_server_pod_that_stops_is_reported_once() {
+    let mut seen = std::collections::HashSet::new();
+    assert_eq!(note_server_stop(&mut seen, &server_pod("a", "Running", None, false), false), None);
+    let stopped = note_server_stop(&mut seen, &server_pod("a", "Failed", Some("OOMKilled"), false), false).expect("reported");
+    assert_eq!(stopped.conversation_id, 42);
+    assert!(stopped.notice.contains("rust-analyzer") && stopped.notice.contains("OOMKilled"), "{}", stopped.notice);
+    assert!(stopped.notice.contains("memory limit"), "an OOM says what to change: {}", stopped.notice);
+    assert!(stopped.notice.contains("start_language_server"), "{}", stopped.notice);
+    assert_eq!(note_server_stop(&mut seen, &server_pod("a", "Failed", Some("OOMKilled"), false), false), None);
+    // A new pod for the same server is reported again.
+    assert!(note_server_stop(&mut seen, &server_pod("b", "Failed", Some("Error"), false), false).is_some());
+}
+
+#[test]
+fn test_a_server_pod_stopped_by_smelt_or_before_is_not_reported() {
+    let mut seen = std::collections::HashSet::new();
+    assert_eq!(note_server_stop(&mut seen, &server_pod("a", "Failed", Some("Error"), true), false), None);
+    assert_eq!(note_server_stop(&mut seen, &server_pod("b", "Failed", Some("Error"), false), true), None);
+    assert_eq!(note_server_stop(&mut seen, &server_pod("b", "Failed", Some("Error"), false), false), None);
+    // One that never got through its install: its start already said
+    // what went wrong.
+    assert_eq!(note_server_stop(&mut seen, &unready_server_pod("c", "Failed", Some("StartError"), false), false), None);
+}
+
+#[test]
+fn test_an_empty_install_still_records_success() {
+    assert!(pod_script("  ").contains("( true )"));
+}
+
+/// Real-cluster tests: a stand-in sandbox pod (the real image, idle)
+/// and its conversation's workspace claim, with `cat` as the "server".
+pub(crate) mod cluster;

@@ -87,7 +87,7 @@ globset = { version = "0.4", optional = true }
 # install_default() call.
 rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
 # CDP-native (talks directly to chrome-headless-shell, no chromedriver to
-# download/manage) — originally added for src/browser_tests.rs's
+# download/manage) — originally added for src/browser_tests/'s
 # comprehensive sandbox-visibility check (see
 # SME-10's "Why
 # chromiumoxide"), now also a real runtime dependency of src/webfetch.rs
@@ -206,7 +206,7 @@ server = [
     "dep:tracing-opentelemetry",
 ]
 # Separate from `server` so the default `cargo test --features server` loop
-# stays exactly as fast as it is today — src/browser_tests.rs's one
+# stays exactly as fast as it is today — src/browser_tests/'s one
 # #[ignore]d test opts in explicitly. `chromiumoxide` itself moved to
 # `server` proper once `webfetch` started using it as a real runtime
 # dependency, not just a test one — see
@@ -221,7 +221,7 @@ browser-test = ["server"]
 # check` (no features) and only builds under `server`.
 [[bin]]
 name = "sandbox_agent"
-path = "src/bin/sandbox_agent.rs"
+path = "src/bin/sandbox_agent/main.rs"
 required-features = ["server"]
 
 # Standalone CLI, run by scripts/build-sandbox-image.sh — see
@@ -234,10 +234,10 @@ required-features = ["server"]
 
 # Standalone CLI, run by scripts/check-server's cleanup (SME-129): deletes
 # the sandbox pods and claims a check server's scratch database made — see
-# src/bin/sandbox_instance_cleanup.rs's own doc comment.
+# src/bin/sandbox_instance_cleanup/main.rs's own doc comment.
 [[bin]]
 name = "sandbox_instance_cleanup"
-path = "src/bin/sandbox_instance_cleanup.rs"
+path = "src/bin/sandbox_instance_cleanup/main.rs"
 required-features = ["server"]
 
 [dev-dependencies]

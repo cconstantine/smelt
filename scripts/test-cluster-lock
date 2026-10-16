@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# scripts/with-cluster-lock (SME-100), and clean-test-namespace.sh under
+# it. The stubs and helpers are in scripts/lib/test-check-scripts.sh.
+#
+#   scripts/test-cluster-lock
+. "$(dirname "$0")/lib/test-check-scripts.sh"
+
+# scripts/with-cluster-lock (SME-100). Every wait is bounded with timeout,
+# so a deadlock fails a case rather than hanging the run.
+
+# 1. The lock is held for the command, and only for it; its exit status
+# comes back.
+out=$(timeout 20 scripts/with-cluster-lock bash -c 'flock -n "$1" true && echo free || echo held' _ "$lock" 2>&1)
+[ "$out" = held ] || fail "with-cluster-lock: during the command the lock was: $out"
+lock_is_free || fail "with-cluster-lock: the lock is still held after the command"
+timeout 20 scripts/with-cluster-lock true || fail "with-cluster-lock true exited $?"
+timeout 20 scripts/with-cluster-lock bash -c 'exit 3'
+rc=$?
+[ "$rc" = 3 ] || fail "with-cluster-lock didn't pass on the command's exit status 3: $rc"
+
+# 2. A second run waits, naming the holder, and runs once the first ends.
+gate=$dir/lock-gate b_out=$dir/lock-b-out b_err=$dir/lock-b-err
+: >"$gate"
+: >"$b_out"
+# Not under timeout: $! must be with-cluster-lock's own pid, the holder.
+# Each command bounds itself instead.
+scripts/with-cluster-lock bash -c 'for _ in $(seq 1 300); do [ -s "$1" ] && exit 0; sleep 0.1; done; exit 1' _ "$gate" 2>/dev/null &
+a=$!
+wait_until_held || fail "with-cluster-lock: run A never took the lock"
+scripts/with-cluster-lock bash -c 'echo ran >"$1"' _ "$b_out" 2>"$b_err" &
+b=$!
+sleep 1
+grep -q "waiting for the cluster lock (held by pid $a" "$b_err" ||
+    fail "with-cluster-lock: run B didn't say it waits for pid $a: $(cat "$b_err")"
+[ -s "$b_out" ] && fail "with-cluster-lock: run B ran while A held the lock"
+echo go >"$gate"
+wait "$a" || fail "with-cluster-lock: run A failed"
+wait "$b" || fail "with-cluster-lock: run B failed"
+[ -s "$b_out" ] || fail "with-cluster-lock: run B never ran after A finished"
+
+# 3. Re-entry: under an old outer flock it runs inside that lock, with a
+# notice; inside itself, silently.
+if ! out=$(timeout 10 flock "$lock" scripts/with-cluster-lock true 2>&1); then
+    fail "with-cluster-lock under an outer flock didn't finish (deadlock?): $out"
+fi
+grep -q "drop the outer flock" <<<"$out" || fail "with-cluster-lock under an outer flock printed no notice: $out"
+if ! out=$(timeout 10 scripts/with-cluster-lock scripts/with-cluster-lock true 2>&1); then
+    fail "with-cluster-lock inside itself didn't finish (deadlock?): $out"
+fi
+[ -z "$out" ] || fail "with-cluster-lock inside itself printed: $out"
+
+# The descriptor form of an outer lock (`exec 9>>LOCK; flock 9`): the
+# short-lived `flock 9` that took it has exited, so /proc/locks doesn't
+# list it, yet the descriptor this script inherits holds it (SME-100
+# review 1). It re-enters rather than deadlocking.
+if ! out=$( (flock 9 && timeout 10 scripts/with-cluster-lock true) 9>>"$lock" 2>&1); then
+    fail "with-cluster-lock under a descriptor-form outer flock didn't finish (deadlock?): $out"
+fi
+grep -q "drop the outer flock" <<<"$out" || fail "with-cluster-lock under a descriptor-form outer flock printed no notice: $out"
+# And a lock held that way by an unrelated process: it says it waits, though
+# /proc/locks names no holder.
+(flock 9 && sleep 3) 9>>"$lock" &
+outer=$!
+wait_until_held || fail "the descriptor-form holder never took the lock"
+out=$(timeout 2 scripts/with-cluster-lock true 2>&1)
+rc=$?
+wait "$outer"
+[ "$rc" = 124 ] || fail "with-cluster-lock didn't wait for a descriptor-form holder (exit $rc): $out"
+grep -q "waiting for the cluster lock" <<<"$out" || fail "with-cluster-lock waited silently for a holder /proc/locks doesn't list: $out"
+
+# 4. Something the command leaves running keeps the lock until it ends
+# too, as with the old outer flock: it may be what still uses the cluster
+# (a test binary orphaned by a killed cargo), so the lock errs on the safe
+# side (SME-100 review 2). A run waiting meanwhile names it, though
+# /proc/locks can't once the holder has exited.
+bg=$(timeout 20 scripts/with-cluster-lock bash -c 'sleep 4 >/dev/null 2>&1 & echo $!')
+if [ -n "$bg" ] && pid_is_live "$bg"; then
+    lock_is_free && fail "with-cluster-lock: the lock came free while something the command started still ran"
+    out=$(timeout 1 scripts/with-cluster-lock true 2>&1)
+    grep -q "waiting for the cluster lock (held by pid $bg" <<<"$out" ||
+        fail "with-cluster-lock: the waiting line doesn't name the leftover holding the lock: $out"
+    for _ in $(seq 1 60); do pid_is_live "$bg" || break; sleep 0.1; done
+    lock_is_free || fail "with-cluster-lock: the lock is still held after the command's leftover ended"
+else
+    fail "with-cluster-lock: the background sleep isn't running: '$bg'"
+fi
+
+# 5. No kill of the holder frees the lock while the command, or anything it
+# started, still runs: its pid is the one the waiting line names, and a
+# second run beside an orphaned test binary is the collision the lock is
+# for (SME-100 reviews 1 and 2).
+child_pid=$dir/lock-child-pid grandchild_pid=$dir/lock-grandchild-pid
+alive() { [ -s "$1" ] && pid_is_live "$(cat "$1")"; }
+for sig in KILL TERM; do
+    : >"$child_pid"
+    : >"$grandchild_pid"
+    scripts/with-cluster-lock bash -c 'echo $$ >"$1"; sleep 3 & echo $! >"$2"; wait' _ "$child_pid" "$grandchild_pid" 2>/dev/null &
+    holder=$!
+    wait_until_held || fail "with-cluster-lock: the holder to $sig never took the lock"
+    for _ in $(seq 1 50); do [ -s "$grandchild_pid" ] && break; sleep 0.1; done
+    kill -"$sig" "$holder"
+    wait "$holder" 2>/dev/null
+    while alive "$child_pid" || alive "$grandchild_pid"; do
+        lock_is_free && { fail "with-cluster-lock: after $sig to its holder, the lock came free while the command still ran"; break; }
+        sleep 0.1
+    done
+    for f in "$child_pid" "$grandchild_pid"; do alive "$f" && kill "$(cat "$f")"; done
+    for _ in $(seq 1 30); do lock_is_free && break; sleep 0.1; done
+    lock_is_free || fail "with-cluster-lock: after $sig to its holder, the lock is still held once the command ended"
+done
+
+# A command run from a terminal can read it: the command stays in its
+# caller's foreground process group (SME-100 review 2: in a group of its
+# own it was stopped, and the holder spun).
+out=$(printf 'typed\n' | timeout 15 script -qec "scripts/with-cluster-lock bash -c 'read -r line </dev/tty; echo got \$line'" /dev/null 2>&1)
+grep -q "got typed" <<<"$out" || fail "with-cluster-lock: a command couldn't read its terminal: $out"
+
+# Ctrl-C ends the caller too: the holder dies of the same SIGINT, so a
+# calling script stops rather than going on to its next step (SME-100
+# review 2). A real ^C, through a terminal: a background job here ignores
+# SIGINT.
+out=$( (sleep 2; printf '\003'; sleep 1) | timeout 15 script -qec "bash -c 'scripts/with-cluster-lock sleep 8; echo carried on'" /dev/null 2>&1)
+grep -q "carried on" <<<"$out" && fail "with-cluster-lock: its caller carried on after Ctrl-C: $out"
+
+# Its usage text, with no command, is the whole header.
+header_end=$(awk '/^set -uo pipefail/ { print prev; exit } { prev = $0 }' scripts/with-cluster-lock | sed 's/^# \{0,1\}//')
+[ "$(scripts/with-cluster-lock 2>&1 | tail -n 1)" = "$header_end" ] || fail "with-cluster-lock's usage stops before the header's last line: $header_end"
+
+# 6. The log: a line per run with its wait, hold, status and worktree, and
+# re-entered runs marked.
+grep -E "waited=[0-9]+ held=[0-9]+ exit=3 worktree=$PWD " "$lock_log" >/dev/null ||
+    fail "with-cluster-lock's log has no line for the exit-3 run: $(cat "$lock_log")"
+grep -E "reentered held=[0-9]+ exit=0 worktree=$PWD " "$lock_log" >/dev/null ||
+    fail "with-cluster-lock's log has no re-entered line: $(cat "$lock_log")"
+
+# 13. --output: the command's output goes to the file, the waiting line
+# doesn't; and the lock is found from the script's own checkout, not the
+# caller's directory.
+out_file=$dir/lock-output out_err=$dir/lock-output-err
+: >"$out_file"
+timeout 30 flock "$lock" sleep 2 &
+outer=$!
+wait_until_held || fail "--output: the outer holder never took the lock"
+(cd / && timeout 30 "$OLDPWD/scripts/with-cluster-lock" --output "$out_file" bash -c 'echo hello; echo oops >&2') 2>"$out_err" ||
+    fail "with-cluster-lock --output failed: $(cat "$out_err")"
+wait "$outer"
+[ "$(cat "$out_file")" = "$(printf 'hello\noops')" ] || fail "--output wrote: $(cat "$out_file")"
+grep -q "waiting for the cluster lock" "$out_err" || fail "--output: no waiting line on stderr: $(cat "$out_err")"
+grep -q "waiting" "$out_file" && fail "--output: the waiting line went into the output file"
+# A repository of its own: with SMELT_LOCK_DIR unset, the lock is its git
+# common dir's, wherever it's run from.
+fake=$dir/fake-repo
+[ -d "$fake/.git" ] || git init -q "$fake"
+mkdir -p "$fake/scripts"
+cp scripts/with-cluster-lock "$fake/scripts/with-cluster-lock"
+out=$(cd / && env -u SMELT_LOCK_DIR timeout 20 "$fake/scripts/with-cluster-lock" bash -c 'flock -n "$1" true && echo free || echo held' _ "$fake/.git/smelt-cluster.lock" 2>&1)
+[ "$out" = held ] || fail "with-cluster-lock run from / didn't lock its own repository's lock: $out"
+
+# The gate scripts with stubs for cargo, dx, sqlx and the image check: what
+# runs before the lock, and what under it. They write their logs to this
+# checkout's target/check and target/browser-tier, as a real run does.
+
+# 12. clean-test-namespace.sh deletes everything in smelt-park-test, a test
+# run's pods too, so it takes the cluster lock: with a python3 stub, which
+# records the lock's state and its script's first line.
+cat >"$dir/bin/python3" <<'EOF'
+#!/usr/bin/env bash
+read -r first
+echo "python3 $(lock-state) $first" >>"$CALLS"
+EOF
+chmod +x "$dir/bin/python3"
+export CALLS=$dir/calls
+: >"$CALLS"
+clean_env=(env PATH="$dir/bin:$PATH" KUBECONFIG=/nonexistent)
+[ "$("${clean_env[@]}" bash -c 'command -v python3')" = "$dir/bin/python3" ] || {
+    echo "the python3 stub isn't first on PATH; stopping before running clean-test-namespace.sh" >&2
+    exit 1
+}
+timeout 20 "${clean_env[@]}" scripts/clean-test-namespace.sh >/dev/null 2>&1 || fail "clean-test-namespace.sh with a stub failed"
+[ "$(cat "$CALLS")" = "python3 locked import base64, json, re, ssl, sys, tempfile, urllib.request" ] ||
+    fail "clean-test-namespace.sh's python3: $(cat "$CALLS")"
+: >"$CALLS"
+flock "$lock" sleep 3 &
+outer=$!
+wait_until_held || fail "clean-test-namespace.sh: the outer holder never took the lock"
+out=$(timeout 2 "${clean_env[@]}" scripts/clean-test-namespace.sh 2>&1)
+rc=$?
+wait "$outer"
+[ "$rc" = 124 ] || fail "clean-test-namespace.sh didn't wait for the lock (exit $rc): $out"
+grep -q "waiting for the cluster lock" <<<"$out" || fail "clean-test-namespace.sh didn't say it waits: $out"
+[ -s "$CALLS" ] && fail "clean-test-namespace.sh ran while another process held the lock: $(cat "$CALLS")"
+unset CALLS
+
+finish

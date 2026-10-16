@@ -19,7 +19,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-lints=(-D warnings -A clippy::all -D clippy::expect_used -D clippy::unwrap_used)
+lints=(-D warnings -A clippy::all -D clippy::expect_used -D clippy::unwrap_used -D clippy::too_many_lines)
 
 # A container built before SME-95 has no clippy (the Dockerfile adds it now).
 # Say what to run rather than leaving rustup's own error in check.sh's output

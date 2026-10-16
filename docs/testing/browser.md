@@ -1,0 +1,75 @@
+# Browser verification
+
+Part of [testing.md](../testing.md). Checking a change in a real browser: Playwright, the fallback script, and the automated tier ([browser-tier.md](browser-tier.md)).
+
+**A hands-on check on a plain-HTTP name** (Chrome's `--host-resolver-rules=MAP <name> 127.0.0.1`, for a non-secure origin like the user's LAN address) can't write through `dx serve` until SME-146 is fixed: the request guard refuses every write from it with a 403. Send messages from a `localhost` tab and use the plain-HTTP tab only for what makes no request, and start the check server with `-- SMELT_ALLOWED_HOSTS=<name>` so the plain-HTTP tab's reads pass the Host check (the dev `.env` sets that variable, and check servers read it). SME-105's hands-on check took three runs to find this.
+
+A small automated browser test tier exists (`src/browser_tests/`, see below) for behavior that genuinely needs a real DOM to verify — everything else is a hands-on pass, driving a real headless Chrome against a check server.
+
+**Run hands-on checks against `scripts/check-server`, not a `dx serve` in the working tree.** `scripts/check-server start [REF]` builds and serves a commit (default `HEAD`) from a separate worktree (`../smelt-check`, or `$TMPDIR/smelt-check` when the repo's parent isn't writable) on port 8081, and says it's up once the app answers with a 2xx (while `dx` builds it answers with a 500); `scripts/check-server stop` stops it and everything it started; `scripts/check-server status` says what's running. It serves the commit, not your uncommitted edits, and saving a file never restarts it. To check a newer commit, `stop` and `start` again. `CHECK_SCRATCH_DB=1` serves from an empty database of its own (dropped on `stop`), for when the dev database has migrations from another branch. It's refused for a ref without SME-115's fix (one that doesn't contain commit `6c9f03c`; a commit partway through the fix has its migration but still sweeps every claim): every smelt server shares the `smelt-park` namespace, and one from before the fix on an empty database deletes the dev server's sandbox claims (every conversation's `/workspace`). Since the fix, each database labels its pods and claims with its own instance id and touches only those, and a fresh database's ids start above 2,000,000,000, so its names don't meet the dev server's. The same goes for a built `./server` run by hand against a scratch `DATABASE_URL`: only one with the fix. The refusal lives in the script, so run `check-server` only from a branch that contains the fix (`git merge-base --is-ancestor 6c9f03c HEAD`; otherwise merge `origin/main` first): an older branch's own copy has no refusal at all. `stop` deletes that scratch database's own sandbox objects first (SME-129): every pod and claim its server made carries `smelt/instance=<the database's id>`, and once the database is dropped no server ever owns them again. The tool that does it reads the instance from the database, deletes only objects carrying that exact label (pods first, then their claims), and `stop` drops the database only once it succeeded; a cleanup that can't finish keeps the database and exits 1, and `stop` is run again (it retries), never left. Deleting every conversation the check started a sandbox in, in the check server's own UI, stays good practice, and is still required from a checkout whose `check-server` predates SME-129. `sandbox_instance_cleanup --list` prints the namespace's pods and claims grouped by `smelt/instance`, which is how a stranded instance (one whose database is gone) is found; nothing without that exact label is ever deleted. Restart the dev server onto the fix first too: one from before it sweeps a scratch server's claims when it restarts (harmless to your conversations, but it can fail the check). See [process/rules-running.md](../process/rules-running.md) for why: a `dx serve` in the working tree rebuilds and restarts on every save, and stopping only the `dx` process leaves its server child running.
+
+**A check server's log says what its startup and teardown did** (SME-117). `check-server start` passes `RUST_LOG=info` and `NO_COLOR=1` (no colour codes, so `grep claim=` works) unless a non-empty value comes from a `-- RUST_LOG=…` override, the environment or the check worktree's `.env`, in that order; an empty one counts as unset, since smelt reads it as errors only. It prints the level it chose, `RUST_LOG=info (check-server's default)`, `(yours)` or `(from .env)`, and passes it last, so that is what smelt gets. The log is `$CHECK_WORKTREE/.check-server.log`, holding `dx`'s output with smelt's lines inside it; `stop` and `status` print its path and leave it, and the next `start` copies it to `.check-server.log.prev` before emptying it. At info, startup logs this database's instance, adoption's summary (or that a scratch database has nothing to adopt) and the claim sweep's summary, and every pod or claim a teardown, a stopped pod, a deleted volume or the sweep deletes is logged with its name and uid (a dropped sandbox's background delete says `cleaned up dropped sandbox`). Not logged: a pod smelt deletes right after its own create or setup failed (`create_pod`, `SandboxManager::delete`), and language server pods replaced or stopped at run time. To see what a run did to the cluster: `grep -E 'smelt instance|swept|adopt|deleted (pod|claim|volume claim)|tearing down|cleaned up dropped sandbox' "$CHECK_WORKTREE/.check-server.log"`.
+
+**Under `dx serve` (a check server included), every open tab reloads itself when the server restarts:** `dx`'s dev client in the page watches its own socket (`/_dioxus`) and reloads on reconnect. A check that needs a tab to outlive a server restart, such as SME-43's reload banner, has to run built servers instead (`dx build --platform web`, then the bundle's own `./server`); see that ticket's Feature checklist row.
+
+A related gotcha with a `dx serve` that is watching files: **a CSS/asset edit doesn't reliably reach a *fresh* page load.** `App`'s `asset!("/assets/css/...")` links resolve to a content-hashed bundle path baked into the served HTML at build time; `dx`'s hot-reload patches tabs that were already open, but a brand-new browser (exactly what a screenshot script launches each run) can get a stale pre-edit bundle. On `sandbox-native-environment` a fresh `browser_check.py` run kept rendering unstyled markup after a CSS edit that the log said was hot-reloaded. With the check server, commit and restart it (`scripts/check-server stop`, then `start`) before assuming the change itself is wrong.
+
+## Playwright (preferred)
+
+The dev container image bakes in a Python Playwright install specifically so this doesn't have to be rebuilt or asked for per session — see the `Dockerfile`'s `/opt/playwright-venv` stage:
+
+```bash
+scripts/check-server start                         # the app, on http://localhost:8081
+
+/opt/playwright-venv/bin/playwright install chromium   # once per container instance —
+                                                         # the venv exists in the image,
+                                                         # but the browser binary itself
+                                                         # downloads into ~/.cache/ms-playwright
+                                                         # on first use
+
+/opt/playwright-venv/bin/python your_script.py      # a short sync_playwright() script:
+                                                     # launch chromium(args=["--no-sandbox"]),
+                                                     # goto/click/fill, .screenshot(path=...)
+
+scripts/check-server stop                          # when done
+```
+
+Start from `scripts/ui-check/smelt_ui.py`: a `Tab` wrapper that starts and deletes conversations, sends a message and waits for the turn to finish, reads the transcript and notices, and handles several things that each cost a rerun on SME-51. For example, a conversation page never reaches "network idle" (its event stream stays open), and the message box is an `<input>`. Its docstring has a complete example. It talks to `SMELT_UI_BASE` (default `http://localhost:8081`, the check server) and writes screenshots to `SMELT_UI_OUT` (default `./ui-check-out`).
+
+**A check that needs the sandbox but not a real model** can use `scripts/ui-check/mock_tools_upstream.py <port>`, a stand-in Anthropic API with one model, `mock-tools`. A message `TOOL <name> <json input>` makes the turn call that one tool, then answer "done."; anything else gets "noted.". Add it on the Model providers page as an Anthropic provider at `http://127.0.0.1:<port>` with any key, and pick `mock-tools`. Start it before `check-server start` and stop it after `stop`. SME-144's hands-on check drove `run_terminal_command` this way (`TOOL run_terminal_command {"terminal_id": N, "command": "true"}`), deterministic and quick. Four more commands (SME-122), each a whole message: `RUN <command>` runs it in the terminal the conversation's latest `create_terminal` result named (send `TOOL create_terminal {}` first); `REFUSE` streams a few words and stops with `stop_reason: refusal`; `EMPTY` streams a reply with no content at all; `FAIL` answers HTTP 400, so the turn fails with "MOCK-FAILURE". Its docstring lists them all.
+
+**A check cleans up after itself.** `run` deletes every conversation its tabs started with `new_conversation`, in a `finally`, so a check that fails or times out still removes them. On a scratch database a conversation's sandbox pod and claims carry that database's instance label, and since SME-129 `check-server stop` deletes them itself before it drops the database, so a check killed outright no longer strands them; the UI delete is still what keeps a *running* check's namespace small, and is still required from a checkout whose `check-server` predates SME-129. On SME-126 a check script died at its own 300-second wait, before its delete, and left a sandbox behind in `smelt-park`. Two habits keep this from happening in the first place:
+- **Ask for something that doesn't start a sandbox** unless the check is about one. On SME-126 a request to write a file started a sandbox; a long `todowrite` call tested the same thing without one.
+- **Give a local model time.** A turn on the user's llama-server can take many minutes; `wait_idle` waits 15 by default. Don't cut it to 5.
+
+Then view the screenshot (the `Read` tool renders images directly). This is a plain Python script per check, not a fixed CLI (navigating to a conversation, clicking a sidebar entry, reading back `scrollTop`/`scrollHeight` via `page.eval_on_selector`, etc.).
+
+**Before/after comparisons serve each ref from its own check worktree** (`CHECK_WORKTREE=../smelt-check-main scripts/check-server start main`, and another for the branch), not one worktree stopped and restarted on the other ref: `dx` can hand the second run the first one's bundle. Reproduce any difference once before investigating it; a race in a mock (a notice landing mid-turn in one run and after it in the other) looks like a regression too. On SME-57 both happened, and each cost a rerun. For a change to the page's state, the scripted session also switches conversation in the page and back (a sidebar click, not a reload, so the in-page reset runs), and the check server's log is searched for API errors on both refs (SME-57's PR (b)).
+
+**Run one driver script on both refs.** For a set of fixes (a bug bash's, say), write one Playwright script that takes a label (`before` or `after`), runs a check per fix, and writes what each measured to `<SMELT_UI_OUT>/<label>.json` plus a `<label>-<finding>.png` screenshot per check. Serve the base ref, run it as `before`; serve the branch, run it as `after`; then compare the two JSON files finding by finding, and look at the screenshots too: on SME-122 the script's first selectors were wrong (`main`, and a substring that matched the command line itself), so its text checks read false where the screenshots showed the bug. Drive the turns with the mock upstream's commands above wherever the check doesn't need a real model, so both runs see the same replies; SME-122's eleven fixes were re-shot this way for about $0.015 of Haiku, which only the provider-specific ones needed.
+
+## `scripts/browser-check/` (fallback)
+
+Before Playwright was added to the image, UI verification in this sandbox had no browser, no Node, and no Python `pip` available at all (see SME-5's and SME-8's retrospectives) — `scripts/browser-check/` is a from-scratch, pure-stdlib driver built to cover that gap, and is kept as the fallback for an environment that still lacks Docker-rebuild/root access:
+
+```bash
+scripts/browser-check/setup.sh                     # once — downloads a headless
+                                                     # Chrome-for-Testing binary and
+                                                     # its shared libraries into
+                                                     # .browser-check-cache/ (gitignored,
+                                                     # never committed); idempotent,
+                                                     # safe to re-run, no root needed
+
+python3 scripts/browser-check/browser_check.py \
+    http://127.0.0.1:8081/ \
+    --screenshot /tmp/out.png \
+    --action "click:.conversation-item" \
+    --action "sleep:1000" \
+    --action "scroll:.messages"
+```
+
+`scripts/browser-check/cdp.py` hand-rolls just enough raw WebSocket framing (RFC6455) to speak the Chrome DevTools Protocol directly, and `setup.sh` fetches Chrome for Testing plus its missing shared libraries (nss, atk, dbus, X11, mesa, ...) via non-root `apt-get --print-uris` + `dpkg-deb -x` into a local prefix — no root, no system package state touched. `--action` runs steps in order: `click:SELECTOR`, `type:SELECTOR=TEXT`, `wait:SELECTOR` (poll up to 10s), `scroll:SELECTOR` (scrolls to bottom), `sleep:MS`, `eval:JS` (escape hatch — also handy for injecting synthetic markup to preview CSS for a state you don't have live data for, e.g. an error variant when nothing's currently failing). Each run launches its own Chrome and kills it on exit unless `--keep-open` is passed, so repeated runs don't leak orphaned Chrome processes.
+
+## `src/browser_tests/` (automated)
+
+In [testing/browser-tier.md](browser-tier.md).
