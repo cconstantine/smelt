@@ -334,7 +334,7 @@ async fn test_a_calls_wait_for_a_slot_is_on_its_span() {
     let endpoint = limited(addr, 9_162_000_116, Some(1));
     let held = crate::providers::limiter::current(9_162_000_116)
         .expect("a pool")
-        .try_acquire_owned()
+        .try_acquire()
         .expect("the only slot");
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -380,4 +380,59 @@ async fn test_deleting_a_provider_keeps_its_waiting_calls_waiting(pool: sqlx::Pg
     upstream.wait_for_arrivals(2).await;
     upstream.release_one();
     finished(b).await;
+}
+
+/// SME-162 review 2: a limit lowered from 2 to 1 while two calls run lets
+/// no new call in until they're under it: never more than either limit.
+#[sqlx::test]
+async fn test_a_lowered_limit_holds_new_calls_until_the_running_ones_are_under_it(pool: sqlx::PgPool) {
+    let (addr, upstream) = start_gated_upstream(None, false).await;
+    let provider = provider_at(&pool, addr, 9_162_000_204, Some(2)).await;
+    let endpoint = crate::providers::endpoint(&provider);
+    let a = tokio::spawn(call(&endpoint, "a"));
+    let b = tokio::spawn(call(&endpoint, "b"));
+    upstream.wait_for_arrivals(2).await;
+
+    save_limit(&pool, &provider, Some(1)).await;
+    let c = tokio::spawn(call(&endpoint, "c"));
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(upstream.arrivals().len(), 2, "c waits: two running, limit 1");
+    upstream.release_one();
+    let first = upstream.arrivals();
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(upstream.arrivals(), first, "one still running: c still waits");
+
+    upstream.release_one();
+    upstream.wait_for_arrivals(3).await;
+    upstream.release_one();
+    for task in [a, b, c] {
+        finished(task).await;
+    }
+    assert_eq!(upstream.peak.load(Ordering::SeqCst), 2, "never more than the old limit");
+}
+
+/// SME-162 review 2: a limit raised from 1 to 2 while one call runs lets
+/// one more in, not two: the running call counts.
+#[sqlx::test]
+async fn test_a_raised_limit_counts_the_calls_already_running(pool: sqlx::PgPool) {
+    let (addr, upstream) = start_gated_upstream(None, false).await;
+    let provider = provider_at(&pool, addr, 9_162_000_205, Some(1)).await;
+    let endpoint = crate::providers::endpoint(&provider);
+    let a = tokio::spawn(call(&endpoint, "a"));
+    upstream.wait_for_arrivals(1).await;
+
+    save_limit(&pool, &provider, Some(2)).await;
+    let b = tokio::spawn(call(&endpoint, "b"));
+    let c = tokio::spawn(call(&endpoint, "c"));
+    upstream.wait_for_arrivals(2).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(upstream.arrivals().len(), 2, "a and one more: limit 2");
+
+    for _ in 0..3 {
+        upstream.release_one();
+    }
+    for task in [a, b, c] {
+        finished(task).await;
+    }
+    assert_eq!(upstream.peak.load(Ordering::SeqCst), 2);
 }

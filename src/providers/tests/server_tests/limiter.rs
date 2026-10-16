@@ -38,7 +38,7 @@ fn permits(endpoint: &Endpoint) -> Option<usize> {
 }
 
 #[test]
-fn test_a_limit_keeps_one_pool_of_that_many_slots_until_it_changes() {
+fn test_a_limit_keeps_one_pool_resized_in_place() {
     let id = 9_162_000_001;
     limiter::set(id, at(10), None);
     assert!(limiter::current(id).is_none(), "no limit, no pool");
@@ -49,13 +49,39 @@ fn test_a_limit_keeps_one_pool_of_that_many_slots_until_it_changes() {
     limiter::set(id, at(30), Some(2));
     assert!(Arc::ptr_eq(&first, &limiter::current(id).expect("a pool")), "the same limit keeps its pool");
 
-    let held = first.clone().try_acquire_owned().expect("a free slot");
+    // SME-162 review 2: a new count resizes the pool, counting the slots
+    // already held.
+    let held = first.try_acquire().expect("a free slot");
     limiter::set(id, at(40), Some(3));
-    let resized = limiter::current(id).expect("a pool");
-    assert!(!Arc::ptr_eq(&first, &resized), "a new limit, a new pool");
-    assert_eq!(resized.available_permits(), 3, "the old pool's held slot isn't counted");
-    assert!(first.is_closed(), "the old pool is closed, so its waiters look again");
+    assert!(Arc::ptr_eq(&first, &limiter::current(id).expect("a pool")), "resized in place");
+    assert_eq!(first.available_permits(), 2, "3, one held");
+    let second = first.try_acquire().expect("a free slot");
+    limiter::set(id, at(50), Some(1));
+    assert_eq!(first.available_permits(), 0, "1, two held: the one free slot is taken back");
     drop(held);
+    assert_eq!(first.available_permits(), 0, "still owed one: the slot given back is kept");
+    drop(second);
+    assert_eq!(first.available_permits(), 1, "under the limit: the next is freed");
+    limiter::set(id, at(60), Some(2));
+    assert_eq!(first.available_permits(), 2);
+    assert!(!first.is_closed());
+}
+
+/// SME-162 review 2: a limit raised before a lowered one's slots are back
+/// pays off what's owed first.
+#[test]
+fn test_raising_a_lowered_limit_pays_off_what_it_owes_first() {
+    let id = 9_162_000_009;
+    limiter::set(id, at(10), Some(2));
+    let pool = limiter::current(id).expect("a pool");
+    let (a, b) = (pool.try_acquire().expect("a"), pool.try_acquire().expect("b"));
+    limiter::set(id, at(20), Some(1));
+    limiter::set(id, at(30), Some(2));
+    assert_eq!(pool.available_permits(), 0, "two held, limit 2");
+    drop(a);
+    assert_eq!(pool.available_permits(), 1);
+    drop(b);
+    assert_eq!(pool.available_permits(), 2);
 }
 
 #[test]

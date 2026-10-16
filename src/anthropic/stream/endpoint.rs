@@ -39,17 +39,17 @@ const SLOW_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 impl Endpoint {
     /// Waits for one of the provider's request slots, when it has a limit
     /// (SME-162), and holds it until the returned permit drops: when the
-    /// call ends, fails, or is dropped (a Stop). A pool closed while it
-    /// waits (the limit changed) sends it to the provider's pool now, or
-    /// on at once if the limit is gone. A wait past `SLOW_SLOT_WAIT` is
-    /// logged once, naming the host only.
-    pub(super) async fn slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    /// call ends, fails, or is dropped (a Stop). A new count resizes the
+    /// pool it waits on; a pool closed while it waits (the limit was
+    /// cleared) sends it on at once, or to the pool set since. A wait past
+    /// `SLOW_SLOT_WAIT` is logged once, naming the host only.
+    pub(super) async fn slot(&self) -> Option<crate::providers::limiter::Slot> {
         let provider_id = self.slots_of?;
         let slow = tokio::time::Instant::now() + SLOW_SLOT_WAIT;
         let mut warned = false;
         loop {
             let pool = crate::providers::limiter::current(provider_id)?;
-            let acquire = pool.acquire_owned();
+            let acquire = pool.acquire();
             tokio::pin!(acquire);
             let acquired = if warned {
                 acquire.await
@@ -68,9 +68,9 @@ impl Endpoint {
                     }
                 }
             };
-            // Only a pool its limit's change closed refuses: look again.
-            if let Ok(permit) = acquired {
-                return Some(permit);
+            // Only a pool whose limit was cleared refuses: look again.
+            if let Some(slot) = acquired {
+                return Some(slot);
             }
         }
     }
