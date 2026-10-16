@@ -114,3 +114,19 @@ fn stale_files_resyncs_the_changed_and_closes_the_deleted() {
     assert_eq!(stale_files(&files, &same[..2]), None);
     assert_eq!(stale_files(&files, &[same.clone(), vec!["-".to_string()]].concat()), None);
 }
+
+/// SME-172: a rename's edits are applied only to files the server saw as
+/// they are now; a file changed since, or never sent, is listed.
+#[test]
+fn rename_check_lists_files_the_server_saw_otherwise() {
+    let touched = |path: &str, current: &str, synced: Option<&str>| (path.to_string(), current.to_string(), synced.map(str::to_string));
+    assert_eq!(rename_check(&[touched("/workspace/a.rs", "fn a() {}", Some("fn a() {}"))]), Vec::<String>::new());
+    assert_eq!(
+        rename_check(&[
+            touched("/workspace/a.rs", "fn a() {}", Some("fn a() {}")),
+            touched("/workspace/b.rs", "fn b() {}\n// more\n", Some("fn b() {}\n")),
+            touched("/workspace/c.rs", "fn c() {}", None),
+        ]),
+        vec!["/workspace/b.rs".to_string(), "/workspace/c.rs".to_string()]
+    );
+}

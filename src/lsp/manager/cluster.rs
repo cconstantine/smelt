@@ -53,6 +53,7 @@ async fn until_contains(
 
 const MAIN: &str = "/workspace/demo/src/main.rs";
 const SHAPES: &str = "/workspace/demo/src/shapes.rs";
+const GARDEN: &str = "/workspace/demo/src/garden.rs";
 const MAIN_RS: &str = "mod shapes;
 use shapes::{Shape, Square};
 
@@ -63,6 +64,15 @@ fn total(shapes: &[&dyn Shape]) -> f64 {
 fn main() {
     let square = Square { side: 2.0 };
     println!(\"{}\", total(&[&square]));
+}
+
+mod garden;
+";
+/// Never opened in the server before the rename that touches it.
+const GARDEN_RS: &str = "use crate::shapes::Square;
+
+pub fn plot() -> Square {
+    Square { side: 1.0 }
 }
 ";
 const SHAPES_RS: &str = "pub trait Shape {
@@ -91,6 +101,7 @@ async fn test_rust_analyzer_from_the_catalog_answers_across_files(pool: PgPool) 
             ("/workspace/demo/Cargo.toml", "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
             (MAIN, MAIN_RS),
             (SHAPES, SHAPES_RS),
+            (GARDEN, GARDEN_RS),
         ])
         .await;
 
@@ -130,16 +141,19 @@ async fn test_rust_analyzer_from_the_catalog_answers_across_files(pool: PgPool) 
         // SME-172: files open in the server (shapes.rs, since References
         // above) that change on disk are brought up to date before each
         // operation. B16: a rename touching one changed in a terminal works
-        // the first time, rather than being refused for good.
+        // the first time, rather than being refused for good. garden.rs was
+        // never sent to the server: the rename syncs it and asks again.
         let appended = format!("{SHAPES_RS}// appended\n");
         write_files(&client, &sandbox, &[(SHAPES, &appended)]).await;
         let tile = OperationInput { new_name: Some("Tile".to_string()), ..at(MAIN, 9, 18) };
         let renamed = operate(&pool, &client, &sandbox, Operation::Rename, &tile).await;
-        assert!(renamed.as_ref().is_ok_and(|r| r.contains("Renamed to Tile in 2 files")), "{renamed:?}");
+        assert!(renamed.as_ref().is_ok_and(|r| r.contains("Renamed to Tile in 3 files")), "{renamed:?}");
         let shapes = read(&client, &sandbox, SHAPES).await;
         assert!(shapes.contains("pub struct Tile") && shapes.ends_with("}\n// appended\n"), "{shapes}");
         let main = read(&client, &sandbox, MAIN).await;
         assert!(main.contains("let square = Tile {"), "{main}");
+        let garden = read(&client, &sandbox, GARDEN).await;
+        assert!(garden.contains("pub fn plot() -> Tile {"), "{garden}");
 
         // Positions in a file changed on disk are the ones on disk now: a
         // line put above `fn area` moves it from line 2 to 3.
