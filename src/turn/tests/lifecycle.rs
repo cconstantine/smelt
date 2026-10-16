@@ -234,3 +234,128 @@ async fn test_a_failed_turns_reply_is_cleared_while_a_turn_waits_behind_it(pool:
     drop(rx);
     events::forget(conversation_id);
 }
+
+/// A mock upstream that answers its first `failures` requests with a 400
+/// ("the user's turn failed") and every later one with "Noted.", and
+/// counts them.
+async fn start_failing_then_answering_mock_upstream(pool: &PgPool, failures: usize) -> Arc<AtomicUsize> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counted = counter.clone();
+    let app = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(move || {
+            let i = counted.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if i < failures {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"type":"error","error":{"type":"invalid_request_error","message":"the user's turn failed"}}"#
+                            .to_string(),
+                    )
+                        .into_response();
+                }
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    text_reply_body("Noted."),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    crate::providers::test_support::add_mock_provider(pool, addr).await;
+    counter
+}
+
+/// Sends the user's message and waits for its turn to fail and end.
+async fn fail_a_users_turn(pool: &PgPool, conversation_id: i64) {
+    start_turn(pool.clone(), conversation_id, "please".to_string()).await.expect("send");
+    wait_until("the user's turn fails", || {
+        !turn_running(conversation_id) && last_turn_error(conversation_id).is_some()
+    })
+    .await;
+}
+
+/// B30, interleaving: a wake (a command finished during the user's
+/// turn) is counted and queued while the user's turn runs, and that
+/// turn then fails; the wake finds nothing to do. The user's error must
+/// be kept: today the wake took a newer turn generation when it was
+/// counted, so the failure kept nothing.
+#[sqlx::test]
+async fn test_a_wake_queued_behind_a_failing_turn_keeps_its_error(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    let requests = start_failing_then_answering_mock_upstream(&pool, usize::MAX).await;
+    let (reached, release) = test_hooks::pause_after_message_saved(conversation_id);
+
+    start_turn(pool.clone(), conversation_id, "please".to_string()).await.expect("send");
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached)
+        .await
+        .expect("the user's turn saves its message")
+        .expect("hook");
+    let wake = tokio::spawn({
+        let pool = pool.clone();
+        async move { wake_conversation(&pool, conversation_id).await }
+    });
+    wait_until("the wake is queued", || turns_in_flight(conversation_id) == 2).await;
+    let _ = release.send(());
+
+    let woke = tokio::time::timeout(std::time::Duration::from_secs(5), wake)
+        .await
+        .expect("the wake ends")
+        .expect("join")
+        .expect("a wake with nothing to do succeeds");
+    assert!(woke.is_empty(), "the wake had nothing to do: {woke:?}");
+    wait_until("the user's turn ends", || !turn_running(conversation_id)).await;
+    assert!(
+        last_turn_error(conversation_id).is_some_and(|e| e.contains("the user's turn failed")),
+        "the user's error isn't kept: {:?}",
+        last_turn_error(conversation_id)
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "the wake called the model");
+}
+
+/// B30, a wake with nothing pending after the user's turn failed: it
+/// calls no model and must leave the kept error as it was; today it
+/// cleared it.
+#[sqlx::test]
+async fn test_a_wake_with_nothing_pending_keeps_the_kept_error(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    let requests = start_failing_then_answering_mock_upstream(&pool, usize::MAX).await;
+    fail_a_users_turn(&pool, conversation_id).await;
+    let kept = last_turn_error(conversation_id);
+
+    let woke = wake_conversation(&pool, conversation_id).await.expect("nothing to do");
+
+    assert!(woke.is_empty(), "the wake had nothing to do: {woke:?}");
+    assert_eq!(last_turn_error(conversation_id), kept, "the wake changed the kept error");
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "the wake called the model");
+}
+
+/// B30's guard: a wake that does call the model (a finished command's
+/// notice to deliver) is a newer turn, and replaces the kept error, as
+/// any newer turn does.
+#[sqlx::test]
+async fn test_a_wake_that_calls_the_model_replaces_the_kept_error(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    let requests = start_failing_then_answering_mock_upstream(&pool, 1).await;
+    fail_a_users_turn(&pool, conversation_id).await;
+    unnotified_finished_command(&pool, conversation_id, "cmd-sme-179").await;
+
+    let woke = wake_conversation(&pool, conversation_id).await.expect("the wake runs");
+
+    assert_eq!(woke.len(), 2, "the notice and the reply: {woke:?}");
+    assert_eq!(requests.load(Ordering::SeqCst), 2, "the wake called the model");
+    assert_eq!(last_turn_error(conversation_id), None, "the older failure outlived a newer turn");
+}
