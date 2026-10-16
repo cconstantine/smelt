@@ -176,11 +176,15 @@ pub async fn update_mcp_server_config(
     }
     merged.extend(upsert.iter().map(|(k, v)| (k.clone(), v.clone())));
 
-    let url_changed = existing.url != url;
-
+    // Whether the URL changes is decided against the row being written
+    // over, not `existing`: another edit and a sign-in's save can commit
+    // between the read above and this write, and a grant for their URL
+    // must not survive onto this one (SME-166 review 1). Postgres
+    // re-reads a row changed under it before applying the `SET`.
     sqlx::query_as::<_, McpServerConfig>(
         "UPDATE mcp_servers SET name = $2, url = $3, extra_headers = $4, auth_mode = $5,
-             oauth_credentials = CASE WHEN $6 THEN NULL ELSE oauth_credentials END,
+             oauth_credentials = CASE WHEN url IS DISTINCT FROM $3 THEN NULL
+                                      ELSE oauth_credentials END,
              updated_at = now()
          WHERE id = $1 RETURNING *",
     )
@@ -189,7 +193,6 @@ pub async fn update_mcp_server_config(
     .bind(url)
     .bind(sqlx::types::Json(merged))
     .bind(auth_mode)
-    .bind(url_changed)
     .fetch_optional(pool)
     .await
 }
@@ -234,21 +237,48 @@ pub async fn set_mcp_server_oauth_credentials(
     Ok(())
 }
 
-/// Saves a refreshed grant only while the row still holds a grant for the
-/// same client: a refresh that finishes after a Disconnect, a URL change
-/// or a new Connect mustn't write back over what they wrote (SME-113).
-/// `false` when nothing matched.
-pub async fn save_refreshed_mcp_server_oauth_credentials(
+/// Saves a new sign-in's grant only while the row's URL is still `url`,
+/// the address the sign-in started for (SME-166): a sign-in that finishes
+/// after a URL edit or a delete mustn't put the old address's token on the
+/// new one. One statement, so Postgres orders it against the edit's own
+/// `UPDATE` of the row. `false` when nothing matched.
+pub async fn save_mcp_server_sign_in(
     pool: &PgPool,
     id: i64,
-    client_id: &str,
+    url: &str,
     credentials: serde_json::Value,
 ) -> Result<bool, sqlx::Error> {
     let updated = sqlx::query(
         "UPDATE mcp_servers SET oauth_credentials = $3, updated_at = now() \
-         WHERE id = $1 AND oauth_credentials->>'client_id' = $2",
+         WHERE id = $1 AND url = $2",
     )
     .bind(id)
+    .bind(url)
+    .bind(sqlx::types::Json(credentials))
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected() == 1)
+}
+
+/// Saves a refreshed grant only while the row still holds a grant for the
+/// same client: a refresh that finishes after a Disconnect, a URL change
+/// or a new Connect mustn't write back over what they wrote (SME-113).
+/// And only while the row's URL is still `url`, the address the
+/// refreshing connection was built for (SME-166 review 2). `false` when
+/// nothing matched.
+pub async fn save_refreshed_mcp_server_oauth_credentials(
+    pool: &PgPool,
+    id: i64,
+    url: &str,
+    client_id: &str,
+    credentials: serde_json::Value,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE mcp_servers SET oauth_credentials = $4, updated_at = now() \
+         WHERE id = $1 AND url = $2 AND oauth_credentials->>'client_id' = $3",
+    )
+    .bind(id)
+    .bind(url)
     .bind(client_id)
     .bind(sqlx::types::Json(credentials))
     .execute(pool)
