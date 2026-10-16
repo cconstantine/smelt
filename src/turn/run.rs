@@ -220,13 +220,13 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
             }
         };
         if new_message.is_some() {
-            *generation = Some(new_turn_generation(conversation_id));
+            *generation = take_turn_generation(conversation_id);
         }
         // Checked after the generation is taken, both under the lock: a
         // delete landing before the check is seen here, and one landing
         // after it forgets the generation itself (`forget_conversation_lock`),
-        // so the turn's state ends idle either way (SME-179 B31). A notice
-        // or wake for a deleted conversation comes here too.
+        // after which no generation is taken (`take_turn_generation`), so
+        // the turn's state ends idle either way (SME-179 B31).
         if !db::conversation_exists(pool, conversation_id)
             .await
             .map_err(ServerFnError::new)?
@@ -246,7 +246,7 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
             Some((saved, content)) => {
                 // An answer turn's answer, saved as its message.
                 if generation.is_none() {
-                    *generation = Some(new_turn_generation(conversation_id));
+                    *generation = take_turn_generation(conversation_id);
                 }
                 #[cfg(test)]
                 test_hooks::after_message_saved(conversation_id).await;
@@ -483,7 +483,7 @@ fn run_turn_steps<'a: 'b, 'b>(
             // turn, so it replaces the kept error, once, as it first calls
             // the model (SME-179).
             if generation.is_none() {
-                *generation = Some(new_turn_generation(conversation_id));
+                *generation = take_turn_generation(conversation_id);
             }
 
             let turn_model = match resolved_model.take() {

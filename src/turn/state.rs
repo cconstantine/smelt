@@ -110,6 +110,13 @@ fn update_existing(conversation_id: i64, f: impl FnOnce(&mut ConversationRuntime
     }
 }
 
+/// `update_existing`, returning what `f` does.
+fn update_existing_with<R>(conversation_id: i64, f: impl FnOnce(&mut ConversationRuntime) -> R) -> Option<R> {
+    let mut result = None;
+    update_existing(conversation_id, |runtime| result = Some(f(runtime)));
+    result
+}
+
 pub(crate) fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<()>> {
     with_runtime(conversation_id, |runtime| {
         runtime
@@ -354,6 +361,22 @@ pub(super) fn new_turn_generation(conversation_id: i64) -> u64 {
         runtime.kept.error = None;
         runtime.kept.generation
     })
+}
+
+/// Starts a new turn generation for `conversation_id` from inside a turn
+/// that holds its turn lock, as `new_turn_generation`, and returns it;
+/// `None` once the conversation's delete has forgotten its turn state
+/// (no lock in it while this turn still holds one: an unheld lock is
+/// the only one ever freed). A generation taken then would keep the
+/// entry for good (SME-179 review 1).
+pub(super) fn take_turn_generation(conversation_id: i64) -> Option<u64> {
+    update_existing_with(conversation_id, |runtime| {
+        runtime.lock.as_ref()?;
+        runtime.kept.generation += 1;
+        runtime.kept.error = None;
+        Some(runtime.kept.generation)
+    })
+    .flatten()
 }
 
 /// Forgets `conversation_id`'s turn generation and kept error, for a turn

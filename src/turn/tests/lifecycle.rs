@@ -493,3 +493,22 @@ async fn test_an_answer_turn_with_nothing_to_do_keeps_the_kept_error(pool: PgPoo
         last_turn_error(conversation_id)
     );
 }
+
+/// Review 1, finding 2: a turn that takes its generation after a delete
+/// already forgot the conversation's turn state (a wake whose drain ran
+/// before the delete takes it just before its model call) leaves no turn
+/// state once it ends. The turn here is the state a running turn has: it's
+/// counted and holds the turn lock.
+#[test]
+fn test_a_generation_taken_after_a_delete_leaves_no_turn_state() {
+    let conversation_id = 9_179_000_003;
+    let turn = TurnInFlight::start(conversation_id);
+    let held = conversation_lock(conversation_id).try_lock_owned().expect("the lock is free");
+    forget_conversation_lock(conversation_id);
+
+    let _ = take_turn_generation(conversation_id);
+    drop(held);
+    drop(turn);
+
+    assert!(!has_turn_state(conversation_id), "the turn left turn state");
+}
