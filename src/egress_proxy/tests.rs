@@ -673,3 +673,117 @@ async fn test_a_sandbox_reply_cut_off_in_its_head_is_passed_on() {
     let reply = send_raw(proxy.addr, NAVIGATION).await;
     assert_eq!(reply, "HTTP/1.1 200 OK\r\nContent-Le");
 }
+
+/// A pod connection that records when the proxy drops it, and whose reads
+/// can be made to fail.
+struct TrackedPod {
+    inner: TcpStream,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+    fail_reads: bool,
+}
+
+impl Drop for TrackedPod {
+    fn drop(&mut self) {
+        self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl tokio::io::AsyncRead for TrackedPod {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.fail_reads {
+            return std::task::Poll::Ready(Err(std::io::Error::other("the port-forward broke")));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for TrackedPod {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// A `SandboxDial` connecting to `upstream` through a `TrackedPod`.
+fn tracked_dial(upstream: SocketAddr, dropped: Arc<std::sync::atomic::AtomicBool>, fail_reads: bool) -> SandboxDial {
+    Arc::new(move |_, _| {
+        let dropped = dropped.clone();
+        Box::pin(async move {
+            let inner = TcpStream::connect(upstream).await.map_err(|e| e.to_string())?;
+            Ok(Box::new(TrackedPod { inner, dropped, fail_reads }) as Box<dyn PodIo>)
+        })
+    })
+}
+
+/// Waits up to 5 s for the proxy to drop its pod connection.
+async fn dropped_in_time(dropped: &std::sync::atomic::AtomicBool) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !dropped.load(std::sync::atomic::Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    dropped.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Once the page has closed its connection (as Chrome does after every
+/// sandbox reply now), the proxy lets the pod's go too, even when the
+/// server there ignores the end of the request and keeps its side open:
+/// each request has a port-forward of its own, and one held per request
+/// would pile up (SME-165 review 2).
+#[tokio::test]
+async fn test_a_sandbox_connection_ends_when_the_page_closes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap();
+    // Answers, then holds the connection open, reading nothing more.
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let _ = read_head_from(&mut stream, Vec::new()).await;
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi").await;
+            held.push(stream);
+        }
+    });
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let proxy = start_with_sandbox(tracked_dial(upstream, dropped.clone(), false)).await.unwrap();
+    let mut page = TcpStream::connect(proxy.addr).await.unwrap();
+    page.write_all(NAVIGATION.as_bytes()).await.unwrap();
+    let expected = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi";
+    assert_eq!(read_up_to(&mut page, expected.len()).await, expected);
+    drop(page);
+    assert!(dropped_in_time(&dropped).await, "the pod's connection outlived the page's");
+}
+
+/// The same while the pod hasn't answered yet: a page that has gone
+/// doesn't keep a port-forward open waiting for a reply nobody will read
+/// (SME-165 review 2).
+#[tokio::test]
+async fn test_a_sandbox_connection_waiting_for_a_reply_ends_when_the_page_closes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap();
+    // Never answers, and holds the connection open.
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let proxy = start_with_sandbox(tracked_dial(upstream, dropped.clone(), false)).await.unwrap();
+    let mut page = TcpStream::connect(proxy.addr).await.unwrap();
+    page.write_all(NAVIGATION.as_bytes()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(page);
+    assert!(dropped_in_time(&dropped).await, "the pod's connection outlived the page's");
+}

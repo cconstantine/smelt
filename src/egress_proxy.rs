@@ -291,15 +291,40 @@ async fn handle_sandbox(
     // Everything else the page sends goes on to the pod from here — a
     // request body can follow its head in writes of its own (Chrome does
     // this for a larger POST), and the pod won't answer until it has it.
+    // Once the page's side ends (it closed, as Chrome does after every
+    // sandbox reply, or broke), `gone` says so: nothing more can reach the
+    // page, so the pod's connection is let go then, even if the server
+    // there keeps its side open (SME-165 review 2). A failed write to the
+    // pod doesn't: it may still be answering.
+    let (page_gone, gone) = tokio::sync::watch::channel(false);
     let page_to_pod = tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut from_page, &mut to_pod).await;
+        let mut chunk = vec![0u8; 16 * 1024];
+        loop {
+            match from_page.read(&mut chunk).await {
+                Ok(0) | Err(_) => {
+                    let _ = page_gone.send(true);
+                    break;
+                }
+                Ok(n) => {
+                    if to_pod.write_all(&chunk[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
         let _ = to_pod.shutdown().await;
     });
     if request.forward_head.is_some() {
         // The final reply head goes on marked `Connection: close`, so the
         // browser never sends a second request, which nothing would
         // check, down this connection (SME-165).
-        let relayed = reply::relay_reply_heads(&mut from_pod, &mut to_page, MAX_REPLY_HEAD_BYTES).await;
+        let relayed = tokio::select! {
+            relayed = reply::relay_reply_heads(&mut from_pod, &mut to_page, MAX_REPLY_HEAD_BYTES) => relayed,
+            () = page_left(gone.clone()) => {
+                page_to_pod.abort();
+                return Ok(());
+            }
+        };
         let refusal = match relayed.map_err(io)? {
             Relayed::CopyRest => None,
             Relayed::Ended => {
@@ -323,11 +348,22 @@ async fn handle_sandbox(
             return Err(message);
         }
     }
-    let result = tokio::io::copy(&mut from_pod, &mut to_page).await;
+    let result = tokio::select! {
+        result = tokio::io::copy(&mut from_pod, &mut to_page) => result.map(|_| ()),
+        () = page_left(gone) => Ok(()),
+    };
     let _ = to_page.shutdown().await;
     // The pod's side is done; nothing it could still receive would be read.
     page_to_pod.abort();
-    result.map(|_| ()).map_err(io)
+    result.map_err(io)
+}
+
+/// Resolves once `gone` says the page's side of a sandbox connection has
+/// ended; never, if its sender goes without saying so.
+async fn page_left(mut gone: tokio::sync::watch::Receiver<bool>) {
+    if gone.wait_for(|&gone| gone).await.is_err() {
+        std::future::pending::<()>().await;
+    }
 }
 
 /// Reads up to and including the blank line ending the request head;
