@@ -13,11 +13,16 @@ through the sub-agents' own reports, so this only watches statuses.
 
 It polls Linear's GraphQL API every --interval seconds (default 60) and
 compares the board with a snapshot kept in
-~/.local/state/smelt/pm-board-snapshot.json (or $SMELT_PM_STATE_DIR). The
-snapshot is saved when the script exits, and loaded when it starts, so a
-change made between two runs (by the user, or by the Project Manager's own
+~/.local/state/smelt/pm-board-snapshot.json (or $SMELT_PM_STATE_DIR). Each
+poll is compared with the one before it, and the snapshot is saved after
+every successful poll, so a ticket that leaves a wake state and comes back
+(Up Next -> Planned -> Up Next, a plan being revised) wakes it when a poll
+sees it return. The snapshot is loaded when the script starts, so the first
+poll is compared with the board at the previous run's last successful poll,
+and a change made after it (by the user, or by the Project Manager's own
 pass) is reported at once. The Project Manager's own moves therefore cause at
-most one extra wake, and nothing the user does in between is missed.
+most one extra wake. A ticket that leaves and comes back between two polls,
+or while no run is going, is missed: no poll saw it leave.
 
 The API key is a Linear personal API key (read-only is enough), read from
 ~/.config/smelt/linear-api-key, or the file $SMELT_LINEAR_KEY_FILE names. The
@@ -25,19 +30,23 @@ file must not be readable by group or others (chmod 600). The key is never
 printed.
 
 Exit status: 0 with one line per change on stdout; 1 for --once with nothing
-changed; 2 when the key is missing, refused (401/403, no retry) or the API keeps
-failing (the message says why). With --once a failed poll isn't retried.
+changed; 2 when the key is missing, refused (401/403, no retry), the API keeps
+failing, or the snapshot can't be saved (the message says why; any change
+lines are printed first). With --once a failed poll isn't retried.
 
     scripts/pm-wait-for-board                 # wait for the next change
     scripts/pm-wait-for-board --once          # check once: report and exit 0, or exit 1 if nothing changed
-    scripts/pm-wait-for-board --self-test     # run the comparison's tests (no network)
+    scripts/pm-wait-for-board --self-test     # run its tests (no network; a temporary state dir, never the real one)
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import stat
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -154,20 +163,54 @@ def changes(old, new):
 
 
 def load_snapshot():
+    """The saved board, or None when there's none to compare with. A snapshot
+    that can't be used (corrupt, not a board, unreadable) is said on stderr,
+    and the first poll then takes a new baseline (SME-176 review 1)."""
+    path = state_path()
     try:
-        with open(state_path()) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+        with open(path) as f:
+            board = json.load(f)
+        if not isinstance(board, dict) or not all(
+            isinstance(v, dict) and "state" in v for v in board.values()
+        ):
+            raise ValueError("not a board")
+        return board
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        print(f"pm-wait-for-board: the snapshot at {path} can't be used ({e})", file=sys.stderr)
         return None
 
 
 def save_snapshot(board):
+    # A temporary file of this save's own: two waiters can run at once, and
+    # with a shared one each truncated and moved the other's (SME-176 review
+    # 1). The last move wins, and the file in place is always a whole board.
     path = state_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(board, f, sort_keys=True)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(
+        dir=os.path.dirname(path), prefix=os.path.basename(path) + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(board, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _save_or_fail(board):
+    # An unsaved snapshot is SME-176's missed wake again at the next restart,
+    # and a state directory that can't be written is a setup problem the
+    # Project Manager should see.
+    try:
+        save_snapshot(board)
+    except OSError as e:
+        fail(f"can't save the board snapshot at {state_path()}: {e}")
 
 
 def self_test():
@@ -203,8 +246,295 @@ def self_test():
         if got != want:
             failed += 1
             print(f"case {i}: want {want}, got {got}")
-    print(f"{len(cases) - failed} passed, {failed} failed")
+    passed = len(cases) - failed
+
+    # The poll loop, driven with scripted polls in a state directory of the
+    # test's own: it never reads the real snapshot or the key.
+    saved_dir = os.environ.get("SMELT_PM_STATE_DIR")
+    try:
+        with tempfile.TemporaryDirectory(prefix="pm-wait-for-board-self-test.") as root:
+            for name, case in _loop_cases(b):
+                case_dir = tempfile.mkdtemp(dir=root)
+                os.environ["SMELT_PM_STATE_DIR"] = case_dir
+                try:
+                    problems = case()
+                except Exception as e:  # noqa: BLE001 - reported as the case's failure
+                    problems = [f"raised {e!r}"]
+                finally:
+                    os.chmod(case_dir, 0o700)
+                if problems:
+                    failed += 1
+                    for p in problems:
+                        print(f"{name}: {p}")
+                else:
+                    passed += 1
+    finally:
+        if saved_dir is None:
+            os.environ.pop("SMELT_PM_STATE_DIR", None)
+        else:
+            os.environ["SMELT_PM_STATE_DIR"] = saved_dir
+    print(f"{passed} passed, {failed} failed")
     return 1 if failed else 0
+
+
+class _Stop(Exception):
+    """The scripted polls ran out: stands for the waiter being killed."""
+
+
+def _run(polls, once=False):
+    """One run of the script, as main() makes it, against scripted polls: each
+    is a board, an exception the fetch raises, or a function called at that
+    poll that returns one of those. Returns (status, stdout lines, stderr); the
+    status is "killed" when the polls ran out first."""
+    polls = list(polls)
+
+    def fetch():
+        if not polls:
+            raise _Stop()
+        p = polls.pop(0)
+        if callable(p):
+            p = p()
+        if isinstance(p, BaseException):
+            raise p
+        return p
+
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            status = watch(fetch, lambda s: None, load_snapshot(), once, 60)
+        except _Stop:
+            status = "killed"
+        except SystemExit as e:
+            status = e.code
+        except Exception as e:  # noqa: BLE001 - a case reports it as its result
+            status = f"raised {e!r}"
+    return status, out.getvalue().splitlines(), err.getvalue()
+
+
+def _expect(problems, what, got, want):
+    if got != want:
+        problems.append(f"{what}: want {want!r}, got {got!r}")
+
+
+def _loop_cases(b):
+    def first_run_takes_a_baseline():
+        p = []
+        status, out, _ = _run([b(SME_1="Up Next")], once=True)
+        _expect(p, "status", status, 1)
+        _expect(p, "stdout", out, [])
+        _expect(p, "snapshot", load_snapshot(), b(SME_1="Up Next"))
+        return p
+
+    def a_move_into_a_wake_state_wakes():
+        p = []
+        save_snapshot(b(SME_1="Backlog"))
+        status, out, _ = _run([b(SME_1="Backlog"), b(SME_1="Up Next")])
+        _expect(p, "status", status, 0)
+        _expect(p, "stdout", out, ["SME-1: Backlog -> Up Next"])
+        _expect(p, "snapshot", load_snapshot(), b(SME_1="Up Next"))
+        return p
+
+    def failed_polls_give_up_after_the_limit():
+        p = []
+        save_snapshot(b(SME_1="Backlog"))
+        polls = [urllib.error.URLError("down")] * MAX_FAILURES + [b(SME_1="Up Next")]
+        status, out, _ = _run(polls)
+        _expect(p, "status", status, 2)
+        _expect(p, "stdout", out, [])
+        return p
+
+    def a_refused_key_exits_at_once():
+        p = []
+        save_snapshot(b(SME_1="Backlog"))
+        refused = urllib.error.HTTPError(API_URL, 401, "Unauthorized", {}, None)
+        status, _, err = _run([refused, b(SME_1="Up Next")])
+        _expect(p, "status", status, 2)
+        _expect(p, "says the key was refused", "refused the key" in err, True)
+        return p
+
+    # SME-176: every successful poll becomes the board the next one is
+    # compared with, in memory and in the snapshot file.
+    def out_and_back_within_one_run_wakes():
+        p = []
+        save_snapshot(b(SME_1="Up Next"))
+        status, out, _ = _run([b(SME_1="Planned"), b(SME_1="Up Next")])
+        _expect(p, "status", status, 0)
+        _expect(p, "stdout", out, ["SME-1: Planned -> Up Next"])
+        return p
+
+    def out_and_back_across_a_restart_wakes():
+        p = []
+        save_snapshot(b(SME_1="Up Next"))
+        status, out, _ = _run([b(SME_1="Planned")])
+        _expect(p, "run 1 status", status, "killed")
+        _expect(p, "run 1 snapshot", load_snapshot(), b(SME_1="Planned"))
+        status, out, _ = _run([b(SME_1="Up Next")])
+        _expect(p, "run 2 status", status, 0)
+        _expect(p, "run 2 stdout", out, ["SME-1: Planned -> Up Next"])
+        return p
+
+    def a_failed_poll_changes_nothing():
+        p = []
+        save_snapshot(b(SME_1="Up Next"))
+        seen = []
+
+        def fails_and_reads_the_snapshot():
+            seen.append(load_snapshot())
+            return urllib.error.URLError("down")
+
+        status, out, _ = _run([b(SME_1="Planned"), fails_and_reads_the_snapshot, b(SME_1="Up Next")])
+        _expect(p, "status", status, 0)
+        _expect(p, "stdout", out, ["SME-1: Planned -> Up Next"])
+        _expect(p, "snapshot at the failure", seen, [b(SME_1="Planned")])
+        return p
+
+    def a_move_between_runs_wakes_once():
+        p = []
+        save_snapshot(b(SME_1="Backlog", SME_2="Backlog"))
+        status, out, _ = _run([b(SME_1="Up Next", SME_2="Backlog")])
+        _expect(p, "run 1 status", status, 0)
+        # The Project Manager's own pass moves SME-2 while no waiter runs.
+        status, out, _ = _run([b(SME_1="Up Next", SME_2="Up Next")])
+        _expect(p, "run 2 status", status, 0)
+        _expect(p, "run 2 stdout", out, ["SME-2: Backlog -> Up Next"])
+        status, out, _ = _run([b(SME_1="Up Next", SME_2="Up Next")] * 3)
+        _expect(p, "run 3 status", status, "killed")
+        _expect(p, "run 3 stdout", out, [])
+        return p
+
+    def once_with_nothing_changed_saves_the_board():
+        p = []
+        save_snapshot(b(SME_1="Up Next"))
+        status, out, _ = _run([b(SME_1="Planned")], once=True)
+        _expect(p, "first --once status", status, 1)
+        _expect(p, "snapshot", load_snapshot(), b(SME_1="Planned"))
+        status, out, _ = _run([b(SME_1="Up Next")], once=True)
+        _expect(p, "second --once status", status, 0)
+        _expect(p, "second --once stdout", out, ["SME-1: Planned -> Up Next"])
+        return p
+
+    def limit_out_and_back_between_two_polls_is_missed():
+        # The documented limit: no poll saw it leave, so no poll can see it
+        # come back.
+        p = []
+        save_snapshot(b(SME_1="Up Next"))
+        status, out, _ = _run([b(SME_1="Up Next")])
+        _expect(p, "status", status, "killed")
+        _expect(p, "stdout", out, [])
+        return p
+
+    def leaving_the_board_and_coming_back_wakes():
+        p = []
+        save_snapshot(b(SME_1="Up Next", SME_2="Backlog"))
+        status, out, _ = _run([b(SME_2="Backlog"), b(SME_1="Up Next", SME_2="Backlog")])
+        _expect(p, "status", status, 0)
+        _expect(p, "stdout", out, ["SME-1: new -> Up Next"])
+        return p
+
+    def a_bad_snapshot_is_named_and_replaced():
+        # Corrupt, not a board, or unreadable: said on stderr, then a new
+        # baseline, never a traceback or a silent one.
+        p = []
+        for what, write in (
+            ("corrupt", lambda f: f.write('{"SME-1": {"state": "Up')),
+            ("not a board", lambda f: f.write("[]")),
+            ("unreadable", lambda f: (f.write("{}"), os.chmod(state_path(), 0))),
+        ):
+            os.makedirs(os.path.dirname(state_path()), exist_ok=True)
+            with open(state_path(), "w") as f:
+                write(f)
+            status, out, err = _run([b(SME_1="Up Next")], once=True)
+            _expect(p, f"{what}: status", status, 1)
+            _expect(p, f"{what}: says so", f"the snapshot at {state_path()} can't be used" in err, True)
+            _expect(p, f"{what}: new baseline", load_snapshot(), b(SME_1="Up Next"))
+        return p
+
+    def make_saves_fail():
+        # A state directory nothing can be written in. self_test makes it
+        # writable again after the case.
+        os.makedirs(os.path.dirname(state_path()), exist_ok=True)
+        os.chmod(os.path.dirname(state_path()), 0o500)
+
+    def a_second_waiters_save_mid_write_breaks_neither():
+        # Two waiters can run at once (the ticket's Trade-offs). Forced
+        # interleaving: waiter B saves a whole snapshot while waiter A is
+        # between opening its temporary file and moving it into place. With
+        # one shared temporary file, B's save truncated and moved A's, so A's
+        # write landed in the live snapshot (corrupt when shorter) and A's
+        # move failed: exit 2.
+        p = []
+        save_snapshot(b(SME_1="Up Next", SME_22="Backlog", SME_333="Backlog"))
+        real_dump = json.dump
+        other = b(SME_1="Planned", SME_22="Backlog", SME_333="Backlog")
+
+        def dump_with_b_saving_first(obj, f, **kw):
+            json.dump = real_dump
+            save_snapshot(other)
+            real_dump(obj, f, **kw)
+
+        json.dump = dump_with_b_saving_first
+        try:
+            status, out, err = _run([b(SME_1="Planned")], once=True)
+        finally:
+            json.dump = real_dump
+        _expect(p, "A's status", status, 1)
+        _expect(p, "A's stderr", err, "")
+        _expect(p, "snapshot (A moved last)", load_snapshot(), b(SME_1="Planned"))
+        leftovers = sorted(set(os.listdir(os.path.dirname(state_path()))) - {"pm-board-snapshot.json"})
+        _expect(p, "temporary files left", leftovers, [])
+        return p
+
+    def a_wake_whose_save_fails_still_reports_the_change():
+        # Printed before the save: a kill or a failure between the two can
+        # repeat a wake at the next run, never lose one.
+        p = []
+        save_snapshot(b(SME_1="Backlog"))
+        make_saves_fail()
+        status, out, err = _run([b(SME_1="Up Next")])
+        _expect(p, "status", status, 2)
+        _expect(p, "stdout", out, ["SME-1: Backlog -> Up Next"])
+        _expect(p, "says why", "can't save the board snapshot at " + state_path() in err, True)
+        return p
+
+    def a_failed_save_with_nothing_to_report_exits_2():
+        p = []
+        save_snapshot(b(SME_1="Up Next"))
+        make_saves_fail()
+        status, out, err = _run([b(SME_1="Planned"), b(SME_1="Up Next")])
+        _expect(p, "status", status, 2)
+        _expect(p, "stdout", out, [])
+        _expect(p, "says why", "can't save the board snapshot at " + state_path() in err, True)
+        return p
+
+    def a_failed_baseline_save_exits_2():
+        p = []
+        make_saves_fail()
+        status, out, err = _run([b(SME_1="Up Next")])
+        _expect(p, "status", status, 2)
+        _expect(p, "says why", "can't save the board snapshot at " + state_path() in err, True)
+        return p
+
+    return [
+        (f.__name__, f)
+        for f in (
+            a_bad_snapshot_is_named_and_replaced,
+            a_second_waiters_save_mid_write_breaks_neither,
+            a_wake_whose_save_fails_still_reports_the_change,
+            a_failed_save_with_nothing_to_report_exits_2,
+            a_failed_baseline_save_exits_2,
+            first_run_takes_a_baseline,
+            a_move_into_a_wake_state_wakes,
+            failed_polls_give_up_after_the_limit,
+            a_refused_key_exits_at_once,
+            out_and_back_within_one_run_wakes,
+            out_and_back_across_a_restart_wakes,
+            a_failed_poll_changes_nothing,
+            a_move_between_runs_wakes_once,
+            once_with_nothing_changed_saves_the_board,
+            limit_out_and_back_between_two_polls_is_missed,
+            leaving_the_board_and_coming_back_wakes,
+        )
+    ]
 
 
 def main():
@@ -213,7 +543,7 @@ def main():
     )
     p.add_argument("--interval", type=int, default=60, help="seconds between polls (default 60)")
     p.add_argument("--once", action="store_true", help="check once and exit (1 if nothing changed)")
-    p.add_argument("--self-test", action="store_true", help="run the comparison's tests and exit")
+    p.add_argument("--self-test", action="store_true", help="run the comparison's and poll loop's tests and exit")
     args = p.parse_args()
     if args.self_test:
         return self_test()
@@ -221,11 +551,18 @@ def main():
         p.error("--interval must be at least 10 seconds")
 
     key = read_key()
-    old = load_snapshot()
+    return watch(lambda: fetch_board(key), time.sleep, load_snapshot(), args.once, args.interval)
+
+
+def watch(fetch, sleep, old, once, interval):
+    """Poll `fetch()` until the board changes in a way that needs the Project
+    Manager, comparing with `old` (None: no snapshot yet). Returns the exit
+    status. `fetch` returns a board or raises what fetch_board raises; `sleep`
+    waits that many seconds."""
     failures = 0
     while True:
         try:
-            board = fetch_board(key)
+            board = fetch()
             failures = 0
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
@@ -235,34 +572,40 @@ def main():
                     "Security & access > API keys)."
                 )
             failures += 1
-            if args.once or failures >= MAX_FAILURES:
+            if once or failures >= MAX_FAILURES:
                 print(f"pm-wait-for-board: giving up after {failures} failed polls: {e}", file=sys.stderr)
                 return 2
             print(f"pm-wait-for-board: poll failed ({e}); retrying", file=sys.stderr)
-            time.sleep(min(args.interval * failures, 600))
+            sleep(min(interval * failures, 600))
             continue
         except (urllib.error.URLError, OSError, RuntimeError, KeyError, ValueError) as e:
             failures += 1
-            if args.once or failures >= MAX_FAILURES:
+            if once or failures >= MAX_FAILURES:
                 print(f"pm-wait-for-board: giving up after {failures} failed polls: {e}", file=sys.stderr)
                 return 2
             print(f"pm-wait-for-board: poll failed ({e}); retrying", file=sys.stderr)
-            time.sleep(min(args.interval * failures, 600))
+            sleep(min(interval * failures, 600))
             continue
         if old is None:
             # First run: nothing to compare with yet. Keep this as the baseline.
-            save_snapshot(board)
-            old = board
+            _save_or_fail(board)
             print("pm-wait-for-board: no snapshot yet; took one, watching from now", file=sys.stderr)
         else:
             found = changes(old, board)
             if found:
-                save_snapshot(board)
-                print("\n".join(found))
+                # Printed before the save: a kill between the two then
+                # repeats this wake at the next run instead of losing it.
+                print("\n".join(found), flush=True)
+                _save_or_fail(board)
                 return 0
-        if args.once:
+            # Nothing to report: this poll is what the next one, or the next
+            # run, compares with (SME-176). Otherwise a ticket that leaves a
+            # wake state and comes back looks unchanged.
+            _save_or_fail(board)
+        old = board
+        if once:
             return 1
-        time.sleep(args.interval)
+        sleep(interval)
 
 
 if __name__ == "__main__":
