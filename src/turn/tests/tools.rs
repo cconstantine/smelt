@@ -426,7 +426,7 @@ async fn test_run_turn_errors_when_max_turns_exceeded(pool: PgPool) {
     // than run_turn (which would replay the mock upstream the real
     // MAX_TURNS — 10,000 — times just to prove the same "give up and
     // error" behavior).
-    let result = run_turn_bounded(&pool, conversation.id, Some(new_message), 3, false, false).await;
+    let result = run_turn_bounded(&pool, conversation.id, Some(new_message), 3, None, false).await;
     assert!(result.is_err(), "expected an error, got {result:?}");
 }
 

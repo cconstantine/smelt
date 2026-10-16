@@ -148,9 +148,9 @@ pub(crate) async fn answer_question(
     }
     publish_question(conversation_id, None);
     resume_turns(conversation_id);
-    new_turn_generation(conversation_id);
+    let generation = new_turn_generation(conversation_id);
     tokio::spawn(async move {
-        if let Err(e) = run_turn_bounded(&pool, conversation_id, None, MAX_TURNS, true, false).await {
+        if let Err(e) = run_turn_bounded(&pool, conversation_id, None, MAX_TURNS, Some(generation), false).await {
             let message = e.message();
             crate::events::publish(conversation_id, crate::events::ConversationEvent::TurnError { message });
         }

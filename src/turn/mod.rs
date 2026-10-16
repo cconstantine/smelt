@@ -13,6 +13,7 @@ use crate::models::Message;
 use crate::{anthropic, db};
 
 mod compaction;
+mod failure;
 mod history;
 mod notify;
 mod questions;
@@ -24,6 +25,7 @@ mod test_hooks;
 mod tests;
 
 use self::compaction::*;
+pub(crate) use self::failure::*;
 pub(crate) use self::history::*;
 pub(crate) use self::notify::*;
 pub(crate) use self::questions::*;
