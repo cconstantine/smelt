@@ -222,6 +222,12 @@ async fn test_a_sandbox_route_refuses_requests_other_sites_send() {
              Sec-Fetch-Site: same-site\r\nSec-Fetch-Mode: cors\r\n\r\n",
         "GET http://localhost:3000/ HTTP/1.1\r\nHost: localhost:3000\r\nSec-Fetch-Site: none\r\n\
              Sec-Fetch-Mode: navigate\r\n\r\n",
+        // A sandbox page on another port that sends `Referrer-Policy:
+        // same-origin` (Django's default) or `no-referrer`, loading an
+        // image: only `localhost` is same-site with `localhost`, so it's
+        // the sandbox's own (SME-173 review 1, measured in Chromium).
+        "GET http://localhost:3000/ HTTP/1.1\r\nHost: localhost:3000\r\nSec-Fetch-Site: same-site\r\n\
+             Sec-Fetch-Mode: no-cors\r\nSec-Fetch-Dest: image\r\n\r\n",
     ] {
         let reply = send_raw(proxy.addr, head).await;
         assert!(reply.starts_with("HTTP/1.1 200") && reply.ends_with("upstream says hi"), "got {reply:?}");

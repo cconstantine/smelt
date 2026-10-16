@@ -61,6 +61,22 @@ pub fn browser_sends_sec_fetch(host: &str) -> bool {
     host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
+/// What the caller knows about the address a request to a sandbox server
+/// was sent to, for `allows_request_from`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Destination {
+    /// Whether the browser sends `Sec-Fetch-*` to that address
+    /// (`browser_sends_sec_fetch`).
+    pub sends_sec_fetch: bool,
+    /// Whether every page a browser counts as same-site with that address is
+    /// home. True in the model's browser, where the sandbox is `localhost`
+    /// or a loopback address: only `localhost` on another port is same-site
+    /// with `localhost` (`*.localhost` is a site of its own), and that is
+    /// the sandbox. False for previews, which are all same-site with each
+    /// other (SME-173 review 1).
+    pub same_site_is_home: bool,
+}
+
 /// Whether a request to a sandbox server came from somewhere allowed to
 /// send it: that server's own pages ("home", as `is_home` judges an
 /// origin's host and port), the model or user asking directly, or a plain
@@ -76,17 +92,17 @@ pub fn browser_sends_sec_fetch(host: &str) -> bool {
 /// when they share a domain. So a same-site request also needs to be a
 /// GET/HEAD page load, or a GET/HEAD whose `Referer` is home (SME-173).
 /// smelt's own preview links send no `Referer` (`noreferrer`), so they get
-/// through as page loads.
+/// through as page loads. Where every page same-site with the address is
+/// home (`Destination::same_site_is_home`), `same-site` is enough.
 ///
-/// `sends_sec_fetch` says whether the browser sends `Sec-Fetch-*` to the
-/// address it used (`browser_sends_sec_fetch`). Where it does, a request
-/// with neither header isn't from a browser page at all. Where it doesn't
-/// (a container's plain-http address), another site's `<img>` arrives with
-/// neither, so only a GET/HEAD page load (`Upgrade-Insecure-Requests`) or
-/// a request whose `Referer` is home gets through (SME-90).
+/// Where the browser sends no `Sec-Fetch-*` (`Destination::sends_sec_fetch`,
+/// a container's plain-http address), another site's `<img>` arrives with
+/// neither header, so only a GET/HEAD page load (`Upgrade-Insecure-Requests`)
+/// or a request whose `Referer` is home gets through (SME-90). Where it does,
+/// a request with neither header isn't from a browser page at all.
 pub fn allows_request_from(
     source: &RequestSource,
-    sends_sec_fetch: bool,
+    destination: Destination,
     is_home: impl Fn(&str, Option<u16>) -> bool,
 ) -> bool {
     // "null" (an opaque origin) and anything unparseable aren't home.
@@ -106,10 +122,10 @@ pub fn allows_request_from(
         Some("same-origin" | "none") => true,
         // Every preview shares a site with the others (and with smelt when
         // they share a domain), so `same-site` alone says nothing (SME-173).
-        Some("same-site") => navigation || referer_is_home,
+        Some("same-site") => destination.same_site_is_home || navigation || referer_is_home,
         // `cross-site`, and any value browsers don't send.
         Some(_) => navigation,
-        None if sends_sec_fetch => true,
+        None if destination.sends_sec_fetch => true,
         None => referer_is_home || (get_or_head && source.upgrade_insecure_requests),
     }
 }
@@ -306,6 +322,13 @@ mod tests {
         }
     }
 
+    /// A `*.preview.localhost` preview, same-site with every other.
+    const PREVIEW: Destination = Destination { sends_sec_fetch: true, same_site_is_home: false };
+    /// `localhost` in the model's browser, where same-site means the sandbox.
+    const SANDBOX_ROUTE: Destination = Destination { sends_sec_fetch: true, same_site_is_home: true };
+    /// A container's plain-http address, which gets no `Sec-Fetch-*`.
+    const CONTAINER: Destination = Destination { sends_sec_fetch: false, same_site_is_home: true };
+
     fn sandbox_home(host: &str, _port: Option<u16>) -> bool {
         is_sandbox_host(host)
     }
@@ -329,7 +352,7 @@ mod tests {
             ("a link from another site", source("GET", None, Some("cross-site"), Some("navigate"))),
             ("not a browser", source("POST", None, None, None)),
         ] {
-            assert!(allows_request_from(&s, true, sandbox_home), "{what} should be allowed");
+            assert!(allows_request_from(&s, SANDBOX_ROUTE, sandbox_home), "{what} should be allowed");
         }
     }
 
@@ -343,7 +366,7 @@ mod tests {
             ("a cross-site POST page load", source("POST", None, Some("cross-site"), Some("navigate"))),
             ("an opaque origin", source("POST", Some("null"), Some("cross-site"), Some("cors"))),
         ] {
-            assert!(!allows_request_from(&s, true, sandbox_home), "{what} should be refused");
+            assert!(!allows_request_from(&s, SANDBOX_ROUTE, sandbox_home), "{what} should be refused");
         }
     }
 
@@ -380,7 +403,7 @@ mod tests {
         ];
         let let_in: Vec<&str> = cases
             .iter()
-            .filter(|(_, s)| allows_request_from(s, true, preview_42))
+            .filter(|(_, s)| allows_request_from(s, PREVIEW, preview_42))
             .map(|(what, _)| *what)
             .collect();
         assert!(let_in.is_empty(), "these should be refused: {let_in:#?}");
@@ -396,11 +419,17 @@ mod tests {
             ("the preview's own image", from_page("same-origin", "no-cors", Some("http://3000-42.preview.localhost:8181/"), false)),
             ("a typed URL", from_page("none", "navigate", None, true)),
         ] {
-            assert!(allows_request_from(&s, true, preview_42), "{what} should be allowed");
+            assert!(allows_request_from(&s, PREVIEW, preview_42), "{what} should be allowed");
         }
         // The model's browser: a sandbox page's image from another port.
         let image = from_page("same-site", "no-cors", Some("http://localhost:4400/"), false);
-        assert!(allows_request_from(&image, true, sandbox_or_container), "the sandbox page's own image");
+        assert!(allows_request_from(&image, SANDBOX_ROUTE, sandbox_or_container), "the sandbox page's own image");
+        // The same from a page with `Referrer-Policy: same-origin` (Django's
+        // default) or `no-referrer`: only the sandbox is same-site there
+        // (SME-173 review 1).
+        let no_referrer = from_page("same-site", "no-cors", None, false);
+        assert!(allows_request_from(&no_referrer, SANDBOX_ROUTE, sandbox_or_container), "a no-referrer sandbox page's image");
+        assert!(!allows_request_from(&no_referrer, PREVIEW, preview_42), "but not at a preview");
     }
 
     #[test]
@@ -425,7 +454,7 @@ mod tests {
             ("a page on localhost", plain("GET", Some("http://localhost:5173/"), false)),
             ("the page's own POST", source("POST", Some("http://172.20.0.2:8080"), None, None)),
         ] {
-            assert!(allows_request_from(&s, false, sandbox_or_container), "{what} should be allowed");
+            assert!(allows_request_from(&s, CONTAINER, sandbox_or_container), "{what} should be allowed");
         }
     }
 
@@ -440,7 +469,7 @@ mod tests {
             ("an unparseable referrer", plain("GET", Some("not a url"), false)),
             ("another site's POST", source("POST", Some("http://evil.test:8703"), None, None)),
         ] {
-            assert!(!allows_request_from(&s, false, sandbox_or_container), "{what} should be refused");
+            assert!(!allows_request_from(&s, CONTAINER, sandbox_or_container), "{what} should be refused");
         }
     }
 }

@@ -389,7 +389,9 @@ mod server {
             let authority = port.map_or_else(|| host.to_string(), |port| format!("{host}:{port}"));
             template.match_host(&authority).is_some_and(|(origin_conversation, _, _)| origin_conversation == conversation)
         };
-        if !crate::fetch_guard::allows_request_from(&source, sends_sec_fetch, is_home) {
+        // Every preview is same-site with every other (SME-173).
+        let destination = crate::fetch_guard::Destination { sends_sec_fetch, same_site_is_home: false };
+        if !crate::fetch_guard::allows_request_from(&source, destination, is_home) {
             return text_response(
                 StatusCode::FORBIDDEN,
                 "Refused: a page from another site tried to reach this preview. Open the preview's \
