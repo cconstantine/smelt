@@ -66,8 +66,10 @@
 # It never stops a server it didn't start: stop that one yourself, or use
 # another CHECK_PORT. While it waits for the server, an answer counts only
 # when every listener on the port is in the server's own process group,
-# before and after the request; one that isn't, appearing at any point,
-# ends the start with exit 1, naming it, and leaves this server to stop.
+# before and after each request; one that isn't, seen at any of those
+# checks, ends the start with exit 1, naming it, and leaves this server to
+# stop. Only this network namespace's sockets are seen, and a listener that
+# comes and goes between two checks isn't (SME-175 review 2).
 #
 # A start and a stop of the same scratch database take a lock on the
 # database's own name ($SMELT_LOCK_DIR/smelt-check-scratch-<name>.lock)
@@ -674,7 +676,7 @@ case "${1:-}" in
         fi
         ;;
     *)
-        sed -n '2,77p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,79p' "$0" | sed 's/^# \{0,1\}//'
         exit 2
         ;;
 esac
