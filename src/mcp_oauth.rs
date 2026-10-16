@@ -193,8 +193,9 @@ impl PgCredentialStore {
 
 /// One in-flight authorization attempt per server id — holds the whole
 /// `OAuthState::Session` and its state store (the PKCE verifier, CSRF token
-/// and expected issuer for this attempt) between `start` and the callback,
-/// which ends it whatever the outcome. An attempt is bound to the URL it
+/// and expected issuer for this attempt) between `start` and the callback
+/// carrying its state, which ends it whatever the outcome; a callback
+/// without its state leaves it pending (SME-177). An attempt is bound to the URL it
 /// started for: its manager's store saves the grant only while the row
 /// still has that URL (SME-166), so an edit or a delete needn't touch it. In-memory only: a
 /// restart mid-login just means starting over, the same class of accepted
@@ -530,8 +531,8 @@ impl rmcp::transport::auth::OAuthHttpClient for ProviderHttpClient {
     }
 }
 
-/// Completes an in-flight authorization attempt — pops `server_id`'s
-/// pending `OAuthState`, exchanges `code` for tokens, and persists them via
+/// Completes an in-flight authorization attempt — takes `server_id`'s
+/// pending `OAuthState` if `csrf_token` is its state, exchanges `code` for tokens, and persists them via
 /// `PgCredentialStore` (through `OAuthState::handle_callback_with_issuer`'s
 /// own call into the manager's configured credential store).
 /// `code`/`csrf_token`/`issuer` come straight from the callback request's
