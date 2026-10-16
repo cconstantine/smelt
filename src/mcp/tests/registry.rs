@@ -73,6 +73,9 @@ async fn test_a_connect_finishing_after_a_url_edit_is_not_kept(pool: sqlx::PgPoo
     finish(turn).await;
 
     assert!(!connected(config.id).await, "the connection to the old URL was kept");
+    // One attempt, held across the evict: the generation check refused
+    // it, not an evict that removed a retry (review 1).
+    assert_eq!(a.initializes(), 1);
     assert_eq!(tool_names(&pool, &edited).await, named(&edited, "tool_b"));
     evict(config.id).await;
 }
@@ -94,6 +97,9 @@ async fn test_a_connect_finishing_after_a_header_edit_is_not_kept(pool: sqlx::Pg
     finish(turn).await;
 
     assert!(!connected(config.id).await, "the connection with the old header was kept");
+    // One attempt, held across the evict: the generation check refused
+    // it, not an evict that removed a retry (review 1).
+    assert_eq!(a.initializes(), 1);
     assert_eq!(tool_names(&pool, &edited).await, named(&edited, "tool_a"));
     assert_eq!(
         a.initialize_headers(),
@@ -120,6 +126,9 @@ async fn test_a_connect_finishing_after_a_delete_is_not_kept(pool: sqlx::PgPool)
     finish(turn).await;
 
     assert!(!connected(config.id).await, "the deleted server's connection was kept");
+    // One attempt, held across the evict: the generation check refused
+    // it, not an evict that removed a retry (review 1).
+    assert_eq!(a.initializes(), 1);
     let called = tokio::time::timeout(WAIT, call_tool(&pool, &config, "tool_a", serde_json::json!({})))
         .await
         .expect("the call didn't finish in time");
