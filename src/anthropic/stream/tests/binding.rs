@@ -90,7 +90,7 @@ async fn recording_upstream(
     let endpoint = Endpoint {
         base_url: format!("http://{addr}"),
         auth: Auth::ApiKey(format!("recording-upstream-{n}")),
-        limiter: None,
+        slots_of: None,
     };
     (endpoint, seen)
 }

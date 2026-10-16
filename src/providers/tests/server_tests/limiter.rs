@@ -27,53 +27,58 @@ fn provider_row(id: i64, max: Option<i32>, total_slots: Option<u32>) -> db::Infe
     }
 }
 
+/// The free slots of the provider an endpoint takes its slots from now.
 fn permits(endpoint: &Endpoint) -> Option<usize> {
-    endpoint.limiter.as_ref().map(|pool| pool.available_permits())
+    limiter::current(endpoint.slots_of.expect("a model endpoint")).map(|pool| pool.available_permits())
 }
 
 #[test]
-fn test_a_limit_gives_one_pool_of_that_many_slots_until_it_changes() {
+fn test_a_limit_keeps_one_pool_of_that_many_slots_until_it_changes() {
     let id = 9_162_000_001;
-    assert!(limiter::slots(id, None).is_none(), "no limit, no pool");
+    limiter::set(id, None);
+    assert!(limiter::current(id).is_none(), "no limit, no pool");
 
-    let first = limiter::slots(id, Some(2)).expect("a pool");
+    limiter::set(id, Some(2));
+    let first = limiter::current(id).expect("a pool");
     assert_eq!(first.available_permits(), 2);
-    let again = limiter::slots(id, Some(2)).expect("a pool");
-    assert!(Arc::ptr_eq(&first, &again), "the same limit shares one pool");
+    limiter::set(id, Some(2));
+    assert!(Arc::ptr_eq(&first, &limiter::current(id).expect("a pool")), "the same limit keeps its pool");
 
     let held = first.clone().try_acquire_owned().expect("a free slot");
-    let resized = limiter::slots(id, Some(3)).expect("a pool");
+    limiter::set(id, Some(3));
+    let resized = limiter::current(id).expect("a pool");
     assert!(!Arc::ptr_eq(&first, &resized), "a new limit, a new pool");
     assert_eq!(resized.available_permits(), 3, "the old pool's held slot isn't counted");
-    assert_eq!(first.available_permits(), 1, "the old pool still works for what holds it");
+    assert!(first.is_closed(), "the old pool is closed, so its waiters look again");
     drop(held);
-    assert_eq!(first.available_permits(), 2);
 }
 
 #[test]
-fn test_clearing_a_limit_or_forgetting_a_provider_drops_its_pool() {
+fn test_clearing_a_limit_or_forgetting_a_provider_closes_its_pool() {
     let id = 9_162_000_002;
-    let first = limiter::slots(id, Some(2)).expect("a pool");
-    assert!(limiter::slots(id, None).is_none(), "cleared");
-    let set_again = limiter::slots(id, Some(2)).expect("a pool");
-    assert!(!Arc::ptr_eq(&first, &set_again), "cleared and set again starts afresh");
+    limiter::set(id, Some(2));
+    let first = limiter::current(id).expect("a pool");
+    limiter::set(id, None);
+    assert!(limiter::current(id).is_none(), "cleared");
+    assert!(first.is_closed());
 
+    limiter::set(id, Some(2));
+    let set_again = limiter::current(id).expect("a pool");
+    assert!(!Arc::ptr_eq(&first, &set_again), "cleared and set again starts afresh");
     limiter::forget(id);
-    let after_forget = limiter::slots(id, Some(2)).expect("a pool");
-    assert!(!Arc::ptr_eq(&set_again, &after_forget), "forgotten, then built afresh");
+    assert!(limiter::current(id).is_none(), "forgotten");
+    assert!(set_again.is_closed());
 }
 
 #[test]
-fn test_an_endpoint_carries_its_providers_slots() {
+fn test_an_endpoint_names_its_provider_and_sets_its_pool() {
     let fixed = provider_row(9_162_000_003, Some(2), Some(5));
     let a = endpoint(&fixed);
-    let b = endpoint(&fixed);
+    assert_eq!(a.slots_of, Some(fixed.id));
     assert_eq!(permits(&a), Some(2), "a set count wins over the server's");
-    assert!(
-        Arc::ptr_eq(a.limiter.as_ref().expect("slots"), b.limiter.as_ref().expect("slots")),
-        "two builds share the one pool"
-    );
-    assert_eq!(a, b, "and still compare equal");
+    let pool = limiter::current(fixed.id).expect("a pool");
+    endpoint(&fixed);
+    assert!(Arc::ptr_eq(&pool, &limiter::current(fixed.id).expect("a pool")), "two builds keep the one pool");
 
     assert_eq!(permits(&endpoint(&provider_row(9_162_000_004, None, Some(5)))), None, "no limit");
 }
@@ -89,9 +94,8 @@ fn test_automatic_takes_the_servers_slot_count_once_it_has_one() {
 
     let three = endpoint(&provider_row(id, Some(0), Some(3)));
     assert_eq!(permits(&three), Some(3));
-    let one = endpoint(&provider_row(id, Some(0), Some(1)));
-    assert_eq!(permits(&one), Some(1), "a new report, read on the next build");
-    assert!(!Arc::ptr_eq(three.limiter.as_ref().expect("slots"), one.limiter.as_ref().expect("slots")));
+    endpoint(&provider_row(id, Some(0), Some(1)));
+    assert_eq!(permits(&three), Some(1), "a new report applies to an endpoint built before it");
 }
 
 /// Deleting a provider forgets its pool, which would otherwise stay
@@ -107,10 +111,32 @@ async fn test_deleting_a_provider_forgets_its_slots(pool: PgPool) {
         .await
         .expect("create");
     assert_eq!(row.id, 9_162_000_006);
-    let built = endpoint(&row).limiter.expect("slots");
+    endpoint(&row);
+    let built = limiter::current(row.id).expect("slots");
 
     delete_provider(&pool, row.id).await.expect("delete");
 
-    let rebuilt = limiter::slots(row.id, Some(2)).expect("a pool");
-    assert!(!Arc::ptr_eq(&built, &rebuilt), "the deleted provider's pool was forgotten");
+    assert!(limiter::current(row.id).is_none(), "the deleted provider's pool was forgotten");
+    assert!(built.is_closed());
+}
+
+/// SME-162 review 1: saving a new limit sets the provider's pool at
+/// once, not at the next endpoint build, so a turn already running takes
+/// it from its next model call.
+#[sqlx::test]
+async fn test_saving_a_limit_sets_the_providers_pool_at_once(pool: PgPool) {
+    sqlx::query("ALTER TABLE inference_providers ALTER COLUMN id RESTART WITH 9162000007")
+        .execute(&pool)
+        .await
+        .expect("renumber");
+    let created = create_provider(&pool, ProviderInput { max_concurrent_requests: Some(2), ..input("h", "http://h", "k") })
+        .await
+        .expect("create");
+    assert_eq!(limiter::current(created.id).map(|p| p.available_permits()), Some(2), "set on create");
+    update_provider(&pool, created.id, ProviderInput { max_concurrent_requests: Some(1), ..input("h", "http://h", "") })
+        .await
+        .expect("update");
+    assert_eq!(limiter::current(created.id).map(|p| p.available_permits()), Some(1), "set on update");
+    update_provider(&pool, created.id, input("h", "http://h", "")).await.expect("clear");
+    assert!(limiter::current(created.id).is_none(), "cleared on update");
 }

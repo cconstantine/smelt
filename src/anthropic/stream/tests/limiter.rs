@@ -110,8 +110,12 @@ async fn start_gated_upstream(fail_first: Option<&'static str>, mid_body: bool) 
     (addr, upstream)
 }
 
-fn limited(addr: std::net::SocketAddr, slots: Option<usize>) -> Endpoint {
-    Endpoint { limiter: slots.map(|n| Arc::new(tokio::sync::Semaphore::new(n))), ..test_endpoint(addr) }
+/// An endpoint taking the slots of provider `id`, whose limit is set to
+/// `slots`. The pools are process-wide by provider id: each test uses
+/// an id of its own (9_162_000_1xx and 2xx).
+fn limited(addr: std::net::SocketAddr, id: i64, slots: Option<u32>) -> Endpoint {
+    crate::providers::limiter::set(id, slots);
+    Endpoint { slots_of: Some(id), ..test_endpoint(addr) }
 }
 
 fn call(endpoint: &Endpoint, model: &str) -> impl std::future::Future<Output = Result<StreamedTurn, String>> + Send + 'static {
@@ -145,7 +149,7 @@ async fn finished(task: tokio::task::JoinHandle<Result<StreamedTurn, String>>) -
 #[tokio::test]
 async fn test_the_second_request_to_a_busy_provider_waits_for_a_slot() {
     let (addr, upstream) = start_gated_upstream(None, false).await;
-    let endpoint = limited(addr, Some(1));
+    let endpoint = limited(addr, 9_162_000_111, Some(1));
     let a = tokio::spawn(call(&endpoint, "a"));
     upstream.wait_for_arrivals(1).await;
     let b = tokio::spawn(call(&endpoint, "b"));
@@ -167,7 +171,7 @@ async fn test_the_second_request_to_a_busy_provider_waits_for_a_slot() {
 #[tokio::test]
 async fn test_the_slot_is_held_until_the_stream_ends() {
     let (addr, upstream) = start_gated_upstream(None, true).await;
-    let endpoint = limited(addr, Some(1));
+    let endpoint = limited(addr, 9_162_000_112, Some(1));
     let a = tokio::spawn(call(&endpoint, "a"));
     upstream.wait_for_arrivals(1).await;
     let b = tokio::spawn(call(&endpoint, "b"));
@@ -188,7 +192,7 @@ async fn test_the_slot_is_held_until_the_stream_ends() {
 #[tokio::test]
 async fn test_the_slot_is_held_across_transient_retries() {
     let (addr, upstream) = start_gated_upstream(Some("a"), false).await;
-    let endpoint = limited(addr, Some(1));
+    let endpoint = limited(addr, 9_162_000_113, Some(1));
     let a = tokio::spawn(call(&endpoint, "a"));
     upstream.wait_for_arrivals(1).await;
     let b = tokio::spawn(call(&endpoint, "b"));
@@ -212,7 +216,7 @@ async fn test_the_slot_is_held_across_transient_retries() {
 #[tokio::test]
 async fn test_a_cancelled_waiter_takes_no_slot() {
     let (addr, upstream) = start_gated_upstream(None, false).await;
-    let endpoint = limited(addr, Some(1));
+    let endpoint = limited(addr, 9_162_000_114, Some(1));
     let a = tokio::spawn(call(&endpoint, "a"));
     upstream.wait_for_arrivals(1).await;
     let b = tokio::spawn(call(&endpoint, "b"));
@@ -228,7 +232,8 @@ async fn test_a_cancelled_waiter_takes_no_slot() {
     finished(c).await;
     assert_eq!(upstream.arrivals(), ["a", "c"], "b never sent");
     assert_eq!(upstream.peak.load(Ordering::SeqCst), 1);
-    assert_eq!(endpoint.limiter.as_ref().expect("slots").available_permits(), 1, "every slot back");
+    let pool = crate::providers::limiter::current(endpoint.slots_of.expect("slots")).expect("a pool");
+    assert_eq!(pool.available_permits(), 1, "every slot back");
 }
 
 /// With no limit set (every provider's default), calls go out at once,
@@ -236,7 +241,7 @@ async fn test_a_cancelled_waiter_takes_no_slot() {
 #[tokio::test]
 async fn test_a_provider_without_a_limit_sends_at_once() {
     let (addr, upstream) = start_gated_upstream(None, false).await;
-    let endpoint = limited(addr, None);
+    let endpoint = limited(addr, 9_162_000_115, None);
     let a = tokio::spawn(call(&endpoint, "a"));
     let b = tokio::spawn(call(&endpoint, "b"));
     upstream.wait_for_arrivals(2).await;
@@ -245,4 +250,76 @@ async fn test_a_provider_without_a_limit_sends_at_once() {
     upstream.release_one();
     finished(a).await;
     finished(b).await;
+}
+
+/// SME-162 review 1: a limit set while a turn runs applies from its next
+/// model call. The turn's endpoint was built with no limit; then the
+/// user saves 1.
+#[sqlx::test]
+async fn test_a_limit_saved_mid_turn_applies_to_its_next_call(pool: sqlx::PgPool) {
+    let (addr, upstream) = start_gated_upstream(None, false).await;
+    let provider = provider_at(&pool, addr, 9_162_000_201, None).await;
+    let endpoint = crate::providers::endpoint(&provider);
+    save_limit(&pool, &provider, Some(1)).await;
+
+    let a = tokio::spawn(call(&endpoint, "a"));
+    upstream.wait_for_arrivals(1).await;
+    let b = tokio::spawn(call(&endpoint, "b"));
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(upstream.arrivals(), ["a"], "the running turn's endpoint takes the new limit");
+    upstream.release_one();
+    finished(a).await;
+    upstream.wait_for_arrivals(2).await;
+    upstream.release_one();
+    finished(b).await;
+}
+
+/// SME-162 review 1: a call waiting for a slot when the limit is raised
+/// goes at once, instead of waiting on the old pool.
+#[sqlx::test]
+async fn test_a_waiting_call_takes_a_raised_limit_at_once(pool: sqlx::PgPool) {
+    let (addr, upstream) = start_gated_upstream(None, false).await;
+    let provider = provider_at(&pool, addr, 9_162_000_202, Some(1)).await;
+    let endpoint = crate::providers::endpoint(&provider);
+    let a = tokio::spawn(call(&endpoint, "a"));
+    upstream.wait_for_arrivals(1).await;
+    let b = tokio::spawn(call(&endpoint, "b"));
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(upstream.arrivals(), ["a"]);
+
+    save_limit(&pool, &provider, Some(2)).await;
+    upstream.wait_for_arrivals(2).await;
+    upstream.release_one();
+    upstream.release_one();
+    finished(a).await;
+    finished(b).await;
+}
+
+/// A provider at `addr` with id `id` and the given limit.
+async fn provider_at(pool: &sqlx::PgPool, addr: std::net::SocketAddr, id: i64, max: Option<i32>) -> crate::db::InferenceProvider {
+    sqlx::query(&format!("ALTER TABLE inference_providers ALTER COLUMN id RESTART WITH {id}"))
+        .execute(pool)
+        .await
+        .expect("renumber");
+    let provider = crate::db::create_inference_provider(pool, "p", "other", &format!("http://{addr}"), "api_key", "test-key", false, None, true, max)
+        .await
+        .expect("create provider");
+    assert_eq!(provider.id, id);
+    provider
+}
+
+/// Saves `max` on the provider's form, as the user would.
+async fn save_limit(pool: &sqlx::PgPool, provider: &crate::db::InferenceProvider, max: Option<u32>) {
+    let input = crate::providers::ProviderInput {
+        name: provider.name.clone(),
+        kind: crate::providers::ProviderKind::Other,
+        base_url: provider.base_url.clone(),
+        auth_kind: crate::providers::AuthKind::ApiKey,
+        secret: String::new(),
+        prompt_caching: false,
+        price_catalog_provider: None,
+        keep_reasoning: true,
+        max_concurrent_requests: max,
+    };
+    crate::providers::update_provider(pool, provider.id, input).await.expect("save the limit");
 }

@@ -21,21 +21,15 @@ impl std::fmt::Debug for Auth {
 
 /// A model provider to send requests to: its base URL and credential,
 /// from its `inference_providers` row (`providers::endpoint`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Endpoint {
     pub base_url: String,
     pub auth: Auth,
-    /// The provider's request slots when it has a max concurrent
-    /// requests (SME-162): a model call holds one from before it sends
-    /// until it ends. `None` is no limit, and for every probe.
-    pub limiter: Option<std::sync::Arc<tokio::sync::Semaphore>>,
-}
-
-// By hand: the slots aren't part of which provider it is.
-impl PartialEq for Endpoint {
-    fn eq(&self, other: &Self) -> bool {
-        self.base_url == other.base_url && self.auth == other.auth
-    }
+    /// The provider whose request slots a model call takes (SME-162),
+    /// looked up at each call (`providers::limiter`), so a limit changed
+    /// mid-turn applies from the turn's next call. `None` for every
+    /// probe, which takes none.
+    pub slots_of: Option<i64>,
 }
 
 /// How long a model call waits for a request slot before it says so in
@@ -45,28 +39,40 @@ const SLOW_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 impl Endpoint {
     /// Waits for one of the provider's request slots, when it has a limit
     /// (SME-162), and holds it until the returned permit drops: when the
-    /// call ends, fails, or is dropped (a Stop). A wait past
-    /// `SLOW_SLOT_WAIT` is logged once, naming the host only.
-    pub(super) async fn slot(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, String> {
-        let Some(pool) = self.limiter.clone() else {
-            return Ok(None);
-        };
-        let acquire = pool.acquire_owned();
-        tokio::pin!(acquire);
-        let permit = tokio::select! {
-            permit = &mut acquire => permit,
-            () = tokio::time::sleep(SLOW_SLOT_WAIT) => {
-                let host = url::Url::parse(&self.base_url).ok().and_then(|u| u.host_str().map(str::to_string));
-                tracing::warn!(
-                    waited_secs = SLOW_SLOT_WAIT.as_secs(),
-                    host = host.as_deref().unwrap_or(""),
-                    "waiting for a free request slot on the model provider"
-                );
+    /// call ends, fails, or is dropped (a Stop). A pool closed while it
+    /// waits (the limit changed) sends it to the provider's pool now, or
+    /// on at once if the limit is gone. A wait past `SLOW_SLOT_WAIT` is
+    /// logged once, naming the host only.
+    pub(super) async fn slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let provider_id = self.slots_of?;
+        let slow = tokio::time::Instant::now() + SLOW_SLOT_WAIT;
+        let mut warned = false;
+        loop {
+            let pool = crate::providers::limiter::current(provider_id)?;
+            let acquire = pool.acquire_owned();
+            tokio::pin!(acquire);
+            let acquired = if warned {
                 acquire.await
+            } else {
+                tokio::select! {
+                    acquired = &mut acquire => acquired,
+                    () = tokio::time::sleep_until(slow) => {
+                        warned = true;
+                        let host = url::Url::parse(&self.base_url).ok().and_then(|u| u.host_str().map(str::to_string));
+                        tracing::warn!(
+                            waited_secs = SLOW_SLOT_WAIT.as_secs(),
+                            host = host.as_deref().unwrap_or(""),
+                            "waiting for a free request slot on the model provider"
+                        );
+                        acquire.await
+                    }
+                }
+            };
+            // Only a pool its limit's change closed refuses: look again.
+            if let Ok(permit) = acquired {
+                return Some(permit);
             }
-        };
-        // Only a closed pool refuses, and no pool is ever closed.
-        permit.map(Some).map_err(|_| "the model provider's request slots were closed".to_string())
+        }
     }
 
     /// `path` (starting with `/`) under the base URL.

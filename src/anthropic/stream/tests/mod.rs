@@ -4,7 +4,7 @@ fn test_endpoint(addr: std::net::SocketAddr) -> Endpoint {
     Endpoint {
         base_url: format!("http://{addr}"),
         auth: Auth::ApiKey("test-key".to_string()),
-        limiter: None,
+        slots_of: None,
     }
 }
 

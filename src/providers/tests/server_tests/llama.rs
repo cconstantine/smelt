@@ -2,7 +2,7 @@ use super::*;
 
 fn llama_turn_model(template: Option<TemplateSettings>) -> TurnModel {
     TurnModel { adaptive_thinking: true,
-        endpoint: Endpoint { base_url: "http://llama".to_string(), auth: Auth::Bearer("k".to_string()), limiter: None },
+        endpoint: Endpoint { base_url: "http://llama".to_string(), auth: Auth::Bearer("k".to_string()), slots_of: None },
         provider_id: 1,
         model: "flash-next".to_string(),
         thinking: true,
@@ -230,6 +230,30 @@ async fn test_a_llama_cpp_providers_props_are_kept_and_used_by_its_turns(pool: P
     let listing = provider_models(&pool, p.id, true).await.expect("models");
     assert!(listing.server_error.as_deref().is_some_and(|e| e.contains("503")), "{listing:?}");
     assert_eq!(listing.server_caps, Some(caps));
+}
+
+/// SME-162 review 1: an automatic provider's page reading `/props`
+/// sets its pool from the count at once, so a turn already running
+/// takes it from its next model call.
+#[sqlx::test]
+async fn test_reading_props_sets_an_automatic_providers_pool_at_once(pool: PgPool) {
+    let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let base = mock_llama_cpp(up).await;
+    // The pools are process-wide by provider id: an id of its own.
+    sqlx::query("ALTER TABLE inference_providers ALTER COLUMN id RESTART WITH 9162000301")
+        .execute(&pool)
+        .await
+        .expect("renumber");
+    let p = db::create_inference_provider(&pool, "llama", "llama_cpp", &base, "bearer", "k", false, None, false, Some(0))
+        .await
+        .expect("create");
+    let running = endpoint(&p);
+    assert!(crate::providers::limiter::current(p.id).is_none(), "nothing read yet: no limit");
+
+    provider_models(&pool, p.id, true).await.expect("models");
+
+    let slots = crate::providers::limiter::current(running.slots_of.expect("a model endpoint"));
+    assert_eq!(slots.map(|s| s.available_permits()), Some(1), "the fixture's one slot");
 }
 
 /// SME-111 review 2: the picker's quick listing (no `/props`)
