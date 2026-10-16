@@ -350,6 +350,13 @@ pub(super) fn new_turn_generation(conversation_id: i64) -> u64 {
     })
 }
 
+/// Forgets `conversation_id`'s turn generation and kept error, for a turn
+/// that found its conversation deleted: the generation it took would
+/// otherwise keep the conversation's turn state for good (SME-179 B31).
+pub(super) fn forget_turn_generation(conversation_id: i64) {
+    update_existing(conversation_id, |runtime| runtime.kept = KeptTurnError::default());
+}
+
 /// Keeps `error` as `conversation_id`'s, if `generation` is still its
 /// latest turn generation.
 pub(super) fn keep_turn_error(conversation_id: i64, generation: u64, error: String) {
@@ -390,4 +397,11 @@ pub(super) fn holds_lock_and_stops(conversation_id: i64) -> (bool, bool) {
 #[cfg(test)]
 pub(super) fn turns_in_flight(conversation_id: i64) -> usize {
     read_runtime(conversation_id, |runtime| runtime.turns_in_flight).unwrap_or(0)
+}
+
+/// Whether `conversation_id` has any turn state at all, for tests of
+/// what's freed.
+#[cfg(test)]
+pub(super) fn has_turn_state(conversation_id: i64) -> bool {
+    read_runtime(conversation_id, |_| ()).is_some()
 }

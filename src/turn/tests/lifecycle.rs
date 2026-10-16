@@ -359,3 +359,80 @@ async fn test_a_wake_that_calls_the_model_replaces_the_kept_error(pool: PgPool) 
     assert_eq!(requests.load(Ordering::SeqCst), 2, "the wake called the model");
     assert_eq!(last_turn_error(conversation_id), None, "the older failure outlived a newer turn");
 }
+
+/// What `delete_conversation` does to the turn engine and the database:
+/// stop, delete, forget.
+async fn delete_as_the_api_does(pool: &PgPool, conversation_id: i64) {
+    stop_turn_now(conversation_id);
+    db::delete_conversation(pool, conversation_id).await.expect("delete");
+    forget_conversation_lock(conversation_id);
+    assert!(!has_turn_state(conversation_id), "the delete itself left turn state");
+}
+
+/// B31: a notice delivered, or a wake, after the conversation is
+/// deleted, and a send racing the delete (its generation taken after
+/// the delete forgot the old one), each fail and leave no turn state
+/// behind. Today each left a turn generation, so the entry was never
+/// idle again, for the life of the process.
+#[sqlx::test]
+async fn test_a_notice_after_a_delete_leaves_no_turn_state(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+
+    let delivered = db::create_conversation(&pool).await.expect("create conversation").id;
+    delete_as_the_api_does(&pool, delivered).await;
+    deliver_notice(&pool, delivered, "Docker in your sandbox was restarted.".to_string()).await;
+    assert!(!has_turn_state(delivered), "a delivered notice left turn state");
+
+    let woken = db::create_conversation(&pool).await.expect("create conversation").id;
+    delete_as_the_api_does(&pool, woken).await;
+    let woke = wake_conversation(&pool, woken).await;
+    assert!(
+        woke.as_ref().is_ok_and(Vec::is_empty) || woke.as_ref().is_err_and(|e| e.to_string().contains("not found")),
+        "{woke:?}"
+    );
+    assert!(!has_turn_state(woken), "a wake left turn state");
+
+    let sent = db::create_conversation(&pool).await.expect("create conversation").id;
+    delete_as_the_api_does(&pool, sent).await;
+    // `start_turn`'s own step, after its exists check passed.
+    new_turn_generation(sent);
+    let result = run_turn_bounded(&pool, sent, Some(hello()), MAX_TURNS, true, true).await;
+    assert!(result.as_ref().is_err_and(|e| e.to_string().contains("not found")), "{result:?}");
+    assert!(!has_turn_state(sent), "a send racing the delete left turn state");
+}
+
+/// Row 5's check then act, interleaving: the delete (stop, delete,
+/// forget, as the API does) lands after the turn's exists check passed
+/// (the turn paused right after saving its message). The turn ends, and
+/// its turn state ends idle and gone. A guard: today's code passes it
+/// too, since the delete's forget already reset the generation the turn
+/// took when it was counted.
+#[sqlx::test]
+async fn test_a_delete_after_the_exists_check_leaves_no_turn_state(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    let (reached, release) = test_hooks::pause_after_message_saved(conversation_id);
+
+    new_turn_generation(conversation_id);
+    let turn = tokio::spawn({
+        let pool = pool.clone();
+        async move { run_turn_bounded(&pool, conversation_id, Some(hello()), MAX_TURNS, true, true).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached)
+        .await
+        .expect("the turn saves its message")
+        .expect("hook");
+    stop_turn_now(conversation_id);
+    db::delete_conversation(&pool, conversation_id).await.expect("delete");
+    forget_conversation_lock(conversation_id);
+    let _ = release.send(());
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+        .await
+        .expect("the turn ends")
+        .expect("join");
+    assert!(result.is_err(), "{result:?}");
+    assert!(!has_turn_state(conversation_id), "the turn left turn state");
+}

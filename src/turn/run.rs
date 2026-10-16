@@ -259,10 +259,16 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
         if generation_taken {
             *generation = Some(new_turn_generation(conversation_id));
         }
+        // Checked after the generation is taken, both under the lock: a
+        // delete landing before the check is seen here, and one landing
+        // after it forgets the generation itself (`forget_conversation_lock`),
+        // so the turn's state ends idle either way (SME-179 B31). A notice
+        // or wake for a deleted conversation comes here too.
         if !db::conversation_exists(pool, conversation_id)
             .await
             .map_err(ServerFnError::new)?
         {
+            forget_turn_generation(conversation_id);
             return Err(ServerFnError::new("conversation not found").into());
         }
         // Saved holding the lock and outside the stop's `select!`, so a
