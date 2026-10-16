@@ -520,7 +520,7 @@ pub fn normalize_address(input: &str) -> Result<String, String> {
     if input.is_empty() {
         return Err("enter an address".to_string());
     }
-    if input.contains("://") {
+    if has_scheme(input) {
         return Ok(input.to_string());
     }
     let scheme = match url::Url::parse(&format!("http://{input}")) {
@@ -528,6 +528,16 @@ pub fn normalize_address(input: &str) -> Result<String, String> {
         _ => "https",
     };
     Ok(format!("{scheme}://{input}"))
+}
+
+/// Whether `input` starts with a scheme and `://`: a `://` later on (a
+/// return URL in the query, review 1) doesn't count. A scheme is a letter
+/// then letters, digits, `+`, `-` or `.`, as RFC 3986 has it.
+fn has_scheme(input: &str) -> bool {
+    input.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    })
 }
 
 /// Whether Chromium would keep a typed `url` on plain http: an IP, a

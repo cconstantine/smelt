@@ -169,6 +169,8 @@ fn test_normalize_address_gives_local_and_private_addresses_http() {
         // Review 1: a typed :80 is http's own port; https on it can't load.
         ("example.com:80", "http://example.com:80"),
         ("nas.corp:80", "http://nas.corp:80"),
+        // Review 1: a `://` later on (a return URL in the query) isn't a scheme.
+        ("localhost:5173/?next=http://x", "http://localhost:5173/?next=http://x"),
     ]);
     assert!(wrong.is_empty(), "wrong scheme for:\n{}", wrong.join("\n"));
 }
@@ -179,6 +181,7 @@ fn test_normalize_address_gives_public_names_https() {
         ("example.com", "https://example.com"),
         ("example.com/a?b=1", "https://example.com/a?b=1"),
         ("sub.example.co.uk", "https://sub.example.co.uk"),
+        ("example.com/r?u=https://y", "https://example.com/r?u=https://y"),
         // Only a whole label matches a local suffix: `contest` isn't `test`.
         ("shop.contest", "https://shop.contest"),
         // A private suffix not on the short list stays https (a trade-off).
@@ -196,6 +199,12 @@ fn test_normalize_address_gives_public_names_https() {
 fn test_normalize_address_keeps_an_explicit_scheme_and_trims() {
     assert_eq!(normalize_address("  http://example.com/x  ").unwrap(), "http://example.com/x");
     assert_eq!(normalize_address("https://example.com").unwrap(), "https://example.com");
+    assert_eq!(normalize_address("HTTP://Example.com").unwrap(), "HTTP://Example.com");
+    assert_eq!(normalize_address("chrome://version").unwrap(), "chrome://version");
+    assert_eq!(
+        normalize_address("http://localhost:5173/?next=http://x").unwrap(),
+        "http://localhost:5173/?next=http://x"
+    );
 }
 
 #[test]
