@@ -7,6 +7,8 @@ use serde_json::Value;
 
 use super::types::{ContentBlock, CreateMessageRequest, TokenUsage};
 
+mod lines;
+
 /// The fully assembled result of one streamed Anthropic turn: every content
 /// block (text and/or tool_use) in order, plus the `stop_reason` that says
 /// whether this turn is final or wants a tool run (`"tool_use"`).
@@ -814,7 +816,7 @@ async fn stream_message(
     };
 
     let mut byte_stream = response.bytes_stream();
-    let mut line_buffer = String::new();
+    let mut lines = lines::LineBuffer::default();
     let mut blocks = Blocks::default();
     let mut stop_reason = String::new();
     let mut usage = TokenUsage::default();
@@ -826,10 +828,9 @@ async fn stream_message(
 
         let Some(chunk) = next else { break };
         let chunk = chunk.map_err(|e| format!("error reading Anthropic response stream: {e}"))?;
-        line_buffer.push_str(&String::from_utf8_lossy(&chunk));
+        lines.push(&chunk);
 
-        while let Some(newline_pos) = line_buffer.find('\n') {
-            let line: String = line_buffer.drain(..=newline_pos).collect();
+        while let Some(line) = lines.next_line() {
             let line = line.trim();
             let Some(data) = line.strip_prefix("data: ") else {
                 continue;

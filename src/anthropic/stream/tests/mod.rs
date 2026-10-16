@@ -47,6 +47,56 @@ async fn run_against_mock_upstream(
     stream_anthropic_message(&test_endpoint(addr), &request, on_delta).await
 }
 
+/// Like `run_against_mock_upstream`, but serves the body as the given
+/// chunks, pausing before each after the first so each reaches the
+/// client as its own read (SME-169).
+async fn run_against_chunked_upstream(
+    chunks: Vec<Vec<u8>>,
+    on_delta: impl FnMut(&str),
+) -> Result<StreamedTurn, String> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+
+    let app = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(move || {
+            let chunks = chunks.clone();
+            async move {
+                let stream = futures_util::stream::iter(chunks.into_iter().enumerate()).then(|(i, chunk)| async move {
+                    if i > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk))
+                });
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(stream),
+                )
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    let request = CreateMessageRequest {
+        model: "claude-opus-4-8".to_string(),
+        max_tokens: 100,
+        system: None,
+        messages: vec![],
+        stream: true,
+        tools: vec![],
+        thinking: None,
+        prompt_caching: false,
+        output_config: None,
+        chat_template_kwargs: None,
+    };
+
+    stream_anthropic_message(&test_endpoint(addr), &request, on_delta).await
+}
+
 /// The body a paused provider actually returned during the bug bash,
 /// relayed through an Anthropic-compatible router: the provider's
 /// message is JSON inside the Anthropic error's own `message`.

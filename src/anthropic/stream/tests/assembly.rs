@@ -304,3 +304,50 @@ async fn test_an_unparseable_tool_input_still_fails_the_call() {
         assert!(err.contains("failed to parse tool_use input JSON for add"), "{err}");
     }
 }
+
+/// SME-169: a character whose bytes arrive in two network chunks is
+/// decoded whole, in a reply's text and in a tool's input alike.
+#[tokio::test]
+async fn test_a_character_split_across_two_chunks_is_decoded_whole() {
+    let [start, input] = tool_at(1, "call_a", r#"{"a":"中"}"#);
+    let [delta, stop] = tool_use_end();
+    let body = sse(&[
+        serde_json::json!({"type": "message_start"}),
+        text_at(0, "a crab 🦀 here"),
+        stop_at(0),
+        start,
+        input,
+        stop_at(1),
+        delta,
+        stop,
+    ])
+    .as_bytes();
+    let crab = body.windows(4).position(|w| w == "🦀".as_bytes()).expect("the crab is in the body");
+    let zhong = body.windows(3).position(|w| w == "中".as_bytes()).expect("中 is in the body");
+    let chunks = vec![
+        body[..crab + 2].to_vec(),
+        body[crab + 2..zhong + 1].to_vec(),
+        body[zhong + 1..].to_vec(),
+    ];
+
+    let mut deltas = String::new();
+    let turn = run_against_chunked_upstream(chunks, |d| deltas.push_str(d))
+        .await
+        .expect("stream should succeed");
+
+    // One assertion, so a failure shows the live text and both blocks.
+    assert_eq!(
+        (deltas.as_str(), turn.content),
+        (
+            "a crab 🦀 here",
+            vec![
+                text("a crab 🦀 here"),
+                ContentBlock::ToolUse {
+                    id: "call_a".to_string(),
+                    name: "add".to_string(),
+                    input: serde_json::json!({"a": "中"}),
+                },
+            ]
+        )
+    );
+}
