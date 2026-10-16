@@ -12,7 +12,8 @@
 //! before every request, refreshing it when it's expiring (SME-113).
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use rmcp::transport::auth::{
     AuthError, AuthorizationManager, AuthorizationRequest, CredentialStore, InMemoryStateStore,
@@ -163,6 +164,49 @@ struct PendingAttempt {
     /// which `rmcp` checks on a code callback but which an error callback
     /// has to be checked against here (`verify_error_callback`).
     stored: InMemoryStateStore,
+}
+
+/// How long a failed callback's error waits for its page to take it.
+const CALLBACK_ERROR_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// The last failed callback's error per server id, and when it was kept
+/// (SME-168). The callback redirects with only `?oauth_callback=1`, and the
+/// edit page takes the text from here (`take_callback_error`), so no text
+/// in a link can show as smelt's own error. A successful callback clears
+/// the slot; a take empties it; an entry older than `CALLBACK_ERROR_TTL`
+/// is refused on take and pruned on the next record. In memory: a restart
+/// between the callback and its page load loses the text, and the status
+/// section still says the server isn't connected. A plain `Mutex`: nothing
+/// is awaited while it's held.
+static CALLBACK_ERRORS: LazyLock<StdMutex<HashMap<i64, (String, Instant)>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn callback_errors() -> std::sync::MutexGuard<'static, HashMap<i64, (String, Instant)>> {
+    // No critical section leaves the map half-changed.
+    CALLBACK_ERRORS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Keeps `message` as server `id`'s callback error, replacing any earlier
+/// one, after pruning the expired entries.
+fn record_callback_error(id: i64, message: String) {
+    record_callback_error_at(id, message, Instant::now());
+}
+
+fn record_callback_error_at(id: i64, message: String, at: Instant) {
+    let mut errors = callback_errors();
+    errors.retain(|_, (_, kept)| kept.elapsed() < CALLBACK_ERROR_TTL);
+    errors.insert(id, (message, at));
+}
+
+fn clear_callback_error(id: i64) {
+    callback_errors().remove(&id);
+}
+
+/// Server `id`'s kept callback error, removed so it shows once; `None` if
+/// there's none or it's older than `CALLBACK_ERROR_TTL`.
+pub fn take_callback_error(id: i64) -> Option<String> {
+    let (message, kept) = callback_errors().remove(&id)?;
+    (kept.elapsed() < CALLBACK_ERROR_TTL).then_some(message)
 }
 
 /// Starts an OAuth authorization attempt for `config` and returns the
@@ -521,14 +565,18 @@ pub async fn callback_handler(
     // No pool parameter needed here: the `OAuthState` popped from `PENDING`
     // already carries the `PgCredentialStore` `start` configured it with,
     // so `handle_callback` alone persists the exchanged tokens.
+    // The error stays on the server and the redirect carries only a flag
+    // (SME-168): a text in the URL would let any link put its own words in
+    // smelt's error styling.
     let outcome = complete_callback(id, params).await;
     match outcome {
-        Ok(()) => axum::response::Redirect::to(&format!("/mcp-servers/{id}")),
+        Ok(()) => {
+            clear_callback_error(id);
+            axum::response::Redirect::to(&format!("/mcp-servers/{id}"))
+        }
         Err(error) => {
-            let encoded: String =
-                percent_encoding::utf8_percent_encode(&error, percent_encoding::NON_ALPHANUMERIC)
-                    .collect();
-            axum::response::Redirect::to(&format!("/mcp-servers/{id}?oauth_error={encoded}"))
+            record_callback_error(id, error);
+            axum::response::Redirect::to(&format!("/mcp-servers/{id}?oauth_callback=1"))
         }
     }
 }

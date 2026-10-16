@@ -296,9 +296,9 @@ async fn test_a_javascript_authorization_endpoint_is_refused(pool: PgPool) {
 /// Pulls `state`'s value out of the authorization URL `start` returns
 /// — standing in for the real browser round-trip a live flow would
 /// need (the provider's `/authorize` page reflecting it back on
-/// redirect). Percent-decodes with the same crate already used for
-/// `callback_handler`'s error encoding, rather than adding a URL-
-/// parsing dependency just for this.
+/// redirect). Percent-decodes with the `percent_encoding` crate smelt
+/// already depends on, rather than adding a URL-parsing dependency just
+/// for this.
 fn extract_query_param(url: &str, key: &str) -> Option<String> {
     let query = url.split_once('?')?.1;
     query.split('&').find_map(|pair| {
@@ -786,3 +786,5 @@ async fn test_a_connection_manager_for_an_old_url_does_not_use_the_new_urls_gran
         "it should need a sign-in instead: {token:?}"
     );
 }
+
+mod callback_errors;

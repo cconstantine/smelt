@@ -27,7 +27,7 @@ Path parameters (`{id}`) map directly onto a same-named function argument. `Serv
 ## Routes that aren't server functions
 
 `main.rs`'s `build_router` adds a few things around the Dioxus app:
-- **`GET /oauth/mcp-callback/{id}`** → `mcp_oauth::callback_handler`, a plain Axum route. The OAuth provider sends the user's browser here, and it has to answer with a real redirect back into the app, not JSON. See [mcp.md](mcp.md#oauth).
+- **`GET /oauth/mcp-callback/{id}`** → `mcp_oauth::callback_handler`, a plain Axum route. The OAuth provider sends the user's browser here, and it has to answer with a real redirect back into the app, not JSON: `/mcp-servers/{id}`, or `/mcp-servers/{id}?oauth_callback=1` after a failure, whose error stays on the server. See [mcp.md](mcp.md#oauth).
 - **`request_guard::guard`**, a layer over every route (SME-51). smelt has no login, so it refuses what another site's page could send on the user's behalf. A request that isn't `GET`/`HEAD`/`OPTIONS` is refused when `Sec-Fetch-Site` says it came from another site (`same-site` included: a sandbox preview is a sibling origin), or, without that header, when `Origin` names another host. Once `SMELT_ALLOWED_HOSTS` is set, a `Host` that isn't one of those names or `SMELT_BASE_URL`'s host is refused too (IP addresses and `localhost` always pass). A request with neither header (curl, a script) is let through.
 
 The sandbox preview proxy (`src/preview.rs`, SME-42) isn't on this router at all: it has a listener of its own, `SMELT_PREVIEW_ADDR` (default `0.0.0.0:8181`), because the preview's address is all in `Host` and `dx serve`'s dev proxy replaces `Host`. See [setup.md](setup.md).
@@ -162,6 +162,7 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `delete_mcp_server` | `DELETE /api/mcp-servers/{id}` | also drops the cached connection |
 | `start_mcp_server_oauth` | `POST /api/mcp-servers/{id}/oauth/start` | returns the authorization URL the browser goes to (SME-16) |
 | `disconnect_mcp_server_oauth` | `POST /api/mcp-servers/{id}/oauth/disconnect` | clears the stored OAuth credentials |
+| `take_mcp_server_oauth_error` | `POST /api/mcp-servers/{id}/oauth/callback-error` | the last failed callback's error, removed as it's read; the edit page calls it when the callback's redirect brought it there with `?oauth_callback=1` (SME-168) |
 | `list_sandbox_volumes` / `create_sandbox_volume` | `GET /api/sandbox-volumes`, `POST /api/sandbox-volumes` | volumes mounted into sandbox pods; create makes the PVC and expands a leading `~` in the mount path |
 | `delete_sandbox_volume` | `DELETE /api/sandbox-volumes/{id}` | deletes the PVC, then the row |
 | `delete_conversation` | `DELETE /api/conversations/{id}` | hard delete; cascades to the conversation's messages (`ON DELETE CASCADE`); also tears down its sandboxes and browsing session, and drops its event channel and turn lock; deleting a nonexistent id is not an error |

@@ -364,26 +364,30 @@ pub fn McpServerEdit(id: i64) -> Element {
         }
     });
 
-    // A failed OAuth attempt lands back here as `?oauth_error=...` (see
-    // `mcp_oauth::callback_handler`) — read once on mount via a JS eval
-    // (there's no query-param extraction wired into `Route` yet) and strip
-    // it from the URL so a later refresh doesn't keep re-showing it.
+    // A failed OAuth attempt lands back here as `?oauth_callback=1` (see
+    // `mcp_oauth::callback_handler`): the error itself stays on the server,
+    // and is taken from there once. Its text never comes from the URL, so
+    // a link can't put its own words in smelt's error styling (SME-168).
+    // The flag is read on mount via a JS eval (there's no query-param
+    // extraction wired into `Route` yet) and stripped, so a refresh doesn't
+    // ask again.
     let oauth_error: Signal<Option<String>> = use_signal(|| None);
     #[cfg(feature = "web")]
     use_effect(move || {
         spawn(async move {
             let mut oauth_error = oauth_error;
             let script = "const p = new URLSearchParams(window.location.search);
-                 const err = p.get('oauth_error');
-                 if (err !== null) {
-                     p.delete('oauth_error');
+                 const flagged = p.has('oauth_callback');
+                 if (flagged) {
+                     p.delete('oauth_callback');
                      const rest = p.toString();
                      window.history.replaceState({}, '', window.location.pathname + (rest ? '?' + rest : ''));
                  }
-                 return err;";
-            if let Ok(value) = document::eval(script).await {
-                if let Some(err) = value.as_str() {
-                    oauth_error.set(Some(err.to_string()));
+                 return flagged;";
+            let flagged = document::eval(script).await.ok().and_then(|v| v.as_bool());
+            if flagged == Some(true) {
+                if let Ok(Some(text)) = crate::api::mcp::take_mcp_server_oauth_error(id).await {
+                    oauth_error.set(Some(text));
                 }
             }
         });
