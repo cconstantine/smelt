@@ -160,7 +160,7 @@ fn test_a_trailing_dot_is_kept_in_links_and_matched() {
 /// `172-21-0-2-3000` is no port at all (SME-183's review).
 #[test]
 fn test_a_placeholder_in_the_port_is_refused() {
-    for bad in ["http://{conversation}.x.test:{port}", "http://{port}-x.test:{conversation}", "http://{port}.x.test:8{conversation}"] {
+    for bad in ["http://{conversation}.x.test:{port}", "http://{port}-x.test:{conversation}", "http://{port}.x.test:8{conversation}", "https://a:{port}-{conversation}.x.test"] {
         let error = PreviewTemplate::parse(bad).expect_err(&format!("{bad:?} should be refused"));
         assert!(error.contains("placeholder in its port"), "the error should say the port can't hold a placeholder: {error:?}");
     }
@@ -208,9 +208,9 @@ fn test_a_template_with_more_than_one_port_is_refused() {
         "https://{port}-{conversation}.x.test:8181:8181",
         "https://{port}-{conversation}.x.test::8181",
         "https://{port}-{conversation}.x.test:8181:",
-        "https://a:{port}-{conversation}.x.test",
     ] {
-        assert!(PreviewTemplate::parse(bad).is_err(), "{bad:?} should be refused");
+        let error = PreviewTemplate::parse(bad).expect_err(&format!("{bad:?} should be refused"));
+        assert!(error.contains("one port at most"), "{bad:?} should be refused for its ports: {error:?}");
     }
 }
 
