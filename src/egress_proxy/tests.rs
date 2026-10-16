@@ -14,7 +14,6 @@ fn test_parse_connect_gives_a_tunnel_target() {
             host: "example.com".to_string(),
             port: 443,
             forward_head: None,
-            upgrading: false,
             source: fetch_guard::RequestSource {
                 method: "CONNECT".to_string(),
                 ..Default::default()
@@ -597,21 +596,24 @@ async fn test_a_sandbox_reply_after_an_unasked_101_is_closed() {
     assert_eq!(got, expected);
 }
 
-/// A `101` to a request that asked to upgrade goes through unchanged, and
-/// the connection is a tunnel both ways from there.
+/// Chrome skips every 1xx, a `101` included, unless the request is its
+/// own WebSocket handshake (`HttpNetworkTransaction::DoReadHeadersComplete`),
+/// which it sends inside a `CONNECT` tunnel, never as a plain request. So a
+/// `101` to a plain request asking to upgrade is interim too, and the
+/// reply after it is closed (SME-165 review 1).
 #[tokio::test]
-async fn test_a_sandbox_upgrade_stays_a_tunnel() {
+async fn test_a_sandbox_reply_after_a_101_to_an_upgrade_request_is_closed() {
     let switching = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
-    let (got, mut stream) = exchange(
-        vec![switching.as_bytes()],
+    let expected = format!("{switching}HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi");
+    let reply = format!("{switching}HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nhi");
+    let (got, _) = exchange(
+        vec![reply.as_bytes()],
         "GET http://localhost:3000/ws HTTP/1.1\r\nHost: localhost:3000\r\nConnection: Upgrade\r\n\
          Upgrade: websocket\r\nSec-Fetch-Site: none\r\nSec-Fetch-Mode: navigate\r\n\r\n",
-        switching,
+        &expected,
     )
     .await;
-    assert_eq!(got, switching);
-    stream.write_all(b"ping").await.unwrap();
-    assert_eq!(read_up_to(&mut stream, 4).await, "ping", "the tunnel should carry bytes both ways");
+    assert_eq!(got, expected);
 }
 
 /// A first header line starting with whitespace would be read by Chrome

@@ -295,7 +295,7 @@ async fn handle_sandbox(
         // The final reply head goes on marked `Connection: close`, so the
         // browser never sends a second request, which nothing would
         // check, down this connection (SME-165).
-        let relayed = reply::relay_reply_heads(&mut from_pod, &mut to_page, request.upgrading, MAX_HEAD_BYTES).await;
+        let relayed = reply::relay_reply_heads(&mut from_pod, &mut to_page, MAX_HEAD_BYTES).await;
         let refusal = match relayed.map_err(io)? {
             Relayed::CopyRest => None,
             Relayed::Ended => {
@@ -379,9 +379,6 @@ struct ProxyRequest {
     /// The request head to send upstream, rewritten to origin-form; `None`
     /// for `CONNECT`, which tunnels raw bytes instead.
     forward_head: Option<Vec<u8>>,
-    /// Whether it asks to upgrade the connection (a WebSocket's handshake
-    /// sent without `CONNECT`): only then does a `101` reply start a tunnel.
-    upgrading: bool,
     /// Who sent it, for the sandbox route (`fetch_guard::allows_request_from`).
     /// A `CONNECT`'s real request is inside its tunnel, so this is read there.
     source: fetch_guard::RequestSource,
@@ -431,7 +428,6 @@ fn parse_request_head(head: &[u8]) -> Result<ProxyRequest, String> {
             host,
             port,
             forward_head: None,
-            upgrading: false,
             source: request_source(head),
         });
     }
@@ -467,7 +463,6 @@ fn parse_request_head(head: &[u8]) -> Result<ProxyRequest, String> {
         host,
         port,
         forward_head: Some(forward.into_bytes()),
-        upgrading,
         source: request_source(head),
     })
 }

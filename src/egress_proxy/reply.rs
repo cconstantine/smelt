@@ -128,8 +128,8 @@ pub(super) fn close_response_head(head: &[u8]) -> Vec<u8> {
 
 /// How relaying the pod's reply heads ended.
 pub(super) enum Relayed {
-    /// The final head went to the page (closed), or a `101` to an upgrade,
-    /// or bytes that aren't HTTP: copy the rest raw.
+    /// The final head went to the page (closed), or bytes that aren't
+    /// HTTP: copy the rest raw.
     CopyRest,
     /// The pod's stream ended, with whatever came of the reply passed on.
     Ended,
@@ -140,14 +140,19 @@ pub(super) enum Relayed {
 }
 
 /// Reads the pod's reply heads and passes them to the page: interim (1xx)
-/// heads unchanged, a `101` unchanged and the end of the heads when the
-/// request was `upgrading`, and the final head through
-/// `close_response_head`. The bytes after the last head handled go on to
-/// the page too. No time limit: a slow server is legitimate.
+/// heads unchanged, and the final head through `close_response_head`. The
+/// bytes after the last head handled go on to the page too. No time limit:
+/// a slow server is legitimate.
+///
+/// A `101` is interim here, whatever the request asked: Chrome skips every
+/// 1xx unless the request is its own WebSocket handshake
+/// (`HttpNetworkTransaction::DoReadHeadersComplete`), and it sends that
+/// inside a `CONNECT` tunnel, never as a plain request, so a `101` passed on
+/// as the end of the heads would leave the head after it, the one Chrome
+/// decides on, unmarked (SME-165 review 1).
 pub(super) async fn relay_reply_heads(
     from_pod: &mut (impl AsyncRead + Unpin),
     to_page: &mut (impl AsyncWrite + Unpin),
-    upgrading: bool,
     limit: usize,
 ) -> std::io::Result<Relayed> {
     let mut buf: Vec<u8> = Vec::new();
@@ -171,16 +176,12 @@ pub(super) async fn relay_reply_heads(
             let head = &buf[start..];
             let code = status_code(head);
             sent_any = true;
-            if code / 100 == 1 && !(code == 101 && upgrading) {
+            if code / 100 == 1 {
                 to_page.write_all(head).await?;
                 buf = after;
                 continue;
             }
-            if code == 101 {
-                to_page.write_all(head).await?;
-            } else {
-                to_page.write_all(&close_response_head(head)).await?;
-            }
+            to_page.write_all(&close_response_head(head)).await?;
             to_page.write_all(&after).await?;
             return Ok(Relayed::CopyRest);
         }
