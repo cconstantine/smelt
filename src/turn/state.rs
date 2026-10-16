@@ -12,7 +12,9 @@ static RUNTIMES: LazyLock<Mutex<HashMap<i64, ConversationRuntime>>> = LazyLock::
 /// stop counter and reply are freed when idle (`release_idle_turn_state`);
 /// the entry itself goes only when nothing in it is in use, which, once a
 /// turn has run (its generation), is when the conversation is deleted: a
-/// few bytes per conversation, as the separate kept-error map was.
+/// few bytes per conversation, as the separate kept-error map was. A turn
+/// that finds its conversation already deleted forgets its generation
+/// (SME-179).
 #[derive(Default)]
 pub(super) struct ConversationRuntime {
     /// The turn lock. A live `send_message` call and a notice's `run_turn`
@@ -24,7 +26,8 @@ pub(super) struct ConversationRuntime {
     lock: Option<Arc<tokio::sync::Mutex<()>>>,
     /// The reply text streamed so far in the current model call, for a tab
     /// that connects mid-reply (`get_reply_in_progress`). Cleared when a
-    /// call starts, when its reply is saved, and when the turn ends.
+    /// call starts, when its reply is saved, when its turn fails or is
+    /// stopped, and when the last turn ends.
     reply: Option<String>,
     /// The stop counter and the last stop noted (`TurnStops`).
     stops: Option<TurnStops>,
@@ -49,6 +52,29 @@ pub(super) struct ConversationRuntime {
 }
 
 impl ConversationRuntime {
+    /// A receiver for the stop counter, with its current value already
+    /// seen, so only a later stop wakes it.
+    fn stop_receiver(&mut self) -> tokio::sync::watch::Receiver<u64> {
+        let mut receiver = self.stops.get_or_insert_with(TurnStops::default).counter.subscribe();
+        receiver.borrow_and_update();
+        receiver
+    }
+
+    /// Frees the turn lock and stop counter once no one has them (SME-91):
+    /// the lock only when this is the last handle, so one in use is never
+    /// replaced by a fresh one, and the stop counter when no turn listens
+    /// to it (a stop with nothing running only pauses). Each is made again
+    /// on next use. Not the kept error: a turn starting meanwhile has its
+    /// generation there already (SME-91 review).
+    fn release_idle(&mut self) {
+        if self.lock.as_ref().is_some_and(|lock| Arc::strong_count(lock) == 1) {
+            self.lock = None;
+        }
+        if self.stops.as_ref().is_some_and(|stops| stops.counter.receiver_count() == 0) {
+            self.stops = None;
+        }
+    }
+
     fn is_idle(&self) -> bool {
         self.lock.is_none()
             && self.reply.is_none()
@@ -82,6 +108,13 @@ fn update_existing(conversation_id: i64, f: impl FnOnce(&mut ConversationRuntime
             runtimes.remove(&conversation_id);
         }
     }
+}
+
+/// `update_existing`, returning what `f` does.
+fn update_existing_with<R>(conversation_id: i64, f: impl FnOnce(&mut ConversationRuntime) -> R) -> Option<R> {
+    let mut result = None;
+    update_existing(conversation_id, |runtime| result = Some(f(runtime)));
+    result
 }
 
 pub(crate) fn conversation_lock(conversation_id: i64) -> Arc<tokio::sync::Mutex<()>> {
@@ -152,11 +185,7 @@ impl Default for TurnStops {
 /// A receiver for `conversation_id`'s stop counter, with its current value
 /// already seen, so only a later stop wakes it.
 pub(super) fn stop_receiver(conversation_id: i64) -> tokio::sync::watch::Receiver<u64> {
-    with_runtime(conversation_id, |runtime| {
-        let mut receiver = runtime.stops.get_or_insert_with(TurnStops::default).counter.subscribe();
-        receiver.borrow_and_update();
-        receiver
-    })
+    with_runtime(conversation_id, ConversationRuntime::stop_receiver)
 }
 
 /// Notes stop `stopped_by` (the stop counter's value) in
@@ -197,71 +226,89 @@ pub(super) fn resume_turns(conversation_id: i64) {
 
 /// Counts a turn as in flight for as long as it lives, including when it's
 /// dropped part-way by a stop, and publishes `TurnState` when the
-/// conversation goes from idle to busy or back.
-pub(super) struct TurnInFlight(i64);
+/// conversation goes from idle to busy or back. It holds the turn's stop
+/// receiver, made when it's counted.
+///
+/// Its start and its end are each one critical section of the turn
+/// state, publishing `TurnState` inside it (SME-179 B29): a turn counted
+/// as another ends comes wholly before or after that end, so tabs are
+/// told `running: false` and `running: true` in the order they happened,
+/// the end can't clear the new turn's reply, and a Stop can't land
+/// between the count and the receiver. `events::publish` only sends on a
+/// broadcast channel, under its own map's lock (the same order
+/// `append_reply` takes them in).
+pub(super) struct TurnInFlight {
+    conversation_id: i64,
+    /// `None` only once dropped.
+    stop: Option<tokio::sync::watch::Receiver<u64>>,
+}
 
 impl TurnInFlight {
     pub(super) fn start(conversation_id: i64) -> Self {
-        let first = with_runtime(conversation_id, |runtime| {
+        let (first, stop) = with_runtime(conversation_id, |runtime| {
             runtime.turns_in_flight += 1;
-            if runtime.turns_in_flight != 1 {
-                false
-            } else {
+            let stop = runtime.stop_receiver();
+            let first = runtime.turns_in_flight == 1;
+            if first {
                 runtime.started_at = Some(std::time::Instant::now());
-                true
+                crate::events::publish(
+                    conversation_id,
+                    crate::events::ConversationEvent::TurnState { running: true, elapsed: 0 },
+                );
             }
+            (first, stop)
         });
         if first {
-            crate::events::publish(
-                conversation_id,
-                crate::events::ConversationEvent::TurnState { running: true, elapsed: 0 },
-            );
+            // Only tells the sidebar to fetch the busy list again.
             crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
         }
-        TurnInFlight(conversation_id)
+        TurnInFlight { conversation_id, stop: Some(stop) }
+    }
+
+    /// The turn's stop receiver: it changes when the user stops the
+    /// conversation after the turn was counted.
+    pub(super) fn stop(&mut self) -> &mut tokio::sync::watch::Receiver<u64> {
+        let conversation_id = self.conversation_id;
+        self.stop.get_or_insert_with(|| stop_receiver(conversation_id))
     }
 }
 
 impl Drop for TurnInFlight {
     fn drop(&mut self) {
+        let conversation_id = self.conversation_id;
+        let stop = self.stop.take();
         let mut last = false;
-        update_existing(self.0, |runtime| {
+        update_existing(conversation_id, |runtime| {
+            // First, so the release below sees no listener of this turn's:
+            // the last turn ending frees the stop counter.
+            drop(stop);
             runtime.turns_in_flight = runtime.turns_in_flight.saturating_sub(1);
             last = runtime.turns_in_flight == 0;
             if last {
                 runtime.started_at = None;
+                // A stopped or failed turn leaves no reply in progress.
+                runtime.reply = None;
+                runtime.release_idle();
+                crate::events::publish(
+                    conversation_id,
+                    crate::events::ConversationEvent::TurnState { running: false, elapsed: 0 },
+                );
             }
         });
+        #[cfg(test)]
+        super::test_hooks::after_in_flight_changed(conversation_id);
         if last {
-            // A stopped or failed turn leaves no reply in progress.
-            clear_reply_in_progress(self.0);
-            release_idle_turn_state(self.0);
-            crate::events::publish(
-                self.0,
-                crate::events::ConversationEvent::TurnState { running: false, elapsed: 0 },
-            );
             crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
         }
     }
 }
 
 /// Frees `conversation_id`'s turn lock and stop counter once no one has
-/// them (SME-91): the lock only when the state's is the last handle, so
-/// one in use is never replaced by a fresh one, and the stop counter when
-/// no turn listens to it (a stop with nothing running only pauses). Each
-/// is made again on next use. Under the state's lock, which handing one
-/// out also takes. Not the kept error: a turn starting meanwhile has its
-/// generation there already (SME-91 review); it's a few bytes per
-/// conversation, freed on delete.
+/// them (`ConversationRuntime::release_idle`), under the state's lock,
+/// which handing one out also takes. The kept error stays: it's a few
+/// bytes per conversation, freed on delete.
 pub(super) fn release_idle_turn_state(conversation_id: i64) {
-    update_existing(conversation_id, |runtime| {
-        if runtime.lock.as_ref().is_some_and(|lock| Arc::strong_count(lock) == 1) {
-            runtime.lock = None;
-        }
-        if runtime.stops.as_ref().is_some_and(|stops| stops.counter.receiver_count() == 0) {
-            runtime.stops = None;
-        }
-    });
+    update_existing(conversation_id, ConversationRuntime::release_idle);
 }
 
 /// Every conversation with a turn running or queued, for the sidebar's
@@ -294,9 +341,12 @@ pub(crate) fn turn_started_elapsed(conversation_id: i64) -> Option<std::time::Du
 
 /// A conversation's last failed turn's error, until the user writes again,
 /// for a tab that connects after the `TurnError` event (SME-51 B11), and
-/// its turn generation: bumped by the user sending and by every turn
-/// starting, so a turn's failure is kept only if no newer turn has started
-/// since it did (SME-91).
+/// its turn generation: bumped by the user sending or answering, by a turn
+/// with a message of its own once it holds the turn lock, and by a wake or
+/// an answer turn once it has something for the model, so a turn's
+/// failure is kept only if no newer turn has started since it did
+/// (SME-91). A wake or answer turn with nothing to do leaves it alone
+/// (SME-179).
 #[derive(Default)]
 pub(super) struct KeptTurnError {
     generation: u64,
@@ -311,6 +361,32 @@ pub(super) fn new_turn_generation(conversation_id: i64) -> u64 {
         runtime.kept.error = None;
         runtime.kept.generation
     })
+}
+
+/// Starts a new turn generation for `conversation_id` from inside a turn
+/// that holds its turn lock `held`, as `new_turn_generation`, and returns
+/// it; `None` once the conversation's delete has forgotten its turn
+/// state, when the entry no longer has `held` as its lock (none, or a
+/// fresh one made since: an unheld lock is the only one ever freed). A
+/// generation taken then would keep the entry for good (SME-179 reviews
+/// 1 and 2).
+pub(super) fn take_turn_generation(conversation_id: i64, held: &Arc<tokio::sync::Mutex<()>>) -> Option<u64> {
+    update_existing_with(conversation_id, |runtime| {
+        if !runtime.lock.as_ref().is_some_and(|lock| Arc::ptr_eq(lock, held)) {
+            return None;
+        }
+        runtime.kept.generation += 1;
+        runtime.kept.error = None;
+        Some(runtime.kept.generation)
+    })
+    .flatten()
+}
+
+/// Forgets `conversation_id`'s turn generation and kept error, for a turn
+/// that found its conversation deleted: the generation it took would
+/// otherwise keep the conversation's turn state for good (SME-179 B31).
+pub(super) fn forget_turn_generation(conversation_id: i64) {
+    update_existing(conversation_id, |runtime| runtime.kept = KeptTurnError::default());
 }
 
 /// Keeps `error` as `conversation_id`'s, if `generation` is still its
@@ -346,4 +422,18 @@ pub(crate) fn last_turn_error(conversation_id: i64) -> Option<String> {
 #[cfg(test)]
 pub(super) fn holds_lock_and_stops(conversation_id: i64) -> (bool, bool) {
     read_runtime(conversation_id, |runtime| (runtime.lock.is_some(), runtime.stops.is_some())).unwrap_or((false, false))
+}
+
+/// How many turns `conversation_id` has running or queued, for tests
+/// that wait for a turn to queue.
+#[cfg(test)]
+pub(super) fn turns_in_flight(conversation_id: i64) -> usize {
+    read_runtime(conversation_id, |runtime| runtime.turns_in_flight).unwrap_or(0)
+}
+
+/// Whether `conversation_id` has any turn state at all, for tests of
+/// what's freed.
+#[cfg(test)]
+pub(super) fn has_turn_state(conversation_id: i64) -> bool {
+    read_runtime(conversation_id, |_| ()).is_some()
 }
