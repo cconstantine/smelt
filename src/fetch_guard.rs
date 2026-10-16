@@ -71,9 +71,12 @@ pub struct Destination {
     /// Whether every page a browser counts as same-site with that address is
     /// home. True in the model's browser, where the sandbox is `localhost`
     /// or a loopback address: only `localhost` on another port is same-site
-    /// with `localhost` (`*.localhost` is a site of its own), and that is
-    /// the sandbox. False for previews, which are all same-site with each
-    /// other (SME-173 review 1).
+    /// with `localhost` (`*.localhost` is a site of its own), and likewise
+    /// for `127.0.0.1` and `[::1]`, so that is the sandbox (measured in
+    /// Chromium, SME-173 review 2). The route sets it for container
+    /// addresses too, where it never applies: they get no `Sec-Fetch-*`
+    /// over http, and TLS to the sandbox is refused. False for previews,
+    /// which are all same-site with each other (SME-173 review 1).
     pub same_site_is_home: bool,
 }
 
