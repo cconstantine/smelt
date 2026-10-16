@@ -138,7 +138,8 @@ pub(super) fn record_saved(conversation_id: i64, persisted: &mut Vec<Message>, s
 /// behind: a streaming reply isn't saved, and tool calls without results
 /// get answered on the next request (`answer_unfinished_tool_calls`).
 /// `from_user` says `new_message` is the user's own (`start_turn`): only
-/// that dismisses a question the conversation waits on (SME-34).
+/// that dismisses a question the conversation waits on (SME-34), whether
+/// the turn runs or a Stop catches it queued (SME-170).
 #[cfg(feature = "server")]
 pub(super) fn run_turn_bounded<'a>(
     pool: &'a PgPool,
@@ -208,15 +209,20 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
         // Queued behind another turn until the lock is free. Stopped while
         // queued: keep the message anyway (a finished command's notice,
         // say), without running a turn for it; the conversation is paused,
-        // so the model sees it next time the user writes (SME-40 F4).
+        // so the model sees it next time the user writes (SME-40 F4). It's
+        // saved as a turn that ran would save it (SME-170): the user's own
+        // message dismisses a question still waiting, and an answer from
+        // the card goes first in it. A stopped wake or answer turn has no
+        // message, saves nothing, and leaves an answer for the next turn.
         let guard = tokio::select! {
             guard = lock.clone().lock_owned() => guard,
             _ = stop.changed() => {
                 let stopped_by = *stop.borrow_and_update();
                 let _turn = lock.lock().await;
-                if let Some(message) = &new_message {
-                    match db::create_message(pool, conversation_id, &message.role, &message.content).await {
-                        Ok(saved) => record_saved(conversation_id, &mut Vec::new(), saved),
+                if new_message.is_some() {
+                    match save_turn_message(pool, conversation_id, new_message, from_user).await {
+                        Ok(Some((saved, _))) => record_saved(conversation_id, &mut Vec::new(), saved),
+                        Ok(None) => {}
                         Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't keep a stopped turn's message"),
                     }
                 }
