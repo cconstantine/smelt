@@ -151,6 +151,16 @@ pub async fn request_instruction(
     .await
 }
 
+/// Share-locks the conversation's row until the transaction ends, as a
+/// foreign key to it would, so deleting the conversation waits (SME-181).
+pub async fn share_lock_conversation(executor: impl sqlx::PgExecutor<'_>, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT 1 FROM conversations WHERE id = $1 FOR KEY SHARE")
+        .bind(id)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
 /// Takes the card `id` from conversation `conversation_id` to answer it:
 /// `None` when it's gone (answered already, or not this conversation's).
 pub async fn take_instruction_request(

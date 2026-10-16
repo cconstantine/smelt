@@ -168,3 +168,83 @@ async fn test_a_card_asked_for_while_a_decline_waits_is_dropped_by_it(pool: PgPo
     );
     assert!(decline_waited, "Decline waited for the load rather than running first");
 }
+
+/// Holds every row of `table` for `repo_id` with `SELECT … FOR UPDATE`,
+/// uncommitted, so whoever writes them next waits for the rollback.
+async fn hold_rows<'a>(pool: &'a PgPool, table: &str, repo_id: i64) -> sqlx::Transaction<'a, sqlx::Postgres> {
+    let mut holding = pool.begin().await.expect("begin the holding transaction");
+    sqlx::query(&format!("SELECT 1 FROM {table} WHERE repo_id = $1 FOR UPDATE"))
+        .bind(repo_id)
+        .execute(&mut *holding)
+        .await
+        .expect("hold the rows");
+    holding
+}
+
+/// Two conversations about the same remote, with a card in A. B is
+/// the one that will be deleted.
+async fn a_card_and_b(pool: &PgPool) -> (i64, TrustRequest, i64, db::ConversationRepo) {
+    let a = db::create_conversation(pool).await.expect("conversation A");
+    let b = db::create_conversation(pool).await.expect("conversation B");
+    let repo_a = cloned_repo(pool, a.id).await;
+    let repo_b = cloned_repo(pool, b.id).await;
+    request_or_load(pool, a.id, &repo_a, "AGENTS.md", &file("a")).await.expect("ask in A");
+    let card_a = only_repo(pool, a.id).await.trust_requests.remove(0);
+    (a.id, card_a, b.id, repo_b)
+}
+
+fn spawn_delete(pool: &PgPool, conversation_id: i64) -> tokio::task::JoinHandle<Result<(), sqlx::Error>> {
+    let pool = pool.clone();
+    tokio::spawn(async move { db::delete_conversation(&pool, conversation_id).await })
+}
+
+/// SME-181 review 1, finding 1. Interleaving: deleting conversation B
+/// (a file loaded and a card, both from the remote) is held at its
+/// cascade into `loaded_instructions` while Decline answers A's card.
+/// The delete's cascade takes B's loaded file and then its card; a
+/// Decline that dropped B's card before unloading took them the other
+/// way round, and Postgres aborted one of the two as a deadlock.
+#[sqlx::test]
+async fn test_a_decline_and_a_conversation_delete_dont_deadlock(pool: PgPool) {
+    let (a, card_a, b, repo_b) = a_card_and_b(&pool).await;
+    db::load_instruction(&pool, b, repo_b.id, "AGENTS.md", &file("loaded")).await.expect("loaded in B");
+    db::request_instruction(&pool, b, repo_b.id, "web/AGENTS.md", &file("asked")).await.expect("a card in B");
+
+    let holding = hold_rows(&pool, "loaded_instructions", repo_b.id).await;
+    let delete = spawn_delete(&pool, b);
+    assert!(waiters_or_finished(&pool, 1, &delete).await, "the delete never reached B's loaded file");
+    let decline = spawn_decide(&pool, a, &card_a, false);
+    let decline_waited = waiters_or_finished(&pool, 2, &decline).await;
+    holding.rollback().await.expect("release B's loaded file");
+
+    let deleted = join(delete, "the delete").await;
+    let declined = join(decline, "Decline").await;
+    deleted.expect("the delete succeeds");
+    declined.expect("Decline succeeds");
+    assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("trust"), Some(false));
+    assert!(decline_waited, "Decline waited for the delete rather than running first");
+}
+
+/// SME-181 review 1, finding 1, the deciding conversation's own delete.
+/// Interleaving: Trust on A's card is held at its load while A is
+/// deleted. Trust took its card before its load's foreign key took a
+/// share lock on A's row, and the delete takes A's row before its card,
+/// so the two deadlocked. Trust now locks A's row first.
+#[sqlx::test]
+async fn test_a_trust_and_a_delete_of_its_own_conversation_dont_deadlock(pool: PgPool) {
+    let (a, card_a, _, _) = a_card_and_b(&pool).await;
+    let repo_a = only_repo(&pool, a).await;
+
+    let holding = hold_row(&pool, "loaded_instructions", a, repo_a.id).await;
+    let trust = spawn_decide(&pool, a, &card_a, true);
+    assert!(waiters_or_finished(&pool, 1, &trust).await, "Trust never reached its load");
+    let delete = spawn_delete(&pool, a);
+    let delete_waited = waiters_or_finished(&pool, 2, &delete).await;
+    holding.rollback().await.expect("release the load");
+
+    let trusted = join(trust, "Trust").await;
+    let deleted = join(delete, "the delete").await;
+    trusted.expect("Trust succeeds");
+    deleted.expect("the delete succeeds");
+    assert!(delete_waited, "the delete waited for Trust rather than running first");
+}

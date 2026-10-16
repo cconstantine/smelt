@@ -66,6 +66,13 @@ async fn settle(
 ) -> Result<Settled, String> {
     let e = |e: sqlx::Error| e.to_string();
     db::lock_remote_trust(&mut *tx, remote_key).await.map_err(e)?;
+    // Row locks in a conversation delete's order (its row, then its
+    // cascade into loaded_instructions, then instruction_requests), so
+    // a decision and a delete wait for each other instead of
+    // deadlocking (SME-181 review 1). The deciding conversation's row
+    // first: the load's foreign key would share-lock it only after the
+    // card is taken.
+    db::share_lock_conversation(&mut *tx, conversation_id).await.map_err(e)?;
     let request = db::take_instruction_request(&mut *tx, request_id, conversation_id)
         .await
         .map_err(e)?
@@ -91,6 +98,16 @@ async fn settle(
             .map_err(e)?;
     }
 
+    // Declined: nothing from this remote stays in any conversation's
+    // instructions, including a version loaded while it was trusted.
+    // Before the other cards: a delete cascades into loaded files first.
+    let mut unloaded = Vec::new();
+    if !trusted {
+        for (id, dir, path) in db::unload_instructions_for_remote(&mut *tx, remote_key).await.map_err(e)? {
+            unloaded.push((id, format!("{}/{dir}/{path}", crate::sandbox::WORKSPACE_DIR)));
+        }
+    }
+
     // Other requests about this remote: their files weren't shown, so
     // they're dropped, and their conversations told where things stand.
     let mut others = Vec::new();
@@ -104,14 +121,6 @@ async fn settle(
         others.push((other, other_file));
     }
 
-    // Declined: nothing from this remote stays in any conversation's
-    // instructions, including a version loaded while it was trusted.
-    let mut unloaded = Vec::new();
-    if !trusted {
-        for (id, dir, path) in db::unload_instructions_for_remote(&mut *tx, remote_key).await.map_err(e)? {
-            unloaded.push((id, format!("{}/{dir}/{path}", crate::sandbox::WORKSPACE_DIR)));
-        }
-    }
     Ok(Settled { repo, file, others, unloaded })
 }
 
