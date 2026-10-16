@@ -3,6 +3,8 @@
 //! (how to run it, and which files it takes). Pure functions over the
 //! fetched text; the page shows the result for the user to check and edit.
 
+use std::borrow::Cow;
+
 use crate::models::LanguageServerConfig;
 
 /// Where a server pod's installs go: its HOME (SME-35's spike).
@@ -46,7 +48,13 @@ pub fn suggest(package_yaml: &str, languages_toml: &str) -> Result<Suggestion, S
         .or_else(|| package.bin.keys().next().cloned())
         .unwrap_or_else(|| package.name.clone());
 
-    let (install_command, command) = install(&purl, source, &bin, &mut notes);
+    let (install_command, command) = match install(&purl, source, &bin, &mut notes) {
+        Ok(install) => install,
+        Err(note) => {
+            notes.push(note);
+            (String::new(), bin.clone())
+        }
+    };
     let image = image_for(&purl, &package.languages);
 
     let (file_types, root_markers) = languages(&helix, &package.name, &package.languages);
@@ -211,25 +219,61 @@ impl Purl {
     }
 }
 
-/// The install command and the path it leaves the executable at.
-fn install(purl: &Purl, source: &Source, bin: &str, notes: &mut Vec<String>) -> (String, String) {
+/// One shell word for `value`, a value from the catalog (SME-182): the
+/// saved install command runs in the server pod's `sh -c` as written, so
+/// this is the only place it can be quoted. As is when every character is
+/// in CPython `shlex.quote`'s safe set (every real registry value but the
+/// unfilled templates), else in single quotes, POSIX style. Refused, with
+/// the note to show, when quoting can't make it safe: empty, starting with
+/// `-` (quoted, it's still an option to npm, pip, go or cargo), or holding
+/// a control character.
+fn shell_word(value: &str) -> Result<Cow<'_, str>, String> {
+    if value.is_empty() || value.starts_with('-') || value.chars().any(char::is_control) {
+        const SHOWN: usize = 80;
+        let shown: String = value.chars().take(SHOWN).collect();
+        let more = if value.chars().nth(SHOWN).is_some() { "…" } else { "" };
+        return Err(format!(
+            "The catalog's install details include {shown:?}{more}, which smelt won't put in a command: fill in the install command."
+        ));
+    }
+    if value.chars().all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c)) {
+        Ok(Cow::Borrowed(value))
+    } else {
+        Ok(Cow::Owned(format!("'{}'", value.replace('\'', r"'\''"))))
+    }
+}
+
+/// The install command and the path it leaves the executable at, or the
+/// note to show when a catalog value can't go in a command.
+fn install(purl: &Purl, source: &Source, bin: &str, notes: &mut Vec<String>) -> Result<(String, String), String> {
     let home = POD_HOME;
-    let extras = source.extra_packages.join(" ");
-    let with_extras = |base: String| if extras.is_empty() { base } else { format!("{base} {extras}") };
-    match purl.kind.as_str() {
+    let with_extras = |base: String| -> Result<String, String> {
+        let mut command = base;
+        for extra in &source.extra_packages {
+            command.push(' ');
+            command.push_str(&shell_word(extra)?);
+        }
+        Ok(command)
+    };
+    let versioned = |separator: &str| shell_word(&format!("{}{separator}{}", purl.path, purl.version)).map(Cow::into_owned);
+    Ok(match purl.kind.as_str() {
         "npm" => (
-            with_extras(format!("npm install --prefix {home}/lsp {}@{}", purl.path, purl.version)),
+            with_extras(format!("npm install --prefix {home}/lsp {}", versioned("@")?))?,
             format!("{home}/lsp/node_modules/.bin/{bin}"),
         ),
         "pypi" => (
-            with_extras(format!("python -m venv {home}/venv && {home}/venv/bin/pip install {}=={}", purl.path, purl.version)),
+            with_extras(format!("python -m venv {home}/venv && {home}/venv/bin/pip install {}", versioned("==")?))?,
             format!("{home}/venv/bin/{bin}"),
         ),
         // GOBIN: Go's image sets GOPATH to /go, so without it the binary
         // lands in /go/bin.
-        "golang" => (format!("GOBIN={home}/go/bin go install {}@{}", purl.path, purl.version), format!("{home}/go/bin/{bin}")),
+        "golang" => (format!("GOBIN={home}/go/bin go install {}", versioned("@")?), format!("{home}/go/bin/{bin}")),
         "cargo" => (
-            format!("cargo install {} --version {} --root {home}/cargo", purl.name(), purl.version),
+            format!(
+                "cargo install {} --version {} --root {home}/cargo",
+                shell_word(purl.name())?,
+                shell_word(&purl.version)?
+            ),
             format!("{home}/cargo/bin/{bin}"),
         ),
         "github" => match github_asset(source) {
@@ -238,20 +282,22 @@ fn install(purl: &Purl, source: &Source, bin: &str, notes: &mut Vec<String>) -> 
                 if file.contains("{{") {
                     notes.push(format!("The release asset's name ({file}) has a template smelt doesn't fill in: check the install command."));
                 }
-                let url = format!("https://github.com/{}/releases/download/{}/{file}", purl.path, purl.version);
                 let target = format!("{home}/bin/{bin}");
-                let inner = inner.unwrap_or_else(|| bin.to_string());
+                let url = shell_word(&format!("https://github.com/{}/releases/download/{}/{file}", purl.path, purl.version))?
+                    .into_owned();
+                let to = shell_word(&target)?;
+                let inner = shell_word(&format!("{home}/opt/{}", inner.as_deref().unwrap_or(bin)))?.into_owned();
                 let command = if file.ends_with(".tar.gz") || file.ends_with(".tgz") {
-                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL {url} | tar -xz -C {home}/opt && ln -sf {home}/opt/{inner} {target}")
+                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL {url} | tar -xz -C {home}/opt && ln -sf {inner} {to}")
                 } else if file.ends_with(".tar.xz") {
-                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL {url} | tar -xJ -C {home}/opt && ln -sf {home}/opt/{inner} {target}")
+                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL {url} | tar -xJ -C {home}/opt && ln -sf {inner} {to}")
                 } else if file.ends_with(".zip") {
                     notes.push("The release is a .zip: the image needs unzip.".to_string());
-                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL -o {home}/release.zip {url} && unzip -q {home}/release.zip -d {home}/opt && ln -sf {home}/opt/{inner} {target}")
+                    format!("mkdir -p {home}/bin {home}/opt && curl -fsSL -o {home}/release.zip {url} && unzip -q {home}/release.zip -d {home}/opt && ln -sf {inner} {to}")
                 } else if file.ends_with(".gz") {
-                    format!("mkdir -p {home}/bin && curl -fsSL {url} | gunzip > {target} && chmod +x {target}")
+                    format!("mkdir -p {home}/bin && curl -fsSL {url} | gunzip > {to} && chmod +x {to}")
                 } else {
-                    format!("mkdir -p {home}/bin && curl -fsSL -o {target} {url} && chmod +x {target}")
+                    format!("mkdir -p {home}/bin && curl -fsSL -o {to} {url} && chmod +x {to}")
                 };
                 (command, target)
             }
@@ -264,7 +310,7 @@ fn install(purl: &Purl, source: &Source, bin: &str, notes: &mut Vec<String>) -> 
             notes.push(format!("smelt can't suggest an install for pkg:{other} packages: fill in the install command."));
             (String::new(), bin.to_string())
         }
-    }
+    })
 }
 
 /// The Linux x86-64 release asset: its file, and the executable's path
@@ -513,5 +559,159 @@ mod tests {
     fn test_something_that_isnt_a_mason_package_is_refused() {
         assert!(suggest("not: [a, package", HELIX).is_err());
         assert!(suggest("name: x\n", HELIX).is_err(), "no source");
+    }
+
+    /// A mason package with `source_id` and these `extra_packages`, each
+    /// written as a YAML double-quoted string.
+    fn package_with_extras(name: &str, source_id: &str, extras: &[&str]) -> String {
+        let extras: String = extras
+            .iter()
+            .map(|e| format!("    - {}\n", serde_json::to_string(e).expect("a JSON string")))
+            .collect();
+        format!("name: {name}\nlanguages:\n  - Python\nsource:\n  id: {source_id}\n  extra_packages:\n{extras}bin:\n  {name}: npm:{name}\n")
+    }
+
+    /// An empty directory of the test's own to run `sh` in.
+    fn scratch(test: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("smelt-catalog-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    /// Runs `script` with a real `sh -c` in `dir`.
+    fn sh(dir: &std::path::Path, script: &str) -> std::process::Output {
+        std::process::Command::new("sh").arg("-c").arg(script).current_dir(dir).output().expect("sh runs")
+    }
+
+    fn lines(path: std::path::PathBuf) -> Vec<String> {
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn test_catalog_values_reach_the_shell_as_single_words() {
+        let extras = ["$(touch MARKER)", "a;touch MARKER", "`touch MARKER`", "it's", "{{ x | y }}"];
+        let yaml = package_with_extras("pkg", "pkg:npm/pkg@1.0.0", &extras);
+        let install = suggest(&yaml, HELIX).expect("a suggestion").config.install_command;
+        assert!(install.starts_with("npm install --prefix /tmp/home/lsp pkg@1.0.0 "), "{install}");
+
+        let dir = scratch("single-words");
+        let out = sh(&dir, &format!("npm() {{ printf '%s\\n' \"$@\" > ARGS; }}\n{install}"));
+        assert!(!dir.join("MARKER").exists(), "a catalog value ran a command: {install}\n{out:?}");
+        let mut expected = vec!["install", "--prefix", "/tmp/home/lsp", "pkg@1.0.0"];
+        expected.extend(extras);
+        assert_eq!(lines(dir.join("ARGS")), expected, "{install}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_each_install_kind_quotes_what_it_takes_from_the_catalog() {
+        let install = |yaml: &str| suggest(yaml, HELIX).expect("a suggestion").config;
+
+        let pypi = install(&package_with_extras("pkg", "pkg:pypi/pkg@1.0", &["x y"]));
+        assert_eq!(pypi.install_command, "python -m venv /tmp/home/venv && /tmp/home/venv/bin/pip install pkg==1.0 'x y'");
+
+        let golang = install("name: tool\nsource:\n  id: pkg:golang/example.com/a b/tool@v1.0.0\n");
+        assert_eq!(golang.install_command, "GOBIN=/tmp/home/go/bin go install 'example.com/a b/tool@v1.0.0'");
+
+        let cargo = install("name: tool\nsource:\n  id: pkg:cargo/a;b@1.0\n");
+        assert_eq!(cargo.install_command, "cargo install 'a;b' --version 1.0 --root /tmp/home/cargo");
+
+        let archive = install(
+            "name: tool\nsource:\n  id: pkg:github/owner/tool@v1\n  asset:\n    - target: linux_x64\n      file: tool-$HOME.tar.gz\n      bin: dir with space/tool\nbin:\n  tool: \"{{source.asset.bin}}\"\n",
+        );
+        assert_eq!(
+            archive.install_command,
+            "mkdir -p /tmp/home/bin /tmp/home/opt && curl -fsSL 'https://github.com/owner/tool/releases/download/v1/tool-$HOME.tar.gz' | tar -xz -C /tmp/home/opt && ln -sf '/tmp/home/opt/dir with space/tool' /tmp/home/bin/tool"
+        );
+
+        // No `bin` map: the target is named after the package.
+        let plain = install("name: a;b\nsource:\n  id: pkg:github/owner/tool@v1\n  asset:\n    - target: linux_x64_gnu\n      file: tool\n");
+        assert_eq!(
+            plain.install_command,
+            "mkdir -p /tmp/home/bin && curl -fsSL -o '/tmp/home/bin/a;b' https://github.com/owner/tool/releases/download/v1/tool && chmod +x '/tmp/home/bin/a;b'"
+        );
+        assert_eq!(plain.command, "/tmp/home/bin/a;b", "the command is an argv, run with no shell: unquoted");
+    }
+
+    #[test]
+    fn test_a_value_quoting_cant_make_safe_leaves_the_install_to_the_user() {
+        let long = format!("-{}", "a".repeat(200));
+        let long_shown = format!("{:?}…", &long[..80]);
+        let cases = [
+            (package_with_extras("pkg", "pkg:npm/pkg@1.0.0", &["--registry=http://evil.test"]), r#""--registry=http://evil.test""#, "node:22-slim"),
+            (package_with_extras("pkg", "pkg:npm/pkg@1.0.0", &["a\nb"]), r#""a\nb""#, "node:22-slim"),
+            (package_with_extras("pkg", "pkg:npm/pkg@1.0.0", &[""]), r#""""#, "node:22-slim"),
+            (package_with_extras("pkg", "pkg:pypi/pkg@1.0", &[long.as_str()]), long_shown.as_str(), "python:3-slim"),
+            ("name: pkg\nlanguages:\n  - Python\nsource:\n  id: pkg:cargo/pkg@-x\n".to_string(), r#""-x""#, "rust:1"),
+        ];
+        for (yaml, shown, image) in cases {
+            let s = suggest(&yaml, HELIX).expect("a partial suggestion");
+            let c = &s.config;
+            assert_eq!(c.install_command, "", "{shown}");
+            assert!(
+                s.notes.iter().any(|n| n.contains(shown) && n.contains("fill in the install command")),
+                "{shown}: {:?}",
+                s.notes
+            );
+            assert!(!s.notes.iter().any(|n| n.contains(&long)), "a long value is cut: {:?}", s.notes);
+            assert_eq!(c.image, image, "{shown}");
+            assert_eq!(c.command, "pkg", "{shown}");
+            assert_eq!(c.file_types.get("py").map(String::as_str), Some("python"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn test_shell_word_round_trips_through_sh() {
+        let dir = scratch("round-trip");
+        for value in ["'", "\"", "$HOME", "`", "\\", "a b", "*", "~x", "#x", "{a,b}", "é", "it's \"$(x)\""] {
+            let word = shell_word(value).expect("quotable");
+            let out = sh(&dir, &format!("printf %s {word}"));
+            assert!(out.status.success(), "{value}: {out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), value, "{value} as {word}");
+        }
+        for value in ["@scope/pkg@1.2.3", "pkg==1.0", "v0.0.0-20260918162853-acb8859b9031", "4.39.0%2B79757"] {
+            assert_eq!(shell_word(value).expect("safe"), value, "a safe value is left as it is");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_actionlints_unfilled_template_is_one_quoted_word() {
+        let s = suggest_for("actionlint");
+        let install = &s.config.install_command;
+        let url = r#"https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_{{ version | strip_prefix "v" }}_linux_amd64.tar.gz"#;
+        assert_eq!(
+            install,
+            &format!("mkdir -p /tmp/home/bin /tmp/home/opt && curl -fsSL '{url}' | tar -xz -C /tmp/home/opt && ln -sf /tmp/home/opt/actionlint /tmp/home/bin/actionlint")
+        );
+        assert!(s.notes.iter().any(|n| n.contains("template")), "the template note still fires: {:?}", s.notes);
+
+        let dir = scratch("actionlint");
+        let stubs = "curl() { printf '%s\\n' \"$@\" > CURL_ARGS; }\ntar() { :; }\nmkdir() { :; }\nln() { :; }\nstrip_prefix() { touch MARKER; }\n";
+        let out = sh(&dir, &format!("{stubs}{install}"));
+        assert!(!dir.join("MARKER").exists(), "the template ran as a command: {out:?}");
+        assert_eq!(lines(dir.join("CURL_ARGS")), vec!["-fsSL", url]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Guards: real packages whose values need no quoting read as before.
+    /// (The pypi and cargo installs are wrong for SME-215's reasons: they
+    /// drop the purl's qualifiers. Pinned as unchanged, not as right.)
+    #[test]
+    fn test_real_packages_that_need_no_quoting_are_unchanged() {
+        assert_eq!(
+            suggest_for("commitlint").config.install_command,
+            "npm install --prefix /tmp/home/lsp @commitlint/cli@21.2.3 @commitlint/config-conventional commitlint-format-json"
+        );
+        assert_eq!(
+            suggest_for("python-lsp-server").config.install_command,
+            "python -m venv /tmp/home/venv && /tmp/home/venv/bin/pip install python-lsp-server==1.15.0"
+        );
+        assert_eq!(suggest_for("nil").config.install_command, "cargo install nil --version 2025-06-13 --root /tmp/home/cargo");
     }
 }
