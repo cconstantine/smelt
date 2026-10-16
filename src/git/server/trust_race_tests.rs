@@ -134,3 +134,37 @@ async fn test_trust_and_decline_on_two_conversations_cards_settle_once(pool: PgP
     assert!(only_repo(&pool, b.id).await.trust_requests.is_empty(), "no card left in B");
     assert!(decline_waited, "Decline waited for Trust rather than running first");
 }
+
+/// The reader. Interleaving: conversation B's `request_or_load` (the
+/// remote undecided) is held at its card's insert while Decline answers
+/// conversation A's card for the same remote. The Decline drops B's
+/// card and tells B, rather than leave it asking about a declined remote.
+#[sqlx::test]
+async fn test_a_card_asked_for_while_a_decline_waits_is_dropped_by_it(pool: PgPool) {
+    let a = db::create_conversation(&pool).await.expect("conversation A");
+    let b = db::create_conversation(&pool).await.expect("conversation B");
+    let repo_a = cloned_repo(&pool, a.id).await;
+    let repo_b = cloned_repo(&pool, b.id).await;
+    request_or_load(&pool, a.id, &repo_a, "AGENTS.md", &file("a")).await.expect("ask in A");
+    let card_a = only_repo(&pool, a.id).await.trust_requests.remove(0);
+
+    let holding = hold_row(&pool, "instruction_requests", b.id, repo_b.id).await;
+    let load = tokio::spawn({
+        let (pool, repo_b) = (pool.clone(), repo_b.clone());
+        async move { request_or_load(&pool, b.id, &repo_b, "AGENTS.md", &file("b")).await }
+    });
+    assert!(waiters_or_finished(&pool, 1, &load).await, "the load never reached its card");
+    let decline = spawn_decide(&pool, a.id, &card_a, false);
+    let decline_waited = waiters_or_finished(&pool, 2, &decline).await;
+    holding.rollback().await.expect("release the card");
+
+    assert_eq!(join(load, "the load").await.expect("the load"), LoadOutcome::AwaitingTrust);
+    let notices = join(decline, "Decline").await.expect("Decline");
+    assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("trust"), Some(false));
+    assert!(only_repo(&pool, b.id).await.trust_requests.is_empty(), "B's card is dropped");
+    assert!(
+        notices.iter().any(|(id, text)| *id == b.id && text.contains("chose not to trust")),
+        "B's model is told: {notices:?}"
+    );
+    assert!(decline_waited, "Decline waited for the load rather than running first");
+}
