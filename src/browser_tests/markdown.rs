@@ -194,3 +194,110 @@ pub(super) async fn wait_for_copy_label(page: &chromiumoxide::Page, reply: i64, 
 pub(super) fn reply_copy_button(reply: i64) -> String {
     format!(".message[data-reply=\"{reply}\"] .reply-copy")
 }
+
+/// SME-174: a saved reply whose code block nests very deeply (D's `$(`,
+/// the one grammar whose scope depth has no bound) opens like any other.
+/// For each depth, in a conversation and tab of its own: the client goes
+/// live, the text after the block shows, the block is highlighted with all
+/// its text, its span nesting is capped at `MAX_SPAN_DEPTH`, and the page
+/// still renders a live event afterwards (a wasm stack overflow is a trap
+/// that leaves the client dead even where some DOM was drawn). Failures
+/// are gathered per depth, so one run shows the whole series. Unfixed, the
+/// client never went live from 500 on. The deepest block `highlight` takes
+/// (about 32,000) isn't here: it passes too, but syntect's own parse of it
+/// took about 70 s in the tier's debug bundle (SME-209).
+pub(super) async fn scenario_markdown_deep_code(t: &Scenario<'_>) {
+    let mut failures = Vec::new();
+    for depth in [100, 500, 2_000, 8_000] {
+        // A depth that hangs the tab ends alone, so the rest still run.
+        let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tokio::time::timeout(
+            Duration::from_secs(45),
+            deep_code_at(t, depth),
+        )))
+        .await;
+        let problems = match outcome {
+            Ok(Ok(problems)) => problems,
+            Ok(Err(_)) => vec!["didn't finish within 45 s".to_string()],
+            Err(panic) => vec![
+                panic.downcast_ref::<String>().cloned().unwrap_or_else(|| "panicked".to_string()),
+            ],
+        };
+        failures.extend(problems.into_iter().map(|p| format!("depth {depth}: {p}")));
+        // Closed before the next depth, however this one ended: a tab still
+        // busy in a hung render would take the CPU the next one needs.
+        t.close_tabs().await;
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// One depth of `scenario_markdown_deep_code`: what went wrong, if anything.
+async fn deep_code_at(t: &Scenario<'_>, depth: usize) -> Vec<String> {
+    use crate::events::{ConversationEvent, publish};
+    let mut problems = Vec::new();
+    let conversation = t.conversation().await;
+    db::create_message(t.pool, conversation.id, "user", &[anthropic::ContentBlock::Text { text: "Deep code".into() }])
+        .await
+        .expect("seed the user's message");
+    let reply = format!("Deep:\n\n```d\n{}\n```\n\nAFTER-DEEP-CODE\n", "$(".repeat(depth));
+    db::create_message(t.pool, conversation.id, "assistant", &[anthropic::ContentBlock::Text { text: reply }])
+        .await
+        .expect("seed the reply");
+    let started = tokio::time::Instant::now();
+    let page = t.tab(t.url(&format!("conversation/{}", conversation.id))).await;
+    let live = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(wait_for_live_client(
+        &page,
+        conversation.id,
+    )))
+    .await;
+    let live_after = started.elapsed();
+    if live.is_err() {
+        problems.push("1: the client never went live".to_string());
+    }
+    if !wait_for_text(&page, "AFTER-DEEP-CODE", Duration::from_secs(20)).await {
+        problems.push("2: the text after the block never rendered".to_string());
+    }
+    let rendered_after = started.elapsed();
+    // The deepest chain of scope spans (those with a class; a run of text
+    // has a span of its own, with none) under the block, walked with an
+    // explicit stack: a recursive walk would itself be the deep recursion.
+    let facts: serde_json::Value = page
+        .evaluate(
+            "(() => { const pre = document.querySelector('.message-assistant .markdown pre.hl-code'); \
+               if (!pre) return { highlighted: false }; \
+               let deepest = 0; const stack = [[pre, 0]]; \
+               while (stack.length) { const [el, d] = stack.pop(); \
+                 const here = el.tagName === 'SPAN' && el.className !== '' ? d + 1 : d; \
+                 if (here > deepest) deepest = here; \
+                 for (const child of el.children) stack.push([child, here]); } \
+               const text = pre.querySelector('code')?.textContent ?? pre.textContent; \
+               return { highlighted: true, dollars: text.split('$(').length - 1, deepest }; })()",
+        )
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|v| v.into_value().map_err(|e| e.to_string()))
+        .unwrap_or_else(|e| serde_json::json!({ "error": e }));
+    if facts["highlighted"] != true {
+        problems.push(format!("3: the block isn't highlighted: {facts}"));
+    } else {
+        if facts["dollars"].as_u64() != Some(depth as u64) {
+            problems.push(format!("4: the block lost text: {} of {depth} `$(`", facts["dollars"]));
+        }
+        let deepest = facts["deepest"].as_u64().unwrap_or(u64::MAX);
+        if deepest > crate::highlight::MAX_SPAN_DEPTH as u64 {
+            problems.push(format!("5: spans nest {deepest} deep, past {}", crate::highlight::MAX_SPAN_DEPTH));
+        }
+    }
+    let still_live = format!("STILL-LIVE-{depth}");
+    publish(conversation.id, ConversationEvent::ReplyReset {});
+    publish(conversation.id, ConversationEvent::ReplyDelta { text: still_live.clone(), offset: 0 });
+    if !wait_for_text(&page, &still_live, Duration::from_secs(10)).await {
+        problems.push("6: a live event after the render never showed".to_string());
+    }
+    eprintln!(
+        "browser tier: markdown_deep_code: depth {depth}: live in {} ms, rendered in {} ms, span depth {}",
+        live_after.as_millis(),
+        rendered_after.as_millis(),
+        facts["deepest"]
+    );
+    problems
+}
