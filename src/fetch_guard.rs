@@ -400,6 +400,13 @@ mod tests {
             ("an unparseable referrer", from_page("same-site", "no-cors", Some("not a url"), false)),
             ("a same-site POST with no Origin", RequestSource { method: "POST".to_string(), ..from_page("same-site", "navigate", None, true) }),
             ("an unknown Sec-Fetch-Site value", from_page("same-ish", "no-cors", None, false)),
+            (
+                "a same-site POST with a home Referer and no Origin",
+                RequestSource {
+                    method: "POST".to_string(),
+                    ..from_page("same-site", "no-cors", Some("http://5173-42.preview.localhost:8181/"), false)
+                },
+            ),
         ];
         let let_in: Vec<&str> = cases
             .iter()
