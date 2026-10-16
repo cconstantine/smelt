@@ -328,9 +328,15 @@ async fn test_the_question_is_recorded_before_the_replys_other_tools_run(pool: P
 /// The interleaving is forced, not timed: the queued turn publishes
 /// `TurnState { running: true }` just before it makes its stop receiver,
 /// with no await in between, so the Stop reaches it while it waits for
-/// the lock.
+/// the lock, and it takes the stop before the lock is free (code review
+/// 1: releasing the lock straight after the stop let the turn run and
+/// save its message the normal way about half the time). It asserts the
+/// message wasn't saved by the turn running.
 async fn stop_while_queued(conversation_id: i64, queue: impl std::future::Future<Output = ()>) -> Vec<events::ConversationEvent> {
     let mut rx = events::subscribe(conversation_id);
+    // Only the run path reaches this hook. Its release is dropped, so a
+    // run-path save doesn't wait on it: it only tells the test it happened.
+    let (mut ran, _) = test_hooks::pause_after_message_saved(conversation_id);
     let lock = conversation_lock(conversation_id);
     let running = lock.lock().await;
     queue.await;
@@ -348,6 +354,11 @@ async fn stop_while_queued(conversation_id: i64, queue: impl std::future::Future
     .await
     .expect("the queued turn is in flight");
     stop_turn_now(conversation_id);
+    // The stop woke the queued turn. Yielding lets it run while the lock is
+    // still held, so its `select!` finds only the stop ready (the test
+    // runtime is current-thread). Dropping the lock first would make both
+    // arms ready at once, and the `select!` would pick one at random.
+    tokio::task::yield_now().await;
     drop(running);
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
@@ -361,6 +372,7 @@ async fn stop_while_queued(conversation_id: i64, queue: impl std::future::Future
     })
     .await
     .expect("the stopped turn ends");
+    assert!(ran.try_recv().is_err(), "the message was saved by the turn running, not by the stop while it was queued");
     seen
 }
 
