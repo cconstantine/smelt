@@ -430,6 +430,10 @@ fn checked(input: ProviderInput) -> Result<ProviderInput, String> {
     if input.max_concurrent_requests.is_some_and(|n| i32::try_from(n).is_err()) {
         return Err(format!("Max concurrent requests can be at most {}.", i32::MAX));
     }
+    // Only a llama.cpp server reports its slots (SME-162 review 1).
+    if input.max_concurrent_requests == Some(0) && input.kind != ProviderKind::LlamaCpp {
+        return Err("Max concurrent requests 0 (the server's own count) needs a llama.cpp server, which reports it; type a number instead.".to_string());
+    }
     Ok(ProviderInput {
         name,
         base_url,

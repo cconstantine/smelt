@@ -234,7 +234,7 @@ fn ProviderFields(
                 value: "{form().max_concurrent_requests}",
                 oninput: move |e| form.write().max_concurrent_requests = e.value() }
             p { class: "muted",
-                "Leave blank for no limit. A server only serves as many requests at once as it has slots. Type 0 to use the server's own count (a llama.cpp server reports it on this provider's page once its models are listed), or type the number to set it yourself. While all slots are busy smelt waits before sending, so two conversations take turns instead of one timing out."
+                "Leave blank for no limit. A server only serves as many requests at once as it has slots. A llama.cpp server can take 0, its own count, which it reports on this provider's page once its models are listed; otherwise type the number. While all slots are busy smelt waits before sending, so two conversations take turns instead of one timing out."
             }
 
             label { r#for: "provider-prices", "Prices from" }

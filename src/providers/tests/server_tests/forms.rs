@@ -80,8 +80,12 @@ async fn test_a_providers_max_concurrent_requests_is_saved_and_shown(pool: PgPoo
     let stored = db::get_inference_provider(&pool, one.id).await.expect("get").expect("exists");
     assert_eq!(stored.max_concurrent_requests, Some(1), "nothing saved");
 
-    let auto = update_provider(&pool, one.id, limited(Some(0))).await.expect("automatic");
-    assert_eq!(auto.max_concurrent_requests, Some(0), "0 is automatic, not refused");
+    // SME-162 review 1: only a llama.cpp server reports a slot count.
+    let not_llama = update_provider(&pool, one.id, limited(Some(0))).await.expect_err("0 on Ollama");
+    assert!(not_llama.contains("llama.cpp"), "{not_llama}");
+    let llama = ProviderInput { kind: ProviderKind::LlamaCpp, ..limited(Some(0)) };
+    let auto = update_provider(&pool, one.id, llama).await.expect("automatic");
+    assert_eq!(auto.max_concurrent_requests, Some(0), "0 is automatic on a llama.cpp provider");
     let cleared = update_provider(&pool, one.id, limited(None)).await.expect("clear");
     assert_eq!(cleared.max_concurrent_requests, None, "blank is no limit");
     let set_again = update_provider(&pool, one.id, limited(Some(3))).await.expect("set");
