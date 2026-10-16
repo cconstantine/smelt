@@ -462,4 +462,121 @@ else
     echo "note: ::1 can't be bound here; skipping the IPv6-only listener case"
 fi
 
+# The readiness wait counts an answer only while every listener on the port
+# is the server's own (SME-175). Each case below starts check-server in the
+# background on a port of its own, with dx shaped by the given settings,
+# and puts a foreign listener on the port once the start is past its
+# preflight (its pid file is written just after).
+start_out=$dir/start-out
+start_in_background() { # port, then VAR=VALUE settings
+    local p=$1
+    shift
+    : >"$start_out"
+    : >"$pid_file"
+    timeout 30 "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$p" "$@" \
+        scripts/check-server start HEAD >"$start_out" 2>&1 &
+    starter=$!
+}
+wait_for_pid_file() {
+    for _ in $(seq 1 100); do
+        [ -s "$pid_file" ] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+# Waits up to 10 s for process group $1 to end.
+wait_for_group_end() { # pgid
+    for _ in $(seq 1 100); do
+        group_is_live "$1" || return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+# 14. A listener appears on the port after the preflight, while dx is still
+# building (it binds 3 s in): start stops waiting and exits 1, naming it,
+# and dx then fails its own bind and exits.
+fport=$(free_port)
+start_in_background "$fport" DX_BIND_DELAY=3
+wait_for_pid_file || fail "the mid-start case's start wrote no pid file: $(cat "$start_out")"
+dx_group=$(cat "$pid_file")
+start_foreign 0.0.0.0 "$fport" || fail "the mid-start foreign listener never listened"
+wait "$starter"
+rc=$?
+out=$(cat "$start_out")
+[ "$rc" = 1 ] || fail "a listener appearing mid-start: start exited $rc: $out"
+grep -q "check server up" <<<"$out" && fail "a listener appearing mid-start passed for the check server: $out"
+grep -qw "pid $foreign_pid" <<<"$out" || fail "a listener appearing mid-start isn't named (pid $foreign_pid): $out"
+wait_for_group_end "$dx_group" || fail "the stub dx kept running after its port was taken"
+"${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" scripts/check-server stop >/dev/null 2>&1
+pid_is_live "$foreign_pid" || fail "start or stop signalled the mid-start listener"
+stop_foreign "$foreign_pid"
+
+# 15. The same while dx never binds at all: start exits 1 within seconds,
+# rather than taking the foreign answer for dx's or waiting 12 minutes.
+fport=$(free_port)
+start_in_background "$fport" DX_NO_LISTEN=1
+wait_for_pid_file || fail "the never-binds case's start wrote no pid file: $(cat "$start_out")"
+start_foreign 0.0.0.0 "$fport" || fail "the never-binds foreign listener never listened"
+wait "$starter"
+rc=$?
+out=$(cat "$start_out")
+[ "$rc" = 1 ] || fail "a listener while dx never binds: start exited $rc: $out"
+grep -q "check server up" <<<"$out" && fail "a listener while dx never binds passed for the check server: $out"
+grep -qw "pid $foreign_pid" <<<"$out" || fail "a listener while dx never binds isn't named (pid $foreign_pid): $out"
+"${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" scripts/check-server stop >/dev/null 2>&1
+pid_is_live "$foreign_pid" || fail "start or stop signalled the never-binds listener"
+stop_foreign "$foreign_pid"
+
+# 16. A listener beside the server's, on IPv6's loopback (dx binds IPv4
+# only), appearing between start's ownership check and its request (the
+# curl stub's hook starts it): start exits 1 rather than up, whichever of
+# the two answered.
+if has_ipv6_loopback; then
+    fport=$(free_port)
+    hook=$dir/curl-hook
+    hook_done=$dir/curl-hook-done
+    hook_ready=$dir/curl-hook-ready
+    cat >"$hook" <<'EOF'
+#!/usr/bin/env bash
+# Once: a foreign listener on [::1]:$HOOK_PORT, without the locks start holds.
+[ -s "$HOOK_DONE" ] && exit 0
+echo 1 >"$HOOK_DONE"
+exec 8>&- 9>&-
+"$STUB_PYTHON3" -I "$STUB_HTTP_200" ::1 "$HOOK_PORT" --own-group --ready "$HOOK_READY" </dev/null >/dev/null 2>&1 &
+for _ in $(seq 1 50); do
+    [ -s "$HOOK_READY" ] && exit 0
+    sleep 0.1
+done
+EOF
+    chmod +x "$hook"
+    : >"$hook_done"
+    : >"$hook_ready"
+    start_in_background "$fport" CURL_HOOK="$hook" HOOK_DONE="$hook_done" HOOK_READY="$hook_ready" HOOK_PORT="$fport"
+    wait "$starter"
+    rc=$?
+    out=$(cat "$start_out")
+    foreign_pid=$(cat "$hook_ready")
+    [ -n "$foreign_pid" ] || fail "the curl hook's listener never listened: $out"
+    [ "$rc" = 1 ] || fail "a listener beside the server's: start exited $rc: $out"
+    grep -q "check server up" <<<"$out" && fail "a listener beside the server's let start say up: $out"
+    [ -n "$foreign_pid" ] && { grep -qw "pid $foreign_pid" <<<"$out" || fail "the listener beside the server's isn't named (pid $foreign_pid): $out"; }
+    "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" scripts/check-server stop >/dev/null 2>&1
+    if [ -n "$foreign_pid" ]; then
+        pid_is_live "$foreign_pid" || fail "start or stop signalled the listener beside the server's"
+        kill "$foreign_pid" 2>/dev/null
+    fi
+else
+    echo "note: ::1 can't be bound here; skipping the listener-beside case"
+fi
+
+# 17. Nothing listens until dx binds, 3 s in: start waits and then says up,
+# through the real curl.
+fport=$(free_port)
+if ! out=$(timeout 30 "${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" DX_BIND_DELAY=3 scripts/check-server start HEAD 2>&1); then
+    fail "a dx that binds late: start failed: $out"
+fi
+grep -qF "check server up at http://localhost:$fport/" <<<"$out" || fail "a dx that binds late: start said: $out"
+"${cs_env[@]}" CHECK_WORKTREE="$worktree" CHECK_PORT="$fport" scripts/check-server stop >/dev/null 2>&1
+
 finish
