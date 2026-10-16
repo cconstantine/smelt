@@ -732,9 +732,12 @@ async fn edit_diagnostics(config_list: &[LanguageServerConfig], client: &kube::C
         });
     }
     let session = session_for(client, &pod_name, &config, &root).await.ok()?;
+    // Before the refresh: it syncs the edited file too when the server
+    // has it open, and diagnostics published without a version after that
+    // are for the new text.
+    let since = Instant::now();
     refresh_open_files(client, &pod_name, &session).await.ok()?;
     let text = read_in_pod(client, &pod_name, path).await.ok()?;
-    let since = Instant::now();
     let version = session.sync(path, &text).await.ok()?;
     let found = session.diagnostics(path, version, since, EDIT_DIAGNOSTICS_WAIT).await;
     let lines: Vec<&str> = text.lines().collect();
