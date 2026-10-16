@@ -335,10 +335,11 @@ pub(crate) fn turn_started_elapsed(conversation_id: i64) -> Option<std::time::Du
 /// A conversation's last failed turn's error, until the user writes again,
 /// for a tab that connects after the `TurnError` event (SME-51 B11), and
 /// its turn generation: bumped by the user sending or answering, by a turn
-/// with a message of its own or an answer once it holds the turn lock, and
-/// by a wake once it has notices for the model, so a turn's failure is
-/// kept only if no newer turn has started since it did (SME-91). A wake
-/// with nothing to do leaves it alone (SME-179).
+/// with a message of its own once it holds the turn lock, and by a wake or
+/// an answer turn once it has something for the model, so a turn's
+/// failure is kept only if no newer turn has started since it did
+/// (SME-91). A wake or answer turn with nothing to do leaves it alone
+/// (SME-179).
 #[derive(Default)]
 pub(super) struct KeptTurnError {
     generation: u64,

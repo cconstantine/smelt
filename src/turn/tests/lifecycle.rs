@@ -436,3 +436,60 @@ async fn test_a_delete_after_the_exists_check_leaves_no_turn_state(pool: PgPool)
     assert!(result.is_err(), "{result:?}");
     assert!(!has_turn_state(conversation_id), "the turn left turn state");
 }
+
+
+/// Review 1, finding 1, interleaving: with a question waiting and the
+/// lock held, the user sends M, then answers the card (answer turn A
+/// queues behind M). M takes the answer into its own message and fails;
+/// A then has nothing to do. M's error must be kept: A took a generation
+/// as soon as it held the lock, which cleared it.
+#[sqlx::test]
+async fn test_an_answer_turn_with_nothing_to_do_keeps_the_kept_error(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counted = counter.clone();
+    let ask = super::ask_user::ask_body();
+    let app = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(move || {
+            let i = counted.fetch_add(1, Ordering::SeqCst);
+            let ask = ask.clone();
+            async move {
+                if i == 0 {
+                    return ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], ask).into_response();
+                }
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    r#"{"type":"error","error":{"type":"invalid_request_error","message":"the user's turn failed"}}"#.to_string(),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
+    crate::providers::test_support::add_mock_provider(&pool, addr).await;
+
+    run_turn(&pool, conversation_id, hello()).await.expect("asks");
+    assert!(db::get_pending_question(&pool, conversation_id).await.expect("read").is_some());
+
+    let held = conversation_lock(conversation_id).lock_owned().await;
+    start_turn(pool.clone(), conversation_id, "do X instead".to_string()).await.expect("send");
+    wait_until("M queued", || turns_in_flight(conversation_id) == 1).await;
+    let answers = vec![crate::questions::QuestionAnswer { selected: vec!["No".to_string()], other: None }];
+    answer_question(pool.clone(), conversation_id, "toolu_ask".to_string(), answers).await.expect("answer");
+    wait_until("A queued", || turns_in_flight(conversation_id) == 2).await;
+    drop(held);
+
+    wait_until("both end", || !turn_running(conversation_id)).await;
+    assert_eq!(counter.load(Ordering::SeqCst), 2, "M called the model once and A not at all");
+    assert!(
+        last_turn_error(conversation_id).is_some_and(|e| e.contains("the user's turn failed")),
+        "the user's error isn't kept: {:?}",
+        last_turn_error(conversation_id)
+    );
+}

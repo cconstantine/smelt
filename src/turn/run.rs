@@ -135,7 +135,7 @@ pub(super) fn run_turn_bounded<'a>(
             #[cfg(test)]
             test_hooks::after_turn_counted(conversation_id).await;
             // The turn's generation, once it holds the lock and has something
-            // to do (`run_turn_stoppable`).
+            // to tell the model (`run_turn_stoppable`).
             let mut generation = None;
             let result = run_turn_stoppable(
                 pool,
@@ -143,7 +143,6 @@ pub(super) fn run_turn_bounded<'a>(
                 new_message,
                 max_turns,
                 from_user,
-                keep_error,
                 in_flight.stop(),
                 &mut generation,
             )
@@ -173,13 +172,16 @@ pub(super) fn run_turn_bounded<'a>(
 /// `run_turn_bounded`'s turn: waits for the turn lock, saves the turn's
 /// message, and runs it, ending early on a stop (`stop`).
 ///
-/// A turn with a message of its own or an answer to keep an error for
-/// (`keep_error`) takes a new turn generation once it holds the lock
-/// (`generation`), clearing the kept error; a wake takes one only once
-/// it has notices to tell the model (`run_turn_steps`). Not when it's
-/// counted, as before SME-179 (B30): a wake queued behind the user's
-/// failing turn took a newer one first, so that failure was never kept,
-/// and a wake with nothing to do cleared the error the user was shown.
+/// A turn with a message of its own takes a new turn generation once it
+/// holds the lock (`generation`), clearing the kept error. One without
+/// (a wake, or an answer from the card) takes one only once it has
+/// something to tell the model: the answer it saves here, or notices its
+/// drain saves (`run_turn_steps`). Not when it's counted, as before
+/// SME-179 (B30): a wake queued behind the user's failing turn took a
+/// newer one first, so that failure was never kept, and a wake with
+/// nothing to do cleared the error the user was shown. An answer turn
+/// whose answer another turn already took has nothing to do either
+/// (review 1).
 #[cfg(feature = "server")]
 pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
     pool: &'a PgPool,
@@ -187,7 +189,6 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
     new_message: Option<anthropic::AnthropicMessage>,
     max_turns: usize,
     from_user: bool,
-    keep_error: bool,
     stop: &'b mut tokio::sync::watch::Receiver<u64>,
     generation: &'b mut Option<u64>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TurnResult> + Send + 'b>>
@@ -218,8 +219,7 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
                 return Err(TurnFailure::Stopped);
             }
         };
-        let generation_taken = new_message.is_some() || keep_error;
-        if generation_taken {
+        if new_message.is_some() {
             *generation = Some(new_turn_generation(conversation_id));
         }
         // Checked after the generation is taken, both under the lock: a
@@ -244,6 +244,10 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
         let mut persisted = Vec::new();
         let new_content = match save_turn_message(pool, conversation_id, new_message, from_user).await? {
             Some((saved, content)) => {
+                // An answer turn's answer, saved as its message.
+                if generation.is_none() {
+                    *generation = Some(new_turn_generation(conversation_id));
+                }
                 #[cfg(test)]
                 test_hooks::after_message_saved(conversation_id).await;
                 record_saved(conversation_id, &mut persisted, saved);
@@ -252,7 +256,7 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
             None => None,
         };
         tokio::select! {
-            result = run_turn_body(pool, conversation_id, guard, persisted, new_content, max_turns, generation_taken) => return result.map_err(TurnFailure::Failed),
+            result = run_turn_body(pool, conversation_id, guard, persisted, new_content, max_turns, generation) => return result.map_err(TurnFailure::Failed),
             _ = stop.changed() => {}
         }
         // Stopped mid-turn: the body, and its hold on the lock, is gone.
@@ -367,27 +371,27 @@ impl Drop for TurnSteps {
 /// The turn itself, holding the turn lock (`turn_lock`) until it ends:
 /// `persisted` starts with the turn's own message, already saved by
 /// `run_turn_bounded`, and `new_content` is that message's content
-/// (`None` for a wake). `generation_taken` says the turn already took
-/// its turn generation; a wake that hasn't takes one before it first
-/// calls the model. A turn that fails leaves no reply in progress,
+/// (`None` for a wake). `generation` is the turn's generation, if it has
+/// taken one; a turn that hasn't takes one before it first calls the
+/// model. A turn that fails leaves no reply in progress,
 /// as a stopped one doesn't (`end_stopped_turn`): cleared, and every tab
 /// told, while it still holds the lock, so it can't be another turn's
 /// and a turn queued behind it doesn't show it (SME-179 B28).
 #[cfg(feature = "server")]
-pub(super) fn run_turn_body<'a>(
+pub(super) fn run_turn_body<'a: 'b, 'b>(
     pool: &'a PgPool,
     conversation_id: i64,
     turn_lock: tokio::sync::OwnedMutexGuard<()>,
     persisted: Vec<Message>,
     new_content: Option<Vec<anthropic::ContentBlock>>,
     max_turns: usize,
-    generation_taken: bool,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
+    generation: &'b mut Option<u64>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'b>>
 {
     Box::pin(async move {
         // Moved in, so the lock is held for as long as the turn runs.
         let _turn = turn_lock;
-        let result = run_turn_steps(pool, conversation_id, persisted, new_content, max_turns, generation_taken).await;
+        let result = run_turn_steps(pool, conversation_id, persisted, new_content, max_turns, generation).await;
         if result.is_err() {
             clear_reply_in_progress(conversation_id);
             crate::events::publish(conversation_id, crate::events::ConversationEvent::ReplyReset {});
@@ -399,14 +403,14 @@ pub(super) fn run_turn_body<'a>(
 /// `run_turn_body`'s steps: the loop that calls the model, runs the tools
 /// it asks for and saves each step.
 #[cfg(feature = "server")]
-fn run_turn_steps<'a>(
+fn run_turn_steps<'a: 'b, 'b>(
     pool: &'a PgPool,
     conversation_id: i64,
     mut persisted: Vec<Message>,
     new_content: Option<Vec<anthropic::ContentBlock>>,
     max_turns: usize,
-    generation_taken: bool,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
+    generation: &'b mut Option<u64>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'b>>
 {
     Box::pin(async move {
         // The turn's own span, `run_turn_bounded`'s: its model and the
@@ -475,10 +479,11 @@ fn run_turn_steps<'a>(
             if is_wake && persisted.is_empty() {
                 return Ok(persisted);
             }
-            // A wake with notices to tell is a newer turn, so it replaces
-            // the kept error, once, as it first calls the model (SME-179).
-            if !generation_taken && steps.count == 0 {
-                new_turn_generation(conversation_id);
+            // A wake (or an answer turn) with notices to tell is a newer
+            // turn, so it replaces the kept error, once, as it first calls
+            // the model (SME-179).
+            if generation.is_none() {
+                *generation = Some(new_turn_generation(conversation_id));
             }
 
             let turn_model = match resolved_model.take() {
