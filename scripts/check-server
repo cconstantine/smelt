@@ -305,9 +305,10 @@ foreign_listener_inodes() { # pgid (may be empty) port
     local listeners ours="" inode
     listeners=$(port_listener_inodes "$2")
     # Tests only: runs between the two reads, so a case can make the
-    # server bind there.
+    # server bind there. Its output goes to stderr: this function's
+    # stdout is the list of foreign inodes (SME-175 review 2).
     if [ -n "$1" ] && [ -n "${CHECK_SERVER_TEST_OWNERSHIP_HOOK:-}" ]; then
-        "$CHECK_SERVER_TEST_OWNERSHIP_HOOK"
+        "$CHECK_SERVER_TEST_OWNERSHIP_HOOK" >&2
     fi
     [ -n "$1" ] && ours=$(group_socket_inodes "$1")
     local still

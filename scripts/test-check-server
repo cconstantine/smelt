@@ -641,9 +641,11 @@ hook=$dir/ownership-hook
 hook_done=$dir/ownership-hook-done
 cat >"$hook" <<'EOF'
 #!/usr/bin/env bash
-# Once: wait up to 10 s for a listener on $HOOK_PORT.
+# Once: wait up to 10 s for a listener on $HOOK_PORT. It also prints a
+# line, which must never be read as a listener (review 2).
 [ -s "$HOOK_DONE" ] && exit 0
 echo 1 >"$HOOK_DONE"
+echo "ownership hook ran"
 suffix=$(printf ':%04X' "$HOOK_PORT")
 for _ in $(seq 1 100); do
     awk -v s="$suffix" '$4 == "0A" && substr($2, length($2) - 4) == s { f = 1 } END { exit !f }' /proc/net/tcp && exit 0
