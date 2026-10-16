@@ -248,7 +248,13 @@ fn shell_word(value: &str) -> Result<Cow<'_, str>, String> {
         let text: String = value.chars().skip(from).take(SHOWN).collect();
         let before = if from > 0 { "…" } else { "" };
         let after = if value.chars().nth(from + SHOWN).is_some() { "…" } else { "" };
-        format!("{before}{text:?}{after}")
+        // `{:?}` leaves some invisible characters as they are (a Hangul
+        // filler is a letter to it): escape those too, so the note shows them.
+        let escaped: String = format!("{text:?}")
+            .chars()
+            .map(|c| if invisible(c) { format!("\\u{{{:x}}}", u32::from(c)) } else { c.to_string() })
+            .collect();
+        format!("{before}{escaped}{after}")
     };
     if let Some(at) = first_bad {
         return refuse(shown(at.saturating_sub(20)), "holds a control character");
@@ -269,20 +275,30 @@ fn shell_word(value: &str) -> Result<Cow<'_, str>, String> {
 }
 
 /// Whether `c` changes how the text around it shows without showing
-/// itself: bidi controls (U+061C, U+200E/F, U+202A–U+202E, U+2066–U+2069),
-/// zero-width and invisible characters (U+00AD, U+180E, U+200B–U+200D,
-/// U+2060–U+2064, U+FEFF), and the line and paragraph separators.
+/// itself: Unicode's Default_Ignorable_Code_Point set (DerivedCoreProperties:
+/// bidi controls, zero-width characters, variation selectors, Hangul
+/// fillers, the tag block used to smuggle hidden text), plus the line and
+/// paragraph separators and the interlinear annotation characters.
 fn invisible(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'
+            | '\u{034F}'
             | '\u{061C}'
-            | '\u{180E}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
             | '\u{200B}'..='\u{200F}'
             | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
             | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFFB}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
     )
 }
 

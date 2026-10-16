@@ -305,7 +305,18 @@ fn test_every_github_download_shape_quotes_and_every_kind_refuses() {
 fn test_a_value_that_would_show_as_something_else_is_refused() {
     // A right-to-left override shows `evil` the other way round in the
     // form; a zero-width space or a soft hyphen doesn't show at all.
-    for (extra, escaped) in [("pkg\u{202E}live", r"\u{202e}"), ("type\u{200B}script", r"\u{200b}"), ("a\u{2066}b", r"\u{2066}"), ("x\u{AD}y", r"\u{ad}")] {
+    // A tag character or a variation selector hides text ("ASCII
+    // smuggling"); a Hangul filler shows as a gap, even in the note unless
+    // it's escaped there.
+    for (extra, escaped) in [
+        ("pkg\u{202E}live", r"\u{202e}"),
+        ("type\u{200B}script", r"\u{200b}"),
+        ("a\u{2066}b", r"\u{2066}"),
+        ("x\u{AD}y", r"\u{ad}"),
+        ("type\u{E0074}script", r"\u{e0074}"),
+        ("a\u{FE0F}b", r"\u{fe0f}"),
+        ("pkg\u{3164}x", r"\u{3164}"),
+    ] {
         let s = suggest(&package_with_extras("pkg", "pkg:npm/pkg@1.0.0", &[extra]), HELIX).expect("a partial suggestion");
         assert_eq!(s.config.install_command, "", "{escaped}");
         assert!(
