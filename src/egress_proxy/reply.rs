@@ -32,7 +32,8 @@ fn status_line_start(buf: &[u8]) -> Option<usize> {
 
 /// Whether `buf` can't be an HTTP reply: Chrome decides that once 8 bytes
 /// have come without `http` in place, and reads the reply as HTTP/0.9,
-/// which it never reuses (and refuses on a port other than 80).
+/// which it never reuses (and refuses on a port that isn't the scheme's
+/// default, but for a Shoutcast `ICY` reply over http).
 fn is_not_http(buf: &[u8]) -> bool {
     buf.len() >= STATUS_LINE_SLOP + 4 && status_line_start(buf).is_none()
 }
@@ -56,9 +57,13 @@ fn end_of_head(buf: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// `head`'s lines as Chrome splits them: NUL bytes dropped, then broken at
-/// every run of carriage returns and line feeds. The first is the status
-/// line.
+/// `head`'s lines as Chrome splits them, broken at every run of carriage
+/// returns and line feeds, NUL bytes dropped. The first is the status line.
+/// Chrome refuses a head holding a NUL (`HttpResponseHeaders::TryToCreate`)
+/// before it would split it, so the NULs dropped here only matter to the
+/// proxy: a final head it rewrites comes out without them, `close` and all,
+/// and an interim one goes on unchanged for Chrome to refuse. Neither can
+/// be reused.
 fn head_lines(head: &[u8]) -> Vec<Vec<u8>> {
     let head: Vec<u8> = head.iter().copied().filter(|&b| b != 0).collect();
     head.split(|&b| b == b'\r' || b == b'\n')
@@ -289,8 +294,9 @@ mod tests {
         assert_eq!(closed("HTTP/1.1 204 No Content\r\n\r\n"), "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
     }
 
-    /// Chrome ends a header line at any CR or LF, and drops NUL bytes
-    /// before reading names (`HttpUtil::AssembleRawHeaders`).
+    /// Chrome ends a header line at any CR or LF
+    /// (`HttpUtil::AssembleRawHeaders`). It refuses a head with a NUL in it;
+    /// the proxy's rewrite drops the NUL and still marks the head closed.
     #[test]
     fn test_close_response_head_reads_lines_and_names_as_chrome_does() {
         assert_eq!(
