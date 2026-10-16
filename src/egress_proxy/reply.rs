@@ -90,7 +90,8 @@ const CONNECTION_HEADERS: [&[u8]; 3] = [b"connection", b"proxy-connection", b"ke
 /// `head` (from its status line to its blank line) with `Connection:
 /// close` as its first header and every other `Connection`,
 /// `Proxy-Connection` and `Keep-Alive` header gone, a dropped header's
-/// continuation lines with it. Lines are ended with CRLF; the status line
+/// continuation lines with it, and any continuation line straight after the
+/// status line. Lines are ended with CRLF; the status line
 /// and every other header are kept as they were, so the body's framing is
 /// unchanged. Being first, the `close` is the token `IsKeepAlive` meets
 /// first even if a name here were read differently.
@@ -103,8 +104,12 @@ pub(super) fn close_response_head(head: &[u8]) -> Vec<u8> {
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"Connection: close\r\n");
-    // Whether the last line that wasn't a continuation was dropped.
-    let mut dropping = false;
+    // Whether the last line that wasn't a continuation was dropped. A
+    // continuation line straight after the status line is dropped too:
+    // Chrome would join it onto `Connection: close`, making that one value
+    // neither `close` nor `keep-alive` (SME-165 review 1), and where it
+    // follows the status line Chrome skips it anyway.
+    let mut dropping = true;
     for line in lines {
         let continuation = matches!(line.first(), Some(b' ' | b'\t'));
         if !continuation {
@@ -218,6 +223,16 @@ mod tests {
         assert_eq!(
             closed("HTTP/1.1 200 OK\r\nConnection: Upgrade,\r\n keep-alive\r\nX-Long: a,\r\n\tb\r\n\r\n"),
             "HTTP/1.1 200 OK\r\nConnection: close\r\nX-Long: a,\r\n\tb\r\n\r\n"
+        );
+    }
+
+    /// Chrome would join a first header line that starts with whitespace
+    /// onto the `Connection: close` before it (SME-165 review 1).
+    #[test]
+    fn test_close_response_head_drops_a_leading_continuation_line() {
+        assert_eq!(
+            closed("HTTP/1.1 200 OK\r\n X-Foo: bar\r\n\tmore\r\nContent-Length: 2\r\n\r\n"),
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\n"
         );
     }
 

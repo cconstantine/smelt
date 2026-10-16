@@ -614,6 +614,23 @@ async fn test_a_sandbox_upgrade_stays_a_tunnel() {
     assert_eq!(read_up_to(&mut stream, 4).await, "ping", "the tunnel should carry bytes both ways");
 }
 
+/// A first header line starting with whitespace would be read by Chrome
+/// as a continuation of the proxy's `Connection: close`
+/// (`AssembleRawHeaders`), turning its value into `close X-Foo: bar`,
+/// which `IsKeepAlive` reads as neither close nor keep-alive, so an
+/// HTTP/1.1 connection is kept (SME-165 review 1).
+#[tokio::test]
+async fn test_a_sandbox_reply_whose_first_header_is_a_continuation_is_still_closed() {
+    let expected = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi";
+    let (got, _) = exchange(
+        vec![b"HTTP/1.1 200 OK\r\n X-Foo: bar\r\nContent-Length: 2\r\n\r\nhi"],
+        NAVIGATION,
+        expected,
+    )
+    .await;
+    assert_eq!(got, expected);
+}
+
 /// A reply head too large to check is refused, saying why.
 #[tokio::test]
 async fn test_a_sandbox_reply_head_too_large_is_refused() {
