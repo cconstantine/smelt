@@ -115,3 +115,145 @@ fn test_templates_missing_a_placeholder_scheme_or_with_a_path_are_refused() {
         assert!(PreviewTemplate::parse(bad).is_err(), "{bad:?} should be refused");
     }
 }
+
+/// A browser leaves a scheme's default port out of `Host` and `Origin`,
+/// so a template that spells it out must too (SME-183).
+#[test]
+fn test_a_default_port_is_dropped_as_a_browser_drops_it() {
+    for (template_text, url, host) in [
+        ("https://{port}-{conversation}.preview.example.com:443", "https://3000-42.preview.example.com", "3000-42.preview.example.com"),
+        ("http://{port}-{conversation}.preview.example.com:80", "http://3000-42.preview.example.com", "3000-42.preview.example.com"),
+        ("https://{port}-{conversation}.preview.example.com:", "https://3000-42.preview.example.com", "3000-42.preview.example.com"),
+        ("https://{port}-{conversation}.preview.example.com:0443", "https://3000-42.preview.example.com", "3000-42.preview.example.com"),
+        ("https://{port}-{conversation}.Preview.EXAMPLE.com:443", "https://3000-42.preview.example.com", "3000-42.PREVIEW.example.com"),
+    ] {
+        let t = template(template_text);
+        assert_eq!(t.url_for(42, PodHost::Localhost, 3000), url, "{template_text:?}");
+        assert_eq!(t.match_host(host), Some((42, PodHost::Localhost, 3000)), "{template_text:?} should match {host:?}");
+    }
+}
+
+#[test]
+fn test_a_non_default_port_is_kept_in_the_form_a_browser_sends() {
+    for (template_text, url, host) in [
+        ("https://{port}-{conversation}.example.com:8443", "https://3000-42.example.com:8443", "3000-42.example.com:8443"),
+        ("https://{port}-{conversation}.example.com:80", "https://3000-42.example.com:80", "3000-42.example.com:80"),
+        ("http://{port}-{conversation}.example.com:443", "http://3000-42.example.com:443", "3000-42.example.com:443"),
+        ("http://{port}-{conversation}.example.com:08181", "http://3000-42.example.com:8181", "3000-42.example.com:8181"),
+    ] {
+        let t = template(template_text);
+        assert_eq!(t.url_for(42, PodHost::Localhost, 3000), url, "{template_text:?}");
+        assert_eq!(t.match_host(host), Some((42, PodHost::Localhost, 3000)), "{template_text:?} should match {host:?}");
+        assert_eq!(t.match_host("3000-42.example.com"), None, "{template_text:?} needs its port");
+    }
+}
+
+#[test]
+fn test_a_trailing_dot_is_kept_in_links_and_matched() {
+    let t = template("https://{port}-{conversation}.preview.example.com.:443");
+    assert_eq!(t.url_for(42, PodHost::Localhost, 3000), "https://3000-42.preview.example.com.");
+    assert_eq!(t.match_host("3000-42.preview.example.com."), Some((42, PodHost::Localhost, 3000)));
+}
+
+/// A placeholder can't be the port: a preview of port 80 would link to
+/// `…:80`, which a browser sends back without the port, and a container's
+/// `172-21-0-2-3000` is no port at all (SME-183's review).
+#[test]
+fn test_a_placeholder_in_the_port_is_refused() {
+    for bad in ["http://{conversation}.x.test:{port}", "http://{port}-x.test:{conversation}", "http://{port}.x.test:8{conversation}", "https://a:{port}-{conversation}.x.test"] {
+        let error = PreviewTemplate::parse(bad).expect_err(&format!("{bad:?} should be refused"));
+        assert!(error.contains("placeholder in its port"), "the error should say the port can't hold a placeholder: {error:?}");
+    }
+}
+
+/// Templates accepted before SME-183 that no browser's `Host` can match.
+#[test]
+fn test_templates_no_browser_host_can_match_are_refused() {
+    for bad in [
+        "https://user@{port}-{conversation}.example.com",
+        "http://[{port}-{conversation}]:8181",
+        "http://[::1]:{port}-{conversation}",
+        "https://{port}-{conversation}.bücher.example",
+        "https://{port}-{conversation}.example.com:99999",
+        "https://{port}-{conversation}.example.com:44a",
+        "https://{port}-{conversation}.example.com:+443",
+        "https://{port}-{conversation}.example.com:0",
+    ] {
+        let error = PreviewTemplate::parse(bad).expect_err(&format!("{bad:?} should be refused"));
+        assert!(error.contains(bad), "the error should name the template: {error:?}");
+    }
+    let error = PreviewTemplate::parse("https://{port}-{conversation}.bücher.example").expect_err("non-ASCII");
+    assert!(error.contains("xn--"), "the error should say to write the xn-- form: {error:?}");
+}
+
+/// A proxy in front of the listener may write the default port into
+/// `Host` (nginx's `$host:$server_port`); `Origin` is still matched
+/// exactly, as a browser writes it (SME-183's review).
+#[test]
+fn test_a_request_host_spelling_out_the_default_port_still_matches() {
+    let t = template("https://{port}-{conversation}.preview.example.com:443");
+    assert_eq!(t.match_request_host("3000-42.preview.example.com:443"), Some((42, PodHost::Localhost, 3000)));
+    assert_eq!(t.match_request_host("3000-42.preview.example.com"), Some((42, PodHost::Localhost, 3000)));
+    assert_eq!(t.match_request_host("3000-42.preview.example.com:80"), None);
+    assert_eq!(t.match_host("3000-42.preview.example.com:443"), None, "an Origin spelling out :443 isn't a browser's");
+    let t = template("http://{port}-{conversation}.preview.example.com");
+    assert_eq!(t.match_request_host("3000-42.preview.example.com:80"), Some((42, PodHost::Localhost, 3000)));
+    assert_eq!(t.match_request_host("3000-42.preview.example.com:443"), None);
+}
+
+/// A colon left in the host after the port is split off (SME-183's review).
+#[test]
+fn test_a_template_with_more_than_one_port_is_refused() {
+    for bad in [
+        "https://{port}-{conversation}.x.test:8181:8181",
+        "https://{port}-{conversation}.x.test::8181",
+        "https://{port}-{conversation}.x.test:8181:",
+    ] {
+        let error = PreviewTemplate::parse(bad).expect_err(&format!("{bad:?} should be refused"));
+        assert!(error.contains("one port at most"), "{bad:?} should be refused for its ports: {error:?}");
+    }
+}
+
+/// Characters a browser's `Host` never carries: it percent-decodes, reads
+/// a backslash as a path, and refuses spaces (SME-183's review).
+#[test]
+fn test_a_template_with_spaces_percent_or_backslash_is_refused() {
+    for (bad, named) in [
+        ("https://{port}-{conversation}.x.test ", "space"),
+        ("https://{port}-{conversation}.x .test", "space"),
+        ("https://{port}-{conversation}.x.test:443 ", "space"),
+        ("https://{port}-{conversation}.x.test\t", "space"),
+        ("https://{port}-{conversation}.%41.test", "%"),
+        ("https://{port}-{conversation}.x.test\\", "\\"),
+    ] {
+        let error = PreviewTemplate::parse(bad).expect_err(&format!("{bad:?} should be refused"));
+        assert!(error.contains(named), "the error for {bad:?} should name {named:?}: {error:?}");
+    }
+}
+
+/// The rest of what a browser refuses in a host name (WHATWG's forbidden
+/// code points, a last label that's a number) is found by parsing a
+/// sample address the way a browser does (SME-183's review round 2).
+#[test]
+fn test_a_template_whose_addresses_no_browser_accepts_is_refused() {
+    for bad in [
+        "https://{port}-{conversation}.x|y.com",
+        "https://{port}-{conversation}.x^y.com",
+        "https://{port}-{conversation}.x<y.com",
+        "https://{port}-{conversation}.x\u{1}y.com",
+        "https://{port}-{conversation}.x\u{7f}y.com",
+        "https://{port}-{conversation}.127.0.0.1",
+    ] {
+        let error = PreviewTemplate::parse(bad).expect_err(&format!("{bad:?} should be refused"));
+        assert!(error.contains("browser"), "the error should say a browser can't open it: {error:?}");
+    }
+    for good in [
+        DEFAULT_PREVIEW_URL,
+        "https://{port}-{conversation}-smelt.constantlee.us",
+        "https://c{conversation}-p{port}.example.com",
+        "https://{port}-{conversation}.preview.example.com.:443",
+        "http://{port}_{conversation}.x.test:8181",
+    ] {
+        assert!(PreviewTemplate::parse(good).is_ok(), "{good:?} should be accepted");
+    }
+}

@@ -625,3 +625,87 @@ async fn test_a_websocket_passes_through_to_the_dev_server() {
         .expect("a message");
     assert_eq!(reply.into_text().unwrap(), "echo: hi");
 }
+
+/// A preview server answering to an `https` template that spells out
+/// `:443`, as behind a TLS proxy; requests carry the `Host` a browser
+/// sends there, without the default port (SME-183).
+async fn start_preview_at_default_port(dial_for: DialFor) -> (SocketAddr, PreviewTemplate) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let template = PreviewTemplate::parse("https://{port}-{conversation}.preview.example.test:443").unwrap();
+    tokio::spawn(serve(listener, template.clone(), dial_for, None));
+    (addr, template)
+}
+
+#[tokio::test]
+async fn test_a_template_with_its_default_port_serves_the_host_a_browser_sends() {
+    let upstream = start_upstream().await;
+    let dials = Dials::default();
+    let (preview, _) = start_preview_at_default_port(dial_for_upstream(upstream, dials.clone())).await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{preview}/"))
+        .header("host", "3000-42.preview.example.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(*dials.lock().unwrap(), vec![(42, 3000)]);
+}
+
+#[tokio::test]
+async fn test_a_template_with_its_default_port_knows_its_own_pages() {
+    let upstream = start_upstream().await;
+    let dials = Dials::default();
+    let (preview, _) = start_preview_at_default_port(dial_for_upstream(upstream, dials.clone())).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{preview}/");
+    let host = "3000-42.preview.example.test";
+    let response = client
+        .get(&url)
+        .header("host", host)
+        .header("origin", "https://5173-42.preview.example.test")
+        .header("sec-fetch-site", "same-site")
+        .header("sec-fetch-mode", "cors")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "a fetch from the conversation's own preview");
+    let response = client
+        .get(&url)
+        .header("host", host)
+        .header("referer", "https://5173-42.preview.example.test/page")
+        .header("sec-fetch-site", "same-site")
+        .header("sec-fetch-mode", "no-cors")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "a script loaded by the conversation's own preview");
+    let response = client
+        .post(&url)
+        .header("host", host)
+        .header("origin", "https://5173-7.preview.example.test")
+        .header("sec-fetch-site", "same-site")
+        .header("sec-fetch-mode", "cors")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403, "a POST from another conversation's preview");
+    let dials = dials.lock().unwrap();
+    assert!(!dials.is_empty() && dials.iter().all(|&d| d == (42, 3000)), "{dials:?}");
+}
+
+/// A TLS proxy that writes `Host` as `$host:$server_port` (SME-183's review).
+#[tokio::test]
+async fn test_a_template_with_its_default_port_serves_a_proxy_host_spelling_it_out() {
+    let upstream = start_upstream().await;
+    let dials = Dials::default();
+    let (preview, _) = start_preview_at_default_port(dial_for_upstream(upstream, dials.clone())).await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{preview}/"))
+        .header("host", "3000-42.preview.example.test:443")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(*dials.lock().unwrap(), vec![(42, 3000)]);
+}
