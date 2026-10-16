@@ -176,11 +176,15 @@ pub async fn update_mcp_server_config(
     }
     merged.extend(upsert.iter().map(|(k, v)| (k.clone(), v.clone())));
 
-    let url_changed = existing.url != url;
-
+    // Whether the URL changes is decided against the row being written
+    // over, not `existing`: another edit and a sign-in's save can commit
+    // between the read above and this write, and a grant for their URL
+    // must not survive onto this one (SME-166 review 1). Postgres
+    // re-reads a row changed under it before applying the `SET`.
     sqlx::query_as::<_, McpServerConfig>(
         "UPDATE mcp_servers SET name = $2, url = $3, extra_headers = $4, auth_mode = $5,
-             oauth_credentials = CASE WHEN $6 THEN NULL ELSE oauth_credentials END,
+             oauth_credentials = CASE WHEN url IS DISTINCT FROM $3 THEN NULL
+                                      ELSE oauth_credentials END,
              updated_at = now()
          WHERE id = $1 RETURNING *",
     )
@@ -189,7 +193,6 @@ pub async fn update_mcp_server_config(
     .bind(url)
     .bind(sqlx::types::Json(merged))
     .bind(auth_mode)
-    .bind(url_changed)
     .fetch_optional(pool)
     .await
 }

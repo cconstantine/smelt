@@ -515,3 +515,79 @@ async fn test_save_mcp_server_sign_in_saves_only_onto_the_url_it_started_for(poo
     .expect("save on a missing id");
     assert!(!saved, "a save for a missing id must match nothing");
 }
+
+/// SME-166 review 1: whether an edit changes the URL is decided against
+/// the row the edit writes over, not one it read earlier. Interleaving:
+/// a rename reads the row at X; another edit (to Y) and a sign-in's save
+/// for Y commit; then the rename writes X back. Deciding from its read,
+/// the rename kept Y's grant on X.
+#[sqlx::test]
+async fn test_an_edit_racing_a_url_change_still_clears_the_grant(pool: PgPool) {
+    let created = create_mcp_server_config(
+        &pool,
+        "github",
+        "https://x.example/mcp",
+        &HashMap::new(),
+        "oauth",
+        None,
+        None,
+    )
+    .await
+    .expect("create mcp server config");
+
+    let mut moving = pool.begin().await.expect("begin the move to Y");
+    sqlx::query(
+        "UPDATE mcp_servers SET url = 'https://y.example/mcp',
+             oauth_credentials = '{\"client_id\": \"for-y\"}' WHERE id = $1",
+    )
+    .bind(created.id)
+    .execute(&mut *moving)
+    .await
+    .expect("move to Y and save Y's grant, uncommitted");
+
+    let rename = tokio::spawn({
+        let pool = pool.clone();
+        let id = created.id;
+        async move {
+            update_mcp_server_config(
+                &pool,
+                id,
+                "renamed",
+                "https://x.example/mcp",
+                &HashMap::new(),
+                &[],
+                "oauth",
+            )
+            .await
+        }
+    });
+    // Commit only once the rename has read the row (at X) and is waiting
+    // on the move's row lock to write it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+                  WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("pg_stat_activity");
+        if waiting > 0 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the rename never waited on the move");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    moving.commit().await.expect("commit the move");
+
+    let updated = rename
+        .await
+        .expect("rename task")
+        .expect("rename should succeed")
+        .expect("row should exist");
+    assert_eq!(updated.url, "https://x.example/mcp");
+    assert!(
+        updated.oauth_credentials.is_none(),
+        "Y's grant must not stay on the row once it's back at X"
+    );
+}
