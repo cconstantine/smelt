@@ -508,19 +508,62 @@ pub fn current_url(conversation_id: i64) -> Option<String> {
         .map(|s| s.current_url.clone())
 }
 
-/// What someone typed into the live panel's address bar, as a URL: a
-/// bare host (`example.com`) gets `https://`. Whether the result is a
-/// URL smelt will actually load is `navigate`'s call, not this one's.
+/// What someone typed into the live panel's address bar, as a URL. With
+/// no scheme typed it picks one as Chromium's omnibox does (SME-184):
+/// `http://` for an IP literal, an explicit port other than 443, a
+/// single-label name or a local-only suffix (`localhost:5173`, a dev
+/// server in the sandbox), `https://` for anything else (`example.com`),
+/// and for input that doesn't parse. Whether the result is a URL smelt
+/// will actually load is `navigate`'s call, not this one's.
 pub fn normalize_address(input: &str) -> Result<String, String> {
     let input = input.trim();
     if input.is_empty() {
         return Err("enter an address".to_string());
     }
-    if input.contains("://") {
-        Ok(input.to_string())
-    } else {
-        Ok(format!("https://{input}"))
+    if has_scheme(input) {
+        return Ok(input.to_string());
     }
+    let scheme = match url::Url::parse(&format!("http://{input}")) {
+        Ok(url) if is_local_address(&url, input) => "http",
+        _ => "https",
+    };
+    Ok(format!("{scheme}://{input}"))
+}
+
+/// Whether `input` starts with a scheme and `://`: a `://` later on (a
+/// return URL in the query, review 1) doesn't count. A scheme is a letter
+/// then letters, digits, `+`, `-` or `.`, as RFC 3986 has it.
+fn has_scheme(input: &str) -> bool {
+    input.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    })
+}
+
+/// Whether Chromium would keep a typed `url` on plain http: an IP, a
+/// typed port (443 excepted: there https is what can work), or a
+/// name outside the public DNS. A short suffix list stands in for the
+/// Public Suffix List; `.home.arpa` is home-only, and smelt has no
+/// fallback to http if https fails, so it gets http too.
+fn is_local_address(url: &url::Url, input: &str) -> bool {
+    // `port()` hides the scheme's default port, so a typed :80 shows only
+    // when parsed as https (review 1: https on port 80 can't load). The
+    // port goes first so an IP with :443 gets https too (review 2).
+    let https_port = || url::Url::parse(&format!("https://{input}")).ok()?.port();
+    if let Some(port) = url.port().or_else(https_port) {
+        return port != 443;
+    }
+    let name = match url.host() {
+        Some(url::Host::Domain(name)) => name,
+        Some(_) => return true,
+        None => return false,
+    };
+    let name = name.strip_suffix('.').unwrap_or(name);
+    const LOCAL: [&str; 6] = ["localhost", "local", "lan", "internal", "test", "home.arpa"];
+    !name.contains('.')
+        || LOCAL
+            .iter()
+            .any(|suffix| name.strip_suffix(suffix).is_some_and(|rest| rest.ends_with('.')))
 }
 
 #[cfg(all(test, feature = "browser-test"))]
