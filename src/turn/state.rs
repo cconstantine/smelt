@@ -384,3 +384,10 @@ pub(crate) fn last_turn_error(conversation_id: i64) -> Option<String> {
 pub(super) fn holds_lock_and_stops(conversation_id: i64) -> (bool, bool) {
     read_runtime(conversation_id, |runtime| (runtime.lock.is_some(), runtime.stops.is_some())).unwrap_or((false, false))
 }
+
+/// How many turns `conversation_id` has running or queued, for tests
+/// that wait for a turn to queue.
+#[cfg(test)]
+pub(super) fn turns_in_flight(conversation_id: i64) -> usize {
+    read_runtime(conversation_id, |runtime| runtime.turns_in_flight).unwrap_or(0)
+}

@@ -368,15 +368,19 @@ impl Drop for TurnSteps {
     }
 }
 
-/// The turn itself, holding the turn lock (`turn_lock`): `persisted` starts
-/// with the turn's own message, already saved by `run_turn_bounded`, and
-/// `new_content` is that message's content (`None` for a wake).
+/// The turn itself, holding the turn lock (`turn_lock`) until it ends:
+/// `persisted` starts with the turn's own message, already saved by
+/// `run_turn_bounded`, and `new_content` is that message's content
+/// (`None` for a wake). A turn that fails leaves no reply in progress,
+/// as a stopped one doesn't (`end_stopped_turn`): cleared, and every tab
+/// told, while it still holds the lock, so it can't be another turn's
+/// and a turn queued behind it doesn't show it (SME-179 B28).
 #[cfg(feature = "server")]
 pub(super) fn run_turn_body<'a>(
     pool: &'a PgPool,
     conversation_id: i64,
     turn_lock: tokio::sync::OwnedMutexGuard<()>,
-    mut persisted: Vec<Message>,
+    persisted: Vec<Message>,
     new_content: Option<Vec<anthropic::ContentBlock>>,
     max_turns: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
@@ -384,6 +388,27 @@ pub(super) fn run_turn_body<'a>(
     Box::pin(async move {
         // Moved in, so the lock is held for as long as the turn runs.
         let _turn = turn_lock;
+        let result = run_turn_steps(pool, conversation_id, persisted, new_content, max_turns).await;
+        if result.is_err() {
+            clear_reply_in_progress(conversation_id);
+            crate::events::publish(conversation_id, crate::events::ConversationEvent::ReplyReset {});
+        }
+        result
+    })
+}
+
+/// `run_turn_body`'s steps: the loop that calls the model, runs the tools
+/// it asks for and saves each step.
+#[cfg(feature = "server")]
+fn run_turn_steps<'a>(
+    pool: &'a PgPool,
+    conversation_id: i64,
+    mut persisted: Vec<Message>,
+    new_content: Option<Vec<anthropic::ContentBlock>>,
+    max_turns: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServerFnResult<Vec<Message>>> + Send + 'a>>
+{
+    Box::pin(async move {
         // The turn's own span, `run_turn_bounded`'s: its model and the
         // number of model calls it made, recorded however it ends.
         let mut steps = TurnSteps { span: tracing::Span::current(), count: 0 };
