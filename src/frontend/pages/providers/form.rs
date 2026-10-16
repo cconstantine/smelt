@@ -15,6 +15,14 @@ struct ProviderForm {
     price_source_chosen: bool,
     /// llama.cpp only (SME-111).
     keep_reasoning: bool,
+    /// "Max concurrent requests" as typed (SME-162).
+    max_concurrent_requests: String,
+}
+
+/// "Max concurrent requests" as sent: blank (or anything but a count) is
+/// no limit, `0` the server's own count. The server checks the rest.
+pub(super) fn max_requests_from_text(text: &str) -> Option<u32> {
+    text.trim().parse().ok()
 }
 
 impl ProviderForm {
@@ -29,6 +37,7 @@ impl ProviderForm {
             price_source: None,
             price_source_chosen: false,
             keep_reasoning: true,
+            max_concurrent_requests: String::new(),
         }
     }
 
@@ -43,6 +52,7 @@ impl ProviderForm {
             price_source: provider.price_catalog_provider.clone(),
             price_source_chosen: true,
             keep_reasoning: provider.keep_reasoning,
+            max_concurrent_requests: provider.max_concurrent_requests.map(|n| n.to_string()).unwrap_or_default(),
         }
     }
 
@@ -56,6 +66,7 @@ impl ProviderForm {
             prompt_caching: self.prompt_caching,
             price_catalog_provider: self.price_source.clone(),
             keep_reasoning: self.keep_reasoning,
+            max_concurrent_requests: max_requests_from_text(&self.max_concurrent_requests),
         }
     }
 
@@ -215,6 +226,15 @@ fn ProviderFields(
                 p { class: "muted",
                     "Sends the chat template preserve_thinking, so the model sees its reasoning from earlier turns. Off keeps only the current reply's tool calls' reasoning: conversations stay smaller, and the server re-reads from the first reasoning it drops, once per new message. Only sent when the server's template supports it."
                 }
+            }
+
+            label { r#for: "provider-max-requests", "Max concurrent requests" }
+            input { id: "provider-max-requests", r#type: "number", min: "0", step: "1",
+                placeholder: "No limit",
+                value: "{form().max_concurrent_requests}",
+                oninput: move |e| form.write().max_concurrent_requests = e.value() }
+            p { class: "muted",
+                "Leave blank for no limit. A server only serves as many requests at once as it has slots. Type 0 to use the server's own count (a llama.cpp server reports it on this provider's page once its models are listed), or type the number to set it yourself. While all slots are busy smelt waits before sending, so two conversations take turns instead of one timing out."
             }
 
             label { r#for: "provider-prices", "Prices from" }

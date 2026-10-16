@@ -177,6 +177,7 @@ impl From<db::InferenceProvider> for ProviderSummary {
             prompt_caching: provider.prompt_caching,
             keep_reasoning: provider.keep_reasoning,
             server_caps: server_caps(&provider),
+            max_concurrent_requests: provider.max_concurrent_requests.and_then(|n| u32::try_from(n).ok()),
             price_catalog_provider: provider.price_catalog_provider,
             kind: ProviderKind::parse(&provider.kind).unwrap_or(ProviderKind::Other),
             auth_kind: AuthKind::parse(&provider.auth_kind).unwrap_or(AuthKind::ApiKey),
@@ -424,6 +425,10 @@ fn checked(input: ProviderInput) -> Result<ProviderInput, String> {
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(str::to_string);
+    // The column's range; 0 is the server's own count (SME-162).
+    if input.max_concurrent_requests.is_some_and(|n| i32::try_from(n).is_err()) {
+        return Err(format!("Max concurrent requests can be at most {}.", i32::MAX));
+    }
     Ok(ProviderInput {
         name,
         base_url,
@@ -458,7 +463,7 @@ pub async fn create_provider(pool: &PgPool, input: ProviderInput) -> Result<Prov
         input.prompt_caching,
         input.price_catalog_provider.as_deref(),
         input.keep_reasoning,
-        None,
+        to_column(input.max_concurrent_requests),
     )
     .await
     .map_err(|e| save_error(&input.name, e))?;
@@ -496,7 +501,7 @@ pub async fn update_provider(
         input.prompt_caching,
         input.price_catalog_provider.as_deref(),
         input.keep_reasoning,
-        None,
+        to_column(input.max_concurrent_requests),
     )
     .await
     .map_err(|e| save_error(&input.name, e))?

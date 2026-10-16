@@ -122,3 +122,14 @@ fn test_models_without_tools_are_suggested_last() {
     let ids: Vec<&str> = ordered.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, vec!["b", "c", "a"]);
 }
+
+/// SME-162: "Max concurrent requests" as sent. The server is the
+/// authority on what's allowed; blank or anything unreadable is no limit.
+#[test]
+fn test_max_concurrent_requests_reads_blank_zero_and_a_count() {
+    assert_eq!(max_requests_from_text(""), None, "blank is no limit");
+    assert_eq!(max_requests_from_text("  "), None);
+    assert_eq!(max_requests_from_text("0"), Some(0), "0 is the server's own count");
+    assert_eq!(max_requests_from_text(" 3 "), Some(3));
+    assert_eq!(max_requests_from_text("abc"), None);
+}

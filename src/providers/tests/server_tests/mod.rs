@@ -65,6 +65,7 @@ fn input(name: &str, base_url: &str, secret: &str) -> ProviderInput {
         prompt_caching: false,
         price_catalog_provider: None,
         keep_reasoning: true,
+        max_concurrent_requests: None,
     }
 }
 

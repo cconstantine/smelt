@@ -28,6 +28,7 @@ async fn test_a_provider_form_is_checked_and_the_secret_never_comes_back(pool: P
             price_catalog_provider: None,
             keep_reasoning: true,
             server_caps: None,
+            max_concurrent_requests: None,
         }
     );
     assert!(received(&mut app_events, &crate::events::AppEvent::ProvidersChanged));
@@ -62,6 +63,31 @@ async fn test_a_provider_form_is_checked_and_the_secret_never_comes_back(pool: P
         update_provider(&pool, created.id + 100, input("Z", "http://h", "")).await,
         Err("That provider no longer exists.".to_string())
     );
+}
+
+/// SME-162: the form's max concurrent requests is saved and shown: a
+/// count, `0` for the server's own count, or blank for no limit; one the
+/// column can't hold is refused, naming the field.
+#[sqlx::test]
+async fn test_a_providers_max_concurrent_requests_is_saved_and_shown(pool: PgPool) {
+    let limited = |max| ProviderInput { max_concurrent_requests: max, ..input("Home", "http://ollama:11434", "secret-1234567890") };
+    let one = create_provider(&pool, limited(Some(1))).await.expect("create");
+    assert_eq!(one.max_concurrent_requests, Some(1));
+
+    let too_many = Some(i32::MAX as u32 + 1);
+    let refused = update_provider(&pool, one.id, limited(too_many)).await.expect_err("too many");
+    assert!(refused.contains("Max concurrent requests"), "{refused}");
+    let stored = db::get_inference_provider(&pool, one.id).await.expect("get").expect("exists");
+    assert_eq!(stored.max_concurrent_requests, Some(1), "nothing saved");
+
+    let auto = update_provider(&pool, one.id, limited(Some(0))).await.expect("automatic");
+    assert_eq!(auto.max_concurrent_requests, Some(0), "0 is automatic, not refused");
+    let cleared = update_provider(&pool, one.id, limited(None)).await.expect("clear");
+    assert_eq!(cleared.max_concurrent_requests, None, "blank is no limit");
+    let set_again = update_provider(&pool, one.id, limited(Some(3))).await.expect("set");
+    assert_eq!(set_again.max_concurrent_requests, Some(3));
+    let most = update_provider(&pool, one.id, limited(Some(i32::MAX as u32))).await.expect("the column's most");
+    assert_eq!(most.max_concurrent_requests, Some(i32::MAX as u32));
 }
 
 /// Effort is kept per model and sent only on an Anthropic provider:
