@@ -317,3 +317,68 @@ fn test_the_adoption_patch_is_held_to_the_objects_uid_not_its_version() {
     assert_eq!(patch["metadata"]["uid"], "uid-401");
     assert!(patch["metadata"].get("resourceVersion").is_none(), "{patch}");
 }
+
+/// SME-180 review 1: deleting a `Sandbox` (a start whose git install
+/// failed, or one stopped while starting) and its drop queue delete only
+/// the pod it made, by uid. Once that pod is gone, another database's pod
+/// can take the name, and is left: before, both deleted by name.
+///
+/// Harmless if killed: unique names; the other pod is labelled with
+/// another instance and never starts (an image that doesn't exist).
+#[tokio::test]
+async fn test_a_sandboxs_delete_leaves_another_databases_pod_that_took_its_name() {
+    let client = test_client().await;
+    let manager = SandboxManager::new(client.clone());
+    let pods = pods_api(&client);
+    let sandbox = manager.create(&unique_session_id("replaced"), "256Mi", &[]).await.expect("create pod");
+    let name = sandbox.pod_name.clone();
+    let uid = sandbox.uid.clone();
+
+    pods.delete(&name, &immediate_delete_params()).await.expect("delete our pod");
+    let gone = tokio::time::timeout(Duration::from_secs(60), async {
+        while pods.get_opt(&name).await.ok().flatten().is_some() {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await;
+    let theirs: Pod = serde_json::from_value(serde_json::json!({
+        "metadata": {"name": name, "labels": {INSTANCE_LABEL: "another-smelt-database"}},
+        "spec": {"containers": [{"name": "sandbox", "image": "smelt.invalid/none:0"}]},
+    }))
+    .expect("pod");
+    let made = match gone {
+        Ok(()) => pods.create(&PostParams::default(), &theirs).await.map(|_| ()).map_err(|e| e.to_string()),
+        Err(_) => Err("our pod wasn't gone after 60s".to_string()),
+    };
+    let kept = |pod: Option<Pod>| pod.is_some_and(|p| p.metadata.deletion_timestamp.is_none());
+
+    let deleted = manager.delete(sandbox).await;
+    let kept_by_delete = kept(pods.get_opt(&name).await.ok().flatten());
+    if !kept_by_delete {
+        // Put it back, so the drop queue's check stands on its own.
+        let _ = tokio::time::timeout(Duration::from_secs(60), async {
+            while pods.get_opt(&name).await.ok().flatten().is_some() {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await;
+        pods.create(&PostParams::default(), &theirs).await.ok();
+    }
+    let (tx, rx) = mpsc::unbounded_channel();
+    tx.send((name.clone(), uid.clone())).expect("queue");
+    drop(tx);
+    let drained = tokio::time::timeout(Duration::from_secs(60), drain_cleanup_queue(client.clone(), rx)).await;
+    let kept_by_queue = kept(pods.get_opt(&name).await.ok().flatten());
+
+    pods.delete(&name, &immediate_delete_params()).await.ok();
+    made.expect("make the other database's pod");
+    assert!(uid.is_some(), "the sandbox kept no uid");
+    assert!(deleted.is_ok(), "{deleted:?}");
+    assert!(drained.is_ok(), "the drop queue took over 60s");
+    assert!(
+        kept_by_delete && kept_by_queue,
+        "another database's pod was deleted: by the sandbox's delete {}, by its drop queue {}",
+        !kept_by_delete,
+        !kept_by_queue
+    );
+}

@@ -207,6 +207,16 @@ pub(crate) fn pod_delete_params() -> DeleteParams {
     }
 }
 
+/// `pod_delete_params` held to the pod a `Sandbox` made or reused, by its
+/// `uid`: a pod that has taken its name since is refused (409) and left
+/// (SME-180 review 1).
+pub(super) fn sandbox_delete_params(uid: Option<&str>) -> DeleteParams {
+    DeleteParams {
+        preconditions: Some(kube::api::Preconditions { uid: uid.map(str::to_string), resource_version: None }),
+        ..pod_delete_params()
+    }
+}
+
 /// Tests' own cleanup, which needs nothing to stop cleanly.
 #[cfg(test)]
 pub(super) fn immediate_delete_params() -> DeleteParams {

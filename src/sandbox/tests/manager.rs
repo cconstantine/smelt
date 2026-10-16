@@ -547,6 +547,7 @@ async fn test_sandbox_futures_stay_small() {
         .expect("lazy pool");
     let client = kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().expect("url"))).expect("client");
     let instance = db::SmeltInstance { id: "size-test".to_string(), owns_unlabelled: true };
+    let shell = PodShell::new(client.clone(), "sandbox-1".to_string(), instance.clone());
 
     let sizes = [
         ("force_terminate_pod", std::mem::size_of_val(&force_terminate_pod(&pool, 1)), 1200),
@@ -574,6 +575,12 @@ async fn test_sandbox_futures_stay_small() {
         ("run_command", std::mem::size_of_val(&run_command(&pool, 1, 1, "cmd", "true")), 1300),
         // B1 (SME-122): every reconnect awaits it.
         ("start_under_way_for_pod", std::mem::size_of_val(&start_under_way_for_pod(&pool, 1)), 700),
+        // SME-180: every git exec reads the pod first. The read's future
+        // shares its space with the exec's (2320 bytes then), so `run` was
+        // 2408 and `refuse_foreign` 1680; one holding both at once would be
+        // over 4000.
+        ("PodShell::run", std::mem::size_of_val(&shell.run(&["true"], None)), 3000),
+        ("refuse_foreign", std::mem::size_of_val(&refuse_foreign(&pods_api(&client), "sandbox-1", &instance)), 3400),
     ];
     for (name, size, bound) in sizes {
         println!("{name}: {size} bytes (bound {bound})");

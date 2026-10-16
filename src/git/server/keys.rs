@@ -225,7 +225,7 @@ pub async fn install_into_pod(pool: &PgPool, pod_id: i64) -> Result<(), String> 
         let keys: Vec<(String, String)> = keys.into_iter().map(|k| (k.name, k.private_key)).collect();
         // Bounded: every install waits on this lock, so a stalled exec
         // mustn't hold it.
-        let shell = sandbox::PodShell::for_pod(pod_id).map_err(|e| e.to_string())?;
+        let shell = sandbox::PodShell::for_pod(pool, pod_id).await.map_err(|e| e.to_string())?;
         tokio::time::timeout(INSTALL_TIMEOUT, install_git_files(&shell, &pod_git_files(&keys, &identity)))
         .await
         .map_err(|_| format!("writing git files into the pod took over {}s", INSTALL_TIMEOUT.as_secs()))?
