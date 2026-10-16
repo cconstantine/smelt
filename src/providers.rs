@@ -414,6 +414,7 @@ pub(crate) mod test_support {
             false,
             None,
             true,
+            None,
         )
         .await
         .expect("create the mock provider");

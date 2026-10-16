@@ -124,6 +124,7 @@ fn llama_provider(caps: Option<serde_json::Value>, keep_reasoning: bool) -> db::
         price_catalog_provider: None,
         keep_reasoning,
         server_caps: caps,
+        max_concurrent_requests: None,
         created_at: chrono::NaiveDateTime::default(),
         updated_at: chrono::NaiveDateTime::default(),
     }
@@ -202,7 +203,7 @@ async fn test_a_llama_cpp_providers_props_are_kept_and_used_by_its_turns(pool: P
     use crate::anthropic::Effort;
     let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let base = mock_llama_cpp(up.clone()).await;
-    let p = db::create_inference_provider(&pool, "llama", "llama_cpp", &base, "bearer", "k", false, None, false)
+    let p = db::create_inference_provider(&pool, "llama", "llama_cpp", &base, "bearer", "k", false, None, false, None)
         .await
         .expect("create");
     set_model_settings(&pool, p.id, "flash-next", settings(None, None, Some(Effort::Low))).await.expect("effort");
@@ -238,7 +239,7 @@ async fn test_a_llama_cpp_providers_props_are_kept_and_used_by_its_turns(pool: P
 async fn test_a_quick_llama_cpp_listing_keeps_what_props_said(pool: PgPool) {
     let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let base = mock_llama_cpp(up).await;
-    let p = db::create_inference_provider(&pool, "llama", "llama_cpp", &base, "bearer", "k", false, None, true)
+    let p = db::create_inference_provider(&pool, "llama", "llama_cpp", &base, "bearer", "k", false, None, true, None)
         .await
         .expect("create");
     // A four-slot server: each slot has a quarter of the 262,144.

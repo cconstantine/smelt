@@ -56,6 +56,7 @@ async fn test_a_bearer_providers_turn_sends_its_token_as_a_bearer_header(pool: P
         false,
         None,
         true,
+        None,
     )
     .await
     .expect("create provider");

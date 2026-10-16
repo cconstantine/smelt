@@ -69,7 +69,7 @@ async fn test_a_provider_form_is_checked_and_the_secret_never_comes_back(pool: P
 #[sqlx::test]
 async fn test_a_models_effort_is_kept_and_sent_only_to_anthropic(pool: PgPool) {
     use crate::anthropic::Effort;
-    let anthropic = db::create_inference_provider(&pool, "a", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None, true)
+    let anthropic = db::create_inference_provider(&pool, "a", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None, true, None)
         .await
         .expect("anthropic provider");
     let ollama = provider(&pool, "o", "api_key").await;

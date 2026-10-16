@@ -49,7 +49,7 @@ fn settings(
 }
 
 async fn provider(pool: &PgPool, name: &str, auth_kind: &str) -> db::InferenceProvider {
-    db::create_inference_provider(pool, name, "ollama", "http://ollama:11434", auth_kind, "the-secret", false, None, true)
+    db::create_inference_provider(pool, name, "ollama", "http://ollama:11434", auth_kind, "the-secret", false, None, true, None)
         .await
         .expect("create provider")
 }

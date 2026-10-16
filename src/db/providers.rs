@@ -23,6 +23,9 @@ pub struct InferenceProvider {
     pub keep_reasoning: bool,
     /// llama.cpp only: its `/props`, as `providers::LlamaServerInfo`.
     pub server_caps: Option<serde_json::Value>,
+    /// How many requests it's sent at once: `None` no limit, `0`
+    /// the count its `/props` reports, else that many (SME-162).
+    pub max_concurrent_requests: Option<i32>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -40,6 +43,7 @@ impl std::fmt::Debug for InferenceProvider {
             .field("price_catalog_provider", &self.price_catalog_provider)
             .field("keep_reasoning", &self.keep_reasoning)
             .field("server_caps", &self.server_caps)
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
             .field("secret", &"..")
             .finish_non_exhaustive()
     }
@@ -55,10 +59,12 @@ pub async fn create_inference_provider(
     prompt_caching: bool,
     price_catalog_provider: Option<&str>,
     keep_reasoning: bool,
+    max_concurrent_requests: Option<i32>,
 ) -> Result<InferenceProvider, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
-        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret, prompt_caching, price_catalog_provider, keep_reasoning)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *",
+        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret, prompt_caching, price_catalog_provider, keep_reasoning,
+                                          max_concurrent_requests)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *",
     )
     .bind(name)
     .bind(kind)
@@ -68,6 +74,7 @@ pub async fn create_inference_provider(
     .bind(prompt_caching)
     .bind(price_catalog_provider)
     .bind(keep_reasoning)
+    .bind(max_concurrent_requests)
     .fetch_one(pool)
     .await
 }
@@ -101,12 +108,13 @@ pub async fn update_inference_provider(
     prompt_caching: bool,
     price_catalog_provider: Option<&str>,
     keep_reasoning: bool,
+    max_concurrent_requests: Option<i32>,
 ) -> Result<Option<InferenceProvider>, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
         "UPDATE inference_providers
          SET name = $2, kind = $3, base_url = $4, auth_kind = $5,
              secret = COALESCE($6, secret), prompt_caching = $7, price_catalog_provider = $8,
-             keep_reasoning = $9,
+             keep_reasoning = $9, max_concurrent_requests = $10,
              -- Another server's caps don't describe this one (SME-111 review 2).
              server_caps = CASE WHEN kind = $3 AND base_url = $4 THEN server_caps END,
              updated_at = now()
@@ -121,6 +129,7 @@ pub async fn update_inference_provider(
     .bind(prompt_caching)
     .bind(price_catalog_provider)
     .bind(keep_reasoning)
+    .bind(max_concurrent_requests)
     .fetch_optional(pool)
     .await
 }

@@ -443,6 +443,7 @@ pub async fn create_provider(pool: &PgPool, input: ProviderInput) -> Result<Prov
         input.prompt_caching,
         input.price_catalog_provider.as_deref(),
         input.keep_reasoning,
+        None,
     )
     .await
     .map_err(|e| save_error(&input.name, e))?;
@@ -480,6 +481,7 @@ pub async fn update_provider(
         input.prompt_caching,
         input.price_catalog_provider.as_deref(),
         input.keep_reasoning,
+        None,
     )
     .await
     .map_err(|e| save_error(&input.name, e))?
