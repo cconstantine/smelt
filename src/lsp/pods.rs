@@ -180,11 +180,14 @@ pub async fn start_with(
             true
         }
     };
-    if let Err(e) = wait_running(&pods, &name).await {
-        let _ = pods.delete(&name, &crate::sandbox::pod_delete_params()).await;
-        return Err(e);
-    }
-    match wait_installed(client, &name).await {
+    let uid = match wait_running(&pods, &name).await {
+        Ok(uid) => uid,
+        Err(e) => {
+            let _ = pods.delete(&name, &crate::sandbox::pod_delete_params()).await;
+            return Err(e);
+        }
+    };
+    match wait_installed(client, &pods, &name, &uid).await {
         Ok(()) => {
             let ready = json!({"metadata": {"annotations": {READY_ANNOTATION: "true"}}});
             if let Err(e) = pods.patch(&name, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&ready)).await {
@@ -216,19 +219,53 @@ fn has_stopped(pod: &Pod) -> bool {
     matches!(pod.status.as_ref().and_then(|s| s.phase.as_deref()), Some("Failed" | "Succeeded"))
 }
 
-/// Why the server container stopped, when Kubernetes says (`OOMKilled`).
+/// Why the server stopped, when Kubernetes says: the pod's own reason
+/// when it has one, else its container's (`OOMKilled`). An eviction
+/// during the install, before the script's TERM trap is set, fails the
+/// pod and keeps its own `Evicted` (captured live, SME-171 review 2);
+/// one after it ends the script with 0, which drops it. A container that "Completed" was stopped by a TERM
+/// signal (the pod script's trap exits 0, and nothing else ends it). Short
+/// of a delete, which `install_interrupted`, `list_with` and
+/// `note_server_stop` rule out first, that's an eviction, which on k3s
+/// says "Evicted" only in an event (captured live, SME-171 review 1).
+/// `wait_running` doesn't rule a delete out, so a pod deleted as it
+/// starts may read so there too.
 fn stop_reason(pod: &Pod) -> Option<String> {
-    pod.status
-        .as_ref()?
-        .container_statuses
-        .as_ref()?
-        .first()?
-        .state
-        .as_ref()?
-        .terminated
-        .as_ref()?
-        .reason
-        .clone()
+    let status = pod.status.as_ref()?;
+    if let Some(reason) = &status.reason {
+        return Some(reason.clone());
+    }
+    let reason = status.container_statuses.as_ref()?.first()?.state.as_ref()?.terminated.as_ref()?.reason.clone()?;
+    Some(if reason == "Completed" { "evicted by its node, most likely".to_string() } else { reason })
+}
+
+/// Why a server stopped, for a sentence about it: what an OOM kill
+/// means and what to change, or Kubernetes' reason as is.
+fn stop_explanation(reason: Option<&str>) -> String {
+    match reason {
+        Some("OOMKilled") => " (OOMKilled: it ran out of memory; the user can raise its memory limit on the \
+                              Language servers page)"
+            .to_string(),
+        Some(reason) => format!(" ({reason})"),
+        None => String::new(),
+    }
+}
+
+/// What a start waiting on pod `name`'s install (the pod `uid` it saw
+/// running) makes of the pod as read now: the error to end the wait
+/// with, or `None` when the install may still be running (SME-171).
+fn install_interrupted(name: &str, uid: &str, pod: Option<&Pod>) -> Option<String> {
+    let deleted = || {
+        Some(format!(
+            "{name} was deleted during its install (its sandbox went, or the server was stopped or restarted)"
+        ))
+    };
+    let Some(pod) = pod else { return deleted() };
+    if pod.metadata.uid.as_deref() != Some(uid) || pod.metadata.deletion_timestamp.is_some() {
+        return deleted();
+    }
+    has_stopped(pod)
+        .then(|| format!("{name} stopped during its install{}", stop_explanation(stop_reason(pod).as_deref())))
 }
 
 async fn wait_gone(pods: &kube::Api<Pod>, name: &str) -> Result<(), String> {
@@ -242,16 +279,16 @@ async fn wait_gone(pods: &kube::Api<Pod>, name: &str) -> Result<(), String> {
 }
 
 /// Waits for the pod to run, failing early on what won't fix itself (an
-/// image that can't be pulled).
-async fn wait_running(pods: &kube::Api<Pod>, name: &str) -> Result<(), String> {
+/// image that can't be pulled). Returns the running pod's uid.
+async fn wait_running(pods: &kube::Api<Pod>, name: &str) -> Result<String, String> {
     let started = std::time::Instant::now();
     loop {
         let pod = pods.get(name).await.map_err(|e| e.to_string())?;
         let status = pod.status.as_ref();
         match status.and_then(|s| s.phase.as_deref()) {
-            Some("Running") => return Ok(()),
+            Some("Running") => return pod.metadata.uid.clone().ok_or_else(|| format!("{name} is running without a uid")),
             Some("Failed" | "Succeeded") => {
-                return Err(format!("{name} stopped before it started ({})", stop_reason(&pod).unwrap_or_default()));
+                return Err(format!("{name} stopped before it started{}", stop_explanation(stop_reason(&pod).as_deref())));
             }
             _ => {}
         }
@@ -275,11 +312,53 @@ async fn wait_running(pods: &kube::Api<Pod>, name: &str) -> Result<(), String> {
     }
 }
 
+/// What `wait_installed` makes of each read of its pod.
+struct InstallWatch<'a> {
+    name: &'a str,
+    uid: &'a str,
+    /// The last read's error, when the last read failed: a failed read
+    /// isn't a death (the API server may be busy), and goes in the
+    /// timeout's message only while it's still the latest news.
+    read_error: Option<String>,
+}
+
+impl InstallWatch<'_> {
+    /// The error to end the wait with, if the pod as read says so.
+    fn read(&mut self, pod: Result<Option<Pod>, String>) -> Option<String> {
+        match pod {
+            Ok(pod) => {
+                self.read_error = None;
+                install_interrupted(self.name, self.uid, pod.as_ref())
+            }
+            Err(e) => {
+                self.read_error = Some(e);
+                None
+            }
+        }
+    }
+
+    fn timed_out(&self) -> String {
+        format!(
+            "The install didn't finish within {} minutes{}",
+            INSTALL_TIMEOUT.as_secs() / 60,
+            self.read_error.as_ref().map(|e| format!(" (last error reading the pod: {e})")).unwrap_or_default()
+        )
+    }
+}
+
 /// Waits for the pod's install to finish; a failure comes back with its
-/// output.
-async fn wait_installed(client: &kube::Client, name: &str) -> Result<(), String> {
+/// output. Pod `uid` stopping or going ends the wait at once, saying why
+/// (SME-171): its install can't finish then, and every exec into it
+/// fails, which reads as "not finished yet".
+async fn wait_installed(client: &kube::Client, pods: &kube::Api<Pod>, name: &str, uid: &str) -> Result<(), String> {
+    #[cfg(test)]
+    test_hooks::reached_install_wait(name);
     let started = std::time::Instant::now();
+    let mut watch = InstallWatch { name, uid, read_error: None };
     loop {
+        if let Some(error) = watch.read(pods.get_opt(name).await.map_err(|e| e.to_string())) {
+            return Err(error);
+        }
         if let Some(rc) = install_rc(client, name).await {
             if rc == "0" {
                 return Ok(());
@@ -291,7 +370,7 @@ async fn wait_installed(client: &kube::Client, name: &str) -> Result<(), String>
             return Err(format!("The install failed (exit {rc}):\n{}", log.trim_end()));
         }
         if started.elapsed() > INSTALL_TIMEOUT {
-            return Err(format!("The install didn't finish within {} minutes", INSTALL_TIMEOUT.as_secs() / 60));
+            return Err(watch.timed_out());
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
@@ -414,14 +493,7 @@ pub fn note_server_stop(seen: &mut std::collections::HashSet<String>, pod: &Pod,
     if !seen.insert(pod.metadata.uid.clone()?) || initial {
         return None;
     }
-    let reason = stop_reason(pod);
-    let why = match reason.as_deref() {
-        Some("OOMKilled") => " (OOMKilled: it ran out of memory; the user can raise its memory limit on the \
-                             Language servers page)"
-            .to_string(),
-        Some(reason) => format!(" ({reason})"),
-        None => String::new(),
-    };
+    let why = stop_explanation(stop_reason(pod).as_deref());
     Some(ServerStopped {
         conversation_id,
         notice: format!(
@@ -457,6 +529,27 @@ pub async fn open_stdio(client: &kube::Client, pod_name: &str, config: &Language
         let _ = attached.join().await;
     });
     Ok(ServerIo { stdin: Box::new(stdin), stdout: Box::new(stdout) })
+}
+
+/// Lets a real-cluster test act once a start is waiting on its install,
+/// not still waiting for its pod to run (SME-171).
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    type Waiters = std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>;
+    static WAITERS: std::sync::LazyLock<std::sync::Mutex<Waiters>> = std::sync::LazyLock::new(Default::default);
+
+    /// Fires once the start of pod `name` begins waiting on its install.
+    pub fn on_install_wait(name: &str) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        WAITERS.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), tx);
+        rx
+    }
+
+    pub(super) fn reached_install_wait(name: &str) {
+        if let Some(tx) = WAITERS.lock().unwrap_or_else(|e| e.into_inner()).remove(name) {
+            let _ = tx.send(());
+        }
+    }
 }
 
 #[cfg(test)]
