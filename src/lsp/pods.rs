@@ -220,8 +220,10 @@ fn has_stopped(pod: &Pod) -> bool {
 }
 
 /// Why the server stopped, when Kubernetes says: the pod's own reason
-/// when it has one (`Evicted`, on some clusters), else its container's
-/// (`OOMKilled`). A container that "Completed" was stopped by a TERM
+/// when it has one, else its container's (`OOMKilled`). An eviction
+/// during the install, before the script's TERM trap is set, fails the
+/// pod and keeps its own `Evicted` (captured live, SME-171 review 2);
+/// one after it ends the script with 0, which drops it. A container that "Completed" was stopped by a TERM
 /// signal (the pod script's trap exits 0, and nothing else ends it). Short
 /// of a delete, which `install_interrupted`, `list_with` and
 /// `note_server_stop` rule out first, that's an eviction, which on k3s
