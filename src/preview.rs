@@ -158,6 +158,18 @@ impl PreviewTemplate {
             return Err(format!("{template:?} must hold {PORT} and {CONVERSATION} once each"));
         }
         let authority = browser_authority(template, scheme, &authority)?;
+        // The rest of what a browser refuses in a host (WHATWG's forbidden
+        // code points, a last label that's a number): a sample address
+        // must come back from the `url` crate's parser as written.
+        let sample = authority.replace(PORT, "3000").replace(CONVERSATION, "1");
+        let parsed = url::Url::parse(&format!("{scheme}://{sample}/")).ok();
+        let round_trip = parsed.as_ref().and_then(|url| {
+            let host = url.host_str()?;
+            Some(url.port().map_or_else(|| host.to_string(), |port| format!("{host}:{port}")))
+        });
+        if round_trip.as_deref() != Some(sample.as_str()) {
+            return Err(format!("{template:?} gives addresses like {sample:?}, which a browser can't open"));
+        }
         #[expect(clippy::expect_used, reason = "both placeholders were counted exactly once above")]
         let port_at = authority.find(PORT).expect("counted above");
         #[expect(clippy::expect_used, reason = "both placeholders were counted exactly once above")]

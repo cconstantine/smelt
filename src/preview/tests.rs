@@ -230,3 +230,30 @@ fn test_a_template_with_spaces_percent_or_backslash_is_refused() {
         assert!(error.contains(named), "the error for {bad:?} should name {named:?}: {error:?}");
     }
 }
+
+/// The rest of what a browser refuses in a host name (WHATWG's forbidden
+/// code points, a last label that's a number) is found by parsing a
+/// sample address the way a browser does (SME-183's review round 2).
+#[test]
+fn test_a_template_whose_addresses_no_browser_accepts_is_refused() {
+    for bad in [
+        "https://{port}-{conversation}.x|y.com",
+        "https://{port}-{conversation}.x^y.com",
+        "https://{port}-{conversation}.x<y.com",
+        "https://{port}-{conversation}.x\u{1}y.com",
+        "https://{port}-{conversation}.x\u{7f}y.com",
+        "https://{port}-{conversation}.127.0.0.1",
+    ] {
+        let error = PreviewTemplate::parse(bad).expect_err(&format!("{bad:?} should be refused"));
+        assert!(error.contains("browser"), "the error should say a browser can't open it: {error:?}");
+    }
+    for good in [
+        DEFAULT_PREVIEW_URL,
+        "https://{port}-{conversation}-smelt.constantlee.us",
+        "https://c{conversation}-p{port}.example.com",
+        "https://{port}-{conversation}.preview.example.com.:443",
+        "http://{port}_{conversation}.x.test:8181",
+    ] {
+        assert!(PreviewTemplate::parse(good).is_ok(), "{good:?} should be accepted");
+    }
+}
