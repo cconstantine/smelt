@@ -32,6 +32,10 @@ use sqlx::PgPool;
 
 /// Largest request head accepted — far above anything a browser sends.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
+/// Largest reply head the sandbox route passes on: Chrome's own limit
+/// (`HttpStreamParser::kMaxHeaderBufSize`), so every head it would accept
+/// gets through (SME-165 review 1).
+const MAX_REPLY_HEAD_BYTES: usize = 256 * 1024;
 /// Bounds reading the request head and connecting upstream; the tunnel
 /// itself is unbounded, since a WebSocket can legitimately stay open.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -295,7 +299,7 @@ async fn handle_sandbox(
         // The final reply head goes on marked `Connection: close`, so the
         // browser never sends a second request, which nothing would
         // check, down this connection (SME-165).
-        let relayed = reply::relay_reply_heads(&mut from_pod, &mut to_page, MAX_HEAD_BYTES).await;
+        let relayed = reply::relay_reply_heads(&mut from_pod, &mut to_page, MAX_REPLY_HEAD_BYTES).await;
         let refusal = match relayed.map_err(io)? {
             Relayed::CopyRest => None,
             Relayed::Ended => {

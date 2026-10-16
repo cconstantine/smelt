@@ -633,10 +633,21 @@ async fn test_a_sandbox_reply_whose_first_header_is_a_continuation_is_still_clos
     assert_eq!(got, expected);
 }
 
+/// Chrome accepts a reply head up to 256 KiB (`kMaxHeaderBufSize`), so the
+/// proxy passes one that size on rather than refusing it (SME-165 review 1).
+#[tokio::test]
+async fn test_a_sandbox_reply_head_chrome_accepts_is_passed_on() {
+    let filler = "a".repeat(200 * 1024);
+    let reply = format!("HTTP/1.1 200 OK\r\nX-Filler: {filler}\r\nContent-Length: 2\r\n\r\nhi");
+    let expected = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nX-Filler: {filler}\r\nContent-Length: 2\r\n\r\nhi");
+    let (got, _) = exchange(vec![reply.as_bytes()], NAVIGATION, &expected).await;
+    assert!(got == expected, "got {:?}", &got[..got.len().min(200)]);
+}
+
 /// A reply head too large to check is refused, saying why.
 #[tokio::test]
 async fn test_a_sandbox_reply_head_too_large_is_refused() {
-    let reply = format!("HTTP/1.1 200 OK\r\nX-Filler: {}\r\n\r\n", "a".repeat(70 * 1024));
+    let reply = format!("HTTP/1.1 200 OK\r\nX-Filler: {}\r\n\r\n", "a".repeat(260 * 1024));
     let (got, _) = exchange(vec![reply.as_bytes()], NAVIGATION, &"x".repeat(1024)).await;
     assert!(got.starts_with("HTTP/1.1 502"), "got {:?}", &got[..got.len().min(200)]);
     assert!(got.contains("too large"), "the reply should say why: {:?}", &got[..got.len().min(200)]);
