@@ -467,3 +467,6 @@ async fn grep_tool(
     })
     .to_string())
 }
+
+#[cfg(test)]
+mod tests;
