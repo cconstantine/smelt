@@ -17,6 +17,10 @@ mod tests {
 }
 ```
 
+## Cost, size and budget tests
+
+**A test that measures what a page, a read or a result costs needs a fixture where the cost exists** (SME-189). Its `read_file` tests each used a one-line or three-line file, so nothing ever asked what reading on within a long line costs when the file goes on behind it — and the fix shipped re-sending every line after the cut one, about twelve times what the walk wins. Only a code review saw it, four fix commits and two review rounds late. So when the thing under test is a budget, a cap or a truncation, put the interesting line in the middle of a full page and assert what the response *holds*, not only what it says: a minimal fixture can't see a per-page cost.
+
 ## Database tests
 
 `db.rs`'s CRUD functions take `pool: &PgPool` as an explicit parameter (see [database.md](database.md)), so tests use `#[sqlx::test]` instead of `db::get()`'s process-wide pool — each test function gets its own freshly created, migrated Postgres database, handed in as an argument:

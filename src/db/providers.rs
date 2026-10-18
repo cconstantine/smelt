@@ -23,6 +23,9 @@ pub struct InferenceProvider {
     pub keep_reasoning: bool,
     /// llama.cpp only: its `/props`, as `providers::LlamaServerInfo`.
     pub server_caps: Option<serde_json::Value>,
+    /// How many requests it's sent at once: `None` no limit, `0`
+    /// the count its `/props` reports, else that many (SME-162).
+    pub max_concurrent_requests: Option<i32>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -40,6 +43,7 @@ impl std::fmt::Debug for InferenceProvider {
             .field("price_catalog_provider", &self.price_catalog_provider)
             .field("keep_reasoning", &self.keep_reasoning)
             .field("server_caps", &self.server_caps)
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
             .field("secret", &"..")
             .finish_non_exhaustive()
     }
@@ -55,10 +59,12 @@ pub async fn create_inference_provider(
     prompt_caching: bool,
     price_catalog_provider: Option<&str>,
     keep_reasoning: bool,
+    max_concurrent_requests: Option<i32>,
 ) -> Result<InferenceProvider, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
-        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret, prompt_caching, price_catalog_provider, keep_reasoning)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *",
+        "INSERT INTO inference_providers (name, kind, base_url, auth_kind, secret, prompt_caching, price_catalog_provider, keep_reasoning,
+                                          max_concurrent_requests)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *",
     )
     .bind(name)
     .bind(kind)
@@ -68,6 +74,7 @@ pub async fn create_inference_provider(
     .bind(prompt_caching)
     .bind(price_catalog_provider)
     .bind(keep_reasoning)
+    .bind(max_concurrent_requests)
     .fetch_one(pool)
     .await
 }
@@ -101,15 +108,18 @@ pub async fn update_inference_provider(
     prompt_caching: bool,
     price_catalog_provider: Option<&str>,
     keep_reasoning: bool,
+    max_concurrent_requests: Option<i32>,
 ) -> Result<Option<InferenceProvider>, sqlx::Error> {
     sqlx::query_as::<_, InferenceProvider>(
         "UPDATE inference_providers
          SET name = $2, kind = $3, base_url = $4, auth_kind = $5,
              secret = COALESCE($6, secret), prompt_caching = $7, price_catalog_provider = $8,
-             keep_reasoning = $9,
+             keep_reasoning = $9, max_concurrent_requests = $10,
              -- Another server's caps don't describe this one (SME-111 review 2).
              server_caps = CASE WHEN kind = $3 AND base_url = $4 THEN server_caps END,
-             updated_at = now()
+             -- Always later than the last: the request limit is versioned
+             -- by it, even across a clock step (SME-162 review 2).
+             updated_at = GREATEST(now(), updated_at + interval '1 microsecond')
          WHERE id = $1 RETURNING *",
     )
     .bind(id)
@@ -121,22 +131,34 @@ pub async fn update_inference_provider(
     .bind(prompt_caching)
     .bind(price_catalog_provider)
     .bind(keep_reasoning)
+    .bind(max_concurrent_requests)
     .fetch_optional(pool)
     .await
 }
 
-/// Keeps what a llama.cpp server last said about itself (SME-111).
+/// Keeps what a llama.cpp server last said about itself (SME-111), if
+/// the provider is still that server (`kind` and `base_url` unchanged:
+/// an edit made while it was read clears it), and returns the row as
+/// written, whose limit is read from it (SME-162 review 2). `None` when
+/// the provider is gone or points elsewhere now.
 pub async fn set_inference_provider_server_caps(
     pool: &PgPool,
     id: i64,
+    kind: &str,
+    base_url: &str,
     server_caps: &serde_json::Value,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE inference_providers SET server_caps = $2 WHERE id = $1")
-        .bind(id)
-        .bind(server_caps)
-        .execute(pool)
-        .await?;
-    Ok(())
+) -> Result<Option<InferenceProvider>, sqlx::Error> {
+    sqlx::query_as::<_, InferenceProvider>(
+        "UPDATE inference_providers SET server_caps = $4,
+             updated_at = GREATEST(now(), updated_at + interval '1 microsecond')
+         WHERE id = $1 AND kind = $2 AND base_url = $3 RETURNING *",
+    )
+    .bind(id)
+    .bind(kind)
+    .bind(base_url)
+    .bind(server_caps)
+    .fetch_optional(pool)
+    .await
 }
 
 /// Deletes a provider, first clearing it as the default and from every

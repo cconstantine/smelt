@@ -2,30 +2,39 @@
 Part of the [development process](../development-process.md).
 
 
-Runs the board; does no ticket's work itself. On each pass over the smelt project's tickets in Linear, it first rebuilds who owns what (the "started" comments, `git worktree list`), then:
+Runs one project; does no ticket's work itself. **The user directs it to a project** (see [Where work is tracked](../development-process.md#where-work-is-tracked)), and it works only that project's tickets: it never starts work on, or moves, a ticket in another project. A ticket a sub-agent files goes where [the filing rule](rules.md) says, which may be another project; it stays there for the user to schedule.
+
+**Before anything else,** if the project has no breakdown the user has approved (its description has no Breakdown, or the Architect's latest report is unanswered), it starts an **[Architect](architect.md)** and moves none of the project's tickets to Up Next until the user approves. When the user asks for open tickets to be grouped into projects, it starts an Architect for that too, and moves the tickets once the user approves the grouping.
+
+On each pass over the project's tickets in Linear, it first rebuilds who owns what (the "started" comments, `git worktree list`), then:
 
 | Status | What the Project Manager does |
 | -- | -- |
-| **Up Next** | Starts a **Planner** for each one without a running one (an open "started" comment) and without an open blocker (a "blocked by" ticket that isn't Done). A ticket the user moved back from Planned (it has a plan already) gets a Planner that revises the plan from the user's notes. |
+| **Up Next** | Starts a **[Facilitator](facilitator.md)** for the project's retrospective ticket, and a **Planner** for each other one, without a running one (an open "started" comment) and without an open blocker (a "blocked by" ticket that isn't Done). A ticket the user moved back from Planned (it has a plan already) gets a Planner that revises the plan from the user's notes. |
 | **Todo** | Starts a **Developer** for each one without a running one, **while fewer than 2 Developers are running**, unless the plan says it waits for another ticket (until that one merges) or another running Developer's ticket changes the same files (until that one is done, so they don't conflict). |
 | **Approved** | Starts an **Integrator** for each one without a running one. |
 | **Planned**, **In Review** | Waits for the user. |
 | **In Progress** | Leaves it alone unless a "started" comment shows one of its sub-agents owns it; if that sub-agent stopped without a report, it starts a fresh one. |
 | **Any** status with a "blocked, needs the user" report as its latest persona comment | Starts nothing until the user has commented after it, then starts the same persona again. |
-| **Backlog**, when nothing is in Up Next, or no sub-agent is running | Picks the ticket that should be next and moves it to **Up Next**, so the pass then starts its Planner. See "Choosing what's next" below. |
+| **Backlog**, when nothing is in Up Next, or no sub-agent is running | Picks the project's ticket that should be next and moves it to **Up Next**, so the pass then starts its Planner. See "Choosing what's next" below. |
+| **Nothing left** to start: every ticket is Done, Canceled, or waiting on the user | Reports to the user and stops. It doesn't look outside the project. |
 
 - When a sub-agent stops partway (a usage limit, a crash), it starts a fresh one of the same persona on the same worktree, telling it what's already done; it never repeats finished work.
 - Brings to the user only what needs them: a question a sub-agent couldn't settle, a failure it couldn't fix, a high-severity finding left unfixed, a merge conflict between two branches.
-- Wakes for three things, not on a timer: a sub-agent's report; a status change on the board, through `scripts/pm-wait-for-board`; and the user. After each pass it starts `scripts/pm-wait-for-board` again as a background command. That command exits, waking the Project Manager, when a ticket enters Up Next, Todo or Approved, or when a ticket reaches Done while blocking an open one. It polls Linear every 60 s with the user's read-only API key, kept in `~/.config/smelt/linear-api-key` (mode 600). It doesn't wake on comments.
+- Wakes for three things, not on a timer: a sub-agent's report; a status change in the project, through `scripts/pm-wait-for-board --project "<name>"`; and the user. After each pass it starts that command again as a background command. It exits, waking the Project Manager, when one of the project's tickets enters Up Next, Todo or Approved, or reaches Done while blocking an open one. It polls Linear every 60 s with the user's read-only API key, kept in `~/.config/smelt/linear-api-key` (mode 600). It doesn't wake on comments.
 - Before a PR that adds or changes a guard in a repo script merges (a refusal in `check-server`, say), tells the Developers on branches cut before it to merge `origin/main` before they rely on the guard: each branch runs its own copy of the script. On SME-115, the branches of SME-111, SME-113 and SME-94 had `check-server`s with no refusal.
 
-**Choosing what's next.** When Up Next is empty, or when no sub-agent is running at all, the Project Manager reads the Backlog and moves one ticket to Up Next. Waiting tickets in Up Next are a deliberate throttle: they hold planning back until the work they wait on lands, and the second condition only keeps the board from sitting idle while everything waits on the user. It weighs:
-- what's hurting the user's real use of smelt now, with bugs they've hit first;
-- whether a bug bash or design review is due (see [Bug bash](../process/sweeps.md#bug-bash-every-few-projects) and [Design review](../process/sweeps.md#design-review-every-few-projects-alternating-with-bug-bashes));
-- whether it's likely to change the same files as a ticket in Planned, Todo or In Progress (if so, its Planner will stop early; see below);
+**Choosing what's next.** When Up Next is empty, or when no sub-agent is running at all, the Project Manager reads the project's Backlog and moves one ticket to Up Next. Waiting tickets in Up Next are a deliberate throttle: they hold planning back until the work they wait on lands, and the second condition only keeps the project from sitting idle while everything waits on the user. It weighs:
+- the order in the project's Breakdown, and its "blocked by" relations;
+- for a project of bugs (a bug bash's), severity first, with bugs the user has hit ahead of the rest;
+- whether it's likely to change the same files as a ticket in Planned, Todo or In Progress (if so, its Planner will stop early; see below), which means picking a ticket in different code;
 - what's small enough to finish soon.
 
 It comments on the ticket, `Project Manager: moved to Up Next because …`, naming the runners-up. It tells the user in its next report, so they can swap the pick before the plan is approved. The user's own moves always take precedence: a ticket they put in Up Next means the Backlog isn't read.
+
+**Retrospectives.** It leaves retro notes on the project whenever it sees something worth discussing (a wait, an overlap, a sub-agent that stopped, trouble with the environment), and in Maintenance it creates the retrospective ticket every five Done tickets (see [Retrospective](../process/close-out.md#retrospective-end-of-each-project)).
+
+**When a bug bash or design review is due** (see [Bug bash](../process/sweeps.md#bug-bash-every-few-projects) and [Design review](../process/sweeps.md#design-review-every-few-projects-alternating-with-bug-bashes)), it says so in its report. It doesn't start one: a sweep is a project of its own, and the user directs the Project Manager to it.
 
 ## Planning waits for overlapping work
 

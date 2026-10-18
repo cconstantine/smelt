@@ -122,3 +122,18 @@ fn test_models_without_tools_are_suggested_last() {
     let ids: Vec<&str> = ordered.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, vec!["b", "c", "a"]);
 }
+
+/// SME-162: "Max concurrent requests" as sent: blank is no limit, and
+/// (review 1) anything but a whole number, 0 or more, is refused rather
+/// than saved as no limit.
+#[test]
+fn test_max_concurrent_requests_reads_blank_zero_and_a_count() {
+    assert_eq!(max_requests_from_text(""), Ok(None), "blank is no limit");
+    assert_eq!(max_requests_from_text("  "), Ok(None));
+    assert_eq!(max_requests_from_text("0"), Ok(Some(0)), "0 is the server's own count");
+    assert_eq!(max_requests_from_text(" 3 "), Ok(Some(3)));
+    for typed in ["abc", "1.5", "-1", "99999999999"] {
+        let refused = max_requests_from_text(typed).expect_err(typed);
+        assert!(refused.contains("Max concurrent requests"), "{refused}");
+    }
+}

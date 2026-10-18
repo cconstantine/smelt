@@ -185,8 +185,10 @@ mod server {
 
     /// The most of one tool result that reaches the model (SME-76).
     /// Conversation 23 took in single results of 40–106 KB, which on a
-    /// local model meant 10–30 minutes per step.
-    const MAX_TOOL_RESULT_CHARS: usize = 30_000;
+    /// local model meant 10–30 minutes per step. `pub(super)` because a
+    /// tool's own size test guards against it (SME-189 review 1): `read_file`'s
+    /// cut-line budget is set so a page of cut lines stays under this.
+    pub(super) const MAX_TOOL_RESULT_CHARS: usize = 30_000;
 
     /// Cuts `result` to `MAX_TOOL_RESULT_CHARS`, saying so and how to see
     /// the rest. The rest is dropped. Also says whether it cut.

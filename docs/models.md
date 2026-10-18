@@ -84,7 +84,7 @@ pub struct LanguageServerSuggestion {
 
 ## Other types
 
-Model providers' wire types (`ProviderSummary`, `ProviderInput`, `ProviderKind`, `AuthKind`, `LlamaServerInfo`, `ModelInfo`, `ProviderModels`, `ModelChoice`, `ConversationModel`) are in `src/providers.rs` rather than here, next to the logic that fills them (SME-72). `ConversationModel` is internally tagged (`state`) with struct variants, round-tripped in its tests.
+Model providers' wire types (`ProviderSummary`, `ProviderInput`, `ProviderKind`, `AuthKind`, `LlamaServerInfo`, `ModelInfo`, `ProviderModels`, `ModelChoice`, `ConversationModel`) are in `src/providers.rs` rather than here, next to the logic that fills them (SME-72). `ConversationModel` is internally tagged (`state`) with struct variants, round-tripped in its tests. `ProviderSummary` and `ProviderInput` carry `max_concurrent_requests: Option<u32>` (SME-162): `None` no limit, `0` the slot count the server reports, else that many.
 
 `models.rs` isn't the only home for these:
 

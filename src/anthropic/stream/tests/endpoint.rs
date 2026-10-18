@@ -5,7 +5,7 @@ use super::*;
 #[test]
 fn test_messages_url_ignores_a_trailing_slash() {
     let url = |base: &str| {
-        Endpoint { base_url: base.to_string(), auth: Auth::ApiKey(String::new()) }.url("/v1/messages")
+        Endpoint { base_url: base.to_string(), auth: Auth::ApiKey(String::new()), slots_of: None }.url("/v1/messages")
     };
     assert_eq!(url("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
     assert_eq!(url("https://gateway.example/"), "https://gateway.example/v1/messages");
@@ -43,6 +43,7 @@ async fn test_a_redirect_never_carries_the_key_to_another_host() {
     let endpoint = Endpoint {
         base_url: format!("http://{provider}"),
         auth: Auth::ApiKey("sk-secret".to_string()),
+        slots_of: None,
     };
     let request = CreateMessageRequest {
         model: "m".to_string(),
@@ -67,6 +68,7 @@ fn test_an_endpoints_debug_hides_its_secret() {
     let endpoint = Endpoint {
         base_url: "https://api.anthropic.com".to_string(),
         auth: Auth::Bearer("sk-very-secret".to_string()),
+        slots_of: None,
     };
     let shown = format!("{endpoint:?}");
     assert!(!shown.contains("sk-very-secret"), "{shown}");
@@ -177,6 +179,7 @@ async fn send_and_capture_headers(auth: Auth) -> (
     let endpoint = Endpoint {
         base_url: format!("http://{addr}"),
         auth,
+        slots_of: None,
     };
     let result =
         send_and_await_response(&endpoint, &request, Binding::AsIs, std::time::Duration::from_secs(5)).await;
@@ -224,6 +227,7 @@ async fn test_an_unreachable_model_endpoint_is_reported_as_the_model() {
         &Endpoint {
             base_url: "http://127.0.0.1:1".to_string(),
             auth: Auth::ApiKey("key".to_string()),
+            slots_of: None,
         },
         &CreateMessageRequest {
             model: "local".to_string(),

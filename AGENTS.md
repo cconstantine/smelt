@@ -15,11 +15,11 @@ A single-user, 100%-Rust AI chat agent talking to Claude. Dioxus fullstack (SSR 
 | Dioxus components, routing, calling server functions from the UI | [docs/frontend.md](docs/frontend.md) |
 | Where tests live, database and sandbox tests, running them, the browser tier | [docs/testing.md](docs/testing.md) |
 | The development process: plan, TDD, rules, done, close-out (an index of its parts) | [docs/development-process.md](docs/development-process.md) |
-| Personas (Project Manager, Planner, Developer, Code Reviewer, Integrator) and the ticket workflow they run | [docs/personas/README.md](docs/personas/README.md) |
+| Personas (Project Manager, Architect, Planner, Developer, Code Reviewer, Integrator, Facilitator) and the ticket workflow they run | [docs/personas/README.md](docs/personas/README.md) |
 
 ## Project tracking
 
-Ideas, plans and completed projects are tickets in Linear (team "Smelt Agent", ids `SME-N`, project "smelt"): Backlog = idea, Up Next = to plan, Planned = plan awaiting the user, Todo = approved and ready, In Progress, In Review = awaiting the user's answers to the retrospective, Approved = ready to merge, Done. Current features, architecture and goals are in [docs/current-state/](docs/current-state/index.md). An `SME-N` in a code comment or doc is one of these tickets. See [docs/development-process.md](docs/development-process.md#where-work-is-tracked).
+Ideas, plans and completed work are tickets in Linear (team "Smelt Agent", ids `SME-N`). Every ticket belongs to a project, one per line of work (a feature, a bug bash, a cleanup), with true one-offs in "Maintenance". Linear holds only tracking; product and process documents live in the repo, including the [Feature checklist](docs/feature-checklist/index.md). Statuses: Backlog = idea, Up Next = to plan, Planned = plan awaiting the user, Todo = approved and ready, In Progress, In Review = awaiting the user's answers to its questions, Approved = ready to merge, Done. Current features, architecture and goals are in [docs/current-state/](docs/current-state/index.md). An `SME-N` in a code comment or doc is one of these tickets. See [docs/development-process.md](docs/development-process.md#where-work-is-tracked).
 
 ## For any agent
 
@@ -29,4 +29,4 @@ These hold for every agent working on the repo, Claude or not.
 - **Production functions stay under 200 code lines.** `scripts/lint-expects` runs clippy's `too_many_lines`, and `src/repo_lints.rs` checks `#[component]` functions, which clippy can't see into; split a long function along its own steps.
 - **`scripts/check.sh` gates every commit:** both builds with no warnings, the lints, and the server tests. Tests that use the shared Postgres or the k3s cluster run under the cluster lock: through `scripts/check.sh`, or `scripts/cluster-test <cargo test arguments>` for one test, never a bare `cargo test` (see [docs/testing.md](docs/testing.md#running-tests)).
 - **Never `git checkout` in the main checkout or touch the dev server:** work in a worktree of your own (see [docs/personas/rules.md](docs/personas/rules.md)).
-- **Ticket work needs Linear** (the Linear MCP tools): plans, What shipped and retrospectives live in the ticket. The process starts at [docs/development-process.md](docs/development-process.md), and the personas that run it at [docs/personas/README.md](docs/personas/README.md).
+- **Ticket work needs Linear** (the Linear MCP tools): plans and What shipped live in the ticket, retro notes on the project. The process starts at [docs/development-process.md](docs/development-process.md), and the personas that run it at [docs/personas/README.md](docs/personas/README.md).
