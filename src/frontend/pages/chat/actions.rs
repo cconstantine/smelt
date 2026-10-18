@@ -174,7 +174,13 @@ pub(super) fn send_action(
                 // would land in the wrong box). After a switch the store was
                 // reset and holds no `temp_id`, so the withdraw is a no-op.
                 withdraw_unsent(&mut messages.write(), temp_id);
-                let restored = draft_after_failed_send(&input.peek(), &content);
+                // `next_temp_id` only moves on a send, so this send is still
+                // the latest exactly when the counter sits where it left it.
+                // Otherwise the viewer sent again while this one was in
+                // flight, its own send is what emptied the box, and restoring
+                // would replace that message with this one (code review 1).
+                let another_send_since = *next_temp_id.peek() != temp_id - 1;
+                let restored = draft_after_failed_send(&input.peek(), &content, another_send_since);
                 if *selected.peek() == Some(id)
                     && let Some(draft) = restored
                 {
@@ -202,8 +208,11 @@ pub(super) fn withdraw_unsent(messages: &mut Vec<Message>, temp_id: i64) {
 }
 
 /// What the message box should hold after a send of `sent` failed, given
-/// what it holds now (SME-185 B36): the sent text back when the box is
-/// empty, and nothing when the viewer has typed something new since.
-pub(super) fn draft_after_failed_send(draft: &str, sent: &str) -> Option<String> {
-    draft.trim().is_empty().then(|| sent.to_string())
+/// what it holds now and whether anything was sent since (SME-185 B36): the
+/// sent text back when the box is empty, and nothing when the viewer has
+/// typed something new since, or sent again since — a second send clears the
+/// box too, and restoring would then swap the older message in for the one
+/// the viewer meant to send (code review 1).
+pub(super) fn draft_after_failed_send(draft: &str, sent: &str, another_send_since: bool) -> Option<String> {
+    (!another_send_since && draft.trim().is_empty()).then(|| sent.to_string())
 }

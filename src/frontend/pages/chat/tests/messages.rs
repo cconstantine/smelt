@@ -106,9 +106,19 @@ fn test_withdrawing_a_send_leaves_its_saved_copy() {
 /// something typed since.
 #[test]
 fn test_a_failed_send_gives_its_text_back_only_to_an_empty_box() {
-    assert_eq!(draft_after_failed_send("", "hi").as_deref(), Some("hi"));
-    assert_eq!(draft_after_failed_send("  \n", "hi").as_deref(), Some("hi"));
-    assert_eq!(draft_after_failed_send("new text", "hi"), None);
+    assert_eq!(draft_after_failed_send("", "hi", false).as_deref(), Some("hi"));
+    assert_eq!(draft_after_failed_send("  \n", "hi", false).as_deref(), Some("hi"));
+    assert_eq!(draft_after_failed_send("new text", "hi", false), None);
+}
+
+/// SME-185 code review 1: an empty box isn't an untouched one when the
+/// viewer sent again while this send was still in flight — the second send
+/// cleared it. Restoring the first one's text then hides what the viewer
+/// sent last, and leaves a message in the box they may well send by
+/// accident.
+#[test]
+fn test_a_failed_send_gives_its_text_back_only_while_it_is_still_the_last_send() {
+    assert_eq!(draft_after_failed_send("", "hi", true), None, "the box is empty because a later send cleared it");
 }
 
 /// Code review 1 (SME-34): a message sent while a question waits is
