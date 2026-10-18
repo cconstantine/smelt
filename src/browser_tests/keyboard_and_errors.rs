@@ -221,7 +221,7 @@ pub(super) async fn scenario_settings_two_step(t: &Scenario<'_>) {
         "the language server should be deleted"
     );
 
-    let provider = db::create_inference_provider(pool, &unique_id("two-step"), "anthropic", "http://127.0.0.1:9", "api_key", "key", false, None, true)
+    let provider = db::create_inference_provider(pool, &unique_id("two-step"), "anthropic", "http://127.0.0.1:9", "api_key", "key", false, None, true, None)
         .await
         .expect("create a provider");
     let page = t.tab(t.url(&format!("providers/{}", provider.id))).await;

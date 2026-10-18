@@ -4,6 +4,7 @@ fn test_endpoint(addr: std::net::SocketAddr) -> Endpoint {
     Endpoint {
         base_url: format!("http://{addr}"),
         auth: Auth::ApiKey("test-key".to_string()),
+        slots_of: None,
     }
 }
 
@@ -238,3 +239,4 @@ mod spans;
 mod binding;
 mod assembly;
 mod cut_off;
+mod limiter;

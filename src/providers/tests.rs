@@ -75,6 +75,40 @@ fn test_a_llama_cpp_provider_starts_with_bearer_auth_and_no_caching() {
     );
 }
 
+/// SME-162: the form sends a provider's max concurrent requests, and its
+/// summary shows it back, automatic (`0`) included.
+#[test]
+fn test_a_providers_max_concurrent_requests_crosses_to_the_browser_and_back() {
+    let input = ProviderInput {
+        name: "Home".to_string(),
+        kind: ProviderKind::LlamaCpp,
+        base_url: "http://llama:8080".to_string(),
+        auth_kind: AuthKind::Bearer,
+        secret: String::new(),
+        prompt_caching: false,
+        price_catalog_provider: None,
+        keep_reasoning: true,
+        max_concurrent_requests: Some(0),
+    };
+    let json = serde_json::to_string(&input).expect("serializes");
+    assert_eq!(serde_json::from_str::<ProviderInput>(&json).expect("deserializes"), input);
+    let summary = ProviderSummary {
+        id: 1,
+        name: "Home".to_string(),
+        kind: ProviderKind::LlamaCpp,
+        base_url: "http://llama:8080".to_string(),
+        auth_kind: AuthKind::Bearer,
+        secret_hint: None,
+        prompt_caching: false,
+        price_catalog_provider: None,
+        keep_reasoning: true,
+        server_caps: None,
+        max_concurrent_requests: Some(2),
+    };
+    let json = serde_json::to_string(&summary).expect("serializes");
+    assert_eq!(serde_json::from_str::<ProviderSummary>(&json).expect("deserializes"), summary);
+}
+
 /// The server's info goes to the browser on the provider's summary.
 #[test]
 fn test_llama_server_info_round_trips_through_json() {
