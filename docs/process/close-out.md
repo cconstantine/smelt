@@ -8,17 +8,17 @@ What shipped, the docs, the code review and the retrospective: the gate on mergi
 After each project completes:
 - Replace the ticket's `## Plan` section with `## What shipped` (including anything changed from the plan, and what's not done)
 - Update the **Current state** docs if features or architecture changed
-- Add or update the project's rows in the **Feature checklist**: what a user can do, and how to check it in the browser
-- File anything left undone that's worth doing as its own Backlog ticket, linked as related
+- Add or update the ticket's row in the **Feature checklist** (`docs/feature-checklist/`, the file for its area): what a user can do, and how to check it in the browser
+- File anything left undone that's worth doing as its own Backlog ticket in the same project, linked as related (see where tickets go in [Rules every persona follows](../personas/rules.md))
 - When the project deleted a feature, search for its name in prose too (docs, comments, CSS, prompts, test names), not only its identifiers: the compiler finds the code, nothing finds the sentences. On SME-54, removing `run_async`'s task suite left wording about it in docs and comments that only the code review found.
 - Put the ticket id in the PR's title or body
 - Review the PR once it's open (see [Code review](#code-review-after-opening-the-pr))
 - Once the reviews are done, add `## Retrospective` to the ticket (see below), before the PR merges
 - Move the ticket to **Done** once the PR merges
 
-When the user mentions a new idea, create a **Backlog** ticket for it before it is forgotten.
+When the user mentions a new idea, create a **Backlog** ticket for it before it is forgotten, in the project it belongs to, or in Maintenance when none fits. An idea too big for one ticket becomes a project of its own instead, with the user's words as its description, for an [Architect](../personas/architect.md) to break down when the user directs the Project Manager to it.
 
-**After a range edit to a Linear ticket or document** (`replace_range`, or replacing a whole section), read it back and compare it against the version from before the edit; sections outside the range should be unchanged. A save's reply can show stale content, so read it again rather than trusting the reply. On SME-32 a `replace_range` on the Current state document silently deleted 11 architecture bullets, restored only because an earlier copy was still in the session. `replace_range`'s `to` anchor is exclusive and stays in place: end the range at the next section's heading and **don't** repeat that heading in `new_string`, or it appears twice (or `replace` the whole old section). Ending it at a section's own last line left that line duplicated on SME-70, SME-49, SME-86 and SME-90; this doc's old advice to include the `to` heading in `new_string` doubled a heading on SME-117.
+**After a range edit to a Linear ticket or project description** (`replace_range`, or replacing a whole section), read it back and compare it against the version from before the edit; sections outside the range should be unchanged. A save's reply can show stale content, so read it again rather than trusting the reply. On SME-32 a `replace_range` on the Current state document silently deleted 11 architecture bullets, restored only because an earlier copy was still in the session. `replace_range`'s `to` anchor is exclusive and stays in place: end the range at the next section's heading and **don't** repeat that heading in `new_string`, or it appears twice (or `replace` the whole old section). Ending it at a section's own last line left that line duplicated on SME-70, SME-49, SME-86 and SME-90; this doc's old advice to include the `to` heading in `new_string` doubled a heading on SME-117.
 
 **Prefer `replace` with a unique anchor over `replace_range`.** Quote just the text that changes, with enough around it to match once; a range's two anchors are where the doubled lines and lost sections above came from. **When appending a table row** (`append`, or `insert_after` a table's last row), check whether the content already ends with a newline, and if it does, don't start the row with another: a blank line ends a Markdown table, so the new row shows as a paragraph under it. On SME-106 range edits left a doubled heading, and an append left a blank line splitting a table.
 

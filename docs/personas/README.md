@@ -6,7 +6,8 @@ Every persona still follows the rest of the [development process](../development
 
 | Persona | Works on | Moves the ticket | File |
 | -- | -- | -- | -- |
-| Project Manager | the whole board | Backlog to Up Next | [project-manager.md](project-manager.md) |
+| Project Manager | the one project the user directs it to | Backlog to Up Next, within that project | [project-manager.md](project-manager.md) |
+| Architect | one project: its description and its breakdown into tickets | creates tickets in Backlog | [architect.md](architect.md) |
 | Planner | one Up Next ticket | to Planned, or Todo with no questions | [planner.md](planner.md) |
 | Developer | one Todo ticket | to In Progress, then In Review, or Approved with no questions | [developer.md](developer.md) |
 | Code Reviewer | one PR | none: it reports to the Developer | [code-reviewer.md](code-reviewer.md) |
