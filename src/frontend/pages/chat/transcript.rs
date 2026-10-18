@@ -290,22 +290,29 @@ pub(super) fn MessageView(
 }
 
 /// Whether the transcript shows a new conversation's start screen (SME-41
-/// D12): no messages, no turn running, not missing, and its messages
-/// loaded, with none in them. Two frames used to flash it on a switch
-/// (SME-185 B38): the messages resource still holding the conversation
-/// left until the new load lands (so the load must be `selected`'s), and
-/// the new load landing one render before the effect that copies it into
-/// the transcript (so the load itself must be empty).
+/// D12): no messages, no turn running, not missing, nothing of the
+/// conversation's own showing in its place, and its messages loaded with
+/// none in them. Two frames used to flash it on a switch (SME-185 B38): the
+/// messages resource still holding the conversation left until the new load
+/// lands (so the load must be `selected`'s), and the new load landing one
+/// render before the effect that copies it into the transcript (so the load
+/// itself must be empty). It stays down while the conversation has an error
+/// line (code review 1): a failed first send leaves it empty, idle and
+/// loaded, and the screen — with its repo form and the example asks that
+/// overwrite whatever is in the message box — doesn't belong under the line
+/// saying the send didn't go.
 pub(super) fn shows_start_screen(
     selected: Option<i64>,
     loaded: Option<&(i64, Result<Vec<Message>, ServerFnError>)>,
     no_messages: bool,
     turn_running: bool,
     missing: bool,
+    error_showing: bool,
 ) -> bool {
     no_messages
         && !turn_running
         && !missing
+        && !error_showing
         && matches!(loaded, Some((id, Ok(list))) if Some(*id) == selected && list.is_empty())
 }
 
@@ -437,6 +444,7 @@ pub(super) fn Transcript(
                 messages().is_empty(),
                 turn_running(),
                 conversation_missing(),
+                selected().is_some_and(|id| stream_errors.read().lines.contains_key(&id)),
             ) {
                 div { class: "conversation-empty",
                     h2 { "What should smelt work on?" }

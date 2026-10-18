@@ -233,10 +233,10 @@ fn loaded(id: i64, ok: bool) -> (i64, Result<Vec<Message>, ServerFnError>) {
 #[test]
 fn test_the_start_screen_waits_for_the_open_conversations_own_load() {
     assert!(
-        !shows_start_screen(Some(2), Some(&loaded(1, true)), true, false, false),
+        !shows_start_screen(Some(2), Some(&loaded(1, true)), true, false, false, false),
         "the conversation left's load showed the start screen"
     );
-    assert!(!shows_start_screen(Some(2), None, true, false, false), "nothing loaded yet");
+    assert!(!shows_start_screen(Some(2), None, true, false, false, false), "nothing loaded yet");
 }
 
 /// SME-185 B38: the open conversation's own load has landed, but the
@@ -246,16 +246,30 @@ fn test_the_start_screen_waits_for_the_open_conversations_own_load() {
 fn test_the_start_screen_waits_for_a_loaded_list_to_reach_the_transcript() {
     let with_a_message = (2, Ok(vec![user_text(5, "hello")]));
     assert!(
-        !shows_start_screen(Some(2), Some(&with_a_message), true, false, false),
+        !shows_start_screen(Some(2), Some(&with_a_message), true, false, false, false),
         "a load holding a message showed the start screen before the transcript had it"
     );
 }
 
 #[test]
 fn test_the_start_screen_shows_only_for_an_empty_idle_loaded_conversation() {
-    assert!(shows_start_screen(Some(2), Some(&loaded(2, true)), true, false, false));
-    assert!(!shows_start_screen(Some(2), Some(&loaded(2, true)), false, false, false), "it has messages");
-    assert!(!shows_start_screen(Some(2), Some(&loaded(2, true)), true, true, false), "a turn is running");
-    assert!(!shows_start_screen(Some(2), Some(&loaded(2, true)), true, false, true), "it's missing");
-    assert!(!shows_start_screen(Some(2), Some(&loaded(2, false)), true, false, false), "its load failed");
+    assert!(shows_start_screen(Some(2), Some(&loaded(2, true)), true, false, false, false));
+    assert!(!shows_start_screen(Some(2), Some(&loaded(2, true)), false, false, false, false), "it has messages");
+    assert!(!shows_start_screen(Some(2), Some(&loaded(2, true)), true, true, false, false), "a turn is running");
+    assert!(!shows_start_screen(Some(2), Some(&loaded(2, true)), true, false, true, false), "it's missing");
+    assert!(!shows_start_screen(Some(2), Some(&loaded(2, false)), true, false, false, false), "its load failed");
+}
+
+/// SME-185 code review 1: a failed first send leaves exactly the state the
+/// start screen asks for — no messages, no turn, its empty load landed — so
+/// withdrawing the bubble brought "What should smelt work on?" back over the
+/// failure, with its example asks ready to overwrite the text that had just
+/// gone back into the box. While that conversation has an error line, the
+/// screen stays down.
+#[test]
+fn test_the_start_screen_stays_down_while_an_error_shows_for_the_conversation() {
+    assert!(
+        !shows_start_screen(Some(2), Some(&loaded(2, true)), true, false, false, true),
+        "a failed send's error line didn't keep the start screen down"
+    );
 }
