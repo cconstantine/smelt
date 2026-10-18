@@ -203,6 +203,16 @@ pub(super) fn send_action(
 /// same text may be a send still in flight, and a saved copy that already
 /// replaced this one (the response was lost after the server saved it)
 /// stays.
+///
+/// Rests on how the temporary ids are handed out (SME-185 code review 1):
+/// `send_action` draws them from `next_temp_id`, a signal created once by
+/// `ChatPanel` and counting down from -1, so they are negative and unique
+/// for the life of the panel — a real id from the database is positive and
+/// can never collide, and two sends never share one. Give `ChatPanel` a
+/// per-conversation `key`, or move `next_temp_id` into `ConversationState`,
+/// and the counter resets while an older failed send is still in flight:
+/// its id could then be handed out again and this would delete the wrong
+/// message.
 pub(super) fn withdraw_unsent(messages: &mut Vec<Message>, temp_id: i64) {
     messages.retain(|m| m.id != temp_id);
 }
