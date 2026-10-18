@@ -250,7 +250,10 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "deleted_in_another_tab", 60, Box::pin(scenario_deleted_in_another_tab(&t))).await;
     run_scenario(&t, only, r, k, "working_line_timer_survives_a_reload", 60, Box::pin(scenario_working_line_timer_survives_a_reload(&t))).await;
     run_scenario(&t, only, r, k, "oauth_callback_error_link", 60, Box::pin(scenario_oauth_callback_error_link(&t))).await;
-    run_scenario(&t, only, r, k, "switch_shows_no_start_screen", 30, Box::pin(scenario_switch_shows_no_start_screen(&t))).await;
+    // 60s, not 30: the scenario switches conversations twice and waits on the
+    // start screen staying down each time, and a cold hydration plus the two
+    // server round-trips comfortably pass 30s on a loaded machine.
+    run_scenario(&t, only, r, k, "switch_shows_no_start_screen", 60, Box::pin(scenario_switch_shows_no_start_screen(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()
