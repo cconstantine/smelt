@@ -10,7 +10,7 @@ On each pass over the project's tickets in Linear, it first rebuilds who owns wh
 
 | Status | What the Project Manager does |
 | -- | -- |
-| **Up Next** | Starts a **Planner** for each one without a running one (an open "started" comment) and without an open blocker (a "blocked by" ticket that isn't Done). A ticket the user moved back from Planned (it has a plan already) gets a Planner that revises the plan from the user's notes. |
+| **Up Next** | Starts a **[Facilitator](facilitator.md)** for the project's retrospective ticket, and a **Planner** for each other one, without a running one (an open "started" comment) and without an open blocker (a "blocked by" ticket that isn't Done). A ticket the user moved back from Planned (it has a plan already) gets a Planner that revises the plan from the user's notes. |
 | **Todo** | Starts a **Developer** for each one without a running one, **while fewer than 2 Developers are running**, unless the plan says it waits for another ticket (until that one merges) or another running Developer's ticket changes the same files (until that one is done, so they don't conflict). |
 | **Approved** | Starts an **Integrator** for each one without a running one. |
 | **Planned**, **In Review** | Waits for the user. |
@@ -31,6 +31,8 @@ On each pass over the project's tickets in Linear, it first rebuilds who owns wh
 - what's small enough to finish soon.
 
 It comments on the ticket, `Project Manager: moved to Up Next because …`, naming the runners-up. It tells the user in its next report, so they can swap the pick before the plan is approved. The user's own moves always take precedence: a ticket they put in Up Next means the Backlog isn't read.
+
+**Retrospectives.** It leaves retro notes on the project whenever it sees something worth discussing (a wait, an overlap, a sub-agent that stopped, trouble with the environment), and in Maintenance it creates the retrospective ticket every five Done tickets (see [Retrospective](../process/close-out.md#retrospective-end-of-each-project)).
 
 **When a bug bash or design review is due** (see [Bug bash](../process/sweeps.md#bug-bash-every-few-projects) and [Design review](../process/sweeps.md#design-review-every-few-projects-alternating-with-bug-bashes)), it says so in its report. It doesn't start one: a sweep is a project of its own, and the user directs the Project Manager to it.
 
