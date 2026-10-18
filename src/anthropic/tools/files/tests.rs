@@ -1,12 +1,13 @@
 //! `read_file`'s tests: unit tests on `read_file_response` with a built
 //! `FileContents` — no pod, no database.
 //!
-//! The cap `execute` puts on every tool result lives in `mod server` and is
-//! private to it, so the size assertions here name the number (30,000) and
-//! the constant it comes from.
+//! The size assertions are against `MAX_TOOL_RESULT_CHARS`, the cap `execute`
+//! puts on every tool result. Naming the number there instead guarded nothing
+//! a lowered cap would have been caught by (SME-189 review 1, finding 3).
 
 use super::*;
 use crate::agent_protocol::FileContents;
+use crate::anthropic::tools::server::MAX_TOOL_RESULT_CHARS;
 
 /// A `read_file`'s page of a file, as the sandbox agent's reply hands it
 /// over. `hash` is always the whole file's, so an `edit_file` after a
@@ -88,8 +89,7 @@ fn test_read_file_response_stops_at_the_budget_and_says_where_to_continue() {
         "the cut line names itself and says how to read on: {}",
         tail(content.lines().next().expect("a line"), 120)
     );
-    // MAX_TOOL_RESULT_CHARS, which `mod server` keeps to itself.
-    assert!(response.to_string().chars().count() < 30_000);
+    assert!(response.to_string().chars().count() < MAX_TOOL_RESULT_CHARS);
     assert_eq!(response["hash"], "h", "the hash is still the whole file's");
 }
 
@@ -309,8 +309,7 @@ fn test_a_page_of_cut_lines_stays_under_the_tool_result_cap() {
         let response = read(vec![line; 2_000], 2_000, 1, 1);
         let json = response.to_string();
         let parsed: Value = serde_json::from_str(&json).expect("the response is still JSON");
-        // MAX_TOOL_RESULT_CHARS, which `mod server` keeps to itself.
-        assert!(json.chars().count() < 30_000, "{what}: {} characters", json.chars().count());
+        assert!(json.chars().count() < MAX_TOOL_RESULT_CHARS, "{what}: {} characters", json.chars().count());
         assert_eq!(parsed["truncated"], true, "{what}: some lines were left out");
         let page: Vec<&str> = parsed["content"].as_str().expect("content").lines().collect();
         assert!(
