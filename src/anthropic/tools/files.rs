@@ -29,11 +29,11 @@ pub(super) fn tools() -> Vec<Tool> {
                                such as [line 7 cut: characters 1–2000 of 40000 shown; read \
                                on with offset 7, character 2001]; pass that offset and \
                                character to read on within the line. character (1-based, \
-                               counted as lsp counts it) starts the first line returned at \
-                               that character instead of the line's start, and the reply \
-                               then says character. next_offset, when present, is where the \
-                               next whole line starts (truncated: true means this read \
-                               stopped early for size, not at limit)."
+                               counted as lsp counts it) starts the read at that character \
+                               instead of the line's start and returns that line alone, and \
+                               the reply then says character. next_offset, when present, is \
+                               where the next whole line starts (truncated: true means this \
+                               read stopped early for size, not at limit)."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -239,6 +239,10 @@ async fn read_file_tool(
         .and_then(Value::as_u64)
         .unwrap_or(1)
         .max(1) as u32;
+    // A read that starts mid-line answers one line, so don't ask the pod for
+    // the lines after it: walking a long line would otherwise fetch (and a
+    // refusal would fetch) a whole page each step (SME-189 review 1).
+    let limit = if character > 1 { 1 } else { limit };
 
     let contents = sandbox::read_file(pool, conversation_id, &path, offset, limit)
         .await
@@ -255,8 +259,11 @@ async fn read_file_tool(
 /// that says so is the only way on into it. `next_offset` stays the next
 /// *whole* line and `truncated` stays "lines left out for the budget", so a
 /// reader that ignores `character` still pages by whole lines and can't loop
-/// on one (SME-189). `hash` is always the whole file's, whatever was cut, so
-/// an `edit_file` after a partial read checks against the same hash.
+/// on one (SME-189). A read that starts mid-line answers that line alone —
+/// its page holds no other line — so following a long line's notes costs the
+/// line rather than the file (SME-189 review 1). `hash` is always the whole
+/// file's, whatever was cut, so an `edit_file` after a partial read checks
+/// against the same hash.
 pub(super) fn read_file_response(
     contents: crate::agent_protocol::FileContents,
     offset: u32,
@@ -276,6 +283,11 @@ pub(super) fn read_file_response(
             }
             *first = first.chars().skip(start - 1).collect();
         }
+        // A read that starts mid-line is following one line's note, so it
+        // answers that line and nothing else: the lines after it belong to
+        // the next whole line, and re-sending them on every step of a walk
+        // costs about twelve times what the walk wins (SME-189 review 1).
+        lines.truncate(1);
     }
     // Each line cut for itself, so `fit_lines` below never cuts one: it
     // sees texts of at most `MAX_LINE_CHARS` characters. The notes go on

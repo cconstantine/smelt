@@ -149,6 +149,53 @@ fn test_reading_on_walks_a_one_line_file_to_its_end() {
     assert_eq!(joined, line, "the reads join to the line exactly");
 }
 
+/// A read that starts mid-line is following one line's note, so it answers
+/// that line and nothing else (SME-189 review 1, finding 1): the page after
+/// it belongs to the next whole line, and re-sending it on every step of a
+/// walk costs about twelve times what the walk wins.
+#[test]
+fn test_a_read_that_starts_mid_line_shows_only_that_line() {
+    let long = "x".repeat(40_000);
+    let lines: Vec<String> = std::iter::once(long.clone())
+        .chain((1..=2_000).map(|i| format!("line {i} of a file that goes on for a while")))
+        .collect();
+
+    let response = read(lines.clone(), 2_001, 1, 2_001);
+    let page = shown_lines(&response);
+    assert_eq!(page.len(), 1, "a mid-line read answers the one line it started in");
+    let (text, pointer) = cut_note(&page[0]);
+    assert_eq!(text, long.chars().skip(2_000).take(2_000).collect::<String>(), "characters 2001–4000");
+    assert_eq!(pointer, Some((1, 4_001)), "and on into the same line, not past it");
+    assert_eq!(response["next_offset"], 2, "the next whole line, as ever");
+    assert!(response.get("truncated").is_none(), "nothing was left out for the budget");
+
+    // Following the notes from there to the end of the line costs the line,
+    // not the file: nineteen reads of ~2,000 characters each, rather than
+    // nineteen pages of everything that follows the long line.
+    let mut joined = String::new();
+    let mut sent = 0;
+    let mut character = 2_001;
+    let mut reads = 0;
+    loop {
+        let response = read(lines.clone(), 2_001, 1, character);
+        let page = shown_lines(&response);
+        assert_eq!(page.len(), 1, "read {} of the walk stayed on line 1", reads + 1);
+        sent += response["content"].as_str().expect("content").chars().count();
+        let (text, pointer) = cut_note(&page[0]);
+        joined.push_str(&text);
+        reads += 1;
+        let Some((_, next)) = pointer else { break };
+        character = next;
+    }
+    assert_eq!(reads, 19, "the remaining 38,000 characters at 2,000 a read");
+    assert_eq!(joined, long.chars().skip(2_000).collect::<String>(), "the reads finish the line");
+    assert!(sent < 45_000, "following the notes sent {sent} characters to read 38,000 of them");
+
+    // A read from the line's start still pages on past it, as ever.
+    let page = shown_lines(&read(lines, 2_001, 1, 1));
+    assert!(page.len() > 1, "the read that found the long line keeps the lines after it");
+}
+
 /// A cut counts characters, never bytes, so it splits nothing — and a
 /// grapheme made of several characters can still land in two reads, which is
 /// fine because the reads join exactly.
