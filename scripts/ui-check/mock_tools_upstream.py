@@ -8,7 +8,8 @@ finished notice waking the model) gets "noted." with no tool call.
 More commands (SME-122's re-shoots), each a whole user message:
 - `RUN <command>` calls `run_terminal_command` with that command, in the
   terminal the conversation's latest `create_terminal` result named (send
-  `TOOL create_terminal {}` first).
+  `TOOL create_terminal {}` first, and before that `TOOL create_pod {}`:
+  `create_terminal` needs the sandbox running).
 - `REFUSE` streams "Here is how to" and stops with `stop_reason: refusal`.
 - `EMPTY` streams a reply with no content blocks at all (`end_turn`).
 - `FAIL` answers HTTP 400 with an `invalid_request_error`, "MOCK-FAILURE"."""
