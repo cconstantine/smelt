@@ -130,7 +130,9 @@ pub fn stored_previews(rows: &[(String, u16)]) -> Vec<(PodHost, u16)> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreviewTemplate {
     scheme: String,
-    /// The authority, lowercased, split around its two placeholders.
+    /// The authority, lowercased, with its port in the form a browser
+    /// sends in `Host` (a scheme's default port dropped, SME-183), split
+    /// around its two placeholders.
     before: String,
     between: String,
     after: String,
@@ -154,6 +156,19 @@ impl PreviewTemplate {
         let authority = authority.to_ascii_lowercase();
         if authority.matches(PORT).count() != 1 || authority.matches(CONVERSATION).count() != 1 {
             return Err(format!("{template:?} must hold {PORT} and {CONVERSATION} once each"));
+        }
+        let authority = browser_authority(template, scheme, &authority)?;
+        // The rest of what a browser refuses in a host (WHATWG's forbidden
+        // code points, a last label that's a number): a sample address
+        // must come back from the `url` crate's parser as written.
+        let sample = authority.replace(PORT, "3000").replace(CONVERSATION, "1");
+        let parsed = url::Url::parse(&format!("{scheme}://{sample}/")).ok();
+        let round_trip = parsed.as_ref().and_then(|url| {
+            let host = url.host_str()?;
+            Some(url.port().map_or_else(|| host.to_string(), |port| format!("{host}:{port}")))
+        });
+        if round_trip.as_deref() != Some(sample.as_str()) {
+            return Err(format!("{template:?} gives addresses like {sample:?}, which a browser can't open"));
         }
         #[expect(clippy::expect_used, reason = "both placeholders were counted exactly once above")]
         let port_at = authority.find(PORT).expect("counted above");
@@ -193,6 +208,15 @@ impl PreviewTemplate {
         format!("{}://{}{first}{}{second}{}", self.scheme, self.before, self.between, self.after)
     }
 
+    /// `match_host` for the listener's own `Host` header, which a proxy in
+    /// front of it may write with the scheme's default port
+    /// (`$host:$server_port`), though a browser never does (SME-183's
+    /// review). `Origin` and `Referer` stay matched exactly.
+    pub fn match_request_host(&self, host: &str) -> Option<(i64, PodHost, u16)> {
+        let default = if self.scheme == "https" { ":443" } else { ":80" };
+        self.match_host(host.strip_suffix(default).unwrap_or(host))
+    }
+
     /// The conversation, host in its pod, and port a request's `Host`
     /// header names, if it's a preview address at all.
     pub fn match_host(&self, host: &str) -> Option<(i64, PodHost, u16)> {
@@ -212,6 +236,54 @@ impl PreviewTemplate {
         let conversation: i64 = conversation.parse().ok().filter(|&c| c > 0)?;
         let (pod_host, port) = parse_port_slot(slot)?;
         Some((conversation, pod_host, port))
+    }
+}
+
+/// A template's authority as a browser sends it back in `Host` and
+/// `Origin`: a scheme's default port, or an empty one, dropped, and any
+/// other port in plain decimal. An authority no browser's `Host` can
+/// match is refused: userinfo, an IP literal, a non-ASCII name, whitespace,
+/// `%` or `\`, a placeholder in the port, or more than one port.
+fn browser_authority(template: &str, scheme: &str, authority: &str) -> Result<String, String> {
+    let invalid = |why: &str| format!("{template:?} {why}");
+    if authority.contains('@') {
+        return Err(invalid("must not hold a user name (no user@)"));
+    }
+    if authority.contains(['[', ']']) {
+        return Err(invalid("must be a host name, not an IP address in [brackets]"));
+    }
+    if !authority.is_ascii() {
+        return Err(invalid("must be written in ASCII: give a non-ASCII name in its xn-- form"));
+    }
+    if authority.contains(char::is_whitespace) {
+        return Err(invalid("must not hold a space or other whitespace"));
+    }
+    if authority.contains(['%', '\\']) {
+        return Err(invalid("must not hold % or \\: a browser decodes the one and reads the other as a path"));
+    }
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return Ok(authority.to_string());
+    };
+    // A browser leaves a default port out of `Host`, which a placeholder
+    // can't know to do, and a container's slot is no port at all.
+    if port.contains('{') {
+        return Err(invalid("can't hold a placeholder in its port"));
+    }
+    if host.contains(':') {
+        return Err(invalid("must have one port at most"));
+    }
+    if port.is_empty() {
+        return Ok(host.to_string());
+    }
+    let number = if port.bytes().all(|b| b.is_ascii_digit()) { port.parse::<u16>().ok().filter(|&n| n != 0) } else { None };
+    let Some(number) = number else {
+        return Err(invalid("has an invalid port"));
+    };
+    let default = if scheme == "https" { 443 } else { 80 };
+    if number == default {
+        Ok(host.to_string())
+    } else {
+        Ok(format!("{host}:{number}"))
     }
 }
 
@@ -362,7 +434,7 @@ mod server {
     async fn handle(mut request: Request<Incoming>, preview: &Preview<'_>, cached: &CachedUpstream) -> Response<Body> {
         let template = preview.template;
         let host = request.headers().get(HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
-        let Some((conversation, pod_host, port)) = template.match_host(host) else {
+        let Some((conversation, pod_host, port)) = template.match_request_host(host) else {
             return text_response(StatusCode::NOT_FOUND, "This isn't a sandbox preview address.");
         };
         // Only this conversation's own previews, and someone opening the link

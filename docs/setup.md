@@ -84,6 +84,31 @@ cargo check --no-default-features --features web --target wasm32-unknown-unknown
 cargo test --features server
 ```
 
+**Run all of it inside the compose stack's `smelt` service rather than
+installing a toolchain wherever you happen to be.** That service
+(`docker-compose.yml`, built from `Dockerfile`'s `dev` target) *is* the
+development environment — rust with the wasm32 target, `rustfmt` and `clippy`,
+the pinned `dioxus-cli`, `sqlx-cli`, `gh`, the docker CLI and Playwright — and
+compose hands it Postgres, a Docker sidecar and a ready kubeconfig for the
+hermetic test cluster (`KUBECONFIG=/etc/smelt/k3s/park-kubeconfig.yaml`,
+written by `k3s-bootstrap`). So the whole gate runs there with nothing
+installed by hand, which is also what CI does, one step per command
+([.github/workflows/ci.yml](<../.github/workflows/ci.yml>)):
+
+```bash
+docker compose up -d postgres docker k3s
+docker compose run --rm smelt scripts/build-sandbox-image.sh  # once per change to the agent's sources
+docker compose run --rm smelt scripts/check.sh
+```
+
+An agent working inside a smelt conversation sandbox — which has none of that
+toolchain, no Postgres and no cluster — should reach for the same thing through
+the sandbox's own Docker rather than `apt-get install`-ing rust, clippy and a
+wasm target piecemeal: an installed toolchain costs more to get and proves
+less, since it reaches neither the database nor a cluster. A daemon that
+refuses privileged containers can't bring up the `k3s` and `docker` sidecars,
+and then the cluster-backed tests fall to CI.
+
 Helper scripts: `scripts/check.sh` (the checks every commit must pass: both
 builds with no warnings, plus the server tests), `scripts/check-server`
 (`dx serve` from a separate worktree, for hands-on checks), and

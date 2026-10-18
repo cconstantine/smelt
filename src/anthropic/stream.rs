@@ -7,7 +7,10 @@ use serde_json::Value;
 
 use super::types::{ContentBlock, CreateMessageRequest, TokenUsage};
 
+mod endpoint;
 mod lines;
+
+pub use endpoint::{Auth, Endpoint};
 
 /// The fully assembled result of one streamed Anthropic turn: every content
 /// block (text and/or tool_use) in order, plus the `stop_reason` that says
@@ -25,70 +28,6 @@ pub struct StreamedTurn {
     /// The tool call a cut-off reply stopped in the middle of, by name
     /// (SME-126): dropped from `content`, never run.
     pub cut_off_call: Option<String>,
-}
-
-/// How a request authenticates to a provider (SME-72).
-#[derive(Clone, PartialEq)]
-pub enum Auth {
-    /// An `x-api-key` header, as Anthropic (and local Ollama) expect.
-    ApiKey(String),
-    /// An `Authorization: Bearer` header, for gateways that want one.
-    Bearer(String),
-}
-
-// By hand, so a secret never reaches a log line.
-impl std::fmt::Debug for Auth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ApiKey(_) => f.write_str("ApiKey(..)"),
-            Self::Bearer(_) => f.write_str("Bearer(..)"),
-        }
-    }
-}
-
-/// A model provider to send requests to: its base URL and credential,
-/// from its `inference_providers` row (`providers::endpoint`).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Endpoint {
-    pub base_url: String,
-    pub auth: Auth,
-}
-
-impl Endpoint {
-    /// `path` (starting with `/`) under the base URL.
-    pub fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url.trim_end_matches('/'))
-    }
-
-    /// The HTTP client for requests to this provider. It doesn't follow
-    /// redirects: reqwest drops `Authorization` on a redirect to another
-    /// host but not `x-api-key`, so following one could hand the key to a
-    /// host it wasn't entered for. Anthropic-compatible APIs don't redirect.
-    /// One client for every provider, so connections are reused.
-    pub fn client(&self) -> Result<reqwest::Client, String> {
-        static CLIENT: std::sync::LazyLock<Result<reqwest::Client, String>> =
-            std::sync::LazyLock::new(|| {
-                reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
-                    // smelt's own name on every model request, listing
-                    // included: Kimi Code's terms count a hidden or faked
-                    // client identity as a violation (SME-106).
-                    .user_agent(concat!("smelt/", env!("CARGO_PKG_VERSION")))
-                    .build()
-                    .map_err(|e| format!("couldn't set up the HTTP client: {e}"))
-            });
-        CLIENT.clone()
-    }
-
-    /// Adds the credential and the `anthropic-version` header every
-    /// Anthropic-compatible request carries.
-    pub fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let request = request.header("anthropic-version", "2023-06-01");
-        match &self.auth {
-            Auth::ApiKey(key) => request.header("x-api-key", key),
-            Auth::Bearer(token) => request.header("Authorization", format!("Bearer {token}")),
-        }
-    }
 }
 
 /// A single interpreted Anthropic SSE payload, reduced to what
@@ -704,6 +643,7 @@ pub async fn stream_anthropic_message(
         gen_ai.response.finish_reasons = Empty,
         smelt.retries = Empty,
         smelt.binding = Empty,
+        smelt.slot_wait_ms = Empty,
         otel.status_code = Empty,
         otel.status_description = Empty,
     );
@@ -755,6 +695,13 @@ async fn stream_message(
     mut on_delta: impl FnMut(&str),
     tries: &mut Tries,
 ) -> Result<StreamedTurn, String> {
+    // Held through the retries and the whole stream (SME-162); the wait
+    // for it is on the span, apart from the model's time (review 1).
+    let (_slot, waited) = endpoint.slot().await.unzip();
+    if let Some(waited) = waited {
+        let waited = i64::try_from(waited.as_millis()).unwrap_or(i64::MAX);
+        tracing::Span::current().record("smelt.slot_wait_ms", waited);
+    }
     // Retried only here, before anything has streamed: nothing has been
     // shown to the viewer yet, so a retry is invisible to them.
     let mut attempt = 0;

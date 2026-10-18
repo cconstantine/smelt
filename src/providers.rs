@@ -137,6 +137,9 @@ pub struct ProviderSummary {
     pub keep_reasoning: bool,
     /// What a llama.cpp server last said about itself (`/props`).
     pub server_caps: Option<LlamaServerInfo>,
+    /// How many requests it's sent at once: `None` no limit, `0` the
+    /// slot count its server reports, else that many (SME-162).
+    pub max_concurrent_requests: Option<u32>,
 }
 
 /// What a llama.cpp server says about itself on `/props` (SME-111): read
@@ -192,6 +195,8 @@ pub struct ProviderInput {
     pub price_catalog_provider: Option<String>,
     /// llama.cpp only: keep earlier turns' reasoning (SME-111).
     pub keep_reasoning: bool,
+    /// As `ProviderSummary`'s (SME-162).
+    pub max_concurrent_requests: Option<u32>,
 }
 
 /// A models.dev catalog provider, for the provider form's "Prices from"
@@ -370,6 +375,9 @@ pub use server::*;
 #[cfg(feature = "server")]
 mod server;
 
+#[cfg(feature = "server")]
+pub mod limiter;
+
 #[cfg(test)]
 mod tests;
 
@@ -414,6 +422,7 @@ pub(crate) mod test_support {
             false,
             None,
             true,
+            None,
         )
         .await
         .expect("create the mock provider");

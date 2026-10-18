@@ -3,6 +3,7 @@ use sqlx::PgPool;
 use super::super::*;
 use crate::anthropic::stream::{Auth, Endpoint};
 use crate::db;
+use std::sync::Arc;
 
 /// Whether `event` is among what `rx` has received so far. The
 /// buses are process-wide, so other tests' events may come first.
@@ -49,7 +50,7 @@ fn settings(
 }
 
 async fn provider(pool: &PgPool, name: &str, auth_kind: &str) -> db::InferenceProvider {
-    db::create_inference_provider(pool, name, "ollama", "http://ollama:11434", auth_kind, "the-secret", false, None, true)
+    db::create_inference_provider(pool, name, "ollama", "http://ollama:11434", auth_kind, "the-secret", false, None, true, None)
         .await
         .expect("create provider")
 }
@@ -64,6 +65,7 @@ fn input(name: &str, base_url: &str, secret: &str) -> ProviderInput {
         prompt_caching: false,
         price_catalog_provider: None,
         keep_reasoning: true,
+        max_concurrent_requests: None,
     }
 }
 
@@ -71,3 +73,4 @@ mod resolution;
 mod forms;
 mod llama;
 mod listing;
+mod limiter;

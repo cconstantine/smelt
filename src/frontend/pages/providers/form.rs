@@ -15,6 +15,22 @@ struct ProviderForm {
     price_source_chosen: bool,
     /// llama.cpp only (SME-111).
     keep_reasoning: bool,
+    /// "Max concurrent requests" as typed (SME-162).
+    max_concurrent_requests: String,
+}
+
+/// "Max concurrent requests" as sent: blank is no limit, `0` the
+/// server's own count, else that many. Anything else is refused here,
+/// rather than saved as no limit (SME-162 review 1); the server checks
+/// the rest.
+pub(super) fn max_requests_from_text(text: &str) -> Result<Option<u32>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse().map(Some).map_err(|_| {
+        "Max concurrent requests is a whole number, 0 or more, or blank for no limit.".to_string()
+    })
 }
 
 impl ProviderForm {
@@ -29,6 +45,7 @@ impl ProviderForm {
             price_source: None,
             price_source_chosen: false,
             keep_reasoning: true,
+            max_concurrent_requests: String::new(),
         }
     }
 
@@ -43,11 +60,12 @@ impl ProviderForm {
             price_source: provider.price_catalog_provider.clone(),
             price_source_chosen: true,
             keep_reasoning: provider.keep_reasoning,
+            max_concurrent_requests: provider.max_concurrent_requests.map(|n| n.to_string()).unwrap_or_default(),
         }
     }
 
-    fn input(&self) -> ProviderInput {
-        ProviderInput {
+    fn input(&self) -> Result<ProviderInput, String> {
+        Ok(ProviderInput {
             name: self.name.clone(),
             kind: self.kind,
             base_url: self.base_url.clone(),
@@ -56,7 +74,8 @@ impl ProviderForm {
             prompt_caching: self.prompt_caching,
             price_catalog_provider: self.price_source.clone(),
             keep_reasoning: self.keep_reasoning,
-        }
+            max_concurrent_requests: max_requests_from_text(&self.max_concurrent_requests)?,
+        })
     }
 
     /// Follows the address and kind with the suggested price source, until
@@ -107,9 +126,17 @@ fn ProviderFields(
         let f = form();
         suggest_kind && f.kind != ProviderKind::LlamaCpp && llama_cpp_at().as_deref() == Some(f.base_url.trim())
     };
+    // A field the page refuses before saving (SME-162 review 1).
+    let mut field_error: Signal<Option<String>> = use_signal(|| None);
     let submit = move |event: Event<FormData>| {
         event.prevent_default();
-        on_save.call(form().input());
+        match form().input() {
+            Ok(input) => {
+                field_error.set(None);
+                on_save.call(input);
+            }
+            Err(e) => field_error.set(Some(e)),
+        }
     };
     let secret_placeholder = match (is_new, &secret_hint) {
         (true, _) => "The API key or token".to_string(),
@@ -217,6 +244,15 @@ fn ProviderFields(
                 }
             }
 
+            label { r#for: "provider-max-requests", "Max concurrent requests" }
+            input { id: "provider-max-requests", r#type: "number", min: "0", step: "1",
+                placeholder: "No limit",
+                value: "{form().max_concurrent_requests}",
+                oninput: move |e| form.write().max_concurrent_requests = e.value() }
+            p { class: "muted",
+                "Leave blank for no limit. A server only serves as many requests at once as it has slots. A llama.cpp server can take 0, its own count, which it reports on this provider's page once its models are listed; otherwise type the number. While all slots are busy smelt waits before sending, so two conversations take turns instead of one timing out."
+            }
+
             label { r#for: "provider-prices", "Prices from" }
             select {
                 id: "provider-prices",
@@ -246,7 +282,7 @@ fn ProviderFields(
                 }
             }
 
-            super::super::ErrorText { message: error }
+            super::super::ErrorText { message: field_error().or(error) }
             button { r#type: "submit", "{save_label}" }
         }
     }

@@ -42,7 +42,7 @@ async fn test_terminal(pool: &PgPool, conversation_id: i64) -> i64 {
 // --- Model providers (SME-72) ---
 
 async fn test_provider(pool: &PgPool, name: &str) -> InferenceProvider {
-    create_inference_provider(pool, name, "anthropic", "https://api.anthropic.com", "api_key", "sk-ant-0123456789", false, None, true)
+    create_inference_provider(pool, name, "anthropic", "https://api.anthropic.com", "api_key", "sk-ant-0123456789", false, None, true, None)
         .await
         .expect("create provider")
 }

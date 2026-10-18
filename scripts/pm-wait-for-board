@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Block until the smelt Linear board needs the Project Manager, then exit.
+"""Block until a Linear project's tickets need the Project Manager, then exit.
 
-The Project Manager runs this as a background command. It exits, which wakes
-the Project Manager, as soon as a status change on the board needs acting on:
+The Project Manager runs this as a background command, with --project naming
+the project the user directed it to; it watches only that project's tickets
+(the "board"). It exits, which wakes the Project Manager, as soon as a status
+change on the board needs acting on:
 
   - a ticket enters Up Next, Todo or Approved;
   - a ticket reaches Done while it blocks a ticket that isn't Done
@@ -13,7 +15,8 @@ through the sub-agents' own reports, so this only watches statuses.
 
 It polls Linear's GraphQL API every --interval seconds (default 60) and
 compares the board with a snapshot kept in
-~/.local/state/smelt/pm-board-snapshot.json (or $SMELT_PM_STATE_DIR). Each
+~/.local/state/smelt/pm-board-snapshot-<project>.json (or $SMELT_PM_STATE_DIR),
+one per project, so switching projects reports nothing stale. Each
 poll is compared with the one before it, and the snapshot is saved after
 every successful poll, so a ticket that leaves a wake state and comes back
 (Up Next -> Planned -> Up Next, a plan being revised) wakes it when a poll
@@ -34,8 +37,8 @@ changed; 2 when the key is missing, refused (401/403, no retry), the API keeps
 failing, or the snapshot can't be saved (the message says why; any change
 lines are printed first). With --once a failed poll isn't retried.
 
-    scripts/pm-wait-for-board                 # wait for the next change
-    scripts/pm-wait-for-board --once          # check once: report and exit 0, or exit 1 if nothing changed
+    scripts/pm-wait-for-board --project "Bug bash 4"          # wait for the next change
+    scripts/pm-wait-for-board --project "Bug bash 4" --once   # check once: report and exit 0, or exit 1 if nothing changed
     scripts/pm-wait-for-board --self-test     # run its tests (no network; a temporary state dir, never the real one)
 """
 
@@ -52,7 +55,9 @@ import urllib.error
 import urllib.request
 
 API_URL = os.environ.get("SMELT_LINEAR_API_URL", "https://api.linear.app/graphql")
-PROJECT = "smelt"
+# The Linear project the Project Manager is directed to (--project). It only
+# runs that project's tickets, so it watches only them.
+PROJECT = None
 WAKE_STATES = ("Up Next", "Todo", "Approved")
 DONE = "Done"
 MAX_FAILURES = 10
@@ -81,7 +86,9 @@ def state_path():
     base = os.environ.get(
         "SMELT_PM_STATE_DIR", os.path.expanduser("~/.local/state/smelt")
     )
-    return os.path.join(base, "pm-board-snapshot.json")
+    slug = "".join(c if c.isalnum() else "-" for c in PROJECT.lower())
+    slug = "-".join(part for part in slug.split("-") if part)
+    return os.path.join(base, f"pm-board-snapshot-{slug}.json")
 
 
 def fail(msg):
@@ -250,6 +257,8 @@ def self_test():
 
     # The poll loop, driven with scripted polls in a state directory of the
     # test's own: it never reads the real snapshot or the key.
+    global PROJECT
+    PROJECT = "Self test"
     saved_dir = os.environ.get("SMELT_PM_STATE_DIR")
     try:
         with tempfile.TemporaryDirectory(prefix="pm-wait-for-board-self-test.") as root:
@@ -480,7 +489,7 @@ def _loop_cases(b):
         _expect(p, "A's status", status, 1)
         _expect(p, "A's stderr", err, "")
         _expect(p, "snapshot (A moved last)", load_snapshot(), b(SME_1="Planned"))
-        leftovers = sorted(set(os.listdir(os.path.dirname(state_path()))) - {"pm-board-snapshot.json"})
+        leftovers = sorted(set(os.listdir(os.path.dirname(state_path()))) - {os.path.basename(state_path())})
         _expect(p, "temporary files left", leftovers, [])
         return p
 
@@ -514,9 +523,31 @@ def _loop_cases(b):
         _expect(p, "says why", "can't save the board snapshot at " + state_path() in err, True)
         return p
 
+    # Each project the Project Manager is directed to has a snapshot of its
+    # own, so switching projects can't report the other project's tickets as
+    # new.
+    def each_project_has_its_own_snapshot():
+        global PROJECT
+        p = []
+        saved = PROJECT
+        try:
+            PROJECT = "Bug bash 4"
+            save_snapshot(b(SME_1="Up Next"))
+            bash_path = state_path()
+            PROJECT = "Maintenance"
+            _expect(p, "other project's snapshot", load_snapshot(), None)
+            _expect(p, "paths differ", state_path() != bash_path, True)
+            _expect(p, "file name", os.path.basename(bash_path), "pm-board-snapshot-bug-bash-4.json")
+            PROJECT = "Bug bash 4"
+            _expect(p, "own snapshot", load_snapshot(), b(SME_1="Up Next"))
+        finally:
+            PROJECT = saved
+        return p
+
     return [
         (f.__name__, f)
         for f in (
+            each_project_has_its_own_snapshot,
             a_bad_snapshot_is_named_and_replaced,
             a_second_waiters_save_mid_write_breaks_neither,
             a_wake_whose_save_fails_still_reports_the_change,
@@ -538,15 +569,20 @@ def _loop_cases(b):
 
 
 def main():
+    global PROJECT
     p = argparse.ArgumentParser(
-        description="Wait until the smelt Linear board needs the Project Manager."
+        description="Wait until a Linear project's tickets need the Project Manager."
     )
+    p.add_argument("--project", help='the Linear project the Project Manager is directed to, by name (e.g. "Bug bash 4")')
     p.add_argument("--interval", type=int, default=60, help="seconds between polls (default 60)")
     p.add_argument("--once", action="store_true", help="check once and exit (1 if nothing changed)")
     p.add_argument("--self-test", action="store_true", help="run the comparison's and poll loop's tests and exit")
     args = p.parse_args()
     if args.self_test:
         return self_test()
+    if not args.project or not args.project.strip():
+        p.error("--project is required: the project the Project Manager is directed to")
+    PROJECT = args.project.strip()
     if args.interval < 10:
         p.error("--interval must be at least 10 seconds")
 

@@ -298,6 +298,7 @@ pub async fn probe_llama_cpp(base_url: &str) -> bool {
     let endpoint = Endpoint {
         base_url: base_url.trim().to_string(),
         auth: super::stream::Auth::ApiKey(String::new()),
+        slots_of: None,
     };
     let Ok(client) = endpoint.client() else {
         return false;
@@ -634,6 +635,7 @@ mod tests {
         let endpoint = Endpoint {
             base_url: format!("http://{addr}/"),
             auth: Auth::ApiKey("key-1".to_string()),
+            slots_of: None,
         };
         (endpoint, seen)
     }
@@ -661,6 +663,7 @@ mod tests {
         let endpoint = Endpoint {
             base_url: format!("http://{addr}"),
             auth: Auth::ApiKey("k".to_string()),
+            slots_of: None,
         };
         let models = list_models(ProviderKind::Anthropic, &endpoint).await.expect("lists");
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
@@ -688,6 +691,7 @@ mod tests {
         let endpoint = Endpoint {
             base_url: format!("http://{addr}"),
             auth: Auth::ApiKey("k".to_string()),
+            slots_of: None,
         };
         let models = list_models(ProviderKind::Anthropic, &endpoint).await.expect("lists");
         assert_eq!(models.len(), MAX_PAGES, "one model per page, then it stops");
@@ -758,6 +762,7 @@ mod tests {
         let endpoint = Endpoint {
             base_url: "http://127.0.0.1:1".to_string(),
             auth: Auth::ApiKey("k".to_string()),
+            slots_of: None,
         };
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(15),

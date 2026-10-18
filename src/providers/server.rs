@@ -143,14 +143,30 @@ pub fn template_settings(provider: &db::InferenceProvider, row: Option<&db::Prov
     }
 }
 
+/// How many requests at once `provider` is sent (SME-162): its max
+/// concurrent requests, or with `0` the slot count its server last
+/// reported (`server_caps`). `None` is no limit: none set, or automatic
+/// with no count read yet.
+pub fn resolved_max(provider: &db::InferenceProvider) -> Option<u32> {
+    match provider.max_concurrent_requests? {
+        0 => server_caps(provider)?.total_slots,
+        n => u32::try_from(n).ok(),
+    }
+    // A pool of none would never send anything.
+    .filter(|n| *n > 0)
+}
+
+/// The provider's address, credential and request slots (SME-162).
 pub fn endpoint(provider: &db::InferenceProvider) -> Endpoint {
     let auth = match AuthKind::parse(&provider.auth_kind) {
         Some(AuthKind::Bearer) => Auth::Bearer(provider.secret.clone()),
         _ => Auth::ApiKey(provider.secret.clone()),
     };
+    limiter::set(provider.id, provider.updated_at, resolved_max(provider));
     Endpoint {
         base_url: provider.base_url.clone(),
         auth,
+        slots_of: Some(provider.id),
     }
 }
 
@@ -162,6 +178,7 @@ impl From<db::InferenceProvider> for ProviderSummary {
             prompt_caching: provider.prompt_caching,
             keep_reasoning: provider.keep_reasoning,
             server_caps: server_caps(&provider),
+            max_concurrent_requests: provider.max_concurrent_requests.and_then(|n| u32::try_from(n).ok()),
             price_catalog_provider: provider.price_catalog_provider,
             kind: ProviderKind::parse(&provider.kind).unwrap_or(ProviderKind::Other),
             auth_kind: AuthKind::parse(&provider.auth_kind).unwrap_or(AuthKind::ApiKey),
@@ -409,6 +426,14 @@ fn checked(input: ProviderInput) -> Result<ProviderInput, String> {
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(str::to_string);
+    // The column's range; 0 is the server's own count (SME-162).
+    if input.max_concurrent_requests.is_some_and(|n| i32::try_from(n).is_err()) {
+        return Err(format!("Max concurrent requests can be at most {}.", i32::MAX));
+    }
+    // Only a llama.cpp server reports its slots (SME-162 review 1).
+    if input.max_concurrent_requests == Some(0) && input.kind != ProviderKind::LlamaCpp {
+        return Err("Max concurrent requests 0 (the server's own count) needs a llama.cpp server, which reports it; type a number instead.".to_string());
+    }
     Ok(ProviderInput {
         name,
         base_url,
@@ -443,9 +468,11 @@ pub async fn create_provider(pool: &PgPool, input: ProviderInput) -> Result<Prov
         input.prompt_caching,
         input.price_catalog_provider.as_deref(),
         input.keep_reasoning,
+        to_column(input.max_concurrent_requests),
     )
     .await
     .map_err(|e| save_error(&input.name, e))?;
+    limiter::set(provider.id, provider.updated_at, resolved_max(&provider));
     providers_changed();
     Ok(provider.into())
 }
@@ -480,10 +507,13 @@ pub async fn update_provider(
         input.prompt_caching,
         input.price_catalog_provider.as_deref(),
         input.keep_reasoning,
+        to_column(input.max_concurrent_requests),
     )
     .await
     .map_err(|e| save_error(&input.name, e))?
     .ok_or("That provider no longer exists.")?;
+    // From each running turn's next model call (SME-162 review 1).
+    limiter::set(provider.id, provider.updated_at, resolved_max(&provider));
     providers_changed();
     Ok(provider.into())
 }
@@ -507,6 +537,7 @@ pub async fn delete_provider(pool: &PgPool, id: i64) -> Result<(), String> {
             Err(e) => return Err(e.to_string()),
         }
     }
+    limiter::forget(id);
     providers_changed();
     Ok(())
 }
@@ -660,9 +691,16 @@ async fn read_llama_props(
         Ok(info) => {
             crate::anthropic::models::apply_llama_props(listed, &info);
             let value = serde_json::to_value(&info).map_err(|e| e.to_string())?;
-            db::set_inference_provider_server_caps(pool, provider.id, &value)
-                .await
-                .map_err(|e| e.to_string())?;
+            let written =
+                db::set_inference_provider_server_caps(pool, provider.id, &provider.kind, &provider.base_url, &value)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            // An automatic limit takes the new count from each running
+            // turn's next model call (SME-162 review 1), from the row as
+            // written: a limit saved while this was read stands (review 2).
+            if let Some(row) = written {
+                limiter::set(row.id, row.updated_at, resolved_max(&row));
+            }
             Ok((Some(info), None))
         }
         Err(e) => Ok((server_caps(provider), Some(e))),

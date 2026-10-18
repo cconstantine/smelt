@@ -7,7 +7,7 @@ async fn test_inference_provider_round_trip_keeps_the_secret_unless_replaced(poo
     let created = test_provider(&pool, "anthropic").await;
     assert_eq!(list_inference_providers(&pool).await.expect("list"), vec![created.clone()]);
 
-    let renamed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", None, false, None, true)
+    let renamed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", None, false, None, true, None)
         .await
         .expect("update")
         .expect("exists");
@@ -17,7 +17,7 @@ async fn test_inference_provider_round_trip_keeps_the_secret_unless_replaced(poo
     );
     assert_eq!(renamed.secret, "sk-ant-0123456789", "no new secret keeps the stored one");
 
-    let rekeyed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", Some("new-secret"), true, Some("anthropic"), true)
+    let rekeyed = update_inference_provider(&pool, created.id, "work", "other", "https://gw.example", "bearer", Some("new-secret"), true, Some("anthropic"), true, None)
         .await
         .expect("update")
         .expect("exists");
@@ -29,7 +29,7 @@ async fn test_inference_provider_round_trip_keeps_the_secret_unless_replaced(poo
     );
 
     assert_eq!(
-        update_inference_provider(&pool, 999_999, "x", "other", "u", "bearer", None, false, None, true).await.expect("update"),
+        update_inference_provider(&pool, 999_999, "x", "other", "u", "bearer", None, false, None, true, None).await.expect("update"),
         None
     );
 }
@@ -40,15 +40,19 @@ async fn test_inference_provider_round_trip_keeps_the_secret_unless_replaced(poo
 #[sqlx::test]
 async fn test_a_providers_server_caps_go_when_its_address_or_kind_changes(pool: PgPool) {
     let caps = serde_json::json!({"template_caps": {"supports_reasoning_effort": true}});
-    let p = create_inference_provider(&pool, "llama", "llama_cpp", "http://one", "bearer", "k", false, None, true)
+    let p = create_inference_provider(&pool, "llama", "llama_cpp", "http://one", "bearer", "k", false, None, true, None)
         .await
         .expect("create");
     let caps_after = |name: &'static str, kind: &'static str, url: &'static str| {
         let pool = pool.clone();
         let caps = caps.clone();
         async move {
-            set_inference_provider_server_caps(&pool, p.id, &caps).await.expect("caps");
-            update_inference_provider(&pool, p.id, name, kind, url, "bearer", None, false, None, false)
+            let now = get_inference_provider(&pool, p.id).await.expect("get").expect("exists");
+            set_inference_provider_server_caps(&pool, p.id, &now.kind, &now.base_url, &caps)
+                .await
+                .expect("caps")
+                .expect("written for the server it points at");
+            update_inference_provider(&pool, p.id, name, kind, url, "bearer", None, false, None, false, None)
                 .await
                 .expect("update")
                 .expect("exists")
@@ -58,6 +62,31 @@ async fn test_a_providers_server_caps_go_when_its_address_or_kind_changes(pool: 
     assert_eq!(caps_after("renamed", "llama_cpp", "http://one").await, Some(caps.clone()), "same server");
     assert_eq!(caps_after("renamed", "llama_cpp", "http://two").await, None, "another address");
     assert_eq!(caps_after("renamed", "other", "http://two").await, None, "another kind");
+}
+
+/// SME-162 review 2: a server's `/props` is kept only while the provider
+/// still points at that server: one read before an address change is
+/// dropped, not stored for the new address.
+#[sqlx::test]
+async fn test_server_caps_are_kept_only_for_the_server_they_came_from(pool: PgPool) {
+    let caps = serde_json::json!({"total_slots": 4});
+    let p = create_inference_provider(&pool, "llama", "llama_cpp", "http://one", "bearer", "k", false, None, true, Some(0))
+        .await
+        .expect("create");
+    update_inference_provider(&pool, p.id, "llama", "llama_cpp", "http://two", "bearer", Some("k"), false, None, true, Some(0))
+        .await
+        .expect("update")
+        .expect("exists");
+    let written = set_inference_provider_server_caps(&pool, p.id, "llama_cpp", "http://one", &caps).await.expect("caps");
+    assert_eq!(written, None, "read from the old address");
+    let stored = get_inference_provider(&pool, p.id).await.expect("get").expect("exists");
+    assert_eq!(stored.server_caps, None);
+    let written = set_inference_provider_server_caps(&pool, p.id, "llama_cpp", "http://two", &caps)
+        .await
+        .expect("caps")
+        .expect("written");
+    assert_eq!(written.server_caps, Some(caps));
+    assert!(written.updated_at > stored.updated_at, "a new version");
 }
 
 #[sqlx::test]
@@ -213,4 +242,31 @@ async fn test_model_overrides_and_reported_details_leave_each_other_alone(pool: 
         }
     );
     assert_eq!(list_provider_models(&pool, provider.id).await.expect("list"), vec![row]);
+}
+
+/// SME-162: a provider's max concurrent requests is kept as set: none
+/// (no limit), `0` (the count its server reports) or a count; an update
+/// sets it outright, and a negative count is refused.
+#[sqlx::test]
+async fn test_a_providers_max_concurrent_requests_is_kept_as_set(pool: PgPool) {
+    let unset = test_provider(&pool, "unset").await;
+    assert_eq!(unset.max_concurrent_requests, None, "no limit unless set");
+    let two = create_inference_provider(&pool, "two", "llama_cpp", "http://two", "bearer", "k", false, None, true, Some(2))
+        .await
+        .expect("create");
+    assert_eq!(get_inference_provider(&pool, two.id).await.expect("get").expect("exists").max_concurrent_requests, Some(2));
+    let auto = create_inference_provider(&pool, "auto", "llama_cpp", "http://auto", "bearer", "k", false, None, true, Some(0))
+        .await
+        .expect("create");
+    assert_eq!(auto.max_concurrent_requests, Some(0), "0 is kept: the server's own count");
+
+    let update = |max| update_inference_provider(&pool, two.id, "two", "llama_cpp", "http://two", "bearer", None, false, None, true, max);
+    assert_eq!(update(Some(5)).await.expect("update").expect("exists").max_concurrent_requests, Some(5));
+    assert_eq!(update(None).await.expect("update").expect("exists").max_concurrent_requests, None, "cleared");
+
+    let refused = create_inference_provider(&pool, "neg", "other", "http://neg", "bearer", "k", false, None, true, Some(-1)).await;
+    assert!(
+        matches!(&refused, Err(sqlx::Error::Database(e)) if e.is_check_violation()),
+        "a negative count is refused: {refused:?}"
+    );
 }

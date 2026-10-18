@@ -176,6 +176,7 @@ async fn test_end_to_end_browser_scenarios() {
         false,
         None,
         true,
+        None,
     )
     .await
     .expect("save the mock provider");
