@@ -212,6 +212,22 @@ mod detail_body_tests {
         let html = dioxus::ssr::render_element(render_context_detail_body(None));
         assert!(html.contains("Loading…"), "{html}");
     }
+
+    /// SME-185 code review 1: the heading was only in the two loaded arms, so
+    /// a fetch that failed after a slow load inserted it and shifted the
+    /// panel's content down. Every state renders it, and only once.
+    #[test]
+    fn test_the_context_dialog_keeps_its_heading_in_every_state() {
+        for (state, html) in [
+            ("loading", dioxus::ssr::render_element(render_context_detail_body(None))),
+            (
+                "failed",
+                dioxus::ssr::render_element(render_context_detail_body(Some(&Err("boom".to_string())))),
+            ),
+        ] {
+            assert_eq!(html.matches("<h3>Context</h3>").count(), 1, "{state}: {html}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -311,17 +327,18 @@ mod context_usage_tests {
 /// The context dialog's body: "Loading…" until its fetch lands, then the
 /// snapshot, or why it couldn't load (SME-185 B37: a failed fetch used to
 /// leave "Loading…" for good). A plain function, so a test can render it.
+///
+/// The heading is outside the match: every state has it, so a fetch that
+/// fails after a slow load doesn't shift the panel's content down (code
+/// review 1), and it keeps the × (placed top right) clear of the text.
 pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSnapshot, String>>) -> Element {
-    match detail {
+    let body = match detail {
         None => rsx! { p { "Loading…" } },
         // A transport error's text ends in a space ("Failed to fetch ").
         Some(Err(reason)) => rsx! {
-            // The heading keeps the × (placed top right) clear of the text.
-            h3 { "Context" }
             ErrorText { message: Some(format!("Couldn't load the context: {}. Close it and open it again to retry.", reason.trim_end())) }
         },
         Some(Ok(detail)) => rsx! {
-            h3 { "Context" }
             if !detail.instructions.is_empty() {
                 h4 { class: "context-detail-heading", "Project instructions ({detail.instructions.len()})" }
                 p { class: "muted", "AGENTS.md files from this conversation's repos, sent with every turn as part of the system prompt below." }
@@ -377,6 +394,10 @@ pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSna
                 }
             }
         },
+    };
+    rsx! {
+        h3 { "Context" }
+        {body}
     }
 }
 
