@@ -4,7 +4,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use super::Tool;
-use super::pods::{LINES_BUDGET_CHARS, fit_lines};
+use super::pods::{LINES_BUDGET_CHARS, MAX_LINE_CHARS, fit_lines};
 use super::server::required_str;
 use crate::anthropic::ContentBlock;
 use crate::models::Message;
@@ -25,16 +25,23 @@ pub(super) fn tools() -> Vec<Tool> {
                                content, the file's total line count, and a content hash — \
                                edit_file, and write_file when overwriting, need that hash \
                                (as expected_hash) to confirm nothing else changed the file \
-                               first. Lines over 2000 characters are cut; next_offset, when \
-                               present, is where the rest of the file starts (truncated: true \
-                               means this read stopped early for size, not at limit)."
+                               first. Lines over 2000 characters are cut, ending in a note \
+                               such as [line 7 cut: characters 1–2000 of 40000 shown; read \
+                               on with offset 7, character 2001]; pass that offset and \
+                               character to read on within the line. character (1-based, \
+                               counted as lsp counts it) starts the read at that character \
+                               instead of the line's start and returns that line alone, and \
+                               the reply then says character. next_offset, when present, is \
+                               where the next whole line starts (truncated: true means this \
+                               read stopped early for size, not at limit)."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "path": {"type": "string"},
                         "offset": {"type": "integer", "minimum": 1, "description": "1-indexed starting line, defaults to 1"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "defaults to 2000, capped at 2000"}
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "defaults to 2000, capped at 2000"},
+                        "character": {"type": "integer", "minimum": 1, "description": "1-based character in the offset line to start at, defaults to 1; use the one a cut line's note gives"}
                     },
                     "required": ["path"]
                 }),
@@ -211,6 +218,20 @@ const DEFAULT_READ_FILE_LIMIT: u32 = 2000;
 
 const MAX_READ_FILE_LIMIT: u32 = 2000;
 
+/// `read_file`'s `character` input: the 1-based character of the `offset`
+/// line to start the read at, defaulting to the line's start. Held to what a
+/// position can be *before* the cast, so a number too big for one falls into
+/// `read_file_response`'s past-the-end refusal instead of wrapping round to
+/// a real position and answering the wrong characters under a position that
+/// looks self-consistent (SME-189 review 1).
+fn character_param(input: &Value) -> u32 {
+    input
+        .get("character")
+        .and_then(Value::as_u64)
+        .map(|c| c.clamp(1, u32::MAX as u64))
+        .unwrap_or(1) as u32
+}
+
 async fn read_file_tool(
     pool: &PgPool,
     conversation_id: i64,
@@ -227,24 +248,79 @@ async fn read_file_tool(
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_READ_FILE_LIMIT as u64)
         .clamp(1, MAX_READ_FILE_LIMIT as u64) as u32;
+    let character = character_param(input);
+    // A read that starts mid-line answers one line, so don't ask the pod for
+    // the lines after it: walking a long line would otherwise fetch (and a
+    // refusal would fetch) a whole page each step (SME-189 review 1).
+    let limit = if character > 1 { 1 } else { limit };
 
     let contents = sandbox::read_file(pool, conversation_id, &path, offset, limit)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(read_file_response(contents, offset).to_string())
+    Ok(read_file_response(contents, offset, character)?.to_string())
 }
 
-/// `read_file`'s answer: `contents`' lines numbered from `offset`, as
-/// many as fit `LINES_BUDGET_CHARS` (`truncated` when some didn't),
-/// with `next_offset` whenever the file goes on past them.
-pub(super) fn read_file_response(contents: crate::agent_protocol::FileContents, offset: u32) -> Value {
+/// `read_file`'s answer: `contents`' lines numbered from `offset` — the
+/// first starting at `character`, a 1-based character of that line, when it
+/// is more than 1 — as many as fit `LINES_BUDGET_CHARS` (`truncated` when
+/// some didn't), with `next_offset` whenever the file goes on past them.
+///
+/// A line longer than `MAX_LINE_CHARS` is cut by `cut_line`, and the note
+/// that says so is the only way on into it. `next_offset` stays the next
+/// *whole* line and `truncated` stays "lines left out for the budget", so a
+/// reader that ignores `character` still pages by whole lines and can't loop
+/// on one (SME-189). A read that starts mid-line answers that line alone —
+/// its page holds no other line — so following a long line's notes costs the
+/// line rather than the file (SME-189 review 1). `hash` is always the whole
+/// file's, whatever was cut, so an `edit_file` after a partial read checks
+/// against the same hash.
+pub(super) fn read_file_response(
+    contents: crate::agent_protocol::FileContents,
+    offset: u32,
+    character: u32,
+) -> Result<Value, String> {
     // the line number, a tab and the joining newline, JSON-escaped
     const PER_LINE: usize = 10;
-    let (lines, truncated) = fit_lines(contents.lines, LINES_BUDGET_CHARS, PER_LINE);
-    let numbered = lines
+    let mut lines = contents.lines;
+    if character > 1 {
+        if let Some(first) = lines.first_mut() {
+            let length = first.chars().count();
+            let start = character as usize;
+            if start > length {
+                return Err(format!(
+                    "character {start} is past the end of line {offset}, which has {length} characters"
+                ));
+            }
+            *first = first.chars().skip(start - 1).collect();
+        }
+        // A read that starts mid-line is following one line's note, so it
+        // answers that line and nothing else: the lines after it belong to
+        // the next whole line, and re-sending them on every step of a walk
+        // costs about twelve times what the walk wins (SME-189 review 1).
+        lines.truncate(1);
+    }
+    // Each line cut for itself, so `fit_lines` below never cuts one: it
+    // sees texts of at most `MAX_LINE_CHARS` characters. The notes go on
+    // after it, which is what keeps `pods::fit_lines` unchanged — a cut line
+    // costs at least 2,010 of the budget, so at most 12 of them fit a read,
+    // and their notes fit the room the budget leaves under the cap.
+    let mut shown = Vec::with_capacity(lines.len());
+    let mut notes = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let line_no = offset as usize + i;
+        let (text, note) = cut_line(line, line_no, if i == 0 { character as usize } else { 1 });
+        shown.push(text);
+        notes.push(note);
+    }
+    let (kept, truncated) = fit_lines(shown, LINES_BUDGET_CHARS, PER_LINE);
+    // `fit_lines` keeps a prefix, so `notes` still lines up index for index.
+    let numbered = kept
         .iter()
         .enumerate()
-        .map(|(i, line)| format!("{:>6}\t{line}", offset as usize + i))
+        .map(|(i, line)| match notes.get(i) {
+            Some(Some(note)) => format!("{:>6}\t{line}{note}", offset as usize + i),
+            _ => format!("{:>6}\t{line}", offset as usize + i),
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let mut response = serde_json::json!({
@@ -252,14 +328,48 @@ pub(super) fn read_file_response(contents: crate::agent_protocol::FileContents, 
         "total_lines": contents.total_lines,
         "hash": contents.hash,
     });
-    let next = offset as usize + lines.len();
+    let next = offset as usize + kept.len();
     if next <= contents.total_lines {
         response["next_offset"] = Value::from(next);
     }
     if truncated {
         response["truncated"] = Value::Bool(true);
     }
-    response
+    // A read that starts mid-line says so: the text it got isn't the line's
+    // start. Nothing is added inside `content`, so text copied out of a read
+    // into `edit_file` stays real file text. And only of text it did show —
+    // an empty read has no position in it (SME-189 review 1, finding 5).
+    if character > 1 && !kept.is_empty() {
+        response["character"] = Value::from(character);
+    }
+    Ok(response)
+}
+
+/// The most of one line `read_file` shows (SME-76's `MAX_LINE_CHARS`), and
+/// the note a cut one wears.
+///
+/// `line` is what the read shows of it — whole, or from character `start`
+/// onward when the read starts mid-line — and `line_no` its 1-based line
+/// number. Characters are counted with `chars()`, never by byte index, so a
+/// cut can't split one. Returns the text to show (at most `MAX_LINE_CHARS`
+/// characters) and, for a cut line, its note: which characters of which line
+/// it shows, how long the line is, and the `offset` and `character` to read
+/// on with. The note goes on the end, so nothing a model might copy into
+/// `edit_file`'s `old_string` appears at the front.
+fn cut_line(line: &str, line_no: usize, start: usize) -> (String, Option<String>) {
+    let length = line.chars().count();
+    if length <= MAX_LINE_CHARS {
+        return (line.to_string(), None);
+    }
+    let shown: String = line.chars().take(MAX_LINE_CHARS).collect();
+    let (first, last) = (start, start + MAX_LINE_CHARS - 1);
+    let note = format!(
+        "… [line {line_no} cut: characters {first}–{last} of {} shown; \
+         read on with offset {line_no}, character {}]",
+        start + length - 1,
+        last + 1
+    );
+    (shown, Some(note))
 }
 
 /// Overwriting an existing path requires it to have already been
@@ -467,3 +577,7 @@ async fn grep_tool(
     })
     .to_string())
 }
+
+#[cfg(test)]
+mod tests;
+

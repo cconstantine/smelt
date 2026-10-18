@@ -8,7 +8,7 @@ The process is split into a file per part, so an agent reads only the part its j
 | -- | -- |
 | Personas: who does what, and the statuses each moves | [personas/README.md](personas/README.md) |
 | Rules every persona follows (ownership, worktrees, the cluster lock, hands-on checks, questions for the user) | [personas/rules.md](personas/rules.md) |
-| Project Manager, Planner, Developer, Code Reviewer, Integrator | [personas/](personas/README.md) |
+| Project Manager, Architect, Planner, Developer, Code Reviewer, Integrator | [personas/](personas/README.md) |
 | Phase 1: the plan | [process/plan.md](process/plan.md) |
 | Phase 2: test-first implementation, and the testing rules | [process/tdd.md](process/tdd.md) |
 | Rules for the code: outside APIs, spikes, Kubernetes, async boundaries, errors | [process/rules-code.md](process/rules-code.md) |
@@ -22,7 +22,11 @@ The process is split into a file per part, so an agent reads only the part its j
 
 ## Where work is tracked
 
-Ideas, plans and finished projects live in Linear, not in the repo: team **Smelt Agent** (ticket ids `SME-N`), project **smelt**. Use the Linear MCP tools to read and update them. The one exception is a plan too long for the Linear MCP to return, which goes in `docs/plans/` on the ticket's branch (see [Planner](personas/planner.md)).
+Ideas, plans and finished work live in Linear, not in the repo: team **Smelt Agent** (ticket ids `SME-N`). Use the Linear MCP tools to read and update them.
+
+**Every ticket belongs to a project,** one per line of work: a feature, a bug bash, a design review, a cleanup. A project's description in Linear says its goal, its scope, when it's done and the tickets it breaks into, each an atomic unit of work (one plan, one branch, one PR); the [Architect](personas/architect.md) writes it. A ticket that fits no line of work goes in the standing **Maintenance** project. A ticket filed during other work goes in the project of the ticket that found it, and in Maintenance only when it's unrelated (see [Rules every persona follows](personas/rules.md)). The user directs the [Project Manager](personas/project-manager.md) to one project at a time.
+
+**Linear holds tracking; documents live in the repo.** Tickets (with their plans, What shipped and, on a project's retrospective ticket, the retrospective), comments (retro notes among them, on the project), statuses, relations and project descriptions are in Linear. Anything that describes the product or the process and outlives one ticket is a repo file: the Current state docs, the Feature checklist and these process docs. A plan too long for the Linear MCP to return goes in `docs/plans/` on the ticket's branch (see [Planner](personas/planner.md)) and is removed before the PR merges.
 
 | Status | Meaning |
 |---|---|
@@ -31,14 +35,14 @@ Ideas, plans and finished projects live in Linear, not in the repo: team **Smelt
 | **Planned** | Has a plan with questions for the user (see [Questions for the user](personas/rules.md)); the user may leave notes on the ticket. A plan with no questions goes straight to Todo. |
 | **Todo** | The user approved the plan; ready to be worked on. |
 | **In Progress** | Being implemented on a branch. |
-| **In Review** | PR open, reviewed and fixed, retrospective written; waiting for the user to answer its questions. A ticket with no questions goes straight to Approved. |
+| **In Review** | PR open, reviewed and fixed (or a retrospective written); waiting for the user to answer its questions. A ticket with no questions goes straight to Approved. |
 | **Approved** | The user answered the questions and said which recommendations they disagree with, or there were no questions; ready to act on the answers and merge. |
-| **Done** | Merged and closed out: the ticket records what shipped and the retrospective. |
+| **Done** | Merged and closed out: the ticket records what shipped. |
 | **Canceled** / **Duplicate** | Dropped, or folded into another ticket. |
 
 Each ticket gets one label: **Feature**, **Improvement** or **Bug**. Related tickets are linked as related rather than only mentioned.
 
-The **Current state** docs (`docs/current-state/`, one file per section — index.md first) describe current features, architecture and goals. The **Feature checklist** document (on the smelt project in Linear) lists every shipped feature with the steps to check it through the web UI, one row per ticket.
+The **Current state** docs (`docs/current-state/`, one file per section — index.md first) describe current features, architecture and goals. The **Feature checklist** (`docs/feature-checklist/`, one file per area — index.md first) lists every shipped feature with the steps to check it through the web UI, one row per ticket.
 
 Linear's markdown differs from GitHub's in ways that bite: don't hard-wrap lines (a wrapped line starting with `+` or `-` becomes a list item), put file names in backticks (Linear turns a bare `name.rs` into a web link), and link repo files by their GitHub URL, not a relative path.
 
@@ -46,7 +50,7 @@ Linear's markdown differs from GitHub's in ways that bite: don't hard-wrap lines
 
 ## Evolving this process
 
-This document should change as we learn what works. Either party can propose a change at any time — proposals are especially natural after a project wraps up, but don't wait.
+This document should change as we learn what works. Either party can propose a change at any time — the project's retrospective is the natural place (see [Retrospective](process/close-out.md#retrospective-end-of-each-project)), but don't wait.
 
 **Proactively propose changes** when you notice:
 - A step that caused unnecessary friction or delay
