@@ -218,6 +218,20 @@ const DEFAULT_READ_FILE_LIMIT: u32 = 2000;
 
 const MAX_READ_FILE_LIMIT: u32 = 2000;
 
+/// `read_file`'s `character` input: the 1-based character of the `offset`
+/// line to start the read at, defaulting to the line's start. Held to what a
+/// position can be *before* the cast, so a number too big for one falls into
+/// `read_file_response`'s past-the-end refusal instead of wrapping round to
+/// a real position and answering the wrong characters under a position that
+/// looks self-consistent (SME-189 review 1).
+fn character_param(input: &Value) -> u32 {
+    input
+        .get("character")
+        .and_then(Value::as_u64)
+        .map(|c| c.clamp(1, u32::MAX as u64))
+        .unwrap_or(1) as u32
+}
+
 async fn read_file_tool(
     pool: &PgPool,
     conversation_id: i64,
@@ -234,11 +248,7 @@ async fn read_file_tool(
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_READ_FILE_LIMIT as u64)
         .clamp(1, MAX_READ_FILE_LIMIT as u64) as u32;
-    let character = input
-        .get("character")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-        .max(1) as u32;
+    let character = character_param(input);
     // A read that starts mid-line answers one line, so don't ask the pod for
     // the lines after it: walking a long line would otherwise fetch (and a
     // refusal would fetch) a whole page each step (SME-189 review 1).

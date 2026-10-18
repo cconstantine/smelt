@@ -275,6 +275,30 @@ fn test_a_character_past_the_end_of_its_line_is_refused() {
     assert_eq!(response["content"], "");
 }
 
+/// `character` is held to what a position can be before it is cast, so an
+/// absurd number falls into the past-the-end refusal instead of wrapping
+/// round to a real position and answering the wrong characters under a
+/// position that looks self-consistent (SME-189 review 1, finding 2).
+#[test]
+fn test_a_character_too_big_for_a_position_is_refused_not_wrapped() {
+    assert_eq!(character_param(&serde_json::json!({})), 1, "absent means the line's start");
+    assert_eq!(character_param(&serde_json::json!({"character": 0})), 1, "0 means the line's start");
+    assert_eq!(character_param(&serde_json::json!({"character": 2_001})), 2_001);
+    // 2^32 and 2^32 + 2,000: cast as they were, they become 0 and 2,001 — so
+    // one answers the line's start as if nothing were wrong, and the other
+    // answers characters 2001–4000 labelled `"character": 2001`.
+    assert_eq!(character_param(&serde_json::json!({"character": 4_294_967_296_u64})), u32::MAX);
+    assert_eq!(character_param(&serde_json::json!({"character": 4_294_969_297_u64})), u32::MAX);
+
+    let error = read_file_response(
+        contents(vec!["abcd".into()], 1),
+        1,
+        character_param(&serde_json::json!({"character": 4_294_969_297_u64})),
+    )
+    .expect_err("an out-of-range position is refused, whatever its width");
+    assert_eq!(error, "character 4294967295 is past the end of line 1, which has 4 characters");
+}
+
 /// The notes go on after `fit_lines`, so they cost nothing against the
 /// budget — and a page of nothing but cut lines still fits under the cap.
 #[test]
