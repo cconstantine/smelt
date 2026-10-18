@@ -335,10 +335,11 @@ pub(super) fn read_file_response(
     if truncated {
         response["truncated"] = Value::Bool(true);
     }
-    // Only a read that starts mid-line says so: the text it got isn't the
-    // line's start. Nothing is added inside `content`, so text copied out of
-    // a read into `edit_file` stays real file text.
-    if character > 1 {
+    // A read that starts mid-line says so: the text it got isn't the line's
+    // start. Nothing is added inside `content`, so text copied out of a read
+    // into `edit_file` stays real file text. And only of text it did show —
+    // an empty read has no position in it (SME-189 review 1, finding 5).
+    if character > 1 && !kept.is_empty() {
         response["character"] = Value::from(character);
     }
     Ok(response)

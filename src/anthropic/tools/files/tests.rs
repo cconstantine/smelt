@@ -270,9 +270,11 @@ fn test_a_character_past_the_end_of_its_line_is_refused() {
     assert_eq!(error, "character 40001 is past the end of line 1, which has 40000 characters");
 
     // A read that gets no line at all ignores `character`: an offset past
-    // the end of the file is an empty read, as it has always been.
+    // the end of the file is an empty read, as it has always been — and
+    // claims no position in text it didn't show (SME-189 review 1, finding 5).
     let response = read(vec![], 3, 10, 5);
     assert_eq!(response["content"], "");
+    assert!(response.get("character").is_none(), "an empty read has no position in it");
 }
 
 /// `character` is held to what a position can be before it is cast, so an
