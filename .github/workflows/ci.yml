@@ -169,12 +169,23 @@ jobs:
       # step is for) is written; scripts/ci-web-bundle stops it with a
       # process dump and passes (SME-67). The step normally takes about a
       # minute; the timeout catches a hang the script doesn't.
+      # Retry once. A first attempt has hit this step's timeout on a
+      # docs-only commit whose parent was green minutes earlier, with nothing
+      # in the log to explain it (SME-189: `dx build --platform web` at
+      # 10 minutes on a one-line change to docs). The step gets 20 minutes so
+      # each attempt keeps its own 10, and a genuine hang still fails — just
+      # 10 minutes later, and with the first attempt's output above it.
       - name: dx build --platform web
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
-          docker compose run --rm \
-            -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
-            smelt scripts/ci-web-bundle
+          attempt=1
+          until docker compose run --rm \
+              -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
+              smelt scripts/ci-web-bundle; do
+            if [ "$attempt" -ge 2 ]; then exit 1; fi
+            echo "::warning::attempt $attempt of dx build --platform web failed; retrying once (SME-189)"
+            attempt=$((attempt + 1))
+          done
 
       # Also creates a real sandbox pod (see src/browser_tests/) — same
       # reasoning as the step above.
