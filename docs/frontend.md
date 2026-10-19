@@ -151,7 +151,7 @@ The `use_resource` + `use_effect`-into-a-plain-signal pairing (rather than readi
 
 ## Streaming into the UI
 
-Sending is an ordinary request: `send()` adds an optimistic copy of the message (a negative id), calls `send_message`, and shows an error only if the request itself fails. Everything else arrives on the conversation's event stream, the same way in every tab watching the conversation:
+Sending is an ordinary request: `send()` adds an optimistic copy of the message (a negative id), calls `send_message`, and on failure takes that copy back by its temp id, gives the text back to a message box the viewer hasn't touched since that send, and says "Couldn't send the message: …" (`withdraw_unsent` and `draft_after_failed_send`, SME-185 B36). By id, not by text: a saved copy that has already replaced this one stays, and an in-flight copy of the same text is left alone. Everything else arrives on the conversation's event stream, the same way in every tab watching the conversation:
 - `ReplyReset` starts the streaming bubble (`streaming_reply`), `ReplyDelta` adds to it, and a saved assistant message (`MessagesAppended`) or the turn ending (`TurnState { running: false }`) clears it. It's reset on a conversation switch and restored from `get_reply_in_progress` in the reconnect pull.
 - `MessagesAppended` goes through `accept_saved_messages`: each saved user message replaces one optimistic copy of itself (same text), then anything new is added. Without that the sender saw its own message twice.
 - `TurnError` sets the conversation's error, except for a stop (`TURN_STOPPED`), which shows as its saved notice instead (see above).
