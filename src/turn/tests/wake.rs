@@ -364,3 +364,60 @@ fn test_format_duration_names_one_or_two_units() {
     assert_eq!(format_duration(86_400), "1 day");
     assert_eq!(format_duration(90_000), "1 day 1 hour");
 }
+
+/// SME-79 review 1: the paused-conversation path the deferral rides on,
+/// exercised for the idle notice. While the user has stopped the
+/// conversation, the wake is a no-op: the notice is neither saved nor
+/// marked, so nothing is lost or duplicated. The next message's turn
+/// drains it, and its numbers are the ones the command has earned by
+/// then — recomputed at the drain, not frozen at the wake that didn't
+/// happen. ("untouched for 3 hours" reads oddly; it's honest.)
+#[sqlx::test]
+async fn test_a_stopped_conversation_holds_the_idle_notice_for_the_next_message(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation(&pool)
+        .await
+        .expect("create conversation");
+    untouched_running_command(&pool, conversation.id, "cmd-paused", 601).await;
+
+    let counter = start_mock_upstream(&pool, vec![text_reply_body("Noted.")]).await;
+
+    stop_turn_now(conversation.id);
+    assert!(is_paused(conversation.id), "a stop pauses the conversation");
+
+    wake_conversation(&pool, conversation.id)
+        .await
+        .expect("a paused wake does nothing, successfully");
+    assert_eq!(counter.load(Ordering::SeqCst), 0, "the paused conversation is not woken for the notice");
+    let saved = db::list_messages(&pool, conversation.id).await.expect("list messages");
+    assert!(saved.is_empty(), "nothing is saved while the conversation is stopped: {saved:?}");
+    let command = db::get_terminal_command(&pool, "cmd-paused")
+        .await
+        .expect("query")
+        .expect("the command row");
+    assert!(command.idle_notice_at.is_none(), "the notice isn't marked — it's still owed, not lost");
+
+    // The stop itself stretches the clock. When the user comes back, the
+    // notice is written from the numbers of that moment.
+    sqlx::query("UPDATE terminal_commands SET created_at = now() - make_interval(secs => 7501) WHERE command_id = $1")
+        .bind("cmd-paused")
+        .execute(&pool)
+        .await
+        .expect("backdate through the stop");
+    resume_turns(conversation.id);
+    assert!(!is_paused(conversation.id));
+
+    run_turn(&pool, conversation.id, hello()).await.expect("the user's next turn runs");
+
+    let saved = db::list_messages(&pool, conversation.id).await.expect("list messages");
+    let notices: Vec<&String> = saved
+        .iter()
+        .filter(|m| m.content.contains("still running"))
+        .map(|m| &m.content)
+        .collect();
+    assert_eq!(notices.len(), 1, "the drain saved the one notice: {saved:?}");
+    // 7501 s, not the 601 s it was at the wake that did nothing.
+    assert!(notices[0].contains("running for 2 hours 5 minutes"), "recomputed at the drain: {}", notices[0]);
+    assert!(notices[0].contains("hasn't been touched in 2 hours 5 minutes"), "{}", notices[0]);
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "the user's turn is the only model call");
+}
