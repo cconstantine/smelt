@@ -121,6 +121,17 @@ fn test_a_failed_send_gives_its_text_back_only_while_it_is_still_the_last_send()
     assert_eq!(draft_after_failed_send("", "hi", true), None, "the box is empty because a later send cleared it");
 }
 
+/// SME-185 code review 2: whether a failed send is still the last one is
+/// the counter sitting where that send left it — one below the id it drew —
+/// and no test could reach that `- 1` while it was an inline expression.
+/// The send of -1 leaves the counter at -2; anything else means another send.
+#[test]
+fn test_a_send_is_the_last_one_while_the_counter_sits_where_it_left_it() {
+    assert!(is_still_the_last_send(-2, -1), "the counter sits where this send left it");
+    assert!(!is_still_the_last_send(-1, -1), "a counter that never moved is not a send that happened");
+    assert!(!is_still_the_last_send(-3, -1), "another send drew the next id while this one was in flight");
+}
+
 /// Code review 1 (SME-34): a message sent while a question waits is
 /// saved with the question's result in front of the user's text. Its
 /// optimistic copy (just the text) is still replaced.

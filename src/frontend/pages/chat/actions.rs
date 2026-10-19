@@ -174,12 +174,11 @@ pub(super) fn send_action(
                 // would land in the wrong box). After a switch the store was
                 // reset and holds no `temp_id`, so the withdraw is a no-op.
                 withdraw_unsent(&mut messages.write(), temp_id);
-                // `next_temp_id` only moves on a send, so this send is still
-                // the latest exactly when the counter sits where it left it.
-                // Otherwise the viewer sent again while this one was in
-                // flight, its own send is what emptied the box, and restoring
-                // would replace that message with this one (code review 1).
-                let another_send_since = *next_temp_id.peek() != temp_id - 1;
+                // Restoring is for the viewer who hasn't done anything since
+                // the send. If they sent again while this one was in flight,
+                // that send is what emptied the box, and restoring would
+                // replace their last message with this one (code review 1).
+                let another_send_since = !is_still_the_last_send(*next_temp_id.peek(), temp_id);
                 let restored = draft_after_failed_send(&input.peek(), &content, another_send_since);
                 if *selected.peek() == Some(id)
                     && let Some(draft) = restored
@@ -215,6 +214,17 @@ pub(super) fn send_action(
 /// message.
 pub(super) fn withdraw_unsent(messages: &mut Vec<Message>, temp_id: i64) {
     messages.retain(|m| m.id != temp_id);
+}
+
+/// Whether the send that drew `temp_id` is still the latest one, so a
+/// failure of it is still about what the viewer is looking at (SME-185 code
+/// review 2). `send_action` hands out `temp_id` and leaves the counter at
+/// `temp_id - 1`, and nothing else moves that signal, so a counter sitting
+/// where this send left it is exactly "nothing has been sent since". The
+/// counter is the rule, not the box: a send empties the box too, and an
+/// empty box after a second send means the second one is what to restore.
+pub(super) fn is_still_the_last_send(next_temp_id: i64, temp_id: i64) -> bool {
+    next_temp_id == temp_id - 1
 }
 
 /// What the message box should hold after a send of `sent` failed, given
