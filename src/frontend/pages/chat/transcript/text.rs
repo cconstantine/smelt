@@ -82,6 +82,7 @@ pub(in crate::frontend::pages::chat) fn tool_summary(name: &str, input: &serde_j
         "terminal_command_status" => "Checked a command".to_string(),
         "read_terminal_output" => "Read a command's output".to_string(),
         "list_commands" => "Listed recent commands".to_string(),
+        "set_idle_notice" => "Re-timed a command's idle notice".to_string(),
         "read_file" => format!("Read {}", field("path")),
         "write_file" => format!("Wrote {}", field("path")),
         "edit_file" => format!("Edited {}", field("path")),
@@ -349,6 +350,15 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
         }
         if let Some((id, _)) = rest.split_once("'s outcome is unknown") {
             return Some(format!("{} stopped: its terminal became unreachable", command(id)));
+        }
+        // The idle notice (SME-79): smelt woke the model because a running
+        // command went untouched — the sentence, without the tool advice
+        // written for the model.
+        if let Some((head, tail)) = rest.split_once(" is still running and hasn't been touched in ")
+            && let Some((id, _)) = head.split_once(" (\"")
+            && let Some((quiet, _)) = tail.split_once(':')
+        {
+            return Some(format!("{} is still running, untouched for {quiet}", command(id)));
         }
     }
     if let Some(rest) = text.strip_prefix("Sandbox pod ")

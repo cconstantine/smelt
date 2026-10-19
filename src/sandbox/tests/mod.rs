@@ -215,3 +215,4 @@ mod starting;
 mod teardown;
 mod adoption;
 mod image;
+mod idle_notice;

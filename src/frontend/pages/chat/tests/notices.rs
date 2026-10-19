@@ -100,6 +100,22 @@ fn test_system_notices_read_as_short_sentences() {
         notice("Terminal command abc123's outcome is unknown — the terminal became unreachable while it was running.").as_deref(),
         Some("`python3 primes.py` stopped: its terminal became unreachable")
     );
+    // SME-79: the idle notice reads as one sentence naming the command,
+    // without the tool advice written for the model; an unknown id falls
+    // back like the others, and text that only starts like a notice is not
+    // one.
+    assert_eq!(
+        notice(r#"Terminal command abc123 ("python3 primes.py", running for 2 hours 5 minutes) is still running and hasn't been touched in 5 minutes: 42 lines on stdout, 0 on stderr. Nothing stopped it and smelt won't stop it. Read what it has printed with read_terminal_output."#).as_deref(),
+        Some("`python3 primes.py` is still running, untouched for 5 minutes")
+    );
+    assert_eq!(
+        notice(r#"Terminal command zzz ("sleep 300", running for 1 hour) is still running and hasn't been touched in 1 hour: 0 lines on stdout, 0 on stderr. Nothing stopped it and smelt won't stop it."#).as_deref(),
+        Some("A command is still running, untouched for 1 hour")
+    );
+    assert_eq!(
+        notice("Terminal command abc123 is still running, and nobody knows how it goes."),
+        None
+    );
     assert_eq!(
         notice("Sandbox pod 156 stopped unexpectedly (OOMKilled); every terminal running in it is no longer available.").as_deref(),
         Some("The sandbox stopped unexpectedly (OOMKilled); its terminals are gone")
@@ -146,6 +162,7 @@ fn test_tool_summary_says_what_a_call_did() {
         "Ran `python3 primes.py`"
     );
     assert_eq!(tool_summary("read_terminal_output", &serde_json::json!({"command_id": "x"})), "Read a command's output");
+    assert_eq!(tool_summary("set_idle_notice", &serde_json::json!({"command_id": "x", "idle_notice_seconds": 60})), "Re-timed a command's idle notice");
     assert_eq!(tool_summary("write_file", &serde_json::json!({"path": "/home/sandbox/a.py", "content": "x"})), "Wrote /home/sandbox/a.py");
     assert_eq!(tool_summary("read_file", &serde_json::json!({"path": "/etc/hosts"})), "Read /etc/hosts");
     assert_eq!(tool_summary("list_directory", &serde_json::json!({"path": "/tmp"})), "Listed /tmp");
