@@ -20,6 +20,33 @@ fn test_idle_notice_minutes_falls_back_to_five_minutes_with_a_warning() {
     }
 }
 
+/// SME-79 review 1: a whole number of minutes is only a sane interval up
+/// to a day. Past it, `minutes * 60` can overflow — a debug build panics
+/// inside the tool call, a release build wraps, and the wrapped value
+/// lands either on the `CHECK (idle_notice_secs >= 0)` (every
+/// `run_terminal_command` failing with an opaque constraint error) or on a
+/// silently different interval. Anything past the ceiling is treated like
+/// the other bad values: warn and use the default. The values below are
+/// the ones from the review, each of which escaped the documented fallback
+/// in its own way.
+#[test]
+fn test_idle_notice_minutes_past_the_ceiling_falls_back_like_a_bad_value() {
+    let default = 300;
+    // The ceiling itself is still an interval, and the multiply at this
+    // size can't overflow.
+    assert_eq!(idle_notice_secs_from(Some("1440".to_string())), 86_400);
+    for too_long in [
+        "1441", // one minute past the ceiling
+        "40000000000", // seconds past i32: used to mean i32::MAX, silently
+        "153722867280912931", // * 60 overflows i64: a debug-build panic
+        "307445734561825860", // wraps to -16 s in release: a CHECK violation on every command
+        "307445734561825861", // wraps to +44 s in release: notices every 44 seconds, no warning
+        "99999999999999999999999999999999999999", // past i64: doesn't parse at all
+    ] {
+        assert_eq!(idle_notice_secs_from(Some(too_long.to_string())), default, "{too_long} is past a day, not an interval");
+    }
+}
+
 /// Move a command's clock back `secs` from its start — nothing has touched
 /// these, so that's where they count from.
 async fn backdate_created(pool: &sqlx::PgPool, command_id: &str, secs: i64) {
