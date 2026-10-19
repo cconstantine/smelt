@@ -26,7 +26,7 @@ Ideas, plans and finished work live in Linear, not in the repo: team **Smelt Age
 
 **Every ticket belongs to a project,** one per line of work: a feature, a bug bash, a design review, a cleanup. A project's description in Linear says its goal, its scope, when it's done and the tickets it breaks into, each an atomic unit of work (one plan, one branch, one PR); the [Architect](personas/architect.md) writes it. A ticket that fits no line of work goes in the standing **Maintenance** project. A ticket filed during other work goes in the project of the ticket that found it, and in Maintenance only when it's unrelated (see [Rules every persona follows](personas/rules.md)). The user directs the [Project Manager](personas/project-manager.md) to one project at a time.
 
-**Linear holds tracking; documents live in the repo.** Tickets (with their plans, What shipped and, on a project's retrospective ticket, the retrospective), comments (retro notes among them, on the project), statuses, relations and project descriptions are in Linear. Anything that describes the product or the process and outlives one ticket is a repo file: the Current state docs, the Feature checklist and these process docs. A plan too long for the Linear MCP to return goes in `docs/plans/` on the ticket's branch (see [Planner](personas/planner.md)) and is removed before the PR merges.
+**Linear holds tracking; documents live in the repo.** Tickets (with their plans, What shipped and, on a "Next retrospective" ticket, the retrospective), comments (retro notes among them), statuses, relations and project descriptions are in Linear. Anything that describes the product or the process and outlives one ticket is a repo file: the Current state docs, the Feature checklist and these process docs. A plan too long for the Linear MCP to return goes in `docs/plans/` on the ticket's branch (see [Planner](personas/planner.md)) and is removed before the PR merges.
 
 | Status | Meaning |
 |---|---|
@@ -50,7 +50,7 @@ Linear's markdown differs from GitHub's in ways that bite: don't hard-wrap lines
 
 ## Evolving this process
 
-This document should change as we learn what works. Either party can propose a change at any time — the project's retrospective is the natural place (see [Retrospective](process/close-out.md#retrospective-end-of-each-project)), but don't wait.
+This document should change as we learn what works. Either party can propose a change at any time — the retrospective is the natural place (see [Retrospective](process/close-out.md#retrospective)), but don't wait.
 
 **Proactively propose changes** when you notice:
 - A step that caused unnecessary friction or delay
@@ -160,9 +160,9 @@ Moved to [process/done.md](process/done.md#adding-a-new-feature-typical-flow).
 
 Moved to [process/close-out.md](process/close-out.md#keeping-linear-current).
 
-## Retrospective (end of each project)
+## Retrospective
 
-Moved to [process/close-out.md](process/close-out.md#retrospective-end-of-each-project).
+Moved to [process/close-out.md](process/close-out.md#retrospective).
 
 ## Code review (after opening the PR)
 

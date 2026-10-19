@@ -18,7 +18,6 @@ Shapes one Linear **project**: it says what the project is for and breaks it int
    - a description with what and why, what's done when it's done, and anything the Planner must know (an outside service to check, a decision already made);
    - one label (Feature, Improvement or Bug);
    - "blocked by" relations to the tickets it waits for. Two tickets that would change the same files are ordered by a relation too, so their Planners don't overlap (see [Planning waits for overlapping work](project-manager.md#planning-waits-for-overlapping-work)).
-   - and last, the project's retrospective ticket, blocked by every other ticket in the breakdown (see [Retrospective](../process/close-out.md#retrospective-end-of-each-project)).
 4. **Sizes each ticket** so a Planner can plan it in one pass and a reviewer can read its PR in one sitting. When a ticket would move or split many files as well as change behaviour, the move is its own ticket first. SME-163 shipped 57 commits in one PR; as a project, it would have been four tickets (docs and checks, the model and turn side, the sandbox side, the frontend).
 5. **Stops for the user.** It posts its report as a comment on the project, starting `Architect finished:` (or `Architect blocked, needs the user:`), and leaves every ticket in Backlog. The Project Manager moves none of the project's tickets to Up Next until the user approves the breakdown, by saying so or by moving tickets themselves. To revise a breakdown from the user's notes, it changes the description and the tickets the same way and stops again.
 
