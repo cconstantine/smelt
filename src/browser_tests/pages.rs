@@ -182,12 +182,16 @@ pub(super) async fn scenario_empty_conversation(t: &Scenario<'_>) {
 }
 
 /// Waits until the chat panel (not the sidebar, which shows titles) holds
-/// `text`.
+/// `text`. A failed `evaluate` counts as "not yet", the way `wait_for_count`
+/// has it (code review 2): this one polls across a conversation switch, where
+/// a dropped CDP context reads as an error, and one hiccup should time the
+/// scenario out on its own assertion rather than unwind it.
 async fn wait_for_transcript_text(page: &chromiumoxide::Page, text: &str, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let js = format!("(document.querySelector('.chat-panel')?.innerText ?? '').includes({text:?})");
-        if let Ok(true) = page.evaluate(js).await.expect("read the chat panel").into_value::<bool>() {
+        let holds: bool = page.evaluate(js).await.ok().and_then(|v| v.into_value().ok()).unwrap_or(false);
+        if holds {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
