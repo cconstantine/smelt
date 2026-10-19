@@ -138,6 +138,55 @@ async fn test_an_untouched_command_is_noticed_and_keeps_running(pool: PgPool) {
     .await;
 }
 
+/// SME-79 review 1: the feature-checklist row claims `send_signal` touches
+/// a command, and this is the call site it means — against a live pod. A
+/// running command left untouched past its interval is signalled through
+/// the tool; the signal is a touch: `touched_at` says the moment of the
+/// signal, not the command's start.
+#[sqlx::test]
+async fn test_signalling_a_command_through_the_tool_touches_it(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        let terminal = create_terminal(&pool, conversation.id).await.expect("create_terminal");
+        let command_id = "idle-signal";
+        db::create_terminal_command(&pool, conversation.id, terminal, command_id, "sleep 60", 300)
+            .await
+            .expect("create_terminal_command");
+        send_command(&pool, terminal, command_id, "sleep 60").await.expect("send_command");
+        // Seven minutes of pretend time untouched, so the notice is due and
+        // any touch now is visible as a clock restarted from the signal.
+        // The signal itself ends the sleep; what's under test is the
+        // touch, which happens while the row is still `running`.
+        sqlx::query("UPDATE terminal_commands SET created_at = now() - make_interval(secs => 420) WHERE command_id = $1")
+            .bind(command_id)
+            .execute(&pool)
+            .await
+            .expect("backdate created_at");
+
+        let out = crate::anthropic::tools::execute(
+            &pool,
+            conversation.id,
+            "toolu-signal",
+            "send_signal",
+            &serde_json::json!({"command_id": command_id, "signal": "INT"}),
+        )
+        .await
+        .expect("the tool signals the live command");
+        assert_eq!(out, format!("signal INT sent to {command_id}"));
+
+        let command = db::get_terminal_command(&pool, command_id)
+            .await
+            .expect("query")
+            .expect("the command row");
+        let touched = command.touched_at.expect("signalling a command is a touch (SME-79)");
+        let ago = (chrono::Utc::now().naive_utc() - touched).num_seconds();
+        assert!((0..=5).contains(&ago), "the clock counts from the signal, not the start: touched {ago}s ago");
+    })
+    .await;
+}
+
 /// A file written in one conversation's pod is invisible from another's.
 #[sqlx::test]
 async fn test_two_conversations_pods_are_isolated(pool: PgPool) {
