@@ -289,6 +289,33 @@ pub(super) fn MessageView(
     }
 }
 
+/// Whether the transcript shows a new conversation's start screen (SME-41
+/// D12): no messages, no turn running, not missing, nothing of the
+/// conversation's own showing in its place, and its messages loaded with
+/// none in them. Two frames used to flash it on a switch (SME-185 B38): the
+/// messages resource still holding the conversation left until the new load
+/// lands (so the load must be `selected`'s), and the new load landing one
+/// render before the effect that copies it into the transcript (so the load
+/// itself must be empty). It stays down while the conversation has an error
+/// line (code review 1): a failed first send leaves it empty, idle and
+/// loaded, and the screen — with its repo form and the example asks that
+/// overwrite whatever is in the message box — doesn't belong under the line
+/// saying the send didn't go.
+pub(super) fn shows_start_screen(
+    selected: Option<i64>,
+    loaded: Option<&(i64, Result<Vec<Message>, ServerFnError>)>,
+    no_messages: bool,
+    turn_running: bool,
+    missing: bool,
+    error_showing: bool,
+) -> bool {
+    no_messages
+        && !turn_running
+        && !missing
+        && !error_showing
+        && matches!(loaded, Some((id, Ok(list))) if Some(*id) == selected && list.is_empty())
+}
+
 /// The transcript: the conversation's messages, a new conversation's
 /// first steps, the reply as it streams, the working line, errors, trust
 /// cards and the model's waiting question. Scrolling it keeps the panel's stick-to-bottom and
@@ -297,7 +324,7 @@ pub(super) fn MessageView(
 pub(super) fn Transcript(
     selected: Memo<Option<i64>>,
     state: Store<ConversationState>,
-    initial_messages: Resource<Option<Result<Vec<Message>, ServerFnError>>>,
+    initial_messages: Resource<Option<(i64, Result<Vec<Message>, ServerFnError>)>>,
     tz_offset_minutes: Signal<i32>,
     mut input: Signal<String>,
     on_attach: EventHandler<()>,
@@ -411,7 +438,14 @@ pub(super) fn Transcript(
             // A new conversation says what smelt does and offers a
             // few asks to start from, instead of a blank screen
             // (SME-41 D12). Picking one fills the message box.
-            if messages().is_empty() && !turn_running() && !conversation_missing() && matches!(initial_messages(), Some(Some(Ok(_)))) {
+            if shows_start_screen(
+                selected(),
+                initial_messages.read().as_ref().and_then(|loaded| loaded.as_ref()),
+                messages().is_empty(),
+                turn_running(),
+                conversation_missing(),
+                selected().is_some_and(|id| stream_errors.read().lines.contains_key(&id)),
+            ) {
                 div { class: "conversation-empty",
                     h2 { "What should smelt work on?" }
                     p { "It works in a sandbox of its own: it writes and runs code, uses a terminal, reads the web, and shows you each step." }

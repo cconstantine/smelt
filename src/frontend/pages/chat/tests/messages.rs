@@ -79,6 +79,59 @@ fn test_accept_saved_messages_replaces_one_copy_per_saved_message() {
     assert_eq!(existing.len(), 2, "a repeat of an already shown message changes nothing");
 }
 
+/// SME-185 B36: a send that failed takes its copy back, so sending it
+/// again shows the message once, not twice.
+#[test]
+fn test_a_resend_after_a_failed_send_shows_the_message_once() {
+    let mut shown = vec![user_text(1, "earlier"), user_text(-1, "hello once")];
+    withdraw_unsent(&mut shown, -1);
+    shown.push(user_text(-2, "hello once"));
+    accept_saved_messages(&mut shown, vec![user_text(5, "hello once")]);
+    assert_eq!(ids(&shown), vec![1, 5], "one copy of the resent message, the saved one");
+}
+
+/// SME-185 B36: the response was lost after the server saved the message,
+/// and the saved copy has already replaced the optimistic one. The
+/// withdraw goes by id, so it leaves the saved copy alone.
+#[test]
+fn test_withdrawing_a_send_leaves_its_saved_copy() {
+    let mut shown = vec![user_text(-1, "hi"), user_text(-2, "hi")];
+    accept_saved_messages(&mut shown, vec![user_text(5, "hi")]);
+    assert_eq!(ids(&shown), vec![-2, 5]);
+    withdraw_unsent(&mut shown, -1);
+    assert_eq!(ids(&shown), vec![-2, 5], "nothing with id -1 left; the in-flight -2 and the saved 5 stay");
+}
+
+/// SME-185 B36: the sent text goes back into an empty box, never over
+/// something typed since.
+#[test]
+fn test_a_failed_send_gives_its_text_back_only_to_an_empty_box() {
+    assert_eq!(draft_after_failed_send("", "hi", false).as_deref(), Some("hi"));
+    assert_eq!(draft_after_failed_send("  \n", "hi", false).as_deref(), Some("hi"));
+    assert_eq!(draft_after_failed_send("new text", "hi", false), None);
+}
+
+/// SME-185 code review 1: an empty box isn't an untouched one when the
+/// viewer sent again while this send was still in flight — the second send
+/// cleared it. Restoring the first one's text then hides what the viewer
+/// sent last, and leaves a message in the box they may well send by
+/// accident.
+#[test]
+fn test_a_failed_send_gives_its_text_back_only_while_it_is_still_the_last_send() {
+    assert_eq!(draft_after_failed_send("", "hi", true), None, "the box is empty because a later send cleared it");
+}
+
+/// SME-185 code review 2: whether a failed send is still the last one is
+/// the counter sitting where that send left it — one below the id it drew —
+/// and no test could reach that `- 1` while it was an inline expression.
+/// The send of -1 leaves the counter at -2; anything else means another send.
+#[test]
+fn test_a_send_is_the_last_one_while_the_counter_sits_where_it_left_it() {
+    assert!(is_still_the_last_send(-2, -1), "the counter sits where this send left it");
+    assert!(!is_still_the_last_send(-1, -1), "a counter that never moved is not a send that happened");
+    assert!(!is_still_the_last_send(-3, -1), "another send drew the next id while this one was in flight");
+}
+
 /// Code review 1 (SME-34): a message sent while a question waits is
 /// saved with the question's result in front of the user's text. Its
 /// optimistic copy (just the text) is still replaced.
@@ -180,4 +233,54 @@ fn test_browser_input_event_for_key_leaves_ctrl_and_cmd_shortcuts_to_the_viewer(
             "{mods:?}+V should not type a v"
         );
     }
+}
+
+fn loaded(id: i64, ok: bool) -> (i64, Result<Vec<Message>, ServerFnError>) {
+    (id, if ok { Ok(Vec::new()) } else { Err(ServerFnError::new("boom")) })
+}
+
+/// SME-185 B38: switching from 1 to 2, the messages resource still holds
+/// 1's load until 2's lands. That's no reason for 2's start screen.
+#[test]
+fn test_the_start_screen_waits_for_the_open_conversations_own_load() {
+    assert!(
+        !shows_start_screen(Some(2), Some(&loaded(1, true)), true, false, false, false),
+        "the conversation left's load showed the start screen"
+    );
+    assert!(!shows_start_screen(Some(2), None, true, false, false, false), "nothing loaded yet");
+}
+
+/// SME-185 B38: the open conversation's own load has landed, but the
+/// effect that copies it into the transcript runs after this render. A
+/// load with messages in it is no empty conversation, even for that frame.
+#[test]
+fn test_the_start_screen_waits_for_a_loaded_list_to_reach_the_transcript() {
+    let with_a_message = (2, Ok(vec![user_text(5, "hello")]));
+    assert!(
+        !shows_start_screen(Some(2), Some(&with_a_message), true, false, false, false),
+        "a load holding a message showed the start screen before the transcript had it"
+    );
+}
+
+#[test]
+fn test_the_start_screen_shows_only_for_an_empty_idle_loaded_conversation() {
+    assert!(shows_start_screen(Some(2), Some(&loaded(2, true)), true, false, false, false));
+    assert!(!shows_start_screen(Some(2), Some(&loaded(2, true)), false, false, false, false), "it has messages");
+    assert!(!shows_start_screen(Some(2), Some(&loaded(2, true)), true, true, false, false), "a turn is running");
+    assert!(!shows_start_screen(Some(2), Some(&loaded(2, true)), true, false, true, false), "it's missing");
+    assert!(!shows_start_screen(Some(2), Some(&loaded(2, false)), true, false, false, false), "its load failed");
+}
+
+/// SME-185 code review 1: a failed first send leaves exactly the state the
+/// start screen asks for — no messages, no turn, its empty load landed — so
+/// withdrawing the bubble brought "What should smelt work on?" back over the
+/// failure, with its example asks ready to overwrite the text that had just
+/// gone back into the box. While that conversation has an error line, the
+/// screen stays down.
+#[test]
+fn test_the_start_screen_stays_down_while_an_error_shows_for_the_conversation() {
+    assert!(
+        !shows_start_screen(Some(2), Some(&loaded(2, true)), true, false, false, true),
+        "a failed send's error line didn't keep the start screen down"
+    );
 }

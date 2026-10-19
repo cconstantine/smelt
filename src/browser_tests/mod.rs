@@ -250,6 +250,12 @@ async fn test_end_to_end_browser_scenarios() {
     run_scenario(&t, only, r, k, "deleted_in_another_tab", 60, Box::pin(scenario_deleted_in_another_tab(&t))).await;
     run_scenario(&t, only, r, k, "working_line_timer_survives_a_reload", 60, Box::pin(scenario_working_line_timer_survives_a_reload(&t))).await;
     run_scenario(&t, only, r, k, "oauth_callback_error_link", 60, Box::pin(scenario_oauth_callback_error_link(&t))).await;
+    // 60s, not 30: the scenario creates three conversations, hydrates, then
+    // waits on five of its own 10s timeouts across four switches. They return
+    // early when things are fast, but a slow run legitimately spends most of
+    // that passing every step, so 30s can fail a working run and have it read
+    // as an infrastructure failure (code review 2).
+    run_scenario(&t, only, r, k, "switch_shows_no_start_screen", 60, Box::pin(scenario_switch_shows_no_start_screen(&t))).await;
 
     let mut failures: Vec<String> = results
         .iter()

@@ -180,3 +180,84 @@ pub(super) async fn scenario_empty_conversation(t: &Scenario<'_>) {
         "picking an example shouldn't send it"
     );
 }
+
+/// Waits until the chat panel (not the sidebar, which shows titles) holds
+/// `text`. A failed `evaluate` counts as "not yet", the way `wait_for_count`
+/// has it (code review 2): this one polls across a conversation switch, where
+/// a dropped CDP context reads as an error, and one hiccup should time the
+/// scenario out on its own assertion rather than unwind it.
+async fn wait_for_transcript_text(page: &chromiumoxide::Page, text: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let js = format!("(document.querySelector('.chat-panel')?.innerText ?? '').includes({text:?})");
+        let holds: bool = page.evaluate(js).await.ok().and_then(|v| v.into_value().ok()).unwrap_or(false);
+        if holds {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// SME-185 B38: switching between two conversations with messages never
+/// shows the new-conversation start screen, not even for a moment. The
+/// messages resource kept the conversation left's load while the next one
+/// loaded, and that load was fine, so the start screen was inserted until
+/// the new messages landed. A MutationObserver sees every insertion.
+pub(super) async fn scenario_switch_shows_no_start_screen(t: &Scenario<'_>) {
+    let first = t.conversation().await;
+    let second = t.conversation().await;
+    let empty = t.conversation().await;
+    let first_text = unique_id("switch-first");
+    let second_text = unique_id("switch-second");
+    seed_user_message(t.pool, first.id, &first_text).await;
+    seed_user_message(t.pool, second.id, &second_text).await;
+    let page = t.tab(t.url(&format!("conversation/{}", first.id))).await;
+    wait_for_live_client(&page, first.id).await;
+    assert!(wait_for_transcript_text(&page, &first_text, Duration::from_secs(10)).await, "the first conversation's message");
+    page.evaluate(
+        "window.__startScreenSeen = false;
+         new MutationObserver(records => {
+             for (const r of records) for (const n of r.addedNodes) {
+                 if (n.nodeType === 1 && (n.matches('.conversation-empty') || n.querySelector('.conversation-empty'))) {
+                     window.__startScreenSeen = true;
+                 }
+             }
+         }).observe(document.body, { childList: true, subtree: true });",
+    )
+    .await
+    .expect("watch for the start screen");
+    for (to, text) in [(second.id, &second_text), (first.id, &first_text)] {
+        click_conversation(&page, to).await;
+        assert!(wait_for_transcript_text(&page, text, Duration::from_secs(10)).await, "conversation {to}'s message");
+        let seen: bool = page.evaluate("window.__startScreenSeen").await.expect("read the flag").into_value().expect("a bool");
+        assert!(!seen, "switching to conversation {to}, which has a message, showed the start screen");
+    }
+    // The start screen itself still shows where it belongs.
+    click_conversation(&page, empty.id).await;
+    assert!(
+        wait_for_count(&page, ".conversation-empty", 1, Duration::from_secs(10)).await,
+        "an empty conversation should still show its start screen"
+    );
+    // Leaving it, the resource still holds its (empty, fine) load until the
+    // next one lands: the start screen mustn't stay up on the next
+    // conversation meanwhile. Checked on every DOM change once the URL
+    // names the next conversation.
+    page.evaluate(format!(
+        "window.__startScreenStayed = false;
+         new MutationObserver(() => {{
+             if (location.pathname === '/conversation/{}' && document.querySelector('.conversation-empty')) {{
+                 window.__startScreenStayed = true;
+             }}
+         }}).observe(document.body, {{ childList: true, subtree: true, characterData: true }});",
+        second.id
+    ))
+    .await
+    .expect("watch the start screen stay");
+    click_conversation(&page, second.id).await;
+    assert!(wait_for_transcript_text(&page, &second_text, Duration::from_secs(10)).await, "the second conversation's message again");
+    let stayed: bool = page.evaluate("window.__startScreenStayed").await.expect("read the flag").into_value().expect("a bool");
+    assert!(!stayed, "leaving the empty conversation, its start screen stayed up on conversation {}", second.id);
+}

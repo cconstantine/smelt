@@ -166,8 +166,28 @@ pub(super) fn send_action(
         // turn. Keyed by `id`: the viewer may switch away meanwhile.
         spawn(async move {
             stream_errors.write().clear(id);
-            if let Err(e) = send_message(id, content).await {
-                stream_errors.write().set_local_error(id, server_error_message(&e));
+            if let Err(e) = send_message(id, content.clone()).await {
+                // Not sent (SME-185 B36): the copy goes, so a resend shows
+                // the message once, and its text goes back in the box if
+                // the viewer is still here and hasn't typed anything since
+                // (`input` outlives a switch, so on another conversation it
+                // would land in the wrong box). After a switch the store was
+                // reset and holds no `temp_id`, so the withdraw is a no-op.
+                withdraw_unsent(&mut messages.write(), temp_id);
+                // Restoring is for the viewer who hasn't done anything since
+                // the send. If they sent again while this one was in flight,
+                // that send is what emptied the box, and restoring would
+                // replace their last message with this one (code review 1).
+                let another_send_since = !is_still_the_last_send(*next_temp_id.peek(), temp_id);
+                let restored = draft_after_failed_send(&input.peek(), &content, another_send_since);
+                if *selected.peek() == Some(id)
+                    && let Some(draft) = restored
+                {
+                    input.set(draft);
+                }
+                stream_errors
+                    .write()
+                    .set_local_error(id, format!("Couldn't send the message: {}", server_error_message(&e)));
             }
             // The first message titles a conversation, and any send moves
             // it up the list — refresh the sidebar even if the viewer has
@@ -175,4 +195,44 @@ pub(super) fn send_action(
             *conversations_changed.write() += 1;
         });
     }
+}
+
+/// Takes a failed send's optimistic copy back off the transcript (SME-185
+/// B36), by its temporary id. By id, not by text: another copy with the
+/// same text may be a send still in flight, and a saved copy that already
+/// replaced this one (the response was lost after the server saved it)
+/// stays.
+///
+/// Rests on how the temporary ids are handed out (SME-185 code review 1):
+/// `send_action` draws them from `next_temp_id`, a signal created once by
+/// `ChatPanel` and counting down from -1, so they are negative and unique
+/// for the life of the panel — a real id from the database is positive and
+/// can never collide, and two sends never share one. Give `ChatPanel` a
+/// per-conversation `key`, or move `next_temp_id` into `ConversationState`,
+/// and the counter resets while an older failed send is still in flight:
+/// its id could then be handed out again and this would delete the wrong
+/// message.
+pub(super) fn withdraw_unsent(messages: &mut Vec<Message>, temp_id: i64) {
+    messages.retain(|m| m.id != temp_id);
+}
+
+/// Whether the send that drew `temp_id` is still the latest one, so a
+/// failure of it is still about what the viewer is looking at (SME-185 code
+/// review 2). `send_action` hands out `temp_id` and leaves the counter at
+/// `temp_id - 1`, and nothing else moves that signal, so a counter sitting
+/// where this send left it is exactly "nothing has been sent since". The
+/// counter is the rule, not the box: a send empties the box too, and an
+/// empty box after a second send means the second one is what to restore.
+pub(super) fn is_still_the_last_send(next_temp_id: i64, temp_id: i64) -> bool {
+    next_temp_id == temp_id - 1
+}
+
+/// What the message box should hold after a send of `sent` failed, given
+/// what it holds now and whether anything was sent since (SME-185 B36): the
+/// sent text back when the box is empty, and nothing when the viewer has
+/// typed something new since, or sent again since — a second send clears the
+/// box too, and restoring would then swap the older message in for the one
+/// the viewer meant to send (code review 1).
+pub(super) fn draft_after_failed_send(draft: &str, sent: &str, another_send_since: bool) -> Option<String> {
+    (!another_send_since && draft.trim().is_empty()).then(|| sent.to_string())
 }
