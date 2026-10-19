@@ -283,6 +283,42 @@ mod server {
             .and_then(Value::as_i64)
             .ok_or_else(|| format!("missing or non-integer field: {field}"))
     }
+
+    /// An optional idle-notice interval: `None` when absent or an explicit
+    /// null, which asks for the deployment default rather than an error
+    /// (`run_terminal_command`, SME-79). Present but not a usable interval
+    /// is refused naming the field.
+    pub(super) fn optional_notice_secs(input: &Value, field: &str) -> Result<Option<i32>, String> {
+        match input.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => notice_secs(value, field).map(Some),
+        }
+    }
+
+    /// A required idle-notice interval: `set_idle_notice` has no default to
+    /// fall back to, so `0` has to be said out loud (SME-79). Same rules as
+    /// `optional_notice_secs`.
+    pub(super) fn required_notice_secs(input: &Value, field: &str) -> Result<i32, String> {
+        let value = input
+            .get(field)
+            .ok_or_else(|| format!("missing field: {field}"))?;
+        notice_secs(value, field)
+    }
+
+    /// What makes a JSON value a usable idle-notice interval (SME-79): a
+    /// whole number of seconds from zero up — `0` meaning "never", a choice
+    /// rather than a mistake — and small enough for the column that stores
+    /// it. Every refusal names the field, so the model can fix its call.
+    fn notice_secs(value: &Value, field: &str) -> Result<i32, String> {
+        let secs = value
+            .as_i64()
+            .ok_or_else(|| format!("{field} must be an integer, got {value}"))?;
+        if secs < 0 {
+            return Err(format!("{field} must be 0 (for never) or more, got {secs}"));
+        }
+        i32::try_from(secs).map_err(|_| format!("{field} is too long an interval to store: {secs} seconds"))
+    }
+
     #[cfg(test)]
     mod tests;
 }
@@ -294,3 +330,7 @@ pub use server::execute;
 pub use server::native_tool_definitions;
 #[cfg(feature = "server")]
 pub use server::tool_definitions;
+/// The command line as smelt quotes it back to the model — shared with the
+/// idle notice, whose sentence is written over in `turn` (SME-76, SME-79).
+#[cfg(feature = "server")]
+pub(crate) use pods::shown_command;

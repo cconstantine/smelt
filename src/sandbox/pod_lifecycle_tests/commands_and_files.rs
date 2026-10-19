@@ -13,7 +13,7 @@ async fn test_a_finished_command_wakes_the_model(pool: PgPool) {
         let terminal = create_terminal(&pool, conversation.id).await.expect("create_terminal");
         let mut wake_events = events::subscribe(conversation.id);
         let command_id = "wake";
-        db::create_terminal_command(&pool, conversation.id, terminal, command_id, "true")
+        db::create_terminal_command(&pool, conversation.id, terminal, command_id, "true", 300)
             .await
             .expect("create_terminal_command");
         send_command(&pool, terminal, command_id, "true").await.expect("send_command");

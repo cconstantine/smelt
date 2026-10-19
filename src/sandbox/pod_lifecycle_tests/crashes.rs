@@ -66,7 +66,7 @@ async fn test_stopping_a_pod_for_the_user_closes_everything_and_says_so(pool: Pg
         let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
         assert!(received_pods_changed(&mut app_events).await, "creating a pod should tell app-wide listeners");
         let terminal = create_terminal(&pool, conversation.id).await.expect("create_terminal");
-        db::create_terminal_command(&pool, conversation.id, terminal, "long", "sleep 300")
+        db::create_terminal_command(&pool, conversation.id, terminal, "long", "sleep 300", 300)
             .await
             .expect("create_terminal_command");
         send_command(&pool, terminal, "long", "sleep 300").await.expect("send_command");
@@ -117,7 +117,7 @@ async fn test_the_pods_view_shows_a_busy_pods_limits_and_live_usage(pool: PgPool
         let conversation = db::create_conversation(&pool).await.expect("create conversation");
         let pod = create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
         let terminal = create_terminal(&pool, conversation.id).await.expect("create_terminal");
-        db::create_terminal_command(&pool, conversation.id, terminal, "long", "sleep 300")
+        db::create_terminal_command(&pool, conversation.id, terminal, "long", "sleep 300", 300)
             .await
             .expect("create_terminal_command");
         send_command(&pool, terminal, "long", "sleep 300").await.expect("send_command");
@@ -199,7 +199,7 @@ async fn test_watch_pods_closes_records_of_pods_gone_from_the_cluster(pool: PgPo
         let gone_before = db::create_conversation(&pool).await.expect("create conversation");
         let pod_before = create_pod(&pool, gone_before.id, PodLimitOverrides::default()).await.expect("create_pod");
         let terminal = db::create_sandbox_terminal(&pool, pod_before).await.expect("a terminal record");
-        db::create_terminal_command(&pool, gone_before.id, terminal.id, "stale", "sleep 300")
+        db::create_terminal_command(&pool, gone_before.id, terminal.id, "stale", "sleep 300", 300)
             .await
             .expect("a running command record");
         sqlx::query("UPDATE sandbox_pods SET created_at = now() - interval '10 minutes' WHERE id = $1")

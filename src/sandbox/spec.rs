@@ -318,6 +318,56 @@ pub(super) fn default_docker_memory_limit() -> String {
         .unwrap_or_else(|| "8Gi".to_string())
 }
 
+/// `SANDBOX_IDLE_NOTICE_MINUTES`, default `5` — same pattern as
+/// `default_memory_limit`, but a whole number of minutes. How long a running
+/// terminal command may go untouched before smelt wakes its conversation to
+/// say it's still running (SME-79). Never a kill: nothing stops on this
+/// clock, and this is only the default — a command can ask for its own
+/// interval (`idle_notice_seconds`), or for none at all.
+///
+/// It's read when a command starts and stored on its row, so changing it
+/// applies to commands started after; `0` turns the check off for those, and
+/// a running command keeps whatever it started with.
+pub(crate) fn idle_notice_default_secs() -> i32 {
+    idle_notice_secs_from(std::env::var("SANDBOX_IDLE_NOTICE_MINUTES").ok())
+}
+
+/// The seconds for a `SANDBOX_IDLE_NOTICE_MINUTES` of `setting`. Pulled
+/// out of `idle_notice_default_secs` so the parsing is testable without
+/// the environment. An empty setting is no setting; anything else that
+/// isn't a whole number of minutes gets a warning — the operator set it,
+/// and silently falling back would hide that it isn't being used.
+pub(super) fn idle_notice_secs_from(setting: Option<String>) -> i32 {
+    let Some(setting) = setting.filter(|s| !s.is_empty()) else {
+        return DEFAULT_IDLE_NOTICE_SECS;
+    };
+    match setting.parse::<i64>() {
+        // 0 is a choice, not a mistake: it turns the whole check off.
+        Ok(0) => 0,
+        Ok(minutes) if minutes > 0 => (minutes * 60).try_into().unwrap_or(i32::MAX),
+        Ok(minutes) => {
+            tracing::warn!(
+                minutes,
+                default_minutes = DEFAULT_IDLE_NOTICE_SECS / 60,
+                "SANDBOX_IDLE_NOTICE_MINUTES is negative; using the default instead"
+            );
+            DEFAULT_IDLE_NOTICE_SECS
+        }
+        Err(_) => {
+            tracing::warn!(
+                minutes = %setting,
+                default_minutes = DEFAULT_IDLE_NOTICE_SECS / 60,
+                "SANDBOX_IDLE_NOTICE_MINUTES is not a number of minutes; using the default instead"
+            );
+            DEFAULT_IDLE_NOTICE_SECS
+        }
+    }
+}
+
+/// The default idle-notice interval, 5 minutes — see
+/// `idle_notice_default_secs`.
+const DEFAULT_IDLE_NOTICE_SECS: i32 = 300;
+
 /// Shared by the sandbox and Docker sidecar containers: projects that
 /// bind-mount host paths go here, and terminals start here.
 pub const WORKSPACE_DIR: &str = "/workspace";

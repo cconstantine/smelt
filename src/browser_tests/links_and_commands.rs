@@ -293,7 +293,7 @@ pub(super) async fn scenario_terminal_command_indicator(t: &Scenario<'_>) {
 
     // A lost command, seen after a reload.
     let lost = unique_id("cmd-lost");
-    db::create_terminal_command(pool, conversation.id, terminal, &lost, "make").await.expect("a command row");
+    db::create_terminal_command(pool, conversation.id, terminal, &lost, "make", 300).await.expect("a command row");
     db::mark_terminal_command_lost(pool, &lost).await.expect("mark it lost");
     open().await;
     let pill = wait_for_pill(&page, "lost", "task-terminal-command-lost", Duration::from_secs(15)).await;

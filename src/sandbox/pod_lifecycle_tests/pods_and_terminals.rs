@@ -117,10 +117,10 @@ async fn test_terminals_in_one_pod_run_independently_and_are_guarded(pool: PgPoo
         assert_eq!(first_stdout_line(&pool, &pwd_2).await, "/var");
 
         // A long command in one doesn't hold up the other.
-        db::create_terminal_command(&pool, id, terminal_1, "long-1", "sleep 5").await.expect("create_terminal_command");
+        db::create_terminal_command(&pool, id, terminal_1, "long-1", "sleep 5", 300).await.expect("create_terminal_command");
         send_command(&pool, terminal_1, "long-1", "sleep 5").await.expect("send_command");
         tokio::time::sleep(Duration::from_millis(300)).await; // let it start
-        db::create_terminal_command(&pool, id, terminal_2, "quick-2", "echo still_alive")
+        db::create_terminal_command(&pool, id, terminal_2, "quick-2", "echo still_alive", 300)
             .await
             .expect("create_terminal_command");
         send_command(&pool, terminal_2, "quick-2", "echo still_alive").await.expect("send_command");
@@ -133,7 +133,7 @@ async fn test_terminals_in_one_pod_run_independently_and_are_guarded(pool: PgPoo
         poll_until_finished(&pool, "long-1").await;
 
         // terminate_terminal is refused while a command runs in it.
-        db::create_terminal_command(&pool, id, terminal_2, "blocking-2", "sleep 30").await.expect("create_terminal_command");
+        db::create_terminal_command(&pool, id, terminal_2, "blocking-2", "sleep 30", 300).await.expect("create_terminal_command");
         send_command(&pool, terminal_2, "blocking-2", "sleep 30").await.expect("send_command");
         tokio::time::sleep(Duration::from_millis(300)).await;
         let blocked_terminate = terminate_terminal(&pool, terminal_2).await;

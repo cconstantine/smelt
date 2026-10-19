@@ -143,12 +143,18 @@ pub enum RunCommandError {
 /// panel as started, and sends it to the pod's agent. A send that fails
 /// marks the row lost, and says so to the panel, so nothing waits on a
 /// command that never ran.
+///
+/// `idle_notice_secs` is this command's idle-notice interval, decided by the
+/// caller (the tool, from its parameter or the deployment default): the row
+/// carries it from the start, and `0` means this command never gets one
+/// (SME-79).
 pub async fn run_command(
     pool: &PgPool,
     conversation_id: i64,
     terminal_id: i64,
     command_id: &str,
     command: &str,
+    idle_notice_secs: i32,
 ) -> Result<(), RunCommandError> {
     if let Some(running) = db::terminal_command_is_running(pool, terminal_id)
         .await
@@ -157,7 +163,7 @@ pub async fn run_command(
         return Err(RunCommandError::Busy(running));
     }
 
-    db::create_terminal_command(pool, conversation_id, terminal_id, command_id, command)
+    db::create_terminal_command(pool, conversation_id, terminal_id, command_id, command, idle_notice_secs)
         .await
         .map_err(|e| RunCommandError::Failed(e.to_string()))?;
 
