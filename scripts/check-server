@@ -102,13 +102,13 @@ scratch_db_file() { echo "$worktree/.check-server.scratch-db"; }
 # to the same cluster (SME-129). Empty means the inherited environment.
 kubeconfig_file() { echo "$worktree/.check-server.kubeconfig"; }
 
-# The dev DATABASE_URL: the environment's, else the check worktree's .env.
+# The dev DATABASE_URL: the environment's, else the check worktree's .env read
+# as dotenvy reads it (SME-186 B40 — the server itself gets its URL through
+# dotenvy, so the two have to read the line the same way).
 dev_database_url() {
     local url=${DATABASE_URL:-}
     if [ -z "$url" ] && [ -f "$worktree/.env" ]; then
-        url=$(sed -n 's/^DATABASE_URL=//p' "$worktree/.env" | tail -n 1)
-        url=${url%\"}
-        url=${url#\"}
+        url=$(env_file_value DATABASE_URL)
     fi
     echo "$url"
 }
@@ -183,26 +183,23 @@ drop_scratch_db() {
     echo "dropped the scratch database"
 }
 
-# NAME's value in the worktree's .env, as dotenvy reads it: the first line
-# setting it (dotenvy never overrides a value it has set), with or without
-# `export`, spaces around `=` allowed. A quoted value is what's inside its
-# quotes; an unquoted one ends at a ` #` comment (SME-117 review 1: a
-# `RUST_LOG=debug # note` passed on whole silenced smelt's log entirely).
+# NAME's value in the worktree's .env, exactly as dotenvy reads it:
+# scripts/lib/dotenv-value is a port of that crate's parser, so the first line
+# setting a name wins, `export` and whitespace around `=` are allowed, quotes,
+# escapes and `$NAME` substitution are honoured, a ` #` comment ends an
+# unquoted value, and a line that fails to parse stops the load there. The sed
+# this replaces did some of it and missed the rest (SME-117 review 1: a
+# `RUST_LOG=debug # note` passed on whole silenced smelt's log entirely;
+# SME-117 review 2: `RUST_LOG= # note` is empty to dotenvy; SME-186 B40: it
+# kept the *last* line, and a `$` in a dev .env's DATABASE_URL made this script
+# and the server disagree on the URL). A missing file or name prints nothing.
+# A missing python3 fails rather than reading nothing quietly.
 env_file_value() {
-    local value
-    value=$(sed -En "s/^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=[[:space:]]*//p" "$worktree/.env" 2>/dev/null | head -n 1)
-    case "$value" in
-        \"*) value=${value#\"}; value=${value%%\"*} ;;
-        \'*) value=${value#\'}; value=${value%%\'*} ;;
-        # Nothing before a comment: empty, as dotenvy reads it (SME-117
-        # review 2: `RUST_LOG= # note` silenced smelt's log).
-        \#*) value="" ;;
-        *)
-            value=${value%%[[:space:]]#*}
-            value=${value%"${value##*[![:space:]]}"}
-            ;;
-    esac
-    echo "$value"
+    command -v python3 >/dev/null 2>&1 || {
+        echo "reading $worktree/.env needs python3 (scripts/lib/dotenv-value)" >&2
+        return 1
+    }
+    python3 -I "$repo/scripts/lib/dotenv-value" "$worktree/.env" "$1"
 }
 
 # The value of the last `-- NAME=` override given to start (in start's

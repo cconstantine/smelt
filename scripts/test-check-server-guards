@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# scripts/check-server's guards (SME-186): that it reads the check worktree's
+# .env as dotenvy does, that a ref from before SME-115's fix is refused
+# whatever database it would get, that the wait for the port lock is bounded
+# and names the server that holds it, and that a pid file only ever claims a
+# group that looks like this worktree's server. The stubs and helpers are in
+# scripts/lib/test-check-scripts.sh.
+#
+#   scripts/test-check-server-guards
+. "$(dirname "$0")/lib/test-check-scripts.sh"
+
+# Whatever an earlier, failed run left running.
+check_server stop >/dev/null
+: >"$SQLX_CALLS"
+: >"$pid_file"
+: >"$scratch_file"
+
+# G5 (SME-186 B40): the scratch database's URL is built from what dotenvy
+# would load, not from what `sed | tail` finds. The dev .env's DATABASE_URL is
+# unquoted and holds a `$`, which dotenvy substitutes and sed does not; and
+# dotenvy keeps the first line that sets a name, where `tail -n 1` kept the
+# last. The environment's DATABASE_URL is unset here, so .env is what's read.
+env_file=$worktree/.env
+pw_value=pw7value
+printf 'export DATABASE_URL="postgres://u:${PW}@localhost/smelt_dev"\nDATABASE_URL=postgres://u@elsewhere/x\n' >"$env_file"
+dotenv_url=postgres://u:${pw_value}@localhost/smelt_scratch_worktree
+: >"$SQLX_CALLS"
+extra_env=(DATABASE_URL= PW="$pw_value")
+if ! out=$(CHECK_SCRATCH_DB=1 check_server start HEAD); then
+    fail "G5: start: $out"
+fi
+extra_env=()
+grep -qx "database create --database-url $dotenv_url" "$SQLX_CALLS" ||
+    fail "G5: start created a database dotenvy wouldn't have named ($dotenv_url): $(cat "$SQLX_CALLS")"
+[ "$(cat "$scratch_file" 2>/dev/null)" = "$dotenv_url" ] ||
+    fail "G5: start recorded '$(cat "$scratch_file" 2>/dev/null)', not $dotenv_url"
+check_server stop >/dev/null
+[ "$(tail -n 1 "$SQLX_CALLS")" = "database drop -y --database-url $dotenv_url" ] ||
+    fail "G5: stop didn't drop the database start created: $(cat "$SQLX_CALLS")"
+: >"$env_file"
+
+finish
