@@ -8,7 +8,7 @@ What shipped, the docs and the code review: the gate on merging a ticket's PR. T
 After each project completes:
 - Replace the ticket's `## Plan` section with `## What shipped` (including anything changed from the plan, and what's not done)
 - Update the **Current state** docs if features or architecture changed
-- Add or update the ticket's row in the **Feature checklist** (`docs/feature-checklist/`, the file for its area): what a user can do, and how to check it in the browser
+- Add or update the ticket's row in the **Feature checklist** (`docs/feature-checklist/`, the file for its area): what a user can do, and how to check it in the browser. Verify the row against the tree before the PR: every test it names exists, and every documented behaviour is what the code executes — not what it intends (SME-79's row claimed a `send_signal`-touching test that didn't exist, and its env-var docs promised warn-and-default for values that overflow; SME-254 finding 6).
 - File anything left undone that's worth doing as its own Backlog ticket in the same project, linked as related (see where tickets go in [Rules every persona follows](../personas/rules.md))
 - When the project deleted a feature, search for its name in prose too (docs, comments, CSS, prompts, test names), not only its identifiers: the compiler finds the code, nothing finds the sentences. On SME-54, removing `run_async`'s task suite left wording about it in docs and comments that only the code review found.
 - Put the ticket id in the PR's title or body
