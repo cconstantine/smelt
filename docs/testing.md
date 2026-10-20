@@ -107,6 +107,14 @@ A name filter matches every test whose path contains it, and several filters are
 
 **A module with both pure and real-cluster tests keeps the real-cluster ones in a `cluster` submodule** (as `sweep::tests::cluster::…` does), so a filter on the pure tests' path can't reach them. On SME-134 the filter `sweep::tests::test_the_sweep_`, meant for the pure tests, also ran four real-cluster sweep tests outside the lock.
 
+### Known infrastructure failures
+
+A gate red **only** on one of these is not the branch's: re-run it before investigating it as code (each one costs a full gate and an investigation to rediscover). File what a re-run confirms per the rules — a known failure is still filed the first time — and when a red matches an entry but reads differently, add the new symptom to the entry rather than opening a fresh one-off (SME-254, finding 3; `docs/personas/developer.md` step 4 names the five acts).
+
+- **The shared-cluster start/stop race family — [SME-255](https://linear.app/smelt-agent/issue/SME-255) + [SME-256](https://linear.app/smelt-agent/issue/SME-256), one family, kept as one entry.** Two symptoms so far: `clear_ids_base()` (`2e9 + nanos % 1e9` — the modulo drops the second) can hand two parallel `#[sqlx::test]` workers the same conversation id, and since pod names derive from it, their pods collide by name in the shared cluster; and a Stop that deletes the cluster object before it closes the record lets a start in that window report Kubernetes' 404 instead of "the sandbox was stopped while it was starting". The gate log names the pod once, so the two cannot be told apart after the fact — check a red gate against the whole family, and look for the third symptom before filing a fourth ticket.
+- **The k3s DNS failure in the cluster LSP tests** (met in [SME-185](https://linear.app/smelt-agent/issue/SME-185)'s gating): name resolution inside the test cluster fails mid-run; re-run before reading it as the change.
+- **`check-server` stop failing transiently**: retry it until it succeeds, with a pause and a time limit, exactly as [personas/rules.md](personas/rules.md)'s hands-on block shows; one still failing after the limit goes in the report, never left unsaid, and the scratch database is kept.
+
 **Gate from a detached gate worktree** when the lock queue is long, so writing the next commit goes on while a gate waits, and nothing edits the tree being gated (see [process/rules-commits.md](process/rules-commits.md)). A worktree has its own `target/`, so the gate's build never shares artefacts with the branch's:
 
 ```bash
