@@ -135,6 +135,33 @@ fn test_system_notices_read_as_short_sentences() {
     assert_eq!(notice("Please run the tests"), None);
 }
 
+/// SME-79 review 2: the quoted command line sits *before* the notice's
+/// marker, so a command whose own text contains that phrase moves the split
+/// into the middle of the quote — `grep`ping over smelt's own notices is the
+/// plain way to do it. The real marker is the *last* one: everything after it
+/// is smelt's fixed text.
+#[test]
+fn test_an_idle_notice_splits_at_its_own_marker() {
+    // The phrase smelt writes between the quoted command and its numbers,
+    // leading and trailing spaces and all — the marker the sentence is cut at.
+    let marker = " is still running and hasn't been touched in ";
+    let line = format!(r#"grep -c "{marker}" agent.log"#);
+    let notice = format!(
+        r#"Terminal command abc123 ("{line}", running for 1 minute){marker}5 minutes: 0 lines on stdout, 0 on stderr. Nothing stopped it and smelt won't stop it."#
+    );
+    let commands = HashMap::from([("abc123".to_string(), line.clone())]);
+    assert_eq!(
+        system_notice(&notice, &commands).as_deref(),
+        Some(format!("`{line}` is still running, untouched for 5 minutes")).as_deref(),
+        "cut at the notice's own marker, not at the one inside the quoted command"
+    );
+    // An unknown command id still falls back like every other notice's.
+    assert_eq!(
+        system_notice(&notice, &HashMap::new()).as_deref(),
+        Some("A command is still running, untouched for 5 minutes")
+    );
+}
+
 #[test]
 fn test_terminal_commands_are_found_by_id() {
     let messages = vec![

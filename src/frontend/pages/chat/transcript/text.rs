@@ -343,18 +343,23 @@ pub(in crate::frontend::pages::chat) fn system_notice(text: &str, commands: &Has
         Some(line) => format!("`{line}`"),
         None => "A command".to_string(),
     };
+    // Each split is at the *last* occurrence of smelt's own marker: a
+    // command's line can hold that very phrase (a `grep` over smelt's own
+    // notices does), and the idle notice quotes it before the marker — cut at
+    // the first occurrence and the sentence tears open inside the quote.
+    // Everything past the notice's own marker is smelt's fixed text.
     if let Some(rest) = text.strip_prefix("Terminal command ") {
-        if let Some((id, tail)) = rest.split_once(" finished: exit code ") {
+        if let Some((id, tail)) = rest.rsplit_once(" finished: exit code ") {
             let code = tail.trim_end_matches('.');
             return Some(format!("{} finished (exit code {code})", command(id)));
         }
-        if let Some((id, _)) = rest.split_once("'s outcome is unknown") {
+        if let Some((id, _)) = rest.rsplit_once("'s outcome is unknown") {
             return Some(format!("{} stopped: its terminal became unreachable", command(id)));
         }
         // The idle notice (SME-79): smelt woke the model because a running
         // command went untouched — the sentence, without the tool advice
         // written for the model.
-        if let Some((head, tail)) = rest.split_once(" is still running and hasn't been touched in ")
+        if let Some((head, tail)) = rest.rsplit_once(" is still running and hasn't been touched in ")
             && let Some((id, _)) = head.split_once(" (\"")
             && let Some((quiet, _)) = tail.split_once(':')
         {
