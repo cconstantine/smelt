@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# The .env reader scripts/lib/dotenv-value, checked against dotenvy 0.15.7's own
+# answers (SME-186, B40). check-server and browser-tier read .env through that
+# reader; before it they used `sed | tail`, which disagreed with the dotenvy the
+# server itself runs over its .env (src/main.rs) on real files: it took the
+# *last* line for a key where dotenvy takes the first, kept quotes, and did no
+# `$NAME` substitution — so a .env whose DATABASE_URL is
+# `postgres://u:${PW}@localhost/…` gave the scripts one URL and the server
+# another.
+#
+# The expected values below are the crate's, not a reading of its source. They
+# were generated once by a throwaway Rust program that, for each fixture here,
+# called dotenvy::from_path — which is load(), the call smelt makes — in a clean
+# process holding only that case's own environment, and printed the key it was
+# asked for. The reader was then run over the same fixtures the same way and the
+# two tables diffed: 0 differences over these 44 cases. If dotenvy ever changes
+# how it parses, regenerating the table that way is what shows it; the cases
+# below are where a line-based reader gets it wrong.
+#
+# Each row writes its fixture with printf, from the single-quoted format: a `\`
+# in the content is `\\`, a `%` is `%%`, a newline `\n`, a carriage return `\r`,
+# a tab `\011`, the BOM its three octal bytes, and a `'` closes the quote and
+# comes back as '"'"'. Every row was checked to write the same bytes as the
+# fixture file the crate read.
+#
+#   scripts/test-dotenv-value
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+failures=0
+fail() {
+    echo "FAIL: $*" >&2
+    failures=$((failures + 1))
+}
+
+# Fixtures and outputs live under target/<script name>/ and are kept,
+# overwritten on the next run (SME-107: this runs unattended).
+dir=$PWD/target/$(basename "$0")
+mkdir -p "$dir/fixtures"
+
+# The reader is python3, run isolated (-I: no user site-packages, no
+# PYTHONPATH), so nothing in the caller's environment can change what it parses.
+python3=$(command -v python3) || { echo "test-dotenv-value needs python3" >&2; exit 1; }
+
+# check NAME KEY EXPECTED STOPS FIXTURE [VAR=VALUE ...]
+#
+# Runs the reader over the fixture in an environment of only the case's own
+# VAR=VALUE pairs, so a $NAME inside the file sees exactly what dotenvy saw.
+# EXPECTED is what a caller sees from `$(dotenv-value FILE KEY)` — the reader
+# ends a value with one newline and prints nothing at all when the file gives
+# the key no value, and those two are the same thing to a caller.
+#
+# STOPS is 'stops' where dotenvy's load ends early, at a line it can't parse.
+# The reader stops looking as soon as it has the key it was asked for, so a
+# stop *after* the answer is silent and the value is still the crate's — that's
+# why two rows that stop expect a value and say nothing on stderr. A stop the
+# reader reaches (the row expects no value) must name the line, so a caller
+# that gets nothing back can tell "no such key" from "this file stopped
+# parsing here".
+check() {
+    local name=$1 key=$2 want=$3 stops=$4 fmt=$5
+    shift 5
+    local case_dir=$dir/fixtures/$name rc got
+    printf -- "$fmt" >"$case_dir.env" || { fail "$name: could not write the fixture"; return; }
+    env -i "$@" "$python3" -I scripts/lib/dotenv-value "$case_dir.env" "$key" \
+        >"$case_dir.out" 2>"$case_dir.err"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        fail "$name: exit $rc, want 0: a reader failure never aborts a caller"
+    fi
+    # One newline is the reader's separator, not part of the value: strip
+    # exactly one, which is what command substitution hands a caller.
+    got=$(cat "$case_dir.out"; printf x)
+    got=${got%x}
+    got=${got%$'\n'}
+    if [ "$got" != "$want" ]; then
+        fail "$name ($key): got [$got], want [$want]"
+    fi
+    if [ -n "$stops" ] && [ -z "$want" ]; then
+        if ! grep -qE 'line [0-9]+' "$case_dir.err"; then
+            fail "$name: a load that stops before the key names the line on stderr, got: $(cat "$case_dir.err")"
+        fi
+    elif [ -z "$stops" ] && [ -s "$case_dir.err" ]; then
+        fail "$name: nothing on stderr unless a line fails to parse, got: $(cat "$case_dir.err")"
+    fi
+}
+
+# The table: NAME KEY EXPECTED STOPS FIXTURE [VAR=VALUE ...]. Generated from
+# dotenvy 0.15.7's answers, as the header says.
+check first-line-wins              'KEY'          '1'                          ''     'KEY=1\nKEY=2\n'
+check export-prefix                'KEY'          '1'                          ''     'export KEY=1\n'
+check spaces-around-equals         'KEY'          '1'                          ''     'KEY = 1 \n'
+check single-quotes                'KEY'          'x y'                        ''     'KEY='"'"'x y'"'"'\n'
+check double-quotes                'KEY'          'x y'                        ''     'KEY="x y"\n'
+check joined-quotes                'KEY'          'ab cde f'                   ''     'KEY=a'"'"'b c'"'"'d"e f"\n'
+check comment-after-value          'KEY'          'v'                          ''     'KEY=v # c\n'
+check empty-with-comment           'KEY'          ''                           ''     'KEY= # c\n'
+check hash-inside-quotes           'KEY'          'a # b'                      ''     'KEY="a # b"\n'
+check hash-no-space                'KEY'          'v#c'                        ''     'KEY=v#c\n'
+check dollar-brace-env             'KEY'          'fromenv'                    ''     'KEY=${X}\n' X=fromenv
+check dollar-bare-env              'KEY'          'fromenv'                    ''     'KEY=$X\n' X=fromenv
+check env-beats-earlier-line       'KEY'          'fromenv'                    ''     'X=fromfile\nKEY=${X}\n' X=fromenv
+check earlier-line-when-unset      'KEY'          'fromfile'                   ''     'X=fromfile\nKEY=${X}\n'
+check escaped-dollar               'KEY'          '$X'                         ''     'KEY=\\$X\n' X=fromenv
+check single-quoted-dollar         'KEY'          '$X'                         ''     'KEY='"'"'$X'"'"'\n' X=fromenv
+check multiline-double-quoted      'KEY'          $'line1\nline2'              ''     'KEY="line1\nline2"\n'
+check bom                          'KEY'          '1'                          ''     '\357\273\277KEY=1\n'
+check crlf                         'KEY'          '1'                          ''     'KEY=1\r\n'
+check bad-line-before-key          'KEY'          ''                           'stops' '!! not a line\nKEY=1\n'
+check bad-line-after-key           'KEY'          '1'                          'stops' 'KEY=1\n!! not a line\n'
+check newline-escape               'KEY'          $'l1\nl2'                    ''     'KEY="l1\\nl2"\n'
+check escaped-space                'KEY'          'my cool'                    ''     'KEY=my\\ cool\n'
+check bad-escape                   'KEY'          ''                           'stops' 'KEY=h\\8u\n'
+check unterminated-double          'KEY'          ''                           'stops' 'KEY="why\nOTHER=1\n'
+check unterminated-double-other    'OTHER'        ''                           'stops' 'KEY="why\nOTHER=1\n'
+check strong-quotes-concat         'KEY'          'sweet $\fgs'"'"'fds'        ''     'KEY='"'"'sweet $\\fgs'"'"'\\'"'"''"'"'fds'"'"'\n'
+check dotted-key                   'KEY.Value'    'V'                          ''     'KEY.Value=V\n'
+check export-as-key                'export'       'x'                          ''     'export=x\n'
+check undefined-substitution       'KEY'          '><><'                       ''     'KEY=>${NOPE}<>$NOPE2<\n'
+check database-url-b40             'DATABASE_URL' 'postgres://u:s3cret@localhost/smelt_dev' ''     'export DATABASE_URL="postgres://u:${PW}@localhost/smelt_dev"\nDATABASE_URL=postgres://u@elsewhere/x\n' PW=s3cret
+check comments-only                'KEY'          ''                           ''     '# nothing\n# KEY=1\n'
+check trailing-tab                 'KEY'          ''                           ''     'KEY=\011\n'
+check quoted-then-junk             'KEY'          ''                           'stops' 'KEY="v" junk\n'
+check no-equals                    'KEY'          ''                           'stops' 'KEY\n'
+check brace-eats-following-name    'KEY'          'atail'                      ''     'X=a\nKEY=${X}tail\n'
+check bare-name-eats-underscore    'KEY'          'a_1'                        ''     'X1=a\nX_1=b\nKEY=$X1_1\n'
+check dollar-then-space            'KEY'          'a b'                        ''     'KEY=a$ b\n'
+check empty-value                  'KEY'          ''                           ''     'KEY=\n'
+check key-starts-with-underscore   '_KEY'         '1'                          ''     '_KEY=1\n'
+check leading-space-then-key       'KEY'          '1'                          ''     '   KEY=1\n'
+check comment-line-inside-multiline 'KEY'          $'a\n# not a comment\nb'     ''     'KEY="a\n# not a comment\nb"\n'
+check trailing-backslash-joins     'KEY'          'a'                          'stops' 'KEY=a\\\nb\n'
+check missing-key                  'KEY'          ''                           ''     'OTHER=1\n'
+
+# Two things the table can't say, because they aren't about a file's contents.
+# A file that isn't there at all is the caller's "no .env" branch: nothing on
+# either stream, and exit 0, so a script with no .env behaves as it did before
+# there was a reader to fail.
+env -i "$python3" -I scripts/lib/dotenv-value "$dir/fixtures/no-such-file.env" KEY \
+    >"$dir/fixtures/missing-file.out" 2>"$dir/fixtures/missing-file.err"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    fail "a missing file: exit $rc, want 0"
+fi
+if [ -s "$dir/fixtures/missing-file.out" ] || [ -s "$dir/fixtures/missing-file.err" ]; then
+    fail "a missing file: prints nothing at all, got out=[$(cat "$dir/fixtures/missing-file.out")] err=[$(cat "$dir/fixtures/missing-file.err")]"
+fi
+
+# And a call that isn't a call: wrong arguments fail loudly, since that's a
+# bug in a caller rather than something the file can be blamed for.
+env -i "$python3" -I scripts/lib/dotenv-value >"$dir/fixtures/usage.out" 2>"$dir/fixtures/usage.err"
+rc=$?
+if [ "$rc" -ne 2 ]; then
+    fail "called with no arguments: exit $rc, want 2"
+fi
+
+if [ "$failures" -eq 0 ]; then
+    echo "dotenv-value: all checks passed"
+fi
+exit "$failures"
