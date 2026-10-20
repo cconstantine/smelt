@@ -15,6 +15,52 @@ check_server stop >/dev/null
 : >"$pid_file"
 : >"$scratch_file"
 
+# G1 (SME-186 B39): a ref from before 6c9f03c, where SME-115's fix is
+# complete, is refused whatever database it would be served on. The refusal
+# was tied to CHECK_SCRATCH_DB=1, so any of these could be started on another
+# database — `-- DATABASE_URL=…`, or one inherited from the environment — and
+# that server's startup sweep deletes every conversation's sandbox claim that
+# isn't in the database it serves: the harm the refusal exists to stop. Such a
+# ref can't usefully serve on the dev database either, which is why refusing
+# it outright costs nothing: smelt runs sqlx::migrate!() before the sweep, and
+# that fails with VersionMissing on a database holding migrations the ref
+# doesn't, as the dev one has for months.
+port_lock=$SMELT_LOCK_DIR/smelt-check-server-$port.lock
+refused_pre_fix_ref() { # name ref [start args...]
+    local name=$1 ref=$2 out rc want_head
+    shift 2
+    # Whatever the previous case left running, and the run before that. A
+    # red run's start succeeds, and its server holds the port lock: without
+    # this, the next case waits on it forever — B48, which is commit 5's.
+    check_server stop >/dev/null
+    want_head=$(git -C "$worktree" rev-parse HEAD 2>/dev/null || echo "no checkout")
+    : >"$SQLX_CALLS"
+    : >"$pid_file"
+    : >"$scratch_file"
+    out=$(check_server start "$ref" "$@")
+    rc=$?
+    [ "$rc" = 1 ] || fail "$name: start exited $rc, not 1: $out"
+    grep -q "SME-115" <<<"$out" || fail "$name: the refusal doesn't name SME-115: $out"
+    grep -qF "$ref" <<<"$out" || fail "$name: the refusal doesn't name the ref: $out"
+    [ -s "$SQLX_CALLS" ] && fail "$name: a refused start called sqlx: $(cat "$SQLX_CALLS")"
+    [ -s "$pid_file" ] && fail "$name: a refused start wrote a pid file: '$(cat "$pid_file")'"
+    [ -s "$scratch_file" ] && fail "$name: a refused start wrote a scratch file: '$(cat "$scratch_file")'"
+    [ "$(git -C "$worktree" rev-parse HEAD 2>/dev/null || echo "no checkout")" = "$want_head" ] ||
+        fail "$name: a refused start checked $ref out anyway"
+    flock -n "$port_lock" true || fail "$name: a refused start took the port lock"
+}
+old_ref=$(git rev-list --max-parents=0 HEAD | tail -n 1)
+for ref in "$old_ref" 7dc5248; do
+    refused_pre_fix_ref "a pre-SME-115 ref ($ref) with nothing given" "$ref"
+    refused_pre_fix_ref "a pre-SME-115 ref ($ref) with a database as an override" \
+        "$ref" -- DATABASE_URL=postgres://u@localhost/empty
+    extra_env=(DATABASE_URL=postgres://u@localhost/from-the-environment)
+    refused_pre_fix_ref "a pre-SME-115 ref ($ref) with a database in the environment" "$ref"
+    extra_env=()
+done
+# Whatever the red run left running.
+check_server stop >/dev/null
+
 # G5 (SME-186 B40): the scratch database's URL is built from what dotenvy
 # would load, not from what `sed | tail` finds. The dev .env's DATABASE_URL is
 # unquoted and holds a `$`, which dotenvy substitutes and sed does not; and

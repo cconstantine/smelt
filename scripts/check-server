@@ -13,6 +13,15 @@
 # variable that's already set. (To make compaction happen quickly, set a
 # small context window on the model's row at /providers.)
 #
+# A REF from before SME-115's fix (6c9f03c) is refused outright, whatever
+# database it would serve (SME-186 B39): such a smelt sweeps the shared
+# sandbox namespace for claims whose conversation isn't in the database it
+# serves, so one on any other database deletes those conversations'
+# /workspace. It can't serve on the dev database either — sqlx::migrate!()
+# runs first and fails on a database holding migrations the ref doesn't,
+# which the dev one has held for months — so what's refused is only ever a
+# server that would do that harm. Merge origin/main into the ref to serve it.
+#
 # The server logs at RUST_LOG=info, without colour (NO_COLOR=1), unless a
 # non-empty value is given as an override, in the environment or in the
 # check worktree's .env, so its log records what startup and teardown
@@ -29,10 +38,6 @@
 #                   another branch, which stop smelt starting: on SME-65 every
 #                   page was a 500 because SME-35's branch had applied one.
 #                   Nothing from the dev database is copied into it.
-#                   Refused for a REF without SME-115's fix (6c9f03c): such a server
-#                   on a scratch database deletes the sandbox claims (each
-#                   conversation's /workspace) of every conversation on the
-#                   dev server.
 #
 #                   stop deletes that database's own sandbox objects first
 #                   (SME-129): every pod and claim its server made carries
@@ -457,10 +462,16 @@ start() {
     # The fix is complete from 6c9f03c on (fresh ids): a commit partway
     # through it has the smelt_instance migration but still sweeps every
     # claim, so ancestry is the test, not the migration (SME-115 review).
-    # A repository without that commit refuses too.
-    if [ "${CHECK_SCRATCH_DB:-}" = 1 ] &&
-        ! git -C "$repo" merge-base --is-ancestor 6c9f03c "$commit" 2>/dev/null; then
-        echo "CHECK_SCRATCH_DB=1 is refused for $ref ($commit): it predates SME-115's fix, so a server serving it on a scratch database deletes the dev server's sandbox claims" >&2
+    # A repository without that commit refuses too. Refused whatever
+    # database the server would get, not only with CHECK_SCRATCH_DB=1
+    # (SME-186 B39): `-- DATABASE_URL=<another database>`, or one inherited
+    # from the environment, walked past the old condition into exactly the
+    # harm the refusal is here for. Such a ref can't usefully serve on the
+    # dev database either, so nothing that worked before stops working:
+    # smelt runs sqlx::migrate!().run() before the sweep, and sqlx fails
+    # with VersionMissing on a database holding migrations the ref doesn't.
+    if ! git -C "$repo" merge-base --is-ancestor 6c9f03c "$commit" 2>/dev/null; then
+        echo "$ref ($commit) is refused: it predates SME-115's fix, so its server sweeps every sandbox claim that isn't in the database it serves, deleting the conversations of every other server's. Merge origin/main into it, or serve a ref from 6c9f03c on" >&2
         exit 1
     fi
     # The scratch lock, after the refusals (a refused start never waits) and
@@ -673,7 +684,9 @@ case "${1:-}" in
         fi
         ;;
     *)
-        sed -n '2,79p' "$0" | sed 's/^# \{0,1\}//'
+        # The whole header, whatever lines it runs to now (the test that the
+        # usage is the header compares against it line by line).
+        awk 'NR > 1 { if (/^set -euo pipefail/) exit; print }' "$0" | sed 's/^# \{0,1\}//'
         exit 2
         ;;
 esac
