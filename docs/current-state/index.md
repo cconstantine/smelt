@@ -15,7 +15,7 @@ A single-user, 100%-Rust AI coding agent. Every conversation is a coding session
 
 ## Explicitly out of scope (v1)
 
-* Every tool is real (the `run_async` task suite and its stand-ins `add`/`count`/`echo` were removed by SME-54; long-running work goes through terminal commands) — SME-28's leftovers are SME-78 and SME-79 below (repos and credentials in the sandbox shipped with SME-32).
+* Every tool is real (the `run_async` task suite and its stand-ins `add`/`count`/`echo` were removed by SME-54; long-running work goes through terminal commands, and smelt never stops one on a timer — it tells the model it's still running and lets the model decide, SME-79) — SME-28's leftover is SME-78 below (repos and credentials in the sandbox shipped with SME-32).
 * Multi-user accounts or login.
 * Renaming conversations. (Deleting is supported — see [api.md](<https://github.com/cconstantine/smelt/blob/main/docs/api.md>).)
 * A single shell dying (or the agent itself) while the rest of the pod survives isn't specifically detected — per SME-12's finding, a real OOM kill on this cluster always takes the whole pod down together, so this narrow case (something other than OOM — a bash bug, a stray signal — killing just one shell) is a real but lower-priority gap, not the common case.
@@ -25,7 +25,7 @@ A single-user, 100%-Rust AI coding agent. Every conversation is a coding session
 
 The open tickets, by theme (Backlog unless marked):
 
-* **What the model can do:** SME-78 (stop idle sandbox pods, Up Next), SME-79 (a time limit on a terminal command, Up Next), SME-73 (compact and carry on when a turn overflows the context, Up Next), SME-29 (model safety, including confirmation before destructive actions), SME-36 (a multi-file patch tool), SME-37 (skills), SME-38 (subagents), SME-31 (MCP servers running alongside the sandbox).
+* **What the model can do:** SME-78 (stop idle sandbox pods, Up Next), SME-73 (compact and carry on when a turn overflows the context, Up Next), SME-29 (model safety, including confirmation before destructive actions), SME-36 (a multi-file patch tool), SME-37 (skills), SME-38 (subagents), SME-31 (MCP servers running alongside the sandbox).
 * **Models and providers:** SME-162 (a provider's limit on concurrent requests, Up Next), SME-109 (pick a cost-effective provider), SME-110 (a ChatGPT plan), SME-74 and SME-98 (keep earlier reasoning across a model, prompt or tool change), SME-120 (thinking blocks whose text is omitted), SME-116 (reasoning priced higher reads low).
 * **The UI:** SME-71 (desktop notifications, Up Next), SME-44 (VS Code into a sandbox), SME-138 (Copy over plain HTTP), SME-160 ("Working" timer, In Progress), and design review 2 (SME-123, Todo).
 * **Security:** SME-45 (previews only for signed-in users), SME-47 (unprivileged Docker, blocked on the homelab node's Linux 5.10), SME-48 (SSH keys encrypted and out of the model's reach), SME-63 (Chrome's sandbox, pod service-account tokens, network policy), SME-128 (listen on loopback only), SME-131 (state-changing remote calls a timeout can cancel), SME-139 (a release build aborts on any panic).

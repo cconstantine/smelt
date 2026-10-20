@@ -193,7 +193,7 @@ async fn run_and_wait(
     command_id: &str,
     command: &str,
 ) -> String {
-    db::create_terminal_command(pool, conversation_id, terminal_id, command_id, command)
+    db::create_terminal_command(pool, conversation_id, terminal_id, command_id, command, 300)
         .await
         .expect("create_terminal_command");
     send_command(pool, terminal_id, command_id, command)

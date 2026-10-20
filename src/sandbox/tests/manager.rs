@@ -572,7 +572,7 @@ async fn test_sandbox_futures_stay_small() {
         ("terminate_pod", std::mem::size_of_val(&terminate_pod(&pool, 1)), 1700),
         ("teardown_conversation", std::mem::size_of_val(&teardown_conversation(&pool, 1, &[])), 14400),
         // SME-144 moved its publishes around the send: 664 bytes then.
-        ("run_command", std::mem::size_of_val(&run_command(&pool, 1, 1, "cmd", "true")), 1300),
+        ("run_command", std::mem::size_of_val(&run_command(&pool, 1, 1, "cmd", "true", 300)), 1300),
         // B1 (SME-122): every reconnect awaits it.
         ("start_under_way_for_pod", std::mem::size_of_val(&start_under_way_for_pod(&pool, 1)), 700),
         // SME-180: every git exec reads the pod first. The read's future

@@ -285,3 +285,75 @@ pub(super) async fn close_pod_terminals(pool: &PgPool, pod_id: i64) -> (Option<i
     }
     (conversation_id, found_live_terminal)
 }
+
+// --- Idle notices (SME-79) ---
+
+/// How often the idle watch looks (SME-79). This is only the granularity of
+/// the check: a due notice fires at most one pass late, and can never fire
+/// early — the due rule is the database's own comparison, per command. The
+/// interval itself lives on the command's row (the deployment default
+/// `SANDBOX_IDLE_NOTICE_MINUTES`, or what `run_terminal_command` was given),
+/// never here. A minute is coarse enough to be nearly free and fine enough
+/// that a restart notices what's due within a minute.
+const IDLE_WATCH_TICK: Duration = Duration::from_secs(60);
+
+/// For as long as smelt runs, tells the model about terminal commands it has
+/// left untouched (SME-79): every pass, wake each conversation that has a
+/// running command whose idle notice is due. smelt stops nothing here and
+/// nothing stops anywhere on this clock — the notice says so, and the model
+/// decides what to do with its own command.
+///
+/// Only a real server runs this (from `main`), like `watch_pods`, and never
+/// the browser-test harness. The wake is `Notice::Wake`: its drain saves the
+/// notice under the conversation's turn lock, so a turn in flight takes it at
+/// the next iteration, a conversation the user stopped waits for their next
+/// message, and a conversation with nothing actually due is a true no-op.
+pub async fn watch_idle_commands(pool: PgPool) {
+    loop {
+        tokio::time::sleep(IDLE_WATCH_TICK).await;
+        notice_idle_commands_once(&pool).await;
+    }
+}
+
+/// One pass of the idle watch: every conversation with a running command
+/// whose idle notice is due gets one `Notice::Wake`. A pass that finds two
+/// due commands in one conversation wakes it once; the wake's drain re-reads
+/// the due rule under the conversation lock, so a command that finished, or
+/// was touched, or whose notice another drain already saved in between costs
+/// nothing. A conversation the user has stopped is left out rather than
+/// woken — see the skip below. Returns the conversation ids it woke, oldest
+/// first, so the pass is testable without running a turn.
+pub(crate) async fn notice_idle_commands_once(pool: &PgPool) -> Vec<i64> {
+    let due = match db::idle_commands_to_notice(pool).await {
+        Ok(due) => due,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list terminal commands for idle notices");
+            return Vec::new();
+        }
+    };
+    let mut woken: Vec<i64> = Vec::new();
+    for (conversation_id, command_id) in due {
+        if woken.contains(&conversation_id) {
+            continue;
+        }
+        // The user has this conversation stopped. `Notice::Wake` is a no-op
+        // there and saves and marks nothing, so the row stays due: waking it
+        // cost a task and an "…waking its conversation" line every pass, for
+        // as long as it stayed stopped, over a wake that never happened
+        // (SME-79 review 2). Skipping changes nothing for the notice — it is
+        // still owed, and the user's next message drains it as ever.
+        if crate::turn::is_paused(conversation_id) {
+            continue;
+        }
+        // Ids only, never the command line: that's model-authored text
+        // (SME-137), and the tool span already records ids and no input.
+        tracing::info!(
+            conversation_id,
+            %command_id,
+            "a terminal command has gone untouched: waking its conversation"
+        );
+        crate::turn::notify(pool, conversation_id, vec![crate::turn::Notice::Wake]);
+        woken.push(conversation_id);
+    }
+    woken
+}

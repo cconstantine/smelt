@@ -161,6 +161,95 @@ pub(super) async fn drain_unnotified_terminal_commands(
     Ok(())
 }
 
+/// The second half of the drain, run with
+/// `drain_unnotified_terminal_commands` in the same place: commands still
+/// *running* whose idle notice is due (SME-79) — untouched for their whole
+/// interval. smelt never stops them; this tells the model one is still
+/// going, with the numbers it needs to decide, and the model decides. Saved
+/// through `db::save_idle_notice`, in the conversation's locked step like
+/// every other notice, and only while the command is *still* due — one that
+/// finished or was touched since the watch woke this conversation gets
+/// nothing. Each one restarts the command's clock, so a command nobody
+/// touches is told about again, every interval, without limit.
+#[cfg(feature = "server")]
+pub(super) async fn drain_idle_command_notices(
+    pool: &PgPool,
+    conversation_id: i64,
+    pending_new_content: &mut Vec<anthropic::ContentBlock>,
+    persisted: &mut Vec<Message>,
+) -> ServerFnResult<()> {
+    for command in db::idle_commands_due(pool, conversation_id)
+        .await
+        .map_err(ServerFnError::new)?
+    {
+        let text = format!(
+            "Terminal command {id} (\"{shown}\", running for {running}) is still running and \
+             hasn't been touched in {untouched}: {stdout} lines on stdout, {stderr} on stderr. \
+             Nothing stopped it and smelt won't stop it. Read what it has printed with \
+             read_terminal_output, check it with terminal_command_status, interrupt it with \
+             send_signal (INT, then KILL if it ignores that), or run your next command in \
+             another terminal. To stop these notices for it, call set_idle_notice with \
+             idle_notice_seconds 0 or a longer interval.",
+            id = command.command_id,
+            shown = crate::anthropic::tools::shown_command(&command.command),
+            running = format_duration(command.running_for_secs),
+            untouched = format_duration(command.untouched_for_secs),
+            stdout = command.stdout_lines,
+            stderr = command.stderr_lines,
+        );
+        let notice_content = vec![anthropic::ContentBlock::Text { text }];
+        // The notice and the mark together, so a Stop between them can't
+        // leave a notice the next drain saves again (SME-91).
+        let Some(saved) =
+            db::save_idle_notice(pool, conversation_id, &command.command_id, &notice_content)
+                .await
+                .map_err(ServerFnError::new)?
+        else {
+            continue;
+        };
+        pending_new_content.extend(notice_content);
+        record_saved(conversation_id, persisted, saved);
+    }
+    Ok(())
+}
+
+/// A duration in seconds, said in words: "45 seconds", "5 minutes",
+/// "2 hours 5 minutes", "3 days 4 hours" (SME-79). The two biggest units that
+/// fit, rounded down — a notice never overstates how long a command has been
+/// left alone. Shared by the idle notice and `set_idle_notice`'s reply.
+pub(crate) fn format_duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        count(secs, "second")
+    } else if secs < 3_600 {
+        spoken(secs / 60, secs % 60, "minute", "second")
+    } else if secs < 86_400 {
+        spoken(secs / 3_600, secs % 3_600 / 60, "hour", "minute")
+    } else {
+        spoken(secs / 86_400, secs % 86_400 / 3_600, "day", "hour")
+    }
+}
+
+/// The two units that fit a duration's sentence, the smaller one only when
+/// there's something to say: "5 minutes", "2 hours 5 minutes" (SME-79).
+fn spoken(big: i64, small: i64, big_unit: &str, small_unit: &str) -> String {
+    if small == 0 {
+        count(big, big_unit)
+    } else {
+        format!("{} {}", count(big, big_unit), count(small, small_unit))
+    }
+}
+
+/// A count and its unit, pluralised the way the sentence reads: "1 minute",
+/// "5 minutes" (SME-79).
+fn count(n: i64, unit: &str) -> String {
+    if n == 1 {
+        format!("{n} {unit}")
+    } else {
+        format!("{n} {unit}s")
+    }
+}
+
 /// What `notify` does with one notice.
 #[derive(Debug)]
 pub(crate) enum Notice {

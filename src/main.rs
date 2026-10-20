@@ -167,6 +167,9 @@ async fn start_up(dotenv_problem: Option<String>) -> tokio::net::TcpListener {
     // and /pods match it. Only here, never in the browser test harness:
     // see `sandbox::watch_pods`.
     tokio::spawn(sandbox::watch_pods(pool.clone()));
+    // Tells the model about terminal commands it has left untouched
+    // (SME-79): wakes, never stops. See `sandbox::watch_idle_commands`.
+    tokio::spawn(sandbox::watch_idle_commands(pool.clone()));
     // Clones the last run was in the middle of never finished (SME-32).
     match db::fail_unfinished_clones(pool, git::CLONE_INTERRUPTED).await {
         Ok(0) => {}

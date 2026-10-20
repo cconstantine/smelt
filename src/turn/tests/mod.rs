@@ -135,7 +135,7 @@ async fn unnotified_finished_command(pool: &PgPool, conversation_id: i64, comman
     let terminal = db::create_sandbox_terminal(pool, pod.id)
         .await
         .expect("create sandbox terminal");
-    db::create_terminal_command(pool, conversation_id, terminal.id, command_id, "echo hi")
+    db::create_terminal_command(pool, conversation_id, terminal.id, command_id, "echo hi", 300)
         .await
         .expect("create terminal command");
     db::mark_terminal_command_finished(pool, command_id, 0)

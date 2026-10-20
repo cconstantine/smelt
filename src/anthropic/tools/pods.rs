@@ -4,7 +4,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use super::Tool;
-use super::server::{required_i64, required_str};
+use super::server::{optional_notice_secs, required_i64, required_notice_secs, required_str};
 use crate::{db, sandbox};
 use crate::anthropic::ToolDefinition;
 
@@ -141,13 +141,23 @@ fn command_tools() -> Vec<Tool> {
                                returned id to check on it, or send_signal to interrupt it — \
                                you'll also be notified here when it finishes, with no further \
                                tool call needed. If a command seems stuck, send_signal it (or \
-                               use another terminal) rather than retrying this one."
+                               use another terminal) rather than retrying this one. A command \
+                               that goes untouched wakes you with a notice that it's still \
+                               running; `idle_notice_seconds` is how long that takes for this \
+                               command (0 for never, omit for the default). smelt never stops \
+                               a command on a timer, and reading its output, checking its \
+                               status or signalling it resets that clock."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "terminal_id": {"type": "integer"},
-                        "command": {"type": "string", "description": "the shell command to run"}
+                        "command": {"type": "string", "description": "the shell command to run"},
+                        "idle_notice_seconds": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "how long this command may go untouched before you get a notice that it's still running; 0 for never, omit for the default"
+                        }
                     },
                     "required": ["terminal_id", "command"]
                 }),
@@ -162,7 +172,8 @@ fn command_tools() -> Vec<Tool> {
                                handle it gracefully, or ignore it entirely; the terminal \
                                itself (working directory, environment) is never affected \
                                either way. Errors if command_id doesn't match the command \
-                               currently in flight."
+                               currently in flight. Calling this also resets the command's \
+                               idle clock."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -181,7 +192,12 @@ fn command_tools() -> Vec<Tool> {
                 description: "Check a terminal command's status without blocking — \
                                \"running\", or finished/lost with its exit code — plus how \
                                many lines of stdout and stderr it has produced so far (use \
-                               these counts with read_terminal_output's offset/limit)."
+                               these counts with read_terminal_output's offset/limit). While \
+                               the command runs the response also carries idle_notice_seconds \
+                               (the interval it's watched on, 0 when turned off) and \
+                               untouched_for_seconds (how long it had gone untouched before \
+                               this call; null once it isn't running). Calling this also \
+                               resets the command's idle clock."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -200,7 +216,8 @@ fn command_tools() -> Vec<Tool> {
                                \"stdout\" is not necessarily the same line as offset 0 \
                                against \"both\". Lines over 2000 characters are cut; when the \
                                slice is too big to return whole, it stops early with \
-                               truncated: true and the next_offset to read from."
+                               truncated: true and the next_offset to read from. Calling this \
+                               also resets the command's idle clock."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -233,6 +250,29 @@ fn command_tools() -> Vec<Tool> {
                 }),
             },
             run: run!(|c| list_commands_tool(c.pool, c.conversation_id, c.input)),
+        },
+        Tool {
+            def: ToolDefinition {
+                name: "set_idle_notice".to_string(),
+                description: "Change how often smelt wakes you to say a running command is \
+                               still there: the notice fires after this many seconds without \
+                               you touching the command, counted from now, and `0` turns them \
+                               off for it. smelt never stops a command on a timer — the \
+                               notice tells you it's running and you decide what to do. This \
+                               call is itself a touch, so the next notice is a full interval \
+                               away; checking the status, reading the output or signalling it \
+                               restarts the clock too."
+                    .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command_id": {"type": "string"},
+                        "idle_notice_seconds": {"type": "integer", "minimum": 0, "description": "how long it may go untouched before the next notice; 0 for no more notices"}
+                    },
+                    "required": ["command_id", "idle_notice_seconds"]
+                }),
+            },
+            run: run!(|c| set_idle_notice_tool(c.pool, c.conversation_id, c.input)),
         },
     ]
 }
@@ -350,17 +390,26 @@ async fn list_terminals_tool(pool: &PgPool, conversation_id: i64) -> Result<Stri
 /// for how long, and the ways out (SME-76: a bare "already running"
 /// left a model retrying the busy terminal for hours).
 pub(super) fn busy_terminal_message(command: &db::TerminalCommand, now: chrono::NaiveDateTime) -> String {
-    const SHOWN_CHARS: usize = 80;
-    let shown: String = command.command.chars().take(SHOWN_CHARS).collect();
-    let ellipsis = if command.command.chars().count() > SHOWN_CHARS { "…" } else { "" };
     let minutes = (now - command.created_at).num_minutes().max(0);
     format!(
-        "a command is already running in this terminal: {id} (\"{shown}{ellipsis}\"), started \
+        "a command is already running in this terminal: {id} (\"{shown}\"), started \
          {minutes} min ago with no exit yet. Read its output with read_terminal_output, \
          interrupt it with send_signal (command_id {id}, INT, then KILL if it ignores that), \
          or run this in another terminal (create_terminal).",
         id = command.command_id,
+        shown = shown_command(&command.command),
     )
+}
+
+/// How much of a command line smelt quotes back to the model: 80 characters,
+/// cut with an ellipsis so a long one is visibly cut. The busy-terminal
+/// refusal (SME-76) and the idle notice (SME-79) both name the command, and
+/// neither should paste a whole script into the conversation to do it.
+pub(crate) fn shown_command(command: &str) -> String {
+    const SHOWN_CHARS: usize = 80;
+    let shown: String = command.chars().take(SHOWN_CHARS).collect();
+    let ellipsis = if command.chars().count() > SHOWN_CHARS { "…" } else { "" };
+    format!("{shown}{ellipsis}")
 }
 
 /// `busy_terminal_message` for whatever command holds `terminal_id`.
@@ -382,16 +431,52 @@ async fn run_terminal_command_tool(
 ) -> Result<String, String> {
     let terminal_id = required_i64(input, "terminal_id")?;
     let command = required_str(input, "command")?;
+    // The interval is settled here, once, and stored on the row: absent
+    // takes the deployment's default, 0 means this command never gets a
+    // notice, and either way a later change to the default doesn't reach a
+    // command already running (SME-79).
+    let idle_notice_secs =
+        optional_notice_secs(input, "idle_notice_seconds")?.unwrap_or_else(sandbox::idle_notice_default_secs);
     owned_terminal(pool, conversation_id, terminal_id).await?;
 
     let command_id = tool_use_id.to_string();
-    sandbox::run_command(pool, conversation_id, terminal_id, &command_id, &command)
+    // The result text stays exactly `command sent (id: <id>)`: the
+    // transcript's command lookup parses it, and the interval is readable
+    // from terminal_command_status instead (SME-79).
+    sandbox::run_command(pool, conversation_id, terminal_id, &command_id, &command, idle_notice_secs)
         .await
         .map_err(|e| match e {
             sandbox::RunCommandError::Busy(running) => busy_terminal_message(&running, chrono::Utc::now().naive_utc()),
             sandbox::RunCommandError::Failed(e) => e,
         })?;
     Ok(format!("command sent (id: {command_id})"))
+}
+
+/// Re-times a running command's idle notice (SME-79): `0` seconds turns the
+/// notices off for it, and the new interval counts from this call — which is
+/// itself a touch, so the model isn't left with one second on the clock
+/// because it asked late. A command that isn't running is refused: an idle
+/// notice is about a command still going, and its finish has its own notice.
+async fn set_idle_notice_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
+    let command_id = required_str(input, "command_id")?;
+    let secs = required_notice_secs(input, "idle_notice_seconds")?;
+    let command = owned_command(pool, conversation_id, &command_id).await?;
+    if command.status != "running" {
+        return Err(format!(
+            "command {command_id} is not running ({}); idle notices are only for commands still going",
+            command.status
+        ));
+    }
+    let updated = db::set_terminal_command_notice_secs(pool, &command_id, secs)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("command {command_id} has just finished; idle notices are only for commands still going"))?;
+    let interval = crate::turn::format_duration(i64::from(updated.idle_notice_secs));
+    Ok(if updated.idle_notice_secs == 0 {
+        format!("idle notice for {command_id} turned off")
+    } else {
+        format!("idle notice for {command_id} set to {interval}")
+    })
 }
 
 const ALLOWED_SIGNALS: &[&str] = &["INT", "TERM", "KILL"];
@@ -405,6 +490,11 @@ async fn send_signal_tool(pool: &PgPool, conversation_id: i64, input: &Value) ->
         ));
     }
     let command = owned_command(pool, conversation_id, &command_id).await?;
+    // Signalling a command is touching it: its idle clock restarts
+    // (SME-79).
+    db::touch_terminal_command(pool, &command_id)
+        .await
+        .map_err(|e| e.to_string())?;
     sandbox::send_signal(pool, command.terminal_id, &command_id, &signal)
         .await
         .map_err(|e| e.to_string())?;
@@ -414,15 +504,27 @@ async fn send_signal_tool(pool: &PgPool, conversation_id: i64, input: &Value) ->
 async fn terminal_command_status_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
     let command_id = required_str(input, "command_id")?;
     owned_command(pool, conversation_id, &command_id).await?;
+    // The status first, the touch second: `untouched_for_seconds` is how
+    // long the command had gone for before this check, and this check is
+    // itself a touch, so re-arming first would make the answer always 0
+    // (SME-79).
     let status = db::terminal_command_status(pool, &command_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("unknown command id: {command_id}"))?;
+    db::touch_terminal_command(pool, &command_id)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({
         "status": status.status,
         "exit_code": status.exit_code,
         "stdout_lines": status.stdout_lines,
         "stderr_lines": status.stderr_lines,
+        // The idle clock (SME-79): the interval in force — 0 when turned
+        // off — and how long the command went untouched before this call,
+        // absent once it isn't running.
+        "idle_notice_seconds": status.idle_notice_secs,
+        "untouched_for_seconds": status.untouched_for_seconds,
     })
     .to_string())
 }
@@ -466,6 +568,11 @@ const MAX_READ_LIMIT: i64 = 500;
 async fn read_terminal_output_tool(pool: &PgPool, conversation_id: i64, input: &Value) -> Result<String, String> {
     let command_id = required_str(input, "command_id")?;
     owned_command(pool, conversation_id, &command_id).await?;
+    // Reading a command's output is touching it: its idle clock restarts
+    // (SME-79).
+    db::touch_terminal_command(pool, &command_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let stream = input
         .get("stream")
         .and_then(Value::as_str)

@@ -234,7 +234,7 @@ async fn test_a_command_is_announced_before_its_finish(pool: PgPool) {
 
     let run = tokio::spawn({
         let pool = pool.clone();
-        async move { run_command(&pool, conversation_id, terminal.id, "cmd-fast", "true").await }
+        async move { run_command(&pool, conversation_id, terminal.id, "cmd-fast", "true", 300).await }
     });
     let mut fake = agent.next_connection().await;
     let ClientMessage::Command { id, terminal_id, .. } = fake.next_request().await else {
@@ -264,7 +264,7 @@ async fn test_a_failed_send_announces_the_command_lost(pool: PgPool) {
     let _agent = fake_agent(pod_id, Greeting::Hello(next_major), Duration::ZERO).await;
     let mut events = crate::events::subscribe(conversation_id);
 
-    let result = run_command(&pool, conversation_id, terminal.id, "cmd-unsent", "echo hi").await;
+    let result = run_command(&pool, conversation_id, terminal.id, "cmd-unsent", "echo hi", 300).await;
     assert!(matches!(result, Err(RunCommandError::Failed(_))), "{result:?}");
 
     let updates = command_updates(&mut *events, "cmd-unsent", Duration::from_secs(3)).await;
@@ -297,7 +297,7 @@ async fn test_a_lost_mark_that_fails_announces_nothing(pool: PgPool) {
     let _agent = fake_agent(pod_id, Greeting::Hello(next_major), Duration::ZERO).await;
     let mut events = crate::events::subscribe(conversation_id);
 
-    let result = run_command(&pool, conversation_id, terminal.id, "cmd-unmarked", "echo hi").await;
+    let result = run_command(&pool, conversation_id, terminal.id, "cmd-unmarked", "echo hi", 300).await;
     assert!(matches!(result, Err(RunCommandError::Failed(_))), "{result:?}");
 
     let updates = command_updates(&mut *events, "cmd-unmarked", Duration::from_secs(2)).await;

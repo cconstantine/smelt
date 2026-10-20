@@ -100,6 +100,22 @@ fn test_system_notices_read_as_short_sentences() {
         notice("Terminal command abc123's outcome is unknown — the terminal became unreachable while it was running.").as_deref(),
         Some("`python3 primes.py` stopped: its terminal became unreachable")
     );
+    // SME-79: the idle notice reads as one sentence naming the command,
+    // without the tool advice written for the model; an unknown id falls
+    // back like the others, and text that only starts like a notice is not
+    // one.
+    assert_eq!(
+        notice(r#"Terminal command abc123 ("python3 primes.py", running for 2 hours 5 minutes) is still running and hasn't been touched in 5 minutes: 42 lines on stdout, 0 on stderr. Nothing stopped it and smelt won't stop it. Read what it has printed with read_terminal_output."#).as_deref(),
+        Some("`python3 primes.py` is still running, untouched for 5 minutes")
+    );
+    assert_eq!(
+        notice(r#"Terminal command zzz ("sleep 300", running for 1 hour) is still running and hasn't been touched in 1 hour: 0 lines on stdout, 0 on stderr. Nothing stopped it and smelt won't stop it."#).as_deref(),
+        Some("A command is still running, untouched for 1 hour")
+    );
+    assert_eq!(
+        notice("Terminal command abc123 is still running, and nobody knows how it goes."),
+        None
+    );
     assert_eq!(
         notice("Sandbox pod 156 stopped unexpectedly (OOMKilled); every terminal running in it is no longer available.").as_deref(),
         Some("The sandbox stopped unexpectedly (OOMKilled); its terminals are gone")
@@ -117,6 +133,33 @@ fn test_system_notices_read_as_short_sentences() {
         Some("Background task count (t1) finished: Counted to 3")
     );
     assert_eq!(notice("Please run the tests"), None);
+}
+
+/// SME-79 review 2: the quoted command line sits *before* the notice's
+/// marker, so a command whose own text contains that phrase moves the split
+/// into the middle of the quote — `grep`ping over smelt's own notices is the
+/// plain way to do it. The real marker is the *last* one: everything after it
+/// is smelt's fixed text.
+#[test]
+fn test_an_idle_notice_splits_at_its_own_marker() {
+    // The phrase smelt writes between the quoted command and its numbers,
+    // leading and trailing spaces and all — the marker the sentence is cut at.
+    let marker = " is still running and hasn't been touched in ";
+    let line = format!(r#"grep -c "{marker}" agent.log"#);
+    let notice = format!(
+        r#"Terminal command abc123 ("{line}", running for 1 minute){marker}5 minutes: 0 lines on stdout, 0 on stderr. Nothing stopped it and smelt won't stop it."#
+    );
+    let commands = HashMap::from([("abc123".to_string(), line.clone())]);
+    assert_eq!(
+        system_notice(&notice, &commands).as_deref(),
+        Some(format!("`{line}` is still running, untouched for 5 minutes")).as_deref(),
+        "cut at the notice's own marker, not at the one inside the quoted command"
+    );
+    // An unknown command id still falls back like every other notice's.
+    assert_eq!(
+        system_notice(&notice, &HashMap::new()).as_deref(),
+        Some("A command is still running, untouched for 5 minutes")
+    );
 }
 
 #[test]
@@ -146,6 +189,7 @@ fn test_tool_summary_says_what_a_call_did() {
         "Ran `python3 primes.py`"
     );
     assert_eq!(tool_summary("read_terminal_output", &serde_json::json!({"command_id": "x"})), "Read a command's output");
+    assert_eq!(tool_summary("set_idle_notice", &serde_json::json!({"command_id": "x", "idle_notice_seconds": 60})), "Re-timed a command's idle notice");
     assert_eq!(tool_summary("write_file", &serde_json::json!({"path": "/home/sandbox/a.py", "content": "x"})), "Wrote /home/sandbox/a.py");
     assert_eq!(tool_summary("read_file", &serde_json::json!({"path": "/etc/hosts"})), "Read /etc/hosts");
     assert_eq!(tool_summary("list_directory", &serde_json::json!({"path": "/tmp"})), "Listed /tmp");

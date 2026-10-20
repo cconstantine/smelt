@@ -463,6 +463,11 @@ fn run_turn_steps<'a: 'b, 'b>(
                 &mut persisted,
             )
             .await?;
+            // Commands still *running* but left untouched long enough to
+            // earn an idle notice (SME-79) — the same every-iteration
+            // visibility the finish notices above have.
+            drain_idle_command_notices(pool, conversation_id, &mut pending_new_content, &mut persisted)
+                .await?;
 
             // The model's `ask_user` (SME-34): an answer recorded since
             // this turn saved its own message is taken now, so the model

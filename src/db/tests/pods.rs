@@ -14,11 +14,11 @@ async fn test_list_live_pods_reports_each_live_pod_and_its_activity(pool: PgPool
     let busy_pod = create_sandbox_pod(&pool, busy.id).await.expect("pod");
     let t1 = create_sandbox_terminal(&pool, busy_pod.id).await.expect("terminal");
     let t2 = create_sandbox_terminal(&pool, busy_pod.id).await.expect("terminal");
-    create_terminal_command(&pool, busy.id, t1.id, "cmd-done", "true")
+    create_terminal_command(&pool, busy.id, t1.id, "cmd-done", "true", 300)
         .await
         .expect("command");
     mark_terminal_command_finished(&pool, "cmd-done", 0).await.expect("finish");
-    create_terminal_command(&pool, busy.id, t2.id, "cmd-running", "sleep 100")
+    create_terminal_command(&pool, busy.id, t2.id, "cmd-running", "sleep 100", 300)
         .await
         .expect("command");
     let closed = create_sandbox_terminal(&pool, busy_pod.id).await.expect("terminal");

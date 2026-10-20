@@ -13,7 +13,7 @@ async fn test_a_finished_command_wakes_the_model(pool: PgPool) {
         let terminal = create_terminal(&pool, conversation.id).await.expect("create_terminal");
         let mut wake_events = events::subscribe(conversation.id);
         let command_id = "wake";
-        db::create_terminal_command(&pool, conversation.id, terminal, command_id, "true")
+        db::create_terminal_command(&pool, conversation.id, terminal, command_id, "true", 300)
             .await
             .expect("create_terminal_command");
         send_command(&pool, terminal, command_id, "true").await.expect("send_command");
@@ -49,6 +49,140 @@ async fn test_a_finished_command_wakes_the_model(pool: PgPool) {
             }),
             "the notice itself should be saved even though the follow-up call failed, got: {messages:?}"
         );
+    })
+    .await;
+}
+
+/// SME-79: the promise, against a real pod. A command nobody touches is
+/// noticed, and the notice stops nothing: the row is still `running` when the
+/// notice is saved, and the command then ends by itself and gets its finish
+/// notice like any other — an idle notice doesn't use that one up.
+#[sqlx::test]
+async fn test_an_untouched_command_is_noticed_and_keeps_running(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        let terminal = create_terminal(&pool, conversation.id).await.expect("create_terminal");
+        let command_id = "idle-sleep";
+        // A 3-second interval on a 12-second sleep, so the notice and the
+        // command's own end are clearly separate events, not one race.
+        db::create_terminal_command(&pool, conversation.id, terminal, command_id, "sleep 12", 3)
+            .await
+            .expect("create_terminal_command");
+        send_command(&pool, terminal, command_id, "sleep 12").await.expect("send_command");
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let woken = notice_idle_commands_once(&pool).await;
+        assert!(
+            woken.contains(&conversation.id),
+            "the pass should wake the conversation holding the due command, got {woken:?}"
+        );
+
+        // Its drain saves the notice; the delivery that follows fails for want
+        // of a model provider, as in SME-13's test — the notice is saved first
+        // either way. Poll for it rather than guess at a delay.
+        let noticed = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                let messages = db::list_messages(&pool, conversation.id).await.expect("list_messages");
+                if messages.iter().any(|m| {
+                    m.blocks().ok().is_some_and(|blocks| {
+                        blocks.iter().any(|b| {
+                            matches!(
+                                b,
+                                crate::anthropic::ContentBlock::Text { text }
+                                    if text.contains(command_id) && text.contains("still running")
+                                    && text.contains("Nothing stopped it")
+                            )
+                        })
+                    })
+                }) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(noticed, "the idle notice should be saved naming the command and that nothing stopped it");
+
+        let command = db::get_terminal_command(&pool, command_id)
+            .await
+            .expect("query")
+            .expect("the command row");
+        assert_eq!(
+            command.status, "running",
+            "smelt noticed the command and stopped nothing — SME-79's whole point"
+        );
+        assert!(command.idle_notice_at.is_some(), "the notice is marked, restarting the clock");
+        assert!(command.notified_at.is_none(), "an idle notice is not the finish notice");
+
+        // And it ends on its own, at about the 12 seconds it asked for, with
+        // its finish notice taken.
+        let finished = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                let row = db::get_terminal_command(&pool, command_id)
+                    .await
+                    .expect("query")
+                    .expect("the command row");
+                if row.status == "finished" && row.notified_at.is_some() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(finished, "the command should finish by itself and get its finish notice");
+    })
+    .await;
+}
+
+/// SME-79 review 1: the feature-checklist row claims `send_signal` touches
+/// a command, and this is the call site it means — against a live pod. A
+/// running command left untouched past its interval is signalled through
+/// the tool; the signal is a touch: `touched_at` says the moment of the
+/// signal, not the command's start.
+#[sqlx::test]
+async fn test_signalling_a_command_through_the_tool_touches_it(pool: PgPool) {
+    let client = own_sandbox(&pool).await;
+    run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
+        let conversation = db::create_conversation(&pool).await.expect("create conversation");
+        create_pod(&pool, conversation.id, PodLimitOverrides::default()).await.expect("create_pod");
+        let terminal = create_terminal(&pool, conversation.id).await.expect("create_terminal");
+        let command_id = "idle-signal";
+        db::create_terminal_command(&pool, conversation.id, terminal, command_id, "sleep 60", 300)
+            .await
+            .expect("create_terminal_command");
+        send_command(&pool, terminal, command_id, "sleep 60").await.expect("send_command");
+        // Seven minutes of pretend time untouched, so the notice is due and
+        // any touch now is visible as a clock restarted from the signal.
+        // The signal itself ends the sleep; what's under test is the
+        // touch, which happens while the row is still `running`.
+        sqlx::query("UPDATE terminal_commands SET created_at = now() - make_interval(secs => 420) WHERE command_id = $1")
+            .bind(command_id)
+            .execute(&pool)
+            .await
+            .expect("backdate created_at");
+
+        let out = crate::anthropic::tools::execute(
+            &pool,
+            conversation.id,
+            "toolu-signal",
+            "send_signal",
+            &serde_json::json!({"command_id": command_id, "signal": "INT"}),
+        )
+        .await
+        .expect("the tool signals the live command");
+        assert_eq!(out, format!("signal INT sent to {command_id}"));
+
+        let command = db::get_terminal_command(&pool, command_id)
+            .await
+            .expect("query")
+            .expect("the command row");
+        let touched = command.touched_at.expect("signalling a command is a touch (SME-79)");
+        let ago = (chrono::Utc::now().naive_utc() - touched).num_seconds();
+        assert!((0..=5).contains(&ago), "the clock counts from the signal, not the start: touched {ago}s ago");
     })
     .await;
 }
