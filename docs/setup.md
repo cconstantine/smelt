@@ -107,7 +107,7 @@ the sandbox's own Docker rather than `apt-get install`-ing rust, clippy and a
 wasm target piecemeal: an installed toolchain costs more to get and proves
 less, since it reaches neither the database nor a cluster. A daemon that
 refuses privileged containers can't bring up the `k3s` and `docker` sidecars,
-and then the cluster-backed tests fall to CI.
+and then the cluster-backed tests fall to CI. What this seat is, in practice — one clone, the sequential gate, what is and isn't installed, how the run ends — is the "Working from a conversation sandbox" section of [the persona rules](personas/rules.md). This deployment's daemon allows privileged containers, so the real gate runs in a conversation sandbox and not only in CI.
 
 Helper scripts: `scripts/check.sh` (the checks every commit must pass: both
 builds with no warnings, plus the server tests), `scripts/check-server`
