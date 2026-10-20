@@ -14,4 +14,4 @@ Every persona still follows the rest of the [development process](../development
 | Integrator | one Approved ticket | to Done | [integrator.md](integrator.md) |
 | Facilitator | the "Next retrospective" ticket | to In Review, or Approved with no questions | [facilitator.md](facilitator.md) |
 
-Every persona follows [Rules every persona follows](rules.md).
+Every persona follows [Rules every persona follows](rules.md). Ownership is recorded in Linear as a `started` comment either way the seat takes: `worktree <path>, branch <branch>`, or `conversation <id>, clone <path>` when the persona runs in a conversation (rules.md, "Working from a conversation sandbox"; SME-254, proposal 13).
