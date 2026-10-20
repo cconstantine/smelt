@@ -152,3 +152,38 @@ async fn test_the_idle_watch_wake_saves_the_notices_and_repeats_the_interval(poo
     assert_eq!(notice_idle_commands_once(&pool).await, vec![conversation_id]);
     assert_eq!(notices(&pool, conversation_id, 4).await.len(), 4, "a second notice for each command");
 }
+
+/// SME-79 review 2: a conversation the user has stopped is left out of the
+/// pass. Its wake is a no-op there — `wake_conversation` returns early while
+/// the conversation is paused — and saves and marks nothing, so the row stayed
+/// due and every pass woke it again for as long as it stayed stopped: a task
+/// spawned only to discover it was paused, and an info line claiming a wake
+/// that never happened, once a minute. The notice is held, not lost — the
+/// user's next message drains it with that moment's numbers, which
+/// `turn::tests::wake::test_a_stopped_conversation_holds_the_idle_notice_for_the_next_message`
+/// pins.
+#[sqlx::test]
+async fn test_a_stopped_conversation_is_left_out_of_the_idle_pass(pool: sqlx::PgPool) {
+    let _guard = crate::providers::test_support::lock_turn_tests();
+    // A conversation this test pauses, so an id no other run's conversation
+    // shares (SME-135).
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let stopped = idle_conversation(&pool, &["idle-paused-1"]).await;
+    let running = idle_conversation(&pool, &["idle-running-1"]).await;
+
+    crate::turn::stop_turn_now(stopped);
+    assert!(crate::turn::is_paused(stopped), "the user has that conversation stopped");
+
+    assert_eq!(
+        notice_idle_commands_once(&pool).await,
+        vec![running],
+        "the stopped conversation is skipped; the other is woken as usual"
+    );
+    let command = db::get_terminal_command(&pool, "idle-paused-1")
+        .await
+        .expect("query")
+        .expect("the command row");
+    assert!(command.idle_notice_at.is_none(), "its notice is still owed, not spent on a wake that didn't happen");
+
+    crate::turn::forget_conversation_lock(stopped);
+}
