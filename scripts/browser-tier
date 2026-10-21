@@ -28,9 +28,16 @@ cd "$(dirname "$0")/.."
 
 url=${DATABASE_URL:-}
 if [ -z "$url" ] && [ -f .env ]; then
-    url=$(sed -n 's/^DATABASE_URL=//p' .env | tail -n 1)
-    url=${url%\"}
-    url=${url#\"}
+    # As dotenvy reads it, not with `sed | tail`: the first line for a name
+    # wins, and `export`, quotes, escapes and `$NAME` substitution all count
+    # (SME-186 B40 — the server takes its URL through dotenvy, so a URL built
+    # any other way is not the URL the server ends up with). The reader exits
+    # 0 whatever the file holds, so only a missing python3 gets here.
+    command -v python3 >/dev/null || {
+        echo "browser-tier: reading .env needs python3 (scripts/lib/dotenv-value)" >&2
+        exit 1
+    }
+    url=$(python3 -I scripts/lib/dotenv-value .env DATABASE_URL) || exit 1
 fi
 [ -n "$url" ] || { echo "browser-tier needs DATABASE_URL (environment or .env)" >&2; exit 1; }
 query=""
