@@ -522,6 +522,12 @@ pub async fn read_terminal_output(
     .await
 }
 
+/// A command that ended (finished or lost) and whose notice isn't saved
+/// yet, in one fragment shared by the turn's drain and a wake's check for
+/// work, so the two can't disagree (SME-218). Both terminal states need
+/// exactly one notification each. `terminal_commands` must be aliased `tc`.
+const UNNOTIFIED_END: &str = "tc.status IN ('finished', 'lost') AND tc.notified_at IS NULL";
+
 /// Backs the completion-notification check in `run_turn_bounded`'s loop — both
 /// terminal states (`finished` and `lost`) need exactly one notification
 /// each, so this matches either, not just `finished`.
@@ -529,11 +535,11 @@ pub async fn unnotified_finished_terminal_commands(
     pool: &PgPool,
     conversation_id: i64,
 ) -> Result<Vec<TerminalCommand>, sqlx::Error> {
-    sqlx::query_as::<_, TerminalCommand>(
-        "SELECT * FROM terminal_commands
-         WHERE conversation_id = $1 AND status IN ('finished', 'lost') AND notified_at IS NULL
-         ORDER BY id ASC",
-    )
+    sqlx::query_as::<_, TerminalCommand>(&format!(
+        "SELECT tc.* FROM terminal_commands tc
+         WHERE tc.conversation_id = $1 AND {UNNOTIFIED_END}
+         ORDER BY tc.id ASC"
+    ))
     .bind(conversation_id)
     .fetch_all(pool)
     .await
@@ -598,6 +604,23 @@ pub async fn save_command_notice(
 const IDLE_NOTICE_DUE: &str = "tc.status = 'running' AND tc.idle_notice_secs > 0 \
     AND now() - GREATEST(tc.created_at, COALESCE(tc.touched_at, tc.created_at), COALESCE(tc.idle_notice_at, tc.created_at)) \
         >= make_interval(secs => tc.idle_notice_secs)";
+
+/// Whether a wake of `conversation_id` has anything to act on: an ended
+/// command's notice, a due idle notice, or an answered question no turn has
+/// taken — exactly what its turn's first step drains or takes (SME-218). A
+/// question still waiting is no work: that turn would stop at it. Read
+/// before the wake is counted, so one with nothing to do tells no tab a turn
+/// started; the drain under the turn lock still decides what's saved.
+pub async fn wake_has_work(pool: &PgPool, conversation_id: i64) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT EXISTS (SELECT 1 FROM terminal_commands tc WHERE tc.conversation_id = $1 AND {UNNOTIFIED_END}) \
+             OR EXISTS (SELECT 1 FROM terminal_commands tc WHERE tc.conversation_id = $1 AND {IDLE_NOTICE_DUE}) \
+             OR EXISTS (SELECT 1 FROM pending_questions WHERE conversation_id = $1 AND answer IS NOT NULL)"
+    ))
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
+}
 
 /// Every running command whose idle notice is due, oldest first, as
 /// `(conversation_id, command_id)` — the watch's per-pass check. It decides

@@ -75,7 +75,9 @@ pub(super) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: St
 /// pending (e.g. another concurrent wake, or an unrelated live message,
 /// already handled it) — no persisted message, no API call. This is what
 /// keeps several commands finishing close together from costing one model
-/// turn each. See SME-13.
+/// turn each. See SME-13. One that finds nothing pending before it's counted
+/// isn't counted at all, so no tab is told a turn started: it would show
+/// "Working…" and clear the error it shows (SME-218).
 ///
 /// On failure, publishes `ConversationEvent::NotificationDeliveryFailed`
 /// (alongside a `tracing::warn!`) so a watching browser tab sees it live —
@@ -90,6 +92,18 @@ pub(super) async fn wake_conversation(
     pool: &PgPool,
     conversation_id: i64,
 ) -> TurnResult {
+    // Anything to do is asked first, before the step below that counts
+    // the wake (which can't wait on the database): a wake with nothing
+    // isn't counted, so no tab is told a turn started (SME-218). The drain
+    // under the turn lock still decides; this only skips wakes sure to
+    // find nothing.
+    match db::wake_has_work(pool, conversation_id).await {
+        Ok(false) => return Ok(Vec::new()),
+        Ok(true) => {}
+        // Let in as before, so a notice is never dropped; the drain
+        // reports the failure if it persists.
+        Err(e) => tracing::warn!(conversation_id, error = %e, "couldn't check a wake for pending work"),
+    }
     // After the user stopped this conversation, pending notices wait for
     // their next message, which drains them the same way (see `ConversationRuntime::paused`).
     // Checked in the same step that counts the wake, so a Stop either

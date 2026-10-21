@@ -284,9 +284,10 @@ async fn fail_a_users_turn(pool: &PgPool, conversation_id: i64) {
 
 /// B30, interleaving: a wake (a command finished during the user's
 /// turn) is counted and queued while the user's turn runs, and that
-/// turn then fails; the wake finds nothing to do. The user's error must
-/// be kept: today the wake took a newer turn generation when it was
-/// counted, so the failure kept nothing.
+/// turn then drains the command and fails; the wake finds nothing to do.
+/// The user's error must be kept: today the wake took a newer turn
+/// generation when it was counted, so the failure kept nothing. The
+/// command is what gets the wake counted at all (SME-218).
 #[sqlx::test]
 async fn test_a_wake_queued_behind_a_failing_turn_keeps_its_error(pool: PgPool) {
     let _guard = lock_turn_tests();
@@ -300,6 +301,7 @@ async fn test_a_wake_queued_behind_a_failing_turn_keeps_its_error(pool: PgPool) 
         .await
         .expect("the user's turn saves its message")
         .expect("hook");
+    unnotified_finished_command(&pool, conversation_id, "cmd-b30").await;
     let wake = tokio::spawn({
         let pool = pool.clone();
         async move { wake_conversation(&pool, conversation_id).await }
@@ -386,11 +388,16 @@ async fn test_a_notice_after_a_delete_leaves_no_turn_state(pool: PgPool) {
 
     let woken = db::create_conversation(&pool).await.expect("create conversation").id;
     delete_as_the_api_does(&pool, woken).await;
+    // The delete took the wake's pending work with it, so the wake isn't
+    // counted (SME-218).
     let woke = wake_conversation(&pool, woken).await;
-    assert!(
-        woke.as_ref().is_ok_and(Vec::is_empty) || woke.as_ref().is_err_and(|e| e.to_string().contains("not found")),
-        "{woke:?}"
-    );
+    assert!(woke.as_ref().is_ok_and(Vec::is_empty), "{woke:?}");
+    // A counted wake still can be (the delete landing after
+    // `wake_has_work`, or the check failing): `wake_conversation`'s own
+    // steps, after its check passed.
+    let turn = TurnInFlight::start_unless_paused(woken).expect("not paused");
+    let result = run_turn_bounded(&pool, turn, None, MAX_TURNS, None, false).await;
+    assert!(result.as_ref().is_err_and(|e| e.to_string().contains("not found")), "{result:?}");
     assert!(!has_turn_state(woken), "a wake left turn state");
 
     let sent = db::create_conversation(&pool).await.expect("create conversation").id;
