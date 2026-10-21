@@ -131,3 +131,16 @@ pub fn pause_during_record(conversation_id: i64) -> (oneshot::Receiver<()>, ones
 pub async fn during_record(conversation_id: i64) {
     reach(&DURING_RECORD, conversation_id).await;
 }
+
+static AFTER_NOTICE_ADMITTED: Pauses = LazyLock::new(Default::default);
+
+/// Pauses `conversation_id`'s next wake or delivered notice right after
+/// it's let in past the pause, before it waits for the turn lock
+/// (SME-217). As `pause_after_message_saved`.
+pub fn pause_after_notice_admitted(conversation_id: i64) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pause_at(&AFTER_NOTICE_ADMITTED, conversation_id)
+}
+
+pub async fn after_notice_admitted(conversation_id: i64) {
+    reach(&AFTER_NOTICE_ADMITTED, conversation_id).await;
+}

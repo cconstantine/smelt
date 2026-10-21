@@ -239,7 +239,8 @@ pub(super) fn resume_turns(conversation_id: i64) {
 ///
 /// A turn is counted when it's admitted, by its caller before that
 /// returns or spawns it (SME-216): `start_by_user` for the user's send
-/// or answer. In the order of the turn state's critical sections, a Stop
+/// or answer, `start_unless_paused` for a wake or a delivered notice
+/// (SME-217). In the order of the turn state's critical sections, a Stop
 /// ends exactly the turns counted before it. Moved into the turn, never
 /// cloned, so a turn is counted once.
 ///
@@ -262,7 +263,10 @@ enum Admission {
     /// The user sent or answered: ends the pause and takes a new turn
     /// generation.
     ByUser,
-    /// Counted whatever the pause.
+    /// A wake or a delivered notice: refused while paused.
+    UnlessPaused,
+    /// Counted whatever the pause, for tests.
+    #[cfg(test)]
     Always,
 }
 
@@ -271,14 +275,22 @@ enum Admission {
 /// generation, the count and the stop receiver. So a Stop comes wholly
 /// before the admission (a user's turn then ends the pause and runs) or
 /// wholly after it (and ends the turn), and a delete's forget is wholly
-/// before or after the generation (SME-216). Returns the counted turn,
-/// and the conversation's turn generation once it's admitted.
-fn admit(conversation_id: i64, admission: Admission) -> (TurnInFlight, u64) {
+/// before or after the generation (SME-216); and a wake or a delivery is
+/// refused by a Stop before it, or ended by one after it (SME-217).
+/// Returns the counted turn, and the conversation's turn generation once
+/// it's admitted; `None` if refused, with nothing changed.
+fn admit(conversation_id: i64, admission: Admission) -> Option<(TurnInFlight, u64)> {
     let (first, stop, generation) = with_runtime(conversation_id, |runtime| {
-        if let Admission::ByUser = admission {
-            runtime.paused = false;
-            runtime.kept.generation += 1;
-            runtime.kept.error = None;
+        match admission {
+            Admission::ByUser => {
+                runtime.paused = false;
+                runtime.kept.generation += 1;
+                runtime.kept.error = None;
+            }
+            Admission::UnlessPaused if runtime.paused => return None,
+            Admission::UnlessPaused => {}
+            #[cfg(test)]
+            Admission::Always => {}
         }
         runtime.turns_in_flight += 1;
         let stop = runtime.stop_receiver();
@@ -290,13 +302,13 @@ fn admit(conversation_id: i64, admission: Admission) -> (TurnInFlight, u64) {
                 crate::events::ConversationEvent::TurnState { running: true, elapsed: 0 },
             );
         }
-        (first, stop, runtime.kept.generation)
-    });
+        Some((first, stop, runtime.kept.generation))
+    })?;
     if first {
         // Only tells the sidebar to fetch the busy list again.
         crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
     }
-    (TurnInFlight { conversation_id, stop: Some(stop) }, generation)
+    Some((TurnInFlight { conversation_id, stop: Some(stop) }, generation))
 }
 
 impl TurnInFlight {
@@ -305,12 +317,22 @@ impl TurnInFlight {
     /// clearing the kept error, in the same step as the count. Returns the
     /// turn and its generation (`run_turn_bounded`'s `keep_error`).
     pub(super) fn start_by_user(conversation_id: i64) -> (Self, u64) {
-        admit(conversation_id, Admission::ByUser)
+        #[expect(clippy::expect_used, reason = "only `Admission::UnlessPaused` refuses a turn")]
+        let admitted = admit(conversation_id, Admission::ByUser).expect("a user's turn is always admitted");
+        admitted
     }
 
-    /// Counts a turn whatever the pause.
+    /// Admits a wake or a delivered notice, unless the conversation is
+    /// paused after a Stop: then `None`, and nothing changes (SME-217).
+    pub(super) fn start_unless_paused(conversation_id: i64) -> Option<Self> {
+        admit(conversation_id, Admission::UnlessPaused).map(|(turn, _)| turn)
+    }
+
+    /// Counts a turn whatever the pause, for tests.
+    #[cfg(test)]
     pub(super) fn start(conversation_id: i64) -> Self {
-        admit(conversation_id, Admission::Always).0
+        let admitted = admit(conversation_id, Admission::Always);
+        admitted.expect("a test's turn is always admitted").0
     }
 
     pub(super) fn conversation_id(&self) -> i64 {

@@ -125,3 +125,79 @@ async fn test_a_deletes_stop_catching_a_just_sent_turn_leaves_no_turn_state(pool
     drop(rx);
     events::forget(conversation_id);
 }
+
+/// E2 (SME-217), interleaving: a Stop lands right after a wake is let in
+/// past the pause, with the turn lock held so only the stop can wake it.
+/// The wake ends stopped without calling the model, and isn't reported
+/// as a failed notification. Before SME-217 the wake checked the pause,
+/// then counted in a second step, so the Stop only paused and the wake
+/// went on to the model.
+#[sqlx::test]
+async fn test_a_stop_as_a_wake_is_let_in_ends_it(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    unnotified_finished_command(&pool, conversation_id, &format!("cmd-stop-gap-{conversation_id}")).await;
+    let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Noted.")]).await;
+    let mut rx = events::subscribe(conversation_id);
+    let held = conversation_lock(conversation_id).lock_owned().await;
+    let (admitted, release) = test_hooks::pause_after_notice_admitted(conversation_id);
+
+    let wake = tokio::spawn({
+        let pool = pool.clone();
+        async move { wake_conversation(&pool, conversation_id).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), admitted)
+        .await
+        .expect("the wake is let in")
+        .expect("hook");
+    stop_turn_now(conversation_id);
+    release.send(()).expect("the wake waits at the hook");
+    release_after_the_stop_is_seen(held).await;
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), wake)
+        .await
+        .expect("the wake ends within 10 s")
+        .expect("join");
+    assert!(matches!(result, Err(TurnFailure::Stopped)), "{result:?}");
+    assert!(requests.lock().expect("the request log").is_empty(), "the stopped wake called the model");
+    let told = drain_events(&mut rx).await;
+    let failed = told.iter().any(|e| matches!(e, events::ConversationEvent::NotificationDeliveryFailed { .. }));
+    assert!(!failed, "a stop isn't a failed notification: {told:?}");
+    resume_turns(conversation_id);
+}
+
+/// E2 (SME-217), as the test above with a delivered notice: it's saved
+/// once and the stop noted once, without a model call.
+#[sqlx::test]
+async fn test_a_stop_as_a_delivery_is_let_in_ends_it(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Noted.")]).await;
+    let held = conversation_lock(conversation_id).lock_owned().await;
+    let (admitted, release) = test_hooks::pause_after_notice_admitted(conversation_id);
+    let notice = "Docker in your sandbox was restarted.";
+
+    let delivery = tokio::spawn({
+        let pool = pool.clone();
+        async move { deliver_notice(&pool, conversation_id, notice.to_string()).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), admitted)
+        .await
+        .expect("the delivery is let in")
+        .expect("hook");
+    stop_turn_now(conversation_id);
+    release.send(()).expect("the delivery waits at the hook");
+    release_after_the_stop_is_seen(held).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), delivery)
+        .await
+        .expect("the delivery ends within 10 s")
+        .expect("join");
+
+    assert!(requests.lock().expect("the request log").is_empty(), "the stopped delivery called the model");
+    let saved = db::list_messages(&pool, conversation_id).await.expect("list");
+    assert_eq!(saved.iter().filter(|m| m.content.contains(notice)).count(), 1, "the notice once: {saved:?}");
+    assert_eq!(saved.iter().filter(|m| m.content.contains(STOP_NOTICE)).count(), 1, "the stop once: {saved:?}");
+    resume_turns(conversation_id);
+}

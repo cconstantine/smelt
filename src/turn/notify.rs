@@ -40,19 +40,22 @@ pub(super) async fn save_notice_between_turns(
 /// next message. Call it from a spawned task: it waits for a running turn.
 #[cfg(feature = "server")]
 pub(super) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: String) {
-    if is_paused(conversation_id) {
+    // Let in past the pause in the same step that counts it, so a Stop
+    // either refuses it or ends it (SME-217).
+    let Some(turn) = TurnInFlight::start_unless_paused(conversation_id) else {
         if let Err(e) = save_notice_between_turns(pool, conversation_id, text).await {
             tracing::warn!(conversation_id, error = %e, "couldn't save a notice");
         }
         return;
-    }
+    };
+    #[cfg(test)]
+    test_hooks::after_notice_admitted(conversation_id).await;
     // The notice as the turn's own message: the turn saves it before the
     // model call, so it survives the call failing.
     let message = anthropic::AnthropicMessage {
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text }],
     };
-    let turn = TurnInFlight::start(conversation_id);
     if let Err(TurnFailure::Failed(e)) = run_turn_bounded(pool, turn, Some(message), MAX_TURNS, None, false).await {
         tracing::warn!(conversation_id, error = %e, "a notice didn't reach the model");
         crate::events::publish(
@@ -89,10 +92,14 @@ pub(super) async fn wake_conversation(
 ) -> TurnResult {
     // After the user stopped this conversation, pending notices wait for
     // their next message, which drains them the same way (see `ConversationRuntime::paused`).
-    if is_paused(conversation_id) {
+    // Checked in the same step that counts the wake, so a Stop either
+    // refuses it or ends it (SME-217).
+    let Some(turn) = TurnInFlight::start_unless_paused(conversation_id) else {
         return Ok(Vec::new());
-    }
-    let result = run_turn_bounded(pool, TurnInFlight::start(conversation_id), None, MAX_TURNS, None, false).await;
+    };
+    #[cfg(test)]
+    test_hooks::after_notice_admitted(conversation_id).await;
+    let result = run_turn_bounded(pool, turn, None, MAX_TURNS, None, false).await;
     // A stop is the user's doing, not a failure to reach the model.
     if let Err(TurnFailure::Failed(e)) = &result {
         tracing::warn!(conversation_id, error = %e, "wake_conversation failed to notify the model");
