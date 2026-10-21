@@ -12,9 +12,11 @@ pub struct Conversation {
     pub updated_at: NaiveDateTime,
 }
 
-/// What a conversation's completed model calls used and cost in all
-/// (SME-106, `db::get_conversation_spend`). A stopped or failed call has no
-/// final usage and isn't counted.
+/// What a conversation's model calls used and cost in all (SME-106,
+/// `db::get_conversation_spend`). A stopped or failed call is counted with
+/// what it used before it ended, its output estimated when the provider
+/// hadn't reported it yet, and its input from the request's size when
+/// the provider reports that only at the end (SME-178).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "server", derive(sqlx::FromRow))]
 pub struct ConversationSpend {

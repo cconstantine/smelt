@@ -87,3 +87,47 @@ pub fn after_in_flight_changed(conversation_id: i64) {
         let _ = release.recv_timeout(std::time::Duration::from_secs(5));
     }
 }
+
+/// A pause point keyed by conversation, as `AFTER_MESSAGE_SAVED`.
+type Pauses = LazyLock<Mutex<HashMap<i64, Pause>>>;
+
+fn pause_at(pauses: &Pauses, conversation_id: i64) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    pauses.lock().unwrap_or_else(|e| e.into_inner()).insert(conversation_id, (reached_tx, release_rx));
+    (reached_rx, release_tx)
+}
+
+async fn reach(pauses: &Pauses, conversation_id: i64) {
+    let pause = pauses.lock().unwrap_or_else(|e| e.into_inner()).remove(&conversation_id);
+    if let Some((reached, release)) = pause {
+        let _ = reached.send(());
+        let _ = release.await;
+    }
+}
+
+static AFTER_REPLY_SAVED: Pauses = LazyLock::new(Default::default);
+
+/// Pauses `conversation_id`'s next model call right after its reply is
+/// saved, before its usage is recorded (SME-178). As
+/// `pause_after_message_saved`.
+pub fn pause_after_reply_saved(conversation_id: i64) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pause_at(&AFTER_REPLY_SAVED, conversation_id)
+}
+
+pub async fn after_reply_saved(conversation_id: i64) {
+    reach(&AFTER_REPLY_SAVED, conversation_id).await;
+}
+
+static DURING_RECORD: Pauses = LazyLock::new(Default::default);
+
+/// Pauses `conversation_id`'s next finished call's record inside its
+/// spawned task, before it writes (SME-178). As
+/// `pause_after_message_saved`.
+pub fn pause_during_record(conversation_id: i64) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pause_at(&DURING_RECORD, conversation_id)
+}
+
+pub async fn during_record(conversation_id: i64) {
+    reach(&DURING_RECORD, conversation_id).await;
+}

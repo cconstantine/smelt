@@ -67,7 +67,8 @@ impl ModelCallKind {
     }
 }
 
-/// One completed model call, for `record_model_call`.
+/// One model call, for `record_model_call`: finished, or stopped or
+/// failed with what it used (SME-178).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelCall<'a> {
     pub conversation_id: i64,
@@ -77,26 +78,62 @@ pub struct ModelCall<'a> {
     pub usage: crate::anthropic::TokenUsage,
     /// From the price catalog when the call finished; `None` without a price.
     pub cost_usd: Option<f64>,
+    /// Whether the call finished, its reply saved (SME-178): a stopped or
+    /// failed one is recorded with what it used, but isn't the
+    /// conversation's last-known usage.
+    pub finished: bool,
 }
 
-/// Appends `call` to `model_call_usage` (SME-106). A turn's call is also
-/// the conversation's new last-known usage (`upsert_conversation_usage`),
-/// written in the same transaction so the two never disagree. A
-/// compaction's isn't: it described the old, long history.
+/// Appends `call` to `model_call_usage` (SME-106). A finished turn's call
+/// is also the conversation's new last-known usage
+/// (`upsert_conversation_usage`), written in the same transaction so the
+/// two never disagree. A compaction's isn't: it described the old, long
+/// history. Nor is an unfinished one's: its reply may not be saved.
+///
+/// A conversation deleted before or while the call is recorded gives a
+/// row with no conversation, as the deletion's own SET NULL would
+/// (SME-178), and no last-known usage. Only tests call it: production
+/// records go through `record_model_call_if_current`.
+#[cfg(test)]
 pub async fn record_model_call(pool: &PgPool, call: &ModelCall<'_>) -> Result<(), sqlx::Error> {
+    record_model_call_if_current(pool, call, || true).await.map(|_| ())
+}
+
+/// `record_model_call`, for a call whose turn may have been stopped while
+/// it was recorded (code review 1): its record then runs on its own, and
+/// can commit after the next turn's. A finished turn call is the
+/// last-known usage only if `still_current` says its turn still is, asked
+/// holding the conversation's row (`FOR NO KEY UPDATE`), which every
+/// writer of the last-known usage takes first, this one and
+/// `clear_conversation_usage`. A record that sees its turn current
+/// therefore commits before any newer turn's write: that turn starts only
+/// once this one has ended, and then waits for the row. Says whether it
+/// wrote the last-known usage.
+pub async fn record_model_call_if_current(
+    pool: &PgPool,
+    call: &ModelCall<'_>,
+    still_current: impl FnOnce() -> bool + Send,
+) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query(
+    let conversation_id: Option<i64> = sqlx::query_scalar(
         // The provider as it is now: a turn reads it when it starts, and the
         // user may delete it before the reply finishes. A deleted one gives
         // null, as the deletion's own SET NULL would (code review 1). `FOR
         // KEY SHARE` waits for a delete still in progress and then reads
         // null; without it the id is read, and the foreign key fails once
-        // the delete commits (code review 2).
+        // the delete commits (code review 2). The conversation the same
+        // way (SME-178), locked first, since VALUES is evaluated left to
+        // right, and `FOR NO KEY UPDATE`, the lock that orders writes of
+        // its last-known usage (SME-178 code review 1). Taken before the
+        // provider's: a provider's delete locks its conversations first
+        // too, so the two can't wait on each other.
         "INSERT INTO model_call_usage
              (conversation_id, provider_id, model, kind, input_tokens, output_tokens,
               cache_creation_input_tokens, cache_read_input_tokens, cost_usd)
-         VALUES ($1, (SELECT id FROM inference_providers WHERE id = $2 FOR KEY SHARE),
-                 $3, $4, $5, $6, $7, $8, $9)",
+         VALUES ((SELECT id FROM conversations WHERE id = $1 FOR NO KEY UPDATE),
+                 (SELECT id FROM inference_providers WHERE id = $2 FOR KEY SHARE),
+                 $3, $4, $5, $6, $7, $8, $9)
+         RETURNING conversation_id",
     )
     .bind(call.conversation_id)
     .bind(call.provider_id)
@@ -107,12 +144,20 @@ pub async fn record_model_call(pool: &PgPool, call: &ModelCall<'_>) -> Result<()
     .bind(call.usage.cache_creation_input_tokens)
     .bind(call.usage.cache_read_input_tokens)
     .bind(call.cost_usd)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
-    if call.kind == ModelCallKind::Turn {
-        upsert_conversation_usage(&mut *tx, call.conversation_id, &call.usage).await?;
-    }
-    tx.commit().await
+    let current = if let Some(conversation_id) = conversation_id
+        && call.kind == ModelCallKind::Turn
+        && call.finished
+        && still_current()
+    {
+        upsert_conversation_usage(&mut *tx, conversation_id, &call.usage).await?;
+        true
+    } else {
+        false
+    };
+    tx.commit().await?;
+    Ok(current)
 }
 
 pub async fn get_conversation_spend(
