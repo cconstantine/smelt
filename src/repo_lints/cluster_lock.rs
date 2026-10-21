@@ -5,122 +5,128 @@
 //! `cargo test` and drop another run's databases; this finds it in the gate,
 //! with no lock or database needed.
 //!
-//! It reads lines, not Rust. A line whose code starts with `#[` starts
-//! attributes, one or more, each read to its closing `]` (across lines too)
-//! with any `//` comment left out; anything else (a comment, a string) isn't
-//! one. Any attribute that names `sqlx::test`, `#[::sqlx::test]` and a
-//! `cfg_attr` included, counts, and is guarded only when its own brackets
-//! name a guarded migrator. A `use` that imports `sqlx::test` is a finding
-//! too: the import shadows the prelude's `#[test]` (review 1).
+//! A small tokenizer reads the whole file (review 2), on the component
+//! lint's `classify`: it leaves out `//` and `/* */` comments (nested too),
+//! and reads a string, raw string or char literal as one token, so none of
+//! them hides or fakes an attribute. Any `#[…]` that names the path
+//! `sqlx::test`, wherever it is on its line (`#[::sqlx::test]` and a
+//! `cfg_attr` included), counts, and is guarded only when its own brackets
+//! hold `migrator = "<a guarded migrator>"`. A `use` that imports
+//! `sqlx::test`, read to its `;` through any groups, is a finding too: the
+//! import shadows the prelude's `#[test]` (review 1).
 
-/// The migrators that check the lock, as the attribute names them.
-pub(crate) const GUARDED: &[&str] = &[
-    r#"migrator = "crate::test_lock::MIGRATOR""#,
-    r#"migrator = "crate::test_lock::NO_MIGRATIONS""#,
-];
+use super::components::{classify, Kind};
+
+/// The migrators that check the lock, as the attribute's string names them.
+pub(crate) const GUARDED: &[&str] = &["crate::test_lock::MIGRATOR", "crate::test_lock::NO_MIGRATIONS"];
+
+#[derive(Debug, PartialEq)]
+enum Token {
+    Word(String),
+    Punct(char),
+    /// A string literal's text between its quotes, escapes as written.
+    Str(String),
+}
+
+/// `source`'s tokens, each with its line (from 1), from `classify`'s
+/// reading of it. Comments, whitespace and char literals leave no token.
+fn tokens(source: &str) -> Vec<(usize, Token)> {
+    let (chars, ident) = (source.chars().collect::<Vec<_>>(), |c: char| c.is_alphanumeric() || c == '_');
+    let kinds = classify(&chars);
+    let (mut found, mut i, mut line) = (Vec::new(), 0, 1);
+    while i < chars.len() {
+        let start = i;
+        let run = |more: &dyn Fn(usize) -> bool| (start..chars.len()).find(|&j| !more(j)).unwrap_or(chars.len());
+        match kinds[i] {
+            Kind::Comment => i = run(&|j| kinds[j] == Kind::Comment),
+            Kind::Str => {
+                i = run(&|j| kinds[j] == Kind::Str);
+                let text: String = chars[start..i].iter().collect();
+                // `"…"`, `b"…"` or `r#"…"#`; a char literal is none of them.
+                if let Some(value) = text.trim_start_matches(['r', 'b']).trim_start_matches('#').strip_prefix('"') {
+                    let value = value.trim_end_matches('#');
+                    found.push((line, Token::Str(value.strip_suffix('"').unwrap_or(value).to_string())));
+                }
+            }
+            Kind::Code if ident(chars[i]) => {
+                i = run(&|j| kinds[j] == Kind::Code && ident(chars[j]));
+                found.push((line, Token::Word(chars[start..i].iter().collect())));
+            }
+            Kind::Code => {
+                if !chars[i].is_whitespace() {
+                    found.push((line, Token::Punct(chars[i])));
+                }
+                i += 1;
+            }
+        }
+        line += chars[start..i].iter().filter(|c| **c == '\n').count();
+    }
+    found
+}
+
+/// Whether `token` is the word `word`.
+fn is_word(token: &Token, word: &str) -> bool {
+    matches!(token, Token::Word(w) if w == word)
+}
 
 /// Each `#[sqlx::test]` attribute in `source`, and each `use` of
 /// `sqlx::test`: its line (from 1) and whether it names a guarded migrator
 /// (an import never does).
 pub(crate) fn sqlx_tests(source: &str) -> Vec<(usize, bool)> {
-    let lines: Vec<&str> = source.lines().collect();
+    let (lines, tokens): (Vec<usize>, Vec<Token>) = tokens(source).into_iter().unzip();
     let mut found = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let code = line.trim_start();
-        if code.starts_with("#[") {
-            for attribute in attributes(&lines[i..]).iter().filter(|a| names_sqlx_test(a)) {
-                found.push((i + 1, GUARDED.iter().any(|g| attribute.contains(g))));
+    for (k, token) in tokens.iter().enumerate() {
+        let (line, rest) = (lines[k], &tokens[k + 1..]);
+        if *token == Token::Punct('#') && rest.first() == Some(&Token::Punct('[')) {
+            let mut depth = 0i32;
+            let end = rest.iter().position(|t| {
+                depth += match t {
+                    Token::Punct('[') => 1,
+                    Token::Punct(']') => -1,
+                    _ => 0,
+                };
+                depth == 0
+            });
+            let inner = &rest[..end.unwrap_or(rest.len())];
+            let names = inner.windows(4).any(|w| {
+                is_word(&w[0], "sqlx") && w[1] == Token::Punct(':') && w[2] == Token::Punct(':') && is_word(&w[3], "test")
+            });
+            let guarded = inner.windows(3).any(|w| {
+                is_word(&w[0], "migrator") && w[1] == Token::Punct('=') && matches!(&w[2], Token::Str(v) if GUARDED.contains(&v.as_str()))
+            });
+            if names {
+                found.push((line, guarded));
             }
-        } else if imports_sqlx_test(code) {
-            found.push((i + 1, false));
+        } else if is_word(token, "use") {
+            let end = rest.iter().position(|t| *t == Token::Punct(';')).unwrap_or(rest.len());
+            if imports_sqlx_test(&rest[..end]) {
+                found.push((line, false));
+            }
         }
     }
     found
 }
 
-/// The attributes that start `lines[0]`, each from `#[` to its own closing
-/// `]`, read across lines while one is open, with `//` comments outside a
-/// string left out. One still open when the source ends runs to there.
-fn attributes(lines: &[&str]) -> Vec<String> {
-    let (mut found, mut open, mut depth) = (Vec::new(), None::<String>, 0usize);
-    let (mut in_string, mut escaped) = (false, false);
-    for line in lines {
-        let chars: Vec<char> = line.chars().collect();
-        let mut j = 0;
-        while j < chars.len() {
-            let (c, next) = (chars[j], chars.get(j + 1).copied());
-            j += 1;
-            let Some(attribute) = open.as_mut() else {
-                match (c, next) {
-                    (' ' | '\t', _) => continue,
-                    ('#', Some('[')) => {
-                        open = Some("#[".to_string());
-                        depth = 1;
-                        j += 1;
-                        continue;
-                    }
-                    // Code or a comment after the attributes.
-                    _ => return found,
-                }
-            };
-            if in_string {
-                attribute.push(c);
-                match c {
-                    _ if escaped => escaped = false,
-                    '\\' => escaped = true,
-                    '"' => in_string = false,
-                    _ => {}
-                }
-                continue;
-            }
-            match (c, next) {
-                ('/', Some('/')) => break,
-                ('"', _) => in_string = true,
-                ('[', _) => depth += 1,
-                (']', _) => depth -= 1,
-                _ => {}
-            }
-            attribute.push(c);
-            if depth == 0 {
-                found.extend(open.take());
-            }
+/// Whether the use tree `tree` (after `use`, up to its `;`) imports
+/// `sqlx::test`, alone, renamed or in a group, nested groups included.
+fn imports_sqlx_test(tree: &[Token]) -> bool {
+    let (mut path, mut groups, mut alias) = (Vec::<&str>::new(), Vec::new(), false);
+    for token in tree {
+        let ends_a_tree = matches!(token, Token::Punct(',' | '}')) || is_word(token, "as");
+        if ends_a_tree && path.ends_with(&["sqlx", "test"]) {
+            return true;
         }
-        match open.as_mut() {
-            Some(attribute) => attribute.push('\n'),
-            None => return found,
+        match token {
+            Token::Word(_) if alias => alias = false,
+            Token::Word(w) if w == "as" => alias = true,
+            Token::Word(w) if w != "self" => path.push(w.as_str()),
+            Token::Punct('{') => groups.push(path.len()),
+            Token::Punct(',') => path.truncate(groups.last().copied().unwrap_or(0)),
+            Token::Punct('}') => path.truncate(groups.pop().unwrap_or(0)),
+            _ => {}
         }
     }
-    found.extend(open);
-    found
-}
-
-/// Whether `text` names the path `sqlx::test` (`::sqlx::test` included),
-/// not a longer name such as `sqlx::testing`.
-fn names_sqlx_test(text: &str) -> bool {
-    let ident = |c: char| c.is_alphanumeric() || c == '_';
-    text.match_indices("sqlx::test").any(|(at, m)| {
-        !text[..at].ends_with(ident) && !text[at + m.len()..].starts_with(ident)
-    })
-}
-
-/// Whether the line `code` is a `use` that imports `sqlx::test`, alone,
-/// renamed or in a `sqlx::{..}` group.
-fn imports_sqlx_test(code: &str) -> bool {
-    let code = code.split("//").next().unwrap_or_default();
-    let mut words = code.split_whitespace();
-    let first = words.next().unwrap_or_default();
-    let is_use = first == "use" || (first.starts_with("pub") && words.next() == Some("use"));
-    if !is_use {
-        return false;
-    }
-    let grouped = code.split_once("sqlx::{").is_some_and(|(_, rest)| {
-        let group = rest.split('}').next().unwrap_or_default();
-        group.split(',').any(|item| {
-            let item = item.trim();
-            item == "test" || item.starts_with("test ")
-        })
-    });
-    names_sqlx_test(code) || grouped
+    path.ends_with(&["sqlx", "test"])
 }
 
 /// `path:line` for each attribute in `source` that doesn't take the lock.
@@ -225,5 +231,58 @@ mod tests {
         for fine in ["use sqlx::PgPool;", "use sqlx::testing::TestArgs;", "use sqlx::{PgPool, Row};", "// use sqlx::test;"] {
             assert!(sqlx_tests(&format!("{fine}\n")).is_empty(), "{fine}");
         }
+    }
+
+    /// Review 2, finding 1: rustfmt splits a long group across lines.
+    #[test]
+    fn test_a_use_split_across_lines_is_read_to_its_semicolon() {
+        for import in [
+            "use sqlx::{\n    PgPool,\n    test,\n};",
+            "use sqlx::{PgPool, /* a note */ test};",
+            "use {sqlx::{Row, {test as t}}, std::fmt};",
+        ] {
+            let text = format!("mod m {{\n    {import}\n}}\n");
+            assert_eq!(unguarded("src/a.rs", &text), vec!["src/a.rs:2".to_string()], "{import}");
+        }
+        for fine in ["use sqlx::{\n    PgPool,\n    testing::TestArgs,\n};", "use other::{sqlx, test};"] {
+            assert!(sqlx_tests(&format!("{fine}\n")).is_empty(), "{fine}");
+        }
+    }
+
+    /// Review 2, finding 2: a block comment is not the attribute's text.
+    #[test]
+    fn test_a_guard_in_a_block_comment_does_not_count() {
+        for attribute in [format!("#[sqlx::test /* {GUARD} */]"), format!("#[sqlx::test( /* /* {GUARD} */ */ )]")] {
+            assert_eq!(sqlx_tests(&source(&attribute)), vec![(3, false)], "{attribute}");
+        }
+    }
+
+    /// Review 2, finding 3: an attribute anywhere in a line counts.
+    #[test]
+    fn test_an_attribute_after_code_on_its_line_is_a_finding() {
+        let bare = attr("");
+        for line in [
+            format!("fn a() {{}} {bare} async fn t(pool: PgPool) {{}}"),
+            format!("/** doc */ {bare}"),
+            format!("m!({bare} async fn t(pool: PgPool) {{}});"),
+        ] {
+            assert_eq!(sqlx_tests(&source(&line)), vec![(3, false)], "{line}");
+        }
+    }
+
+    /// Review 2, finding 4: raw strings and char literals end where Rust
+    /// ends them, and hold no attribute.
+    #[test]
+    fn test_raw_strings_and_char_literals_end_where_rust_ends_them() {
+        let bare = attr("");
+        for attribute in [
+            format!("#[sqlx::test(fixtures(r#\"a\"b\"#))]\n/// {GUARD}]"),
+            format!("#[sqlx::test(fixtures(r\"a\\\"))]\nconst S: &str = \"{GUARD}]\";"),
+            format!("let q = '\"'; let l: &'static str = \"\"; {bare}"),
+        ] {
+            assert_eq!(sqlx_tests(&source(&attribute)), vec![(3, false)], "{attribute}");
+        }
+        let hidden = format!("const S: &str = r#\"\n{bare}\n\"#;\n/*\n{bare}\n*/\n");
+        assert!(sqlx_tests(&hidden).is_empty(), "{hidden}");
     }
 }
