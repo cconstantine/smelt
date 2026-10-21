@@ -13,7 +13,10 @@
 # called dotenvy::from_path — which is load(), the call smelt makes — in a clean
 # process holding only that case's own environment, and printed the key it was
 # asked for. The reader was then run over the same fixtures the same way and the
-# two tables diffed: 0 differences over these 44 cases. If dotenvy ever changes
+# two tables diffed: 0 differences over these 50 cases. The last six (cr-only
+# on, from the review's differential driver over `from_path_iter`) pin where the
+# reader had drifted from dotenvy: splitting lines the crate does not split, and
+# dropping keys a bad line should not reach. If dotenvy ever changes
 # how it parses, regenerating the table that way is what shows it; the cases
 # below are where a line-based reader gets it wrong.
 #
@@ -130,6 +133,13 @@ check key-starts-with-underscore   '_KEY'         '1'                          '
 check leading-space-then-key       'KEY'          '1'                          ''     '   KEY=1\n'
 check comment-line-inside-multiline 'KEY'          $'a\n# not a comment\nb'     ''     'KEY="a\n# not a comment\nb"\n'
 check trailing-backslash-joins     'KEY'          'a'                          'stops' 'KEY=a\\\nb\n'
+check cr-only-is-content           'KEY'          $'1\rKEY2=2'                 ''     'KEY=1\rKEY2=2\r'
+check cr-only-no-second-key        'KEY2'         ''                           ''     'KEY=1\rKEY2=2\r'
+check vtab-keeps-the-line          'KEY'          $'a\vb'                      ''     'KEY=a\013b\nKEY2=2\n'
+check formfeed-keeps-the-line      'KEY'          $'a\fb'                      ''     'KEY=a\014b\nKEY2=2\n'
+check multiline-crlf-keeps-it      'KEY'          $'m\r\nn'                    ''     'KEY="m\r\nn"\nKEY2=2\n'
+check invalid-utf8-keeps-earlier   'KEY'          '1'                          'stops' 'KEY=1\n\377\376=x\nKEY2=2\n'
+check invalid-utf8-stops-after     'KEY2'         ''                           'stops' 'KEY=1\n\377\376=x\nKEY2=2\n'
 check missing-key                  'KEY'          ''                           ''     'OTHER=1\n'
 
 # Two things the table can't say, because they aren't about a file's contents.

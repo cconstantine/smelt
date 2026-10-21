@@ -18,10 +18,15 @@ The rules it reproduces, each of which a line-based reader gets wrong:
     space and \n, and substitute $NAME and ${NAME} — the environment's value
     first, then an earlier line's, then empty;
   * an unquoted value ends at whitespace, after which only a `#` comment may
-    follow (`KEY=` and `KEY= # c` read empty); a quoted value can span lines,
-    and so can one left open by a trailing `\` or trailing whitespace;
-  * a leading BOM is skipped (as `load()`, smelt's path, does) and CRLF line
-    endings are handled.
+    follow (`KEY=` and `KEY= # c` read empty); only a quote left open spans
+    lines — a line ending in `\` or in whitespace still ends its entry, and
+    the fixture named trailing-backslash-joins records dotenvy's answer;
+  * lines split on `\n` only: a lone CR, `\v` or `\f` is content, not a line
+    ending. An entry's own terminator — a `\n` and a `\r` right before it —
+    comes off, and nothing inside it does, so a CRLF inside a quoted value
+    stays `\r\n` as it is in the crate; a leading BOM is skipped (as
+    `load()`, smelt's path, does); and lines decode as they are read, so
+    keys before a line that is not valid UTF-8 keep their values.
 
 NAME's own value in the environment is NOT consulted: each caller settles
 that precedence for itself (check-server's effective_value and browser-tier
@@ -94,13 +99,23 @@ def _eval_end_state(state, chunk):
 class QuotedLines:
     r"""iter.rs's QuotedLines: one parseable entry per next(), quotes and all.
 
-    An entry whose quote never closes takes the lines after it; so does one
-    ending in a `\` or in whitespace. `line_no` is where the current entry
-    started, `entries` the lines it spans.
+    Lines are what dotenvy's reader sees, and it splits them on `\n` only:
+    a lone CR, `\v` or `\f` is content, not a line ending (Python's
+    splitlines cuts on those; dotenvy does not — SME-186 review 1). An
+    entry whose quote never closes takes the lines after it, bytes and all,
+    so a CRLF inside a quoted value stays `\r\n` as it does for the crate;
+    the entry's own final terminator — a `\n`, and a `\r` before it — is
+    what comes off. Each line decodes as it is read, so keys before a line
+    that is not valid UTF-8 keep their values, as they do for dotenvy's
+    line-by-line reading. `line_no` is where the current entry started.
     """
 
-    def __init__(self, text):
-        self.lines = iter(text.splitlines(keepends=True))
+    def __init__(self, data):
+        parts = data.split(b"\n")
+        lines = [p + b"\n" for p in parts[:-1]]
+        if parts[-1]:
+            lines.append(parts[-1])
+        self.lines = iter(lines)
         self.read = 0
         self.line_no = 0
 
@@ -108,15 +123,20 @@ class QuotedLines:
         buf = ""
         state = COMPLETE
         while True:
-            buf_pos = len(buf)
-            if buf_pos == 0:
+            at = len(buf)
+            if at == 0:
                 self.line_no = self.read + 1
             try:
-                line = next(self.lines)
+                raw = next(self.lines)
             except StopIteration:
                 if state == COMPLETE:
                     raise
                 raise StopLoad(self.line_no, "the file ends inside a quoted value")
+            try:
+                line = raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise StopLoad(self.read + 1,
+                               "the line is not valid UTF-8 (%s)" % exc.reason)
             self.read += 1
             buf += line
             # As dotenvy: the accumulated entry, not the new line — so a `#`
@@ -131,7 +151,7 @@ class QuotedLines:
                         buf = buf[:-1]
                 return buf
             if state == COMMENT:
-                return buf[:buf_pos + pos]
+                return buf[:at + pos]
 
 
 def _substitute(name, substitutions, env):
@@ -296,12 +316,8 @@ def load(path, env):
     # iter.rs's remove_bom, which load() — smelt's path — does before iterating.
     if data.startswith(b"\xef\xbb\xbf"):
         data = data[3:]
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise StopLoad(1, "the file is not valid UTF-8 (%s)" % exc.reason)
     substitutions = {}
-    entries = QuotedLines(text)
+    entries = QuotedLines(data)
     while True:
         try:
             entry = next(entries)
