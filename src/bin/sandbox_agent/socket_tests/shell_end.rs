@@ -247,3 +247,106 @@ async fn test_terminating_a_terminal_whose_shell_already_ended_kills_nothing() {
         .collect();
     assert!(kills.is_empty(), "a killpg was sent to the ended shell's group: {kills:?}");
 }
+
+/// A command's stdout, stderr and exit code, from the agent's event
+/// queue (no socket); events of other commands are skipped.
+async fn collect_command(state: &Arc<AppState>, id: &str) -> (Vec<String>, Vec<String>, i32) {
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    loop {
+        let event = tokio::time::timeout(WAIT, recv_shell_event(state))
+            .await
+            .unwrap_or_else(|_| panic!("{id} didn't exit: {} stdout lines, stderr {stderr:?}", stdout.len()))
+            .expect("the event queue closed");
+        match event_message(event) {
+            Some(AgentMessage::Output { id: of, stream, data, .. }) if of == id => match stream {
+                Stream::Stdout => stdout.push(data),
+                Stream::Stderr => stderr.push(data),
+            },
+            Some(AgentMessage::Exit { id: of, code, .. }) if of == id => return (stdout, stderr, code),
+            _ => {}
+        }
+    }
+}
+
+/// Waits until process `pid` has exited (a zombie, or reaped already).
+async fn wait_until_exited(pid: u32) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let state = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string));
+        if matches!(state.as_deref(), None | Some("Z")) {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "process {pid} didn't exit");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Runs `command` (which waits for the file `{go}` to exist, and then
+/// ends its shell) in a new terminal whose reader is stalled for 400 ms
+/// right after reaping the shell, as on a busy node, with the shell's
+/// last output still in its pipes. The reader is held off reading (by
+/// `current`'s lock, which it takes for each line) until the shell has
+/// exited, so that output is all unread when it's reaped.
+async fn run_with_the_reader_stalled_after_the_reap(terminal_id: &str, command: &str) -> (Vec<String>, Vec<String>, i32) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let go = std::env::temp_dir().join(format!("{terminal_id}-{}-{nanos}", std::process::id()));
+    let state = new_state();
+    assert_eq!(crate::create_terminal(&state, terminal_id.to_string()).await, Reply::TerminalCreated);
+    let shell = state.terminals.lock().await.get(terminal_id).cloned().expect("the terminal");
+    let pause = test_hooks::pause_after_reap(terminal_id);
+    start_command(&state, terminal_id, "c1".to_string(), &command.replace("{go}", &go.display().to_string())).await;
+
+    let current = shell.current.lock().await;
+    std::fs::write(&go, "").expect("write the go file");
+    wait_until_exited(shell.bash_pid).await;
+    drop(current);
+    tokio::time::timeout(WAIT, pause.reached.notified()).await.expect("the reader never reaped the shell");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    pause.release.notify_one();
+    let _ = std::fs::remove_file(&go);
+    collect_command(&state, "c1").await
+}
+
+/// SME-191 review 1, finding 1: a shell that exits with no job running,
+/// and whose reader falls behind (a busy node), still has all its last
+/// output read, and its note doesn't speak of background jobs: with no
+/// job holding them, its pipes always reach their end.
+#[tokio::test]
+async fn test_a_slow_reader_still_gets_all_of_a_jobless_shells_last_output() {
+    let (stdout, stderr, code) = run_with_the_reader_stalled_after_the_reap(
+        "sme191-r1-jobless",
+        "while [ ! -e '{go}' ]; do sleep 0.01; done; seq 1 5000; exit 0",
+    )
+    .await;
+    assert_eq!(code, 0);
+    let expected: Vec<String> = (1..=5000).map(|n| n.to_string()).collect();
+    assert!(stdout == expected, "stdout should be 1..=5000, got {} lines", stdout.len());
+    assert!(
+        stderr.len() == 1 && stderr[0].contains("shell exited") && !stderr[0].contains("background"),
+        "the note should say only that the shell exited: {stderr:?}"
+    );
+}
+
+/// SME-191 review 1, finding 1: a shell that exits leaving a job that
+/// holds its pipes, and whose reader falls behind, still has all of its
+/// own last output read before its command finishes.
+#[tokio::test]
+async fn test_a_slow_reader_still_gets_all_of_a_shells_last_output_when_a_job_holds_its_pipes() {
+    let (stdout, stderr, code) = run_with_the_reader_stalled_after_the_reap(
+        "sme191-r1-job",
+        "sleep 30 & echo \"job $!\" >&2; while [ ! -e '{go}' ]; do sleep 0.01; done; seq 1 5000; exit 4",
+    )
+    .await;
+    let _job = JobGuard(job_pid(&stderr));
+    assert_eq!(code, 4);
+    let expected: Vec<String> = (1..=5000).map(|n| n.to_string()).collect();
+    assert!(stdout == expected, "stdout should be 1..=5000, got {} lines", stdout.len());
+    assert!(
+        stderr.iter().any(|line| line.contains("shell exited") && line.contains("background")),
+        "the note should say a background job is still running: {stderr:?}"
+    );
+}
