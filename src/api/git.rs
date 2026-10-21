@@ -173,10 +173,12 @@ async fn read_attach_answer(answered: tokio::sync::oneshot::Receiver<AttachAnswe
 type AttachAnswer = (Result<RepoSummary, String>, tokio::sync::oneshot::Sender<()>);
 
 /// Hands the attach's start back to the request waiting for it. A
-/// failure nobody read (the tab closed, before the send or after it) is
-/// shown in the conversation instead, as a failure after the answer is
+/// failure no request read (the tab closed, before the send or after it)
+/// is shown in the conversation instead, as a failure after the answer is
 /// (SME-91); a conversation deleted meanwhile is left with no turn state
-/// (SME-219).
+/// (SME-219). "Read" means read by the server function, not seen by the
+/// user: a tab that switched conversations while the attach waited reads
+/// the failure and drops it (SME-224 review 2).
 #[cfg(feature = "server")]
 async fn hand_back_attach(
     pool: &sqlx::PgPool,
@@ -185,12 +187,12 @@ async fn hand_back_attach(
     started: Result<RepoSummary, String>,
 ) {
     let error = started.as_ref().err().cloned();
-    // Seen only once the request says it read it: a request dropped
-    // between the send and its read (the tab closed) never saw it
+    // Read only once the request says it read it: a request dropped
+    // between the send and its read (the tab closed) never read it
     // (SME-224 review 1).
     let (ack, acked) = tokio::sync::oneshot::channel();
-    let seen = answer.send((started, ack)).is_ok() && acked.await.is_ok();
-    if let (Some(e), false) = (error, seen) {
+    let read = answer.send((started, ack)).is_ok() && acked.await.is_ok();
+    if let (Some(e), false) = (error, read) {
         tracing::warn!(conversation_id, error = %e, "\"Work on a repo\" failed with nobody waiting");
         crate::turn::show_error_outside_turn(pool, conversation_id, format!("\"Work on a repo\" failed. {e}")).await;
     }
@@ -488,7 +490,7 @@ mod tests {
     /// SME-224 review 1, finding 3. Interleaving: the failure reaches the
     /// request's channel, and the request is dropped before it reads it
     /// (the tab closed between the send and the request's next poll).
-    /// Nobody saw it, so it's shown in the conversation.
+    /// No request read it, so it's shown in the conversation.
     #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_an_attach_failure_sent_but_never_read_shows_in_the_conversation(pool: sqlx::PgPool) {
         let _guard = crate::providers::test_support::lock_turn_tests();
