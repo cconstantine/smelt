@@ -143,8 +143,8 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `subscribe_app_events` | `GET /api/app-events` | always-open app-wide stream (`AppEvent`), for the pods page |
 | `get_build_id` (`api::version`) | `GET /api/build-id` | the server's `SMELT_BUILD_ID`; a tab asks on every stream (re)connect and offers a reload when it isn't its own (see [architecture.md](architecture.md#live-channels)). The browser tier can override it (`test_override`, `browser-test` only) |
 | `list_conversation_repos` | `GET /api/conversations/{id}/repos` | the conversation's repos, for the sandbox panel, see `ReposUpdate` above |
-| `attach_repo` | `POST /api/conversations/{id}/repos` | "Work on a repo": trusts the remote, starts the sandbox if needed and clones |
-| `decide_repo_trust` | `POST /api/conversations/{id}/instruction-requests/{request_id}` | the trust card's answer; remembered for the remote; on Trust loads exactly the file the card showed; tells and wakes the model |
+| `attach_repo` | `POST /api/conversations/{id}/repos` | "Work on a repo": trusts the remote (under its trust lock, dropping its cards, SME-224), starts the sandbox if needed and clones; runs on if the tab closes, and a failure nobody waits for shows in the conversation (SME-225) |
+| `decide_repo_trust` | `POST /api/conversations/{id}/instruction-requests/{request_id}` | the trust card's answer; remembered for the remote; on Trust loads exactly the file the card showed; tells and wakes the model; runs on if the tab closes (SME-225) |
 | `get_pending_question` (`api::questions`) | `GET /api/conversations/{id}/question` | the question the conversation waits on (none once answered), for the card; live as `QuestionUpdate` |
 | `answer_question` | `POST /api/conversations/{id}/question/answer` | the card's answer, one per question; recorded once, then a turn sends it (see "The model's questions") |
 | `get_waiting_conversations` | `GET /api/questions/waiting` | conversations waiting on an answer, for the sidebar |
