@@ -396,8 +396,8 @@ async fn test_a_notice_after_a_delete_leaves_no_turn_state(pool: PgPool) {
     let sent = db::create_conversation(&pool).await.expect("create conversation").id;
     delete_as_the_api_does(&pool, sent).await;
     // `start_turn`'s own step, after its exists check passed.
-    let generation = new_turn_generation(sent);
-    let result = run_turn_bounded(&pool, sent, Some(hello()), MAX_TURNS, Some(generation), true).await;
+    let (turn, generation) = TurnInFlight::start_by_user(sent);
+    let result = run_turn_bounded(&pool, turn, Some(hello()), MAX_TURNS, Some(generation), true).await;
     assert!(result.as_ref().is_err_and(|e| e.to_string().contains("not found")), "{result:?}");
     assert!(!has_turn_state(sent), "a send racing the delete left turn state");
 }
@@ -415,10 +415,10 @@ async fn test_a_delete_after_the_exists_check_leaves_no_turn_state(pool: PgPool)
     let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
     let (reached, release) = test_hooks::pause_after_message_saved(conversation_id);
 
-    let generation = new_turn_generation(conversation_id);
+    let (in_flight, generation) = TurnInFlight::start_by_user(conversation_id);
     let turn = tokio::spawn({
         let pool = pool.clone();
-        async move { run_turn_bounded(&pool, conversation_id, Some(hello()), MAX_TURNS, Some(generation), true).await }
+        async move { run_turn_bounded(&pool, in_flight, Some(hello()), MAX_TURNS, Some(generation), true).await }
     });
     tokio::time::timeout(std::time::Duration::from_secs(5), reached)
         .await

@@ -33,9 +33,11 @@ pub async fn after_message_saved(conversation_id: i64) {
 
 static AFTER_TURN_COUNTED: LazyLock<Mutex<HashMap<i64, Pause>>> = LazyLock::new(Default::default);
 
-/// Pauses `conversation_id`'s next turn right after it's counted as in
-/// flight (`TurnInFlight::start`), before it waits for the turn lock. As
-/// `pause_after_message_saved`.
+/// Pauses `conversation_id`'s next turn after it's admitted: counted as
+/// in flight by its caller (`TurnInFlight::start_by_user`, SME-216, or
+/// `start_unless_paused`, SME-217; in a test's `run_turn`,
+/// `TurnInFlight::start`), when its future first runs, before it waits
+/// for the turn lock. As `pause_after_message_saved`.
 pub fn pause_after_turn_counted(conversation_id: i64) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
     let (reached_tx, reached_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
@@ -130,4 +132,17 @@ pub fn pause_during_record(conversation_id: i64) -> (oneshot::Receiver<()>, ones
 
 pub async fn during_record(conversation_id: i64) {
     reach(&DURING_RECORD, conversation_id).await;
+}
+
+static AFTER_NOTICE_ADMITTED: Pauses = LazyLock::new(Default::default);
+
+/// Pauses `conversation_id`'s next wake or delivered notice right after
+/// it's let in past the pause, before it waits for the turn lock
+/// (SME-217). As `pause_after_message_saved`.
+pub fn pause_after_notice_admitted(conversation_id: i64) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pause_at(&AFTER_NOTICE_ADMITTED, conversation_id)
+}
+
+pub async fn after_notice_admitted(conversation_id: i64) {
+    reach(&AFTER_NOTICE_ADMITTED, conversation_id).await;
 }

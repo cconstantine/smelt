@@ -147,10 +147,11 @@ pub(crate) async fn answer_question(
         return Err(ServerFnError::new(ALREADY_ANSWERED));
     }
     publish_question(conversation_id, None);
-    resume_turns(conversation_id);
-    let generation = new_turn_generation(conversation_id);
+    // Admitted before this returns, so a Stop sent after it ends the
+    // answer's turn (SME-216).
+    let (in_flight, generation) = TurnInFlight::start_by_user(conversation_id);
     tokio::spawn(async move {
-        if let Err(e) = run_turn_bounded(&pool, conversation_id, None, MAX_TURNS, Some(generation), false).await {
+        if let Err(e) = run_turn_bounded(&pool, in_flight, None, MAX_TURNS, Some(generation), false).await {
             let message = e.message();
             crate::events::publish(conversation_id, crate::events::ConversationEvent::TurnError { message });
         }
