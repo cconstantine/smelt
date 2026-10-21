@@ -378,7 +378,8 @@ pub(super) fn render_context_detail_body(detail: Option<&Result<ContextDetailSna
                     "output: {detail.spend.output_tokens}"
                 }
                 p { class: "muted",
-                    "Completed calls only: a stopped or failed call isn't counted. Each call is priced from models.dev's list "
+                    "A stopped or failed call is counted with what it used before it ended; its output is estimated when the "
+                    "provider hadn't said yet. Each call is priced from models.dev's list "
                     "when it finished, without time-of-day surcharges such as DeepSeek's peak hours."
                     if let Some(at) = detail.prices_as_of {
                         {format!(" Prices as of {} UTC.", at.format("%Y-%m-%d %H:%M"))}
