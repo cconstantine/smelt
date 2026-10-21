@@ -223,3 +223,27 @@ async fn test_terminating_a_terminal_whose_job_holds_its_pipes_ends_its_shell_pr
     }
     assert!(signal::kill(Pid::from_raw(job.0), None).is_ok(), "the background job should be left running");
 }
+
+/// SME-191: terminating a terminal whose shell has already ended kills
+/// nothing. The shell has been reaped, so its process group id is free
+/// and could be another process's (another terminal's job leads its own).
+#[tokio::test]
+async fn test_terminating_a_terminal_whose_shell_already_ended_kills_nothing() {
+    let logs = captured_logs();
+    let addr = serve_agent().await;
+    let mut client = connect_ready(addr).await;
+    create_terminal(&mut client, "sme191-ended").await;
+    // The exit is sent once the shell is marked ended.
+    let (_, _, code) = run_collect(&mut client, "sme191-ended", "c1", "exit 3").await;
+    assert_eq!(code, 3);
+
+    send(&mut client, &ClientMessage::TerminateTerminal { request_id: 2, terminal_id: "sme191-ended".into() }).await;
+    assert_eq!(next(&mut client).await, AgentMessage::Reply { request_id: 2, result: Reply::TerminalTerminated });
+
+    let logged = String::from_utf8_lossy(&logs.0.lock().expect("log buffer")).into_owned();
+    let kills: Vec<&str> = logged
+        .lines()
+        .filter(|line| line.contains("killpg failed while terminating terminal") && line.contains("sme191-ended"))
+        .collect();
+    assert!(kills.is_empty(), "a killpg was sent to the ended shell's group: {kills:?}");
+}

@@ -152,6 +152,12 @@ pub(super) async fn terminate_terminal(state: &Arc<AppState>, terminal_id: Strin
     let Some(shell) = shell else {
         return reply_error("unknown terminal_id");
     };
+    // An ended shell has been reaped (by its reader), so its group id is
+    // free and could be another process's (SME-191). Jobs it left running
+    // live on, as they do when a running shell's group is killed.
+    if shell.ended.load(Ordering::SeqCst) {
+        return Reply::TerminalTerminated;
+    }
 
     if let Err(err) = signal::kill(Pid::from_raw(-(shell.bash_pid as i32)), Signal::SIGKILL) {
         tracing::warn!(%err, %terminal_id, "killpg failed while terminating terminal");
