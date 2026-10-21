@@ -5,7 +5,7 @@ use serde_json::Value;
 use super::TokenUsage;
 
 /// A single interpreted Anthropic SSE payload, reduced to what
-/// `stream_anthropic_message` needs to act on. Anthropic's stream carries
+/// `stream_anthropic_message_metered` needs to act on. Anthropic's stream carries
 /// several event types (message_start, content_block_start,
 /// content_block_delta, content_block_stop, message_delta, message_stop) —
 /// only text/thinking deltas and errors matter for v1, everything else is
@@ -33,7 +33,7 @@ pub enum StreamOutcome {
     /// this call, unless a `message_delta` replaces them (`DeltaUsage`).
     /// `output_tokens` here is a placeholder Anthropic sends before any
     /// output has streamed; a `Delta`'s `output_tokens` (arriving later)
-    /// is what actually finalizes it — see `stream_anthropic_message`.
+    /// is what actually finalizes it — see `stream_anthropic_message_metered`.
     InitialUsage(TokenUsage),
     Error(String),
     Ignored,

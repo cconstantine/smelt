@@ -506,9 +506,11 @@ fn run_turn_steps<'a: 'b, 'b>(
             let (mut request, budget) =
                 build_request(pool, conversation_id, turn_model, last_known_usage.as_ref(), &pending_new_content)
                     .await?;
-            let turn = call_model(conversation_id, turn_model, &mut request).await?;
+            let (turn, recorder) = call_model(pool, conversation_id, turn_model, &mut request).await?;
             save_reply(pool, conversation_id, &turn, &mut persisted).await?;
-            record_call(pool, conversation_id, turn_model, &turn).await?;
+            #[cfg(test)]
+            test_hooks::after_reply_saved(conversation_id).await;
+            recorder.finish(&turn, Some(turn_model.context_window)).await?;
             // The new baseline the *next* compaction check starts from:
             // everything up through this response is now accounted for, so
             // `pending_new_content` resets — only what's persisted after
