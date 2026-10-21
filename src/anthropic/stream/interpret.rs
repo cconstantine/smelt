@@ -22,22 +22,77 @@ pub enum StreamOutcome {
     },
     ToolUseInputDelta(String),
     BlockStop,
-    /// `output_tokens` is `None` only if a `message_delta` event genuinely
-    /// carried no `usage` field at all (defensive — real Anthropic
-    /// responses always include one alongside `stop_reason`) — distinct
-    /// from a real, explicit zero.
-    StopReason {
-        reason: String,
-        output_tokens: Option<i64>,
+    /// A `message_delta`: its `stop_reason`, if it has one, and its
+    /// `usage`, read with or without a stop reason (SME-178). One with
+    /// neither is `Ignored`.
+    Delta {
+        stop_reason: Option<String>,
+        usage: DeltaUsage,
     },
-    /// `message_start`'s own `usage` — the authoritative input/cache token
-    /// counts for this call. `output_tokens` here is a placeholder Anthropic
-    /// sends before any output has streamed; `StopReason`'s own
-    /// `output_tokens` (from `message_delta`, arriving later) is what
-    /// actually finalizes it — see `stream_anthropic_message`.
+    /// `message_start`'s own `usage` — the input/cache token counts for
+    /// this call, unless a `message_delta` replaces them (`DeltaUsage`).
+    /// `output_tokens` here is a placeholder Anthropic sends before any
+    /// output has streamed; a `Delta`'s `output_tokens` (arriving later)
+    /// is what actually finalizes it — see `stream_anthropic_message`.
     InitialUsage(TokenUsage),
     Error(String),
     Ignored,
+}
+
+/// A `message_delta`'s `usage`, each count `None` when the event left it
+/// out (`TokenUsage`'s `serde(default)` can't tell a missing count from
+/// zero). Counts in it are cumulative for the call.
+///
+/// Where providers put their counts (SME-178, B26): Anthropic sends input
+/// and cache counts in `message_start` and usually only `output_tokens`
+/// here, but a server tool's work raises the delta's `input_tokens`;
+/// Ollama's `message_start` has only its request-size estimate, and its
+/// delta the real counts; LiteLLM's `/v1/messages` adapter sends zeros in
+/// `message_start` and the real counts here, or placeholder zeros when
+/// its upstream sent no usage. llama.cpp sends real counts in
+/// `message_start` and only `output_tokens` here.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DeltaUsage {
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_creation_input_tokens: Option<i64>,
+    pub cache_read_input_tokens: Option<i64>,
+}
+
+impl DeltaUsage {
+    fn from_value(usage: &Value) -> Self {
+        let count = |key: &str| usage.get(key).and_then(Value::as_i64);
+        Self {
+            input_tokens: count("input_tokens"),
+            output_tokens: count("output_tokens"),
+            cache_creation_input_tokens: count("cache_creation_input_tokens"),
+            cache_read_input_tokens: count("cache_read_input_tokens"),
+        }
+    }
+
+    /// Applies this delta to the call's usage so far: a present
+    /// `output_tokens` replaces the old one. The input side is replaced
+    /// only when one of its counts here is non-zero, each count present
+    /// replacing and each missing one kept; all zero or missing is a
+    /// placeholder (LiteLLM's) or a plain Anthropic delta, and
+    /// `message_start`'s counts stand.
+    pub fn apply_to(&self, usage: &mut TokenUsage) {
+        if let Some(output) = self.output_tokens {
+            usage.output_tokens = output;
+        }
+        let input_side = [self.input_tokens, self.cache_creation_input_tokens, self.cache_read_input_tokens];
+        if input_side.iter().any(|count| count.is_some_and(|c| c != 0)) {
+            if let Some(input) = self.input_tokens {
+                usage.input_tokens = input;
+            }
+            if let Some(creation) = self.cache_creation_input_tokens {
+                usage.cache_creation_input_tokens = creation;
+            }
+            if let Some(read) = self.cache_read_input_tokens {
+                usage.cache_read_input_tokens = read;
+            }
+        }
+    }
 }
 
 /// Parse one decoded JSON payload from an Anthropic SSE `data:` line.
@@ -114,20 +169,19 @@ pub(super) fn interpret_stream_event(value: &Value) -> StreamOutcome {
             }
         }
         Some("content_block_stop") => StreamOutcome::BlockStop,
-        Some("message_delta") => match value
-            .get("delta")
-            .and_then(|d| d.get("stop_reason"))
-            .and_then(Value::as_str)
-        {
-            Some(reason) => StreamOutcome::StopReason {
-                reason: reason.to_string(),
-                output_tokens: value
-                    .get("usage")
-                    .and_then(|u| u.get("output_tokens"))
-                    .and_then(Value::as_i64),
-            },
-            None => StreamOutcome::Ignored,
-        },
+        Some("message_delta") => {
+            let stop_reason = value
+                .get("delta")
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let usage = value.get("usage").map(DeltaUsage::from_value).unwrap_or_default();
+            if stop_reason.is_none() && usage == DeltaUsage::default() {
+                StreamOutcome::Ignored
+            } else {
+                StreamOutcome::Delta { stop_reason, usage }
+            }
+        }
         Some("error") => {
             let message = value
                 .get("error")

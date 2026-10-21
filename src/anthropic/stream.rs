@@ -23,10 +23,11 @@ pub struct StreamedTurn {
     pub content: Vec<ContentBlock>,
     pub stop_reason: String,
     /// Real usage for *this call* — `input_tokens`/cache fields from
-    /// `message_start`, `output_tokens` from the last `message_delta` that
-    /// carried one (overwritten each time it arrives, same "last one wins"
-    /// treatment `stop_reason` itself already gets). See
-    /// SME-18.
+    /// `message_start`, or from a `message_delta` that carries non-zero
+    /// ones (`DeltaUsage::apply_to`, SME-178), `output_tokens` from the
+    /// last `message_delta` that carried one (overwritten each time it
+    /// arrives, same "last one wins" treatment `stop_reason` itself
+    /// already gets). See SME-18.
     pub usage: TokenUsage,
     /// The tool call a cut-off reply stopped in the middle of, by name
     /// (SME-126): dropped from `content`, never run.
@@ -670,14 +671,11 @@ async fn stream_message(
                 ),
                 StreamOutcome::ToolUseInputDelta(partial_json) => blocks.tool_input(index, &partial_json),
                 StreamOutcome::BlockStop => blocks.stop(index),
-                StreamOutcome::StopReason {
-                    reason,
-                    output_tokens,
-                } => {
-                    stop_reason = reason;
-                    if let Some(output_tokens) = output_tokens {
-                        usage.output_tokens = output_tokens;
+                StreamOutcome::Delta { stop_reason: reason, usage: delta } => {
+                    if let Some(reason) = reason {
+                        stop_reason = reason;
                     }
+                    delta.apply_to(&mut usage);
                 }
                 StreamOutcome::InitialUsage(initial) => {
                     usage.input_tokens = initial.input_tokens;
