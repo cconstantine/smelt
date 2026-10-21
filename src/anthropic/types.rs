@@ -24,7 +24,7 @@ pub enum ContentBlock {
     /// always the *first* block in an assistant turn's content when
     /// present. `signature` is an opaque token Anthropic uses to verify
     /// this block wasn't tampered with if it's echoed back in a later
-    /// turn's history (as it is here — `run_turn` persists and replays
+    /// turn's history (as it is here — `run_turn_bounded` persists and replays
     /// `ContentBlock`s uninterpreted); never displayed, just carried
     /// through as-is.
     Thinking {

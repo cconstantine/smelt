@@ -3,7 +3,7 @@
 
 use super::*;
 
-/// Bound on how many tool-use turns one `run_turn` call will chase before
+/// Bound on how many tool-use turns one `run_turn_bounded` call chases before
 /// giving up. Raised from the original placeholder of 5 (fine for `add`/
 /// `count`, hit almost immediately by a real multi-step coding session using
 /// the sandbox terminal tools) — still not a load-bearing safety limit, just
@@ -32,9 +32,10 @@ pub(super) const MIN_REPLY_TOKENS: u32 = 16_384;
 /// itself. Its reply streams to every tab through the conversation's
 /// events (`relay_reply_delta`).
 /// Returns a boxed, type-erased future rather than using plain `async fn`
-/// sugar: `run_turn` calls `anthropic::tools::execute`, and a tool's
-/// spawned work can wake the model, calling back into `run_turn` (a
-/// finished clone, a command's completion) — that recursion defeats rustc's
+/// sugar, as `run_turn_bounded` does, which it wraps: the turn loop calls
+/// `anthropic::tools::execute`, and a tool's spawned work can wake the
+/// model, calling back into `run_turn_bounded` (a finished clone, a
+/// command's completion) — that recursion defeats rustc's
 /// `Send`-auto-trait inference for plain `async fn`s ("cannot satisfy `impl
 /// Future: Send`" with no useful location). Type-erasing one edge of the
 /// cycle here breaks it.
@@ -432,7 +433,7 @@ fn run_turn_steps<'a: 'b, 'b>(
 
         for _ in 0..max_turns {
             // Checked at the top of every loop iteration, not just once per
-            // `run_turn` call — this is what gives same-turn visibility: if
+            // `run_turn_bounded` call — this is what gives same-turn visibility: if
             // a command finishes partway through a turn's tool-calling
             // loop, the very next iteration already sees the notification,
             // without waiting for a fresh user message. See SME-9's

@@ -522,7 +522,7 @@ pub async fn read_terminal_output(
     .await
 }
 
-/// Backs the completion-notification check in `run_turn`'s loop — both
+/// Backs the completion-notification check in `run_turn_bounded`'s loop — both
 /// terminal states (`finished` and `lost`) need exactly one notification
 /// each, so this matches either, not just `finished`.
 pub async fn unnotified_finished_terminal_commands(

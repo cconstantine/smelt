@@ -39,7 +39,7 @@ impl Message {
 
 Two `ContentBlock` variants exist only for smelt's own bookkeeping, never sent or accepted by Anthropic itself — `CompactionSummary` and `CompactionPlaceholder` (auto-compaction's own output — see SME-18). `history_for_request` translates both into plain `Text` blocks before they're ever replayed to the real API; storage and rendering see the real variant.
 
-Don't confuse `models::Message` (a database row) with `anthropic::AnthropicMessage` (an Anthropic API wire message, `{role, content: Vec<ContentBlock>}`) — `run_turn` converts between them when building a request and when persisting a turn.
+Don't confuse `models::Message` (a database row) with `anthropic::AnthropicMessage` (an Anthropic API wire message, `{role, content: Vec<ContentBlock>}`) — `run_turn_bounded` converts between them when building a request and when persisting a turn.
 
 ## Language servers
 

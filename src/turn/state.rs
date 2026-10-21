@@ -18,8 +18,8 @@ static RUNTIMES: LazyLock<Mutex<HashMap<i64, ConversationRuntime>>> = LazyLock::
 /// forgets it (SME-219).
 #[derive(Default)]
 pub(super) struct ConversationRuntime {
-    /// The turn lock. A live `send_message` call and a notice's `run_turn`
-    /// call (a finished command waking the model, say, or two notices at
+    /// The turn lock. A live `send_message` call and a notice's
+    /// `run_turn_bounded` call (a finished command waking the model, say, or two notices at
     /// once) can race for the same conversation — Anthropic's strict
     /// user/assistant alternation breaks if two writers persist a turn at
     /// once. Which caller acquires it first when several are ready is

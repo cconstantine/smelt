@@ -69,7 +69,7 @@ pub(super) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: St
 
 /// Wakes `conversation_id`'s turn loop because a terminal command reached a
 /// terminal state (finished or lost) — no synthetic message of its own,
-/// unlike `run_turn`; just triggers the same backlog drain
+/// unlike a send's or a notice's turn; just triggers the same backlog drain
 /// `run_turn_bounded`'s loop already does on every iteration. A true no-op
 /// if, by the time this acquires the conversation lock, nothing is actually
 /// pending (e.g. another concurrent wake, or an unrelated live message,
