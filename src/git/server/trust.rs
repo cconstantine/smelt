@@ -110,18 +110,77 @@ async fn settle(
 
     // Other requests about this remote: their files weren't shown, so
     // they're dropped, and their conversations told where things stand.
-    let mut others = Vec::new();
-    for other in db::list_instruction_requests_for_remote(&mut *tx, remote_key).await.map_err(e)? {
-        db::delete_instruction_request(&mut *tx, other.id).await.map_err(e)?;
-        // Its conversation was deleted since the list: nothing to tell.
-        let Some(other_repo) = db::get_conversation_repo(&mut *tx, other.repo_id).await.map_err(e)? else {
-            continue;
-        };
-        let other_file = format!("{}/{}/{}", crate::sandbox::WORKSPACE_DIR, other_repo.dir, other.path);
-        others.push((other, other_file));
-    }
+    let others = drop_cards_for_remote(&mut *tx, remote_key).await?;
 
     Ok(Settled { repo, file, others, unloaded })
+}
+
+/// Drops every card about the remote, in `tx` under its trust lock with
+/// the conversations share-locked first (see `settle`), in id order.
+/// Returns each card dropped and its file's path. A card whose
+/// conversation was deleted since the list is dropped with nothing to
+/// tell. Shared by a decision and "Work on a repo", so the two can't
+/// drift.
+async fn drop_cards_for_remote(
+    tx: &mut sqlx::PgConnection,
+    remote_key: &str,
+) -> Result<Vec<(db::InstructionRequest, String)>, String> {
+    let e = |e: sqlx::Error| e.to_string();
+    let mut dropped = Vec::new();
+    for card in db::list_instruction_requests_for_remote(&mut *tx, remote_key).await.map_err(e)? {
+        db::delete_instruction_request(&mut *tx, card.id).await.map_err(e)?;
+        // Its conversation was deleted since the list: nothing to tell.
+        let Some(repo) = db::get_conversation_repo(&mut *tx, card.repo_id).await.map_err(e)? else {
+            continue;
+        };
+        let file = format!("{}/{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir, card.path);
+        dropped.push((card, file));
+    }
+    Ok(dropped)
+}
+
+/// The user named this remote ("Work on a repo" from conversation
+/// `conversation_id`): it's trusted without asking. Every card about it
+/// goes, since the files they showed weren't what was decided on, and
+/// each waiting model is told to load again, which now works without
+/// asking. Returns those notices, for the caller to deliver.
+///
+/// One transaction under the remote's trust lock (SME-224), in
+/// `settle`'s lock order: a load or a decision on the same remote comes
+/// wholly before or after it, so no card can be committed after the
+/// list and missed. Any error rolls it all back: no trust, every card
+/// still there.
+pub(super) async fn trust_named_remote(
+    pool: &PgPool,
+    conversation_id: i64,
+    remote_key: &str,
+    url: &str,
+) -> Result<Vec<(i64, String)>, String> {
+    let e = |e: sqlx::Error| e.to_string();
+    let mut tx = pool.begin().await.map_err(e)?;
+    db::lock_remote_trust(&mut *tx, remote_key).await.map_err(e)?;
+    db::share_lock_conversations_for(&mut *tx, conversation_id, remote_key).await.map_err(e)?;
+    db::set_repo_trust(&mut *tx, remote_key, true).await.map_err(e)?;
+    let dropped = drop_cards_for_remote(&mut tx, remote_key).await?;
+    tx.commit().await.map_err(e)?;
+
+    // Only committed state is published.
+    let touched: std::collections::BTreeSet<i64> = dropped.iter().map(|(card, _)| card.conversation_id).collect();
+    for id in touched {
+        publish_repos(pool, id).await;
+    }
+    Ok(dropped
+        .into_iter()
+        .map(|(card, file)| {
+            (
+                card.conversation_id,
+                format!(
+                    "The user now trusts {url}. {file} wasn't loaded; call load_instructions \
+                         again for it if you still want it (it loads without asking now)."
+                ),
+            )
+        })
+        .collect())
 }
 
 /// What to tell each conversation's model about a decision, the

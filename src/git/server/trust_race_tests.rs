@@ -365,3 +365,105 @@ async fn test_a_decline_and_a_delete_of_a_conversation_with_two_loaded_files_don
     let holding = hold_one(&pool, "loaded_instructions", second.id).await;
     decline_while_deleting(&pool, a, &card_a, b, holding).await;
 }
+
+fn spawn_attach(pool: &PgPool, conversation_id: i64) -> tokio::task::JoinHandle<Result<Vec<(i64, String)>, String>> {
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        start_attach(&pool, conversation_id, "https://github.com/o/r", None, None)
+            .await
+            .map(|(_, _, notices)| notices)
+    })
+}
+
+/// SME-224. Interleaving: conversation B's `request_or_load` (the remote
+/// undecided) is held at its card's insert while conversation A starts
+/// "Work on a repo" on the same remote. The attach waits for the load,
+/// then drops B's card and tells B, rather than miss a card committed
+/// after it listed the remote's cards.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_card_asked_for_while_work_on_a_repo_waits_is_dropped_by_it(pool: PgPool) {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let a = db::create_conversation(&pool).await.expect("conversation A");
+    let b = db::create_conversation(&pool).await.expect("conversation B");
+    let repo_b = cloned_repo(&pool, b.id).await;
+
+    let holding = hold_row(&pool, "instruction_requests", b.id, repo_b.id).await;
+    let load = tokio::spawn({
+        let (pool, repo_b) = (pool.clone(), repo_b.clone());
+        async move { request_or_load(&pool, b.id, &repo_b, "AGENTS.md", &file("b")).await }
+    });
+    assert!(waiters_or_finished(&pool, 1, &load).await, "the load never reached its card");
+    let attach = spawn_attach(&pool, a.id);
+    let attach_waited = waiters_or_finished(&pool, 2, &attach).await;
+    holding.rollback().await.expect("release the card");
+
+    assert_eq!(join(load, "the load").await.expect("the load"), LoadOutcome::AwaitingTrust);
+    let notices = join(attach, "the attach").await.expect("the attach");
+    assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("trust"), Some(true));
+    assert!(only_repo(&pool, b.id).await.trust_requests.is_empty(), "B's card is dropped");
+    assert!(
+        notices.iter().any(|(id, text)| *id == b.id && text.contains("load_instructions again")),
+        "B's model is told: {notices:?}"
+    );
+    assert!(attach_waited, "the attach waited for the load rather than running first");
+}
+
+/// SME-224. Interleaving: deleting conversation B (a card about the
+/// remote) is held at its cascade into B's card while A starts "Work on
+/// a repo" on the same remote. A conversation deleted meanwhile is
+/// skipped, not a failed attach ("No such repo.").
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_conversation_deleted_while_work_on_a_repo_drops_its_card_doesnt_fail_it(pool: PgPool) {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let (a, _, b, repo_b) = a_card_and_b(&pool).await;
+    db::request_instruction(&pool, b, repo_b.id, "AGENTS.md", &file("asked")).await.expect("a card in B");
+
+    let holding = hold_rows(&pool, "instruction_requests", repo_b.id).await;
+    let delete = spawn_delete(&pool, b);
+    assert!(waiters_or_finished(&pool, 1, &delete).await, "the delete never reached B's card");
+    let attach = spawn_attach(&pool, a);
+    let attach_waited = waiters_or_finished(&pool, 2, &attach).await;
+    holding.rollback().await.expect("release B's card");
+
+    let deleted = join(delete, "the delete").await;
+    let attached = join(attach, "the attach").await;
+    deleted.expect("the delete succeeds");
+    let notices = attached.expect("the attach succeeds");
+    assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("trust"), Some(true));
+    assert!(notices.iter().all(|(id, _)| *id != b), "nothing is told to a deleted conversation: {notices:?}");
+    assert!(attach_waited, "the attach waited for the delete rather than running first");
+}
+
+/// SME-224, the SME-181 review-2 shape. Interleaving: B has two cards
+/// about the remote, the first asked for again so its row moved past
+/// the second's. B's delete cascades into them in that physical order
+/// and is held at the second card while A starts "Work on a repo",
+/// which drops the remote's cards in id order. Without the conversation
+/// share lock first, the two would take the cards in opposite orders.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_work_on_a_repo_and_a_delete_of_a_conversation_with_two_cards_dont_deadlock(pool: PgPool) {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let (a, _, b, repo_b) = a_card_and_b(&pool).await;
+    let first = db::request_instruction(&pool, b, repo_b.id, "AGENTS.md", &file("x1")).await.expect("first card");
+    let second = db::request_instruction(&pool, b, repo_b.id, "web/AGENTS.md", &file("y")).await.expect("second card");
+    db::request_instruction(&pool, b, repo_b.id, "AGENTS.md", &file("x2")).await.expect("the first, asked again");
+    assert_eq!(
+        physical_order(&pool, "instruction_requests", repo_b.id).await,
+        vec![second.id, first.id],
+        "the first card's row moved past the second's"
+    );
+
+    let holding = hold_one(&pool, "instruction_requests", second.id).await;
+    let delete = spawn_delete(&pool, b);
+    assert!(waiters_or_finished(&pool, 1, &delete).await, "the delete never reached the held card");
+    let attach = spawn_attach(&pool, a);
+    let attach_waited = waiters_or_finished(&pool, 2, &attach).await;
+    holding.rollback().await.expect("release the held card");
+
+    let deleted = join(delete, "the delete").await;
+    let attached = join(attach, "the attach").await;
+    deleted.expect("the delete succeeds");
+    attached.expect("the attach succeeds");
+    assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("trust"), Some(true));
+    assert!(attach_waited, "the attach waited for the delete rather than running first");
+}

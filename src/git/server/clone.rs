@@ -346,61 +346,21 @@ pub async fn start_attach(
         ClonePlan::Existing(repo) => {
             // Already checked out (the model cloned it, say): the user
             // naming it trusts it all the same.
-            db::set_repo_trust(pool, &repo.remote_key, true)
-                .await
-                .map_err(|e| e.to_string())?;
-            let notices = settle_requests_trusted_elsewhere(pool, &repo.remote_key, url).await?;
+            let notices = trust_named_remote(pool, conversation_id, &repo.remote_key, url).await?;
             return Ok((summarise(pool, repo).await?, None, notices));
         }
         ClonePlan::Clone { key, dir, retry } => (key, dir, retry),
     };
     // The user named this repo, so its AGENTS.md is trusted without
     // asking (SME-32's plan, open question 1).
-    db::set_repo_trust(pool, &key, true)
-        .await
-        .map_err(|e| e.to_string())?;
-    let notices = settle_requests_trusted_elsewhere(pool, &key, url).await?;
+    // Committed before the repo is recorded, outside the lock: the lock
+    // covers trust and cards, and a repo recorded as cloning has no card.
+    let notices = trust_named_remote(pool, conversation_id, &key, url).await?;
     let Some(repo) = record_clone(pool, conversation_id, url, branch, &key, &dir, retry).await? else {
         let existing = after_lost_race(pool, conversation_id, url, branch, &dir).await?;
         return Ok((summarise(pool, existing).await?, None, notices));
     };
     Ok((summarise(pool, repo.clone()).await?, Some(repo), notices))
-}
-
-/// The remote was trusted without its cards being answered (the user
-/// opened it with "Work on a repo"): the cards go, since the files
-/// they showed weren't what was decided on, and each waiting model is
-/// told to load again, which now works without asking. Returns the
-/// notices, for the caller to deliver.
-async fn settle_requests_trusted_elsewhere(
-    pool: &PgPool,
-    remote_key: &str,
-    url: &str,
-) -> Result<Vec<(i64, String)>, String> {
-    let requests = db::list_instruction_requests_for_remote(pool, remote_key)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut notices = Vec::new();
-    let mut touched = std::collections::BTreeSet::new();
-    for request in requests {
-        db::delete_instruction_request(pool, request.id)
-            .await
-            .map_err(|e| e.to_string())?;
-        let repo = get_repo(pool, request.repo_id).await?;
-        let file = format!("{}/{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir, request.path);
-        notices.push((
-            request.conversation_id,
-            format!(
-                "The user now trusts {url}. {file} wasn't loaded; call load_instructions \
-                     again for it if you still want it (it loads without asking now)."
-            ),
-        ));
-        touched.insert(request.conversation_id);
-    }
-    for id in touched {
-        publish_repos(pool, id).await;
-    }
-    Ok(notices)
 }
 
 /// The rest of "Work on a repo", run apart from the button's request:
