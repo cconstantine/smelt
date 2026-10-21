@@ -170,7 +170,8 @@ async fn test_turns_admitted_back_to_back_queue_in_admission_order(pool: PgPool)
 /// (a) A user's turn admitted with the lock free holds it from its
 /// admission; dropping it frees the lock, and leaves no turn state.
 /// (b) A send whose task is aborted before it first reaches the lock
-/// lets a later send run.
+/// lets a later send run. Its place took the free lock at admission; T3c
+/// and T3d drop a place still waiting for it.
 #[sqlx::test]
 async fn test_a_turn_dropped_before_it_runs_frees_its_place(pool: PgPool) {
     let _guard = lock_turn_tests();
@@ -200,4 +201,64 @@ async fn test_a_turn_dropped_before_it_runs_frees_its_place(pool: PgPool) {
 
     assert_eq!(requests.lock().expect("the request log").len(), 1, "the later send called the model");
     saved_positions(&pool, conversation_id, &["later"]).await;
+}
+
+/// Admits a send while the test holds the turn lock, so its place is
+/// queued (polled once, with the no-op waker), and lets its task run to
+/// just before it first waits on that place. Then it either aborts the
+/// task with the place still queued and frees the lock (`release_first`
+/// false), or frees the lock first, which grants the lock to the place
+/// though the task hasn't polled it, and then aborts. Either way a later
+/// send must run: the aborted place leaves the queue, or gives back the
+/// lock it was granted (review 1).
+async fn abort_a_send_whose_place_is_waiting(pool: &PgPool, release_first: bool) {
+    db::test_support::start_ids_clear_of_other_runs(pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(pool).await.expect("create conversation").id;
+    let requests = start_recording_mock_upstream(pool, vec![text_reply_body("Hi!")]).await;
+    let held = conversation_lock(conversation_id).lock_owned().await;
+
+    let (counted, _release) = test_hooks::pause_after_turn_counted(conversation_id);
+    let (in_flight, generation) = TurnInFlight::start_by_user(conversation_id);
+    let aborted = tokio::spawn({
+        let pool = pool.clone();
+        async move { run_turn_bounded(&pool, in_flight, Some(hello()), MAX_TURNS, Some(generation), true).await }
+    });
+    reached(counted, "the aborted send's task runs").await;
+    if release_first {
+        drop(held);
+        assert!(
+            conversation_lock(conversation_id).try_lock().is_err(),
+            "the lock is granted to the waiting place"
+        );
+        aborted.abort();
+    } else {
+        aborted.abort();
+        // The abort is seen before the lock is freed.
+        let_tasks_run().await;
+        drop(held);
+    }
+    assert!(aborted.await.expect_err("aborted").is_cancelled());
+    // Subscribed after the abort, so only the later send's end is seen.
+    let mut rx = events::subscribe(conversation_id);
+    start_turn(pool.clone(), conversation_id, "later".to_string()).await.expect("the later send");
+    wait_until_idle(&mut rx).await;
+
+    assert_eq!(requests.lock().expect("the request log").len(), 1, "the later send called the model");
+    saved_positions(pool, conversation_id, &["later"]).await;
+}
+
+/// T3c: a send aborted while its place is still queued behind a held
+/// lock, the lock freed after the abort, lets a later send run.
+#[sqlx::test]
+async fn test_a_send_aborted_while_queued_leaves_the_queue(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    abort_a_send_whose_place_is_waiting(&pool, false).await;
+}
+
+/// T3d: a send whose place is granted the lock before its task first
+/// polls it, then aborted, gives the lock back to a later send.
+#[sqlx::test]
+async fn test_a_send_aborted_once_granted_but_unpolled_frees_the_lock(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    abort_a_send_whose_place_is_waiting(&pool, true).await;
 }
