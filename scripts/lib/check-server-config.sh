@@ -71,7 +71,10 @@ effective_value() {
 # Headless Chrome's cache directory: this checkout's, or else the main
 # checkout's (a worktree has none of its own).
 browser_check_cache() {
-    local main
+    # `dir` too, not just `main`: the for loop's variable is otherwise left set
+    # in check-server's shell, where nothing reads it today and something would
+    # tomorrow (SME-186 review 2, finding 3; G7 asks from a shell of its own).
+    local main dir
     main=$(dirname "$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)")
     for dir in "$repo/.browser-check-cache" "$main/.browser-check-cache"; do
         if [ -d "$dir" ]; then

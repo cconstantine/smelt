@@ -497,4 +497,21 @@ grep -q "logging at RUST_LOG=info (yours)" <<<"$out" ||
 check_server stop >/dev/null
 : >"$env_file"
 
+# G7 (SME-186 review 2, finding 3): browser_check_cache left its loop variable in
+# check-server's shell. Nothing reads `dir` today, so the helper asks from outside:
+# this script has a `dir` of its own, which would hide the leak.
+cat >"$dir/check-dir-local.sh" <<'EOF'
+#!/usr/bin/env bash
+# browser_check_cache must not leave `dir` set in the shell that called it.
+# Usage: check-dir-local.sh REPO WORKTREE
+repo=$1 worktree=$2
+. "$repo/scripts/lib/check-server-config.sh"
+browser_check_cache >/dev/null 2>&1
+[ -z "${dir+x}" ] || echo "dir=$dir"
+EOF
+chmod +x "$dir/check-dir-local.sh"
+leaked=$("$dir/check-dir-local.sh" "$PWD" "$worktree")
+[ -z "$leaked" ] ||
+    fail "G7: browser_check_cache left its loop variable behind in its caller: $leaked"
+
 finish
