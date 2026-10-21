@@ -466,8 +466,13 @@ start() {
     # can't undo it, and an empty RUST_LOG in the environment, which
     # dotenvy treats as set, can't hide .env's.
     local log_level log_note no_color
-    log_level=$(effective_value RUST_LOG)
-    case "$(effective_source RUST_LOG)" in
+    # One resolution answers both questions — where RUST_LOG came from and what it
+    # says — so the .env is read once for it, not once per question (SME-186 review
+    # 2, finding 2). It fails when nothing gives a non-empty value, and then
+    # EFFECTIVE_SOURCE is empty, which is the default's case below.
+    effective_resolve RUST_LOG || true
+    log_level=$EFFECTIVE_VALUE
+    case "$EFFECTIVE_SOURCE" in
         "") log_level=info log_note="check-server's default" ;;
         .env) log_note="from .env" ;;
         *) log_note=yours ;;

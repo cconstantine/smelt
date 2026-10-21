@@ -446,4 +446,55 @@ check_server stop >/dev/null
     fail "G5: stop didn't drop the database start created: $(cat "$SQLX_CALLS")"
 : >"$env_file"
 
+# G6 (SME-186 review 2, finding 2): one read of the .env per setting, not one per
+# question about it. effective_value asked effective_source — whose .env arm parses
+# the file to decide — and then parsed it again for the value, so a start
+# (SANDBOX_IMAGE, RUST_LOG, NO_COLOR…) paid for several python3 launches to answer
+# one question. The counter is a python3 of the test's own, first on PATH: it
+# records each call and runs the real reader, so the values stay dotenvy's and only
+# the count is what's under test.
+count_bin=$dir/count-bin
+mkdir -p "$count_bin"
+py_calls=$dir/python-calls
+cat >"$count_bin/python3" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >>"$py_calls"
+exec "$STUB_PYTHON3" "\$@"
+EOF
+chmod +x "$count_bin/python3"
+# How many times the .env was parsed for one name (the reader's last argument).
+parses_for() { grep -c " $1\$" "$py_calls" || true; }
+# start with the stubs, as the lib's check_server() runs it, but with the counting
+# python3 first on PATH. The VAR=value arguments come last, so they win.
+g6_start() {
+    env -u SANDBOX_IMAGE -u RUST_LOG -u NO_COLOR \
+        SANDBOX_IMAGE_IMPORT="$dir/bin/import" SANDBOX_INSTANCE_CLEANUP="$dir/bin/cleanup" \
+        CHECK_WORKTREE="$worktree" DATABASE_URL=postgres://u@localhost/smelt_dev \
+        CHECK_PORT="$port" PATH="$count_bin:$dir/bin:$PATH" "$@" \
+        timeout 90 scripts/check-server start HEAD 2>&1
+}
+printf 'SANDBOX_IMAGE=smelt-sandbox:g6\nRUST_LOG=debug\n' >"$env_file"
+: >"$py_calls"
+out=$(g6_start)
+rc=$?
+[ "$rc" = 0 ] || fail "G6: start with a .env that answers: $out"
+grep -q "logging at RUST_LOG=debug (from .env)" <<<"$out" ||
+    fail "G6: the level read from .env isn't the one start used: $out"
+[ "$(parses_for RUST_LOG)" = 1 ] ||
+    fail "G6: RUST_LOG read the .env $(parses_for RUST_LOG) times, not once — its value and its source are the same question: $(cat "$py_calls")"
+[ "$(parses_for SANDBOX_IMAGE)" = 1 ] ||
+    fail "G6: SANDBOX_IMAGE read the .env $(parses_for SANDBOX_IMAGE) times, not once: $(cat "$py_calls")"
+check_server stop >/dev/null
+# And where the environment settles a name, the file isn't read for it at all.
+: >"$py_calls"
+out=$(g6_start RUST_LOG=info)
+rc=$?
+[ "$rc" = 0 ] || fail "G6: start with RUST_LOG in the environment: $out"
+grep -q "logging at RUST_LOG=info (yours)" <<<"$out" ||
+    fail "G6: the environment's RUST_LOG wasn't used as given: $out"
+[ "$(parses_for RUST_LOG)" = 0 ] ||
+    fail "G6: the .env was read for RUST_LOG though the environment settles it: $(cat "$py_calls")"
+check_server stop >/dev/null
+: >"$env_file"
+
 finish

@@ -36,31 +36,36 @@ override_value() {
     echo "$value"
 }
 
-# Where NAME's value comes from: the first of a `-- NAME=` override, the
-# environment and the check worktree's .env that gives it a non-empty
-# value ("override", "environment" or ".env"). Fails when none does: an
-# empty value counts as unset.
-effective_source() {
+# Resolve NAME once into EFFECTIVE_SOURCE and EFFECTIVE_VALUE: the first of a
+# `-- NAME=` override, the environment and the check worktree's .env that gives it
+# a non-empty value ("override", "environment" or ".env"). Fails when none does: an
+# empty value counts as unset, and then both are empty. The value comes out of the
+# same read that decided where it came from, so asking both questions about one
+# setting doesn't parse the file twice (SME-186 review 2, finding 2: effective_value
+# asked effective_source, whose .env arm reads the file, and read it again for the
+# answer it had already got — and start resolves several settings).
+effective_resolve() {
     local value
+    EFFECTIVE_SOURCE="" EFFECTIVE_VALUE=""
     if value=$(override_value "$1") && [ -n "$value" ]; then
-        echo override
+        EFFECTIVE_SOURCE=override EFFECTIVE_VALUE=$value
     elif [ -n "${!1:-}" ]; then
-        echo environment
-    elif [ -n "$(env_file_value "$1")" ]; then
-        echo .env
+        EFFECTIVE_SOURCE=environment EFFECTIVE_VALUE=${!1}
+    elif value=$(env_file_value "$1") && [ -n "$value" ]; then
+        EFFECTIVE_SOURCE=.env EFFECTIVE_VALUE=$value
     else
         return 1
     fi
 }
 
-# NAME's value: the first non-empty of a `-- NAME=` override, the
-# environment and the check worktree's .env; empty when none is.
+# NAME's value: the first non-empty of a `-- NAME=` override, the environment and
+# the check worktree's .env; empty when none is. Empty with status 0 then, not a
+# failure: every caller assigns this inside `$( )`, where a failing status would
+# end the script under `set -e` — which is why this doesn't pass effective_resolve's
+# own status through.
 effective_value() {
-    case "$(effective_source "$1")" in
-        override) override_value "$1" ;;
-        environment) echo "${!1}" ;;
-        .env) env_file_value "$1" ;;
-    esac
+    effective_resolve "$1" || true
+    echo "$EFFECTIVE_VALUE"
 }
 
 # Headless Chrome's cache directory: this checkout's, or else the main
