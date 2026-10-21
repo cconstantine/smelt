@@ -195,6 +195,57 @@ grep -q "1800" <<<"$out" || fail "G2d: the waiting line doesn't name the 1800 s 
 kill_helper "$holder_pid"
 check_server stop >/dev/null
 
+# G3 (SME-186 B41): a pid file that names a live group which isn't this
+# worktree's server must never be signalled — an id that was reused belongs to
+# someone else. Three groups, each leading a session of its own so that
+# signalling it means signalling a whole group: (a) in a directory of its own
+# with no lock open, (b) holding another port's check-server lock but not
+# working in this worktree, (c) working in this worktree with no lock open.
+# Only a check-server port lock *and* this worktree's directory is this
+# worktree's server; every server start writes the pid file for meets both,
+# since its group inherits descriptor 8 and dx runs in the worktree.
+start_group() { # dir ready-file [lock-to-hold]
+    : >"$2"
+    if [ -n "${3:-}" ]; then
+        setsid bash -c 'cd "$1" || exit 1; exec 9>"$3" || exit 1; flock 9; echo $$ >"$2"; exec sleep 120' \
+            _ "$1" "$2" "$3" >/dev/null 2>&1 &
+    else
+        setsid bash -c 'cd "$1" || exit 1; echo $$ >"$2"; exec sleep 120' _ "$1" "$2" >/dev/null 2>&1 &
+    fi
+    wait_for_file "$2" || fail "the group never wrote its ready file"
+}
+stale_pid_group_case() { # name dir [lock]
+    local name=$1 group_dir=$2 out rc pgid
+    # Whatever the previous case's start left on the port.
+    check_server stop >/dev/null
+    start_group "$group_dir" "$group_dir/group-ready" "${3:-}"
+    pgid=$(cat "$group_dir/group-ready")
+    pid_is_live "$pgid" || fail "$name: the group (pid $pgid) isn't alive"
+    echo "$pgid" >"$pid_file"
+    out=$(check_server status)
+    grep -q "^not running" <<<"$out" || fail "$name: status says '$out', not not running"
+    out=$(check_server stop)
+    rc=$?
+    [ "$rc" = 0 ] || fail "$name: stop exited $rc: $out"
+    grep -qF "process group $pgid" <<<"$out" || fail "$name: stop doesn't name the group: $out"
+    grep -q "isn't this worktree's check server" <<<"$out" || fail "$name: stop doesn't say whose group it isn't: $out"
+    pid_is_live "$pgid" || fail "$name: stop signalled the group the pid file named"
+    [ -s "$pid_file" ] && fail "$name: stop left the pid file naming $pgid: '$(cat "$pid_file")'"
+    # And the start that follows isn't held by a group it must not touch.
+    out=$(check_server start HEAD) || fail "$name: start after a stale pid file: $out"
+    grep -q "check server up" <<<"$out" || fail "$name: start after a stale pid file didn't come up: $out"
+    check_server stop >/dev/null
+    kill_helper "$pgid"
+}
+other_port=$(free_port) || fail "G3: no free port for the other lock"
+for group_dir_name in own-dir other-lock in-worktree; do
+    [ "$group_dir_name" = in-worktree ] && group_dir=$worktree ||
+        { mkdir -p "$dir/$group_dir_name"; group_dir=$dir/$group_dir_name; }
+    lock=""
+    [ "$group_dir_name" = other-lock ] && lock=$SMELT_LOCK_DIR/smelt-check-server-$other_port.lock
+    stale_pid_group_case "G3 ($group_dir_name)" "$group_dir" "$lock"
+done
+
 # G5 (SME-186 B40): the scratch database's URL is built from what dotenvy
 # would load, not from what `sed | tail` finds. The dev .env's DATABASE_URL is
 # unquoted and holds a `$`, which dotenvy substitutes and sed does not; and

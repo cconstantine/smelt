@@ -283,15 +283,12 @@ find_port_holder() {
     local -a leaders=() others=()
     holder_pid="" holder_cmd="" holder_dir=""
     own=$(ps -o pgid= -p $$ | tr -d ' ')
-    # Every child this start spawns while descriptor 8 is open has the port
-    # lock open itself — `find` first of all — and is gone again by the time
-    # its /proc entry is read, so the scan races with processes coming and
-    # going twice over: a directory can vanish under `find` (hence `|| true`
-    # on it), and a pid it names can vanish before this reads it (hence the
-    # `|| true` on the sid read, without which errexit ends the whole start
-    # there, silently, sed's error hidden by the redirect — which is what
-    # killed every wait in the first version of this). A pid that has gone
-    # holds no lock, so it is not the holder either way.
+    # The scan races with processes coming and going: every child a waiting
+    # start spawns while descriptor 8 is open has the lock open itself, `find`
+    # first of all, and is gone again before its /proc entry is read. Hence the
+    # two `|| true`s — without them errexit ends the whole start on a vanished
+    # directory or pid, silently, sed's error hidden by the redirect, which is
+    # what the first version of this did. A pid that has gone holds no lock.
     for fd in $(find /proc/[0-9]*/fd -maxdepth 1 -lname "$port_lock" 2>/dev/null || true); do
         pid=${fd#/proc/}
         pid=${pid%%/*}
@@ -414,14 +411,58 @@ group_is_live() {
     return 1
 }
 
-running_pgid() {
+# The check worktree's real path, which is what /proc/<pid>/cwd says for a
+# process started here: start does `cd "$worktree"` before exec'ing dx. Empty
+# when there's no worktree, and then nothing can be running in it.
+worktree_path() {
+    (cd "$worktree" 2>/dev/null && pwd -P) || true
+}
+
+# Whether a live process in group $1 looks like this worktree's check server:
+# one has a check-server port lock open — descriptor 8, which every process in
+# the group inherits — and one has this worktree as its working directory. A
+# group whose id has been reused meets neither, or only one: another worktree's
+# server holds a lock but works elsewhere, and a stranger started in this
+# worktree has the directory and no lock. This is what keeps `stop` from
+# signalling a group on the pid file's word alone (SME-186 B41). Reads /proc.
+group_is_our_server() { # pgid
+    local pid cwd has_lock="" in_worktree=""
+    cwd=$(worktree_path)
+    for pid in $(pgrep -g "$1" 2>/dev/null || true); do
+        if [ -z "$has_lock" ] &&
+            [ -n "$(find "/proc/$pid/fd" -maxdepth 1 -lname '*/smelt-check-server-*.lock' -print -quit 2>/dev/null || true)" ]; then
+            has_lock=1
+        fi
+        if [ -z "$in_worktree" ] && [ -n "$cwd" ] &&
+            [ "$(readlink "/proc/$pid/cwd" 2>/dev/null || true)" = "$cwd" ]; then
+            in_worktree=1
+        fi
+        [ -n "$has_lock" ] && [ -n "$in_worktree" ] && return 0
+    done
+    return 1
+}
+
+# The process group the pid file names, when it names one. Whether that group
+# is this worktree's server is running_pgid's question; this answers only what
+# the file says, so `stop` can name the group it refuses to signal.
+pid_file_pgid() {
     local file
     file=$(pid_file)
     [ -s "$file" ] || return 1
-    local pgid
+    cat "$file"
+}
+
+running_pgid() {
+    local file pgid
+    file=$(pid_file)
+    [ -s "$file" ] || return 1
     pgid=$(cat "$file")
     # Still ours if a live process in that group is.
     group_is_live "$pgid" || return 1
+    # …and if that group looks like this worktree's server. A live group alone
+    # isn't enough: its id can have been reused, and then it's someone else's
+    # (SME-186 B41).
+    group_is_our_server "$pgid" || return 1
     echo "$pgid"
 }
 
@@ -458,7 +499,15 @@ stop() {
 
     local pgid
     if ! pgid=$(running_pgid); then
-        echo "no check server running (log: $(log_file))"
+        # A pid file naming a live group that running_pgid turned down has an
+        # id that was reused: the group is someone else's, and this is the one
+        # place where it would be signalled. Say so, and empty the file like
+        # any other stale one (SME-186 B41).
+        if pgid=$(pid_file_pgid) && group_is_live "$pgid"; then
+            echo "the pid file names process group $pgid, which isn't this worktree's check server (its id was reused); not signalling it" >&2
+        else
+            echo "no check server running (log: $(log_file))"
+        fi
         [ -e "$(pid_file)" ] && : >"$(pid_file)"
         finish_stop "$scratch_url"
         return 0
