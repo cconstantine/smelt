@@ -13,7 +13,7 @@
 # called dotenvy::from_path — which is load(), the call smelt makes — in a clean
 # process holding only that case's own environment, and printed the key it was
 # asked for. The reader was then run over the same fixtures the same way and the
-# two tables diffed: 0 differences over these 50 cases. The last six (cr-only
+# two tables diffed: 0 differences over these 51 cases. The last seven (cr-only
 # on, from the review's differential driver over `from_path_iter`) pin where the
 # reader had drifted from dotenvy: splitting lines the crate does not split, and
 # dropping keys a bad line should not reach. If dotenvy ever changes
