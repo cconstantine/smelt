@@ -139,23 +139,37 @@ async fn attach_and_answer(
             report_attach_failure(&pool, id, nothing_to_clone, &e).await;
         }
     });
-    answered
+    let (started, ack) = answered
         .await
-        .map_err(|_| "\"Work on a repo\" stopped before it answered.".to_string())?
+        .map_err(|_| "\"Work on a repo\" stopped before it answered.".to_string())?;
+    let _ = ack.send(());
+    started
 }
 
+/// The attach's start as handed back to its request, with the sender the
+/// request acknowledges reading it on.
+#[cfg(feature = "server")]
+type AttachAnswer = (Result<RepoSummary, String>, tokio::sync::oneshot::Sender<()>);
+
 /// Hands the attach's start back to the request waiting for it. A
-/// failure nobody waits for any more (the tab closed) is shown in the
-/// conversation instead, as a failure after the answer is (SME-91); a
-/// conversation deleted meanwhile is left with no turn state (SME-219).
+/// failure nobody read (the tab closed, before the send or after it) is
+/// shown in the conversation instead, as a failure after the answer is
+/// (SME-91); a conversation deleted meanwhile is left with no turn state
+/// (SME-219).
 #[cfg(feature = "server")]
 async fn hand_back_attach(
     pool: &sqlx::PgPool,
     conversation_id: i64,
-    answer: tokio::sync::oneshot::Sender<Result<RepoSummary, String>>,
+    answer: tokio::sync::oneshot::Sender<AttachAnswer>,
     started: Result<RepoSummary, String>,
 ) {
-    if let Err(Err(e)) = answer.send(started) {
+    let error = started.as_ref().err().cloned();
+    // Seen only once the request says it read it: a request dropped
+    // between the send and its read (the tab closed) never saw it
+    // (SME-224 review 1).
+    let (ack, acked) = tokio::sync::oneshot::channel();
+    let seen = answer.send((started, ack)).is_ok() && acked.await.is_ok();
+    if let (Some(e), false) = (error, seen) {
         tracing::warn!(conversation_id, error = %e, "\"Work on a repo\" failed with nobody waiting");
         crate::turn::show_error_outside_turn(pool, conversation_id, format!("\"Work on a repo\" failed. {e}")).await;
     }
@@ -430,10 +444,46 @@ mod tests {
 
         let waited_for = db::create_conversation(&pool).await.expect("conversation").id;
         let (answer, answered) = tokio::sync::oneshot::channel();
-        hand_back_attach(&pool, waited_for, answer, Err("boom".to_string())).await;
-        assert!(matches!(answered.await, Ok(Err(e)) if e == "boom"), "the waiting request gets the error");
+        let handing_back = tokio::spawn({
+            let pool = pool.clone();
+            async move { hand_back_attach(&pool, waited_for, answer, Err("boom".to_string())).await }
+        });
+        let (started, ack) = answered.await.expect("the hand-back answers");
+        assert!(matches!(started, Err(e) if e == "boom"), "the waiting request gets the error");
+        ack.send(()).expect("the hand-back waits for the read");
+        tokio::time::timeout(std::time::Duration::from_secs(10), handing_back)
+            .await
+            .expect("the hand-back finishes")
+            .expect("the hand-back's task");
         assert_eq!(crate::turn::last_turn_error(waited_for), None);
 
         crate::turn::forget_conversation_lock(unanswered);
+    }
+
+    /// SME-224 review 1, finding 3. Interleaving: the failure reaches the
+    /// request's channel, and the request is dropped before it reads it
+    /// (the tab closed between the send and the request's next poll).
+    /// Nobody saw it, so it's shown in the conversation.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_an_attach_failure_sent_but_never_read_shows_in_the_conversation(pool: sqlx::PgPool) {
+        let _guard = crate::providers::test_support::lock_turn_tests();
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        let unread = db::create_conversation(&pool).await.expect("conversation").id;
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let handing_back = hand_back_attach(&pool, unread, answer, Err("Couldn't save the repo: boom".to_string()));
+        tokio::pin!(handing_back);
+        // Sent, and waiting to hear it was read.
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(200), &mut handing_back).await.is_err();
+        drop(answered);
+        if waited {
+            tokio::time::timeout(std::time::Duration::from_secs(10), handing_back)
+                .await
+                .expect("the hand-back finishes");
+        }
+        let error = crate::turn::last_turn_error(unread).expect("the error is kept for a reload");
+        assert!(error.contains("\"Work on a repo\" failed.") && error.contains("boom"), "got: {error}");
+        assert!(waited, "the hand-back didn't wait to hear the request read the failure");
+
+        crate::turn::forget_conversation_lock(unread);
     }
 }
