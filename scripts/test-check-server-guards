@@ -341,7 +341,11 @@ stale_pid_group_case() { # name dir [lock]
     grep -q "^not running" <<<"$out" || fail "$name: status says '$out', not not running"
     out=$(check_server stop)
     rc=$?
-    [ "$rc" = 0 ] || fail "$name: stop exited $rc: $out"
+    # A refusal is not a stop. Exit 3, so that a caller chaining
+    # `scripts/check-server stop && rm -rf "$worktree"` can tell "it stopped"
+    # from "it touched nothing because it couldn't tell the group apart"
+    # (SME-186 review 2, finding 1).
+    [ "$rc" = 3 ] || fail "$name: stop exited $rc, not 3 for a live group it refused to signal: $out"
     grep -qF "process group $pgid" <<<"$out" || fail "$name: stop doesn't name the group: $out"
     grep -q "isn't this worktree's check server" <<<"$out" || fail "$name: stop doesn't say whose group it isn't: $out"
     pid_is_live "$pgid" || fail "$name: stop signalled the group the pid file named"

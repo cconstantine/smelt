@@ -8,6 +8,14 @@
 #   scripts/check-server stop                             stop it, and everything it started
 #   scripts/check-server status
 #
+# stop's exit status says which of three things happened. 0: it stopped the
+# server, or there was nothing to stop. 1: a scratch cleanup didn't finish,
+# and the database is kept so a later stop can retry it (SME-129). 3: it
+# refused to signal the group the pid file names, because that group doesn't
+# look like this worktree's server (SME-186 B41) — it touched nothing, and
+# running it again won't change its mind, so that's a person's call (review 2,
+# finding 1: 0 for a refusal read as "done" to `stop && rm -rf "$worktree"`).
+#
 # KEY=VALUE pairs override the environment for this server only, e.g.
 # `-- SANDBOX_MEMORY_LIMIT=2Gi`. They win over .env, which never overrides a
 # variable that's already set. (To make compaction happen quickly, set a
@@ -247,7 +255,12 @@ stop() {
         # let a person tell them apart (SME-186 B41, review 1 finding 2).
         if pgid=$(pid_file_pgid) && group_is_live "$pgid"; then
             echo "the pid file names process group $pgid, which isn't this worktree's check server; not signalling it, and keeping the pid file and the scratch database — if this is this worktree's server under a lock file that was moved or unlinked, that's what protects it" >&2
-            return 0
+            # Exit 3, not 0: a caller that chains `stop && rm -rf "$worktree"`
+            # reads 0 as "it stopped", and this is not that. 3 is the one status
+            # that means "it touched nothing, because it couldn't tell the group
+            # apart" — retrying won't change its mind, a person has to (SME-186
+            # review 2, finding 1).
+            return 3
         fi
         echo "no check server running (log: $(log_file))"
         [ -e "$(pid_file)" ] && : >"$(pid_file)"
