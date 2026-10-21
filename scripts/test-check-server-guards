@@ -93,6 +93,10 @@ start_holder() { # dir ready-file
     : >"$2"
     setsid bash -c 'cd "$1" || exit 1; exec 9>"$2" || exit 1; flock 9; echo $$ >"$3"; sleep 120' \
         _ "$1" "$port_lock" "$2" >/dev/null 2>&1 &
+    # Forget the job: kill_helper kills it later, and the shell's own
+    # 'Killed' notice would read as a failure in a red run (SME-186
+    # review 1, finding 6).
+    disown
     wait_for_file "$2" || fail "the port holder never wrote its ready file"
     holder_pid=$(cat "$2" 2>/dev/null)
     pid_is_live "$holder_pid" || fail "the port holder (pid $holder_pid) isn't alive"
@@ -314,6 +318,7 @@ start_group() { # dir ready-file [lock-to-hold]
     else
         setsid bash -c 'cd "$1" || exit 1; echo $$ >"$2"; exec sleep 120' _ "$1" "$2" >/dev/null 2>&1 &
     fi
+    disown # as start_holder's: kill_helper kills this group; no 'Killed' notice
     wait_for_file "$2" || fail "the group never wrote its ready file"
 }
 stale_pid_group_case() { # name dir [lock]
