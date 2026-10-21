@@ -578,6 +578,6 @@ pub(super) fn turns_in_flight(conversation_id: i64) -> usize {
 /// Whether `conversation_id` has any turn state at all, for tests of
 /// what's freed.
 #[cfg(test)]
-pub(super) fn has_turn_state(conversation_id: i64) -> bool {
+pub(crate) fn has_turn_state(conversation_id: i64) -> bool {
     read_runtime(conversation_id, |_| ()).is_some()
 }

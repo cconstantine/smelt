@@ -1,4 +1,5 @@
 use super::*;
+use crate::sandbox::test_support::unreachable_client;
 
 /// The manager before `init()`: an error saying so, not a panic (SME-56).
 /// Read from a cell of the test's own, so it holds whatever else runs.
@@ -7,14 +8,6 @@ fn test_the_manager_before_init_is_not_initialized() {
     let cell = OnceLock::new();
     let result = manager_in(&cell);
     assert!(matches!(result, Err(SandboxError::NotInitialized)), "expected NotInitialized");
-}
-
-/// A client for a cluster that isn't there: nothing is sent until a
-/// request is made, so it builds a manager without a cluster.
-fn unreachable_client() -> kube::Client {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let url = "http://127.0.0.1:9".parse().expect("a url");
-    kube::Client::try_from(kube::Config::new(url)).expect("a client")
 }
 
 /// SME-94: a test's own manager is what `get()` returns on the test's
