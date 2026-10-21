@@ -7,31 +7,6 @@
 
 use super::*;
 
-/// Waits (up to 10 s) for `rx` to say no turn is running any more.
-async fn wait_until_idle(rx: &mut tokio::sync::broadcast::Receiver<events::ConversationEvent>) {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            match rx.recv().await {
-                Ok(events::ConversationEvent::TurnState { running: false, .. }) => return,
-                Ok(_) => continue,
-                Err(e) => panic!("the event stream ended: {e}"),
-            }
-        }
-    })
-    .await
-    .expect("the turn ends within 10 s");
-}
-
-/// Lets the stopped turn reach its `select!` while the lock is still
-/// held, so only the stop is ready there (the runtime is current-thread),
-/// then frees the lock.
-async fn release_after_the_stop_is_seen(held: tokio::sync::OwnedMutexGuard<()>) {
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
-    drop(held);
-}
-
 /// E1: a Stop sent right after `send_message` returns ends that send's
 /// turn: no model call, the message kept once, the stop noted once, and
 /// the conversation paused. Before SME-216 the turn wasn't counted yet,

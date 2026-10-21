@@ -22,8 +22,12 @@ pub(super) struct ConversationRuntime {
     /// `run_turn_bounded` call (a finished command waking the model, say, or two notices at
     /// once) can race for the same conversation — Anthropic's strict
     /// user/assistant alternation breaks if two writers persist a turn at
-    /// once. Which caller acquires it first when several are ready is
-    /// unspecified (see SME-8's Open questions).
+    /// once. Admitted turns (the user's sends and answers, wakes and
+    /// delivered notices) acquire it in the order they were admitted:
+    /// each takes its place in the queue then (`TurnPlace`, SME-202).
+    /// Its other users (`save_notice_between_turns`, a stopped turn's
+    /// stop note, the tests' own turns) join the queue when they first
+    /// wait on it.
     lock: Option<Arc<tokio::sync::Mutex<()>>>,
     /// The reply text streamed so far in the current model call, for a tab
     /// that connects mid-reply (`get_reply_in_progress`). Cleared when a
@@ -256,6 +260,45 @@ pub(super) struct TurnInFlight {
     conversation_id: i64,
     /// `None` only once dropped.
     stop: Option<tokio::sync::watch::Receiver<u64>>,
+    /// The turn's place in the turn lock's queue, taken at its admission;
+    /// `None` for a test's turn, or once the turn has taken it to run.
+    place: Option<TurnPlace>,
+}
+
+/// A turn's place in its conversation's turn-lock queue, taken when it's
+/// admitted (SME-202): the lock it queued on, and the acquisition, which
+/// gives the guard once every turn admitted before it is done. The turn
+/// waits on this same acquisition when a Stop catches it queued, so
+/// queued turns run, or are saved when stopped, in admission order.
+pub(super) struct TurnPlace {
+    pub(super) lock: Arc<tokio::sync::Mutex<()>>,
+    pub(super) acquire: TurnAcquire,
+}
+
+/// A turn lock's pending acquisition.
+pub(super) type TurnAcquire =
+    std::pin::Pin<Box<dyn std::future::Future<Output = tokio::sync::OwnedMutexGuard<()>> + Send>>;
+
+impl TurnPlace {
+    /// Joins `lock`'s queue now, rather than at the acquisition's first
+    /// poll by the turn's task: polls it once, with a no-op waker. That's
+    /// sound because only the waker of the latest poll must be woken, and
+    /// tokio replaces a queued waiter's waker on every poll; the turn's
+    /// task polls the acquisition itself when it first waits on it, with
+    /// no wake needed, and a lock handed to it before then waits on its
+    /// entry in the queue. Unconstrained, since with the task's coop
+    /// budget spent the acquisition returns `Pending` without queueing.
+    /// Polled inside the turn state's `std` mutex: it takes only the
+    /// semaphore's own lock.
+    fn join(lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        let mut acquire: TurnAcquire = Box::pin(tokio::task::coop::unconstrained(lock.clone().lock_owned()));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        if let std::task::Poll::Ready(guard) = std::future::Future::poll(acquire.as_mut(), &mut context) {
+            // The lock was free: the turn holds it from its admission.
+            acquire = Box::pin(std::future::ready(guard));
+        }
+        TurnPlace { lock, acquire }
+    }
 }
 
 /// How a turn is admitted (`admit`).
@@ -280,7 +323,13 @@ enum Admission {
 /// Returns the counted turn, and the conversation's turn generation once
 /// it's admitted; `None` if refused, with nothing changed.
 fn admit(conversation_id: i64, admission: Admission) -> Option<(TurnInFlight, u64)> {
-    let (first, stop, generation) = with_runtime(conversation_id, |runtime| {
+    let (first, stop, place, generation) = with_runtime(conversation_id, |runtime| {
+        // A test's turn takes no place: tests hold counted turns that never
+        // run, which would hold or block the lock for good.
+        #[cfg(test)]
+        let ordered = !matches!(admission, Admission::Always);
+        #[cfg(not(test))]
+        let ordered = true;
         match admission {
             Admission::ByUser => {
                 runtime.paused = false;
@@ -294,6 +343,10 @@ fn admit(conversation_id: i64, admission: Admission) -> Option<(TurnInFlight, u6
         }
         runtime.turns_in_flight += 1;
         let stop = runtime.stop_receiver();
+        let place = ordered.then(|| {
+            let lock = runtime.lock.get_or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
+            TurnPlace::join(lock)
+        });
         let first = runtime.turns_in_flight == 1;
         if first {
             runtime.started_at = Some(std::time::Instant::now());
@@ -302,13 +355,13 @@ fn admit(conversation_id: i64, admission: Admission) -> Option<(TurnInFlight, u6
                 crate::events::ConversationEvent::TurnState { running: true, elapsed: 0 },
             );
         }
-        Some((first, stop, runtime.kept.generation))
+        Some((first, stop, place, runtime.kept.generation))
     })?;
     if first {
         // Only tells the sidebar to fetch the busy list again.
         crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
     }
-    Some((TurnInFlight { conversation_id, stop: Some(stop) }, generation))
+    Some((TurnInFlight { conversation_id, stop: Some(stop), place }, generation))
 }
 
 impl TurnInFlight {
@@ -339,6 +392,13 @@ impl TurnInFlight {
         self.conversation_id
     }
 
+    /// The turn's place in the turn lock's queue (`TurnPlace`), for the
+    /// turn to wait on; `None` for a test's turn, which joins the queue
+    /// when it first waits.
+    pub(super) fn take_place(&mut self) -> Option<TurnPlace> {
+        self.place.take()
+    }
+
     /// The turn's stop receiver: it changes when the user stops the
     /// conversation after the turn was counted.
     pub(super) fn stop(&mut self) -> &mut tokio::sync::watch::Receiver<u64> {
@@ -350,6 +410,11 @@ impl TurnInFlight {
 impl Drop for TurnInFlight {
     fn drop(&mut self) {
         let conversation_id = self.conversation_id;
+        // First, before the release below: a queued place leaves the
+        // queue, a granted one frees the lock, and either way its handle
+        // on the lock goes, so the last turn ending frees it. Takes only
+        // the lock's own semaphore lock, never the turn state's.
+        drop(self.place.take());
         let stop = self.stop.take();
         let mut last = false;
         update_existing(conversation_id, |runtime| {
