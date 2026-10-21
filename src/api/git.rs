@@ -125,7 +125,12 @@ async fn attach_and_answer(
                 deliver(&pool, notices);
                 (shown, pending)
             }
-            Err(e) => return hand_back_attach(&pool, id, answer, Err(e)).await,
+            // A failure after the trust committed still owes the models
+            // whose cards it dropped their notices (SME-224 review 1).
+            Err(failed) => {
+                deliver(&pool, failed.notices);
+                return hand_back_attach(&pool, id, answer, Err(failed.error)).await;
+            }
         };
         let nothing_to_clone = pending.is_none();
         hand_back_attach(&pool, id, answer, Ok(shown)).await;
@@ -354,6 +359,55 @@ mod tests {
             trusted(p).await && git::list_repos(p, b).await.expect("repos")[0].trust_requests.is_empty()
         })
         .await;
+        eventually("B's model is told", || told(p, b, "load_instructions again")).await;
+        crate::turn::forget_conversation_lock(a);
+        crate::turn::forget_conversation_lock(b);
+    }
+
+    /// SME-224 review 1, finding 1. Interleaving: another request's repo
+    /// at A's directory, for another remote, is held uncommitted while
+    /// A's "Work on a repo" trusts the remote and drops B's card, so A's
+    /// record of the clone waits for it; it commits, and A's attach loses
+    /// the race and fails. The trust stands, so B's model is still told.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_work_on_a_repo_that_fails_after_trusting_still_tells_the_models(pool: sqlx::PgPool) {
+        let _race = git::test_support::ONE_AT_A_TIME.lock().await;
+        let _turns = crate::providers::test_support::lock_turn_tests();
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        let a = db::create_conversation(&pool).await.expect("conversation A").id;
+        let b = db::create_conversation(&pool).await.expect("conversation B").id;
+        let repo_b = git::test_support::cloned_repo(&pool, b).await;
+        db::request_instruction(&pool, b, repo_b.id, "AGENTS.md", &git::test_support::file("b"))
+            .await
+            .expect("a card in B");
+        crate::turn::stop_turn_now(b);
+
+        let mut holding = pool.begin().await.expect("begin the holding transaction");
+        sqlx::query(
+            "INSERT INTO conversation_repos (conversation_id, url, remote_key, dir, status)
+             VALUES ($1, 'https://github.com/x/r', 'github.com/x/r', 'r', 'cloning')",
+        )
+        .bind(a)
+        .execute(&mut *holding)
+        .await
+        .expect("hold A's directory, uncommitted");
+        let attach = tokio::spawn({
+            let pool = pool.clone();
+            async move { attach_and_answer(&pool, a, "https://github.com/o/r".into(), String::new(), String::new()).await }
+        });
+        let attach_waited = git::test_support::waiters_or_finished(&pool, 1, &attach).await;
+        holding.commit().await.expect("the other request's repo");
+
+        let attached = tokio::time::timeout(std::time::Duration::from_secs(10), attach)
+            .await
+            .expect("the attach answers")
+            .expect("the attach's task");
+        assert!(attach_waited, "the attach never waited at A's directory");
+        let error = attached.expect_err("the attach loses the race");
+        assert!(error.contains("already used by"), "got: {error}");
+        assert!(trusted(&pool).await, "the remote is trusted");
+        assert!(git::list_repos(&pool, b).await.expect("repos")[0].trust_requests.is_empty(), "B's card is dropped");
+        let p = &pool;
         eventually("B's model is told", || told(p, b, "load_instructions again")).await;
         crate::turn::forget_conversation_lock(a);
         crate::turn::forget_conversation_lock(b);

@@ -372,6 +372,7 @@ fn spawn_attach(pool: &PgPool, conversation_id: i64) -> tokio::task::JoinHandle<
         start_attach(&pool, conversation_id, "https://github.com/o/r", None, None)
             .await
             .map(|(_, _, notices)| notices)
+            .map_err(|failed| failed.error)
     })
 }
 
