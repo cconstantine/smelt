@@ -80,8 +80,9 @@ cargo check --no-default-features --features web --target wasm32-unknown-unknown
 
 # ── Tests ─────────────────────────────────────────────────────────────────
 # Requires Postgres running first (docker compose up -d postgres) — DB tests
-# use #[sqlx::test], which needs a reachable DATABASE_URL. See testing.md.
-cargo test --features server
+# use #[sqlx::test], which needs a reachable DATABASE_URL. They run only under
+# the cluster lock, which this takes (SME-212). See testing.md.
+scripts/cluster-test --features server
 ```
 
 **Run all of it inside the compose stack's `smelt` service rather than
