@@ -46,13 +46,14 @@ pub(super) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: St
         }
         return;
     }
-    // The notice as the turn's own message: `run_turn` saves it before the
+    // The notice as the turn's own message: the turn saves it before the
     // model call, so it survives the call failing.
     let message = anthropic::AnthropicMessage {
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text }],
     };
-    if let Err(TurnFailure::Failed(e)) = run_turn(pool, conversation_id, message).await {
+    let turn = TurnInFlight::start(conversation_id);
+    if let Err(TurnFailure::Failed(e)) = run_turn_bounded(pool, turn, Some(message), MAX_TURNS, None, false).await {
         tracing::warn!(conversation_id, error = %e, "a notice didn't reach the model");
         crate::events::publish(
             conversation_id,
@@ -91,7 +92,7 @@ pub(super) async fn wake_conversation(
     if is_paused(conversation_id) {
         return Ok(Vec::new());
     }
-    let result = run_turn_bounded(pool, conversation_id, None, MAX_TURNS, None, false).await;
+    let result = run_turn_bounded(pool, TurnInFlight::start(conversation_id), None, MAX_TURNS, None, false).await;
     // A stop is the user's doing, not a failure to reach the model.
     if let Err(TurnFailure::Failed(e)) = &result {
         tracing::warn!(conversation_id, error = %e, "wake_conversation failed to notify the model");

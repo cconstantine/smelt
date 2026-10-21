@@ -38,7 +38,12 @@ pub(super) const MIN_REPLY_TOKENS: u32 = 16_384;
 /// `Send`-auto-trait inference for plain `async fn`s ("cannot satisfy `impl
 /// Future: Send`" with no useful location). Type-erasing one edge of the
 /// cycle here breaks it.
-#[cfg(feature = "server")]
+///
+/// The tests' way in: it counts the turn when called, before the future
+/// is polled, whatever the pause (`TurnInFlight::start`). Production
+/// turns are admitted by their callers (SME-216): the user's send or
+/// answer ends a pause, and a notice respects it.
+#[cfg(all(feature = "server", test))]
 pub(crate) fn run_turn<'a>(
     pool: &'a PgPool,
     conversation_id: i64,
@@ -47,7 +52,7 @@ pub(crate) fn run_turn<'a>(
 {
     run_turn_bounded(
         pool,
-        conversation_id,
+        TurnInFlight::start(conversation_id),
         Some(new_message),
         MAX_TURNS,
         None,
@@ -81,10 +86,12 @@ pub(super) fn record_saved(conversation_id: i64, persisted: &mut Vec<Message>, s
 /// the turn's failure for a tab that reconnects; it's the generation the
 /// caller took when the user acted (sending, answering), which stands in
 /// for the turn's own if it fails before it takes one (SME-179 review 2).
+/// `in_flight` is the turn, already counted by its caller (SME-216), so a
+/// Stop sent once the caller has returned ends it.
 #[cfg(feature = "server")]
 pub(super) fn run_turn_bounded<'a>(
     pool: &'a PgPool,
-    conversation_id: i64,
+    mut in_flight: TurnInFlight,
     new_message: Option<anthropic::AnthropicMessage>,
     max_turns: usize,
     keep_error: Option<u64>,
@@ -92,6 +99,7 @@ pub(super) fn run_turn_bounded<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TurnResult> + Send + 'a>>
 {
     use tracing::field::Empty;
+    let conversation_id = in_flight.conversation_id();
     Box::pin(async move {
         // The turn's span (SME-137), made when the turn starts: its model
         // calls and tool calls are its children. The model is recorded once
@@ -107,9 +115,6 @@ pub(super) fn run_turn_bounded<'a>(
             otel.status_description = Empty,
         );
         crate::telemetry::in_span(span.clone(), async move {
-            // Counted with its stop receiver made in one step, so a Stop from
-            // here on ends it (SME-179 B29).
-            let mut in_flight = TurnInFlight::start(conversation_id);
             #[cfg(test)]
             test_hooks::after_turn_counted(conversation_id).await;
             // The turn's generation, once it holds the lock and has something
@@ -313,11 +318,12 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     {
         return Err(ServerFnError::new("conversation not found"));
     }
-    // The user writing again ends any pause from an earlier stop.
-    resume_turns(id);
-    // At once, not only when the turn starts: it may queue behind another,
-    // and a turn already running mustn't keep its error over this one.
-    let generation = new_turn_generation(id);
+    // Admitted before this returns, so a Stop sent after it ends this turn
+    // (SME-216). The user writing again ends any pause from an earlier
+    // stop, and its generation is taken at once, not only when the turn
+    // starts: it may queue behind another, and a turn already running
+    // mustn't keep its error over this one.
+    let (in_flight, generation) = TurnInFlight::start_by_user(id);
     let new_message = anthropic::AnthropicMessage {
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text: content }],
@@ -325,7 +331,7 @@ pub(crate) async fn start_turn(pool: PgPool, id: i64, content: String) -> Server
     // In the request's span, so the turn's is its child (SME-137).
     tokio::spawn(tracing::Instrument::in_current_span(async move {
         // Its failure is kept for a reconnecting tab (`keep_error`).
-        if let Err(e) = run_turn_bounded(&pool, id, Some(new_message), MAX_TURNS, Some(generation), true).await {
+        if let Err(e) = run_turn_bounded(&pool, in_flight, Some(new_message), MAX_TURNS, Some(generation), true).await {
             let message = e.message();
             crate::events::publish(id, crate::events::ConversationEvent::TurnError { message });
         }
