@@ -65,20 +65,27 @@ pub(super) async fn run_reader(
     // are all in its pipes by the time it's reaped, so each pipe is read
     // as far as what was in it then, however long that takes (review 1: a
     // fixed time for it lost output on a busy node). A pipe that hasn't
-    // reached its end there is held by a job the shell left running; with
-    // no job, it always has.
+    // reached its end there may be held by a job the shell left running;
+    // with no job, it has, or soon will (review 2: a process substitution
+    // the shell wrote through still holds it, with the shell's last words).
     let mut exit: Option<i32> = None;
     let (mut stdout_read, mut stderr_read) = (ReadSoFar::default(), ReadSoFar::default());
     let (mut stdout_held, mut stderr_held) = (false, false);
     while stdout_open || stderr_open {
+        let (stdout_grace, stderr_grace) = (stdout_read.grace_deadline(), stderr_read.grace_deadline());
         tokio::select! {
             result = fill_piece(&mut stdout, &mut stdout_buf, &mut stdout_read), if stdout_open => {
                 match result {
                     // The pipe's end or an error, or, once the shell has
                     // been reaped, the end of its own output.
                     Ok(false) | Err(_) => {
-                        stdout_open = false;
-                        stdout_held = exit.is_some() && !writers_gone(stdout.get_ref());
+                        let held = exit.is_some() && !writers_gone(stdout.get_ref());
+                        // Read on for a short grace before counting it as
+                        // a job's (review 2).
+                        if !(held && stdout_read.start_grace()) {
+                            stdout_open = false;
+                            stdout_held = held;
+                        }
                     }
                     Ok(true) => {
                         let line = take_piece(&mut stdout_buf);
@@ -111,8 +118,13 @@ pub(super) async fn run_reader(
             result = fill_piece(&mut stderr, &mut stderr_buf, &mut stderr_read), if stderr_open => {
                 match result {
                     Ok(false) | Err(_) => {
-                        stderr_open = false;
-                        stderr_held = exit.is_some() && !writers_gone(stderr.get_ref());
+                        let held = exit.is_some() && !writers_gone(stderr.get_ref());
+                        // Read on for a short grace before counting it as
+                        // a job's (review 2).
+                        if !(held && stderr_read.start_grace()) {
+                            stderr_open = false;
+                            stderr_held = held;
+                        }
                     }
                     Ok(true) => {
                         let line = take_piece(&mut stderr_buf);
@@ -142,6 +154,8 @@ pub(super) async fn run_reader(
                     }
                 }
             }
+            _ = sleep_until_or_never(stdout_grace), if stdout_open => stdout_read.end_grace(),
+            _ = sleep_until_or_never(stderr_grace), if stderr_open => stderr_read.end_grace(),
             _ = sleep_until_or_never(ending.deadline) => {
                 // One marker came and the other didn't in time.
                 ending.give_up_waiting();
@@ -229,13 +243,40 @@ const MARKER_TAIL: usize = 64;
 /// before the command is finished without it (B12, SME-122).
 pub(super) const STDERR_MARKER_WAIT: Duration = Duration::from_secs(1);
 
+/// How long a pipe still held once an ended shell's own output in it has
+/// been read is read on with nothing new arriving, and at most in all,
+/// before it's counted as held by a job (SME-191 review 2): a process
+/// substitution the shell wrote through (`exec > >(tee log)`) passes the
+/// shell's last words on, and closes the pipe, just after the reap.
+const GRACE_QUIET: Duration = Duration::from_millis(500);
+const GRACE_MAX: Duration = Duration::from_secs(1);
+
 /// How far one of a shell's pipes has been read (SME-191): `pulled` bytes
 /// in all, and, once the shell has been reaped, `until`, the end of the
-/// shell's own output in it. What comes after that is a job's.
+/// shell's own output in it. What comes after that is a job's, unless
+/// it comes in the grace that follows (review 2).
 #[derive(Default)]
 struct ReadSoFar {
     pulled: u64,
     until: Option<u64>,
+    grace: Grace,
+}
+
+/// The read-on after an ended shell's own output, while something still
+/// holds the pipe (review 2). `NotYet` to `Running` when the reader gets
+/// to `until` with the pipe still held; `Running` ends at the pipe's end
+/// (not held: no job), or with `GRACE_QUIET` passing with nothing new, or
+/// `GRACE_MAX` in all, to `Over`, which bounds the pipe at what's read.
+/// It runs once.
+#[derive(Default)]
+enum Grace {
+    #[default]
+    NotYet,
+    Running {
+        quiet_until: tokio::time::Instant,
+        ends: tokio::time::Instant,
+    },
+    Over,
 }
 
 impl ReadSoFar {
@@ -248,6 +289,40 @@ impl ReadSoFar {
             Some(in_pipe) => self.until = Some(self.pulled + buffered as u64 + in_pipe as u64),
             None => tracing::warn!("couldn't read how much of an ended shell's output is left; reading to the pipe's end"),
         }
+    }
+
+    /// At `until` with the pipe still held: reads on, with no bound, for
+    /// the grace. False if it has had its grace already.
+    fn start_grace(&mut self) -> bool {
+        if !matches!(self.grace, Grace::NotYet) {
+            return false;
+        }
+        let now = tokio::time::Instant::now();
+        self.grace = Grace::Running { quiet_until: now + GRACE_QUIET, ends: now + GRACE_MAX };
+        self.until = None;
+        true
+    }
+
+    /// Something was read: the grace's quiet wait starts over.
+    fn saw_output(&mut self) {
+        if let Grace::Running { quiet_until, .. } = &mut self.grace {
+            *quiet_until = tokio::time::Instant::now() + GRACE_QUIET;
+        }
+    }
+
+    /// When the running grace ends, if one is.
+    fn grace_deadline(&self) -> Option<tokio::time::Instant> {
+        match self.grace {
+            Grace::Running { quiet_until, ends } => Some(quiet_until.min(ends)),
+            _ => None,
+        }
+    }
+
+    /// The grace has passed: the pipe ends at what's been read, and what
+    /// follows is a job's.
+    fn end_grace(&mut self) {
+        self.grace = Grace::Over;
+        self.until = Some(self.pulled);
     }
 
     /// How many more bytes may be read: `None` for no limit.
@@ -470,6 +545,7 @@ async fn fill_piece<R: tokio::io::AsyncBufRead + Unpin>(
         buf.extend_from_slice(&available[..take]);
         reader.consume(take);
         read.pulled += take as u64;
+        read.saw_output();
     }
 }
 

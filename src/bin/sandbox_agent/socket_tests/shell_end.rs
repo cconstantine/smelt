@@ -419,3 +419,44 @@ async fn test_a_signal_after_the_shell_was_reaped_is_sent_nowhere() {
         "the signal wasn't refused for the ended shell"
     );
 }
+
+/// SME-191 review 2: a shell whose output goes through a process
+/// substitution (`exec > >(tee -a log)`) still has all of it shown, and
+/// its note doesn't speak of jobs. Its own last words are still in the
+/// helper when it's reaped, and the helper, which holds the pipes for a
+/// moment after, is no job left running.
+#[tokio::test]
+async fn test_a_shells_output_through_a_process_substitution_is_all_shown() {
+    let addr = serve_agent().await;
+    let mut client = connect_ready(addr).await;
+    create_terminal(&mut client, "t1").await;
+
+    let (stdout, stderr, code) = run_collect(&mut client, "t1", "c1", "exec > >(sleep 0.3; cat); echo hello; exit 0").await;
+    assert_eq!((stdout, code), (vec!["hello".to_string()], 0));
+    assert!(
+        stderr.len() == 1 && stderr[0].contains("shell exited") && !stderr[0].contains("background"),
+        "the note should say only that the shell exited: {stderr:?}"
+    );
+}
+
+/// SME-191 review 2: a job that keeps writing after its shell exits
+/// doesn't keep the shell's command running: what it writes is shown
+/// for a short while at most, and then the command finishes with the
+/// note that the job is still running.
+#[tokio::test]
+async fn test_a_job_that_keeps_writing_after_its_shell_exits_doesnt_keep_its_command_running() {
+    let addr = serve_agent().await;
+    let mut client = connect_ready(addr).await;
+    create_terminal(&mut client, "t1").await;
+
+    let command = "(for i in $(seq 400); do echo tick; sleep 0.05; done) & echo \"job $!\" >&2; exit 0";
+    let (_, stderr, code) = tokio::time::timeout(Duration::from_secs(5), run_collect(&mut client, "t1", "c1", command))
+        .await
+        .expect("the job's output kept the command running");
+    let _job = JobGuard(job_pid(&stderr));
+    assert_eq!(code, 0);
+    assert!(
+        stderr.iter().any(|line| line.contains("shell exited") && line.contains("background")),
+        "the note should say a background job is still running: {stderr:?}"
+    );
+}
