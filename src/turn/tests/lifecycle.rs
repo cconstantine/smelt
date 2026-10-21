@@ -633,3 +633,54 @@ async fn test_a_shown_error_on_a_live_conversation_is_kept(pool: PgPool) {
     assert_eq!(last_turn_error(conversation_id), Some(message));
     delete_as_the_api_does(&pool, conversation_id).await;
 }
+
+/// A pool of one connection, held by the caller: a check on it waits for
+/// the connection until the caller lets it go.
+async fn held_one_connection_pool(pool: &PgPool) -> (PgPool, sqlx::pool::PoolConnection<sqlx::Postgres>) {
+    let held = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .expect("a one-connection pool");
+    let connection = held.acquire().await.expect("hold its connection");
+    (held, connection)
+}
+
+/// SME-219 review 1, interleaving: a Stop's request is cut off (its
+/// future dropped, as a client hanging up does) after the Stop wrote and
+/// while its existence check waits for a connection. The check still
+/// runs, and the deleted conversation is left with no turn state.
+#[sqlx::test]
+async fn test_a_stop_cut_off_mid_check_still_forgets_a_deleted_conversation(pool: PgPool) {
+    use futures_util::FutureExt;
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    delete_as_the_api_does(&pool, conversation_id).await;
+    let (held, connection) = held_one_connection_pool(&pool).await;
+
+    assert!(stop_conversation(&held, conversation_id).now_or_never().is_none(), "the check didn't wait");
+    assert!(has_turn_state(conversation_id), "the Stop hadn't written before it was cut off");
+    drop(connection);
+
+    wait_until("the cut-off Stop's check forgets the conversation", || !has_turn_state(conversation_id)).await;
+}
+
+/// SME-219 review 1, the same for an error shown outside a turn: cut off
+/// while its check waits, it still forgets the deleted conversation.
+#[sqlx::test]
+async fn test_an_error_cut_off_mid_check_still_forgets_a_deleted_conversation(pool: PgPool) {
+    use futures_util::FutureExt;
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    delete_as_the_api_does(&pool, conversation_id).await;
+    let (held, connection) = held_one_connection_pool(&pool).await;
+
+    let shown = show_error_outside_turn(&held, conversation_id, "\"Work on a repo\" failed.".to_string());
+    assert!(shown.now_or_never().is_none(), "the check didn't wait");
+    assert!(has_turn_state(conversation_id), "the error hadn't been written before it was cut off");
+    drop(connection);
+
+    wait_until("the cut-off error's check forgets the conversation", || !has_turn_state(conversation_id)).await;
+}
