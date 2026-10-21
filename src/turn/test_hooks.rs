@@ -34,8 +34,8 @@ pub async fn after_message_saved(conversation_id: i64) {
 static AFTER_TURN_COUNTED: LazyLock<Mutex<HashMap<i64, Pause>>> = LazyLock::new(Default::default);
 
 /// Pauses `conversation_id`'s next turn after it's admitted: counted as
-/// in flight by its caller (`TurnInFlight::start_by_user` or
-/// `start_unless_paused`, SME-216; in a test's `run_turn`,
+/// in flight by its caller (`TurnInFlight::start_by_user`, SME-216, or
+/// `start_unless_paused`, SME-217; in a test's `run_turn`,
 /// `TurnInFlight::start`), when its future first runs, before it waits
 /// for the turn lock. As `pause_after_message_saved`.
 pub fn pause_after_turn_counted(conversation_id: i64) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
