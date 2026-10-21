@@ -235,15 +235,21 @@ stop() {
 
     local pgid
     if ! pgid=$(running_pgid); then
-        # A pid file naming a live group that running_pgid turned down has an
-        # id that was reused: the group is someone else's, and this is the one
-        # place where it would be signalled. Say so, and empty the file like
-        # any other stale one (SME-186 B41).
+        # A pid file naming a live group that running_pgid turned down: say
+        # so, signal nothing, and leave everything else alone. The id may
+        # well have been reused — but a live group that fails the shape
+        # check is also exactly what this worktree's own server looks like
+        # once its port lock file has been moved or unlinked (a rename takes
+        # the name off the descriptors that hold it: /proc/<pid>/fd reads
+        # `… (deleted)`), and on that reading emptying the pid file and
+        # dropping the scratch database here tears a live server down. The
+        # safe half of both readings: keep the files, keep the database, and
+        # let a person tell them apart (SME-186 B41, review 1 finding 2).
         if pgid=$(pid_file_pgid) && group_is_live "$pgid"; then
-            echo "the pid file names process group $pgid, which isn't this worktree's check server (its id was reused); not signalling it" >&2
-        else
-            echo "no check server running (log: $(log_file))"
+            echo "the pid file names process group $pgid, which isn't this worktree's check server; not signalling it, and keeping the pid file and the scratch database — if this is this worktree's server under a lock file that was moved or unlinked, that's what protects it" >&2
+            return 0
         fi
+        echo "no check server running (log: $(log_file))"
         [ -e "$(pid_file)" ] && : >"$(pid_file)"
         finish_stop "$scratch_url"
         return 0

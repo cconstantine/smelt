@@ -27,7 +27,11 @@ find_port_holder() {
     # two `|| true`s — without them errexit ends the whole start on a vanished
     # directory or pid, silently, sed's error hidden by the redirect, which is
     # what the first version of this did. A pid that has gone holds no lock.
-    for fd in $(find /proc/[0-9]*/fd -maxdepth 1 -lname "$port_lock" 2>/dev/null || true); do
+    # The pattern's trailing `*`: a lock file that has been moved or unlinked
+    # reads `… (deleted)` at the descriptors that still hold it, and that
+    # holder is exactly who a waiting start needs naming (SME-186 review 1,
+    # finding 2).
+    for fd in $(find /proc/[0-9]*/fd -maxdepth 1 -lname "$port_lock*" 2>/dev/null || true); do
         pid=${fd#/proc/}
         pid=${pid%%/*}
         # This start has the lock open itself (descriptor 8), and so does any
@@ -163,12 +167,16 @@ worktree_path() {
 # server holds a lock but works elsewhere, and a stranger started in this
 # worktree has the directory and no lock. This is what keeps `stop` from
 # signalling a group on the pid file's word alone (SME-186 B41). Reads /proc.
+# The lock pattern's trailing `*` tolerates the ` (deleted)` an unlinked file
+# leaves at the descriptors that still hold it: that group holds the lock as
+# surely as if the name were there, and it's this worktree's server whose
+# lock was cleared out from under it (review 1, finding 2).
 group_is_our_server() { # pgid
     local pid cwd has_lock="" in_worktree=""
     cwd=$(worktree_path)
     for pid in $(pgrep -g "$1" 2>/dev/null || true); do
         if [ -z "$has_lock" ] &&
-            [ -n "$(find "/proc/$pid/fd" -maxdepth 1 -lname '*/smelt-check-server-*.lock' -print -quit 2>/dev/null || true)" ]; then
+            [ -n "$(find "/proc/$pid/fd" -maxdepth 1 -lname '*/smelt-check-server-*.lock*' -print -quit 2>/dev/null || true)" ]; then
             has_lock=1
         fi
         if [ -z "$in_worktree" ] && [ -n "$cwd" ] &&

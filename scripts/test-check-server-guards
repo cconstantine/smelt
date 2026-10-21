@@ -253,6 +253,46 @@ kill_helper "$newer_pid"
 kill_helper "$older_pid"
 check_server stop >/dev/null
 
+# G2f (SME-186 review 1, finding 2): the same file moved out from under the
+# holder while a start waits on it — flock follows inodes, so the start keeps
+# waiting on the moved one. The timeout advice scans /proc afterwards, and an
+# unlinked file reads `… (deleted)` there: the exact-name pattern missed the
+# holder entirely, and the advice told you to look for "a check server in
+# another worktree this user can't see" when it could see it all along.
+holder_dir5=$dir/holder-deleted
+mkdir -p "$holder_dir5"
+holder_pid5=$(start_plain_locker "$holder_dir5" "$dir/deleted-ready" hold)
+(
+    CHECK_PORT_WAIT=8 timeout 30 "${guard_env[@]}" scripts/check-server start HEAD \
+        >"$dir/deleted-start.out" 2>&1 </dev/null &
+    spid=$!
+    for _ in $(seq 1 100); do
+        grep -qF "waiting for port $port" "$dir/deleted-start.out" 2>/dev/null && break
+        sleep 0.1
+    done
+    # A rename within one filesystem would just move the name the descriptor
+    # reads; this copy-to-tmpfs-then-unlink is what puts the holder's fd into
+    # the `… (deleted)` state the case is about — and it moves the file
+    # rather than removing it, as this script's rules ask. The name is
+    # per-run so the move never replaces an earlier run's copy.
+    mv "$port_lock" "/dev/shm/sme186-guards-deleted-lock.$$"
+    wait "$spid"
+)
+rc=$?
+out=$(cat "$dir/deleted-start.out")
+[ "$rc" = 1 ] || fail "G2f: the start that outlived the lock file exited $rc, not 1: $out"
+grep -qF "waiting for port $port" <<<"$out" || fail "G2f: the start never reached its wait: $out"
+# The *timeout* line, not the first one: the first was computed before the
+# move and can name the holder the old way even when the timeout can't.
+advice=$(grep "still held after" <<<"$out")
+[ -n "$advice" ] || fail "G2f: no timeout advice after the lock file was moved: $out"
+grep -qF "pid $holder_pid5" <<<"$advice" ||
+    fail "G2f: with the lock file unlinked the timeout advice doesn't name the holder: $advice"
+grep -qF "$holder_dir5" <<<"$advice" || fail "G2f: the timeout advice doesn't name the holder's directory: $advice"
+pid_is_live "$holder_pid5" || fail "G2f: a start that gave up signalled the holder"
+kill_helper "$holder_pid5"
+check_server stop >/dev/null
+
 # G3 (SME-186 B41): a pid file that names a live group which isn't this
 # worktree's server must never be signalled — an id that was reused belongs to
 # someone else. Three groups, each leading a session of its own so that
@@ -261,7 +301,11 @@ check_server stop >/dev/null
 # working in this worktree, (c) working in this worktree with no lock open.
 # Only a check-server port lock *and* this worktree's directory is this
 # worktree's server; every server start writes the pid file for meets both,
-# since its group inherits descriptor 8 and dx runs in the worktree.
+# since its group inherits descriptor 8 and dx runs in the worktree. And
+# stop keeps everything the record claims: the same record read the other
+# way describes this worktree's own live server whose lock file was
+# unlinked, where clearing the files or dropping the database would tear
+# down something live (SME-186 review 1, finding 2).
 start_group() { # dir ready-file [lock-to-hold]
     : >"$2"
     if [ -n "${3:-}" ]; then
@@ -280,6 +324,14 @@ stale_pid_group_case() { # name dir [lock]
     pgid=$(cat "$group_dir/group-ready")
     pid_is_live "$pgid" || fail "$name: the group (pid $pgid) isn't alive"
     echo "$pgid" >"$pid_file"
+    # The scratch database a server of this worktree left behind. Seeded so
+    # the case says what stop may NOT do while an unclaimable group is alive:
+    # the record's other reading is this worktree's own server, under a lock
+    # that was unlinked (G3b), and dropping the database on that reading
+    # tears a live server down (SME-186 review 1, finding 2).
+    echo "$scratch_url" >"$scratch_file"
+    : >"$SQLX_CALLS"
+    : >"$CLEANUP_CALLS"
     out=$(check_server status)
     grep -q "^not running" <<<"$out" || fail "$name: status says '$out', not not running"
     out=$(check_server stop)
@@ -288,7 +340,14 @@ stale_pid_group_case() { # name dir [lock]
     grep -qF "process group $pgid" <<<"$out" || fail "$name: stop doesn't name the group: $out"
     grep -q "isn't this worktree's check server" <<<"$out" || fail "$name: stop doesn't say whose group it isn't: $out"
     pid_is_live "$pgid" || fail "$name: stop signalled the group the pid file named"
-    [ -s "$pid_file" ] && fail "$name: stop left the pid file naming $pgid: '$(cat "$pid_file")'"
+    [ "$(cat "$pid_file")" = "$pgid" ] ||
+        fail "$name: stop cleared the pid file naming live group $pgid: '$(cat "$pid_file")'"
+    [ "$(cat "$scratch_file")" = "$scratch_url" ] ||
+        fail "$name: stop emptied the scratch record while a live group may be serving it: '$(cat "$scratch_file")'"
+    grep -q "database drop" "$SQLX_CALLS" &&
+        fail "$name: stop dropped the scratch database under a live group: $(cat "$SQLX_CALLS")"
+    [ -s "$CLEANUP_CALLS" ] &&
+        fail "$name: stop ran the sandbox cleanup for a group it didn't stop: $(cat "$CLEANUP_CALLS")"
     # And the start that follows isn't held by a group it must not touch.
     out=$(check_server start HEAD) || fail "$name: start after a stale pid file: $out"
     grep -q "check server up" <<<"$out" || fail "$name: start after a stale pid file didn't come up: $out"
@@ -303,6 +362,39 @@ for group_dir_name in own-dir other-lock in-worktree; do
     [ "$group_dir_name" = other-lock ] && lock=$SMELT_LOCK_DIR/smelt-check-server-$other_port.lock
     stale_pid_group_case "G3 ($group_dir_name)" "$group_dir" "$lock"
 done
+
+# G3b (SME-186 review 1, finding 2): the group the pid file names really is
+# this worktree's server, and its lock file has been unlinked — what
+# "clearing a stuck lock" does. A rename moves the inode, so the holder keeps
+# holding it and /proc/<pid>/fd reads `… (deleted)`, which the exact-name
+# pattern missed: status called a live server "not running", start would
+# have joined it on the port it still holds, and stop's answer was to empty
+# the pid file and drop the database underneath it. status must still see
+# the server, and stop must still stop it properly.
+check_server stop >/dev/null
+start_group "$worktree" "$dir/g3b-ready" "$port_lock"
+pgid_b=$(cat "$dir/g3b-ready")
+echo "$pgid_b" >"$pid_file"
+echo "$scratch_url" >"$scratch_file"
+: >"$SQLX_CALLS"
+: >"$CLEANUP_CALLS"
+# Unlink for real: a rename in the same filesystem would just move the name
+# the descriptors read. mv onto tmpfs copies and frees the original, leaving
+# the holders' descriptors reading `… (deleted)` — and it moves the file
+# rather than removing it, as this script's rules ask.
+mv "$port_lock" "/dev/shm/sme186-guards-g3b-lock.$$"
+out=$(check_server status)
+grep -q "^running (process group $pgid_b)" <<<"$out" ||
+    fail "G3b: status doesn't see the server whose lock file was unlinked: $out"
+out=$(check_server stop)
+grep -qF "stopped the check server (process group $pgid_b" <<<"$out" ||
+    fail "G3b: stop didn't stop the server whose lock file was unlinked: $out"
+! pid_is_live "$pgid_b" || fail "G3b: the group is still alive after stop"
+[ -s "$pid_file" ] && fail "G3b: stop left the pid file set: '$(cat "$pid_file")'"
+[ -s "$scratch_file" ] && fail "G3b: stop left the scratch record set: '$(cat "$scratch_file")'"
+grep -q "database drop" "$SQLX_CALLS" ||
+    fail "G3b: stop didn't drop the scratch database of the server it stopped: $(cat "$SQLX_CALLS")"
+[ -s "$CLEANUP_CALLS" ] || fail "G3b: stop didn't run the sandbox cleanup: '$(cat "$CLEANUP_CALLS")'"
 
 # G4 (SME-186 B41): the default check worktree is named after this checkout, so
 # two checkouts never share one server's pid file, port lock and scratch
