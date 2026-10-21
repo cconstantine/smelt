@@ -1,0 +1,3 @@
+#!/bin/bash
+# scripts/retro-scan's own checks (no network): see its --self-test.
+exec python3 -I "$(dirname "$0")/retro-scan" --self-test
