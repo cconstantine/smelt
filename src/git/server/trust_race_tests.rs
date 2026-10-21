@@ -17,7 +17,7 @@ const LIMIT: Duration = Duration::from_secs(10);
 /// the process shares sqlx's parent pool of 20: run together, they ran
 /// out (`PoolTimedOut`). A tokio mutex, since each test has its own
 /// runtime.
-static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Sessions in this test's database waiting on a lock (a row lock or
 /// the remote's advisory lock).
@@ -33,7 +33,7 @@ async fn lock_waiters(pool: &PgPool) -> i64 {
 
 /// Waits until `n` sessions wait on a lock, or `task` has finished.
 /// True when the waiters were seen.
-async fn waiters_or_finished<T>(pool: &PgPool, n: i64, task: &tokio::task::JoinHandle<T>) -> bool {
+pub(crate) async fn waiters_or_finished<T>(pool: &PgPool, n: i64, task: &tokio::task::JoinHandle<T>) -> bool {
     let deadline = Instant::now() + LIMIT;
     loop {
         if lock_waiters(pool).await >= n {
@@ -56,7 +56,7 @@ async fn join<T>(task: tokio::task::JoinHandle<T>, what: &str) -> T {
 
 /// Holds `(repo_id, path)` in `table` with an uncommitted insert, so a
 /// caller's own insert of that row waits until the test rolls back.
-async fn hold_row<'a>(pool: &'a PgPool, table: &str, conversation_id: i64, repo_id: i64) -> sqlx::Transaction<'a, sqlx::Postgres> {
+pub(crate) async fn hold_row<'a>(pool: &'a PgPool, table: &str, conversation_id: i64, repo_id: i64) -> sqlx::Transaction<'a, sqlx::Postgres> {
     let mut holding = pool.begin().await.expect("begin the holding transaction");
     sqlx::query(&format!(
         "INSERT INTO {table} (conversation_id, repo_id, path, content, file_bytes, hash)
