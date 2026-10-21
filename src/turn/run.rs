@@ -199,7 +199,7 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
         // the card goes first in it. A stopped wake or answer turn has no
         // message, saves nothing, and leaves an answer for the next turn.
         // A turn stopped while queued keeps its place in the queue, so
-        // stopped messages are saved in the order they were sent (SME-202).
+        // stopped messages are saved in the order they were admitted (SME-202).
         let guard = tokio::select! {
             guard = &mut acquire => guard,
             _ = stop.changed() => {
