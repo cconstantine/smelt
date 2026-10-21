@@ -123,7 +123,7 @@ impl ServerHandler for MockMcpServer {
 /// Connects a fresh in-process client/server pair over a
 /// `tokio::io::duplex` transport (the same transport rmcp's own
 /// notification test uses) — this module's tests exercise the
-/// registry/dispatch/namespacing logic in `mcp.rs`, not the Streamable
+/// registry/dispatch/namespacing logic in `mcp/`, not the Streamable
 /// HTTP wire format itself (that's `rmcp`'s own tested responsibility;
 /// the real HTTP path was proven separately, live, against GitHub's
 /// hosted MCP server — see SME-15).

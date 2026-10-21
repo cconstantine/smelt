@@ -6,7 +6,7 @@
 //! `CredentialStore` so a connected server's tokens survive a smelt
 //! restart (`rmcp`'s own default is in-memory only), and the
 //! start/callback/disconnect lifecycle the `/mcp-servers` UI and the
-//! `/oauth/mcp-callback/{id}` route (`main.rs`) drive. `src/mcp.rs`'s
+//! `/oauth/mcp-callback/{id}` route (`main.rs`) drive. `src/mcp/`'s
 //! `connect()` is the other half: its transport's HTTP client is rmcp's
 //! `AuthClient`, which gets a token from `connection_manager`'s manager
 //! before every request, refreshing it when it's expiring (SME-113).
@@ -198,7 +198,7 @@ impl PgCredentialStore {
 /// started for: its manager's store saves the grant only while the row
 /// still has that URL (SME-166), so an edit or a delete needn't touch it. In-memory only: a
 /// restart mid-login just means starting over, the same class of accepted
-/// limitation as `mcp.rs`'s connection registry — see SME-16's "Key
+/// limitation as `src/mcp/`'s connection registry — see SME-16's "Key
 /// discovery."
 static PENDING: LazyLock<AsyncMutex<HashMap<i64, PendingAttempt>>> =
     LazyLock::new(|| AsyncMutex::new(HashMap::new()));
