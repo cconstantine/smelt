@@ -405,6 +405,25 @@ impl From<AgentRequestError> for TerminalError {
     }
 }
 
+/// Sandbox stand-ins for other modules' tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// A client for a cluster that isn't there: nothing is sent until a
+    /// request is made, so it builds a manager without a cluster.
+    pub(crate) fn unreachable_client() -> kube::Client {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let url = "http://127.0.0.1:9".parse().expect("a url");
+        kube::Client::try_from(kube::Config::new(url)).expect("a client")
+    }
+
+    /// Gives this test's thread a manager on `unreachable_client`, so
+    /// sandbox code gets past `get()` and its cluster calls fail at once
+    /// (SME-262).
+    pub(crate) fn use_unreachable_test_manager() {
+        super::manager::use_test_manager(unreachable_client());
+    }
+}
+
 #[cfg(test)]
 mod tests;
 

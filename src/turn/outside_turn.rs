@@ -41,7 +41,8 @@ pub(crate) async fn show_error_outside_turn(pool: &PgPool, conversation_id: i64,
 /// cancelled doesn't cancel it.
 async fn forget_turn_state_if_deleted(pool: &PgPool, conversation_id: i64) {
     let pool = pool.clone();
-    let check = tokio::spawn(async move {
+    // In the caller's span, as `start_turn`'s turn is (SME-262 review 1).
+    let check = tokio::spawn(tracing::Instrument::in_current_span(async move {
         match db::conversation_exists(&pool, conversation_id).await {
             Ok(true) => {}
             Ok(false) => forget_conversation_lock(conversation_id),
@@ -51,7 +52,7 @@ async fn forget_turn_state_if_deleted(pool: &PgPool, conversation_id: i64) {
                 "couldn't check a conversation still exists after a stop or an error"
             ),
         }
-    });
+    }));
     if let Err(e) = check.await {
         tracing::warn!(conversation_id, error = %e, "the check after a stop or an error didn't finish");
     }

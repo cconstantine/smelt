@@ -41,31 +41,45 @@ pub async fn get_messages(id: i64) -> ServerFnResult<Vec<Message>> {
 
 #[delete("/api/conversations/{id}")]
 pub async fn delete_conversation(id: i64) -> ServerFnResult<()> {
-    // Its turns first, so nothing is still making a pod (SME-51 B5).
-    stop_turn_now(id);
-    let _ = crate::browsing::close_session(id).await;
-    // Read before the delete cascades them away: teardown deletes the pods
-    // they name too, labelled or not (SME-88). Best-effort, like teardown.
-    let pod_ids: Vec<i64> = match db::list_sandbox_pods(db::get(), id).await {
-        Ok(rows) => rows.into_iter().map(|row| row.id).collect(),
-        Err(e) => {
-            tracing::warn!(conversation_id = id, error = %e, "couldn't list a conversation's pods before deleting it");
-            Vec::new()
-        }
-    };
-    db::delete_conversation(db::get(), id)
-        .await
-        .map_err(ServerFnError::new)?;
-    // After the delete: a pod started meanwhile is found by its label, and
-    // one still starting sees the conversation gone (`create_pod`).
-    // Best-effort, unconditional (unlike terminate_pod, which the model
-    // calls and which is guarded).
-    crate::sandbox::teardown_conversation(db::get(), id, &pod_ids).await;
-    crate::events::forget(id);
-    forget_conversation_lock(id);
-    // After the delete, so a listener refetching sees the pod rows gone.
-    crate::events::publish_app(crate::events::AppEvent::PodsChanged);
-    Ok(())
+    delete_and_forget(db::get(), id).await.map_err(ServerFnError::new)
+}
+
+/// `delete_conversation`'s work, in a task of its own (SME-262): a request
+/// dropped mid-way (the tab closes during a slow teardown) stops only the
+/// wait for it. The delete, the teardown and the forgets still run, so a
+/// deleted conversation leaves no turn state or event channel behind.
+#[cfg(feature = "server")]
+async fn delete_and_forget(pool: &PgPool, id: i64) -> Result<(), String> {
+    let pool = pool.clone();
+    // In the request's span, so its teardown is the request's child, as
+    // `start_turn`'s turn is (SME-137, SME-262 review 1).
+    tokio::spawn(tracing::Instrument::in_current_span(async move {
+        // Its turns first, so nothing is still making a pod (SME-51 B5).
+        stop_turn_now(id);
+        let _ = crate::browsing::close_session(id).await;
+        // Read before the delete cascades them away: teardown deletes the pods
+        // they name too, labelled or not (SME-88). Best-effort, like teardown.
+        let pod_ids: Vec<i64> = match db::list_sandbox_pods(&pool, id).await {
+            Ok(rows) => rows.into_iter().map(|row| row.id).collect(),
+            Err(e) => {
+                tracing::warn!(conversation_id = id, error = %e, "couldn't list a conversation's pods before deleting it");
+                Vec::new()
+            }
+        };
+        db::delete_conversation(&pool, id).await.map_err(|e| e.to_string())?;
+        // After the delete: a pod started meanwhile is found by its label, and
+        // one still starting sees the conversation gone (`create_pod`).
+        // Best-effort, unconditional (unlike terminate_pod, which the model
+        // calls and which is guarded).
+        crate::sandbox::teardown_conversation(&pool, id, &pod_ids).await;
+        crate::events::forget(id);
+        forget_conversation_lock(id);
+        // After the delete, so a listener refetching sees the pod rows gone.
+        crate::events::publish_app(crate::events::AppEvent::PodsChanged);
+        Ok(())
+    }))
+    .await
+    .map_err(|e| format!("The delete didn't finish: {e}"))?
 }
 
 /// Which conversations have a turn running, for the sidebar. Kept current
@@ -452,4 +466,122 @@ pub(crate) fn conversation_event_stream(
             }
         }
     })
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+    use crate::git;
+    use std::time::Duration;
+
+    /// Polls `check` until it holds, for up to 10 s.
+    async fn eventually<F, Fut>(what: &str, mut check: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !check().await {
+            assert!(std::time::Instant::now() < deadline, "{what}: not within 10 s");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `delete_and_forget` for `id` as a request of its own, which the
+    /// test can drop (`abort`), as when the tab closes mid-way.
+    fn spawn_delete(pool: &PgPool, id: i64) -> tokio::task::JoinHandle<Result<(), String>> {
+        let pool = pool.clone();
+        tokio::spawn(async move { delete_and_forget(&pool, id).await })
+    }
+
+    /// SME-262, the ticket's case. Interleaving: the delete commits, and
+    /// teardown's read of this database's instance is held by a table
+    /// lock; the request is dropped there. The conversation's turn state
+    /// and event channel are still forgotten, so an open tab's stream ends.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_a_delete_dropped_mid_teardown_still_forgets_the_conversation(pool: PgPool) {
+        let _race = git::test_support::ONE_AT_A_TIME.lock().await;
+        let _turns = crate::providers::test_support::lock_turn_tests();
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        // Past `get()`, so teardown reads the instance; its cluster calls
+        // then fail at once.
+        crate::sandbox::test_support::use_unreachable_test_manager();
+        let id = db::create_conversation(&pool).await.expect("conversation").id;
+        let mut events = crate::events::subscribe(id);
+
+        let mut holding = pool.begin().await.expect("begin the holding transaction");
+        sqlx::query("LOCK TABLE smelt_instance IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *holding)
+            .await
+            .expect("hold smelt_instance");
+        let request = spawn_delete(&pool, id);
+        assert!(git::test_support::waiters_or_finished(&pool, 1, &request).await, "teardown never read the instance");
+        assert!(!db::conversation_exists(&pool, id).await.expect("exists"), "dropped before the delete committed");
+        request.abort();
+        let _ = request.await;
+        holding.rollback().await.expect("release smelt_instance");
+
+        eventually("the turn state is forgotten", || async move { !crate::turn::has_turn_state(id) }).await;
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Err(tokio::sync::broadcast::error::RecvError::Closed) = events.recv().await {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the conversation's event stream was never closed");
+    }
+
+    /// SME-262. Interleaving: the conversation's row is held `FOR UPDATE`,
+    /// so the DELETE waits; the request is dropped there. The delete
+    /// still commits once the row is released, and its turn state is
+    /// forgotten. (No test manager: teardown stops at `get()`.)
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_a_delete_dropped_mid_delete_still_deletes_and_forgets(pool: PgPool) {
+        let _race = git::test_support::ONE_AT_A_TIME.lock().await;
+        let _turns = crate::providers::test_support::lock_turn_tests();
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        let id = db::create_conversation(&pool).await.expect("conversation").id;
+
+        let mut holding = pool.begin().await.expect("begin the holding transaction");
+        sqlx::query("SELECT 1 FROM conversations WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .execute(&mut *holding)
+            .await
+            .expect("hold the conversation's row");
+        let request = spawn_delete(&pool, id);
+        assert!(git::test_support::waiters_or_finished(&pool, 1, &request).await, "the delete never waited for the row");
+        request.abort();
+        let _ = request.await;
+        holding.rollback().await.expect("release the row");
+
+        let p = &pool;
+        eventually("the conversation is deleted", || async move {
+            !db::conversation_exists(p, id).await.expect("exists")
+        })
+        .await;
+        eventually("the turn state is forgotten", || async move { !crate::turn::has_turn_state(id) }).await;
+    }
+
+    /// SME-262 review 1: the delete's task runs in its request's span, so
+    /// its teardown is the request's child in a trace, as before the task.
+    /// (No test manager: teardown stops at `get()`, inside its span.)
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_a_deletes_teardown_is_a_child_of_its_request(pool: PgPool) {
+        let _race = git::test_support::ONE_AT_A_TIME.lock().await;
+        let _turns = crate::providers::test_support::lock_turn_tests();
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        let id = db::create_conversation(&pool).await.expect("conversation").id;
+
+        // The span is made inside the capture, which only then listens.
+        let (deleted, spans) = crate::telemetry::capture_spans(async {
+            crate::telemetry::in_span(tracing::info_span!("request"), delete_and_forget(&pool, id)).await
+        })
+        .await;
+        deleted.expect("delete");
+        let request = spans.iter().find(|span| span.name == "request").expect("the request's span");
+        let teardown = spans.iter().find(|span| span.name == "teardown_conversation").expect("teardown's span");
+        assert_eq!(teardown.parent_span_id, request.span_context.span_id(), "{spans:?}");
+    }
 }

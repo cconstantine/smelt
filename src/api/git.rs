@@ -68,11 +68,12 @@ async fn decide_and_notify(
     trusted: bool,
 ) -> Result<(), String> {
     let pool = pool.clone();
-    tokio::spawn(async move {
+    // In the request's span, as `start_turn`'s turn is (SME-262 review 1).
+    tokio::spawn(tracing::Instrument::in_current_span(async move {
         let notices = git::decide_trust(&pool, id, request_id, &shown_hash, trusted).await?;
         deliver(&pool, notices);
         Ok(())
-    })
+    }))
     .await
     .map_err(|e| format!("The decision didn't finish: {e}"))?
 }
@@ -131,7 +132,8 @@ fn spawn_attach(
 ) -> (tokio::task::JoinHandle<()>, tokio::sync::oneshot::Receiver<AttachAnswer>) {
     let pool = pool.clone();
     let (answer, answered) = tokio::sync::oneshot::channel();
-    let attaching = tokio::spawn(async move {
+    // In the request's span, as `start_turn`'s turn is (SME-262 review 1).
+    let attaching = tokio::spawn(tracing::Instrument::in_current_span(async move {
         let branch = Some(branch.trim()).filter(|b| !b.is_empty());
         let dir = Some(dir.trim()).filter(|d| !d.is_empty());
         let (shown, pending) = match git::start_attach(&pool, id, url.trim(), branch, dir).await {
@@ -152,7 +154,7 @@ fn spawn_attach(
             tracing::warn!(conversation_id = id, error = %e, "\"Work on a repo\" failed");
             report_attach_failure(&pool, id, nothing_to_clone, &e).await;
         }
-    });
+    }));
     (attaching, answered)
 }
 
@@ -512,5 +514,41 @@ mod tests {
         assert!(waited, "the hand-back didn't wait to hear the request read the failure");
 
         crate::turn::forget_conversation_lock(unread);
+    }
+
+    /// SME-262 review 1: the attach's task, and the check after it shows
+    /// a failure (SME-219), run in the request's span, so what they log
+    /// lands on the request in a trace. A closed pool fails the attach
+    /// at once and the check after the error, and no request reads the
+    /// failure, so both log.
+    #[tokio::test]
+    async fn test_an_attachs_task_logs_in_its_requests_span() {
+        let _guard = crate::providers::test_support::lock_turn_tests();
+        let pool = sqlx::PgPool::connect_lazy("postgres://unused:unused@localhost/unused").expect("a lazy pool");
+        pool.close().await;
+        let id = i64::MAX - 262;
+
+        // The span is made inside the capture, which only then listens.
+        let ((), spans) = crate::telemetry::capture_spans(async {
+            crate::telemetry::in_span(tracing::info_span!("request"), async {
+                let (attaching, answered) =
+                    spawn_attach(&pool, id, "https://github.com/o/r".into(), String::new(), String::new());
+                drop(answered);
+                tokio::time::timeout(std::time::Duration::from_secs(10), attaching)
+                    .await
+                    .expect("the attach finishes")
+                    .expect("the attach's task");
+            })
+            .await
+        })
+        .await;
+        crate::turn::forget_conversation_lock(id);
+        let request = spans.iter().find(|span| span.name == "request").expect("the request's span");
+        let logged: Vec<&str> = request.events.iter().map(|event| event.name.as_ref()).collect();
+        assert!(logged.contains(&"\"Work on a repo\" failed with nobody waiting"), "{logged:?}");
+        assert!(
+            logged.contains(&"couldn't check a conversation still exists after a stop or an error"),
+            "{logged:?}"
+        );
     }
 }
