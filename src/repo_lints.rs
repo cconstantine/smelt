@@ -198,8 +198,8 @@ mod tests {
         assert!(seen > 400, "found the #[sqlx::test]s ({seen})");
         assert!(
             findings.is_empty(),
-            "{} #[sqlx::test]s that don't take the cluster lock: name a guarded migrator on the \
-             attribute's own line, migrator = \"crate::test_lock::MIGRATOR\" (or NO_MIGRATIONS \
+            "{} #[sqlx::test]s that don't take the cluster lock: name a guarded migrator in the \
+             attribute's own brackets, migrator = \"crate::test_lock::MIGRATOR\" (or NO_MIGRATIONS \
              for none), see src/test_lock.rs\n{}",
             findings.len(),
             findings.join("\n")
