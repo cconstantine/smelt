@@ -28,7 +28,8 @@ pub(crate) fn check(held: Option<&str>) -> Result<(), String> {
         _ => Err(format!(
             "this test uses the shared test Postgres or the k3s cluster, so it runs only under the \
              cluster lock: run it with scripts/cluster-test <cargo test args> (one test: -- --exact \
-             <full path>), or scripts/check.sh (docs/testing.md, SME-212). {HELD} is unset."
+             <full path>) or scripts/check.sh, which take the lock and set {HELD} for the tests \
+             (docs/testing.md, SME-212)."
         )),
     }
 }
@@ -84,7 +85,11 @@ mod tests {
         for held in [None, Some("")] {
             let why = check(held).expect_err("refused without the marker");
             assert!(why.contains("scripts/cluster-test"), "{held:?}: {why}");
-            assert!(why.contains("SMELT_CLUSTER_LOCK_HELD"), "{held:?}: {why}");
+            assert!(why.contains("scripts/check.sh"), "{held:?}: {why}");
+            // Review 1: the scripts set the marker; the message doesn't
+            // point at it as the thing to set.
+            assert!(why.contains("which take the lock and set SMELT_CLUSTER_LOCK_HELD"), "{held:?}: {why}");
+            assert!(!why.contains("is unset"), "{held:?}: {why}");
         }
     }
 
