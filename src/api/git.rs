@@ -83,7 +83,7 @@ pub async fn attach_repo(id: i64, url: String, branch: String, dir: String) -> S
     tokio::spawn(async move {
         if let Err(e) = git::finish_attach(pool, id, pending).await {
             tracing::warn!(conversation_id = id, error = %e, "\"Work on a repo\" failed");
-            report_attach_failure(id, nothing_to_clone, &e);
+            report_attach_failure(pool, id, nothing_to_clone, &e).await;
         }
     });
     Ok(shown)
@@ -92,14 +92,17 @@ pub async fn attach_repo(id: i64, url: String, branch: String, dir: String) -> S
 /// A failed "Work on a repo", shown in the conversation when the repo was
 /// already checked out: there's no repo row to mark failed then, and the
 /// failure was only logged (SME-91). With a clone, the repo's row says it.
+/// A conversation deleted meanwhile is left with no turn state (SME-219).
 #[cfg(feature = "server")]
-fn report_attach_failure(conversation_id: i64, nothing_to_clone: bool, error: &str) {
+async fn report_attach_failure(pool: &sqlx::PgPool, conversation_id: i64, nothing_to_clone: bool, error: &str) {
     if nothing_to_clone {
-        crate::turn::show_conversation_error(
+        crate::turn::show_error_outside_turn(
+            pool,
             conversation_id,
             // `error` says what failed ("Couldn't start the sandbox: …").
             format!("\"Work on a repo\" failed. {error}"),
-        );
+        )
+        .await;
     }
 }
 
@@ -138,14 +141,17 @@ mod tests {
     /// SME-91: when the repo was already checked out there's no repo row
     /// to mark failed, so a sandbox that couldn't start was only logged.
     /// It shows in the conversation instead; with a clone, the repo's own
-    /// row says it (the panel), so it isn't shown twice.
-    #[tokio::test]
-    async fn test_a_failed_attach_with_nothing_to_clone_shows_in_the_conversation() {
-        let shown = 9_100_000_095;
+    /// row says it (the panel), so it isn't shown twice. SME-219: one
+    /// deleted while its sandbox was starting is left with no turn state.
+    #[sqlx::test]
+    async fn test_a_failed_attach_with_nothing_to_clone_shows_in_the_conversation(pool: sqlx::PgPool) {
+        let _guard = crate::providers::test_support::lock_turn_tests();
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        let shown = db::create_conversation(&pool).await.expect("create conversation").id;
         let mut rx = crate::events::subscribe(shown);
         // What `finish_attach` fails with when there's nothing to clone:
         // `ensure_sandbox`'s error, which says what failed already.
-        report_attach_failure(shown, true, "Couldn't start the sandbox: the sandbox didn't start");
+        report_attach_failure(&pool, shown, true, "Couldn't start the sandbox: the sandbox didn't start").await;
         let error = crate::turn::last_turn_error(shown).expect("the error is kept for a reload");
         assert!(error.contains("the sandbox didn't start"), "got: {error}");
         assert_eq!(
@@ -160,8 +166,18 @@ mod tests {
             other => panic!("no TurnError published: {other:?}"),
         }
 
-        let with_clone = 9_100_000_096;
-        report_attach_failure(with_clone, false, "the sandbox didn't start");
+        let with_clone = db::create_conversation(&pool).await.expect("create conversation").id;
+        report_attach_failure(&pool, with_clone, false, "the sandbox didn't start").await;
         assert_eq!(crate::turn::last_turn_error(with_clone), None);
+
+        let gone = db::create_conversation(&pool).await.expect("create conversation").id;
+        db::delete_conversation(&pool, gone).await.expect("delete");
+        crate::turn::forget_conversation_lock(gone);
+        report_attach_failure(&pool, gone, true, "Couldn't start the sandbox: conversation not found").await;
+        assert_eq!(crate::turn::last_turn_error(gone), None, "a deleted conversation kept the error");
+
+        // Not left for the next test sharing this process: a live
+        // conversation's error stays until its delete forgets it.
+        crate::turn::forget_conversation_lock(shown);
     }
 }

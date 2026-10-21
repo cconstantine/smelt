@@ -194,10 +194,11 @@ pub async fn get_turn_error(id: i64) -> ServerFnResult<Option<String>> {
 
 /// The user's Stop button: ends this conversation's running turn, and
 /// keeps finished commands and tasks from starting another until they
-/// write again. See `stop_turn_now`.
+/// write again. See `stop_turn_now`. A conversation that's gone, or never
+/// existed, is left with no turn state (`stop_conversation`, SME-219).
 #[post("/api/conversations/{id}/stop")]
 pub async fn stop_turn(id: i64) -> ServerFnResult<()> {
-    stop_turn_now(id);
+    stop_conversation(db::get(), id).await;
     Ok(())
 }
 

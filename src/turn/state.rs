@@ -14,7 +14,8 @@ static RUNTIMES: LazyLock<Mutex<HashMap<i64, ConversationRuntime>>> = LazyLock::
 /// turn has run (its generation), is when the conversation is deleted: a
 /// few bytes per conversation, as the separate kept-error map was. A turn
 /// that finds its conversation already deleted forgets its generation
-/// (SME-179).
+/// (SME-179), and a Stop or a shown error on a deleted conversation
+/// forgets it (SME-219).
 #[derive(Default)]
 pub(super) struct ConversationRuntime {
     /// The turn lock. A live `send_message` call and a notice's `run_turn`
@@ -200,8 +201,11 @@ pub(super) fn note_stop(conversation_id: i64, stopped_by: u64) -> bool {
 }
 
 /// Stops `conversation_id`'s running turn, and any queued behind it. The
-/// pod, its terminals and running commands are left alone. A no-op when
-/// nothing is running.
+/// pod, its terminals and running commands are left alone. Pauses the
+/// conversation even when nothing is running, making its entry if it has
+/// none, so on a deleted conversation it would stay for good: outside the
+/// delete itself (which forgets after), call `stop_conversation`, which
+/// checks (SME-219).
 pub(crate) fn stop_turn_now(conversation_id: i64) {
     with_runtime(conversation_id, |runtime| {
         // Paused even when nothing is running: the user asked the model to
@@ -402,7 +406,9 @@ pub(super) fn keep_turn_error(conversation_id: i64, generation: u64, error: Stri
 /// Shows `message` as `conversation_id`'s error, as a failed turn's is
 /// (`TurnError`, and kept for a reconnecting tab until the user writes),
 /// for something that failed outside a turn: a "Work on a repo" that
-/// couldn't start the sandbox (SME-91).
+/// couldn't start the sandbox (SME-91). Makes the entry if it has none:
+/// for a conversation that may have been deleted meanwhile, call
+/// `show_error_outside_turn`, which checks (SME-219).
 pub(crate) fn show_conversation_error(conversation_id: i64, message: String) {
     with_runtime(conversation_id, |runtime| runtime.kept.error = Some(message.clone()));
     crate::events::publish(conversation_id, crate::events::ConversationEvent::TurnError { message });
