@@ -166,6 +166,6 @@ In [api/events.md](api/events.md#the-browsing-panels-own-live-channel).
 | `take_mcp_server_oauth_error` | `POST /api/mcp-servers/{id}/oauth/callback-error` | the last failed callback's error, removed as it's read; the edit page calls it when the callback's redirect brought it there with `?oauth_callback=1` (SME-168) |
 | `list_sandbox_volumes` / `create_sandbox_volume` | `GET /api/sandbox-volumes`, `POST /api/sandbox-volumes` | volumes mounted into sandbox pods; create makes the PVC and expands a leading `~` in the mount path |
 | `delete_sandbox_volume` | `DELETE /api/sandbox-volumes/{id}` | deletes the PVC, then the row |
-| `delete_conversation` | `DELETE /api/conversations/{id}` | hard delete; cascades to the conversation's messages (`ON DELETE CASCADE`); also tears down its sandboxes and browsing session, and drops its event channel and turn lock; deleting a nonexistent id is not an error |
+| `delete_conversation` | `DELETE /api/conversations/{id}` | hard delete; cascades to the conversation's messages (`ON DELETE CASCADE`); also tears down its sandboxes and browsing session, and drops its event channel and turn lock; runs on if the tab closes, in a task of its own (SME-262); deleting a nonexistent id is not an error |
 
 Not yet implemented (a straightforward addition when needed): renaming a conversation.
