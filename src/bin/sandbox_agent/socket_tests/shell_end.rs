@@ -370,3 +370,52 @@ async fn test_a_shells_last_output_without_a_newline_reaches_its_command_when_a_
         "the note should come last: {stderr:?}"
     );
 }
+
+/// SME-191 review 1, finding 3: a command that arrives once the shell
+/// has been reaped, while its reader is still finishing up (held here
+/// right after the reap), runs in a new shell. Before, the shell was
+/// marked ended only after that, so the command was claimed on the dead
+/// one and finished with its exit note.
+#[tokio::test]
+async fn test_a_command_arriving_just_after_the_shell_was_reaped_runs_in_a_new_shell() {
+    let terminal_id = "sme191-r1-reaped";
+    let state = new_state();
+    assert_eq!(crate::create_terminal(&state, terminal_id.to_string()).await, Reply::TerminalCreated);
+    let pause = test_hooks::pause_after_reap(terminal_id);
+    start_command(&state, terminal_id, "c1".to_string(), "(sleep 0.3; kill -9 $$; sleep 30) & echo \"job $!\"").await;
+    let (stdout, _, code) = collect_command(&state, "c1").await;
+    let _job = JobGuard(job_pid(&stdout));
+    assert_eq!(code, 0);
+
+    tokio::time::timeout(WAIT, pause.reached.notified()).await.expect("the reader never reaped the shell");
+    start_command(&state, terminal_id, "c2".to_string(), "echo next").await;
+    pause.release.notify_one();
+    let (stdout, stderr, code) = collect_command(&state, "c2").await;
+    assert_eq!((stdout, stderr, code), (vec!["next".to_string()], Vec::<String>::new(), 0));
+}
+
+/// SME-191 review 1, finding 3: a signal for the command in flight once
+/// its shell has been reaped is sent nowhere: the shell's pid is free,
+/// so its `/proc` children could be another process's.
+#[tokio::test]
+async fn test_a_signal_after_the_shell_was_reaped_is_sent_nowhere() {
+    let logs = captured_logs();
+    let terminal_id = "sme191-r1-signal";
+    let state = new_state();
+    assert_eq!(crate::create_terminal(&state, terminal_id.to_string()).await, Reply::TerminalCreated);
+    let pause = test_hooks::pause_after_reap(terminal_id);
+    start_command(&state, terminal_id, "c1".to_string(), "sleep 30 & echo \"job $!\"; kill -9 $$").await;
+    tokio::time::timeout(WAIT, pause.reached.notified()).await.expect("the reader never reaped the shell");
+
+    signal_current_command(&state, terminal_id, "c1", "INT").await;
+    pause.release.notify_one();
+    let (stdout, _, _) = collect_command(&state, "c1").await;
+    let _job = JobGuard(job_pid(&stdout));
+    let logged = String::from_utf8_lossy(&logs.0.lock().expect("log buffer")).into_owned();
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains("send_signal: the shell has ended") && line.contains(terminal_id)),
+        "the signal wasn't refused for the ended shell"
+    );
+}

@@ -188,10 +188,10 @@ pub(super) async fn start_command(state: &Arc<AppState>, terminal_id: &str, id: 
     };
 
     let mut current = shell.current.lock().await;
-    // The shell ended between `shell_for_command` and this lock: its end
-    // has been handled (under this lock, `finish_ended_shell`), so a command
-    // claimed now would get no exit. Go round again for a new shell
-    // (review 2).
+    // The shell ended between `shell_for_command` and this lock: it has
+    // been reaped or its end handled (both under this lock), so a command
+    // claimed now would be written to a dead shell. Go round again for a
+    // new shell (review 2; SME-191 review 1).
     if shell.ended.load(Ordering::SeqCst) {
         drop(current);
         return Box::pin(start_command(state, terminal_id, id, command)).await;
@@ -235,7 +235,15 @@ pub(super) async fn signal_current_command(state: &Arc<AppState>, terminal_id: &
         return;
     };
 
-    let matches_current = shell.current.lock().await.as_deref() == Some(id);
+    let current = shell.current.lock().await;
+    // A reaped shell's pid is free, so its `/proc` children could be
+    // another process's (SME-191 review 1).
+    if shell.ended.load(Ordering::SeqCst) {
+        tracing::info!(%terminal_id, %id, "send_signal: the shell has ended, ignoring");
+        return;
+    }
+    let matches_current = current.as_deref() == Some(id);
+    drop(current);
     if !matches_current {
         tracing::info!(%id, "send_signal: id does not match the in-flight command, ignoring");
         return;

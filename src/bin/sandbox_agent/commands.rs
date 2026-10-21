@@ -149,6 +149,13 @@ pub(super) async fn run_reader(
             // Cancel safe, and fused once it has returned (tokio 1.53.1).
             status = child.wait(), if exit.is_none() => {
                 exit = Some(exit_code_of(status));
+                // Ended as soon as it's reaped (review 1): its pid is free
+                // now, and a command claimed from here on, before the end
+                // is finished below, must go to a new shell. Under
+                // `current`'s lock, which `start_command` claims under.
+                let current = shell.current.lock().await;
+                shell.ended.store(true, Ordering::SeqCst);
+                drop(current);
                 stdout_read.end_at(stdout.buffer().len(), unread_in_pipe(stdout.get_ref()));
                 stderr_read.end_at(stderr.buffer().len(), unread_in_pipe(stderr.get_ref()));
                 #[cfg(test)]
@@ -517,8 +524,9 @@ pub(super) struct Shell {
     /// The in-flight command's completion marker (`new_marker`), shared
     /// with this terminal's `run_reader`, which clears it on a match.
     pub(super) marker: Arc<std::sync::Mutex<Option<String>>>,
-    /// Set once the shell has ended (`finish_ended_shell`): the terminal's
-    /// next command starts a new one.
+    /// Set once the shell has ended: as soon as its reader reaps it
+    /// (SME-191), or, if its pipes close first, by `finish_ended_shell`.
+    /// The terminal's next command starts a new one.
     pub(super) ended: std::sync::atomic::AtomicBool,
 }
 
