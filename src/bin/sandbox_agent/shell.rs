@@ -109,13 +109,16 @@ async fn spawn_shell(terminal_id: &str, events_tx: &mpsc::UnboundedSender<ShellE
         bash_pid,
         current: AsyncMutex::new(None),
         marker: Arc::new(std::sync::Mutex::new(None)),
-        bash_child: AsyncMutex::new(child),
         ended: std::sync::atomic::AtomicBool::new(false),
     });
+    // The reader owns the shell's process (it alone waits on it), which
+    // isn't killed on drop (tokio's default): `terminate_terminal`'s
+    // explicit `killpg` is what ends it.
     tokio::spawn(run_reader(
         terminal_id.to_string(),
         stdout,
         stderr,
+        child,
         shell.clone(),
         events_tx.clone(),
     ));
@@ -149,6 +152,12 @@ pub(super) async fn terminate_terminal(state: &Arc<AppState>, terminal_id: Strin
     let Some(shell) = shell else {
         return reply_error("unknown terminal_id");
     };
+    // An ended shell has been reaped (by its reader), so its group id is
+    // free and could be another process's (SME-191). Jobs it left running
+    // live on, as they do when a running shell's group is killed.
+    if shell.ended.load(Ordering::SeqCst) {
+        return Reply::TerminalTerminated;
+    }
 
     if let Err(err) = signal::kill(Pid::from_raw(-(shell.bash_pid as i32)), Signal::SIGKILL) {
         tracing::warn!(%err, %terminal_id, "killpg failed while terminating terminal");
@@ -179,10 +188,10 @@ pub(super) async fn start_command(state: &Arc<AppState>, terminal_id: &str, id: 
     };
 
     let mut current = shell.current.lock().await;
-    // The shell ended between `shell_for_command` and this lock: its end
-    // has been handled (under this lock, `finish_ended_shell`), so a command
-    // claimed now would get no exit. Go round again for a new shell
-    // (review 2).
+    // The shell ended between `shell_for_command` and this lock: it has
+    // been reaped or its end handled (both under this lock), so a command
+    // claimed now would be written to a dead shell. Go round again for a
+    // new shell (review 2; SME-191 review 1).
     if shell.ended.load(Ordering::SeqCst) {
         drop(current);
         return Box::pin(start_command(state, terminal_id, id, command)).await;
@@ -226,7 +235,15 @@ pub(super) async fn signal_current_command(state: &Arc<AppState>, terminal_id: &
         return;
     };
 
-    let matches_current = shell.current.lock().await.as_deref() == Some(id);
+    let current = shell.current.lock().await;
+    // A reaped shell's pid is free, so its `/proc` children could be
+    // another process's (SME-191 review 1).
+    if shell.ended.load(Ordering::SeqCst) {
+        tracing::info!(%terminal_id, %id, "send_signal: the shell has ended, ignoring");
+        return;
+    }
+    let matches_current = current.as_deref() == Some(id);
+    drop(current);
     if !matches_current {
         tracing::info!(%id, "send_signal: id does not match the in-flight command, ignoring");
         return;
