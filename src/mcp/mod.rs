@@ -22,6 +22,13 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::anthropic::ToolDefinition;
 use crate::db::McpServerConfig;
 
+mod call;
+mod oauth_client;
+mod tools;
+pub use call::*;
+use oauth_client::*;
+pub use tools::*;
+
 /// Exa's hosted MCP server, keyless ("free rate-limited usage without
 /// sign-in or API key"), limited to its search tool so reading a page stays
 /// with `webfetch`/`http_request`. Adding an `x-api-key` header to the entry
@@ -46,15 +53,6 @@ pub async fn ensure_default_servers(pool: &sqlx::PgPool) {
     }
 }
 
-/// How long listing tools for a model call waits for a server that isn't
-/// connected yet. A healthy server connects in a second or two; one that
-/// doesn't answer is left out of this call rather than holding it up.
-const TOOL_LIST_WAIT: std::time::Duration = if cfg!(test) {
-    std::time::Duration::from_secs(1)
-} else {
-    std::time::Duration::from_secs(10)
-};
-
 /// How long connecting to a server (and listing its tools) may take, for a
 /// turn or the status page alike. Without it an unreachable host waited
 /// out the operating system's own connect timeout, minutes (SME-51 B8).
@@ -64,36 +62,10 @@ const CONNECT_TIMEOUT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(15)
 };
 
-/// How long one tool call may take. A call holds the turn, and the
-/// conversation's lock, while it waits (SME-51 B8).
-const CALL_TIMEOUT: std::time::Duration = if cfg!(test) {
-    std::time::Duration::from_secs(1)
-} else {
-    std::time::Duration::from_secs(120)
-};
-
 /// After a failed connection, model calls skip the server for this long
 /// instead of trying (and waiting) again on every call. The status page
 /// still tries each time it's opened.
 const RETRY_AFTER_FAILURE: std::time::Duration = std::time::Duration::from_secs(300);
-
-const TOOL_NAME_PREFIX: &str = "mcp__";
-const TOOL_NAME_SEPARATOR: &str = "__";
-
-fn namespaced_tool_name(server_name: &str, tool_name: &str) -> String {
-    format!("{TOOL_NAME_PREFIX}{server_name}{TOOL_NAME_SEPARATOR}{tool_name}")
-}
-
-/// Given a full smelt-facing tool name, returns `(server_name, tool_name)`
-/// if it's an MCP-dispatched tool (`mcp__<server>__<tool>`) — `None`
-/// otherwise, so `anthropic::tools::execute`'s dispatcher can fall through
-/// to smelt's native tools. Splits on the *first* remaining `__` only, so
-/// a tool name that itself contains further underscores (e.g.
-/// `mcp__github__list_issues`) still resolves correctly.
-pub fn parse_tool_name(name: &str) -> Option<(&str, &str)> {
-    let rest = name.strip_prefix(TOOL_NAME_PREFIX)?;
-    rest.split_once(TOOL_NAME_SEPARATOR)
-}
 
 /// Refuses extra headers an `auth_mode` server can't use: an OAuth
 /// server's `Authorization` is its token, which rmcp's `AuthClient` sets (SME-76 lets OAuth servers have other headers, such as
@@ -201,68 +173,6 @@ pub async fn evict(server_id: i64) {
         // `OAUTH_CLIENTS`; nothing takes them the other way round.
         OAUTH_CLIENTS.lock().await.remove(&server_id);
     }
-}
-
-/// An OAuth server's HTTP client: rmcp's `AuthClient`, which gets a token
-/// from the server's `AuthorizationManager` before every request.
-type OAuthClient = rmcp::transport::auth::AuthClient<reqwest_rmcp::Client>;
-
-struct SharedOAuthClient {
-    client: OAuthClient,
-    /// What the manager was built for: the server's URL and the stored
-    /// grant's client id. A manager built for anything else isn't reused.
-    url: String,
-    grant_client_id: Option<String>,
-}
-
-/// One `AuthClient` per OAuth server, cloned into each of its connections
-/// and used by the status check (SME-113). Clones share one manager behind
-/// one mutex, so refreshes are one at a time: with GitHub rotating refresh
-/// tokens on every refresh, two managers refreshing at once would retire
-/// each other's tokens. `evict` drops the entry (an edit, a delete, a
-/// Disconnect, a new grant), and an entry built for another URL or another
-/// grant's client is rebuilt rather than reused, which also covers a build
-/// that finishes after an `evict`.
-static OAUTH_CLIENTS: LazyLock<AsyncMutex<HashMap<i64, SharedOAuthClient>>> =
-    LazyLock::new(|| AsyncMutex::new(HashMap::new()));
-
-/// One lock per server, held while building its `AuthClient`, so two
-/// callers don't build two managers.
-static BUILDING_OAUTH: LazyLock<std::sync::Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>> =
-    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
-fn grant_client_id(config: &McpServerConfig) -> Option<String> {
-    config
-        .oauth_credentials
-        .as_ref()
-        .and_then(|json| json.0.get("client_id")?.as_str().map(str::to_string))
-}
-
-/// The server's shared `AuthClient`, built on first use.
-async fn oauth_client(
-    pool: &sqlx::PgPool,
-    config: &McpServerConfig,
-) -> Result<OAuthClient, String> {
-    let grant_client_id = grant_client_id(config);
-    let lock = server_lock(&BUILDING_OAUTH, config.id);
-    let _building = lock.lock().await;
-    if let Some(shared) = OAUTH_CLIENTS.lock().await.get(&config.id)
-        && shared.url == config.url
-        && shared.grant_client_id == grant_client_id
-    {
-        return Ok(shared.client.clone());
-    }
-    let manager = crate::mcp_oauth::connection_manager(pool, config).await?;
-    let client = OAuthClient::new(transport_http_client()?, manager);
-    OAUTH_CLIENTS.lock().await.insert(
-        config.id,
-        SharedOAuthClient {
-            client: client.clone(),
-            url: config.url.clone(),
-            grant_client_id,
-        },
-    );
-    Ok(client)
 }
 
 /// Drops `server_id`'s cached connection if it's still `service`: one a
@@ -594,68 +504,6 @@ async fn ensure_connected(
     }
 }
 
-fn mcp_tool_to_definition(server_name: &str, tool: &McpTool) -> ToolDefinition {
-    ToolDefinition {
-        name: namespaced_tool_name(server_name, tool.name.as_ref()),
-        description: tool.description.clone().unwrap_or_default().into_owned(),
-        input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
-    }
-}
-
-/// Builds the namespaced `ToolDefinition`s for every configured server —
-/// `anthropic::tools::tool_definitions` appends these to smelt's own
-/// static tool list on every `send_message` call. A server that fails to
-/// connect this turn is skipped (logged, not fatal) rather than failing
-/// the whole tool list — the model just doesn't see that server's tools
-/// until it's reachable again.
-pub async fn tool_definitions_for(
-    pool: &sqlx::PgPool,
-    configs: &[McpServerConfig],
-) -> Vec<ToolDefinition> {
-    // All servers at once, each given at most `TOOL_LIST_WAIT`. A connect
-    // that takes longer carries on in the background (it's spawned, so
-    // giving up on it here doesn't cancel it), and its tools show up on a
-    // later call once it's connected.
-    let attempts = configs.iter().map(|config| {
-        let (pool, config) = (pool.clone(), config.clone());
-        let name = config.name.clone();
-        // In the caller's span, so its connect is the turn's child (SME-137).
-        let task = tokio::spawn(tracing::Instrument::in_current_span(async move {
-            ensure_connected(&pool, &config, Attempt::SkipRecentFailures).await
-        }));
-        async move {
-            match tokio::time::timeout(TOOL_LIST_WAIT, task).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(e))) => {
-                    // Its URL's query can hold the server's key, and this
-                    // line is exported with the turn's span (SME-137).
-                    let error = crate::telemetry::scrub_urls(&e.to_string());
-                    tracing::warn!(server = %name, %error, "MCP server unreachable this turn; its tools are unavailable");
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(server = %name, error = %e, "MCP connect task failed");
-                }
-                Err(_) => {
-                    tracing::warn!(server = %name, "MCP server still connecting; its tools are left out of this call");
-                }
-            }
-        }
-    });
-    futures_util::future::join_all(attempts).await;
-
-    let registry = REGISTRY.lock().await;
-    configs
-        .iter()
-        .filter_map(|config| registry.get(&config.id).map(|conn| (config, conn)))
-        .flat_map(|(config, conn)| {
-            conn.tools
-                .iter()
-                .map(|tool| mcp_tool_to_definition(&config.name, tool))
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
 /// Why `connection_check` couldn't report a server as connected.
 #[derive(Debug, PartialEq)]
 pub enum CheckError {
@@ -664,83 +512,6 @@ pub enum CheckError {
     /// An OAuth server's sign-in can't be refreshed (no refresh token, or
     /// the provider refused it): only a Reconnect brings it back (SME-113).
     SignInExpired(String),
-}
-
-fn sign_in_expired(config: &McpServerConfig) -> String {
-    format!(
-        "the sign-in to MCP server {:?} has expired or was revoked; use Reconnect",
-        config.name
-    )
-}
-
-/// For an OAuth server, gets a token from its shared manager: a store read,
-/// or a refresh when it's expiring. A grant that can't be refreshed drops
-/// the server's cached connection, which would otherwise still report
-/// Connected (SME-113).
-/// The server's stored grant as it is now, to tell whether another
-/// refresh replaced it. `None` too when it can't be read.
-async fn stored_grant(pool: &sqlx::PgPool, server_id: i64) -> Option<serde_json::Value> {
-    crate::db::get_mcp_server_config(pool, server_id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|config| config.oauth_credentials)
-        .map(|json| json.0)
-}
-
-async fn check_sign_in(pool: &sqlx::PgPool, config: &McpServerConfig) -> Result<(), CheckError> {
-    let token = tokio::time::timeout(CONNECT_TIMEOUT, async {
-        let client = oauth_client(pool, config)
-            .await
-            .map_err(CheckError::Unreachable)?;
-        // In a task of its own: a refresh the provider has received
-        // rotates its refresh token whether or not anyone waits for the
-        // reply, so the reply must still be saved when this check times
-        // out or its request goes away (review 2).
-        let fetch = |client: OAuthClient| async move {
-            tokio::spawn(async move { client.get_access_token().await })
-                .await
-                .map_err(|e| {
-                    CheckError::Unreachable(format!(
-                        "getting an OAuth token for MCP server {:?} failed: {e}",
-                        config.name
-                    ))
-                })
-        };
-        let grant_before = stored_grant(pool, config.id).await;
-        let mut fetched = fetch(client.clone()).await?;
-        use rmcp::transport::auth::AuthError::{AuthorizationRequired, InternalError};
-        if matches!(fetched, Err(AuthorizationRequired | InternalError(_)))
-            && stored_grant(pool, config.id).await != grant_before
-        {
-            // The provider refused this refresh, or its save lost the
-            // compare-and-set (SME-177), but the grant changed meanwhile:
-            // another manager refreshed first with the same refresh token
-            // (review 2), or a Reconnect saved a new one. That's what counts.
-            fetched = fetch(client).await?;
-        }
-        fetched.map_err(|e| match e {
-            rmcp::transport::auth::AuthError::AuthorizationRequired => {
-                CheckError::SignInExpired(sign_in_expired(config))
-            }
-            other => CheckError::Unreachable(format!(
-                "couldn't get an OAuth token for MCP server {:?}: {other}",
-                config.name
-            )),
-        })
-    })
-    .await
-    .map_err(|_| {
-        CheckError::Unreachable(format!(
-            "MCP server {:?}'s OAuth provider didn't answer within {}s",
-            config.name,
-            CONNECT_TIMEOUT.as_secs()
-        ))
-    })?;
-    if let Err(CheckError::SignInExpired(_)) = &token {
-        evict(config.id).await;
-    }
-    token.map(|_| ())
 }
 
 /// Attempts a real connection to `config`'s server and reports its current
@@ -802,161 +573,6 @@ async fn check_connection(
         .iter()
         .map(|tool| tool.name.to_string())
         .collect())
-}
-
-/// Dispatches a `tools/call` to `config`'s server and turns the result
-/// into a plain string — `content[].text` blocks concatenated; any other
-/// content block type (image, resource, ...) is JSON-encoded inline rather
-/// than dropped, matching the same "don't lose it" fallback other tool
-/// dispatch paths in this codebase already use. An `is_error` result comes
-/// back as `Err` so `anthropic::tools::execute` wraps it in a
-/// `ContentBlock::ToolResult { is_error: Some(true), .. }` like any other
-/// failed tool call.
-pub async fn call_tool(
-    pool: &sqlx::PgPool,
-    config: &McpServerConfig,
-    tool_name: &str,
-    arguments: serde_json::Value,
-) -> Result<String, String> {
-    use tracing::field::Empty;
-    // The server and tool, never the arguments or result (SME-137).
-    let span = tracing::info_span!(
-        "mcp call",
-        smelt.mcp.server = %config.name,
-        smelt.mcp.tool = %tool_name,
-        otel.status_code = Empty,
-        otel.status_description = Empty,
-    );
-    crate::telemetry::in_span(span.clone(), async move {
-        call_tool_unspanned(pool, config, tool_name, arguments).await.map_err(|e| match e {
-            CallFailure::Reported(message) => {
-                crate::telemetry::mark_error(&span, CallFailure::REPORTED);
-                message
-            }
-            CallFailure::Failed(message) => {
-                crate::telemetry::mark_error(&span, &message);
-                message
-            }
-            CallFailure::Transport { message, description } => {
-                crate::telemetry::mark_error(&span, &description);
-                message
-            }
-        })
-    })
-    .await
-}
-
-/// How a `tools/call` failed: the tool said so, in output of its own (or
-/// smelt refused the call's input, quoting it), or the call itself did.
-/// Only the second's message goes on the span: a span never holds tool
-/// output or input (SME-137 review 1).
-enum CallFailure {
-    Reported(String),
-    Failed(String),
-    /// Below MCP: the span gets `description`, the model `message`.
-    Transport { message: String, description: String },
-}
-
-/// What a `tools/call` that failed below MCP says on its span: the tool,
-/// the server and the kind of failure, never the error's text, which can
-/// quote the server's reply (SME-137 review 2).
-fn transport_failure_description(tool_name: &str, server: &str, error: &rmcp::service::ServiceError) -> String {
-    use rmcp::service::ServiceError;
-    let kind = match error {
-        ServiceError::McpError(_) => "the server returned an error",
-        ServiceError::TransportSend(_) => "a transport error (the server's reply is in the conversation)",
-        ServiceError::TransportClosed => "the transport closed",
-        ServiceError::UnexpectedResponse => "an unexpected response",
-        ServiceError::Timeout { .. } => "rmcp's request timeout",
-        ServiceError::Cancelled { .. } => "the request was cancelled",
-        _ => "an rmcp error",
-    };
-    format!("MCP tool call to {tool_name:?} on {server:?} failed: {kind}")
-}
-
-impl CallFailure {
-    const REPORTED: &'static str = "the MCP tool reported an error (its output is in the conversation)";
-}
-
-async fn call_tool_unspanned(
-    pool: &sqlx::PgPool,
-    config: &McpServerConfig,
-    tool_name: &str,
-    arguments: serde_json::Value,
-) -> Result<String, CallFailure> {
-    let arguments = match arguments {
-        serde_json::Value::Object(map) => Some(map),
-        serde_json::Value::Null => None,
-        other => {
-            return Err(CallFailure::Reported(format!(
-                "tool arguments must be a JSON object, got: {other}"
-            )));
-        }
-    };
-
-    ensure_connected(pool, config, Attempt::SkipRecentFailures)
-        .await
-        .map_err(|e| CallFailure::Failed(e.message))?;
-    let service = REGISTRY
-        .lock()
-        .await
-        .get(&config.id)
-        .map(|conn| conn.service.clone())
-        .ok_or_else(|| CallFailure::Failed(format!("not connected to MCP server {:?}", config.name)))?;
-
-    let mut request = CallToolRequestParams::new(tool_name.to_string());
-    if let Some(arguments) = arguments {
-        request = request.with_arguments(arguments);
-    }
-
-    let result = tokio::time::timeout(CALL_TIMEOUT, service.call_tool(request))
-        .await
-        .map_err(|_| {
-            CallFailure::Failed(format!(
-                "MCP server {:?} didn't answer {tool_name:?} within {}s",
-                config.name,
-                CALL_TIMEOUT.as_secs()
-            ))
-        })?;
-    let result = match result {
-        Ok(result) => result,
-        Err(e) => {
-            // Below MCP (a transport error, such as a 401 that survived
-            // `AuthClient`'s refresh and retry, or a closed connection),
-            // the connection is taken as dead, so the next caller connects
-            // again rather than every call failing on it (SME-113). A
-            // JSON-RPC error from the tool itself isn't the connection's.
-            let from_the_tool = matches!(e, rmcp::service::ServiceError::McpError(_));
-            if !from_the_tool {
-                drop_connection(config.id, &service).await;
-            }
-            let message = format!("MCP tool call to {:?} on {:?} failed: {e}", tool_name, config.name);
-            // The server's own error text, or its reply quoted in a
-            // transport error, can quote the call's input (review 2).
-            return Err(if from_the_tool {
-                CallFailure::Reported(message)
-            } else {
-                CallFailure::Transport { description: transport_failure_description(tool_name, &config.name, &e), message }
-            });
-        }
-    };
-
-    let content = result
-        .content
-        .into_iter()
-        .map(|block| match block {
-            McpContentBlock::Text(text) => text.text,
-            other => serde_json::to_string(&other)
-                .unwrap_or_else(|_| "<unrepresentable MCP content block>".to_string()),
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if result.is_error.unwrap_or(false) {
-        Err(CallFailure::Reported(content))
-    } else {
-        Ok(content)
-    }
 }
 
 #[cfg(test)]

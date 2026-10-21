@@ -94,7 +94,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"], opti
 # (a real headless browser is the actual mechanism behind the `webfetch`
 # tool, not just a test tool) — see SME-21.
 chromiumoxide = { version = "0.7", optional = true }
-# For src/mcp.rs's MCP (Model Context Protocol) client — the official Rust
+# For src/mcp/'s MCP (Model Context Protocol) client — the official Rust
 # SDK, handles the Streamable HTTP transport (both plain-JSON and SSE-upgrade
 # response modes) and server-initiated notifications so smelt doesn't
 # hand-roll the wire protocol — see SME-15.
@@ -108,7 +108,7 @@ chromiumoxide = { version = "0.7", optional = true }
 # which `mcp::install_crypto_provider` makes sure is installed.
 # rmcp's server side (the #[cfg(test)] mock MCP server) is a
 # dev-dependency, below.
-# For src/mcp.rs's header-map construction (HeaderName/HeaderValue) — same
+# For src/mcp/'s header-map construction (HeaderName/HeaderValue) — same
 # version axum/rmcp already pull in transitively, needed here directly
 # since Rust doesn't expose a transitive dependency's API without an
 # explicit edge.
@@ -241,7 +241,7 @@ path = "src/bin/sandbox_instance_cleanup/main.rs"
 required-features = ["server"]
 
 [dev-dependencies]
-# rmcp's server side, for the #[cfg(test)] mock MCP server in src/mcp.rs
+# rmcp's server side, for the #[cfg(test)] mock MCP server in src/mcp/
 # (its ServerHandler trait): tests only, so it stays out of the binary.
 # Cargo unifies these features with the optional dependency above in test
 # builds (SME-60).

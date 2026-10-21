@@ -351,3 +351,114 @@ async fn test_a_character_split_across_two_chunks_is_decoded_whole() {
         )
     );
 }
+
+/// A reply's usage when `message_start` carries `start` and the final
+/// `message_delta` carries `delta_usage`, as `stream_anthropic_message`
+/// returns it.
+async fn usage_of(start: serde_json::Value, delta_usage: serde_json::Value) -> TokenUsage {
+    let body = sse(&[
+        serde_json::json!({"type": "message_start", "message": {"id": "msg_01", "type": "message", "role": "assistant", "content": [], "usage": start}}),
+        text_at(0, "Hi."),
+        stop_at(0),
+        serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": delta_usage}),
+        serde_json::json!({"type": "message_stop"}),
+    ]);
+    run_against_mock_upstream(body, |_| {}).await.expect("stream should succeed").usage
+}
+
+fn usage(input: i64, output: i64, cache_creation: i64, cache_read: i64) -> TokenUsage {
+    TokenUsage {
+        input_tokens: input,
+        output_tokens: output,
+        cache_creation_input_tokens: cache_creation,
+        cache_read_input_tokens: cache_read,
+    }
+}
+
+/// SME-178 B26: Ollama's `message_start` has its request-size estimate
+/// (`estimatedInputTokens`); the final `message_delta` has the real,
+/// cumulative counts (`DeltaUsage`, from `UsageFromMetrics`).
+#[tokio::test]
+async fn test_ollamas_input_and_cache_counts_come_from_its_message_delta() {
+    let got = usage_of(
+        serde_json::json!({"input_tokens": 812, "output_tokens": 0}),
+        serde_json::json!({"input_tokens": 700, "cache_read_input_tokens": 2000, "output_tokens": 42}),
+    )
+    .await;
+    assert_eq!(got, usage(700, 42, 0, 2000));
+}
+
+/// A fully cached Ollama prompt: no uncached input, all of it read.
+#[tokio::test]
+async fn test_a_fully_cached_ollama_prompt_records_no_uncached_input() {
+    let got = usage_of(
+        serde_json::json!({"input_tokens": 812, "output_tokens": 0}),
+        serde_json::json!({"input_tokens": 0, "cache_read_input_tokens": 2700, "output_tokens": 42}),
+    )
+    .await;
+    assert_eq!(got, usage(0, 42, 0, 2700));
+}
+
+/// LiteLLM's `/v1/messages` adapter: zeros in `message_start`
+/// (`_create_initial_usage_delta`), the real input in the delta, each
+/// cache field only when non-zero.
+#[tokio::test]
+async fn test_litellms_input_count_comes_from_its_message_delta() {
+    let got = usage_of(
+        serde_json::json!({"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}),
+        serde_json::json!({"input_tokens": 1500, "output_tokens": 30}),
+    )
+    .await;
+    assert_eq!(got, usage(1500, 30, 0, 0));
+}
+
+/// LiteLLM's held delta with no usage upstream carries placeholder
+/// zeros: they don't replace `message_start`'s counts.
+#[tokio::test]
+async fn test_a_message_deltas_placeholder_zeros_keep_message_starts_counts() {
+    let got = usage_of(
+        serde_json::json!({"input_tokens": 90, "output_tokens": 0, "cache_creation_input_tokens": 4, "cache_read_input_tokens": 6}),
+        serde_json::json!({"input_tokens": 0, "output_tokens": 0}),
+    )
+    .await;
+    assert_eq!(got, usage(90, 0, 4, 6));
+}
+
+/// Anthropic's plain reply: the delta has only `output_tokens`.
+#[tokio::test]
+async fn test_anthropics_plain_delta_keeps_message_starts_input() {
+    let got = usage_of(
+        serde_json::json!({"input_tokens": 472, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 2}),
+        serde_json::json!({"output_tokens": 15}),
+    )
+    .await;
+    assert_eq!(got, usage(472, 15, 0, 0));
+}
+
+/// Anthropic's server-tool reply: the delta's cumulative input count
+/// (10682) covers the tool's work, beyond `message_start`'s 2679.
+#[tokio::test]
+async fn test_anthropics_server_tool_delta_replaces_the_input_count() {
+    let got = usage_of(
+        serde_json::json!({"input_tokens": 2679, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 3}),
+        serde_json::json!({"input_tokens": 10682, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 510, "server_tool_use": {"web_search_requests": 1}}),
+    )
+    .await;
+    assert_eq!(got, usage(10682, 510, 0, 0));
+}
+
+/// A `message_delta` with usage and no `stop_reason` is read too, and
+/// the stop reason still comes from the one that has it.
+#[tokio::test]
+async fn test_a_message_delta_without_a_stop_reason_still_gives_its_usage() {
+    let body = sse(&[
+        serde_json::json!({"type": "message_start", "message": {"usage": {"input_tokens": 812, "output_tokens": 0}}}),
+        text_at(0, "Hi."),
+        stop_at(0),
+        serde_json::json!({"type": "message_delta", "delta": {}, "usage": {"input_tokens": 700, "output_tokens": 9}}),
+        serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+        serde_json::json!({"type": "message_stop"}),
+    ]);
+    let turn = run_against_mock_upstream(body, |_| {}).await.expect("stream should succeed");
+    assert_eq!((turn.usage, turn.stop_reason.as_str()), (usage(700, 9, 0, 0), "end_turn"));
+}

@@ -12,6 +12,7 @@ use crate::api::chat::{STOP_NOTICE, TURN_STOPPED, chat_error_text};
 use crate::models::Message;
 use crate::{anthropic, db};
 
+mod call;
 mod compaction;
 mod failure;
 mod history;
@@ -24,6 +25,7 @@ mod test_hooks;
 #[cfg(test)]
 mod tests;
 
+use self::call::*;
 use self::compaction::*;
 pub(crate) use self::failure::*;
 pub(crate) use self::history::*;
