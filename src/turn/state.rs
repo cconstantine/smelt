@@ -14,11 +14,12 @@ static RUNTIMES: LazyLock<Mutex<HashMap<i64, ConversationRuntime>>> = LazyLock::
 /// turn has run (its generation), is when the conversation is deleted: a
 /// few bytes per conversation, as the separate kept-error map was. A turn
 /// that finds its conversation already deleted forgets its generation
-/// (SME-179).
+/// (SME-179), and a Stop or a shown error on a deleted conversation
+/// forgets it (SME-219).
 #[derive(Default)]
 pub(super) struct ConversationRuntime {
-    /// The turn lock. A live `send_message` call and a notice's `run_turn`
-    /// call (a finished command waking the model, say, or two notices at
+    /// The turn lock. A live `send_message` call and a notice's
+    /// `run_turn_bounded` call (a finished command waking the model, say, or two notices at
     /// once) can race for the same conversation — Anthropic's strict
     /// user/assistant alternation breaks if two writers persist a turn at
     /// once. Which caller acquires it first when several are ready is
@@ -36,7 +37,9 @@ pub(super) struct ConversationRuntime {
     /// notice is still saved, and the model sees it on the user's next
     /// message. Otherwise a stop would be undone seconds later by whatever
     /// was still running. In memory: a restart un-pauses, which is
-    /// harmless.
+    /// harmless. Set by a Stop (`stop_turn_now`); ended by the user's
+    /// send or answer, in its turn's admission
+    /// (`TurnInFlight::start_by_user`), and by a delete's forget.
     paused: bool,
     /// How many turns are running or queued, for the Stop button
     /// (`TurnState`).
@@ -200,8 +203,11 @@ pub(super) fn note_stop(conversation_id: i64, stopped_by: u64) -> bool {
 }
 
 /// Stops `conversation_id`'s running turn, and any queued behind it. The
-/// pod, its terminals and running commands are left alone. A no-op when
-/// nothing is running.
+/// pod, its terminals and running commands are left alone. Pauses the
+/// conversation even when nothing is running, making its entry if it has
+/// none, so on a deleted conversation it would stay for good: outside the
+/// delete itself (which forgets after), call `stop_conversation`, which
+/// checks (SME-219).
 pub(crate) fn stop_turn_now(conversation_id: i64) {
     with_runtime(conversation_id, |runtime| {
         // Paused even when nothing is running: the user asked the model to
@@ -219,7 +225,9 @@ pub(crate) fn is_paused(conversation_id: i64) -> bool {
     read_runtime(conversation_id, |runtime| runtime.paused).unwrap_or(false)
 }
 
-/// Ends the pause after a stop: the user has written again.
+/// Ends the pause after a stop, for tests; the user writing again ends it
+/// in their turn's admission (`TurnInFlight::start_by_user`).
+#[cfg(test)]
 pub(super) fn resume_turns(conversation_id: i64) {
     update_existing(conversation_id, |runtime| runtime.paused = false);
 }
@@ -228,6 +236,13 @@ pub(super) fn resume_turns(conversation_id: i64) {
 /// dropped part-way by a stop, and publishes `TurnState` when the
 /// conversation goes from idle to busy or back. It holds the turn's stop
 /// receiver, made when it's counted.
+///
+/// A turn is counted when it's admitted, by its caller before that
+/// returns or spawns it (SME-216): `start_by_user` for the user's send
+/// or answer, `start_unless_paused` for a wake or a delivered notice
+/// (SME-217). In the order of the turn state's critical sections, a Stop
+/// ends exactly the turns counted before it. Moved into the turn, never
+/// cloned, so a turn is counted once.
 ///
 /// Its start and its end are each one critical section of the turn
 /// state, publishing `TurnState` inside it (SME-179 B29): a turn counted
@@ -243,26 +258,85 @@ pub(super) struct TurnInFlight {
     stop: Option<tokio::sync::watch::Receiver<u64>>,
 }
 
-impl TurnInFlight {
-    pub(super) fn start(conversation_id: i64) -> Self {
-        let (first, stop) = with_runtime(conversation_id, |runtime| {
-            runtime.turns_in_flight += 1;
-            let stop = runtime.stop_receiver();
-            let first = runtime.turns_in_flight == 1;
-            if first {
-                runtime.started_at = Some(std::time::Instant::now());
-                crate::events::publish(
-                    conversation_id,
-                    crate::events::ConversationEvent::TurnState { running: true, elapsed: 0 },
-                );
+/// How a turn is admitted (`admit`).
+enum Admission {
+    /// The user sent or answered: ends the pause and takes a new turn
+    /// generation.
+    ByUser,
+    /// A wake or a delivered notice: refused while paused.
+    UnlessPaused,
+    /// Counted whatever the pause, for tests.
+    #[cfg(test)]
+    Always,
+}
+
+/// Admits a turn for `conversation_id` as `admission` says, in one
+/// critical section of the turn state: the pause decision, a user's turn
+/// generation, the count and the stop receiver. So a Stop comes wholly
+/// before the admission (a user's turn then ends the pause and runs) or
+/// wholly after it (and ends the turn), and a delete's forget is wholly
+/// before or after the generation (SME-216); and a wake or a delivery is
+/// refused by a Stop before it, or ended by one after it (SME-217).
+/// Returns the counted turn, and the conversation's turn generation once
+/// it's admitted; `None` if refused, with nothing changed.
+fn admit(conversation_id: i64, admission: Admission) -> Option<(TurnInFlight, u64)> {
+    let (first, stop, generation) = with_runtime(conversation_id, |runtime| {
+        match admission {
+            Admission::ByUser => {
+                runtime.paused = false;
+                runtime.kept.generation += 1;
+                runtime.kept.error = None;
             }
-            (first, stop)
-        });
-        if first {
-            // Only tells the sidebar to fetch the busy list again.
-            crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
+            Admission::UnlessPaused if runtime.paused => return None,
+            Admission::UnlessPaused => {}
+            #[cfg(test)]
+            Admission::Always => {}
         }
-        TurnInFlight { conversation_id, stop: Some(stop) }
+        runtime.turns_in_flight += 1;
+        let stop = runtime.stop_receiver();
+        let first = runtime.turns_in_flight == 1;
+        if first {
+            runtime.started_at = Some(std::time::Instant::now());
+            crate::events::publish(
+                conversation_id,
+                crate::events::ConversationEvent::TurnState { running: true, elapsed: 0 },
+            );
+        }
+        Some((first, stop, runtime.kept.generation))
+    })?;
+    if first {
+        // Only tells the sidebar to fetch the busy list again.
+        crate::events::publish_app(crate::events::AppEvent::TurnsChanged);
+    }
+    Some((TurnInFlight { conversation_id, stop: Some(stop) }, generation))
+}
+
+impl TurnInFlight {
+    /// Admits the user's turn (a send, an answer from the card): ends any
+    /// pause from an earlier Stop and starts a new turn generation,
+    /// clearing the kept error, in the same step as the count. Returns the
+    /// turn and its generation (`run_turn_bounded`'s `keep_error`).
+    pub(super) fn start_by_user(conversation_id: i64) -> (Self, u64) {
+        #[expect(clippy::expect_used, reason = "only `Admission::UnlessPaused` refuses a turn")]
+        let admitted = admit(conversation_id, Admission::ByUser).expect("a user's turn is always admitted");
+        admitted
+    }
+
+    /// Admits a wake or a delivered notice, unless the conversation is
+    /// paused after a Stop: then `None`, and nothing changes (SME-217).
+    pub(super) fn start_unless_paused(conversation_id: i64) -> Option<Self> {
+        admit(conversation_id, Admission::UnlessPaused).map(|(turn, _)| turn)
+    }
+
+    /// Counts a turn whatever the pause, for tests.
+    #[cfg(test)]
+    pub(super) fn start(conversation_id: i64) -> Self {
+        let admitted = admit(conversation_id, Admission::Always);
+        admitted.expect("a test's turn is always admitted").0
+    }
+
+    pub(super) fn conversation_id(&self) -> i64 {
+        self.conversation_id
     }
 
     /// The turn's stop receiver: it changes when the user stops the
@@ -341,7 +415,8 @@ pub(crate) fn turn_started_elapsed(conversation_id: i64) -> Option<std::time::Du
 
 /// A conversation's last failed turn's error, until the user writes again,
 /// for a tab that connects after the `TurnError` event (SME-51 B11), and
-/// its turn generation: bumped by the user sending or answering, by a turn
+/// its turn generation: bumped by the user sending or answering (in the
+/// turn's admission, `TurnInFlight::start_by_user`), by a turn
 /// with a message of its own once it holds the turn lock, and by a wake or
 /// an answer turn once it has something for the model, so a turn's
 /// failure is kept only if no newer turn has started since it did
@@ -354,7 +429,9 @@ pub(super) struct KeptTurnError {
 }
 
 /// Starts a new turn generation for `conversation_id`, clearing its kept
-/// error, and returns the new generation.
+/// error, and returns the new generation; for tests. The user's send or
+/// answer takes one in its admission (`TurnInFlight::start_by_user`).
+#[cfg(test)]
 pub(super) fn new_turn_generation(conversation_id: i64) -> u64 {
     with_runtime(conversation_id, |runtime| {
         runtime.kept.generation += 1;
@@ -402,7 +479,9 @@ pub(super) fn keep_turn_error(conversation_id: i64, generation: u64, error: Stri
 /// Shows `message` as `conversation_id`'s error, as a failed turn's is
 /// (`TurnError`, and kept for a reconnecting tab until the user writes),
 /// for something that failed outside a turn: a "Work on a repo" that
-/// couldn't start the sandbox (SME-91).
+/// couldn't start the sandbox (SME-91). Makes the entry if it has none:
+/// for a conversation that may have been deleted meanwhile, call
+/// `show_error_outside_turn`, which checks (SME-219).
 pub(crate) fn show_conversation_error(conversation_id: i64, message: String) {
     with_runtime(conversation_id, |runtime| runtime.kept.error = Some(message.clone()));
     crate::events::publish(conversation_id, crate::events::ConversationEvent::TurnError { message });

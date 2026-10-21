@@ -279,11 +279,12 @@ fn command_tools() -> Vec<Tool> {
 
 // The tools: thin wrappers over sandbox.rs (pod/terminal lifecycle + agent
 // connection) and db.rs (command bookkeeping + output). No locking of
-// their own: `execute` is only ever called from `run_turn`'s tool-
+// their own: `execute` is only ever called from `run_turn_bounded`'s tool-
 // dispatch loop, which already holds `conversation_id`'s lock for the
 // whole turn (including every tool_use block in it, processed one at a
 // time, never concurrently) — see SME-9's "Which files" bullet on
-// `anthropic/tools.rs` and `turn::run_turn`'s own `conversation_lock`.
+// `anthropic/tools.rs` and the turn lock `turn::run_turn_bounded` takes
+// (`conversation_lock`).
 
 async fn create_pod_tool(
     pool: &PgPool,

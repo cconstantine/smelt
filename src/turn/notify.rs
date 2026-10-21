@@ -40,19 +40,23 @@ pub(super) async fn save_notice_between_turns(
 /// next message. Call it from a spawned task: it waits for a running turn.
 #[cfg(feature = "server")]
 pub(super) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: String) {
-    if is_paused(conversation_id) {
+    // Let in past the pause in the same step that counts it, so a Stop
+    // either refuses it or ends it (SME-217).
+    let Some(turn) = TurnInFlight::start_unless_paused(conversation_id) else {
         if let Err(e) = save_notice_between_turns(pool, conversation_id, text).await {
             tracing::warn!(conversation_id, error = %e, "couldn't save a notice");
         }
         return;
-    }
-    // The notice as the turn's own message: `run_turn` saves it before the
+    };
+    #[cfg(test)]
+    test_hooks::after_notice_admitted(conversation_id).await;
+    // The notice as the turn's own message: the turn saves it before the
     // model call, so it survives the call failing.
     let message = anthropic::AnthropicMessage {
         role: "user".to_string(),
         content: vec![anthropic::ContentBlock::Text { text }],
     };
-    if let Err(TurnFailure::Failed(e)) = run_turn(pool, conversation_id, message).await {
+    if let Err(TurnFailure::Failed(e)) = run_turn_bounded(pool, turn, Some(message), MAX_TURNS, None, false).await {
         tracing::warn!(conversation_id, error = %e, "a notice didn't reach the model");
         crate::events::publish(
             conversation_id,
@@ -65,7 +69,7 @@ pub(super) async fn deliver_notice(pool: &PgPool, conversation_id: i64, text: St
 
 /// Wakes `conversation_id`'s turn loop because a terminal command reached a
 /// terminal state (finished or lost) — no synthetic message of its own,
-/// unlike `run_turn`; just triggers the same backlog drain
+/// unlike a send's or a notice's turn; just triggers the same backlog drain
 /// `run_turn_bounded`'s loop already does on every iteration. A true no-op
 /// if, by the time this acquires the conversation lock, nothing is actually
 /// pending (e.g. another concurrent wake, or an unrelated live message,
@@ -88,10 +92,14 @@ pub(super) async fn wake_conversation(
 ) -> TurnResult {
     // After the user stopped this conversation, pending notices wait for
     // their next message, which drains them the same way (see `ConversationRuntime::paused`).
-    if is_paused(conversation_id) {
+    // Checked in the same step that counts the wake, so a Stop either
+    // refuses it or ends it (SME-217).
+    let Some(turn) = TurnInFlight::start_unless_paused(conversation_id) else {
         return Ok(Vec::new());
-    }
-    let result = run_turn_bounded(pool, conversation_id, None, MAX_TURNS, None, false).await;
+    };
+    #[cfg(test)]
+    test_hooks::after_notice_admitted(conversation_id).await;
+    let result = run_turn_bounded(pool, turn, None, MAX_TURNS, None, false).await;
     // A stop is the user's doing, not a failure to reach the model.
     if let Err(TurnFailure::Failed(e)) = &result {
         tracing::warn!(conversation_id, error = %e, "wake_conversation failed to notify the model");
@@ -105,11 +113,6 @@ pub(super) async fn wake_conversation(
     result
 }
 
-/// The real body of `run_turn`, with the turn-loop bound as a parameter —
-/// exists only so `test_run_turn_errors_when_max_turns_exceeded` can prove
-/// the "give up and error" behavior without actually replaying the mock
-/// upstream `MAX_TURNS` (10,000) times. Every other caller goes through
-/// `run_turn`, which always passes the real `MAX_TURNS`.
 /// Drains any terminal commands finished (or lost) but not yet notified
 /// into `persisted` as ordinary persisted `user` messages, folding their
 /// content into `pending_new_content` too (the compaction trigger's
