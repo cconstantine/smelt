@@ -38,10 +38,15 @@ pub(super) enum ShellEvent {
 /// SME-122): `Lines` ended the reader on them, wedging the terminal.
 /// One of these runs per terminal (spawned by `create_terminal`); while
 /// idle (no command in flight) both branches simply stay pending.
+/// It owns the shell's process and is the only code that waits on it.
+/// The shell's exit ends the reading too, `SHELL_EXIT_DRAIN` later, not
+/// only its pipes' end: a background job the shell started keeps them
+/// open (SME-191).
 pub(super) async fn run_reader(
     terminal_id: String,
     mut stdout: BufReader<ChildStdout>,
     mut stderr: BufReader<ChildStderr>,
+    mut child: Child,
     shell: Arc<Shell>,
     tx: mpsc::UnboundedSender<ShellEvent>,
 ) {
@@ -56,7 +61,13 @@ pub(super) async fn run_reader(
     // Both pipes are read to their end: the shell's last words on one
     // mustn't be lost because the other closed first.
     let (mut stdout_open, mut stderr_open) = (true, true);
-    while stdout_open || stderr_open {
+    // The shell's status once it has exited, and when to stop reading
+    // what's buffered after that (SME-191). Its own last words are in the
+    // pipes by the time it's reaped; a job it started can hold them open.
+    let mut exit: Option<i32> = None;
+    let mut drain_until: Option<tokio::time::Instant> = None;
+    let mut drained = false;
+    while (stdout_open || stderr_open) && !drained {
         tokio::select! {
             result = fill_piece(&mut stdout, &mut stdout_buf), if stdout_open => {
                 match result {
@@ -124,6 +135,12 @@ pub(super) async fn run_reader(
                 // One marker came and the other didn't in time.
                 ending.give_up_waiting();
             }
+            // Cancel safe, and fused once it has returned (tokio 1.53.1).
+            status = child.wait(), if exit.is_none() => {
+                exit = Some(exit_code_of(status));
+                drain_until = Some(tokio::time::Instant::now() + SHELL_EXIT_DRAIN);
+            }
+            _ = sleep_until_or_never(drain_until) => drained = true,
         }
         if let Some(exit_code) = ending.complete(&marker) {
             let id = shell.current.lock().await.take();
@@ -133,6 +150,13 @@ pub(super) async fn run_reader(
             seq = 0;
         }
     }
+    // A pipe still open here is held by a job the shell left running.
+    let jobs_left = stdout_open || stderr_open;
+    let code = match exit {
+        Some(code) => code,
+        // Both pipes closed and the shell hasn't exited (yet).
+        None => wait_for_closed_shell(&mut child, shell.bash_pid).await,
+    };
     // Ended between the two markers: the command did finish.
     if let Some(exit_code) = ending.code.take() {
         marker.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -142,7 +166,34 @@ pub(super) async fn run_reader(
         }
         seq = 0;
     }
-    finish_ended_shell(&terminal_id, &shell, seq, &tx).await;
+    finish_ended_shell(&terminal_id, &shell, seq, code, jobs_left, &tx).await;
+    if jobs_left {
+        drop(shell);
+        discard_until_closed(stdout, stderr, stdout_open, stderr_open).await;
+    }
+}
+
+/// Reads an ended shell's pipes to their end and throws the output away
+/// (SME-191): a job the shell left running holds them, and it must
+/// neither block on a full pipe (if they weren't read) nor die of SIGPIPE
+/// (if they were closed). Its output reaches no command.
+async fn discard_until_closed(
+    mut stdout: BufReader<ChildStdout>,
+    mut stderr: BufReader<ChildStderr>,
+    mut stdout_open: bool,
+    mut stderr_open: bool,
+) {
+    let (mut out_buf, mut err_buf) = (vec![0u8; 8192], vec![0u8; 8192]);
+    while stdout_open || stderr_open {
+        tokio::select! {
+            read = stdout.read(&mut out_buf), if stdout_open => {
+                stdout_open = matches!(read, Ok(n) if n > 0);
+            }
+            read = stderr.read(&mut err_buf), if stderr_open => {
+                stderr_open = matches!(read, Ok(n) if n > 0);
+            }
+        }
+    }
 }
 
 /// The most bytes of a line read into one `Output` (B13, SME-122); bytes
@@ -158,6 +209,12 @@ const MARKER_TAIL: usize = 64;
 /// How long after a command's stdout marker its stderr marker may take
 /// before the command is finished without it (B12, SME-122).
 pub(super) const STDERR_MARKER_WAIT: Duration = Duration::from_secs(1);
+
+/// How long the reader goes on reading once the shell has exited, before
+/// it finishes the command (SME-191). The shell's own output is in the
+/// pipes already when it's reaped; this is slack for reading it on a busy
+/// node, not a wait for a job's output.
+const SHELL_EXIT_DRAIN: Duration = Duration::from_millis(250);
 
 /// Where the in-flight command's end has got to: see `run_reader`. Each of
 /// its two markers (`o`, written to the shell's stdout, `e` to its stderr)
@@ -255,8 +312,16 @@ async fn sleep_until_or_never(deadline: Option<tokio::time::Instant>) {
 /// so the terminal's next command starts a new shell (`start_command`),
 /// and finishes a command still in flight with the shell's own status and
 /// a line saying what happened; before, it stayed running for good.
-async fn finish_ended_shell(terminal_id: &str, shell: &Shell, seq: u64, tx: &mpsc::UnboundedSender<ShellEvent>) {
-    let code = shell_exit_code(shell).await;
+/// `jobs_left`: a job the shell started still holds its output (SME-191),
+/// which the note says, since the job is left running.
+async fn finish_ended_shell(
+    terminal_id: &str,
+    shell: &Shell,
+    seq: u64,
+    code: i32,
+    jobs_left: bool,
+    tx: &mpsc::UnboundedSender<ShellEvent>,
+) {
     // All under `current`'s lock, which `start_command` claims a command
     // under: a command claimed before this has its marker seen and gets its
     // exit here, and one after it sees `ended` and goes to a new shell
@@ -273,31 +338,41 @@ async fn finish_ended_shell(terminal_id: &str, shell: &Shell, seq: u64, tx: &mps
             id: id.clone().unwrap_or_default(),
             stream: Stream::Stderr,
             seq: seq + 1,
-            data: format!(
-                "smelt: this terminal's shell exited (status {code}); its next command runs in a new shell, with the working directory and variables reset"
-            ),
+            data: if jobs_left {
+                format!(
+                    "smelt: this terminal's shell exited (status {code}), and background jobs it started are still running; their output is no longer shown (redirect a job's output to a file to keep it), and the new shell's `jobs` won't list them (stop one with `kill <pid>` or `pkill`). Its next command runs in a new shell, with the working directory and variables reset"
+                )
+            } else {
+                format!(
+                    "smelt: this terminal's shell exited (status {code}); its next command runs in a new shell, with the working directory and variables reset"
+                )
+            },
         });
         let _ = tx.send(ShellEvent::Marker { terminal_id: terminal_id.to_string(), id, exit_code: code });
     }
 }
 
-/// How long an ended shell's process has to be reaped once both its pipes
-/// have closed, before its process group is killed.
+/// How long a shell's process has to exit once both its pipes have
+/// closed, before its process group is killed.
 const SHELL_EXIT_WAIT: Duration = Duration::from_secs(5);
 
-/// The ended shell's exit status as a shell reports one: its code, or 128
-/// plus the signal that killed it. A shell that closed its pipes but
-/// hasn't exited is killed first.
-async fn shell_exit_code(shell: &Shell) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
-    let mut child = shell.bash_child.lock().await;
+/// The status of a shell whose pipes have both closed: it's waited on for
+/// `SHELL_EXIT_WAIT`, and one that hasn't exited by then is killed first.
+async fn wait_for_closed_shell(child: &mut Child, bash_pid: u32) -> i32 {
     let status = match tokio::time::timeout(SHELL_EXIT_WAIT, child.wait()).await {
         Ok(status) => status,
         Err(_) => {
-            let _ = signal::kill(Pid::from_raw(-(shell.bash_pid as i32)), Signal::SIGKILL);
+            let _ = signal::kill(Pid::from_raw(-(bash_pid as i32)), Signal::SIGKILL);
             child.wait().await
         }
     };
+    exit_code_of(status)
+}
+
+/// An exit status as a shell reports one: its code, or 128 plus the
+/// signal that killed it; 255 when it couldn't be waited on.
+fn exit_code_of(status: std::io::Result<std::process::ExitStatus>) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
     match status {
         Ok(status) => status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
         Err(_) => 255,
@@ -376,10 +451,6 @@ pub(super) struct Shell {
     /// The in-flight command's completion marker (`new_marker`), shared
     /// with this terminal's `run_reader`, which clears it on a match.
     pub(super) marker: Arc<std::sync::Mutex<Option<String>>>,
-    /// The shell's process, waited on once it has ended (`shell_exit_code`).
-    /// Not killed on drop (tokio's default) — `terminate_terminal`'s
-    /// explicit `killpg` is what actually ends it.
-    pub(super) bash_child: AsyncMutex<Child>,
     /// Set once the shell has ended (`finish_ended_shell`): the terminal's
     /// next command starts a new one.
     pub(super) ended: std::sync::atomic::AtomicBool,

@@ -109,13 +109,16 @@ async fn spawn_shell(terminal_id: &str, events_tx: &mpsc::UnboundedSender<ShellE
         bash_pid,
         current: AsyncMutex::new(None),
         marker: Arc::new(std::sync::Mutex::new(None)),
-        bash_child: AsyncMutex::new(child),
         ended: std::sync::atomic::AtomicBool::new(false),
     });
+    // The reader owns the shell's process (it alone waits on it), which
+    // isn't killed on drop (tokio's default): `terminate_terminal`'s
+    // explicit `killpg` is what ends it.
     tokio::spawn(run_reader(
         terminal_id.to_string(),
         stdout,
         stderr,
+        child,
         shell.clone(),
         events_tx.clone(),
     ));
