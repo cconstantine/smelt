@@ -113,6 +113,12 @@ jobs:
       # of its own; SANDBOX_DOCKER_MEMORY_LIMIT lowers that the same way.
       # Since SME-77 pods request no memory and have no CPU limit, so these
       # only cap what a test pod can use.
+      #
+      # Both test steps run through scripts/with-cluster-lock, as every
+      # local run does (SME-212): it tells the tests the lock is held
+      # (SMELT_CLUSTER_LOCK_HELD), and every #[sqlx::test] and real-cluster
+      # test refuses to run without that. Nothing else takes this runner's
+      # lock, so it never waits.
       - name: cargo test --features server
         run: |
           docker compose run --rm \
@@ -121,7 +127,7 @@ jobs:
             -e SANDBOX_DOCKER_MEMORY_LIMIT=256Mi \
             -e SANDBOX_IMAGE \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
-            smelt cargo test --features server
+            smelt scripts/with-cluster-lock cargo test --features server
 
       - name: Dump sandbox pod diagnostics on failure
         if: failure()
@@ -188,7 +194,7 @@ jobs:
           done
 
       # Also creates a real sandbox pod (see src/browser_tests/) — same
-      # reasoning as the step above.
+      # reasoning as the step above, the cluster lock included.
       - name: Browser tests (src/browser_tests/)
         run: |
           docker compose run --rm \
@@ -197,7 +203,7 @@ jobs:
             -e SANDBOX_DOCKER_MEMORY_LIMIT=256Mi \
             -e SANDBOX_IMAGE \
             -v "$PWD/.ci-cargo-cache:/home/dev/.cargo/registry" \
-            smelt cargo test --features "server browser-test" -- --ignored --test-threads=1
+            smelt scripts/with-cluster-lock cargo test --features "server browser-test" -- --ignored --test-threads=1
 
       - name: Dump sandbox pod diagnostics on failure (browser tests)
         if: failure()
