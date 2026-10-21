@@ -108,6 +108,7 @@ pub(super) async fn record_call(
                 &turn_model.model,
                 &turn.usage,
             ),
+            finished: true,
         },
     )
     .await

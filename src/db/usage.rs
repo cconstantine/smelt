@@ -67,7 +67,8 @@ impl ModelCallKind {
     }
 }
 
-/// One completed model call, for `record_model_call`.
+/// One model call, for `record_model_call`: finished, or stopped or
+/// failed with what it used (SME-178).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelCall<'a> {
     pub conversation_id: i64,
@@ -77,26 +78,38 @@ pub struct ModelCall<'a> {
     pub usage: crate::anthropic::TokenUsage,
     /// From the price catalog when the call finished; `None` without a price.
     pub cost_usd: Option<f64>,
+    /// Whether the call finished, its reply saved (SME-178): a stopped or
+    /// failed one is recorded with what it used, but isn't the
+    /// conversation's last-known usage.
+    pub finished: bool,
 }
 
-/// Appends `call` to `model_call_usage` (SME-106). A turn's call is also
-/// the conversation's new last-known usage (`upsert_conversation_usage`),
-/// written in the same transaction so the two never disagree. A
-/// compaction's isn't: it described the old, long history.
+/// Appends `call` to `model_call_usage` (SME-106). A finished turn's call
+/// is also the conversation's new last-known usage
+/// (`upsert_conversation_usage`), written in the same transaction so the
+/// two never disagree. A compaction's isn't: it described the old, long
+/// history. Nor is an unfinished one's: its reply may not be saved.
+///
+/// A conversation deleted before or while the call is recorded gives a
+/// row with no conversation, as the deletion's own SET NULL would
+/// (SME-178), and no last-known usage.
 pub async fn record_model_call(pool: &PgPool, call: &ModelCall<'_>) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query(
+    let conversation_id: Option<i64> = sqlx::query_scalar(
         // The provider as it is now: a turn reads it when it starts, and the
         // user may delete it before the reply finishes. A deleted one gives
         // null, as the deletion's own SET NULL would (code review 1). `FOR
         // KEY SHARE` waits for a delete still in progress and then reads
         // null; without it the id is read, and the foreign key fails once
-        // the delete commits (code review 2).
+        // the delete commits (code review 2). The conversation the same
+        // way (SME-178), locked first: VALUES is evaluated left to right.
         "INSERT INTO model_call_usage
              (conversation_id, provider_id, model, kind, input_tokens, output_tokens,
               cache_creation_input_tokens, cache_read_input_tokens, cost_usd)
-         VALUES ($1, (SELECT id FROM inference_providers WHERE id = $2 FOR KEY SHARE),
-                 $3, $4, $5, $6, $7, $8, $9)",
+         VALUES ((SELECT id FROM conversations WHERE id = $1 FOR KEY SHARE),
+                 (SELECT id FROM inference_providers WHERE id = $2 FOR KEY SHARE),
+                 $3, $4, $5, $6, $7, $8, $9)
+         RETURNING conversation_id",
     )
     .bind(call.conversation_id)
     .bind(call.provider_id)
@@ -107,10 +120,13 @@ pub async fn record_model_call(pool: &PgPool, call: &ModelCall<'_>) -> Result<()
     .bind(call.usage.cache_creation_input_tokens)
     .bind(call.usage.cache_read_input_tokens)
     .bind(call.cost_usd)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
-    if call.kind == ModelCallKind::Turn {
-        upsert_conversation_usage(&mut *tx, call.conversation_id, &call.usage).await?;
+    if let Some(conversation_id) = conversation_id
+        && call.kind == ModelCallKind::Turn
+        && call.finished
+    {
+        upsert_conversation_usage(&mut *tx, conversation_id, &call.usage).await?;
     }
     tx.commit().await
 }

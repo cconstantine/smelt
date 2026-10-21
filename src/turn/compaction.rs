@@ -484,6 +484,7 @@ async fn compact(
                 &turn_model.model,
                 &turn.usage,
             ),
+            finished: true,
         },
     )
     .await
