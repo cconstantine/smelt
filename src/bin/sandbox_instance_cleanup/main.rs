@@ -654,3 +654,6 @@ async fn cluster_client() -> Result<kube::Client, BoxError> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "../../test_lock.rs"]
+mod test_lock;

@@ -40,6 +40,7 @@ fn claim(name: &str, instance: Option<&str>) -> PersistentVolumeClaim {
 /// the unlabelled ones keep their uids.
 #[tokio::test]
 async fn test_cleanup_deletes_only_the_instance_it_is_given() {
+    crate::test_lock::require();
     let client = kube::Client::try_default().await.expect("a cluster client");
     let pods: Api<Pod> = Api::namespaced(client.clone(), NAMESPACE);
     let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), NAMESPACE);
