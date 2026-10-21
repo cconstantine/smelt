@@ -3,7 +3,7 @@ use super::*;
 /// SME-12: a pod deleted out from under a live connection is noticed and
 /// reported with no further tool call, and its terminal closed. The
 /// terminal is idle, so the pod-level notice is all it gets.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_crashed_pod_is_reported_without_a_tool_call(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -34,7 +34,7 @@ async fn test_a_crashed_pod_is_reported_without_a_tool_call(pool: PgPool) {
 /// A deliberate `terminate_pod` is never reported as a crash: the
 /// `Arc::ptr_eq` check in `deregister_if_current` keeps the reader task,
 /// seeing the same connection drop, from misreporting it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_deliberate_terminate_is_never_reported_as_a_crash(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -53,7 +53,7 @@ async fn test_a_deliberate_terminate_is_never_reported_as_a_crash(pool: PgPool) 
 /// SME-26: the user stops a pod with an open terminal and a running
 /// command. Everything is torn down, the command is marked lost, and the
 /// model is told the user stopped it, not that it crashed.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_stopping_a_pod_for_the_user_closes_everything_and_says_so(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -109,7 +109,7 @@ async fn test_stopping_a_pod_for_the_user_closes_everything_and_says_so(pool: Pg
 /// status, limits (the sandbox's and the Docker sidecar's memory added up,
 /// no CPU limit), terminals and activity, and its live usage once
 /// metrics-server has sampled it, which smelt's RBAC lets it read.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_pods_view_shows_a_busy_pods_limits_and_live_usage(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     // metrics-server samples a new pod within a minute or so.
@@ -155,7 +155,7 @@ async fn test_the_pods_view_shows_a_busy_pods_limits_and_live_usage(pool: PgPool
 /// listing, a pod deleted while it runs is closed after the grace period,
 /// and a young record whose pod may still be starting is left alone. All
 /// quietly.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_watch_pods_closes_records_of_pods_gone_from_the_cluster(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -252,7 +252,7 @@ async fn test_watch_pods_closes_records_of_pods_gone_from_the_cluster(pool: PgPo
 /// soon as it's `Running`, as the image's `ENTRYPOINT`, SME-17) makes every
 /// connect fail while the pod stays `Running`: the "reports Running but
 /// unreachable" case this path exists for.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_exhausted_reconnects_force_terminate_an_unreachable_pod(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {

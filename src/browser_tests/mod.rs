@@ -147,6 +147,8 @@ fn selected_scenarios() -> Option<Vec<String>> {
 #[tokio::test]
 #[ignore]
 async fn test_end_to_end_browser_scenarios() {
+    // Before db::init(): it would migrate whatever DATABASE_URL names.
+    crate::test_lock::require();
     let pool = db::init().await;
     sqlx::migrate!()
         .run(pool)

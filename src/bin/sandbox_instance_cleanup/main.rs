@@ -654,3 +654,7 @@ async fn cluster_client() -> Result<kube::Client, BoxError> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "../../test_lock.rs"]
+#[allow(dead_code, reason = "shared with the smelt binary's tests; this one names only some of it")]
+mod test_lock;

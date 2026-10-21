@@ -2,7 +2,7 @@ use super::*;
 
 /// SME-115: an empty database (a scratch, test or fresh one) migrates
 /// to an instance of its own that owns no unlabelled cluster object.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_empty_database_gets_an_instance_that_owns_nothing_unlabelled(pool: PgPool) {
     let instance = smelt_instance(&pool).await.expect("the instance row");
     assert_eq!(instance.id.len(), 36, "a UUID: {:?}", instance.id);
@@ -12,7 +12,7 @@ async fn test_an_empty_database_gets_an_instance_that_owns_nothing_unlabelled(po
 
 /// SME-115: a database that already had conversations when it
 /// migrated (the dev database) owns the objects made before the fix.
-#[sqlx::test(migrations = false)]
+#[sqlx::test(migrator = "crate::test_lock::NO_MIGRATIONS")]
 async fn test_a_database_with_conversations_before_the_migration_owns_unlabelled_objects(pool: PgPool) {
     let all = sqlx::migrate!();
     let before = sqlx::migrate::Migrator {
@@ -34,7 +34,7 @@ async fn test_a_database_with_conversations_before_the_migration_owns_unlabelled
 /// SME-115: a fresh database (a scratch check server's) starts its
 /// ids far above the dev database's, so its pods and claims are never
 /// named like the dev server's; once started, it isn't moved again.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_fresh_database_starts_its_ids_clear(pool: PgPool) {
     let base = start_ids_clear_if_fresh(&pool).await.expect("move them").expect("a fresh database is moved");
     assert!(base >= 2_000_000_000, "base {base}");
@@ -50,7 +50,7 @@ async fn test_a_fresh_database_starts_its_ids_clear(pool: PgPool) {
 /// SME-115 review 2: a move that failed partway (one sequence moved,
 /// the others not) is finished at the next start, instead of leaving
 /// the rest counting from 1 for good.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_partly_moved_database_finishes_the_move(pool: PgPool) {
     sqlx::query("SELECT setval(pg_get_serial_sequence('conversations', 'id'), 2000000005)")
         .execute(&pool)
@@ -68,7 +68,7 @@ async fn test_a_partly_moved_database_finishes_the_move(pool: PgPool) {
 
 /// SME-115: a database whose ids were ever used (the dev or production
 /// database) is left as it is.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_used_database_keeps_its_ids(pool: PgPool) {
     let first = create_conversation(&pool).await.expect("conversation");
     assert_eq!(start_ids_clear_if_fresh(&pool).await.expect("check"), None);
@@ -77,7 +77,7 @@ async fn test_a_used_database_keeps_its_ids(pool: PgPool) {
 }
 
 /// One instance per database: the table takes no second row.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_instance_table_holds_one_row(pool: PgPool) {
     smelt_instance(&pool).await.expect("the instance row");
     let second = sqlx::query("INSERT INTO smelt_instance (owns_unlabelled) VALUES (false)")
@@ -93,7 +93,7 @@ async fn test_the_instance_table_holds_one_row(pool: PgPool) {
 
 /// SME-99: the browser tier's ids start clear of every other run's,
 /// for each table whose ids name cluster objects.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_ids_start_clear_of_other_runs(pool: PgPool) {
     let base = test_support::start_ids_clear_of_other_runs(&pool).await.expect("move the id sequences");
     assert!(base >= 2_000_000_000, "base {base} is in the range other runs use");

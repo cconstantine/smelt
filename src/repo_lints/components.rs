@@ -76,14 +76,14 @@ pub(crate) fn component_lengths(source: &str) -> Result<Vec<(String, usize)>, St
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     Code,
     Comment,
     Str,
 }
 
 /// Each character's kind: in a comment, in a string or char literal, or code.
-fn classify(chars: &[char]) -> Vec<Kind> {
+pub(super) fn classify(chars: &[char]) -> Vec<Kind> {
     let mut kinds = vec![Kind::Code; chars.len()];
     let at = |i: usize, s: &str| s.chars().enumerate().all(|(k, c)| chars.get(i + k) == Some(&c));
     let mut i = 0;

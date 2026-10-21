@@ -121,12 +121,14 @@ pub(super) fn run_turn_bounded<'a>(
             // The turn's generation, once it holds the lock and has something
             // to tell the model (`run_turn_stoppable`).
             let mut generation = None;
+            let place = in_flight.take_place();
             let result = run_turn_stoppable(
                 pool,
                 conversation_id,
                 new_message,
                 max_turns,
                 from_user,
+                place,
                 in_flight.stop(),
                 &mut generation,
             )
@@ -153,8 +155,10 @@ pub(super) fn run_turn_bounded<'a>(
     })
 }
 
-/// `run_turn_bounded`'s turn: waits for the turn lock, saves the turn's
-/// message, and runs it, ending early on a stop (`stop`).
+/// `run_turn_bounded`'s turn: waits for the turn lock, in its place in
+/// the queue (`place`, taken at its admission; a test's turn joins the
+/// queue here), saves the turn's message, and runs it, ending early on a
+/// stop (`stop`).
 ///
 /// A turn with a message of its own takes a new turn generation once it
 /// holds the lock (`generation`), clearing the kept error. One without
@@ -173,12 +177,19 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
     new_message: Option<anthropic::AnthropicMessage>,
     max_turns: usize,
     from_user: bool,
+    place: Option<TurnPlace>,
     stop: &'b mut tokio::sync::watch::Receiver<u64>,
     generation: &'b mut Option<u64>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TurnResult> + Send + 'b>>
 {
     Box::pin(async move {
-        let lock = conversation_lock(conversation_id);
+        // The place's own lock, not the conversation's current one: after
+        // a delete's forget that's a fresh lock this turn doesn't hold.
+        let TurnPlace { lock, mut acquire } = place.unwrap_or_else(|| {
+            let lock = conversation_lock(conversation_id);
+            let acquire: TurnAcquire = Box::pin(lock.clone().lock_owned());
+            TurnPlace { lock, acquire }
+        });
         // Queued behind another turn until the lock is free. Stopped while
         // queued: keep the message anyway (a finished command's notice,
         // say), without running a turn for it; the conversation is paused,
@@ -187,11 +198,15 @@ pub(super) fn run_turn_stoppable<'a: 'b, 'b>(
         // message dismisses a question still waiting, and an answer from
         // the card goes first in it. A stopped wake or answer turn has no
         // message, saves nothing, and leaves an answer for the next turn.
+        // A turn stopped while queued keeps its place in the queue, so
+        // stopped messages are saved in the order they were admitted (SME-202).
         let guard = tokio::select! {
-            guard = lock.clone().lock_owned() => guard,
+            guard = &mut acquire => guard,
             _ = stop.changed() => {
                 let stopped_by = *stop.borrow_and_update();
-                let _turn = lock.lock().await;
+                #[cfg(test)]
+                test_hooks::stopped_while_queued(conversation_id, &new_message).await;
+                let _turn = acquire.await;
                 if new_message.is_some() {
                     match save_turn_message(pool, conversation_id, new_message, from_user).await {
                         Ok(Some((saved, _))) => record_saved(conversation_id, &mut Vec::new(), saved),

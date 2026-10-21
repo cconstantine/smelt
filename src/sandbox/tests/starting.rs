@@ -134,7 +134,7 @@ async fn wait_held_pod_running(pods: &Api<Pod>) -> Result<(), String> {
 /// manager (see `test_open_pod_port_reaches_the_conversations_own_pod`).
 /// `#[ignore]`d so it runs with the browser tier and CI's ignored tests,
 /// not alongside the unit tests that use conversation 1 for real.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 #[ignore]
 async fn test_a_stopping_pod_from_another_run_doesnt_hold_up_the_tier(pool: PgPool) {
     let client = test_client().await;
@@ -180,7 +180,7 @@ async fn test_a_stopping_pod_from_another_run_doesnt_hold_up_the_tier(pool: PgPo
 /// SME-51 B8: the listening probe (`sandbox_preview_url`) waited as
 /// long as the Kubernetes client would for a port-forward to open,
 /// minutes when the API server hangs, holding the turn.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_listening_probe_gives_up_on_a_hanging_cluster(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     db::create_sandbox_pod(&pool, conversation.id).await.expect("pod row");
@@ -216,7 +216,7 @@ fn test_a_pod_start_waits_longer_than_the_docker_probe() {
 /// SME-51 code review 1: a pod start that fails after its conversation
 /// was deleted may have re-created the conversation's claims after the
 /// delete's teardown ran; they're removed. A live conversation's stay.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_failed_start_for_a_deleted_conversation_leaves_no_claims(pool: PgPool) {
     let client = test_client().await;
     let pvcs = pvc_api(&client);
@@ -245,7 +245,7 @@ async fn test_a_failed_start_for_a_deleted_conversation_leaves_no_claims(pool: P
 /// SME-51 B7: "Work on a repo" while the sandbox is still starting
 /// waits for it, rather than taking the half-made pod's record and
 /// cloning into a pod that isn't running.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_start_or_get_pod_waits_for_a_pod_still_starting(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     // A pod being made: its record exists, and its start holds the lock.

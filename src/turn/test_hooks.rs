@@ -146,3 +146,36 @@ pub fn pause_after_notice_admitted(conversation_id: i64) -> (oneshot::Receiver<(
 pub async fn after_notice_admitted(conversation_id: i64) {
     reach(&AFTER_NOTICE_ADMITTED, conversation_id).await;
 }
+
+static STOPPED_WHILE_QUEUED: LazyLock<Mutex<HashMap<(i64, String), Pause>>> = LazyLock::new(Default::default);
+
+/// Pauses `conversation_id`'s turn whose message is `text` in its stop
+/// arm, when a Stop has caught it queued, before it waits for the turn
+/// lock again (SME-202). Keyed by the message's text too, so a test can
+/// pause one named turn there and let another pass. As
+/// `pause_after_message_saved`.
+pub fn pause_stopped_while_queued(conversation_id: i64, text: &str) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    STOPPED_WHILE_QUEUED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((conversation_id, text.to_string()), (reached_tx, release_rx));
+    (reached_rx, release_tx)
+}
+
+pub async fn stopped_while_queued(conversation_id: i64, new_message: &Option<crate::anthropic::AnthropicMessage>) {
+    let text = new_message.iter().flat_map(|m| &m.content).find_map(|block| match block {
+        crate::anthropic::ContentBlock::Text { text } => Some(text.clone()),
+        _ => None,
+    });
+    let Some(text) = text else { return };
+    let pause = STOPPED_WHILE_QUEUED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(conversation_id, text));
+    if let Some((reached, release)) = pause {
+        let _ = reached.send(());
+        let _ = release.await;
+    }
+}

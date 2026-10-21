@@ -1,6 +1,9 @@
 use super::*;
 
 pub(super) async fn test_client() -> kube::Client {
+    // Only under the cluster lock (SME-212): every real-cluster test
+    // gets its client here, or through `lsp::pods::tests::cluster`'s.
+    crate::test_lock::require();
     // Same call `main()` makes before building any TLS-using client
     // (see its own comment) — but `main()` never runs under `cargo
     // test`, so without this, the first `kube::Client` built here hits

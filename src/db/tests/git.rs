@@ -1,6 +1,6 @@
 use super::*;
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_ssh_key_round_trips_and_deletes(pool: PgPool) {
     let work = create_ssh_key(&pool, "work", "ssh-ed25519 AAAA work", "PRIVATE-W")
         .await
@@ -13,7 +13,7 @@ async fn test_ssh_key_round_trips_and_deletes(pool: PgPool) {
     assert!(list_ssh_keys(&pool).await.expect("list keys").is_empty());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_git_identity_is_empty_until_set_then_updates_in_place(pool: PgPool) {
     assert_eq!(
         get_git_identity(&pool).await.expect("get"),
@@ -34,7 +34,7 @@ async fn test_git_identity_is_empty_until_set_then_updates_in_place(pool: PgPool
     assert_eq!(get_git_identity(&pool).await.expect("get"), second);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_conversation_repos_round_trip_through_a_clone(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("create conversation");
     let repo = create_conversation_repo(
@@ -140,7 +140,7 @@ async fn test_conversation_repos_round_trip_through_a_clone(pool: PgPool) {
 /// Only a failed clone is retried, and only the current attempt can
 /// finish a clone: a stale attempt's late "ready" or "failed" changes
 /// nothing (SME-86).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_only_the_current_attempt_finishes_a_clone(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let repo = create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")
@@ -184,7 +184,7 @@ async fn test_only_the_current_attempt_finishes_a_clone(pool: PgPool) {
 }
 
 /// Two retries of the same failed clone at once: exactly one runs.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_two_retries_of_a_failed_clone_one_wins(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let repo = create_conversation_repo(&pool, conversation.id, "u", "k", None, "r")

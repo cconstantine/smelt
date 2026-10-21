@@ -75,7 +75,7 @@ async fn test_a_failed_tool_call_is_a_failed_span_without_its_input() {
     assert!(!format!("{span:?}").contains("SECRET-INPUT"), "{span:?}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_mcp_tool_calls_span_names_its_server(pool: PgPool) {
     let (result, spans) = crate::telemetry::capture_spans(execute(
         &pool,
@@ -97,7 +97,7 @@ async fn test_an_mcp_tool_calls_span_names_its_server(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_tool_call_that_succeeds_leaves_its_span_unmarked(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let (result, spans) = crate::telemetry::capture_spans(execute(
@@ -234,7 +234,7 @@ async fn test_edit_file_tool_rejects_replace_all_and_expected_line_together() {
 /// SME-51 B2: terminal and command ids are sequential or visible,
 /// so each tool checks the terminal or command is the calling
 /// conversation's before touching it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_another_conversations_terminal_and_command_are_unknown(pool: sqlx::PgPool) {
     let owner = db::create_conversation(&pool).await.expect("conversation");
     let other = db::create_conversation(&pool).await.expect("conversation");
@@ -305,7 +305,7 @@ fn test_busy_terminal_message_names_the_command_its_age_and_the_ways_out() {
 
 /// SME-76: both refusals a busy terminal gives say which command
 /// holds it, not just that one does.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_busy_terminal_names_its_command_to_run_and_terminate(pool: sqlx::PgPool) {
     let owner = db::create_conversation(&pool).await.expect("conversation");
     let pod = db::create_sandbox_pod(&pool, owner.id).await.expect("pod");
@@ -404,7 +404,7 @@ fn test_an_edit_result_with_short_diagnostics_is_unchanged() {
 }
 
 /// SME-76: one minified-JSON line could be most of a result.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_read_terminal_output_stops_at_the_budget_with_a_next_offset(pool: sqlx::PgPool) {
     let owner = db::create_conversation(&pool).await.expect("conversation");
     let pod = db::create_sandbox_pod(&pool, owner.id).await.expect("pod");
@@ -439,7 +439,7 @@ async fn test_read_terminal_output_stops_at_the_budget_with_a_next_offset(pool: 
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_edit_file_tool_refuses_when_path_never_read(pool: sqlx::PgPool) {
     let conversation = db::create_conversation(&pool)
         .await
@@ -457,7 +457,7 @@ async fn test_edit_file_tool_refuses_when_path_never_read(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_sandbox_preview_url_without_a_pod_says_to_create_one(pool: sqlx::PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let message = sandbox_preview_url_tool(&pool, conversation.id, &serde_json::json!({"port": 3000}))
@@ -466,7 +466,7 @@ async fn test_sandbox_preview_url_without_a_pod_says_to_create_one(pool: sqlx::P
     assert!(message.contains("create_pod"), "should say how to get a sandbox: {message}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_sandbox_preview_url_refuses_the_sandbox_agents_port(pool: sqlx::PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let message = sandbox_preview_url_tool(&pool, conversation.id, &serde_json::json!({"port": 8088}))
@@ -475,7 +475,7 @@ async fn test_sandbox_preview_url_refuses_the_sandbox_agents_port(pool: sqlx::Pg
     assert!(message.contains("sandbox agent"), "{message}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_sandbox_preview_url_refuses_a_host_that_is_not_a_container_in_the_pod(pool: sqlx::PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     for host in ["10.0.0.5", "172.24.0.1", "web", "localhost", ""] {
@@ -516,7 +516,7 @@ fn test_the_model_never_sees_an_untrusted_agents_md() {
     assert!(told.contains("/workspace/r"), "{told}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_clone_repo_tool_needs_a_url(pool: sqlx::PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let missing = execute(&pool, conversation.id, "toolu_1", "clone_repo", &serde_json::json!({}))
@@ -538,7 +538,7 @@ async fn test_clone_repo_tool_needs_a_url(pool: sqlx::PgPool) {
     assert!(outside.contains("isn't in"), "{outside}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_sandbox_preview_url_refuses_a_port_that_is_not_a_port(pool: sqlx::PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     for input in [
@@ -555,7 +555,7 @@ async fn test_sandbox_preview_url_refuses_a_port_that_is_not_a_port(pool: sqlx::
     }
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_todowrite_tool_rejects_empty_content(pool: sqlx::PgPool) {
     let conversation = db::create_conversation(&pool)
         .await
@@ -573,7 +573,7 @@ async fn test_todowrite_tool_rejects_empty_content(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_todowrite_tool_persists_and_returns_the_list(pool: sqlx::PgPool) {
     let conversation = db::create_conversation(&pool)
         .await
@@ -610,7 +610,7 @@ async fn test_todowrite_tool_persists_and_returns_the_list(pool: sqlx::PgPool) {
     assert_eq!(returned, stored);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_todowrite_tool_overwrites_previous_list(pool: sqlx::PgPool) {
     let conversation = db::create_conversation(&pool)
         .await
@@ -643,7 +643,7 @@ async fn test_todowrite_tool_overwrites_previous_list(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_todoread_tool_returns_current_list(pool: sqlx::PgPool) {
     let conversation = db::create_conversation(&pool)
         .await
@@ -687,7 +687,7 @@ async fn test_unknown_tool_name_errors() {
 /// `add`/`count`. Covers the "config was deleted out from under a
 /// stale tool name" case `call_mcp_tool`'s doc comment describes —
 /// a plain tool error, not a panic.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_execute_routes_mcp_prefixed_names_and_errors_clearly_on_unknown_server(
     pool: PgPool,
 ) {
@@ -763,7 +763,7 @@ fn touched_ago(command: &db::TerminalCommand) -> i64 {
     (chrono::Utc::now().naive_utc() - command.touched_at.expect("touched")).num_seconds()
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_terminal_command_status_shows_the_idle_clock_and_touches_it(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     idle_command(&pool, conversation.id, "idle-status").await;
@@ -789,7 +789,7 @@ async fn test_terminal_command_status_shows_the_idle_clock_and_touches_it(pool: 
     assert!((0..=2).contains(&touched_ago(&row)), "checking is touching: {}", touched_ago(&row));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_terminal_command_status_has_no_untouched_time_once_it_is_running_no_more(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     idle_command(&pool, conversation.id, "idle-finished").await;
@@ -814,7 +814,7 @@ async fn test_terminal_command_status_has_no_untouched_time_once_it_is_running_n
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_read_terminal_output_touches_the_command(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     idle_command(&pool, conversation.id, "idle-read").await;
@@ -834,7 +834,7 @@ async fn test_read_terminal_output_touches_the_command(pool: PgPool) {
     assert!((0..=2).contains(&touched_ago(&row)), "reading is touching: {}", touched_ago(&row));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_set_idle_notice_retimes_a_running_command(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     idle_command(&pool, conversation.id, "idle-set").await;
@@ -868,7 +868,7 @@ async fn test_set_idle_notice_retimes_a_running_command(pool: PgPool) {
     assert_eq!(command_row(&pool, "idle-set").await.idle_notice_secs, 0);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_set_idle_notice_refuses_a_command_that_is_not_running(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     idle_command(&pool, conversation.id, "idle-done").await;

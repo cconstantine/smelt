@@ -10,11 +10,14 @@ async fn configure(pool: &PgPool, package_yaml: &str) -> LanguageServerConfig {
     config
 }
 
-/// Writes `files` into the sandbox's workspace, their project (the
-/// directory under `/workspace`) writable by the server.
+/// Writes `files` into the sandbox's workspace. No chmod: the sandbox
+/// and the server pod both run as uid 1000, so the server can already
+/// write what this writes; and a `chmod -R` over the project raced a
+/// running server's build deleting its own files under `target/`
+/// (SME-220).
 async fn write_files(client: &kube::Client, sandbox: &SandboxRef, files: &[(&str, &str)]) {
     for (path, content) in files {
-        let script = r#"mkdir -p "$(dirname "$1")" && cat > "$1" && chmod -R a+rwX "/workspace/$(echo "$1" | cut -d/ -f3)""#;
+        let script = r#"mkdir -p "$(dirname "$1")" && cat > "$1""#;
         let result = crate::sandbox::exec_with(client, &sandbox.pod_name, "sandbox", &["sh", "-c", script, "_", path], Some(content.as_bytes()))
             .await
             .expect("exec");
@@ -93,7 +96,7 @@ impl Shape for Square {
 /// rust-analyzer, installed as the catalog suggests: navigation across
 /// files, calls, diagnostics (after an edit too), a rename's edits, and
 /// a session that comes back after its server process dies.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_rust_analyzer_from_the_catalog_answers_across_files(pool: PgPool) {
     let config = configure(&pool, include_str!("../fixtures/mason-rust-analyzer.yaml")).await;
     with_sandbox(|client, sandbox| async move {
@@ -218,7 +221,7 @@ async fn test_an_edit_says_when_a_server_cannot_connect() {
 /// Starting a server that's already running gives it a fresh reconnect
 /// budget: that's what the error for a spent budget tells the model
 /// to do, and the pod itself is still ready.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_starting_a_running_server_resets_its_reconnects(pool: PgPool) {
     let config = LanguageServerConfig {
         name: "budget".to_string(),
@@ -274,7 +277,7 @@ async fn test_an_edit_does_not_wait_for_a_server_to_connect() {
 
 /// pyright, installed with npm as the catalog suggests: a definition
 /// in another module, and a type error.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_pyright_from_the_catalog_answers(pool: PgPool) {
     let config = configure(&pool, include_str!("../fixtures/mason-pyright.yaml")).await;
     with_sandbox(|client, sandbox| async move {
@@ -297,7 +300,7 @@ async fn test_pyright_from_the_catalog_answers(pool: PgPool) {
 
 /// gopls, installed with `go install` as the catalog suggests: a
 /// definition in another file of the package.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_gopls_from_the_catalog_answers(pool: PgPool) {
     let config = configure(&pool, include_str!("../fixtures/mason-gopls.yaml")).await;
     with_sandbox(|client, sandbox| async move {
@@ -311,6 +314,25 @@ async fn test_gopls_from_the_catalog_answers(pool: PgPool) {
         start(&pool, &client, &sandbox, &config.name).await.expect("started");
         let found = until_contains(&pool, &client, &sandbox, Operation::Definition, &at(main, 6, 14), "area.go").await;
         assert!(found.contains("func area"), "{found}");
+    })
+    .await;
+}
+
+/// `write_files` changes only the files it writes: a file a running
+/// server's build made under the project keeps its mode. A `chmod -R`
+/// over the project raced the build deleting its own files (SME-220).
+#[tokio::test]
+async fn test_write_files_changes_only_the_files_it_writes() {
+    with_sandbox(|client, sandbox| async move {
+        write_files(&client, &sandbox, &[("/workspace/p/a.txt", "a\n")]).await;
+        let script = "mkdir -p /workspace/p/target && touch /workspace/p/target/kept && chmod 600 /workspace/p/target/kept";
+        let made = crate::sandbox::exec_with(&client, &sandbox.pod_name, "sandbox", &["sh", "-c", script], None).await.expect("exec");
+        assert_eq!(made.exit_code, 0, "{}", made.stderr);
+        write_files(&client, &sandbox, &[("/workspace/p/b.txt", "b\n")]).await;
+        let mode = crate::sandbox::exec_with(&client, &sandbox.pod_name, "sandbox", &["stat", "-c", "%a", "/workspace/p/target/kept"], None)
+            .await
+            .expect("exec");
+        assert_eq!(mode.stdout.trim(), "600", "{}", mode.stderr);
     })
     .await;
 }

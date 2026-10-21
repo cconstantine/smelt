@@ -1,6 +1,6 @@
 use super::*;
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_list_live_pods_reports_each_live_pod_and_its_activity(pool: PgPool) {
     let busy = test_conversation(&pool).await;
     create_message(
@@ -56,7 +56,7 @@ async fn test_list_live_pods_reports_each_live_pod_and_its_activity(pool: PgPool
     assert_eq!(with_pods, vec![busy.id, quiet.id]);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_sandbox_pod_and_terminate_is_idempotent(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let pod = create_sandbox_pod(&pool, conversation.id)
@@ -99,7 +99,7 @@ async fn test_create_sandbox_pod_and_terminate_is_idempotent(pool: PgPool) {
     assert!(unknown.is_none());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_sandbox_terminal_lifecycle_and_pod_id_lookup(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let pod = create_sandbox_pod(&pool, conversation.id)
@@ -139,7 +139,7 @@ async fn test_sandbox_terminal_lifecycle_and_pod_id_lookup(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_pod_previews_are_listed_per_pod_lowest_first_without_repeats(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let pod = create_sandbox_pod(&pool, conversation.id).await.expect("create pod");
@@ -165,7 +165,7 @@ async fn test_pod_previews_are_listed_per_pod_lowest_first_without_repeats(pool:
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_sandbox_pod_conversation_id_resolves_and_returns_none_for_unknown(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let pod = create_sandbox_pod(&pool, conversation.id)
@@ -186,7 +186,7 @@ async fn test_sandbox_pod_conversation_id_resolves_and_returns_none_for_unknown(
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_terminating_a_pod_cascades_to_its_terminals(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let pod = create_sandbox_pod(&pool, conversation.id)

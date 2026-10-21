@@ -6,6 +6,7 @@
 //! opencode. See docs/process/rules-commits.md, "Files stay under the
 //! ceiling".
 
+mod cluster_lock;
 mod components;
 mod links;
 
@@ -180,6 +181,28 @@ mod tests {
             "components over {} code lines: split each into child components along its own parts\n{}",
             components::MAX_COMPONENT_LINES,
             over.join("\n")
+        );
+    }
+
+    /// Every `#[sqlx::test]` names a guarded migrator, so it refuses to run
+    /// outside the cluster lock (SME-212). Pure: it reads the files.
+    #[test]
+    fn test_every_sqlx_test_takes_the_cluster_lock() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (mut seen, mut findings) = (0, Vec::new());
+        for path in tracked_files().into_iter().filter(|p| p.ends_with(".rs")) {
+            let Ok(source) = std::fs::read_to_string(root.join(&path)) else { continue };
+            seen += cluster_lock::sqlx_tests(&source).len();
+            findings.extend(cluster_lock::unguarded(&path, &source));
+        }
+        assert!(seen > 400, "found the #[sqlx::test]s ({seen})");
+        assert!(
+            findings.is_empty(),
+            "{} #[sqlx::test]s that don't take the cluster lock: name a guarded migrator in the \
+             attribute's own brackets, migrator = \"crate::test_lock::MIGRATOR\" (or NO_MIGRATIONS \
+             for none), see src/test_lock.rs\n{}",
+            findings.len(),
+            findings.join("\n")
         );
     }
 

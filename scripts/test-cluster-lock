@@ -122,6 +122,33 @@ grep -q "got typed" <<<"$out" || fail "with-cluster-lock: a command couldn't rea
 out=$( (sleep 2; printf '\003'; sleep 1) | timeout 15 script -qec "bash -c 'scripts/with-cluster-lock sleep 8; echo carried on'" /dev/null 2>&1)
 grep -q "carried on" <<<"$out" && fail "with-cluster-lock: its caller carried on after Ctrl-C: $out"
 
+# 14. The command is told the lock is held (SME-212): SMELT_CLUSTER_LOCK_HELD
+# is the lock file's path, which the tests' own guard (src/test_lock.rs)
+# checks before touching Postgres or the cluster. Each run starts with it
+# unset, as a gate run from a shell does.
+held_cmd=(bash -c 'echo "${SMELT_CLUSTER_LOCK_HELD-unset}"')
+lock_real=$(readlink -f "$lock")
+out=$(env -u SMELT_CLUSTER_LOCK_HELD timeout 20 scripts/with-cluster-lock "${held_cmd[@]}" 2>&1)
+[ "$out" = "$lock_real" ] || fail "with-cluster-lock: the command saw SMELT_CLUSTER_LOCK_HELD=$out, not $lock_real"
+# Re-entry: inside another run, and inside an old outer flock.
+out=$(env -u SMELT_CLUSTER_LOCK_HELD timeout 20 scripts/with-cluster-lock scripts/with-cluster-lock "${held_cmd[@]}" 2>&1)
+[ "$out" = "$lock_real" ] || fail "with-cluster-lock inside itself: the command saw SMELT_CLUSTER_LOCK_HELD=$out"
+out=$(env -u SMELT_CLUSTER_LOCK_HELD timeout 20 flock "$lock" scripts/with-cluster-lock "${held_cmd[@]}" 2>/dev/null)
+[ "$out" = "$lock_real" ] || fail "with-cluster-lock under an outer flock: the command saw SMELT_CLUSTER_LOCK_HELD=$out"
+# The script never reads it: a value already in the caller's environment
+# doesn't count as held, so a run still waits for another holder, and its
+# command then sees the real path.
+flock "$lock" sleep 3 &
+outer=$!
+wait_until_held || fail "SMELT_CLUSTER_LOCK_HELD case: the outer holder never took the lock"
+out=$(SMELT_CLUSTER_LOCK_HELD=1 timeout 2 scripts/with-cluster-lock true 2>&1)
+rc=$?
+wait "$outer"
+[ "$rc" = 124 ] || fail "with-cluster-lock took SMELT_CLUSTER_LOCK_HELD=1 for the lock and didn't wait (exit $rc): $out"
+grep -q "waiting for the cluster lock" <<<"$out" || fail "with-cluster-lock with SMELT_CLUSTER_LOCK_HELD=1 didn't say it waits: $out"
+out=$(SMELT_CLUSTER_LOCK_HELD=1 timeout 20 scripts/with-cluster-lock "${held_cmd[@]}" 2>&1)
+[ "$out" = "$lock_real" ] || fail "with-cluster-lock passed on a caller's SMELT_CLUSTER_LOCK_HELD=$out"
+
 # Its usage text, with no command, is the whole header.
 header_end=$(awk '/^set -uo pipefail/ { print prev; exit } { prev = $0 }' scripts/with-cluster-lock | sed 's/^# \{0,1\}//')
 [ "$(scripts/with-cluster-lock 2>&1 | tail -n 1)" = "$header_end" ] || fail "with-cluster-lock's usage stops before the header's last line: $header_end"

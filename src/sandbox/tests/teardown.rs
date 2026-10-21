@@ -275,7 +275,7 @@ fn test_the_pod_watch_sees_only_our_instance() {
 /// pod (still running) is closed as gone, and that pod is left. Before the
 /// fix the record stayed open on the other pod's status, and terminating
 /// it deleted that pod.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_record_whose_pod_is_another_databases_is_closed_and_the_pod_left(pool: PgPool) {
     let client = test_client().await;
     let pods = pods_api(&client);

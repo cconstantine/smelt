@@ -1,6 +1,6 @@
 use super::*;
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_wake_conversation_is_a_noop_when_nothing_is_pending(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -30,7 +30,7 @@ async fn test_wake_conversation_is_a_noop_when_nothing_is_pending(pool: PgPool) 
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_wake_conversation_drains_a_pending_command_and_completes_a_turn(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -83,7 +83,7 @@ async fn test_wake_conversation_drains_a_pending_command_and_completes_a_turn(po
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_wake_conversation_second_call_is_a_noop_once_the_first_drained_everything(
     pool: PgPool,
 ) {
@@ -142,7 +142,7 @@ async fn test_wake_conversation_second_call_is_a_noop_once_the_first_drained_eve
 /// command's notice (the model sees it once there is one) and says why
 /// it couldn't deliver it; a wake with nothing pending doesn't take the
 /// default or say anything.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_with_no_model_still_saves_the_notice(pool: PgPool) {
     let _guard = lock_turn_tests();
     // An id no other test's database hands out: what this test hears on
@@ -175,7 +175,7 @@ async fn test_a_wake_with_no_model_still_saves_the_notice(pool: PgPool) {
     assert_eq!(failure, crate::providers::NO_MODEL_CONFIGURED);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_with_nothing_pending_leaves_the_model_alone(pool: PgPool) {
     let _guard = lock_turn_tests();
     // The mock first: it moves conversations already there onto it.
@@ -193,7 +193,7 @@ async fn test_a_wake_with_nothing_pending_leaves_the_model_alone(pool: PgPool) {
     assert_eq!(model.provider_id, None, "a wake with nothing to say doesn't take the default");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_wake_conversation_publishes_notification_delivery_failed_on_error(pool: PgPool) {
     let _guard = lock_turn_tests();
     // An id no other test's database hands out: what this test hears on
@@ -276,7 +276,7 @@ async fn untouched_running_command(pool: &PgPool, conversation_id: i64, command_
 /// past its notice period is told to the model as its own user message, says
 /// plainly that nothing stopped it and what it can do about it, and is marked
 /// so its clock restarts from this notice. The command keeps running.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_wake_drains_an_idle_notice_and_the_command_keeps_running(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -333,7 +333,7 @@ async fn test_wake_drains_an_idle_notice_and_the_command_keeps_running(pool: PgP
 
 /// SME-79: the wake-up is for *untouched* commands. A running command
 /// nobody has left long is no reason to wake anyone.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_running_command_not_due_is_left_alone(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -372,7 +372,7 @@ fn test_format_duration_names_one_or_two_units() {
 /// drains it, and its numbers are the ones the command has earned by
 /// then — recomputed at the drain, not frozen at the wake that didn't
 /// happen. ("untouched for 3 hours" reads oddly; it's honest.)
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stopped_conversation_holds_the_idle_notice_for_the_next_message(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -420,4 +420,120 @@ async fn test_a_stopped_conversation_holds_the_idle_notice_for_the_next_message(
     assert!(notices[0].contains("running for 2 hours 5 minutes"), "recomputed at the drain: {}", notices[0]);
     assert!(notices[0].contains("hasn't been touched in 2 hours 5 minutes"), "{}", notices[0]);
     assert_eq!(counter.load(Ordering::SeqCst), 1, "the user's turn is the only model call");
+}
+
+// --- A wake with nothing to do isn't counted (SME-218) ---
+
+/// Every `TurnState` `rx` has had so far, as `running` values in order.
+fn turn_states_heard(rx: &mut tokio::sync::broadcast::Receiver<events::ConversationEvent>) -> Vec<bool> {
+    let mut states = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let events::ConversationEvent::TurnState { running, .. } = event {
+            states.push(running);
+        }
+    }
+    states
+}
+
+/// A question the model asked, still waiting for the user.
+async fn waiting_question(pool: &PgPool, conversation_id: i64) {
+    let questions = vec![crate::questions::Question {
+        question: "Delete the build directory?".to_string(),
+        header: "Delete".to_string(),
+        options: vec![],
+        multi_select: false,
+    }];
+    db::create_pending_question(pool, conversation_id, "toolu_ask", &questions)
+        .await
+        .expect("create the question");
+}
+
+/// SME-218: a wake that finds nothing pending isn't counted as a turn,
+/// so no tab is told one started (it would flash "Working…" and clear
+/// the error it shows), and the kept error stays.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_wake_with_nothing_pending_tells_no_tab_a_turn_started(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    let counter = start_mock_upstream(&pool, vec!["unused".to_string()]).await;
+    remember_turn_error(conversation_id, Some("the last turn failed".to_string()));
+    let mut rx = events::subscribe(conversation_id);
+
+    let woke = wake_conversation(&pool, conversation_id).await.expect("nothing to do");
+
+    assert!(woke.is_empty(), "the wake had nothing to do: {woke:?}");
+    assert_eq!(turn_states_heard(&mut rx), Vec::<bool>::new(), "tabs were told a turn started");
+    assert_eq!(last_turn_error(conversation_id).as_deref(), Some("the last turn failed"));
+    assert_eq!(counter.load(Ordering::SeqCst), 0, "the wake called the model");
+}
+
+/// SME-218: a question still waiting for the user is nothing a wake can
+/// act on (its turn would stop at the question), so it isn't counted.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_wake_with_only_an_unanswered_question_tells_no_tab(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    let counter = start_mock_upstream(&pool, vec!["unused".to_string()]).await;
+    waiting_question(&pool, conversation_id).await;
+    let mut rx = events::subscribe(conversation_id);
+
+    let woke = wake_conversation(&pool, conversation_id).await.expect("nothing to do");
+
+    assert!(woke.is_empty(), "the wake had nothing to do: {woke:?}");
+    assert_eq!(turn_states_heard(&mut rx), Vec::<bool>::new(), "tabs were told a turn started");
+    assert_eq!(counter.load(Ordering::SeqCst), 0, "the wake called the model");
+    assert!(
+        db::get_pending_question(&pool, conversation_id).await.expect("read").is_some(),
+        "the question still waits"
+    );
+}
+
+/// SME-218's guard for the answered-question clause: an answer no turn
+/// took (the server restarted between the answer and its turn) is taken
+/// by the next wake, which sends it to the model.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_wake_takes_an_answer_no_turn_took(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    let counter =
+        start_mock_upstream(&pool, vec![super::ask_user::ask_body(), text_reply_body("Deleting.")]).await;
+    run_turn(&pool, conversation_id, hello()).await.expect("asks");
+    let answers = vec![crate::questions::QuestionAnswer { selected: vec!["Yes (Recommended)".to_string()], other: None }];
+    assert!(
+        db::answer_pending_question(&pool, conversation_id, "toolu_ask", &answers).await.expect("answer"),
+        "the answer is recorded, with no turn spawned for it"
+    );
+
+    let woke = wake_conversation(&pool, conversation_id).await.expect("the wake runs");
+
+    assert_eq!(woke.len(), 2, "the answer and the reply: {woke:?}");
+    assert!(
+        matches!(
+            &woke[0].blocks().expect("valid blocks")[0],
+            anthropic::ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "toolu_ask"
+        ),
+        "the answer went first: {:?}",
+        woke[0]
+    );
+    assert_eq!(counter.load(Ordering::SeqCst), 2, "the wake sent the answer to the model");
+    assert_eq!(db::get_pending_question(&pool, conversation_id).await.expect("read"), None);
+}
+
+/// SME-218's guard for `'lost'` in the shared fragment: a command whose
+/// outcome is unknown is told to the model by a wake, as a finished one is.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_a_wake_drains_a_lost_command(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
+    untouched_running_command(&pool, conversation_id, "cmd-lost", 0).await;
+    db::mark_terminal_command_lost(&pool, "cmd-lost").await.expect("mark lost");
+    let counter = start_mock_upstream(&pool, vec![text_reply_body("Noted.")]).await;
+
+    let woke = wake_conversation(&pool, conversation_id).await.expect("the wake runs");
+
+    assert_eq!(woke.len(), 2, "the notice and the reply: {woke:?}");
+    assert!(woke[0].content.contains("cmd-lost's outcome is unknown"), "{:?}", woke[0]);
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "the wake called the model");
 }

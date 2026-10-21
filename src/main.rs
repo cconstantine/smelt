@@ -41,6 +41,8 @@ mod request_guard;
 mod sandbox;
 #[cfg(feature = "server")]
 mod telemetry;
+#[cfg(all(test, feature = "server"))]
+mod test_lock;
 #[cfg(feature = "server")]
 mod turn;
 #[cfg(feature = "server")]

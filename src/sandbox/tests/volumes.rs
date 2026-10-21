@@ -113,7 +113,7 @@ fn test_validate_mount_path_rejects_relative_empty_and_escaping_paths() {
 /// A relative mount path is mounted into every sandbox pod, and a
 /// container can't start with one — so it must be refused before it's
 /// saved (and before the cluster is touched: MANAGER is unset here).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_volume_refuses_a_relative_mount_path_before_saving_it(pool: PgPool) {
     let result = create_volume(&pool, "cache", "relative/path").await;
     assert!(

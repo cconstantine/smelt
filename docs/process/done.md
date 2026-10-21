@@ -5,7 +5,7 @@ Part of the [development process](../development-process.md).
 A feature is not finished until **both build targets compile**. Server and web code are gated by different feature flags, so a change that builds for one can silently break the other — a missing `#[cfg(...)]`, a server-only dependency pulled into WASM, or dead code that only one target sees. Run both before considering the work complete or asking for review:
 
 ```bash
-cargo test  --features server                                                     # server logic + tests
+scripts/cluster-test --features server                                            # server logic + tests, under the cluster lock
 cargo check --no-default-features --features web --target wasm32-unknown-unknown   # WASM frontend
 ```
 

@@ -14,7 +14,7 @@ fn test_an_oauth_server_refuses_an_authorization_header_and_takes_others() {
 /// SME-113, the bug as reported: a cached connection kept the token it
 /// was opened with, so once that token expired the status still said
 /// Connected and every tool call failed with a 401.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_tool_call_after_the_token_expires_uses_a_refreshed_token(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;
@@ -39,7 +39,7 @@ async fn test_a_tool_call_after_the_token_expires_uses_a_refreshed_token(pool: s
 /// response, and serde_json (without `float_roundtrip`) doesn't parse and
 /// re-serialise every 17-digit float to the same number, so comparing
 /// against a re-serialised `Value` refused every refresh of such a grant.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_grant_holding_a_float_serde_json_does_not_round_trip_still_refreshes(
     pool: sqlx::PgPool,
 ) {
@@ -67,7 +67,7 @@ async fn test_a_grant_holding_a_float_serde_json_does_not_round_trip_still_refre
 /// SME-113: a token the provider stopped accepting before its expiry
 /// (revoked, or a clock out by more than the refresh margin) is
 /// refreshed once and the request retried.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_rejected_token_that_has_not_expired_is_refreshed_and_retried(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;
@@ -86,7 +86,7 @@ async fn test_a_rejected_token_that_has_not_expired_is_refreshed_and_retried(poo
 /// SME-113: a refreshed grant is saved, so after a restart (nothing in
 /// memory) the next connect uses it rather than refreshing again with
 /// a refresh token the provider has already retired.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refreshed_grant_survives_a_restart_without_another_refresh(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;
@@ -109,7 +109,7 @@ async fn test_a_refreshed_grant_survives_a_restart_without_another_refresh(pool:
 /// a manager rebuilt from the stored grant knew only the client id, so
 /// GitHub refused every refresh and the server stayed Unreachable
 /// until a Reconnect.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_preregistered_client_refreshes_with_its_client_secret(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     *mock.required_secret.lock().unwrap() =
@@ -130,7 +130,7 @@ async fn test_a_preregistered_client_refreshes_with_its_client_secret(pool: sqlx
 /// refresh-and-retry) drops the connection, so the next caller connects
 /// again instead of every call failing on the same dead connection. A
 /// JSON-RPC error from the tool itself keeps it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_tool_call_that_fails_at_the_transport_drops_the_connection(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;
@@ -195,7 +195,7 @@ async fn stored_client_id(pool: &sqlx::PgPool, server_id: i64) -> Option<String>
 /// SME-113: a refresh that finishes after a Disconnect doesn't write
 /// the grant back (the server would quietly reconnect itself), and the
 /// call it was for fails rather than going on with it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refresh_finishing_after_a_disconnect_does_not_restore_the_grant(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;
@@ -217,7 +217,7 @@ async fn test_a_refresh_finishing_after_a_disconnect_does_not_restore_the_grant(
 
 /// SME-113: nor does it overwrite a new grant a Connect saved meanwhile
 /// (dynamic registration gives each Connect a new client id).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refresh_finishing_after_a_new_grant_keeps_the_new_grant(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;
@@ -238,7 +238,7 @@ async fn test_a_refresh_finishing_after_a_new_grant_keeps_the_new_grant(pool: sq
 /// SME-177 B24: a Reconnect with a pre-registered client keeps the client
 /// id, so the client-id check alone let a refresh of the old grant,
 /// finishing after the Reconnect, overwrite the new grant.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refresh_finishing_after_a_same_client_reconnect_keeps_the_new_grant(
     pool: sqlx::PgPool,
 ) {
@@ -270,7 +270,7 @@ async fn test_a_refresh_finishing_after_a_same_client_reconnect_keeps_the_new_gr
 /// SME-113: a grant the provider won't refresh any more shows as such,
 /// not as Connected from the cached connection, and the connection is
 /// dropped.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_sign_in_that_cannot_be_refreshed_is_reported_as_expired(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;
@@ -294,7 +294,7 @@ async fn test_a_sign_in_that_cannot_be_refreshed_is_reported_as_expired(pool: sq
 /// manager per server. With a manager each, both refreshed with the
 /// same refresh token, and the provider (rotating it, as GitHub does)
 /// refused the second, reporting a live sign-in as expired.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_status_check_and_a_tool_call_share_one_refresh(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;
@@ -331,7 +331,7 @@ async fn test_the_status_check_and_a_tool_call_share_one_refresh(pool: sqlx::PgP
 /// after the callback's evict), so the new grant's refreshes name its
 /// own client. Review 1: this test used to evict first, which left
 /// nothing cached to reuse.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_new_grant_refreshes_with_its_own_client(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;
@@ -357,7 +357,7 @@ async fn test_a_new_grant_refreshes_with_its_own_client(pool: sqlx::PgPool) {
 /// provider refuses, shows as an expired sign-in on a fresh connect
 /// (the server's 401 after `AuthClient`'s one refresh), not as an
 /// unreachable server.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_revoked_sign_in_that_cannot_be_refreshed_is_reported_as_expired(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;
@@ -380,7 +380,7 @@ async fn test_a_revoked_sign_in_that_cannot_be_refreshed_is_reported_as_expired(
 /// and `error=bad_refresh_token`, not a 400 `invalid_grant`, so rmcp
 /// took it for a failed request and the server read Unreachable, with
 /// Connect, instead of Sign-in expired.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_refresh_github_refuses_is_reported_as_expired(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;
@@ -398,7 +398,7 @@ async fn test_a_refresh_github_refuses_is_reported_as_expired(pool: sqlx::PgPool
 /// SME-113 review 2: a status check that gives up while its refresh is
 /// at the provider mustn't drop the reply. GitHub has rotated the
 /// refresh token by then, so an unsaved reply loses the sign-in.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_status_check_that_times_out_mid_refresh_keeps_the_new_grant(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;
@@ -424,7 +424,7 @@ async fn test_a_status_check_that_times_out_mid_refresh_keeps_the_new_grant(pool
 /// status check's new one can refresh with the same refresh token. The
 /// provider refuses whichever comes second, but the other just saved a
 /// good grant, so the check mustn't call the sign-in expired.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_check_that_loses_a_refresh_race_is_not_reported_as_expired(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;
@@ -457,7 +457,7 @@ async fn test_a_check_that_loses_a_refresh_race_is_not_reported_as_expired(pool:
 /// old refresh token) gets rmcp's `InternalError`, not
 /// `AuthorizationRequired`. The grant changed meanwhile, so the check tries
 /// once more with it instead of reading Unreachable.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_check_whose_refresh_loses_to_a_reconnect_tries_the_new_grant(pool: sqlx::PgPool) {
     let mock = oauth_http::spawn().await;
     let server = oauth_http::create_server(&pool, &mock, None).await;

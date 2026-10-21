@@ -527,6 +527,11 @@ async fn check(pods: &Api<Pod>, loader: &str, wanted: &[String]) -> Result<(), B
 }
 
 #[cfg(test)]
+#[path = "../test_lock.rs"]
+#[allow(dead_code, reason = "shared with the smelt binary's tests; this one uses only require()")]
+mod test_lock;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -546,6 +551,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_loader_that_ends_mid_stream_says_so() -> Result<(), BoxError> {
         const NAME: &str = "sandbox-image-import-test";
+        crate::test_lock::require();
         rustls::crypto::ring::default_provider().install_default().ok();
         let pods: Api<Pod> = Api::namespaced(kube::Client::try_default().await?, NAMESPACE);
         let (mut writer, reader) = tokio::io::duplex(64 * 1024);

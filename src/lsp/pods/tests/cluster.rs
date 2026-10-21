@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub(crate) async fn client() -> kube::Client {
+    crate::test_lock::require(); // only under the cluster lock (SME-212)
     let _ = rustls::crypto::ring::default_provider().install_default();
     kube::Client::try_default().await.expect("KUBECONFIG must point at a reachable cluster")
 }

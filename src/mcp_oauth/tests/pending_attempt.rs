@@ -25,7 +25,7 @@ async fn assert_sign_in_completes(pool: &PgPool, server_id: i64, state: &str, ca
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_forged_code_callback_leaves_the_sign_in_pending(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
     let config = create_oauth_server(&pool, &base_url).await;
@@ -39,7 +39,7 @@ async fn test_a_forged_code_callback_leaves_the_sign_in_pending(pool: PgPool) {
 
 /// Passes on the unfixed code too, since a missing `state` returns before
 /// `PENDING` is touched; a guard against moving the take before that check.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_code_callback_without_state_leaves_the_sign_in_pending(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
     let config = create_oauth_server(&pool, &base_url).await;
@@ -52,7 +52,7 @@ async fn test_a_code_callback_without_state_leaves_the_sign_in_pending(pool: PgP
 
 /// Attempt A completes; a second Connect starts S′; A's callback, sent
 /// again, must not end S′.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_replayed_callback_leaves_the_next_sign_in_pending(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
     let config = create_oauth_server(&pool, &base_url).await;
@@ -69,7 +69,7 @@ async fn test_a_replayed_callback_leaves_the_next_sign_in_pending(pool: PgPool) 
 
 /// S is replaced by a second Connect's S′ before its callback arrives;
 /// S's callback must not end S′.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_callback_for_a_replaced_attempt_leaves_the_new_one_pending(pool: PgPool) {
     let base_url = spawn_mock_oauth_server(MockMetadata::None).await;
     let config = create_oauth_server(&pool, &base_url).await;

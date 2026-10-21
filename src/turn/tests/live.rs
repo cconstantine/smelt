@@ -2,7 +2,7 @@ use super::*;
 
 /// Every tab can show a reply as it streams, one bubble per model
 /// call: a reset when each call starts, then its text.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_streams_its_reply_to_every_tab(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_007)
@@ -29,7 +29,7 @@ async fn test_a_turn_streams_its_reply_to_every_tab(pool: PgPool) {
 }
 
 /// A tab that connects mid-reply can show the text so far.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_reply_so_far_is_available_mid_turn(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_008)
@@ -59,7 +59,7 @@ async fn test_the_reply_so_far_is_available_mid_turn(pool: PgPool) {
 }
 
 /// Sending returns at once; the turn carries on and every tab hears it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_start_turn_returns_before_the_turn_finishes(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_010)
@@ -91,7 +91,7 @@ async fn test_start_turn_returns_before_the_turn_finishes(pool: PgPool) {
     stop_turn_now(conversation.id);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_start_turn_refuses_a_missing_conversation(pool: PgPool) {
     let error = start_turn(pool, 9_100_000_011, "hi".to_string())
         .await
@@ -101,7 +101,7 @@ async fn test_start_turn_refuses_a_missing_conversation(pool: PgPool) {
 }
 
 /// A sent turn that fails, or is stopped, tells every tab why.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_sent_turn_publishes_its_failure(pool: PgPool) {
     let _guard = lock_turn_tests();
     let failing = db::create_conversation_with_id(&pool, 9_100_000_012)
@@ -128,7 +128,7 @@ async fn test_a_sent_turn_publishes_its_failure(pool: PgPool) {
 /// reloaded (or connected) afterwards showed a message with no reply
 /// and no reason. The last error is kept for the reconnect pull, and
 /// the user's next message clears it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_error_is_still_there_after_a_reload(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_014)
@@ -153,7 +153,7 @@ async fn test_a_turn_error_is_still_there_after_a_reload(pool: PgPool) {
 /// SME-51 code review 1: a turn the user didn't send (a finished
 /// task's, say) that goes fine replaces an earlier failure; a reload
 /// mustn't show that error under the newer reply.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_any_new_turn_clears_the_kept_error(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_015)
@@ -184,7 +184,7 @@ async fn next_turn_error(
 
 /// Stopping a turn a finished command started isn't a failed
 /// notification.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_stopping_a_woken_turn_is_not_reported_as_a_failure(pool: PgPool) {
     let _guard = lock_turn_tests();
     // Not `test_a_turn_error_is_still_there_after_a_reload`'s id: that
@@ -230,7 +230,7 @@ async fn test_stopping_a_woken_turn_is_not_reported_as_a_failure(pool: PgPool) {
 
 /// Every tab sees each message as it's saved: the user's own first,
 /// then each step of a multi-step reply, not one batch at the end.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_publishes_each_message_as_it_is_saved(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_006)

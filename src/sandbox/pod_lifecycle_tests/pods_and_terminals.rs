@@ -6,7 +6,7 @@ use super::*;
 /// refused and one pod is listed, Running. `terminate_pod` is refused
 /// while a terminal is open, works once it's closed, and finds no pod the
 /// second time, as for a conversation that never had one.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_pod_sets_up_one_live_pod_per_conversation(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -93,7 +93,7 @@ async fn test_create_pod_sets_up_one_live_pod_per_conversation(pool: PgPool) {
 /// command in one doesn't hold up the other, and one can't be closed while
 /// a command runs in it. Closing one leaves the other, and closing it again
 /// is fine. Command history is per terminal, and outlives it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_terminals_in_one_pod_run_independently_and_are_guarded(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -182,7 +182,7 @@ async fn test_terminals_in_one_pod_run_independently_and_are_guarded(pool: PgPoo
 /// interface its default route uses — whatever the cluster's overlay
 /// happens to have made it, which is exactly what `start-dockerd.sh` is
 /// meant to have taken, and is checked against dockerd's own arguments.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_docker_containers_get_the_pods_uplink_mtu(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     // Longer than `SCENARIO_LIMIT`: importing a base image from the

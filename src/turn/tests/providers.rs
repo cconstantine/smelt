@@ -19,7 +19,7 @@ fn test_is_ollama_thinking_tool_call_corruption_does_not_match_unrelated_errors(
 /// A bearer provider's turn authenticates with its token as a bearer
 /// header, and no `x-api-key` (an Anthropic-compatible gateway such as
 /// Hugging Face's wants exactly that).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_bearer_providers_turn_sends_its_token_as_a_bearer_header(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -78,7 +78,7 @@ async fn test_a_bearer_providers_turn_sends_its_token_as_a_bearer_header(pool: P
 /// SME-162, the whole chain (the provider's column, its endpoint, the
 /// model call): two conversations on a provider allowed one request at
 /// a time take turns at the server, and both turns finish.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_two_conversations_on_a_one_request_provider_take_turns(pool: PgPool) {
     let _guard = lock_turn_tests();
     let first = db::create_conversation(&pool).await.expect("create conversation");

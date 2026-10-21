@@ -1,6 +1,6 @@
 use super::*;
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_ensure_default_servers_adds_exa_search(pool: sqlx::PgPool) {
     ensure_default_servers(&pool).await;
     let exa = crate::db::get_mcp_server_config_by_name(&pool, "exa")
@@ -18,7 +18,7 @@ async fn test_ensure_default_servers_adds_exa_search(pool: sqlx::PgPool) {
 /// test in its browser job:
 /// `SMELT_LIVE_EXA=1 scripts/cluster-test --features server -- --ignored --exact mcp::tests::client::test_live_exa_search_through_smelt_mcp_client`
 /// (a connect reads its server's row, so it needs the test database).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 #[ignore]
 async fn test_live_exa_search_through_smelt_mcp_client(pool: sqlx::PgPool) {
     if std::env::var("SMELT_LIVE_EXA").as_deref() != Ok("1") {
