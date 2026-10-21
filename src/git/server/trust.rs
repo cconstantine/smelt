@@ -149,7 +149,7 @@ async fn drop_cards_for_remote(
 /// `settle`'s lock order: a load or a decision on the same remote comes
 /// wholly before or after it, so no card can be committed after the
 /// list and missed. Any error rolls it all back: no trust, every card
-/// still there.
+/// still there; so does a conversation deleted while it waited.
 pub(super) async fn trust_named_remote(
     pool: &PgPool,
     conversation_id: i64,
@@ -159,7 +159,12 @@ pub(super) async fn trust_named_remote(
     let e = |e: sqlx::Error| e.to_string();
     let mut tx = pool.begin().await.map_err(e)?;
     db::lock_remote_trust(&mut *tx, remote_key).await.map_err(e)?;
-    db::share_lock_conversations_for(&mut *tx, conversation_id, remote_key).await.map_err(e)?;
+    // A conversation deleted while this waited trusts nothing and drops
+    // no card: the remote's waiting models keep their cards to answer
+    // (SME-224 review 1).
+    if !db::share_lock_conversations_for(&mut *tx, conversation_id, remote_key).await.map_err(e)? {
+        return Err("The conversation was deleted.".to_string());
+    }
     db::set_repo_trust(&mut *tx, remote_key, true).await.map_err(e)?;
     let dropped = drop_cards_for_remote(&mut tx, remote_key).await?;
     tx.commit().await.map_err(e)?;

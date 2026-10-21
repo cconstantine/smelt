@@ -409,6 +409,37 @@ async fn test_a_card_asked_for_while_work_on_a_repo_waits_is_dropped_by_it(pool:
     assert!(attach_waited, "the attach waited for the load rather than running first");
 }
 
+/// SME-224 review 1, finding 1. Interleaving: B's load is held at its
+/// card's insert, holding the remote's trust lock, while A's "Work on a
+/// repo" waits for it; A is deleted meanwhile. The attach of a deleted
+/// conversation trusts nothing and drops no card: B's card stays to be
+/// answered.
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+async fn test_work_on_a_repo_from_a_conversation_deleted_while_it_waits_trusts_nothing(pool: PgPool) {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let a = db::create_conversation(&pool).await.expect("conversation A");
+    let b = db::create_conversation(&pool).await.expect("conversation B");
+    let repo_b = cloned_repo(&pool, b.id).await;
+
+    let holding = hold_row(&pool, "instruction_requests", b.id, repo_b.id).await;
+    let load = tokio::spawn({
+        let (pool, repo_b) = (pool.clone(), repo_b.clone());
+        async move { request_or_load(&pool, b.id, &repo_b, "AGENTS.md", &file("b")).await }
+    });
+    assert!(waiters_or_finished(&pool, 1, &load).await, "the load never reached its card");
+    let attach = spawn_attach(&pool, a.id);
+    let attach_waited = waiters_or_finished(&pool, 2, &attach).await;
+    db::delete_conversation(&pool, a.id).await.expect("delete A");
+    holding.rollback().await.expect("release the card");
+
+    assert_eq!(join(load, "the load").await.expect("the load"), LoadOutcome::AwaitingTrust);
+    let attached = join(attach, "the attach").await;
+    assert!(attach_waited, "the attach waited for the load rather than running first");
+    assert!(attached.is_err(), "a deleted conversation's attach fails: {attached:?}");
+    assert_eq!(db::get_repo_trust(&pool, "github.com/o/r").await.expect("trust"), None, "nothing is trusted");
+    assert_eq!(only_repo(&pool, b.id).await.trust_requests.len(), 1, "B's card stays");
+}
+
 /// SME-224. Interleaving: deleting conversation B (a card about the
 /// remote) is held at its cascade into B's card while A starts "Work on
 /// a repo" on the same remote. A conversation deleted meanwhile is
