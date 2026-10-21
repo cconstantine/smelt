@@ -2,7 +2,7 @@ use super::*;
 
 /// Stopping ends an in-flight turn at once, frees the turn lock, and
 /// keeps the user's message.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_stop_turn_ends_a_turn_in_flight(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000001)
@@ -48,7 +48,7 @@ async fn test_stop_turn_ends_a_turn_in_flight(pool: PgPool) {
 /// SME-91: a Stop landing just after the turn saved its own message
 /// (the INSERT committed, the turn not yet told) doesn't save the
 /// message a second time.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_just_after_the_message_is_saved_keeps_it_once(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000091)
@@ -82,7 +82,7 @@ async fn test_a_stop_just_after_the_message_is_saved_keeps_it_once(pool: PgPool)
 
 /// SME-91: a stopped reply doesn't stay on screen while another turn
 /// is still in flight: the stop clears it and tells every tab.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_clears_the_reply_even_with_another_turn_in_flight(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000092)
@@ -123,7 +123,7 @@ async fn test_a_stop_clears_the_reply_even_with_another_turn_in_flight(pool: PgP
 
 /// SME-91: a tab still reconnecting to a deleted conversation (or any
 /// that doesn't exist) is refused, and makes no channel for it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_subscribing_to_a_missing_conversation_is_refused(pool: PgPool) {
     let missing = 9_100_000_099;
     assert!(open_conversation_events(&pool, missing).await.is_err());
@@ -150,7 +150,7 @@ fn test_an_idle_release_keeps_a_starting_turns_generation() {
 
 /// SME-91: a conversation's turn lock and stop counter go once its
 /// turns are done, but not while someone still holds the lock.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_conversations_turn_state_is_freed_after_its_turns(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000191)
@@ -170,7 +170,7 @@ async fn test_a_conversations_turn_state_is_freed_after_its_turns(pool: PgPool) 
 
 /// Every tab can tell a turn is running, including one a background
 /// notice started, and when it ends.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_turn_state_is_published_while_a_turn_runs(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000002)
@@ -204,7 +204,7 @@ fn test_stop_turn_with_nothing_running_does_nothing() {
 
 /// After a stop, a finished command doesn't wake the model; the user's
 /// next message does, and its turn includes the command's notice.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stopped_conversation_waits_for_the_user_before_waking(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000003)
@@ -239,7 +239,7 @@ async fn test_a_stopped_conversation_waits_for_the_user_before_waking(pool: PgPo
 /// A notice delivered while nothing runs gets an answer from the model;
 /// after the user stopped the conversation, it's only saved (SME-32
 /// code review 6: the old save-then-wake never ran a turn).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_delivered_notice_is_answered_unless_stopped(pool: PgPool) {
     let _guard = lock_turn_tests();
     let requests = start_recording_mock_upstream(&pool, vec![text_reply_body("Noted.")]).await;
@@ -261,7 +261,7 @@ async fn test_a_delivered_notice_is_answered_unless_stopped(pool: PgPool) {
     assert!(saved.iter().any(|m| m.content.contains("The user trusts it.")), "saved for later");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_notice_queued_behind_a_stopped_turn_is_still_saved(pool: PgPool) {
     // SME-40 F4: a notice arriving during a turn (a command finishing,
     // say) queues as a turn of its own, behind the running one. Stop
@@ -307,7 +307,7 @@ async fn test_a_notice_queued_behind_a_stopped_turn_is_still_saved(pool: PgPool)
 
 /// SME-91: one Stop is noted once, however many turns it ended, even
 /// when the queued turns' own messages land after the first note.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_one_stop_is_noted_once(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000093)
@@ -350,7 +350,7 @@ async fn test_one_stop_is_noted_once(pool: PgPool) {
 /// SME-91 (SME-51 code review 2): a turn that fails after the user
 /// already sent the next message doesn't leave its error behind once
 /// that next turn succeeds.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_older_turns_failure_isnt_kept_after_a_newer_turn(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9100000094)
@@ -420,7 +420,7 @@ async fn test_an_older_turns_failure_isnt_kept_after_a_newer_turn(pool: PgPool) 
 /// `notify` returns at once, even with a turn holding the lock (a caller
 /// inside a turn can't wait for it), and its notices land in order once
 /// the turn ends (SME-52).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_notify_returns_at_once_and_saves_in_order(pool: PgPool) {
     let conversation = db::create_conversation_with_id(&pool, 9100000052)
         .await
@@ -455,7 +455,7 @@ async fn test_notify_returns_at_once_and_saves_in_order(pool: PgPool) {
     assert_eq!(texts, vec!["first".to_string(), "second".to_string()]);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_save_notice_between_turns_waits_for_the_turn_lock(pool: PgPool) {
     let conversation = db::create_conversation_with_id(&pool, 9100000004)
         .await

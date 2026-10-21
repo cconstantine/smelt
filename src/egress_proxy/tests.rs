@@ -400,7 +400,7 @@ async fn test_a_sandbox_port_with_nothing_listening_says_so() {
     assert!(body.contains("Nothing is listening on localhost:3000"), "got {body:?}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_sandbox_dial_without_a_pod_says_how_to_get_one(pool: PgPool) {
     let conversation = crate::db::create_conversation(&pool).await.expect("create conversation");
     let dial = sandbox_dial(pool, conversation.id);
@@ -427,7 +427,7 @@ async fn test_a_dial_that_never_opens_times_out_with_a_reason() {
     assert!(error.message.contains("localhost:3000") && error.message.contains("Timed out"), "got {error:?}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_sandbox_dial_refuses_the_sandbox_agents_port(pool: PgPool) {
     let conversation = crate::db::create_conversation(&pool).await.expect("create conversation");
     let dial = sandbox_dial(pool, conversation.id);

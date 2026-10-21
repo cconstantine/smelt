@@ -143,7 +143,7 @@ mod tests {
     /// It shows in the conversation instead; with a clone, the repo's own
     /// row says it (the panel), so it isn't shown twice. SME-219: one
     /// deleted while its sandbox was starting is left with no turn state.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_a_failed_attach_with_nothing_to_clone_shows_in_the_conversation(pool: sqlx::PgPool) {
         let _guard = crate::providers::test_support::lock_turn_tests();
         db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");

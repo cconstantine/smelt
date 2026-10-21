@@ -59,7 +59,7 @@ fn test_resolve_pod_id_errors_with_no_pod_when_none_live() {
 /// the process-global `MANAGER` (unset here, since this test doesn't
 /// need a real cluster), so a refusal shows up as `PodAlreadyExists`,
 /// not a panic from `get()`.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_pod_refuses_before_touching_the_manager_when_a_live_pod_exists(
     pool: PgPool,
 ) {
@@ -79,7 +79,7 @@ async fn test_create_pod_refuses_before_touching_the_manager_when_a_live_pod_exi
 
 /// DB-only: with no live pod there's nothing to connect to, and the
 /// manager is never touched.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_open_pod_port_without_a_live_pod_is_no_pod(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let result = open_pod_target(&pool, conversation.id, PodHost::Localhost, 3000).await;
@@ -88,7 +88,7 @@ async fn test_open_pod_port_without_a_live_pod_is_no_pod(pool: PgPool) {
 
 /// DB-only: the sandbox agent's port is refused before anything is
 /// looked up, so no route can reach it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_open_pod_port_refuses_the_sandbox_agents_own_port(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
     let result = open_pod_target(&pool, conversation.id, PodHost::Localhost, AGENT_PORT).await;
@@ -117,7 +117,7 @@ async fn http_get_over(stream: &mut Box<dyn PodIo>, path: &str) -> String {
 /// servers are by default — but never the sandbox agent's own port. A
 /// conversation with no pod of its own can't borrow another's, and a
 /// port nothing listens on ends at once with no bytes.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_open_pod_port_reaches_the_conversations_own_pod(pool: PgPool) {
     // Pod names are `sandbox-{pod_id}`, and every `#[sqlx::test]`
     // database restarts ids at 1 — start this one's ids far from the
@@ -247,7 +247,7 @@ async fn test_open_pod_port_reaches_the_conversations_own_pod(pool: PgPool) {
 
 /// DB-only — no MANAGER touch, since `conversation_pod_id` never calls
 /// `get()`.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_conversation_pod_id_resolves_the_live_pod_and_errors_with_no_pod_otherwise(
     pool: PgPool,
 ) {

@@ -509,7 +509,7 @@ mod tests {
         format!("http://{addr}/api.json")
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_a_refresh_keeps_the_catalog_in_memory_and_saved(pool: sqlx::PgPool) {
         let url = catalog_server(vec![(200, CATALOG.to_string())]).await;
         let store = CatalogStore::new();
@@ -524,7 +524,7 @@ mod tests {
         assert_eq!(restarted.current().as_deref(), Some(fetched.as_ref()), "a restart has the saved copy");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_a_failed_refresh_keeps_the_last_good_catalog(pool: sqlx::PgPool) {
         let url = catalog_server(vec![
             (200, CATALOG.to_string()),
@@ -549,7 +549,7 @@ mod tests {
 
     /// SME-137: each refresh is a `pricing_refresh` span, failed (with the
     /// reason) when the refresh fails.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_a_failed_refresh_is_a_failed_span(pool: sqlx::PgPool) {
         let url = catalog_server(vec![(500, "oops".to_string())]).await;
         let store = CatalogStore::new();
@@ -559,7 +559,7 @@ mod tests {
         assert!(matches!(span.status, opentelemetry::trace::Status::Error { .. }), "{:?}", span.status);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_loading_the_saved_copy_doesnt_replace_a_fresher_fetch(pool: sqlx::PgPool) {
         let url = catalog_server(vec![(200, CATALOG.to_string())]).await;
         let old = CatalogStore::new();

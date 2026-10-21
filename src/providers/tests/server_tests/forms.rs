@@ -1,6 +1,6 @@
 use super::*;
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_provider_form_is_checked_and_the_secret_never_comes_back(pool: PgPool) {
     let mut app_events = crate::events::subscribe_app();
     assert_eq!(
@@ -68,7 +68,7 @@ async fn test_a_provider_form_is_checked_and_the_secret_never_comes_back(pool: P
 /// SME-162: the form's max concurrent requests is saved and shown: a
 /// count, `0` for the server's own count, or blank for no limit; one the
 /// column can't hold is refused, naming the field.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_providers_max_concurrent_requests_is_saved_and_shown(pool: PgPool) {
     // Saving sets the provider's slots, which are process-wide by id
     // (SME-162 review 2): an id no other test uses.
@@ -102,7 +102,7 @@ async fn test_a_providers_max_concurrent_requests_is_saved_and_shown(pool: PgPoo
 
 /// Effort is kept per model and sent only on an Anthropic provider:
 /// another server may refuse the field (SME-106).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_models_effort_is_kept_and_sent_only_to_anthropic(pool: PgPool) {
     use crate::anthropic::Effort;
     let anthropic = db::create_inference_provider(&pool, "a", "anthropic", "http://127.0.0.1:1", "api_key", "k", false, None, true, None)

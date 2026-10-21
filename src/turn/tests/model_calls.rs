@@ -2,7 +2,7 @@ use super::*;
 
 /// Every completed model call is recorded with its own usage: the
 /// compaction's summary call, then each call of the turn's tool loop.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_each_model_call_of_a_turn_is_recorded_with_its_usage(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -91,7 +91,7 @@ async fn test_each_model_call_of_a_turn_is_recorded_with_its_usage(pool: PgPool)
 
 /// Each call is priced from the catalog when it's recorded, as the
 /// provider's catalog entry; a provider without one records no cost.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_each_recorded_call_is_priced_from_the_catalog(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -137,7 +137,7 @@ async fn test_each_recorded_call_is_priced_from_the_catalog(pool: PgPool) {
 
 /// A model's effort goes out as `output_config.effort` on its turns, and
 /// nothing goes out while it's unset.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_models_effort_is_sent_on_its_turns(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -162,7 +162,7 @@ async fn test_a_models_effort_is_sent_on_its_turns(pool: PgPool) {
 /// SME-111: a llama.cpp provider's turn tells the chat template its
 /// settings in `chat_template_kwargs`, never as `output_config`, and its
 /// compaction turns the template's reasoning off.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_llama_cpp_turn_sends_template_settings_and_compaction_turns_thinking_off(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -221,7 +221,7 @@ async fn test_a_llama_cpp_turn_sends_template_settings_and_compaction_turns_thin
 /// SME-111: a turn asks for a reply as long as the conversation has room
 /// for: half a llama.cpp model's window at the start, and after a
 /// compaction the new, smaller history's room, not the old one's.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turns_reply_budget_grows_with_the_room_left(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -271,7 +271,7 @@ async fn test_a_turns_reply_budget_grows_with_the_room_left(pool: PgPool) {
 }
 
 /// SME-111: the user's "Max reply tokens" caps a turn's reply budget.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_models_max_reply_tokens_caps_its_turns(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -295,7 +295,7 @@ async fn test_a_models_max_reply_tokens_caps_its_turns(pool: PgPool) {
 /// SME-111: a llama.cpp model's turn caps its thinking at three quarters
 /// of the reply budget, or the model's reasoning budget; an Anthropic
 /// one's thinking stays adaptive.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_llama_cpp_turn_sends_a_thinking_budget(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)

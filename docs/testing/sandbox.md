@@ -14,6 +14,13 @@ cleanup (explicit `manager.delete(sandbox)`, or in the one test that
 covers the Drop path deliberately, a bounded `tokio::time::timeout` poll
 waiting for the background drain task to do it instead).
 
+A real-cluster test gets its client from `sandbox::tests::test_client()` or
+`lsp::pods::tests::cluster::client()` (or `with_sandbox`, which uses it):
+both call `crate::test_lock::require()` first, so the test refuses to run
+outside the cluster lock (SME-212). One that builds its own `kube::Client`
+calls `require()` itself before it, as the two helper binaries' cluster
+tests do; nothing checks that it does.
+
 Requires `KUBECONFIG` set and pointing at a reachable cluster with the
 `smelt-park`/`smelt-park-test` namespaces' RBAC applied (see
 [SME-7](https://linear.app/smelt-agent/issue/SME-7)) —

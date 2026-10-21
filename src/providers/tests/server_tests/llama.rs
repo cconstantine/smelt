@@ -68,7 +68,7 @@ fn test_a_model_without_adaptive_thinking_is_sent_a_budget() {
 
 /// B9 (SME-122): what the listing says about adaptive thinking is
 /// kept with the model, and a turn on it is sent a budget.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_on_a_model_without_adaptive_thinking_knows_it(pool: PgPool) {
     let conversation = db::create_conversation_with_id(&pool, 9_172_000_009).await.expect("conversation");
     let anthropic = provider(&pool, "anthropic", "api_key").await;
@@ -198,7 +198,7 @@ async fn mock_llama_cpp(props_up: std::sync::Arc<std::sync::atomic::AtomicBool>)
 
 /// SME-111: a llama.cpp provider's page reads `/props` with its
 /// models, keeps it, and a turn sends what its template supports.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_llama_cpp_providers_props_are_kept_and_used_by_its_turns(pool: PgPool) {
     use crate::anthropic::Effort;
     let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -235,7 +235,7 @@ async fn test_a_llama_cpp_providers_props_are_kept_and_used_by_its_turns(pool: P
 /// SME-162 review 1: an automatic provider's page reading `/props`
 /// sets its pool from the count at once, so a turn already running
 /// takes it from its next model call.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_reading_props_sets_an_automatic_providers_pool_at_once(pool: PgPool) {
     let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let base = mock_llama_cpp(up).await;
@@ -299,7 +299,7 @@ async fn gated_llama_cpp() -> (String, std::sync::Arc<std::sync::atomic::AtomicB
 /// comes from the row the read wrote, not the row the listing started
 /// with. And a read for an address the provider no longer has keeps
 /// nothing.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_props_read_doesnt_undo_a_save_made_meanwhile(pool: PgPool) {
     let (base, arrived, release) = gated_llama_cpp().await;
     sqlx::query("ALTER TABLE inference_providers ALTER COLUMN id RESTART WITH 9162000302")
@@ -366,7 +366,7 @@ async fn test_a_props_read_doesnt_undo_a_save_made_meanwhile(pool: PgPool) {
 /// SME-111 review 2: the picker's quick listing (no `/props`)
 /// doesn't replace the slot window and tool support `/props` gave
 /// with `/v1/models`' whole-server `meta.n_ctx` and no tool flag.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_quick_llama_cpp_listing_keeps_what_props_said(pool: PgPool) {
     let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let base = mock_llama_cpp(up).await;
@@ -391,7 +391,7 @@ async fn test_a_quick_llama_cpp_listing_keeps_what_props_said(pool: PgPool) {
     assert_eq!((stored.reported_context_window, stored.reported_tools), (Some(65_536), Some(false)));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_model_settings_are_checked(pool: PgPool) {
     let p = provider(&pool, "p", "api_key").await;
     assert!(set_model_settings(&pool, p.id, " ", settings(None, None, None)).await.is_err());

@@ -49,7 +49,7 @@ fn test_thinking_prefers_the_override_then_the_report_then_on() {
     assert!(!thinking(Some(&row(Some(false), None, None, None))));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_the_picker_states_from_no_providers_to_chosen(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     assert_eq!(
@@ -97,7 +97,7 @@ async fn test_the_picker_states_from_no_providers_to_chosen(pool: PgPool) {
     assert_eq!(conversation_context_window(&pool, conversation.id).await, ASSUMED_CONTEXT_WINDOW);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_takes_the_default_and_keeps_it(pool: PgPool) {
     // Its own id: event buses are process-wide, keyed by id.
     let conversation = db::create_conversation_with_id(&pool, 9_172_000_001).await.expect("conversation");
@@ -143,7 +143,7 @@ async fn test_a_turn_takes_the_default_and_keeps_it(pool: PgPool) {
     assert_eq!(resolve_turn_model(&pool, conversation.id).await.expect("resolves").model, "m1");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_with_no_model_and_no_default_says_so(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     provider(&pool, "p", "api_key").await;
@@ -157,7 +157,7 @@ async fn test_a_turn_with_no_model_and_no_default_says_so(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_switched_conversations_turn_strips_thinking_up_to_the_switch(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let p = provider(&pool, "p", "api_key").await;
@@ -175,7 +175,7 @@ async fn test_a_switched_conversations_turn_strips_thinking_up_to_the_switch(poo
 
 /// SME-72 review: a provider moved to another address is another
 /// backend, whose signatures don't match.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_provider_moved_to_another_address_strips_old_thinking(pool: PgPool) {
     let conversation = db::create_conversation(&pool).await.expect("conversation");
     let p = provider(&pool, "p", "api_key").await;
@@ -191,7 +191,7 @@ async fn test_a_provider_moved_to_another_address_strips_old_thinking(pool: PgPo
 
 /// SME-72 review: the stored key only ever goes to the address it
 /// was entered for.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_moving_a_provider_needs_its_key_again(pool: PgPool) {
     let created = create_provider(&pool, input("p", "http://one:11434", "secret-1234567890"))
         .await

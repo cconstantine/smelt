@@ -86,7 +86,7 @@ fn test_a_turn_ending_doesnt_wipe_the_next_turns_reply() {
 /// so only the stop can wake it. It must end stopped, through the
 /// stopped-while-queued path, its message saved once; today the stop
 /// only paused, and the turn went on to the model.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_just_after_a_turn_is_counted_ends_it(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -197,7 +197,7 @@ async fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
 /// message, before its own model call). A's partial text must be gone
 /// by then, on the server and in every tab; today only the last turn
 /// ending cleared it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_failed_turns_reply_is_cleared_while_a_turn_waits_behind_it(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -288,7 +288,7 @@ async fn fail_a_users_turn(pool: &PgPool, conversation_id: i64) {
 /// The user's error must be kept: today the wake took a newer turn
 /// generation when it was counted, so the failure kept nothing. The
 /// command is what gets the wake counted at all (SME-218).
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_queued_behind_a_failing_turn_keeps_its_error(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -327,7 +327,7 @@ async fn test_a_wake_queued_behind_a_failing_turn_keeps_its_error(pool: PgPool) 
 /// B30, a wake with nothing pending after the user's turn failed: it
 /// calls no model and must leave the kept error as it was; today it
 /// cleared it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_with_nothing_pending_keeps_the_kept_error(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -346,7 +346,7 @@ async fn test_a_wake_with_nothing_pending_keeps_the_kept_error(pool: PgPool) {
 /// B30's guard: a wake that does call the model (a finished command's
 /// notice to deliver) is a newer turn, and replaces the kept error, as
 /// any newer turn does.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_that_calls_the_model_replaces_the_kept_error(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -376,7 +376,7 @@ async fn delete_as_the_api_does(pool: &PgPool, conversation_id: i64) {
 /// the delete forgot the old one), each fail and leave no turn state
 /// behind. Today each left a turn generation, so the entry was never
 /// idle again, for the life of the process.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_notice_after_a_delete_leaves_no_turn_state(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -415,7 +415,7 @@ async fn test_a_notice_after_a_delete_leaves_no_turn_state(pool: PgPool) {
 /// its turn state ends idle and gone. A guard: today's code passes it
 /// too, since the delete's forget already reset the generation the turn
 /// took when it was counted.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_delete_after_the_exists_check_leaves_no_turn_state(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -450,7 +450,7 @@ async fn test_a_delete_after_the_exists_check_leaves_no_turn_state(pool: PgPool)
 /// queues behind M). M takes the answer into its own message and fails;
 /// A then has nothing to do. M's error must be kept: A took a generation
 /// as soon as it held the lock, which cleared it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_answer_turn_with_nothing_to_do_keeps_the_kept_error(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -547,7 +547,7 @@ fn test_a_generation_taken_after_a_delete_and_a_new_lock_leaves_no_turn_state() 
 /// database is gone: the pool is closed). Its error is kept for a tab
 /// that reloads, with the generation `answer_question` took, since no
 /// newer turn has started.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_answer_turn_failing_before_it_saves_the_answer_keeps_its_error(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -569,7 +569,7 @@ async fn test_an_answer_turn_failing_before_it_saves_the_answer_keeps_its_error(
 /// SME-219: the user's Stop on a conversation already deleted (and
 /// forgotten) leaves no turn state. Today it made the entry, paused, and
 /// nothing forgot it again.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_for_a_deleted_conversation_leaves_no_turn_state(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -585,7 +585,7 @@ async fn test_a_stop_for_a_deleted_conversation_leaves_no_turn_state(pool: PgPoo
 /// SME-219: an error shown outside a turn ("Work on a repo" that couldn't
 /// start the sandbox) on a conversation already deleted leaves no turn
 /// state, and no kept error.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_error_shown_for_a_deleted_conversation_leaves_no_turn_state(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -600,7 +600,7 @@ async fn test_an_error_shown_for_a_deleted_conversation_leaves_no_turn_state(poo
 
 /// SME-219: a Stop on an id that was never a conversation leaves no turn
 /// state either.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_for_an_unknown_conversation_leaves_no_turn_state(pool: PgPool) {
     let _guard = lock_turn_tests();
     let base = db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -614,7 +614,7 @@ async fn test_a_stop_for_an_unknown_conversation_leaves_no_turn_state(pool: PgPo
 /// SME-219 guard: a Stop on a live conversation with no turn state yet
 /// (no turn ever run) still pauses it, so a command finishing right after
 /// doesn't wake the model; its delete then leaves nothing.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_for_a_live_idle_conversation_still_pauses_it(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -628,7 +628,7 @@ async fn test_a_stop_for_a_live_idle_conversation_still_pauses_it(pool: PgPool) 
 
 /// SME-219 guard: an error shown outside a turn on a live conversation is
 /// kept for a tab that reloads.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_shown_error_on_a_live_conversation_is_kept(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -657,7 +657,7 @@ async fn held_one_connection_pool(pool: &PgPool) -> (PgPool, sqlx::pool::PoolCon
 /// future dropped, as a client hanging up does) after the Stop wrote and
 /// while its existence check waits for a connection. The check still
 /// runs, and the deleted conversation is left with no turn state.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_cut_off_mid_check_still_forgets_a_deleted_conversation(pool: PgPool) {
     use futures_util::FutureExt;
     let _guard = lock_turn_tests();
@@ -675,7 +675,7 @@ async fn test_a_stop_cut_off_mid_check_still_forgets_a_deleted_conversation(pool
 
 /// SME-219 review 1, the same for an error shown outside a turn: cut off
 /// while its check waits, it still forgets the deleted conversation.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_error_cut_off_mid_check_still_forgets_a_deleted_conversation(pool: PgPool) {
     use futures_util::FutureExt;
     let _guard = lock_turn_tests();

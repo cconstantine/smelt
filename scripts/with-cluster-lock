@@ -38,6 +38,11 @@
 #   status, worktree, the command's first words), written while the lock is
 #   still held, so lines never interleave. A run ended by a signal logs
 #   nothing. Nothing is ever removed (SME-107).
+# - SMELT_CLUSTER_LOCK_HELD: the command runs with it set to the lock
+#   file's path, once the lock is held (taken here, or by an enclosing
+#   process on re-entry). Every `#[sqlx::test]` and real-cluster test
+#   refuses to run without it (src/test_lock.rs, SME-212). This script
+#   never reads it: a value set by hand doesn't count as the lock.
 set -uo pipefail
 
 self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
@@ -61,7 +66,8 @@ run() {
 # descriptor, then logs the run while the lock is still held.
 if [ -n "${_SMELT_LOCK_INNER:-}" ]; then
     asked=$_SMELT_LOCK_ASKED output=$_SMELT_LOCK_OUTPUT log=$_SMELT_LOCK_LOG
-    unset _SMELT_LOCK_INNER _SMELT_LOCK_ASKED _SMELT_LOCK_OUTPUT _SMELT_LOCK_LOG
+    export SMELT_CLUSTER_LOCK_HELD=$_SMELT_LOCK_PATH
+    unset _SMELT_LOCK_INNER _SMELT_LOCK_ASKED _SMELT_LOCK_OUTPUT _SMELT_LOCK_LOG _SMELT_LOCK_PATH
     took=$EPOCHSECONDS
     run "$@"
     rc=$?
@@ -77,7 +83,7 @@ if [ "${1:-}" = "--output" ]; then
     shift 2
 fi
 if [ $# -eq 0 ]; then
-    sed -n '2,40p' "$self" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,45p' "$self" | sed 's/^# \{0,1\}//' >&2
     exit 2
 fi
 
@@ -152,6 +158,7 @@ describe() { # pid: its command line and directory
 reenter() { # holder description ("" when it's this script), command...
     local holder=$1
     shift
+    export SMELT_CLUSTER_LOCK_HELD=$lock_path
     if [ -n "$holder" ]; then
         echo "the cluster lock is already held by an enclosing $holder; running inside it. The scripts take the lock themselves since SME-100: drop the outer flock." >&2
     fi
@@ -191,5 +198,5 @@ fi
 # a run of this script inside the command finds SMELT_CLUSTER_LOCK_HOLDER
 # among its ancestors and re-enters silently.
 export SMELT_CLUSTER_LOCK_HOLDER=$$
-_SMELT_LOCK_INNER=1 _SMELT_LOCK_ASKED=$asked _SMELT_LOCK_OUTPUT=$output _SMELT_LOCK_LOG=$log \
+_SMELT_LOCK_INNER=1 _SMELT_LOCK_ASKED=$asked _SMELT_LOCK_OUTPUT=$output _SMELT_LOCK_LOG=$log _SMELT_LOCK_PATH=$lock_path \
     exec flock -F "$lock" "$self" "$@"

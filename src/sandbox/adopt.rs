@@ -386,7 +386,7 @@ mod log_tests {
         assert_eq!((tally.adopted(), tally.left()), (1, 1));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_adoption_on_a_fresh_database_says_there_is_nothing_to_adopt(pool: PgPool) {
         let client = test_client().await;
         let instance = db::smelt_instance(&pool).await.expect("instance").id;
@@ -400,7 +400,7 @@ mod log_tests {
     /// The owning database's adoption ends with a summary. With no
     /// conversations, volumes or pod records nothing here is its to adopt,
     /// so it changes nothing in the shared namespace.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_adoption_by_the_owning_database_logs_a_summary(pool: PgPool) {
         let client = test_client().await;
         sqlx::query("UPDATE smelt_instance SET owns_unlabelled = true").execute(&pool).await.expect("an owning database");

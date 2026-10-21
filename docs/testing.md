@@ -30,7 +30,7 @@ mod tests {
 mod tests {
     use super::*;
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
     async fn test_thing_round_trip(pool: PgPool) {
         let c = create_conversation(&pool).await.expect("create");
         // ... exercise db functions against `c.id`, passing `&pool` explicitly
@@ -39,6 +39,8 @@ mod tests {
 ```
 
 `#[sqlx::test]` connects to the Postgres server at `DATABASE_URL`, creates a new database per test, runs all migrations against it, and tears it down afterward — no shared fixture, no manual setup/teardown, and no cross-test interference since each test is fully isolated. This requires a reachable Postgres server while running tests (`docker compose up -d postgres`).
+
+**Every `#[sqlx::test]` names a guarded migrator** (SME-212): `migrator = "crate::test_lock::MIGRATOR"`, or `"crate::test_lock::NO_MIGRATIONS"` for a test that migrates by hand (the old `migrations = false`). sqlx hands the migrator over before it creates the test's database, and `src/test_lock.rs` refuses the test there unless `scripts/with-cluster-lock` runs it (see "The cluster lock" below), so a bare `cargo test` fails it by name, panicking at `src/test_lock.rs`, instead of dropping another run's databases. A bare attribute fails the gate: `repo_lints::tests::test_every_sqlx_test_takes_the_cluster_lock` tokenizes every tracked `.rs` file (`src/repo_lints/cluster_lock.rs`), leaving out comments and reading strings, raw strings and char literals whole, and names each `#[…]` that names the path `sqlx::test` wherever it sits (`#[::sqlx::test]`, inside a `cfg_attr`, after other code on its line, inside a macro call), and each `use` that imports `sqlx::test`, read to its `;` through any groups. The guard counts only as `migrator = "…"` among the attribute's own tokens, not in a comment. It reads source, not macro expansions: an attribute a macro assembles from fragments, or `sqlx` imported under another crate name, isn't seen.
 
 **A test that holds several connections at once shares a pool with every other test.** Each `#[sqlx::test]` database is created through sqlx's one parent pool for the process, 20 connections, and a test's own pool draws on it too. A held-row race test (see [tdd.md](process/tdd.md)) holds about four at once: the held transaction, each caller under test, and the `pg_stat_activity` watcher. On SME-181 eight of them running together ran out and failed with `PoolTimedOut`. Such tests take turns through a process-wide `tokio::sync::Mutex` (a `static` the test locks first, as `git::server::trust_race_tests` does).
 
@@ -91,7 +93,7 @@ scripts/cluster-test --features server -- --nocapture   # show println! output
 scripts/cluster-test --features server -- --exact sandbox::tests::manager::test_name   # exactly one test
 ```
 
-**Any run that includes a `#[sqlx::test]` or a real-cluster test goes through `scripts/cluster-test`** (SME-100), which takes its arguments as `cargo test` does: it builds them with `--no-run` first, unlocked, then runs the same command under the cluster lock. A `cargo test … --no-run` needs no lock. See [personas/rules.md](personas/rules.md) ("One cluster user at a time").
+**Any run that includes a `#[sqlx::test]` or a real-cluster test goes through `scripts/cluster-test`** (SME-100), which takes its arguments as `cargo test` does: it builds them with `--no-run` first, unlocked, then runs the same command under the cluster lock. A `cargo test … --no-run` needs no lock. See [personas/rules.md](personas/rules.md) ("One cluster user at a time"). The tests enforce it (SME-212): run any other way, every `#[sqlx::test]` and real-cluster test fails at once with "run it with scripts/cluster-test …" before touching Postgres or the cluster, while pure tests in the same run pass.
 
 **The cluster lock** is `flock` on `<git common dir>/smelt-cluster.lock`, taken by `scripts/with-cluster-lock COMMAND…`, which `check.sh`, `browser-tier`, `cluster-test` and `clean-test-namespace.sh` call around their test run only:
 - while another process holds it, it prints `waiting for the cluster lock (held by pid N, <command>, in <directory>)` once, then waits;
@@ -99,6 +101,7 @@ scripts/cluster-test --features server -- --exact sandbox::tests::manager::test_
 - run inside a holder (a script that locks calling another, or an old outer `flock` in any form), it runs inside that lock rather than deadlocking, and for an outer `flock` says to drop it. It finds holders through `/proc/<pid>/fdinfo` and `/proc/locks`, Linux only, and the waiting line names a process holding the lock even after the one that took it has exited;
 - `--output FILE` sends the command's output to FILE while the waiting line stays on the terminal (`check.sh` keeps `target/check/server-tests.log` this way);
 - each run appends a line to `smelt-cluster-lock.log` next to the lock: start time, `waited=` and `held=` seconds, `exit=`, the worktree, the command;
+- the command runs with `SMELT_CLUSTER_LOCK_HELD` set to the lock file's path, which the tests' guard (`src/test_lock.rs`) checks (SME-212). The script never reads it, so a value in the caller's environment doesn't count as the lock. Never set it by hand or in `.env`: that turns the guard off;
 - `SMELT_LOCK_DIR` moves the lock (and `check-server`'s port locks) elsewhere; the script tests that share `scripts/lib/test-check-scripts.sh` set it so their cases never touch the real one.
 
 A name filter matches every test whose path contains it, and several filters are OR'd, so a filter meant for one unit test can also pick up real-cluster tests (on SME-85, `test_a_` matched a claims test that creates pods). To run one test, name it with `--exact` and its full path.

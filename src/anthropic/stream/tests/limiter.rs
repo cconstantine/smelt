@@ -255,7 +255,7 @@ async fn test_a_provider_without_a_limit_sends_at_once() {
 /// SME-162 review 1: a limit set while a turn runs applies from its next
 /// model call. The turn's endpoint was built with no limit; then the
 /// user saves 1.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_limit_saved_mid_turn_applies_to_its_next_call(pool: sqlx::PgPool) {
     let (addr, upstream) = start_gated_upstream(None, false).await;
     let provider = provider_at(&pool, addr, 9_162_000_201, None).await;
@@ -276,7 +276,7 @@ async fn test_a_limit_saved_mid_turn_applies_to_its_next_call(pool: sqlx::PgPool
 
 /// SME-162 review 1: a call waiting for a slot when the limit is raised
 /// goes at once, instead of waiting on the old pool.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_waiting_call_takes_a_raised_limit_at_once(pool: sqlx::PgPool) {
     let (addr, upstream) = start_gated_upstream(None, false).await;
     let provider = provider_at(&pool, addr, 9_162_000_202, Some(1)).await;
@@ -361,7 +361,7 @@ async fn test_a_calls_wait_for_a_slot_is_on_its_span() {
 /// SME-162 review 2: deleting a provider (to add it again, say) doesn't
 /// let the calls waiting on its slots all go at once: they still take
 /// their turn on the server.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_deleting_a_provider_keeps_its_waiting_calls_waiting(pool: sqlx::PgPool) {
     let (addr, upstream) = start_gated_upstream(None, false).await;
     let provider = provider_at(&pool, addr, 9_162_000_203, Some(1)).await;
@@ -384,7 +384,7 @@ async fn test_deleting_a_provider_keeps_its_waiting_calls_waiting(pool: sqlx::Pg
 
 /// SME-162 review 2: a limit lowered from 2 to 1 while two calls run lets
 /// no new call in until they're under it: never more than either limit.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_lowered_limit_holds_new_calls_until_the_running_ones_are_under_it(pool: sqlx::PgPool) {
     let (addr, upstream) = start_gated_upstream(None, false).await;
     let provider = provider_at(&pool, addr, 9_162_000_204, Some(2)).await;
@@ -413,7 +413,7 @@ async fn test_a_lowered_limit_holds_new_calls_until_the_running_ones_are_under_i
 
 /// SME-162 review 2: a limit raised from 1 to 2 while one call runs lets
 /// one more in, not two: the running call counts.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_raised_limit_counts_the_calls_already_running(pool: sqlx::PgPool) {
     let (addr, upstream) = start_gated_upstream(None, false).await;
     let provider = provider_at(&pool, addr, 9_162_000_205, Some(1)).await;

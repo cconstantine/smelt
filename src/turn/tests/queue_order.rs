@@ -49,7 +49,7 @@ async fn saved_positions(pool: &PgPool, conversation_id: i64, texts: &[&str]) ->
 /// its `select!`). The first is saved first, and it, not the second,
 /// dismisses the question waiting. Before SME-202 the second, which
 /// polled the lock first, was saved first.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_two_sends_a_stop_catches_queued_are_saved_in_order(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -90,7 +90,7 @@ async fn test_two_sends_a_stop_catches_queued_are_saved_in_order(pool: PgPool) {
 /// stop arm to the lock while the first's is held in its own. The first
 /// is still saved first. Before SME-202 a stopped turn dropped its place
 /// and queued again, so the second went ahead of the first.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_arm_running_out_of_order_keeps_send_order(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -125,7 +125,7 @@ async fn test_a_stop_arm_running_out_of_order_keeps_send_order(pool: PgPool) {
 /// T2, with no Stop: a delivered notice admitted before a send runs
 /// before it, though the send's task reaches the lock first. Before
 /// SME-202 turns joined the lock's queue when their task first ran.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_turns_admitted_back_to_back_queue_in_admission_order(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -172,7 +172,7 @@ async fn test_turns_admitted_back_to_back_queue_in_admission_order(pool: PgPool)
 /// (b) A send whose task is aborted before it first reaches the lock
 /// lets a later send run. Its place took the free lock at admission; T3c
 /// and T3d drop a place still waiting for it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_turn_dropped_before_it_runs_frees_its_place(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -249,7 +249,7 @@ async fn abort_a_send_whose_place_is_waiting(pool: &PgPool, release_first: bool)
 
 /// T3c: a send aborted while its place is still queued behind a held
 /// lock, the lock freed after the abort, lets a later send run.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_send_aborted_while_queued_leaves_the_queue(pool: PgPool) {
     let _guard = lock_turn_tests();
     abort_a_send_whose_place_is_waiting(&pool, false).await;
@@ -257,7 +257,7 @@ async fn test_a_send_aborted_while_queued_leaves_the_queue(pool: PgPool) {
 
 /// T3d: a send whose place is granted the lock before its task first
 /// polls it, then aborted, gives the lock back to a later send.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_send_aborted_once_granted_but_unpolled_frees_the_lock(pool: PgPool) {
     let _guard = lock_turn_tests();
     abort_a_send_whose_place_is_waiting(&pool, true).await;

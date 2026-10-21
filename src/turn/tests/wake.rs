@@ -1,6 +1,6 @@
 use super::*;
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_wake_conversation_is_a_noop_when_nothing_is_pending(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -30,7 +30,7 @@ async fn test_wake_conversation_is_a_noop_when_nothing_is_pending(pool: PgPool) 
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_wake_conversation_drains_a_pending_command_and_completes_a_turn(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -83,7 +83,7 @@ async fn test_wake_conversation_drains_a_pending_command_and_completes_a_turn(po
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_wake_conversation_second_call_is_a_noop_once_the_first_drained_everything(
     pool: PgPool,
 ) {
@@ -142,7 +142,7 @@ async fn test_wake_conversation_second_call_is_a_noop_once_the_first_drained_eve
 /// command's notice (the model sees it once there is one) and says why
 /// it couldn't deliver it; a wake with nothing pending doesn't take the
 /// default or say anything.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_with_no_model_still_saves_the_notice(pool: PgPool) {
     let _guard = lock_turn_tests();
     // An id no other test's database hands out: what this test hears on
@@ -175,7 +175,7 @@ async fn test_a_wake_with_no_model_still_saves_the_notice(pool: PgPool) {
     assert_eq!(failure, crate::providers::NO_MODEL_CONFIGURED);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_with_nothing_pending_leaves_the_model_alone(pool: PgPool) {
     let _guard = lock_turn_tests();
     // The mock first: it moves conversations already there onto it.
@@ -193,7 +193,7 @@ async fn test_a_wake_with_nothing_pending_leaves_the_model_alone(pool: PgPool) {
     assert_eq!(model.provider_id, None, "a wake with nothing to say doesn't take the default");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_wake_conversation_publishes_notification_delivery_failed_on_error(pool: PgPool) {
     let _guard = lock_turn_tests();
     // An id no other test's database hands out: what this test hears on
@@ -276,7 +276,7 @@ async fn untouched_running_command(pool: &PgPool, conversation_id: i64, command_
 /// past its notice period is told to the model as its own user message, says
 /// plainly that nothing stopped it and what it can do about it, and is marked
 /// so its clock restarts from this notice. The command keeps running.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_wake_drains_an_idle_notice_and_the_command_keeps_running(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -333,7 +333,7 @@ async fn test_wake_drains_an_idle_notice_and_the_command_keeps_running(pool: PgP
 
 /// SME-79: the wake-up is for *untouched* commands. A running command
 /// nobody has left long is no reason to wake anyone.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_running_command_not_due_is_left_alone(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -372,7 +372,7 @@ fn test_format_duration_names_one_or_two_units() {
 /// drains it, and its numbers are the ones the command has earned by
 /// then — recomputed at the drain, not frozen at the wake that didn't
 /// happen. ("untouched for 3 hours" reads oddly; it's honest.)
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stopped_conversation_holds_the_idle_notice_for_the_next_message(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -451,7 +451,7 @@ async fn waiting_question(pool: &PgPool, conversation_id: i64) {
 /// SME-218: a wake that finds nothing pending isn't counted as a turn,
 /// so no tab is told one started (it would flash "Working…" and clear
 /// the error it shows), and the kept error stays.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_with_nothing_pending_tells_no_tab_a_turn_started(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -470,7 +470,7 @@ async fn test_a_wake_with_nothing_pending_tells_no_tab_a_turn_started(pool: PgPo
 
 /// SME-218: a question still waiting for the user is nothing a wake can
 /// act on (its turn would stop at the question), so it isn't counted.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_with_only_an_unanswered_question_tells_no_tab(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -493,7 +493,7 @@ async fn test_a_wake_with_only_an_unanswered_question_tells_no_tab(pool: PgPool)
 /// SME-218's guard for the answered-question clause: an answer no turn
 /// took (the server restarted between the answer and its turn) is taken
 /// by the next wake, which sends it to the model.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_takes_an_answer_no_turn_took(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;
@@ -523,7 +523,7 @@ async fn test_a_wake_takes_an_answer_no_turn_took(pool: PgPool) {
 
 /// SME-218's guard for `'lost'` in the shared fragment: a command whose
 /// outcome is unknown is told to the model by a wake, as a finished one is.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_wake_drains_a_lost_command(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation_id = db::create_conversation(&pool).await.expect("create conversation").id;

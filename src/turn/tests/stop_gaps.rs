@@ -11,7 +11,7 @@ use super::*;
 /// turn: no model call, the message kept once, the stop noted once, and
 /// the conversation paused. Before SME-216 the turn wasn't counted yet,
 /// so the Stop only paused and the turn went on to the model.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_right_after_a_send_ends_its_turn(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -43,7 +43,7 @@ async fn test_a_stop_right_after_a_send_ends_its_turn(pool: PgPool) {
 /// E1, the card's answer: a Stop sent right after `answer_question`
 /// returns ends the answer's turn. The model isn't called again, and the
 /// answer stays recorded for the next turn to take.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_right_after_an_answer_ends_its_turn(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -77,7 +77,7 @@ async fn test_a_stop_right_after_an_answer_ends_its_turn(pool: PgPool) {
 /// API's delete (Stop, delete, forget) landing right after
 /// `send_message` returns ends with no turn state left. A guard: before
 /// SME-216 the turn wasn't stopped, and failed at its exists check.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_deletes_stop_catching_a_just_sent_turn_leaves_no_turn_state(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -107,7 +107,7 @@ async fn test_a_deletes_stop_catching_a_just_sent_turn_leaves_no_turn_state(pool
 /// as a failed notification. Before SME-217 the wake checked the pause,
 /// then counted in a second step, so the Stop only paused and the wake
 /// went on to the model.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_as_a_wake_is_let_in_ends_it(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
@@ -144,7 +144,7 @@ async fn test_a_stop_as_a_wake_is_let_in_ends_it(pool: PgPool) {
 
 /// E2 (SME-217), as the test above with a delivered notice: it's saved
 /// once and the stop noted once, without a model call.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_stop_as_a_delivery_is_let_in_ends_it(pool: PgPool) {
     let _guard = lock_turn_tests();
     db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");

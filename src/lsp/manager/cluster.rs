@@ -96,7 +96,7 @@ impl Shape for Square {
 /// rust-analyzer, installed as the catalog suggests: navigation across
 /// files, calls, diagnostics (after an edit too), a rename's edits, and
 /// a session that comes back after its server process dies.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_rust_analyzer_from_the_catalog_answers_across_files(pool: PgPool) {
     let config = configure(&pool, include_str!("../fixtures/mason-rust-analyzer.yaml")).await;
     with_sandbox(|client, sandbox| async move {
@@ -221,7 +221,7 @@ async fn test_an_edit_says_when_a_server_cannot_connect() {
 /// Starting a server that's already running gives it a fresh reconnect
 /// budget: that's what the error for a spent budget tells the model
 /// to do, and the pod itself is still ready.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_starting_a_running_server_resets_its_reconnects(pool: PgPool) {
     let config = LanguageServerConfig {
         name: "budget".to_string(),
@@ -277,7 +277,7 @@ async fn test_an_edit_does_not_wait_for_a_server_to_connect() {
 
 /// pyright, installed with npm as the catalog suggests: a definition
 /// in another module, and a type error.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_pyright_from_the_catalog_answers(pool: PgPool) {
     let config = configure(&pool, include_str!("../fixtures/mason-pyright.yaml")).await;
     with_sandbox(|client, sandbox| async move {
@@ -300,7 +300,7 @@ async fn test_pyright_from_the_catalog_answers(pool: PgPool) {
 
 /// gopls, installed with `go install` as the catalog suggests: a
 /// definition in another file of the package.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_gopls_from_the_catalog_answers(pool: PgPool) {
     let config = configure(&pool, include_str!("../fixtures/mason-gopls.yaml")).await;
     with_sandbox(|client, sandbox| async move {

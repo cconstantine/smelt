@@ -1,6 +1,6 @@
 use super::*;
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_terminal_command_starts_running(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -15,7 +15,7 @@ async fn test_create_terminal_command_starts_running(pool: PgPool) {
     assert!(command.notified_at.is_none());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_terminal_command_is_running_reflects_the_single_in_flight_row(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -50,7 +50,7 @@ async fn test_terminal_command_is_running_reflects_the_single_in_flight_row(pool
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_terminal_command_is_running_is_scoped_per_terminal(pool: PgPool) {
     // The whole point of moving this guard from conversation_id to
     // terminal_id: two terminals in flight at once, independently.
@@ -78,7 +78,7 @@ async fn test_terminal_command_is_running_is_scoped_per_terminal(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_mark_terminal_command_finished_sets_status_and_exit_code(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -99,7 +99,7 @@ async fn test_mark_terminal_command_finished_sets_status_and_exit_code(pool: PgP
     assert_eq!(status.exit_code, Some(1));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_mark_terminal_command_lost_only_affects_running_rows(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -125,7 +125,7 @@ async fn test_mark_terminal_command_lost_only_affects_running_rows(pool: PgPool)
     assert_eq!(status.exit_code, Some(0));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_mark_terminal_command_lost_on_a_running_row(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -146,7 +146,7 @@ async fn test_mark_terminal_command_lost_on_a_running_row(pool: PgPool) {
     assert!(status.exit_code.is_none());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_append_terminal_event_and_read_terminal_output_orders_by_seq(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -197,7 +197,7 @@ async fn test_append_terminal_event_and_read_terminal_output_orders_by_seq(pool:
     assert_eq!(stdout_only.get(1).map(|l| l.data.as_str()), Some("out2"));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_read_terminal_output_respects_offset_and_limit(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -220,7 +220,7 @@ async fn test_read_terminal_output_respects_offset_and_limit(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_terminal_command_status_counts_lines_per_stream(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -246,7 +246,7 @@ async fn test_terminal_command_status_counts_lines_per_stream(pool: PgPool) {
     assert_eq!(status.status, "running");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_terminal_command_status_returns_none_for_unknown_command(pool: PgPool) {
     let result = terminal_command_status(&pool, "no-such-command")
         .await
@@ -257,7 +257,7 @@ async fn test_terminal_command_status_returns_none_for_unknown_command(pool: PgP
 /// SME-91: a command's notice and its mark are one step, so a command
 /// already notified (a stopped drain that got as far as the mark, or
 /// another drain) never gets a second notice.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_command_already_notified_gets_no_second_notice(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -285,7 +285,7 @@ async fn test_a_command_already_notified_gets_no_second_notice(pool: PgPool) {
 
 /// SME-91: the notice and the mark commit together: a command that
 /// doesn't exist (nothing to mark) leaves no notice behind.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_notice_without_its_mark_isnt_saved(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let notice = [ContentBlock::Text { text: "nobody's notice".to_string() }];
@@ -297,7 +297,7 @@ async fn test_a_notice_without_its_mark_isnt_saved(pool: PgPool) {
     assert!(messages.is_empty(), "no notice without its mark: {messages:?}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_unnotified_finished_terminal_commands_matches_finished_and_lost_only(
     pool: PgPool,
 ) {
@@ -347,7 +347,7 @@ async fn test_unnotified_finished_terminal_commands_matches_finished_and_lost_on
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_list_terminal_commands_is_most_recent_first_and_bounded(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -376,7 +376,7 @@ async fn test_list_terminal_commands_is_most_recent_first_and_bounded(pool: PgPo
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_delete_conversation_cascades_to_terminal_commands_and_events(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -406,7 +406,7 @@ async fn test_delete_conversation_cascades_to_terminal_commands_and_events(pool:
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_terminating_a_terminal_preserves_its_command_history(pool: PgPool) {
     // The whole reason terminate_terminal soft-deletes instead of
     // DELETEing (see SME-9's "How"): list_commands should still be
@@ -479,7 +479,7 @@ async fn due_ids(pool: &PgPool, conversation_id: i64) -> Vec<String> {
         .collect()
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_create_terminal_command_stores_the_interval(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -495,7 +495,7 @@ async fn test_create_terminal_command_stores_the_interval(pool: PgPool) {
     assert_eq!(running.idle_notice_secs, 0, "0 is a stored choice, not the absence of one");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_idle_commands_due_needs_the_interval_to_have_passed(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -525,7 +525,7 @@ async fn test_idle_commands_due_needs_the_interval_to_have_passed(pool: PgPool) 
     assert_eq!(due_ids(&pool, conversation.id).await, vec!["idle-1".to_string()], "60s is its own interval");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_idle_notice_interval_zero_is_never_due(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -537,7 +537,7 @@ async fn test_idle_notice_interval_zero_is_never_due(pool: PgPool) {
     assert!(idle_commands_to_notice(&pool).await.expect("query").is_empty());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_idle_commands_due_carries_the_counts_and_durations(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -562,7 +562,7 @@ async fn test_idle_commands_due_carries_the_counts_and_durations(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_idle_notices_repeat_until_the_command_is_touched(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -591,7 +591,7 @@ async fn test_idle_notices_repeat_until_the_command_is_touched(pool: PgPool) {
     assert_eq!(due_ids(&pool, conversation.id).await, vec!["idle-2".to_string()]);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_idle_commands_due_skips_finished_and_lost(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -612,7 +612,7 @@ async fn test_idle_commands_due_skips_finished_and_lost(pool: PgPool) {
     assert!(idle_commands_to_notice(&pool).await.expect("query").is_empty());
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_idle_commands_to_notice_lists_every_conversation(pool: PgPool) {
     let conversation_a = test_conversation(&pool).await;
     let conversation_b = test_conversation(&pool).await;
@@ -637,7 +637,7 @@ async fn test_idle_commands_to_notice_lists_every_conversation(pool: PgPool) {
     assert_eq!(due[0].0, conversation_a.id, "with the conversation to wake");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_save_idle_notice_saves_and_marks_once(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -655,7 +655,7 @@ async fn test_save_idle_notice_saves_and_marks_once(pool: PgPool) {
     assert_eq!(messages.len(), 1, "one message for the one notice: {messages:?}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_save_idle_notice_saves_nothing_when_the_command_is_gone_or_touched(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -683,7 +683,7 @@ async fn test_save_idle_notice_saves_nothing_when_the_command_is_gone_or_touched
     assert!(messages.is_empty(), "a refused notice saves nothing: {messages:?}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_idle_notice_leaves_the_finish_notice_owed(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;
@@ -701,7 +701,7 @@ async fn test_idle_notice_leaves_the_finish_notice_owed(pool: PgPool) {
     assert_eq!(unnotified.iter().map(|c| c.command_id.as_str()).collect::<Vec<_>>(), vec!["idle-n4"]);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_set_terminal_command_notice_secs_matches_no_other_row(pool: PgPool) {
     let conversation = test_conversation(&pool).await;
     let terminal_id = test_terminal(&pool, conversation.id).await;

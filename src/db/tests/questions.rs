@@ -1,6 +1,6 @@
 use super::*;
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_pending_question_is_answered_once_then_taken(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     let id = conversation.id;
@@ -27,7 +27,7 @@ async fn test_a_pending_question_is_answered_once_then_taken(pool: PgPool) {
     assert_eq!(get_pending_question(&pool, id).await.expect("get"), None);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_waiting_question_is_taken_only_when_asked_for(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     create_pending_question(&pool, conversation.id, "toolu_q", &sample_questions()).await.expect("create");
@@ -36,7 +36,7 @@ async fn test_a_waiting_question_is_taken_only_when_asked_for(pool: PgPool) {
     assert_eq!(get_pending_question(&pool, conversation.id).await.expect("get"), None);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_pending_question_goes_with_its_conversation(pool: PgPool) {
     let conversation = create_conversation(&pool).await.expect("conversation");
     create_pending_question(&pool, conversation.id, "toolu_q", &sample_questions()).await.expect("create");

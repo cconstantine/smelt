@@ -3,7 +3,7 @@ use super::*;
 /// SME-112: on llama.cpp, whose blocks overlap, the commentary before a
 /// tool call is saved with it (it used to show while streaming and then
 /// vanish), every tab gets it, and the next request replays it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_commentary_before_a_tool_call_on_llama_cpp_is_saved(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation_with_id(&pool, 9_100_000_309)
@@ -42,7 +42,7 @@ async fn test_commentary_before_a_tool_call_on_llama_cpp_is_saved(pool: PgPool) 
     assert_eq!(replayed["content"][1], serde_json::json!({"type": "text", "text": "Let me check your todo list."}));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_executes_tool_and_persists_full_round_trip(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -131,7 +131,7 @@ async fn test_run_turn_executes_tool_and_persists_full_round_trip(pool: PgPool) 
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_describe_live_state_lists_real_pods_and_terminals(pool: PgPool) {
     let conversation = db::create_conversation(&pool)
         .await
@@ -160,7 +160,7 @@ async fn test_describe_live_state_lists_real_pods_and_terminals(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_describe_live_state_lists_the_current_todo_list(pool: PgPool) {
     let conversation = db::create_conversation(&pool)
         .await
@@ -197,7 +197,7 @@ async fn test_describe_live_state_lists_the_current_todo_list(pool: PgPool) {
 /// SME-51 B10: the usage that triggered a compaction describes the old,
 /// long history. Kept after it, a failed or stopped next call left the
 /// following turn compacting again at once.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_compaction_forgets_the_usage_that_triggered_it(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool).await.expect("create conversation");
@@ -224,7 +224,7 @@ async fn test_a_compaction_forgets_the_usage_that_triggered_it(pool: PgPool) {
     assert_eq!(db::get_conversation_usage(&pool, conversation.id).await.expect("usage"), None);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_compacts_before_sending_when_usage_is_near_the_ceiling(pool: PgPool) {
     let _guard = lock_turn_tests();
     // An id no other test's database hands out: what this test hears on
@@ -383,7 +383,7 @@ async fn test_run_turn_compacts_before_sending_when_usage_is_near_the_ceiling(po
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_errors_when_max_turns_exceeded(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)
@@ -445,7 +445,7 @@ fn test_conversation_lock_is_shared_per_conversation_id_only() {
     );
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_run_turn_serializes_concurrent_calls_for_the_same_conversation(pool: PgPool) {
     let _guard = lock_turn_tests();
     let conversation = db::create_conversation(&pool)

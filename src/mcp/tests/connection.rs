@@ -54,7 +54,7 @@ async fn test_connection_check_reports_tool_names_for_a_connected_server() {
     REGISTRY.lock().await.remove(&server_id);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_connection_check_errors_for_an_unconfigured_server(pool: sqlx::PgPool) {
     // No `register_test_connection` call — nothing in the registry, and
     // the row's URL is deliberately unroutable, so this must report an

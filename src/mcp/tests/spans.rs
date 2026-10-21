@@ -33,7 +33,7 @@ async fn test_an_mcp_call_is_a_span_under_its_caller() {
 
 /// The connects a turn's tool list starts run in the background, but
 /// as the turn's children, not roots of their own.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_tool_lists_connect_is_a_child_of_its_caller(pool: sqlx::PgPool) {
     let config = create_static_server(&pool, &test_config(0, "unused").url).await;
     let (_, spans) = crate::telemetry::capture_spans(async {
@@ -51,7 +51,7 @@ async fn test_a_tool_lists_connect_is_a_child_of_its_caller(pool: sqlx::PgPool) 
 /// Review 1: a failed connect's error quotes the server's URL, and a
 /// query can hold its key (`?apiKey=`). Neither a span's status nor the
 /// tool list's warning exports it.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_failed_connect_exports_no_query_from_the_servers_url(pool: sqlx::PgPool) {
     let config = create_static_server(&pool, "http://127.0.0.1:1/mcp?apiKey=SECRET-KEY").await;
     let (_, spans) = crate::telemetry::capture_spans(async {
@@ -114,7 +114,7 @@ fn test_a_transport_failures_span_description_quotes_no_reply_body() {
 /// that answers `tools/call` with an HTTP 500 whose plain-text body
 /// echoes the call's input. rmcp quotes that body in a transport
 /// error; the model gets it, the exported spans don't.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_tools_call_answered_with_a_non_json_rpc_500_exports_none_of_the_body(pool: sqlx::PgPool) {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
@@ -159,7 +159,7 @@ async fn test_a_tools_call_answered_with_a_non_json_rpc_500_exports_none_of_the_
     assert!(!exported.contains("SECRET"), "{exported}");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_failed_mcp_connect_is_a_failed_span(pool: sqlx::PgPool) {
     let config = create_static_server(&pool, &test_config(0, "unused").url).await;
     let (result, spans) = crate::telemetry::capture_spans(connection_check(&pool, &config)).await;

@@ -4,7 +4,7 @@ use super::*;
 /// trigger. The test's database has no model provider, so the wake fails
 /// before any model call, but the notice is saved first and the failure
 /// is published: both seen without any model, real or mock.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_a_finished_command_wakes_the_model(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -57,7 +57,7 @@ async fn test_a_finished_command_wakes_the_model(pool: PgPool) {
 /// noticed, and the notice stops nothing: the row is still `running` when the
 /// notice is saved, and the command then ends by itself and gets its finish
 /// notice like any other — an idle notice doesn't use that one up.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_an_untouched_command_is_noticed_and_keeps_running(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -143,7 +143,7 @@ async fn test_an_untouched_command_is_noticed_and_keeps_running(pool: PgPool) {
 /// running command left untouched past its interval is signalled through
 /// the tool; the signal is a touch: `touched_at` says the moment of the
 /// signal, not the command's start.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_signalling_a_command_through_the_tool_touches_it(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -188,7 +188,7 @@ async fn test_signalling_a_command_through_the_tool_touches_it(pool: PgPool) {
 }
 
 /// A file written in one conversation's pod is invisible from another's.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_two_conversations_pods_are_isolated(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -217,7 +217,7 @@ async fn test_two_conversations_pods_are_isolated(pool: PgPool) {
 /// clobbered. `expected_line` picks one of several matches, `replace_all`
 /// takes them all, an ambiguous match, a missing file and an oversized
 /// write are clear errors, and a write makes its parent directories.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_file_tools_edit_safely_against_stale_hashes(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
@@ -328,7 +328,7 @@ async fn test_file_tools_edit_safely_against_stale_hashes(pool: PgPool) {
 /// SME-19: `glob` matches at every depth with `**` and only the top level
 /// with `*`; `grep` searches every file under its path, and its glob
 /// filter narrows that.
-#[sqlx::test]
+#[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
 async fn test_glob_and_grep_find_files_and_matches(pool: PgPool) {
     let client = own_sandbox(&pool).await;
     run_then_tear_down(&pool, &client, SCENARIO_LIMIT, async {
