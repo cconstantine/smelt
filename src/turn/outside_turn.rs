@@ -19,9 +19,9 @@
 use super::*;
 
 /// The user's Stop (`stop_turn_now`), for a conversation that may already
-/// be deleted: one that is gone leaves no turn state behind (SME-219).
-/// Server code stopping another conversation (one it hasn't just checked)
-/// calls this too.
+/// be deleted: one that is gone leaves no turn state behind (SME-219),
+/// though a turn still in flight there is ended. Server code that stops
+/// another conversation (SME-236's `stop_agent`) must call this too.
 pub(crate) async fn stop_conversation(pool: &PgPool, conversation_id: i64) {
     stop_turn_now(conversation_id);
     forget_turn_state_if_deleted(pool, conversation_id).await;
