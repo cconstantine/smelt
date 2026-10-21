@@ -164,6 +164,21 @@ if [ "$rc" -ne 2 ]; then
     fail "called with no arguments: exit $rc, want 2"
 fi
 
+# And the warning's own shape: a line that fails to parse is exactly where a
+# secret sits unquoted — an unquoted DATABASE_URL with a bad escape in its
+# password — and this warning goes to a terminal and into logs. It must name
+# where the load stopped without echoing what the line held (SME-186 review 1,
+# finding 3).
+secret_case=$dir/fixtures/stop-warning-no-secret
+printf 'DATABASE_URL=postgres://user:SEKRITpw\8@host/db\nOTHER=1\n' >"$secret_case.env"
+env -i "$python3" -I scripts/lib/dotenv-value "$secret_case.env" NOPE \
+    >"$secret_case.out" 2>"$secret_case.err"
+grep -qE 'line 1' "$secret_case.err" \
+    || fail "stop-warning-no-secret: a stop that is reached must name the line, got: $(cat "$secret_case.err")"
+if grep -qF 'SEKRITpw' "$secret_case.err"; then
+    fail "stop-warning-no-secret: the warning echoes the failing line's value: $(cat "$secret_case.err")"
+fi
+
 if [ "$failures" -eq 0 ]; then
     echo "dotenv-value: all checks passed"
 fi

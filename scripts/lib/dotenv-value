@@ -326,7 +326,14 @@ def load(path, env):
         try:
             pair = Entry(entry, substitutions, env).parse()
         except ValueError as exc:
-            raise StopLoad(entries.line_no, "invalid format at %s" % exc)
+            # exc is "<the failing text>:<offset>", the text the line held
+            # itself — and a line that fails to parse is exactly where a
+            # secret sits unquoted, an unquoted DATABASE_URL with a bad
+            # escape in its password being the everyday case. This reason
+            # reaches a terminal and any log beside it, so it names the
+            # offset only, never the text (SME-186 review 1, finding 3).
+            raise StopLoad(entries.line_no,
+                           "invalid format at index %s" % str(exc).rsplit(":", 1)[-1])
         if pair is not None:
             yield pair
 
