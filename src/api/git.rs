@@ -45,18 +45,45 @@ pub async fn forget_repo_trust(remote: String) -> ServerFnResult<()> {
 }
 
 /// The trust card's answer about request `request_id`, with the hash of
-/// the file the card showed. The model is told, and woken to carry on.
+/// the file the card showed. The model is told, and woken to carry on,
+/// even if the tab closes meanwhile (SME-225).
 #[post("/api/conversations/{id}/instruction-requests/{request_id}")]
 pub async fn decide_repo_trust(id: i64, request_id: i64, shown_hash: String, trusted: bool) -> ServerFnResult<()> {
-    let pool = db::get();
-    let notices = git::decide_trust(pool, id, request_id, &shown_hash, trusted)
+    decide_and_notify(db::get(), id, request_id, shown_hash, trusted)
         .await
-        .map_err(ServerFnError::new)?;
-    // In the background: each waits for its conversation's turn to end.
+        .map_err(ServerFnError::new)
+}
+
+/// `decide_repo_trust`'s work, in a task of its own (SME-225): a request
+/// dropped mid-way (the tab closes, the connection resets) stops only the
+/// wait for it. The decision still commits, its tabs are still told, and
+/// so is every waiting model. A decision that fails with nobody waiting
+/// needs nothing more: it rolled back, and the card still shows.
+#[cfg(feature = "server")]
+async fn decide_and_notify(
+    pool: &sqlx::PgPool,
+    id: i64,
+    request_id: i64,
+    shown_hash: String,
+    trusted: bool,
+) -> Result<(), String> {
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        let notices = git::decide_trust(&pool, id, request_id, &shown_hash, trusted).await?;
+        deliver(&pool, notices);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("The decision didn't finish: {e}"))?
+}
+
+/// Delivers each notice in the background: each waits for its
+/// conversation's turn to end.
+#[cfg(feature = "server")]
+fn deliver(pool: &sqlx::PgPool, notices: Vec<(i64, String)>) {
     for (conversation_id, notice) in notices {
         crate::turn::notify(pool, conversation_id, vec![crate::turn::Notice::Deliver(notice)]);
     }
-    Ok(())
 }
 
 /// The conversation's repos, for the sandbox panel.
@@ -66,27 +93,109 @@ pub async fn list_conversation_repos(id: i64) -> ServerFnResult<Vec<RepoSummary>
 }
 
 /// "Work on a repo": records the repo and returns at once; the sandbox
-/// start and the clone run in the background, so a closed tab can't cut
-/// them off. The panel follows them through `ReposUpdate`.
+/// start and the clone run in the background. All of it runs apart from
+/// the request, so a closed tab can't cut any of it off (SME-225). The
+/// panel follows them through `ReposUpdate`.
 #[post("/api/conversations/{id}/repos")]
 pub async fn attach_repo(id: i64, url: String, branch: String, dir: String) -> ServerFnResult<RepoSummary> {
-    let pool = db::get();
-    let branch = Some(branch.trim()).filter(|b| !b.is_empty());
-    let dir = Some(dir.trim()).filter(|d| !d.is_empty());
-    let (shown, pending, notices) = git::start_attach(pool, id, url.trim(), branch, dir)
+    attach_and_answer(db::get(), id, url, branch, dir)
         .await
-        .map_err(ServerFnError::new)?;
-    for (conversation_id, notice) in notices {
-        crate::turn::notify(pool, conversation_id, vec![crate::turn::Notice::Deliver(notice)]);
-    }
-    let nothing_to_clone = pending.is_none();
-    tokio::spawn(async move {
-        if let Err(e) = git::finish_attach(pool, id, pending).await {
+        .map_err(ServerFnError::new)
+}
+
+/// `attach_repo`'s work, all in a task of its own (SME-225): a request
+/// dropped mid-way (the tab closes) stops only the wait for the answer.
+/// The trust and the repo are still recorded, the remote's waiting models
+/// still told, and the sandbox and the clone still go ahead.
+#[cfg(feature = "server")]
+async fn attach_and_answer(
+    pool: &sqlx::PgPool,
+    id: i64,
+    url: String,
+    branch: String,
+    dir: String,
+) -> Result<RepoSummary, String> {
+    let (_attaching, answered) = spawn_attach(pool, id, url, branch, dir);
+    read_attach_answer(answered).await
+}
+
+/// Starts the attach's task: the handle to it (for a test to wait on),
+/// and the channel its start is handed back on.
+#[cfg(feature = "server")]
+fn spawn_attach(
+    pool: &sqlx::PgPool,
+    id: i64,
+    url: String,
+    branch: String,
+    dir: String,
+) -> (tokio::task::JoinHandle<()>, tokio::sync::oneshot::Receiver<AttachAnswer>) {
+    let pool = pool.clone();
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    let attaching = tokio::spawn(async move {
+        let branch = Some(branch.trim()).filter(|b| !b.is_empty());
+        let dir = Some(dir.trim()).filter(|d| !d.is_empty());
+        let (shown, pending) = match git::start_attach(&pool, id, url.trim(), branch, dir).await {
+            Ok((shown, pending, notices)) => {
+                deliver(&pool, notices);
+                (shown, pending)
+            }
+            // A failure after the trust committed still owes the models
+            // whose cards it dropped their notices (SME-224 review 1).
+            Err(failed) => {
+                deliver(&pool, failed.notices);
+                return hand_back_attach(&pool, id, answer, Err(failed.error)).await;
+            }
+        };
+        let nothing_to_clone = pending.is_none();
+        hand_back_attach(&pool, id, answer, Ok(shown)).await;
+        if let Err(e) = git::finish_attach(&pool, id, pending).await {
             tracing::warn!(conversation_id = id, error = %e, "\"Work on a repo\" failed");
-            report_attach_failure(pool, id, nothing_to_clone, &e).await;
+            report_attach_failure(&pool, id, nothing_to_clone, &e).await;
         }
     });
-    Ok(shown)
+    (attaching, answered)
+}
+
+/// The request's side of the hand-back: reads the attach's start and
+/// says it did.
+#[cfg(feature = "server")]
+async fn read_attach_answer(answered: tokio::sync::oneshot::Receiver<AttachAnswer>) -> Result<RepoSummary, String> {
+    let (started, ack) = answered
+        .await
+        .map_err(|_| "\"Work on a repo\" stopped before it answered.".to_string())?;
+    let _ = ack.send(());
+    started
+}
+
+/// The attach's start as handed back to its request, with the sender the
+/// request acknowledges reading it on.
+#[cfg(feature = "server")]
+type AttachAnswer = (Result<RepoSummary, String>, tokio::sync::oneshot::Sender<()>);
+
+/// Hands the attach's start back to the request waiting for it. A
+/// failure no request read (the tab closed, before the send or after it)
+/// is shown in the conversation instead, as a failure after the answer is
+/// (SME-91); a conversation deleted meanwhile is left with no turn state
+/// (SME-219). "Read" means read by the server function, not seen by the
+/// user: a tab that switched conversations while the attach waited reads
+/// the failure and drops it (SME-224 review 2).
+#[cfg(feature = "server")]
+async fn hand_back_attach(
+    pool: &sqlx::PgPool,
+    conversation_id: i64,
+    answer: tokio::sync::oneshot::Sender<AttachAnswer>,
+    started: Result<RepoSummary, String>,
+) {
+    let error = started.as_ref().err().cloned();
+    // Read only once the request says it read it: a request dropped
+    // between the send and its read (the tab closed) never read it
+    // (SME-224 review 1).
+    let (ack, acked) = tokio::sync::oneshot::channel();
+    let read = answer.send((started, ack)).is_ok() && acked.await.is_ok();
+    if let (Some(e), false) = (error, read) {
+        tracing::warn!(conversation_id, error = %e, "\"Work on a repo\" failed with nobody waiting");
+        crate::turn::show_error_outside_turn(pool, conversation_id, format!("\"Work on a repo\" failed. {e}")).await;
+    }
 }
 
 /// A failed "Work on a repo", shown in the conversation when the repo was
@@ -179,5 +288,229 @@ mod tests {
         // Not left for the next test sharing this process: a live
         // conversation's error stays until its delete forgets it.
         crate::turn::forget_conversation_lock(shown);
+    }
+
+    /// Polls `check` until it holds, for up to 10 s.
+    async fn eventually<F, Fut>(what: &str, mut check: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !check().await {
+            assert!(std::time::Instant::now() < deadline, "{what}: not within 10 s");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Whether a message in `conversation_id` says `text`.
+    async fn told(pool: &sqlx::PgPool, conversation_id: i64, text: &str) -> bool {
+        db::list_messages(pool, conversation_id)
+            .await
+            .expect("messages")
+            .iter()
+            .any(|m| m.content.contains(text))
+    }
+
+    async fn trusted(pool: &sqlx::PgPool) -> bool {
+        db::get_repo_trust(pool, "github.com/o/r").await.expect("trust") == Some(true)
+    }
+
+    /// SME-225. Interleaving: Trust on A's card is held at its load, its
+    /// transaction open, and the request is dropped there, as when the
+    /// tab closes or the connection resets. The decision still commits,
+    /// and A's model is still told. (Nothing between the commit and the
+    /// notices can be held, so the drop comes before the commit; the
+    /// decision running apart from the request covers both.)
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_a_trust_decision_whose_request_is_dropped_still_commits_and_tells_the_model(pool: sqlx::PgPool) {
+        let _race = git::test_support::ONE_AT_A_TIME.lock().await;
+        let _turns = crate::providers::test_support::lock_turn_tests();
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        let a = db::create_conversation(&pool).await.expect("conversation").id;
+        let repo = git::test_support::cloned_repo(&pool, a).await;
+        git::request_or_load(&pool, a, &repo, "AGENTS.md", &git::test_support::file("x")).await.expect("ask");
+        let card = git::list_repos(&pool, a).await.expect("repos").remove(0).trust_requests.remove(0);
+        // Paused, so the notice is saved for the model rather than run.
+        crate::turn::stop_turn_now(a);
+
+        let holding = git::test_support::hold_row(&pool, "loaded_instructions", a, repo.id).await;
+        let request = tokio::spawn({
+            let pool = pool.clone();
+            async move { decide_and_notify(&pool, a, card.id, card.hash, true).await }
+        });
+        assert!(git::test_support::waiters_or_finished(&pool, 1, &request).await, "Trust never reached its load");
+        request.abort();
+        let _ = request.await;
+        holding.rollback().await.expect("release the load");
+
+        let p = &pool;
+        eventually("the decision commits", || async move { trusted(p).await }).await;
+        eventually("A's model is told", || told(p, a, "The user trusts")).await;
+        crate::turn::forget_conversation_lock(a);
+    }
+
+    /// SME-225 on "Work on a repo" (SME-224's attach). Interleaving: B's
+    /// load is held at its card's insert, holding the remote's trust
+    /// lock; A's "Work on a repo" waits for it, and its request is dropped
+    /// there. The attach still trusts the remote, drops B's card and
+    /// tells B. The test waits for the attach's sandbox step to finish
+    /// too, so none of it runs on after the test (review 1, finding 4).
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_work_on_a_repo_whose_request_is_dropped_still_drops_the_cards_and_tells_the_models(pool: sqlx::PgPool) {
+        let _race = git::test_support::ONE_AT_A_TIME.lock().await;
+        let _turns = crate::providers::test_support::lock_turn_tests();
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        let a = db::create_conversation(&pool).await.expect("conversation A").id;
+        let b = db::create_conversation(&pool).await.expect("conversation B").id;
+        // A has the repo checked out and a sandbox: nothing to clone or start.
+        git::test_support::cloned_repo(&pool, a).await;
+        db::create_sandbox_pod(&pool, a).await.expect("pod row");
+        let repo_b = git::test_support::cloned_repo(&pool, b).await;
+        crate::turn::stop_turn_now(b);
+
+        let holding = git::test_support::hold_row(&pool, "instruction_requests", b, repo_b.id).await;
+        let load = tokio::spawn({
+            let pool = pool.clone();
+            async move { git::request_or_load(&pool, b, &repo_b, "AGENTS.md", &git::test_support::file("b")).await }
+        });
+        assert!(git::test_support::waiters_or_finished(&pool, 1, &load).await, "the load never reached its card");
+        let (attaching, answered) = spawn_attach(&pool, a, "https://github.com/o/r".into(), String::new(), String::new());
+        let request = tokio::spawn(read_attach_answer(answered));
+        assert!(
+            git::test_support::waiters_or_finished(&pool, 2, &request).await,
+            "the attach never waited for the load"
+        );
+        request.abort();
+        let _ = request.await;
+        holding.rollback().await.expect("release the card");
+
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(10), load)
+            .await
+            .expect("the load finishes")
+            .expect("the load's task");
+        assert_eq!(loaded.expect("the load"), git::LoadOutcome::AwaitingTrust);
+        let p = &pool;
+        eventually("the attach trusts the remote and drops B's card", || async move {
+            trusted(p).await && git::list_repos(p, b).await.expect("repos")[0].trust_requests.is_empty()
+        })
+        .await;
+        eventually("B's model is told", || told(p, b, "load_instructions again")).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), attaching)
+            .await
+            .expect("the attach's sandbox step finishes")
+            .expect("the attach's task");
+        assert_eq!(crate::turn::last_turn_error(a), None, "A's sandbox step failed");
+        crate::turn::forget_conversation_lock(a);
+        crate::turn::forget_conversation_lock(b);
+    }
+
+    /// SME-224 review 1, finding 1. Interleaving: another request's repo
+    /// at A's directory, for another remote, is held uncommitted while
+    /// A's "Work on a repo" trusts the remote and drops B's card, so A's
+    /// record of the clone waits for it; it commits, and A's attach loses
+    /// the race and fails. The trust stands, so B's model is still told.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_work_on_a_repo_that_fails_after_trusting_still_tells_the_models(pool: sqlx::PgPool) {
+        let _race = git::test_support::ONE_AT_A_TIME.lock().await;
+        let _turns = crate::providers::test_support::lock_turn_tests();
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        let a = db::create_conversation(&pool).await.expect("conversation A").id;
+        let b = db::create_conversation(&pool).await.expect("conversation B").id;
+        let repo_b = git::test_support::cloned_repo(&pool, b).await;
+        db::request_instruction(&pool, b, repo_b.id, "AGENTS.md", &git::test_support::file("b"))
+            .await
+            .expect("a card in B");
+        crate::turn::stop_turn_now(b);
+
+        let mut holding = pool.begin().await.expect("begin the holding transaction");
+        sqlx::query(
+            "INSERT INTO conversation_repos (conversation_id, url, remote_key, dir, status)
+             VALUES ($1, 'https://github.com/x/r', 'github.com/x/r', 'r', 'cloning')",
+        )
+        .bind(a)
+        .execute(&mut *holding)
+        .await
+        .expect("hold A's directory, uncommitted");
+        let attach = tokio::spawn({
+            let pool = pool.clone();
+            async move { attach_and_answer(&pool, a, "https://github.com/o/r".into(), String::new(), String::new()).await }
+        });
+        let attach_waited = git::test_support::waiters_or_finished(&pool, 1, &attach).await;
+        holding.commit().await.expect("the other request's repo");
+
+        let attached = tokio::time::timeout(std::time::Duration::from_secs(10), attach)
+            .await
+            .expect("the attach answers")
+            .expect("the attach's task");
+        assert!(attach_waited, "the attach never waited at A's directory");
+        let error = attached.expect_err("the attach loses the race");
+        assert!(error.contains("already used by"), "got: {error}");
+        assert!(trusted(&pool).await, "the remote is trusted");
+        assert!(git::list_repos(&pool, b).await.expect("repos")[0].trust_requests.is_empty(), "B's card is dropped");
+        let p = &pool;
+        eventually("B's model is told", || told(p, b, "load_instructions again")).await;
+        crate::turn::forget_conversation_lock(a);
+        crate::turn::forget_conversation_lock(b);
+    }
+
+    /// SME-225: "Work on a repo" failing once nobody waits for its answer
+    /// (the tab closed) shows the failure in the conversation, as a
+    /// failure after the answer does (SME-91). With someone waiting, it's
+    /// theirs to show, and the conversation keeps no error.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_an_attach_failure_nobody_waits_for_shows_in_the_conversation(pool: sqlx::PgPool) {
+        let _guard = crate::providers::test_support::lock_turn_tests();
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        let unanswered = db::create_conversation(&pool).await.expect("conversation").id;
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        drop(answered);
+        hand_back_attach(&pool, unanswered, answer, Err("Couldn't save the repo: boom".to_string())).await;
+        let error = crate::turn::last_turn_error(unanswered).expect("the error is kept for a reload");
+        assert!(error.contains("\"Work on a repo\" failed.") && error.contains("boom"), "got: {error}");
+
+        let waited_for = db::create_conversation(&pool).await.expect("conversation").id;
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let handing_back = tokio::spawn({
+            let pool = pool.clone();
+            async move { hand_back_attach(&pool, waited_for, answer, Err("boom".to_string())).await }
+        });
+        let (started, ack) = answered.await.expect("the hand-back answers");
+        assert!(matches!(started, Err(e) if e == "boom"), "the waiting request gets the error");
+        ack.send(()).expect("the hand-back waits for the read");
+        tokio::time::timeout(std::time::Duration::from_secs(10), handing_back)
+            .await
+            .expect("the hand-back finishes")
+            .expect("the hand-back's task");
+        assert_eq!(crate::turn::last_turn_error(waited_for), None);
+
+        crate::turn::forget_conversation_lock(unanswered);
+    }
+
+    /// SME-224 review 1, finding 3. Interleaving: the failure reaches the
+    /// request's channel, and the request is dropped before it reads it
+    /// (the tab closed between the send and the request's next poll).
+    /// No request read it, so it's shown in the conversation.
+    #[sqlx::test(migrator = "crate::test_lock::MIGRATOR")]
+    async fn test_an_attach_failure_sent_but_never_read_shows_in_the_conversation(pool: sqlx::PgPool) {
+        let _guard = crate::providers::test_support::lock_turn_tests();
+        db::test_support::start_ids_clear_of_other_runs(&pool).await.expect("ids clear of other runs");
+        let unread = db::create_conversation(&pool).await.expect("conversation").id;
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let handing_back = hand_back_attach(&pool, unread, answer, Err("Couldn't save the repo: boom".to_string()));
+        tokio::pin!(handing_back);
+        // Sent, and waiting to hear it was read.
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(200), &mut handing_back).await.is_err();
+        drop(answered);
+        if waited {
+            tokio::time::timeout(std::time::Duration::from_secs(10), handing_back)
+                .await
+                .expect("the hand-back finishes");
+        }
+        let error = crate::turn::last_turn_error(unread).expect("the error is kept for a reload");
+        assert!(error.contains("\"Work on a repo\" failed.") && error.contains("boom"), "got: {error}");
+        assert!(waited, "the hand-back didn't wait to hear the request read the failure");
+
+        crate::turn::forget_conversation_lock(unread);
     }
 }

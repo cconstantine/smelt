@@ -102,7 +102,7 @@ async fn test_wait_for_clones_waits_for_a_clone_to_finish(pool: PgPool) {
     finisher.await.expect("finisher");
 }
 
-pub(super) fn file(content: &str) -> db::InstructionsFile {
+pub(crate) fn file(content: &str) -> db::InstructionsFile {
     db::InstructionsFile {
         content: content.to_string(),
         file_bytes: content.len() as i64,
@@ -111,7 +111,7 @@ pub(super) fn file(content: &str) -> db::InstructionsFile {
     }
 }
 
-pub(super) async fn cloned_repo(pool: &PgPool, conversation_id: i64) -> db::ConversationRepo {
+pub(crate) async fn cloned_repo(pool: &PgPool, conversation_id: i64) -> db::ConversationRepo {
     let repo = db::create_conversation_repo(pool, conversation_id, "git@github.com:o/r.git", "github.com/o/r", None, "r")
         .await
         .expect("repo");

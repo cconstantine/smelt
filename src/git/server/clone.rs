@@ -325,82 +325,71 @@ pub async fn attach_repo(
     url: &str,
     branch: Option<&str>,
 ) -> Result<RepoSummary, String> {
-    let (shown, pending, _notices) = start_attach(pool, conversation_id, url, branch, None).await?;
+    let (shown, pending, _notices) = start_attach(pool, conversation_id, url, branch, None)
+        .await
+        .map_err(|failed| failed.error)?;
     Ok(finish_attach(pool, conversation_id, pending).await?.unwrap_or(shown))
+}
+
+/// A "Work on a repo" that failed. A failure after the trust committed
+/// still carries the notices it owes the waiting models, whose cards it
+/// dropped (SME-224 review 1); `notices` is empty when it failed first.
+#[derive(Debug)]
+pub struct AttachFailed {
+    pub error: String,
+    pub notices: Vec<(i64, String)>,
 }
 
 /// The part of "Work on a repo" that answers the button: records trust
 /// and the repo (as cloning, so a message sent meanwhile waits for it).
-/// Returns what to show now, and the repo `finish_attach` still has to
-/// clone (`None`: already checked out). Touches no pod.
+/// Returns what to show now, the repo `finish_attach` still has to clone
+/// (`None`: already checked out), and the notices for the models whose
+/// cards the trust dropped. Touches no pod.
 pub async fn start_attach(
     pool: &PgPool,
     conversation_id: i64,
     url: &str,
     branch: Option<&str>,
     dir: Option<&str>,
-) -> Result<(RepoSummary, Option<db::ConversationRepo>, Vec<(i64, String)>), String> {
+) -> Result<(RepoSummary, Option<db::ConversationRepo>, Vec<(i64, String)>), AttachFailed> {
+    let untrusted = |error| AttachFailed { error, notices: Vec::new() };
     let url = url.trim();
     let branch = branch.map(str::trim).filter(|b| !b.is_empty());
-    let (key, dir, retry) = match plan_clone(pool, conversation_id, url, branch, dir).await? {
-        ClonePlan::Existing(repo) => {
-            // Already checked out (the model cloned it, say): the user
-            // naming it trusts it all the same.
-            db::set_repo_trust(pool, &repo.remote_key, true)
-                .await
-                .map_err(|e| e.to_string())?;
-            let notices = settle_requests_trusted_elsewhere(pool, &repo.remote_key, url).await?;
-            return Ok((summarise(pool, repo).await?, None, notices));
-        }
-        ClonePlan::Clone { key, dir, retry } => (key, dir, retry),
+    let plan = plan_clone(pool, conversation_id, url, branch, dir).await.map_err(untrusted)?;
+    let key = match &plan {
+        // Already checked out (the model cloned it, say): the user
+        // naming it trusts it all the same.
+        ClonePlan::Existing(repo) => repo.remote_key.clone(),
+        ClonePlan::Clone { key, .. } => key.clone(),
     };
     // The user named this repo, so its AGENTS.md is trusted without
     // asking (SME-32's plan, open question 1).
-    db::set_repo_trust(pool, &key, true)
-        .await
-        .map_err(|e| e.to_string())?;
-    let notices = settle_requests_trusted_elsewhere(pool, &key, url).await?;
-    let Some(repo) = record_clone(pool, conversation_id, url, branch, &key, &dir, retry).await? else {
-        let existing = after_lost_race(pool, conversation_id, url, branch, &dir).await?;
-        return Ok((summarise(pool, existing).await?, None, notices));
-    };
-    Ok((summarise(pool, repo.clone()).await?, Some(repo), notices))
+    // Committed before the repo is recorded, outside the lock: the lock
+    // covers trust and cards, and a repo recorded as cloning has no card.
+    let notices = trust_named_remote(pool, conversation_id, &key, url).await.map_err(untrusted)?;
+    match record_attach(pool, conversation_id, url, branch, plan).await {
+        Ok((shown, pending)) => Ok((shown, pending, notices)),
+        Err(error) => Err(AttachFailed { error, notices }),
+    }
 }
 
-/// The remote was trusted without its cards being answered (the user
-/// opened it with "Work on a repo"): the cards go, since the files
-/// they showed weren't what was decided on, and each waiting model is
-/// told to load again, which now works without asking. Returns the
-/// notices, for the caller to deliver.
-async fn settle_requests_trusted_elsewhere(
+/// `start_attach`'s step after the trust: records the planned clone.
+async fn record_attach(
     pool: &PgPool,
-    remote_key: &str,
+    conversation_id: i64,
     url: &str,
-) -> Result<Vec<(i64, String)>, String> {
-    let requests = db::list_instruction_requests_for_remote(pool, remote_key)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut notices = Vec::new();
-    let mut touched = std::collections::BTreeSet::new();
-    for request in requests {
-        db::delete_instruction_request(pool, request.id)
-            .await
-            .map_err(|e| e.to_string())?;
-        let repo = get_repo(pool, request.repo_id).await?;
-        let file = format!("{}/{}/{}", crate::sandbox::WORKSPACE_DIR, repo.dir, request.path);
-        notices.push((
-            request.conversation_id,
-            format!(
-                "The user now trusts {url}. {file} wasn't loaded; call load_instructions \
-                     again for it if you still want it (it loads without asking now)."
-            ),
-        ));
-        touched.insert(request.conversation_id);
-    }
-    for id in touched {
-        publish_repos(pool, id).await;
-    }
-    Ok(notices)
+    branch: Option<&str>,
+    plan: ClonePlan,
+) -> Result<(RepoSummary, Option<db::ConversationRepo>), String> {
+    let (key, dir, retry) = match plan {
+        ClonePlan::Existing(repo) => return Ok((summarise(pool, repo).await?, None)),
+        ClonePlan::Clone { key, dir, retry } => (key, dir, retry),
+    };
+    let Some(repo) = record_clone(pool, conversation_id, url, branch, &key, &dir, retry).await? else {
+        let existing = after_lost_race(pool, conversation_id, url, branch, &dir).await?;
+        return Ok((summarise(pool, existing).await?, None));
+    };
+    Ok((summarise(pool, repo.clone()).await?, Some(repo)))
 }
 
 /// The rest of "Work on a repo", run apart from the button's request:

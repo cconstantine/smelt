@@ -154,22 +154,23 @@ pub async fn request_instruction(
 /// Share-locks, in id order, the rows of conversation `id` and of every
 /// conversation with a repo of this remote, until the transaction ends,
 /// as a foreign key to them would: deleting any of them then waits, or
-/// finishes first (SME-181).
+/// finishes first (SME-181). Whether conversation `id` is still there
+/// (one deleted before the lock was granted isn't).
 pub async fn share_lock_conversations_for(
     executor: impl sqlx::PgExecutor<'_>,
     id: i64,
     remote_key: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "SELECT 1 FROM conversations
+) -> Result<bool, sqlx::Error> {
+    let locked: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM conversations
           WHERE id = $1 OR id IN (SELECT conversation_id FROM conversation_repos WHERE remote_key = $2)
           ORDER BY id FOR KEY SHARE",
     )
     .bind(id)
     .bind(remote_key)
-    .execute(executor)
+    .fetch_all(executor)
     .await?;
-    Ok(())
+    Ok(locked.contains(&id))
 }
 
 /// Takes the card `id` from conversation `conversation_id` to answer it:
