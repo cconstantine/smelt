@@ -32,6 +32,11 @@
 #   CHECK_WORKTREE  the worktree (default: ../smelt-check next to this repo,
 #                   or $TMPDIR/smelt-check when that isn't writable)
 #   CHECK_PORT      the app's port (default: 8081; the dev server uses 8080)
+#   CHECK_PORT_WAIT how long start waits for a port another check server
+#                   holds, in seconds (default: 1800; 0 gives up at once).
+#                   On timeout it exits 1, naming the holder and the `stop`
+#                   that would free the port, having checked nothing out and
+#                   created, written or signalled nothing (SME-186 B48).
 #   CHECK_SCRATCH_DB=1  serve from a database of its own, created on start
 #                   (smelt migrates it) and dropped on stop, instead of the dev
 #                   database. For when the dev database has migrations from
@@ -262,18 +267,54 @@ browser_check_cache() {
     return 1
 }
 
-# The directory of a process outside this one's process group with the port
-# lock open: the check server holding the port (its own group, from setsid).
-port_holder() {
-    local own fd pid
+# The process holding the port lock — the check server that holds it — into
+# holder_pid, holder_cmd and holder_dir. The advice a waiting start gives
+# names a worktree, so it has to know which one, and the program (from
+# /proc/<pid>/comm, never the arguments, which can carry a secret — SME-175
+# review 1). It prefers a session leader: setsid made the server's `dx` one,
+# and a second start waiting on the same lock never is, so a leader is the
+# server while any other process with the lock open is only waiting for it
+# (SME-186 B48). With no leader — the server's died, or a start is between its
+# flock and its setsid — it falls back to the youngest of the rest, since a
+# start that queues behind a server is younger than it. Reads /proc only;
+# signals nothing.
+find_port_holder() {
+    local own fd pid sid
+    local -a leaders=() others=()
+    holder_pid="" holder_cmd="" holder_dir=""
     own=$(ps -o pgid= -p $$ | tr -d ' ')
-    for fd in $(find /proc/[0-9]*/fd -maxdepth 1 -lname "$port_lock" 2>/dev/null); do
+    # Every child this start spawns while descriptor 8 is open has the port
+    # lock open itself — `find` first of all — and is gone again by the time
+    # its /proc entry is read, so the scan races with processes coming and
+    # going twice over: a directory can vanish under `find` (hence `|| true`
+    # on it), and a pid it names can vanish before this reads it (hence the
+    # `|| true` on the sid read, without which errexit ends the whole start
+    # there, silently, sed's error hidden by the redirect — which is what
+    # killed every wait in the first version of this). A pid that has gone
+    # holds no lock, so it is not the holder either way.
+    for fd in $(find /proc/[0-9]*/fd -maxdepth 1 -lname "$port_lock" 2>/dev/null || true); do
         pid=${fd#/proc/}
         pid=${pid%%/*}
-        [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$own" ] && continue
-        readlink "/proc/$pid/cwd" && return 0
+        # This start has the lock open itself (descriptor 8), and so does any
+        # start waiting beside it: neither of them is the holder.
+        [ "$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$own" ] && continue
+        # Field 6 of /proc/<pid>/stat is the session id. The command name is
+        # field 2 and can hold spaces and `)`, so cut through the last one
+        # first, as group_is_live does.
+        sid=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f4 || true)
+        [ -n "$sid" ] || continue
+        if [ "$sid" = "$pid" ]; then
+            leaders+=("$pid")
+        else
+            others+=("$pid")
+        fi
     done
-    echo "another worktree"
+    local -a from=("${others[@]}")
+    [ ${#leaders[@]} -gt 0 ] && from=("${leaders[@]}")
+    [ ${#from[@]} -gt 0 ] || return 0
+    holder_pid=$(printf '%s\n' "${from[@]}" | sort -n | tail -n 1)
+    holder_cmd=$(cat "/proc/$holder_pid/comm" 2>/dev/null || echo "an unnamed program")
+    holder_dir=$(readlink "/proc/$holder_pid/cwd" 2>/dev/null || echo "an unreadable directory")
 }
 
 # The inodes of the sockets listening on TCP port $1, on any local address,
@@ -445,6 +486,14 @@ start() {
         echo "CHECK_PORT must be a port number from 1 to 65535, written without a leading zero: '$port'" >&2
         exit 2
     fi
+    # How long to wait for a port another check server holds, validated the
+    # same way and just as early (SME-186 B48): before this there was no bound
+    # at all, so one forgotten server on the port hung every later start.
+    local port_wait=${CHECK_PORT_WAIT:-1800}
+    if ! [[ "$port_wait" =~ ^[0-9]+$ ]]; then
+        echo "CHECK_PORT_WAIT must be a number of seconds to wait for a port another check server holds (0 gives up at once): '$port_wait'" >&2
+        exit 2
+    fi
     local ref=HEAD
     if [ $# -gt 0 ] && [ "$1" != "--" ]; then
         ref=$1
@@ -496,8 +545,27 @@ start() {
     # frees it (SME-100).
     exec 8>>"$port_lock"
     if ! flock -n 8; then
-        echo "waiting for port $port: a check server from $(port_holder) holds it; scripts/check-server stop there, or use another CHECK_PORT" >&2
-        flock 8
+        find_port_holder
+        # Built up in pieces rather than interpolated: an apostrophe inside a
+        # ${var:-word} expansion breaks bash's own parser, and the fallback
+        # text wants one.
+        local holder_where="another worktree" holder_who=""
+        [ -n "$holder_dir" ] && holder_where="$holder_dir"
+        [ -n "$holder_pid" ] && holder_who=" (pid $holder_pid, $holder_cmd)"
+        echo "waiting for port $port: a check server from $holder_where holds it$holder_who; waiting up to ${port_wait}s and then giving up — scripts/check-server stop there, or use another CHECK_PORT" >&2
+        # Bounded (SME-186 B48). On timeout nothing has been checked out,
+        # created, written or signalled, and exiting frees descriptors 8 and 9.
+        if ! flock -w "$port_wait" 8; then
+            # Who holds it now — it may be someone else by now, and the stop
+            # command is only useful with the directory that holds the server.
+            find_port_holder
+            if [ -n "$holder_pid" ]; then
+                echo "port $port: still held after ${port_wait}s by pid $holder_pid ($holder_cmd) in $holder_dir. If that check server is yours to stop: CHECK_WORKTREE=$holder_dir CHECK_PORT=$port scripts/check-server stop; otherwise use another CHECK_PORT" >&2
+            else
+                echo "port $port: still held after ${port_wait}s by a check server in another worktree this user can't see. Stop it there, or use another CHECK_PORT" >&2
+            fi
+            exit 1
+        fi
     fi
     # Anything else listening on the port, after the lock (a start that
     # waited checks once the server before it has stopped) and before
