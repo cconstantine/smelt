@@ -127,13 +127,21 @@ pub async fn get_conversation_usage(
 }
 
 /// Forgets `conversation_id`'s last known usage, after a compaction made
-/// it describe a history that's no longer sent (SME-51 B10).
+/// it describe a history that's no longer sent (SME-51 B10). Holding the
+/// conversation's row first, as `record_model_call_if_current` does, so
+/// an older call's record still on its way commits before the clear
+/// rather than after it (SME-178 code review 1).
 pub async fn clear_conversation_usage(pool: &PgPool, conversation_id: i64) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM conversation_context_usage WHERE conversation_id = $1")
         .bind(conversation_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    tx.commit().await
 }
 
 /// Overwrites `conversation_id`'s usage row with `usage` — "last known

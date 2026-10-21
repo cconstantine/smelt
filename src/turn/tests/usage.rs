@@ -149,7 +149,8 @@ async fn test_a_call_stopped_after_its_reply_is_saved_is_recorded(pool: PgPool) 
 }
 
 /// A Stop while a finished call is being recorded doesn't record it
-/// twice: the record goes on, last-known usage and all.
+/// twice: the record goes on. Its turn gone, it isn't the last-known
+/// usage (code review 1).
 #[sqlx::test]
 async fn test_a_stop_while_a_call_is_recorded_records_it_once(pool: PgPool) {
     let _guard = lock_turn_tests();
@@ -169,8 +170,7 @@ async fn test_a_stop_while_a_call_is_recorded_records_it_once(pool: PgPool) {
     assert_eq!(wait_for_rows(&pool, 1).await, expected);
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(rows(&pool).await, expected, "recorded once");
-    let usage = db::get_conversation_usage(&pool, conversation.id).await.expect("usage");
-    assert_eq!(usage.map(|u| u.input_tokens), Some(1000));
+    assert_eq!(db::get_conversation_usage(&pool, conversation.id).await.expect("usage"), None);
     resume_turns(conversation.id);
 }
 
@@ -262,5 +262,41 @@ async fn test_a_call_on_a_conversation_deleted_mid_turn_is_kept(pool: PgPool) {
         .expect("the turn ends after the stop");
 
     assert_eq!(wait_for_rows(&pool, 1).await, vec![(None, "turn".to_string(), 1200, 0, 1)]);
+    resume_turns(conversation.id);
+}
+
+/// A Stop while a finished call is recorded cuts the record loose: it
+/// can commit after the next turn's. Being no longer the turn's, it
+/// doesn't overwrite the next turn's last-known usage (code review 1).
+#[sqlx::test]
+async fn test_a_stopped_turns_late_record_doesnt_overwrite_the_next_turns_usage(pool: PgPool) {
+    let _guard = lock_turn_tests();
+    let conversation = db::create_conversation_with_id(&pool, 9178000008).await.expect("conversation");
+    start_mock_upstream(
+        &pool,
+        vec![with_usage(&text_reply_body("Hi!"), 1000, 0, 40), with_usage(&text_reply_body("Again!"), 5000, 0, 50)],
+    )
+    .await;
+    let (reached, release) = test_hooks::pause_during_record(conversation.id);
+
+    let turn = spawn_turn(&pool, conversation.id);
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached)
+        .await
+        .expect("the turn records its call")
+        .expect("hook");
+    stop_and_wait(conversation.id, turn).await;
+    resume_turns(conversation.id);
+    run_turn(&pool, conversation.id, hello()).await.expect("the next turn");
+    let input = |u: Option<anthropic::TokenUsage>| u.map(|u| u.input_tokens);
+    assert_eq!(input(db::get_conversation_usage(&pool, conversation.id).await.expect("usage")), Some(5000));
+
+    let _ = release.send(());
+    assert_eq!(wait_for_rows(&pool, 2).await.len(), 2, "the stopped turn's call is still counted");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        input(db::get_conversation_usage(&pool, conversation.id).await.expect("usage")),
+        Some(5000),
+        "the next turn's usage stands"
+    );
     resume_turns(conversation.id);
 }

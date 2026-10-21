@@ -2,6 +2,8 @@
 //! recording its usage.
 
 use super::*;
+#[cfg(feature = "server")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Ollama's Anthropic-compatibility shim can fail to turn a model's raw
 /// output into a valid tool call, surfacing as a flat 500 with a message
@@ -96,7 +98,9 @@ pub(super) async fn call_model(
 /// anything is known). `finish` disarms before it spawns, so a call is
 /// never recorded twice. A drop's record is never the conversation's
 /// last-known usage (`ModelCall::finished`) and publishes nothing; it
-/// reaches an open context panel on its next fetch.
+/// reaches an open context panel on its next fetch. A finished record is
+/// current while `finish` is awaited, and stops being current when
+/// `finish`'s caller is dropped (a Stop) before it ends (code review 1).
 #[cfg(feature = "server")]
 pub(super) struct CallRecorder {
     pool: PgPool,
@@ -134,15 +138,24 @@ impl CallRecorder {
         &self.meter
     }
 
-    /// The record of `usage`, to write in a spawned task.
-    fn record(&self, usage: anthropic::TokenUsage, finished: bool) -> impl Future<Output = Result<(), sqlx::Error>> + Send + 'static {
+    /// The record of `usage`, to write in a spawned task: a finished
+    /// call's with the flag saying whether its turn is still current
+    /// (`db::record_model_call_if_current`), an unfinished one's with
+    /// `None`. Says whether it wrote the last-known usage.
+    fn record(
+        &self,
+        usage: anthropic::TokenUsage,
+        current: Option<Arc<AtomicBool>>,
+    ) -> impl Future<Output = Result<bool, sqlx::Error>> + Send + 'static {
         let pool = self.pool.clone();
         let (conversation_id, provider_id, kind) = (self.conversation_id, self.provider_id, self.kind);
         let model = self.model.clone();
         let cost_usd = crate::pricing::call_cost(self.price_catalog_provider.as_deref(), &model, &usage);
         async move {
+            let finished = current.is_some();
             let call = db::ModelCall { conversation_id, provider_id, model: &model, kind, usage, cost_usd, finished };
-            db::record_model_call(&pool, &call).await
+            let still_current = || current.is_some_and(|c| c.load(Ordering::SeqCst));
+            db::record_model_call_if_current(&pool, &call, still_current).await
         }
     }
 
@@ -157,21 +170,31 @@ impl CallRecorder {
     ///
     /// Written in a spawned task the caller awaits: a Stop dropping the
     /// caller mid-record leaves the task to finish it, and the recorder,
-    /// already disarmed, doesn't record it again (SME-178). A failed
-    /// write fails the caller, as before.
+    /// already disarmed, doesn't record it again (SME-178). The call is
+    /// still counted then, but its usage is the last-known usage, and
+    /// published, only if the caller was still there when the record
+    /// wrote it: once it's gone the next turn may already have written its
+    /// own (code review 1). A failed write fails the caller, as before.
     pub(super) async fn finish(
         mut self,
         turn: &anthropic::stream::StreamedTurn,
         context_window: Option<u32>,
     ) -> ServerFnResult<()> {
         self.armed = false;
-        let record = self.record(turn.usage, true);
+        let current = Arc::new(AtomicBool::new(true));
+        let _current_while_awaited = NotCurrentOnDrop(current.clone());
+        let record = self.record(turn.usage, Some(current.clone()));
         let (conversation_id, usage) = (self.conversation_id, turn.usage);
         let task = tokio::spawn(async move {
             #[cfg(test)]
             test_hooks::during_record(conversation_id).await;
-            record.await?;
-            if let Some(context_window) = context_window {
+            let wrote = record.await?;
+            // Checked again: a caller dropped since the write leaves the
+            // indicator to the next turn's call.
+            if let Some(context_window) = context_window
+                && wrote
+                && current.load(Ordering::SeqCst)
+            {
                 crate::events::publish(
                     conversation_id,
                     crate::events::ConversationEvent::ContextUsageUpdate { usage, context_window },
@@ -180,6 +203,18 @@ impl CallRecorder {
             Ok::<_, sqlx::Error>(())
         });
         task.await.map_err(ServerFnError::new)?.map_err(ServerFnError::new)
+    }
+}
+
+/// Marks a finished call's record no longer current when `finish`'s
+/// future ends or is dropped.
+#[cfg(feature = "server")]
+struct NotCurrentOnDrop(Arc<AtomicBool>);
+
+#[cfg(feature = "server")]
+impl Drop for NotCurrentOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -197,7 +232,7 @@ impl Drop for CallRecorder {
             tracing::warn!(conversation_id, "no runtime to record an unfinished model call on");
             return;
         };
-        let record = self.record(usage, false);
+        let record = self.record(usage, None);
         runtime.spawn(async move {
             if let Err(e) = record.await {
                 tracing::warn!(conversation_id, error = %e, "couldn't record an unfinished model call");

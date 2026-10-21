@@ -362,3 +362,111 @@ async fn test_an_unfinished_turn_call_is_counted_but_isnt_the_last_known_usage(p
         "the finished call's usage stands"
     );
 }
+
+/// Waits (up to 10 s) until a query in this database waits on a lock.
+async fn wait_for_a_lock_waiter(pool: &PgPool, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+                  WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_activity");
+        if waiting > 0 {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "{what} never waited");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A finished call whose turn is no longer current (stopped while its
+/// record was on its way) is counted, but isn't the conversation's
+/// last-known usage: a newer turn's may already be (code review 1).
+#[sqlx::test]
+async fn test_a_call_no_longer_current_is_counted_but_isnt_the_last_known_usage(pool: PgPool) {
+    let conversation = create_conversation(&pool).await.expect("conversation");
+    let provider = test_provider(&pool, "p").await;
+    record_model_call(&pool, &ModelCall { usage: usage(5, 5, 0, 0), ..turn_call(conversation.id, provider.id, true) })
+        .await
+        .expect("the current call");
+
+    let wrote = record_model_call_if_current(&pool, &turn_call(conversation.id, provider.id, true), || false)
+        .await
+        .expect("a call no longer current");
+
+    assert!(!wrote, "said it wrote the last-known usage");
+    assert_eq!(get_conversation_spend(&pool, conversation.id).await.expect("spend").calls, 2);
+    assert_eq!(get_conversation_usage(&pool, conversation.id).await.expect("usage"), Some(usage(5, 5, 0, 0)));
+}
+
+/// Holds `conversation_id`'s row as an older call's record does from its
+/// insert on, once it has seen its turn is still current.
+async fn an_older_record(pool: &PgPool, conversation_id: i64) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut older = pool.begin().await.expect("begin the older record");
+    sqlx::query("SELECT id FROM conversations WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(conversation_id)
+        .execute(&mut *older)
+        .await
+        .expect("hold the conversation");
+    older
+}
+
+/// The older record writes its usage, which a newer write waited for,
+/// and commits.
+async fn finish_the_older_record(mut older: sqlx::Transaction<'static, sqlx::Postgres>, conversation_id: i64) {
+    upsert_conversation_usage(&mut *older, conversation_id, &usage(1000, 0, 0, 0))
+        .await
+        .expect("the older usage");
+    older.commit().await.expect("commit the older record");
+}
+
+/// A record that checked its turn was current, and then lost a race to
+/// the next turn's, still commits first: the next turn's record waits
+/// for the conversation's row and writes after it (code review 1).
+#[sqlx::test]
+async fn test_a_newer_record_waits_for_an_older_one_and_its_usage_stands(pool: PgPool) {
+    let conversation = create_conversation(&pool).await.expect("conversation");
+    let provider = test_provider(&pool, "p").await;
+    let older = an_older_record(&pool, conversation.id).await;
+
+    let newer = tokio::spawn({
+        let pool = pool.clone();
+        let (conversation_id, provider_id) = (conversation.id, provider.id);
+        async move { record_model_call(&pool, &turn_call(conversation_id, provider_id, true)).await }
+    });
+    wait_for_a_lock_waiter(&pool, "the newer record").await;
+    finish_the_older_record(older, conversation.id).await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), newer)
+        .await
+        .expect("the newer record ends")
+        .expect("record task")
+        .expect("the newer record");
+    assert_eq!(get_conversation_usage(&pool, conversation.id).await.expect("usage"), Some(usage(10, 1, 0, 0)));
+}
+
+/// The same for a compaction's clear: it waits for the older record,
+/// so the usage of the history it summarized doesn't come back.
+#[sqlx::test]
+async fn test_a_clear_waits_for_an_older_record_and_leaves_no_usage(pool: PgPool) {
+    let conversation = create_conversation(&pool).await.expect("conversation");
+    let older = an_older_record(&pool, conversation.id).await;
+
+    let clear = tokio::spawn({
+        let pool = pool.clone();
+        let conversation_id = conversation.id;
+        async move { clear_conversation_usage(&pool, conversation_id).await }
+    });
+    wait_for_a_lock_waiter(&pool, "the clear").await;
+    finish_the_older_record(older, conversation.id).await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), clear)
+        .await
+        .expect("the clear ends")
+        .expect("clear task")
+        .expect("the clear");
+    assert_eq!(get_conversation_usage(&pool, conversation.id).await.expect("usage"), None);
+}
