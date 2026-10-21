@@ -12,9 +12,10 @@
 # and a second start waiting on the same lock never is, so a leader is the
 # server while any other process with the lock open is only waiting for it
 # (SME-186 B48). With no leader — the server's died, or a start is between its
-# flock and its setsid — it falls back to the youngest of the rest, since a
-# start that queues behind a server is younger than it. Reads /proc only;
-# signals nothing.
+# flock and its setsid — it falls back to the oldest of the rest: whoever holds
+# the file first is the older, and the processes waiting on it are younger, so
+# the youngest is usually a fellow waiter, and the advice would stop it instead
+# of the server (review 1, finding 1). Reads /proc only; signals nothing.
 find_port_holder() {
     local own fd pid sid
     local -a leaders=() others=()
@@ -46,7 +47,7 @@ find_port_holder() {
     local -a from=("${others[@]}")
     [ ${#leaders[@]} -gt 0 ] && from=("${leaders[@]}")
     [ ${#from[@]} -gt 0 ] || return 0
-    holder_pid=$(printf '%s\n' "${from[@]}" | sort -n | tail -n 1)
+    holder_pid=$(printf '%s\n' "${from[@]}" | sort -n | head -n 1)
     holder_cmd=$(cat "/proc/$holder_pid/comm" 2>/dev/null || echo "an unnamed program")
     holder_dir=$(readlink "/proc/$holder_pid/cwd" 2>/dev/null || echo "an unreadable directory")
 }

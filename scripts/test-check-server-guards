@@ -196,6 +196,63 @@ grep -q "1800" <<<"$out" || fail "G2d: the waiting line doesn't name the 1800 s 
 kill_helper "$holder_pid"
 check_server stop >/dev/null
 
+# G2e (SME-186 review 1): the fallback for when nothing leads a session, which
+# is the server's `dx` gone and a child left holding descriptor 8, or a start
+# sitting between its flock and its setsid. Two non-leaders hold the lock here,
+# each in a group of its own and neither its own session leader: the one that
+# took the lock first, and one queued behind it. The advice must name the one
+# that holds it. A queued start is always the *newest* process with the lock
+# open, so newest is wrong every time it's the one named: `stop` then runs in a
+# worktree that holds nothing, dropping that start's scratch database while the
+# port stays held. The holder predates everything queued behind it on the same
+# lock, so it is the one to name.
+holder_dir2=$dir/holder-no-leader
+waiter_dir2=$dir/waiter-no-leader
+mkdir -p "$holder_dir2" "$waiter_dir2"
+# A process with the lock open that leads no session: os.setpgrp gives it a
+# group of its own (so this script's start doesn't mistake it for a waiter
+# beside it, which it skips by group) without making it a session leader.
+# `hold` takes the lock before writing its ready file, `wait` writes first and
+# then blocks — so the case knows who holds it and who only wants it.
+start_plain_locker() { # dir ready-file hold|wait
+    : >"$2"
+    (
+        cd "$1" || exit 1
+        "$STUB_PYTHON3" -I -c 'import os, sys, fcntl, time
+os.setpgrp()
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_CREAT)
+if sys.argv[3] == "hold":
+    fcntl.flock(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").write(str(os.getpid()))
+fcntl.flock(fd, fcntl.LOCK_EX)
+time.sleep(120)' "$port_lock" "$2" "$3" >/dev/null 2>&1 &
+    )
+    wait_for_file "$2" || fail "the $3 locker never wrote its ready file"
+    local pid
+    pid=$(cat "$2" 2>/dev/null)
+    pid_is_live "$pid" || fail "the $3 locker (pid $pid) isn't alive"
+    echo "$pid"
+}
+older_pid=$(start_plain_locker "$holder_dir2" "$dir/older-ready" hold)
+newer_pid=$(start_plain_locker "$waiter_dir2" "$dir/newer-ready" wait)
+flock -n "$port_lock" true && fail "G2e: the port lock is free while the older locker holds it"
+out=$(CHECK_PORT_WAIT=2 timeout 30 "${guard_env[@]}" scripts/check-server start HEAD 2>&1)
+rc=$?
+[ "$rc" = 1 ] || fail "G2e: a start held past its wait exited $rc, not 1: $out"
+grep -qF "pid $older_pid" <<<"$out" ||
+    fail "G2e: with no session leader the timeout doesn't name the locker that holds the lock: $out"
+grep -qF "$holder_dir2" <<<"$out" || fail "G2e: the timeout doesn't name that locker's directory: $out"
+grep -qF "pid $newer_pid" <<<"$out" &&
+    fail "G2e: the timeout names a process queued behind the holder instead: $out"
+grep -qF "$waiter_dir2" <<<"$out" &&
+    fail "G2e: the timeout points at a queued process's directory: $out"
+grep -qF "CHECK_WORKTREE=$holder_dir2 CHECK_PORT=$port scripts/check-server stop" <<<"$out" ||
+    fail "G2e: the timeout doesn't give the stop command for the holder's worktree: $out"
+pid_is_live "$older_pid" || fail "G2e: a start that gave up signalled the holder"
+kill_helper "$newer_pid"
+kill_helper "$older_pid"
+check_server stop >/dev/null
+
 # G3 (SME-186 B41): a pid file that names a live group which isn't this
 # worktree's server must never be signalled — an id that was reused belongs to
 # someone else. Three groups, each leading a session of its own so that
