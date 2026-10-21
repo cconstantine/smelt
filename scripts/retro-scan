@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Lists the conversations since the last retrospective and flags where to look.
+
+The retrospective's Facilitator reads the record, not notes written for it
+(see docs/personas/facilitator.md). Whole transcripts are too big to read,
+so this prints, for each conversation, only the moments worth a look: the
+user stepping in or stopping a turn, a question asked, a tool error, a
+command that exited non-zero, and long gaps. The Facilitator then reads
+those stretches.
+
+  scripts/retro-scan --base https://smelt.example --since 2026-10-18
+  scripts/retro-scan --since 2026-10-18 --claude-session ~/.claude/projects/<p>/<id>.jsonl
+  scripts/retro-scan --self-test
+
+--base lists every smelt conversation updated since --since (smelt's own
+server functions, GET /api/conversations and /messages). --claude-session
+adds a Claude Code session's transcript (the orchestrating session's own
+record); it may be given more than once.
+"""
+import argparse
+import json
+import re
+import sys
+import urllib.request
+from datetime import datetime, timedelta
+
+NOTICE = re.compile(r"^(Terminal command \S+ finished: exit code (-?\d+)\.|The user stopped this turn)")
+STOPPED = "The user stopped this turn"
+POD_STOPPED = "The user stopped sandbox pod"
+GAP = timedelta(minutes=30)
+SNIPPET = 160
+MAX_HOTSPOTS = 40
+
+
+def when(stamp):
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00")).replace(tzinfo=None)
+
+
+def blocks(content):
+    """A smelt message's content: a JSON list of content blocks, or text."""
+    if isinstance(content, list):
+        return content
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError):
+        return [{"type": "text", "text": str(content)}]
+    return parsed if isinstance(parsed, list) else [{"type": "text", "text": str(parsed)}]
+
+
+def one_line(text):
+    return " ".join(str(text).split())[:SNIPPET]
+
+
+def smelt_hotspots(messages):
+    """(id, time, kind, snippet) for each moment worth a look, in order."""
+    out, seen_brief, last = [], False, None
+    for m in messages:
+        t = when(m["created_at"])
+        if last is not None and t - last > GAP:
+            out.append((m["id"], t, "gap", f"{int((t - last).total_seconds() // 60)} min since the last message"))
+        last = t
+        for b in blocks(m["content"]):
+            kind = b.get("type")
+            if m["role"] == "user" and kind == "text":
+                text = b["text"]
+                notice = NOTICE.match(text)
+                if text.startswith(POD_STOPPED):
+                    out.append((m["id"], t, "pod-stopped", one_line(text)))
+                elif notice and text.startswith(STOPPED):
+                    out.append((m["id"], t, "stop", one_line(text)))
+                elif notice:
+                    if notice.group(2) not in (None, "0"):
+                        out.append((m["id"], t, f"exit {notice.group(2)}", one_line(text)))
+                elif not seen_brief:
+                    seen_brief = True
+                    out.append((m["id"], t, "brief", one_line(text)))
+                else:
+                    out.append((m["id"], t, "user", one_line(text)))
+            elif kind == "tool_use" and b.get("name") == "ask_user":
+                out.append((m["id"], t, "question", one_line(json.dumps(b.get("input")))))
+            elif kind == "tool_result" and b.get("is_error"):
+                c = b.get("content")
+                out.append((m["id"], t, "tool-error", one_line(c if isinstance(c, str) else json.dumps(c))))
+    return out
+
+
+def claude_hotspots(lines):
+    """The same for a Claude Code session's JSONL: the human's own messages and interrupts."""
+    out = []
+    for n, line in enumerate(lines, 1):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("type") != "user" or entry.get("isMeta"):
+            continue
+        content = (entry.get("message") or {}).get("content")
+        texts = [content] if isinstance(content, str) else [
+            b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text"]
+        for text in texts:
+            text = text.strip()
+            if not text or text.startswith("<"):  # harness-injected context, not the human
+                continue
+            stamp = entry.get("timestamp")
+            t = when(stamp) if stamp else None
+            kind = "stop" if text.startswith("[Request interrupted") else "user"
+            out.append((n, t, kind, one_line(text)))
+    return out
+
+
+def report(title, header, spots):
+    print(f"## {title}")
+    print(header)
+    counts = {}
+    for _, _, kind, _ in spots:
+        key = "exit≠0" if kind.startswith("exit") else kind
+        counts[key] = counts.get(key, 0) + 1
+    print("Flags: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none"))
+    for ident, t, kind, text in spots[:MAX_HOTSPOTS]:
+        print(f"- #{ident} {t:%m-%d %H:%M} {kind}: {text}" if t else f"- #{ident} {kind}: {text}")
+    if len(spots) > MAX_HOTSPOTS:
+        print(f"- … {len(spots) - MAX_HOTSPOTS} more")
+    print()
+
+
+def get(base, path):
+    with urllib.request.urlopen(base.rstrip("/") + path, timeout=60) as resp:
+        return json.loads(resp.read())
+
+
+def self_test():
+    msgs = [
+        {"id": 1, "role": "user", "created_at": "2026-10-18T10:00:00", "content": '[{"type":"text","text":"Plan SME-1"}]'},
+        {"id": 2, "role": "assistant", "created_at": "2026-10-18T10:01:00",
+         "content": '[{"type":"tool_use","name":"ask_user","input":{"q":"A or B?"}}]'},
+        {"id": 3, "role": "user", "created_at": "2026-10-18T10:02:00",
+         "content": '[{"type":"tool_result","is_error":true,"content":"boom"}]'},
+        {"id": 4, "role": "user", "created_at": "2026-10-18T10:03:00",
+         "content": '[{"type":"text","text":"Terminal command x finished: exit code 0."}]'},
+        {"id": 5, "role": "user", "created_at": "2026-10-18T10:04:00",
+         "content": '[{"type":"text","text":"Terminal command y finished: exit code 2."}]'},
+        {"id": 6, "role": "user", "created_at": "2026-10-18T11:00:00",
+         "content": '[{"type":"text","text":"The user stopped this turn before it finished."}]'},
+        {"id": 7, "role": "user", "created_at": "2026-10-18T11:01:00", "content": '[{"type":"text","text":"use B"}]'},
+        {"id": 8, "role": "user", "created_at": "2026-10-18T11:02:00",
+         "content": '[{"type":"text","text":"The user stopped sandbox pod 9. Its terminals are gone."}]'},
+    ]
+    kinds = [k for _, _, k, _ in smelt_hotspots(msgs)]
+    assert kinds == ["brief", "question", "tool-error", "exit 2", "gap", "stop", "user", "pod-stopped"], kinds
+    jsonl = [
+        json.dumps({"type": "user", "timestamp": "2026-10-18T10:00:00Z", "message": {"content": "do the thing"}}),
+        json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "content": "x"}]}}),
+        json.dumps({"type": "user", "message": {"content": "<system-reminder>ctx</system-reminder>"}}),
+        json.dumps({"type": "user", "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}}),
+        json.dumps({"type": "assistant", "message": {"content": "hi"}}),
+        "not json",
+    ]
+    kinds = [k for _, _, k, _ in claude_hotspots(jsonl)]
+    assert kinds == ["user", "stop"], kinds
+    print("retro-scan self-test: ok")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--base", help="the smelt deployment whose conversations to scan")
+    p.add_argument("--since", help="the last retrospective's date (ISO 8601)")
+    p.add_argument("--claude-session", action="append", default=[], help="a Claude Code session JSONL to scan")
+    p.add_argument("--self-test", action="store_true")
+    a = p.parse_args()
+    if a.self_test:
+        return self_test()
+    if not a.since or not (a.base or a.claude_session):
+        p.error("--since and at least one of --base or --claude-session are required")
+    since = when(a.since)
+    if a.base:
+        convs = [c for c in get(a.base, "/api/conversations") if when(c["updated_at"]) >= since]
+        print(f"# smelt conversations updated since {a.since}: {len(convs)}\n")
+        for c in sorted(convs, key=lambda c: c["created_at"]):
+            msgs = [m for m in get(a.base, f"/api/conversations/{c['id']}/messages") if when(m["created_at"]) >= since]
+            span = f"{c['created_at'][:16]} → {c['updated_at'][:16]}, {len(msgs)} messages in the window"
+            report(f"Conversation {c['id']}: {one_line(c['title'])}", span, smelt_hotspots(msgs))
+    for path in a.claude_session:
+        with open(path, encoding="utf-8") as f:
+            spots = [s for s in claude_hotspots(f) if s[1] is None or s[1] >= since]
+        report(f"Claude Code session {path}", "(line numbers, not message ids)", spots)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

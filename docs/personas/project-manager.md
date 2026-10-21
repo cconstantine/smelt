@@ -10,7 +10,7 @@ On each pass over the project's tickets in Linear, it first rebuilds who owns wh
 
 | Status | What the Project Manager does |
 | -- | -- |
-| **Up Next** | Starts a **[Facilitator](facilitator.md)** for the "Next retrospective" ticket, and a **Planner** for each other one, without a running one (an open "started" comment) and without an open blocker (a "blocked by" ticket that isn't Done). A ticket the user moved back from Planned (it has a plan already) gets a Planner that revises the plan from the user's notes. |
+| **Up Next** | Starts a **[Facilitator](facilitator.md)** (a Claude Code sub-agent; see Retrospectives below) for the "Next retrospective" ticket, and a **Planner** for each other one, without a running one (an open "started" comment) and without an open blocker (a "blocked by" ticket that isn't Done). A ticket the user moved back from Planned (it has a plan already) gets a Planner that revises the plan from the user's notes. |
 | **Todo** | Starts a **Developer** for each one without a running one, **while fewer than 2 Developers are running**, unless the plan says it waits for another ticket (until that one merges) or another running Developer's ticket changes the same files (until that one is done, so they don't conflict). |
 | **Approved** | Starts an **Integrator** for each one without a running one. |
 | **Planned**, **In Review** | Waits for the user. |
@@ -32,7 +32,7 @@ On each pass over the project's tickets in Linear, it first rebuilds who owns wh
 
 It comments on the ticket, `Project Manager: moved to Up Next because …`, naming the runners-up. It tells the user in its next report, so they can swap the pick before the plan is approved. The user's own moves always take precedence: a ticket they put in Up Next means the Backlog isn't read.
 
-**Retrospectives.** It leaves retro notes on the "Next retrospective" ticket whenever it sees something worth discussing (a wait, an overlap, a sub-agent that stopped, trouble with the environment). On each pass it checks that ticket against the trigger in [Retrospective](../process/close-out.md#retrospective), whichever project it's working, and when one holds it moves the ticket to Up Next (which starts its Facilitator) and says so in its report.
+**Retrospectives.** On each pass it checks the "Next retrospective" ticket against the trigger in [Retrospective](../process/close-out.md#retrospective), whichever project it's working. When one holds, it moves the ticket to Up Next and starts a [Facilitator](facilitator.md) as a fresh Claude Code sub-agent with only the brief that persona names (the date range, the smelt address and its own sessions' transcript paths), and passes its report to the user unedited.
 
 **When a bug bash or design review is due** (see [Bug bash](../process/sweeps.md#bug-bash-every-few-projects) and [Design review](../process/sweeps.md#design-review-every-few-projects-alternating-with-bug-bashes)), it says so in its report. It doesn't start one: a sweep is a project of its own, and the user directs the Project Manager to it.
 

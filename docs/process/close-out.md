@@ -1,7 +1,7 @@
 # Close-out
 Part of the [development process](../development-process.md).
 
-What shipped, the docs and the code review: the gate on merging a ticket's PR. Then retro notes and the standing retrospective.
+What shipped, the docs and the code review: the gate on merging a ticket's PR. Then the standing retrospective.
 
 ## Keeping Linear current
 
@@ -32,15 +32,15 @@ When the user mentions a new idea, create a **Backlog** ticket for it before it 
 
 ## Retro notes (while the work runs)
 
-Every persona leaves notes for the retrospective as things happen, while its context is fresh: see "Retro notes" in [Rules every persona follows](../personas/rules.md). They are comments on the standing **Next retrospective** ticket in Maintenance, so one read finds them all, whichever ticket or project they came from. A note written only at the end of a long run reflects whatever survived compaction, so a surprise, a failure, a rescue or a win gets its note when it happens.
+The retrospective reads the record of the work itself (smelt keeps every conversation whole), so a persona owes it nothing. A note is optional, for what a transcript can't show: see "Retro notes" in [Rules every persona follows](../personas/rules.md).
 
 ## Retrospective
 
 A retrospective looks at the whole development process, across every project, so it doesn't wait for a project to end: projects interleave, grow tickets as they go, and can stop when they're done enough. Before 2026-10-18 each ticket's Developer wrote one, seeing one ticket from one seat; briefly after that each project had one, which never ran for a project that didn't finish.
 
-- **There is always exactly one open "Next retrospective" ticket,** in **Maintenance**, labelled Improvement. Retro notes collect on it as comments.
-- **The Project Manager decides when it runs,** and moves it to Up Next when any one of these holds: about 8–10 notes have built up since the last retrospective; about two weeks have passed with at least a few notes; a note says something is hurting right now (a rule that keeps causing rework, say); or the user asks. It says so in its report. It counts notes from the ticket's comments, whichever project it's working.
-- **A [Facilitator](../personas/facilitator.md) runs it** when the ticket reaches Up Next, instead of a Planner. It first creates the next "Next retrospective" ticket, so notes posted meanwhile land there, then writes the retrospective into its own ticket: what the notes and tickets showed, and numbered proposals.
+- **There is always exactly one open "Next retrospective" ticket,** in **Maintenance**, labelled Improvement. Optional retro notes collect on it as comments (see [Rules every persona follows](../personas/rules.md)), and the retrospective is written into it.
+- **The Project Manager decides when it runs,** and moves it to Up Next when any one of these holds: about two weeks have passed since the last retrospective; about ten tickets have reached Done since then; a note says something is hurting right now (a rule that keeps causing rework, say); or the user asks. It says so in its report.
+- **A [Facilitator](../personas/facilitator.md) runs it,** started by the orchestrating Claude Code session as a fresh sub-agent. It reads the record, not notes written for it: `scripts/retro-scan` lists every smelt conversation and orchestrator transcript since the last retrospective with the moments worth a look, and it reads those. It first creates the next "Next retrospective" ticket, then writes the retrospective into its own ticket, with **at most five ranked proposals**, each citing the incidents behind it.
 - **Process changes follow the [confirm-before-change rule](../development-process.md#evolving-this-process):** the proposals wait for the user at In Review. An [Integrator](../personas/integrator.md) then makes the ones the user didn't mark as disagreed, in one PR, and files a ticket for each one that is code.
 
 ## Code review (after opening the PR)
@@ -54,6 +54,6 @@ Don't run `/code-review` from the conversation that wrote the change: the skill 
 3. **Fix on the PR's branch, test-first, one commit per finding.** A failing test first, as in Phase 2; for a finding about a browser's behaviour, a browser-tier scenario shown failing with the fix switched off. A finding in already-merged code gets its own PR (see [rules-commits.md](rules-commits.md)). **When fixing a finding, search for every other place that makes the same decision** (the same advice, comparison or check) and fix them in the same commit. On SME-121 round 1 fixed the missing-image advice, and round 2 found the same gap in the outdated-agent advice. **When a round has more than two fixes, gate each from a detached gate worktree while writing the next** (see the gating rule in [rules-commits.md](rules-commits.md)), rather than one after another: SME-121's eleven review fixes, mostly advice text, took eleven full gates of about 20 minutes of lock each, back to back.
 4. **Review again after fixing, twice in all by default.** Fixes change the code, and a second pass looks with fresh eyes. The second round follows fixes: when the first round finds nothing to fix, it's the only one (SME-70). After the second round, only high-severity findings block the merge; report the rest and file each one the user wants as a Backlog ticket, linked as related. **Exception: a third round when the second finds medium-severity issues in a new integration** (a new external system, protocol or process smelt drives). Fix the second round's findings first, then review once more; that's the last. On SME-35 (language servers) the second round found two medium issues, and the third found a catalog suggestion that could never start. SME-32 ran ten rounds, each mostly fixing edges made by the last; a round that keeps finding new edges points to a missing state model (see [Phase 1](plan.md)), which another round won't supply.
 5. **Record it in the ticket**: a short code-review part in What shipped listing each finding and its fix.
-6. **Leave retro notes** about the reviews too (see [Retro notes](#retro-notes-while-the-work-runs)), then merge.
+6. **Leave a retro note** about the reviews if one is worth it (optional; see [Retro notes](#retro-notes-while-the-work-runs)), then merge.
 
 On SME-42, the first review found that both new routes could reach the sandbox agent's command WebSocket (any website could have run commands in the sandbox). The project's own real-cluster tests had used that very port as their test server. The second review, after the fixes, found a stalled POST and cross-site requests to the sandbox. None of the four were caught by the tests, the browser tier or the hands-on check.
