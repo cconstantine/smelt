@@ -113,11 +113,6 @@ pub(super) async fn wake_conversation(
     result
 }
 
-/// The real body of `run_turn`, with the turn-loop bound as a parameter —
-/// exists only so `test_run_turn_errors_when_max_turns_exceeded` can prove
-/// the "give up and error" behavior without actually replaying the mock
-/// upstream `MAX_TURNS` (10,000) times. Every other caller goes through
-/// `run_turn`, which always passes the real `MAX_TURNS`.
 /// Drains any terminal commands finished (or lost) but not yet notified
 /// into `persisted` as ordinary persisted `user` messages, folding their
 /// content into `pending_new_content` too (the compaction trigger's
