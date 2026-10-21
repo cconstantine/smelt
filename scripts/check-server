@@ -29,8 +29,9 @@
 # keeps the previous run's as .check-server.log.prev.
 #
 # Settings (environment):
-#   CHECK_WORKTREE  the worktree (default: ../smelt-check next to this repo,
-#                   or $TMPDIR/smelt-check when that isn't writable)
+#   CHECK_WORKTREE  the worktree (default: ../smelt-check-<this checkout's
+#                   name>, or $TMPDIR/smelt-check-<name> when its parent isn't
+#                   writable — one per checkout, so two never share a server)
 #   CHECK_PORT      the app's port (default: 8081; the dev server uses 8080)
 #   CHECK_PORT_WAIT how long start waits for a port another check server
 #                   holds, in seconds (default: 1800; 0 gives up at once).
@@ -90,12 +91,15 @@
 set -euo pipefail
 
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
-# Next to the repo, unless its parent isn't writable (a container whose
-# repo is at /app, say): then under $TMPDIR.
+# A check worktree per checkout (SME-186 B41): one shared default means two
+# checkouts share a pid file, a port lock and the scratch database named after
+# the worktree, so one's `stop` is another's server. Next to the repo, unless
+# its parent isn't writable (a container whose repo is at /app, say): then
+# under $TMPDIR.
 if [ -w "$repo/.." ]; then
-    default_worktree=$repo/../smelt-check
+    default_worktree=$repo/../smelt-check-$(basename "$repo")
 else
-    default_worktree=${TMPDIR:-/tmp}/smelt-check
+    default_worktree=${TMPDIR:-/tmp}/smelt-check-$(basename "$repo")
 fi
 worktree=${CHECK_WORKTREE:-$default_worktree}
 port=${CHECK_PORT:-8081}
