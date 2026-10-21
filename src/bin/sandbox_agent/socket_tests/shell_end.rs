@@ -350,3 +350,23 @@ async fn test_a_slow_reader_still_gets_all_of_a_shells_last_output_when_a_job_ho
         "the note should say a background job is still running: {stderr:?}"
     );
 }
+
+/// SME-191 review 1, finding 2: a shell's last output with no newline at
+/// its end still reaches its command when a job holds its pipes, on both
+/// streams, rather than staying in the reader's buffer for good.
+#[tokio::test]
+async fn test_a_shells_last_output_without_a_newline_reaches_its_command_when_a_job_holds_its_pipes() {
+    let addr = serve_agent().await;
+    let mut client = connect_ready(addr).await;
+    create_terminal(&mut client, "t1").await;
+
+    let (stdout, stderr, code) =
+        run_collect(&mut client, "t1", "c1", "sleep 30 & echo \"job $!\" >&2; printf out; printf err >&2; exit 0").await;
+    let _job = JobGuard(job_pid(&stderr));
+    assert_eq!((stdout, code), (vec!["out".to_string()], 0));
+    assert_eq!(stderr.get(1).map(String::as_str), Some("err"), "stderr: {stderr:?}");
+    assert!(
+        stderr.get(2).is_some_and(|line| line.contains("shell exited") && line.contains("background")),
+        "the note should come last: {stderr:?}"
+    );
+}

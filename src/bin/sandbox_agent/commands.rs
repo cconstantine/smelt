@@ -435,8 +435,8 @@ fn exit_code_of(status: std::io::Result<std::process::ExitStatus>) -> i32 {
 
 /// Reads into `buf` until it holds a whole line or `MAX_OUTPUT_CHUNK`
 /// bytes (B13, SME-122), or the stream ends. True when there's a piece to
-/// take (`take_piece`); false at the end of the stream with nothing left,
-/// or at the end of an ended shell's own output (`read.until`, SME-191).
+/// take (`take_piece`); false at the end of the stream, or of an ended
+/// shell's own output (`read.until`, SME-191), with nothing left.
 /// Cancel safe: `fill_buf` is, and what's read is moved into `buf`, kept
 /// across calls, and counted in `read`, before the next await.
 async fn fill_piece<R: tokio::io::AsyncBufRead + Unpin>(
@@ -450,7 +450,9 @@ async fn fill_piece<R: tokio::io::AsyncBufRead + Unpin>(
         }
         let left = read.left().unwrap_or(usize::MAX);
         if left == 0 {
-            return Ok(false);
+            // A last line with no newline is a piece of its own, as at
+            // the stream's end (review 1).
+            return Ok(!buf.is_empty());
         }
         let available = reader.fill_buf().await?;
         if available.is_empty() {
